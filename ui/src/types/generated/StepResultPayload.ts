@@ -15,9 +15,9 @@ export type StepResultPayload = { step_id: string,
  */
 kind: string, 
 /**
- * A hosted single-shot's per-step cap.
+ * A hosted single-shot's per-dispatch cap (`limits.tokens_per_dispatch`).
  */
-remote_max_tokens_per_execution?: number, 
+tokens_per_dispatch?: number, 
 /**
  * What the step asked the endpoint for.
  */

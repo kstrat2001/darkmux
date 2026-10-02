@@ -21,10 +21,11 @@
 //!
 //! - `LocalModel(Placement)` — gestalt-wave-planned, residency-lease
 //!   protected.
-//! - `RemoteEndpoint` — a hosted seat, bounded by `remote_cap`.
+//! - `UnmanagedEndpoint` — a call to an endpoint darkmux does not manage,
+//!   bounded by that endpoint's `limits.concurrent_calls`.
 //! - `NoModel` — dispatch-free, bounded by `dispatch_free_cap`.
 //! - `LocalModelUnresolved { reason }` — a local seat whose placement would
-//!   not resolve. Still fails OPEN (it runs, under `remote_cap`, as it
+//!   not resolve. Still fails OPEN (it runs, one at a time, as it
 //!   always has), never a hard error — but LOUDLY, via an `eprintln!` and a
 //!   `Warn` flow record naming the step and the reason.
 //!
@@ -582,7 +583,6 @@ pub fn run_step_graph(
     kinds: &StepKindRegistry,
     facts: &Facts,
     est: &(dyn FootprintEstimator + Sync),
-    remote_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     emit: &mut dyn FnMut(FlowRecord),
     persist: &mut dyn FnMut(&Step),
@@ -635,45 +635,10 @@ pub fn run_step_graph(
         ..Default::default()
     };
 
-    // (#1442) Scheduler-owned `bucket_group -> shared remote bucket` map,
-    // living for the WHOLE graph run so sibling steps naming the same group
-    // meter ONE per-execution allowance between them regardless of which
-    // wave each lands in. This is the allowance-multiplication fix: without
-    // it, `seats x k` sibling `dispatch.map` probe steps would each mint a
-    // fresh full allowance, multiplying the effective stage ceiling by the
-    // step count. A step that names no group gets a step-scoped bucket
-    // inside its own kind, so ungrouped behavior is unchanged.
-    //
-    // (#1530 Packet 0) Deliberately NOT unified with the `ArtifactBus`
-    // materialized below, even though both are "scheduler-owned shared
-    // state keyed by a name". `bucket_group` is CONFIG-DRIVEN: its name
-    // comes from a Step's own `config.bucket_group` (resolved per-step,
-    // inline in the wave loop below, because a group can first appear in
-    // ANY wave) and its budget is a runtime value read from that same
-    // config or `config_access::remote_max_tokens_per_step()`. An
-    // `ArtifactBus` entry's factory is a plain `fn() -> Arc<dyn Any + Send
-    // + Sync>` chosen specifically for `Port` to stay `const`-constructible
-    // (see `Port`'s doc) — it cannot capture a runtime budget value, so
-    // retrofitting `RemoteBudget` (`crate::remote_budget`, #1877's shared
-    // home) onto it would need either a captured-closure factory
-    // (abandoning the const-array ergonomics `Port` is built around) or
-    // resolving the bucket_group's budget BEFORE the artifact-bus pre-scan
-    // below (which does not know per-step config, only the STATIC ports a
-    // `StepKind` impl declares). Either path is a real design change for
-    // zero behavior gain in a zero-behavior-change packet, so
-    // `bucket_groups` keeps its own dedicated map — the BINDING requirement
-    // is that `dispatch.map`'s allowance-sharing stays byte-identical, and
-    // leaving its proven mechanism untouched is how this packet guarantees
-    // that.
-    let mut bucket_groups: std::collections::BTreeMap<
-        String,
-        std::sync::Arc<std::sync::Mutex<crate::remote_budget::RemoteBudget>>,
-    > = std::collections::BTreeMap::new();
-
     // (#1530 Packet 0) Materialize the run-scoped `ArtifactBus` ONCE, on
     // this main thread, BEFORE the wave loop below ever spawns a worker —
     // the same "build fully, then treat as read-only across the thread
-    // boundary" discipline `bucket_groups` above uses per-step, applied
+    // boundary" discipline, applied
     // here up front since a `Port::Artifact` declaration is STATIC (a
     // property of the `StepKind` impl, not of any one step's config), so
     // every artifact this graph could ever need is knowable before the
@@ -908,11 +873,9 @@ pub fn run_step_graph(
                 // `run_streaming` read below — `mission.coder` resolves its
                 // role from it, so the gate must see it too. No emitter
                 // (this filter emits through `apply_step_terminal`, not
-                // through a wave channel that does not exist yet) and no
-                // shared remote bucket (nothing is spending tokens here).
+                // through a wave channel that does not exist yet).
                 let ctx = crate::step_kinds::StepRunCtx::new(
                     run.clone(),
-                    None,
                     None,
                     dispatch_override.clone(),
                     bus.clone(),
@@ -1014,41 +977,9 @@ pub fn run_step_graph(
             let kind = kinds
                 .get(&step_snapshot.kind)
                 .with_context_step(&step_snapshot)?;
-            // (#1442) Resolve the step's `bucket_group` to the scheduler-owned
-            // shared bucket (get-or-create), so grouped siblings share ONE
-            // allowance. Ungrouped steps carry `None` and fall back to a
-            // step-scoped bucket inside the kind.
-            let remote_bucket = match crate::step_config::bucket_of(&step_snapshot.kind, &step_snapshot.config) {
-                None => None,
-                Some((group, explicit)) => {
-                    // (#1442 ship-2b) A launcher may stamp the group's
-                    // budget into the step's own config (`bucket_budget`),
-                    // the same key `dispatch.map`'s step-scoped fallback
-                    // honors. Sibling steps of one group are expected to
-                    // declare the SAME value; the first step to create the
-                    // group's bucket wins (the bucket lives for the whole
-                    // graph run). Absent, `remote.max_tokens_per_step`
-                    // applies, and (#2902 step 5) with neither there is no
-                    // per-step cap.
-                    let bucket = match bucket_groups.get(&group) {
-                        Some(b) => b.clone(),
-                        None => {
-                            let b = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::remote_budget::RemoteBudget::from_config(explicit)
-                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
-                                    .with_context_step(&step_snapshot)?,
-                            ));
-                            bucket_groups.insert(group, b.clone());
-                            b
-                        }
-                    };
-                    Some(bucket)
-                }
-            };
             let ctx = crate::step_kinds::StepRunCtx::new(
                 run.clone(),
                 Some(tx.clone()),
-                remote_bucket,
                 dispatch_override.clone(),
                 bus.clone(),
             );
@@ -1072,7 +1003,7 @@ pub fn run_step_graph(
             if let crate::step_kinds::SeatClaim::LocalModelUnresolved { reason } = &seat {
                 eprintln!(
                     "darkmux: step `{}` (kind `{}`) claims a LOCAL model seat but its placement \
-                     could not be resolved ({reason}) — running it under the remote cap, with NO \
+                     could not be resolved ({reason}) — running it one at a time, with NO \
                      wave load and NO #1487 residency lease. A concurrent darkmux command's \
                      reconcile could evict its model mid-generation.",
                     step_snapshot.id, step_snapshot.kind
@@ -1094,7 +1025,7 @@ pub fn run_step_graph(
                 Box::new(move || {
                     // (#2517) `Step::started_ts` is stamped from HERE — the
                     // instant this job's own worker thread is actually
-                    // about to dispatch, queueing behind `remote_cap`
+                    // about to dispatch, queueing behind its endpoint's concurrency
                     // already resolved — never at wave admission on the
                     // main thread (the old bug: every ready step in a wave
                     // shared ONE `now_unix()` stamped before any of them
@@ -1194,11 +1125,10 @@ pub fn run_step_graph(
                     jobs,
                     facts,
                     est,
-                    remote_cap,
                     // (#2394) Dispatch-free steps get their OWN ceiling.
                     // Resolved here (not inside `run_bounded`) so the executor
                     // stays a pure function of its arguments, exactly like
-                    // `remote_cap`, which this caller also resolves.
+                    // the endpoints' own concurrency, resolved per seat.
                     darkmux_types::config_access::dispatch_free_concurrency() as usize,
                     host_factory,
                 )
@@ -1959,11 +1889,11 @@ mod tests {
         let rec = step_start_record(
             &darkmux_types::session_id::RunId::mission("m-test").unwrap(),
             &step,
-            darkmux_flow::payload::SeatClass::RemoteEndpoint,
+            darkmux_flow::payload::SeatClass::UnmanagedEndpoint,
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::StepStart);
         assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action));
-        assert_eq!(rec.payload_json()["seat_class"], "remote_endpoint");
+        assert_eq!(rec.payload_json()["seat_class"], "unmanaged_endpoint");
         // Under the step's task session in its run: the mission comes from
         // that one session.
         assert_eq!(rec.session_id.as_deref(), Some("m-test.task.t-1"));
@@ -2849,7 +2779,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
@@ -2893,7 +2822,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -2924,7 +2852,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -2960,7 +2887,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_s| {},
@@ -3002,7 +2928,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_s| {},
@@ -3078,7 +3003,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -3116,7 +3040,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -3256,7 +3179,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -3486,7 +3408,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
@@ -3517,7 +3438,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
@@ -3593,7 +3513,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
@@ -3644,7 +3563,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |step| persisted.push(step.clone()),
@@ -3671,7 +3589,7 @@ mod tests {
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     }
 
-    // ─── (#1442) StepRunCtx seam: bucket groups + live streaming ─────────
+    // ─── (#1442) StepRunCtx seam: live streaming ─────────
 
     use crate::step_kinds::{StepKind, StepOutcome, StepRunCtx};
     use std::sync::{Arc, Mutex};
@@ -3682,56 +3600,6 @@ mod tests {
         step.kind = kind.to_string();
         step.config = config;
         (task, step)
-    }
-
-    /// (#1442) Draws from whatever bucket the scheduler handed it: admits
-    /// once, then spends the WHOLE remaining allowance (so a shared bucket is
-    /// exhausted for the next grouped sibling). Records `(step_id,
-    /// had_shared_bucket, admitted)` so a test can prove one allowance was
-    /// shared across siblings — vs an ungrouped step getting `None`. It
-    /// stands in for `dispatch.map`, the one kind that meters through a
-    /// group (`step_config::bucket_of`).
-    struct BucketProbeKind {
-        log: Arc<Mutex<Vec<(String, bool, bool)>>>,
-    }
-    impl StepKind for BucketProbeKind {
-        /// (#2394) This fixture runs no model.
-        fn seat(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> SeatClaim {
-            SeatClaim::NoModel
-        }
-        fn id(&self) -> &'static str {
-            "dispatch.map"
-        }
-        fn run(
-            &self,
-            step: &Step,
-            _t: &Task,
-            _i: &BTreeMap<String, String>,
-            ctx: &StepRunCtx,
-        ) -> Result<StepOutcome> {
-            let entry = match ctx.remote_bucket() {
-                Some(b) => {
-                    let mut g = b.lock().expect("bucket poisoned");
-                    // (#2902 step 5) "Admitted" = the shared bucket still had
-                    // room when this step arrived. Then settle a spend far
-                    // past the cap, so the next grouped sibling finds the
-                    // SAME bucket spent.
-                    let admitted = !g.exhausted();
-                    g.admit_reserve(0);
-                    g.settle(0, 1 << 40, 1);
-                    (step.id.clone(), true, admitted)
-                }
-                None => (step.id.clone(), false, false),
-            };
-            self.log.lock().unwrap().push(entry);
-            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
-        }
     }
 
     fn run_graph_with_kind(
@@ -3751,7 +3619,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
@@ -3761,59 +3628,6 @@ mod tests {
         )
         .unwrap();
         emitted
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn bucket_group_siblings_share_one_allowance_between_them() {
-        // Two CHAINED grouped steps (deterministic order, distinct waves)
-        // both name bucket_group "probe". The budget only funds ONE full
-        // draw, so step A admits + exhausts and step B is refused — proving
-        // the scheduler handed both the SAME shared bucket, not a fresh
-        // per-step allowance each.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "100");
-        }
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let kind = Arc::new(BucketProbeKind { log: log.clone() });
-        let cfg = json!({ "bucket_group": "probe" });
-        let (ta, sa) = kinded_step("a", "dispatch.map", cfg.clone(), &[]);
-        let (tb, sb) = kinded_step("b", "dispatch.map", cfg, &["a"]);
-        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
-
-        run_graph_with_kind(kind, &tasks, &mut steps);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-
-        let entries = log.lock().unwrap().clone();
-        let a = entries.iter().find(|e| e.0 == "a-step").expect("a ran");
-        let b = entries.iter().find(|e| e.0 == "b-step").expect("b ran");
-        assert!(a.1 && b.1, "both grouped steps got a scheduler-supplied shared bucket");
-        assert!(a.2, "step A admitted (fresh shared allowance)");
-        assert!(!b.2, "step B found the SAME bucket A spent: one allowance shared between them");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ungrouped_step_gets_no_shared_bucket() {
-        // A step naming NO bucket_group is handed `None` — it falls back to a
-        // step-scoped bucket inside its own kind, never joining a group.
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let kind = Arc::new(BucketProbeKind { log: log.clone() });
-        let (ta, sa) = kinded_step("solo", "dispatch.map", json!({}), &[]);
-        let (tasks, mut steps) = graph(vec![(ta, sa)]);
-
-        run_graph_with_kind(kind, &tasks, &mut steps);
-
-        let entries = log.lock().unwrap().clone();
-        let solo = entries.iter().find(|e| e.0 == "solo-step").expect("ran");
-        assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
     }
 
     /// A model-free step kind that completes with `degraded` set, standing in
@@ -3848,7 +3662,6 @@ mod tests {
             &kinds,
             &Facts::default(),
             &FixedEstimator::default(),
-            8,
             &mock_host_factory,
             &mut |_| {},
             &mut |_step| {},
@@ -3947,7 +3760,7 @@ mod tests {
     #[test]
     fn artifact_bus_shares_one_instance_across_steps_in_a_run() {
         // Two CHAINED steps (B depends on A, so they land in distinct
-        // waves, exactly like the bucket_group test above) of DIFFERENT
+        // waves, exactly like the tests above) of DIFFERENT
         // kinds: A writes its id into the shared artifact, B reads the
         // artifact back. B seeing A's write proves the scheduler
         // materialized ONE artifact instance (from A's `provides()`) and
@@ -3969,7 +3782,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_step| {},
@@ -3993,19 +3805,22 @@ mod tests {
     /// observable.
     struct SleepKind;
     impl StepKind for SleepKind {
-        /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
-    /// exercising what they were written to exercise: `remote_cap`
-    /// serializing genuinely remote dispatches. Before #2394 this kind
-    /// reached the remote track by SAYING NOTHING, which is precisely the
-    /// silence that also swept every dispatch-free step onto that track.
+        /// (#2394) Declares an unmanaged-endpoint seat explicitly, so the
+        /// tests built on it keep exercising what they were written to
+        /// exercise: an endpoint with no `limits.concurrent_calls` running
+        /// its calls one at a time. Before #2394 this kind reached that track
+        /// by SAYING NOTHING, which is precisely the silence that also swept
+        /// every dispatch-free step onto it. A step may name its own endpoint
+        /// in `config.endpoint` (default: one shared `test-endpoint`).
         fn seat(
             &self,
-            _step: &Step,
+            step: &Step,
             _task: &Task,
             _input: &BTreeMap<String, String>,
             _ctx: &StepRunCtx,
         ) -> SeatClaim {
-            SeatClaim::RemoteEndpoint
+            let endpoint = step.config.get("endpoint").and_then(|v| v.as_str()).unwrap_or("test-endpoint");
+            SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new(endpoint, None))
         }
         fn id(&self) -> &'static str {
             "test.sleep"
@@ -4030,8 +3845,10 @@ mod tests {
     #[test]
     fn per_seat_terminal_streams_at_each_job_finish_not_wave_drain() {
         let kind = Arc::new(SleepKind);
-        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250 }), &[]);
-        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        // Two endpoints, so the siblings share a wave without queueing
+        // behind one another.
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250, "endpoint": "slow-endpoint" }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0, "endpoint": "fast-endpoint" }), &[]);
         let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
 
         let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
@@ -4154,7 +3971,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_step| {},
@@ -4229,7 +4045,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -4256,9 +4071,9 @@ mod tests {
     /// `kind.run(...)` inside each job's own closure rather than
     /// from `step.started_ts` (stamped on the main thread, for every ready
     /// step, BEFORE that wave's jobs are even built — see the wave loop's
-    /// own comment on why `remote_cap` can force a ready step to wait
+    /// own comment on why an endpoint's concurrency can force a ready step to wait
     /// behind a sibling before its closure ever starts). Two independent
-    /// siblings land in the SAME wave with `remote_cap: 1` — only ONE can
+    /// siblings land in the SAME wave on one serial endpoint — only ONE can
     /// run at a time. `a-slow` sorts first (`BTreeMap` key order) and
     /// occupies the sole slot for ~250ms; `b-fast` cannot even START until
     /// `a-slow` finishes, then completes near-instantly itself. A `wall_ms`
@@ -4274,7 +4089,7 @@ mod tests {
     /// test. It failed:
     /// ```text
     /// the fast sibling slept 0ms and had to queue behind its sibling under
-    /// remote_cap=1 — its record must reflect ITS OWN near-zero dispatch
+    /// one serial endpoint — its record must reflect ITS OWN near-zero dispatch
     /// duration, never the ~250ms it spent waiting for the shared slot —
     /// got 256ms
     /// ```
@@ -4284,8 +4099,10 @@ mod tests {
     #[test]
     fn concurrent_sibling_steps_each_get_their_own_duration_not_the_waves() {
         let kind = Arc::new(SleepKind);
-        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250 }), &[]);
-        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        // Two endpoints, so the siblings share a wave without queueing
+        // behind one another.
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250, "endpoint": "slow-endpoint" }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0, "endpoint": "fast-endpoint" }), &[]);
         let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
 
         let kinds = StepKindRegistry::new();
@@ -4299,11 +4116,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            // (deliberately 1, not 8) — forces `b-fast` to queue behind
-            // `a-slow` instead of running truly in parallel, so a timing
-            // bug that leaks queue wait into `wall_ms` has something real
-            // to leak.
-            1,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -4332,7 +4144,7 @@ mod tests {
         assert!(
             fast.wall_ms < 150,
             "the fast sibling slept 0ms and had to queue behind its sibling under \
-             remote_cap=1 — its record must reflect ITS OWN near-zero dispatch \
+             one serial endpoint — its record must reflect ITS OWN near-zero dispatch \
              duration, never the ~250ms it spent waiting for the shared slot — got {}ms",
             fast.wall_ms
         );
@@ -4341,7 +4153,7 @@ mod tests {
     /// (#2517) Two steps admitted into the SAME wave (both ready at once,
     /// both flipped to `Running` together) but forced to DISPATCH at
     /// genuinely different wall-clock instants (queued behind
-    /// `remote_cap: 1`) must not read the same `started_ts`. Before the
+    /// one serial endpoint) must not read the same `started_ts`. Before the
     /// fix, `started_ts` was stamped ONCE for the whole wave at admission
     /// (`scheduler.rs`'s wave loop, before either step's `run_streaming`
     /// had even been called) — the shipped crawl config made this visible
@@ -4349,7 +4161,7 @@ mod tests {
     /// actually generating (#2517).
     ///
     /// `a-slow` sleeps 1.5s so its dispatch and `b-fast`'s dispatch (which
-    /// cannot begin until `a-slow` finishes, under `remote_cap: 1`) are
+    /// cannot begin until `a-slow` finishes, on one serial endpoint) are
     /// guaranteed to fall in different whole-second buckets of
     /// `now_unix()` — a gap over 1 second always changes `floor(now)` by
     /// at least one, regardless of where in its own second the wave
@@ -4372,9 +4184,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            // (deliberately 1) — forces `b-fast` to queue behind `a-slow`
-            // rather than dispatching in the same instant.
-            1,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -4388,23 +4197,23 @@ mod tests {
         let b_start = steps["b-fast-step"].started_ts.expect("b-fast actually dispatched");
         assert!(
             b_start > a_start,
-            "b-fast queued ~1.5s behind a-slow under remote_cap=1 — its started_ts must \
+            "b-fast queued ~1.5s behind a-slow on one serial endpoint — its started_ts must \
              reflect when IT actually dispatched, not the wave-admission instant it was \
              made ready alongside a-slow (got a_start={a_start} b_start={b_start})"
         );
     }
 
     /// (#2394) A wave of DISPATCH-FREE siblings must run CONCURRENTLY —
-    /// `remote_cap` protects hosted endpoints and has no business governing
+    /// An endpoint's concurrency limit protects that endpoint and has no business governing
     /// a step that never speaks to a model. Four independent
     /// `procedural.shell` steps, each sleeping 3s, land in ONE wave under
-    /// `remote_cap: 1`; the whole graph must finish in roughly one sleep,
+    /// a one-at-a-time endpoint; the whole graph must finish in roughly one sleep,
     /// not four.
     ///
     /// **Red before the fix**: `procedural.shell` had no seat class of its
     /// own, so the pre-#2394 `residency() -> None` default classified it
-    /// as a remote seat and `run_bounded` ran the four in `remote_cap`-
-    /// sized (i.e. one-at-a-time) batches. Measured ~12.0s against the
+    /// as a remote seat and `run_bounded` ran the four in one-at-a-time
+    /// batches. Measured ~12.0s against the
     /// ceiling of 8s below; ~3.0s after.
     #[test]
     // (#2532) `#[serial_test::serial]`: these steps name no `cwd`/`workdir`,
@@ -4415,7 +4224,7 @@ mod tests {
     // one — see `CwdGuard` in `step_kinds::builtins`'s test module) would
     // make all four steps refuse, which reads as a scheduler bug.
     #[serial_test::serial]
-    fn dispatch_free_siblings_do_not_serialize_behind_the_remote_cap() {
+    fn dispatch_free_siblings_do_not_serialize_behind_a_serial_endpoint() {
         const N: usize = 4;
         const SLEEP_SECS: u64 = 3;
         let pairs: Vec<_> = (0..N)
@@ -4441,9 +4250,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            // The mission-launch value (#2394's live reproduction): one
-            // hosted-endpoint call at a time. It must not reach these.
-            1,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -4458,7 +4264,7 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(SLEEP_SECS * 2 + 2),
             "{N} independent dispatch-free steps each sleeping {SLEEP_SECS}s must overlap \
-             (~{SLEEP_SECS}s total), never serialize behind remote_cap=1 (~{}s) — got {elapsed:?}",
+             (~{SLEEP_SECS}s total), never serialize behind a serial endpoint (~{}s) — got {elapsed:?}",
             SLEEP_SECS * N as u64
         );
     }
@@ -4503,7 +4309,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            4,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_s| {},
@@ -4539,7 +4344,7 @@ mod tests {
     #[serial_test::serial]
     fn step_start_record_carries_the_seat_class_for_every_class() {
         assert_eq!(start_seat_class(&records_for_seat(|| SeatClaim::NoModel)), "no_model");
-        assert_eq!(start_seat_class(&records_for_seat(|| SeatClaim::RemoteEndpoint)), "remote_endpoint");
+        assert_eq!(start_seat_class(&records_for_seat(|| SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)))), "unmanaged_endpoint");
         assert_eq!(
             start_seat_class(&records_for_seat(|| SeatClaim::LocalModelUnresolved {
                 reason: "no active profile".to_string()
@@ -4606,7 +4411,7 @@ mod tests {
     fn a_resolved_seat_emits_no_warning() {
         for claim in [
             (|| SeatClaim::NoModel) as fn() -> SeatClaim,
-            || SeatClaim::RemoteEndpoint,
+            || SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)),
         ] {
             let records = records_for_seat(claim);
             assert!(
@@ -4641,7 +4446,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -4684,7 +4488,7 @@ mod tests {
         struct FailingSleepKind;
         impl StepKind for FailingSleepKind {
             /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
-    /// exercising what they were written to exercise: `remote_cap`
+    /// exercising what they were written to exercise: an endpoint's concurrency
     /// serializing genuinely remote dispatches. Before #2394 this kind
     /// reached the remote track by SAYING NOTHING, which is precisely the
     /// silence that also swept every dispatch-free step onto that track.
@@ -4695,7 +4499,7 @@ mod tests {
                 _input: &BTreeMap<String, String>,
                 _ctx: &StepRunCtx,
             ) -> SeatClaim {
-                SeatClaim::RemoteEndpoint
+                SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None))
             }
             fn id(&self) -> &'static str {
                 "test.fail-sleep"
@@ -4723,7 +4527,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |r| emitted.push(r),
             &mut |_s| {},
@@ -4872,7 +4675,7 @@ mod tests {
 
         let report = run_step_graph(
             &crate::test_run(),
-            &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
+            &mut steps, &tasks, &kinds, &facts, &est, &factory,
             &mut |_r| {}, &mut |_s| {}, None, None, &[],
         )
         .unwrap();
@@ -5023,7 +4826,7 @@ mod tests {
 
         let report = run_step_graph(
             &crate::test_run(),
-            &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
+            &mut steps, &tasks, &kinds, &facts, &est, &factory,
             &mut |_r| {}, &mut |_s| {}, None, None, &[],
         )
         .unwrap();
@@ -5187,7 +4990,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -5267,7 +5069,6 @@ mod tests {
             &kinds,
             &facts,
             &est,
-            8,
             &mock_host_factory,
             &mut |_r| {},
             &mut |_s| {},
@@ -5470,7 +5271,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, &factory, &mut |_r| {}, &mut |_s| {},
             None, None, &[]).unwrap();
 
         assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
@@ -5515,7 +5316,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, &factory, &mut |_r| {}, &mut |_s| {},
             None, None, &[]).unwrap();
 
         unsafe {
@@ -5580,7 +5381,7 @@ mod tests {
 
         let err = run_step_graph(
             &crate::test_run(),
-            &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
+            &mut steps, &tasks, &kinds, &facts, &est, &factory,
             &mut |_r| {}, &mut |_s| {},
             None, None, &[])
         .expect_err("an unmet required artifact must fail the run");
@@ -5617,7 +5418,7 @@ mod tests {
 
         run_step_graph(
             &crate::test_run(),
-            &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
+            &mut steps, &tasks, &kinds, &facts, &est, &factory,
             &mut |_r| {}, &mut |_s| {},
             None, None, &seed)
         .expect("a seeded artifact satisfies the requirement");

@@ -114,7 +114,7 @@ pub fn execute_job_with(
 /// approved the job against the profile as it read then; dispatch resolves
 /// the profile by name again, so a registry edited in between could point it
 /// at a hosted endpoint the boundary forbids. This asks the resolution
-/// dispatch itself routes on (`dispatch_resolves_remote`, which fails closed)
+/// dispatch itself routes on (`dispatch_resolves_unmanaged`, which fails closed)
 /// and refuses before anything is reconciled, loaded or sent.
 ///
 /// Known residual: dispatch reads the registry once more after this check, a
@@ -125,7 +125,7 @@ fn assert_boundary_still_holds(job: &WorkJob, profile: &str) -> Result<()> {
     let holds = match job.boundary {
         None => true,
         Some(crate::Boundary::ManagedOnly) => {
-            !darkmux_crew::dispatch::dispatch_resolves_remote(&job.role_id, Some(profile), None)
+            !darkmux_crew::dispatch::dispatch_resolves_unmanaged(&job.role_id, Some(profile), None)
         }
         Some(crate::Boundary::Unknown) => false,
     };

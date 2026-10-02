@@ -246,7 +246,7 @@ flow_actions! {
     AuditWriteFailed => Audit, "audit.write_failed";
     BatteryPauseUnsupported => Battery, "battery.pause_unsupported";
     /// A budget was reached (or its `warn_at` fraction was) under `warn`, or
-    /// a per-step cap was crossed; the call went ahead.
+    /// a dispatch's token cap was crossed; the call went ahead.
     BudgetWarn => Budget, "budget.warn", Execution;
     /// A call is waiting on a budget (`wait`).
     BudgetWait => Budget, "budget.wait", Execution;

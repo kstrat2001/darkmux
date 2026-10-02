@@ -249,7 +249,7 @@ pub fn dispatch_routed_single_shot(
 
 /// The data boundary for a dispatch that stays on this machine, enforced the
 /// way a receiver enforces it: the profile the dispatch resolves here
-/// (`dispatch_resolves_remote`, which fails closed) must not be a hosted
+/// (`dispatch_resolves_unmanaged`, which fails closed) must not be a hosted
 /// endpoint under `managed_only`. Refused with the typed boundary refusal a
 /// peer's refusal carries, so a caller that re-asks with hosted-safe data on
 /// [`RefusalCode::Boundary`] does the same for a seat here.
@@ -257,7 +257,7 @@ fn enforce_local_boundary(opts: &DispatchOpts, boundary: Option<Boundary>) -> Re
     let refusal = match boundary {
         None => return Ok(()),
         Some(Boundary::ManagedOnly) => {
-            if !dispatch::dispatch_resolves_remote(&opts.role_id, opts.profile_name.as_deref(), None) {
+            if !dispatch::dispatch_resolves_unmanaged(&opts.role_id, opts.profile_name.as_deref(), None) {
                 return Ok(());
             }
             crate::Refusal::BoundaryUnmanaged { profile: opts.profile_name.clone().unwrap_or_else(|| "(default)".into()) }
@@ -1191,10 +1191,10 @@ mod tests {
     // introduce) but is not proof of a live bypass by itself; a red
     // runtime test is.
     //
-    // **Same shape as `darkmux-crew`'s `every_dispatch_remote_call_site_
+    // **Same shape as `darkmux-crew`'s `every_dispatch_unmanaged_call_site_
     // is_guarded_against_resume_from` (#2580), NOT an extension of it.**
     // That check is hard-pinned to one file (`dispatch_internal.rs`) and
-    // one identifier (`dispatch_remote`) in a DIFFERENT crate; generalizing
+    // one identifier (`dispatch_unmanaged`) in a DIFFERENT crate; generalizing
     // it to also cover `dispatch_via_submission` here would mean a
     // crate-or-workspace-wide scan — exactly the redesign its own doc
     // comment says a genuine visibility change would require, not

@@ -1759,7 +1759,7 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 
 /// The grounding scope this dispatch is allowed: [`GroundingScope::RemoteSafe`]
 /// when the answering seat resolves to a hosted endpoint on this machine.
-/// Fails closed via `crew::dispatch::dispatch_resolves_remote`, and for a
+/// Fails closed via `crew::dispatch::dispatch_resolves_unmanaged`, and for a
 /// malformed address. A fleet peer is one of the operator's own machines,
 /// not a hosted endpoint: the scope is [`GroundingScope::Full`], and the peer
 /// itself enforces it: the job carries `managed_only`, and a peer whose
@@ -1768,7 +1768,7 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
     match resolved_answering_seat(overrides) {
         Ok(AnsweringSeat::Here { explicit }) => {
-            if crate::crew::dispatch::dispatch_resolves_remote("radio-host", explicit.as_deref(), None) {
+            if crate::crew::dispatch::dispatch_resolves_unmanaged("radio-host", explicit.as_deref(), None) {
                 GroundingScope::RemoteSafe
             } else {
                 GroundingScope::Full

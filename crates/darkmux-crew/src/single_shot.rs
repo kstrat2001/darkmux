@@ -10,7 +10,7 @@
 //! `"temperature"` + `"stream": false`. The HOSTED (Azure/OpenAI) dialect
 //! (`"max_completion_tokens"`, optional `reasoning_effort`, no temperature)
 //! exists in two single-shot shapes: `dispatch_internal::single_shot_body`
-//! for `dispatch_remote` (a full role dispatch), and this module's
+//! for `dispatch_unmanaged` (a full role dispatch), and this module's
 //! [`hosted_chat_body`] + [`single_shot_chat_hosted`] (#1260) for
 //! endpoint-staffed crew seats (the review's remote probe/judge/
 //! verify seats). Local vs hosted are separate request shapes for separate
@@ -125,7 +125,7 @@ pub fn local_chat_body(
 
 /// (#2902 step 3) Everything a chat-completions request body is made of.
 /// The messages are assembled by the caller ([`chat_messages`] for the
-/// single-shot seats, a fixed system+user pair for `dispatch_remote`, a
+/// single-shot seats, a fixed system+user pair for `dispatch_unmanaged`, a
 /// user-only probe for `doctor --probe`); the dialect decides the rest.
 pub struct ChatBody<'a> {
     pub dialect: darkmux_types::Dialect,
@@ -195,7 +195,7 @@ pub(crate) fn chat_messages(system: &str, user: &str) -> serde_json::Value {
 /// endpoint-staffed crew seat. Pure — unit-testable, with a golden
 /// field-set test mirroring the local body's. Message assembly is
 /// [`chat_messages`], byte-identical to the local dialect (contract 6);
-/// everything else is the hosted dialect `dispatch_remote` proved in the
+/// everything else is the hosted dialect `dispatch_unmanaged` proved in the
 /// 1.17 cycle:
 ///
 /// - `"max_completion_tokens"` (the Azure/OpenAI cap form), never the
@@ -253,7 +253,7 @@ pub(crate) fn local_chat_url(base_url: Option<&str>) -> String {
 
 /// Container-free single-shot chat call against a local LMStudio endpoint.
 /// Builds the local-dialect body, POSTs via the same hardened curl path
-/// `dispatch_remote` uses (0600 secret-bearing config file — moot here
+/// `dispatch_unmanaged` uses (0600 secret-bearing config file — moot here
 /// since local calls carry no auth header, but it's the SAME machinery),
 /// and extracts `choices[0].message.content` + `usage.total_tokens` +
 /// `model`.
@@ -306,7 +306,7 @@ impl HostedSingleShotRequest<'_> {
 
 /// (#1260) Container-free single-shot chat call against a REMOTE
 /// OpenAI-compatible endpoint — the hosted twin of [`single_shot_chat`],
-/// through the EXACT URL/auth/POST chain `dispatch_remote` and
+/// through the EXACT URL/auth/POST chain `dispatch_unmanaged` and
 /// `doctor --probe` use (`ModelEndpoint::chat_url` + `remote_auth_header` +
 /// `remote_chat_completion`): Azure `?api-version=`, Keychain-read auth
 /// header (0600 curl config, never on argv, never logged), and the shared
@@ -548,7 +548,7 @@ mod tests {
             ],
             "max_completion_tokens": 20000,
         });
-        assert_eq!(body, expected, "hosted body must match the proven dispatch_remote dialect exactly");
+        assert_eq!(body, expected, "hosted body must match the proven dispatch_unmanaged dialect exactly");
         assert_eq!(
             body.as_object().unwrap().len(),
             3,

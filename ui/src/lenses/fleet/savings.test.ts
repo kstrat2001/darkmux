@@ -339,8 +339,8 @@ describe("tokensOffMeter", () => {
   // `DispatchMapStepKind::bookend_record` (`crates/darkmux-crew/src/
   // step_kinds/builtins.rs:826-867` and `:1626-1669`, both ending in
   // `stamp_remote_classification(&mut payload, endpoint_label, None)`),
-  // `dispatch_remote` (`dispatch_internal.rs:3217/3239/3303/3331`), and the
-  // container path from a single `remote_endpoint_raw_label`
+  // `dispatch_unmanaged` (`dispatch_internal.rs:3217/3239/3303/3331`), and the
+  // container path from a single `unmanaged_endpoint_raw_label`
   // (`dispatch_internal.rs:5193` on the start, `:7531` on the terminal).
   //
   // So an endpoint held on a start whose own completion lacks one means the

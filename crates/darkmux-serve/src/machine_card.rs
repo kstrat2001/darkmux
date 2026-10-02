@@ -51,6 +51,13 @@ use std::time::Duration;
 /// The card's own shape version. Minor for an added field a reader can
 /// ignore, major for a rename or retype. A peer whose card is on another
 /// major is shown as "card unavailable", never guessed at.
+///
+/// 1.2 (#3035): `seats.hosted` is `seats.unmanaged` ("remote" and "hosted"
+/// were the wrong axis), and its `cap` is gone. `cap` was the machine's
+/// `remote.concurrent_cap`; concurrency is per endpoint now
+/// (`endpoints.<id>.limits.concurrent_calls`), so there is no one number to
+/// report. A 1.2 reader reads an older card's `hosted` key and ignores its
+/// `cap`; 1.0 and 1.1 are unreleased, so no shipped reader meets a 1.2 card.
 pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
@@ -179,8 +186,8 @@ impl CardGrant {
 /// **Only those jobs are counted.** This machine's own dispatches do not pass
 /// through the fleet listener, so `counts_own_work` is `false` and NOTHING in
 /// this block means "free": a model with `held_by_peer_job: false` may be
-/// running this machine's own coder turn, and a hosted count under its cap may
-/// not be under it once own work counts.
+/// running this machine's own coder turn, and an endpoint's held count may be
+/// nearer its `limits.concurrent_calls` once own work counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -193,7 +200,10 @@ pub struct CardSeats {
     /// The local models a peer's job could seat, or does: each managed model
     /// in a work profile, and each model a peer job holds.
     pub local: Vec<CardLocalSeat>,
-    pub hosted: CardHostedSeats,
+    /// Seats on endpoints darkmux does not manage. Written as `unmanaged`; an
+    /// older peer's `hosted` key still reads.
+    #[serde(alias = "hosted")]
+    pub unmanaged: CardUnmanagedSeats,
     /// Submitted jobs waiting for a seat.
     pub waiting: u32,
 }
@@ -232,15 +242,14 @@ pub struct CardLocalSeat {
     pub held_by_peer_job: bool,
 }
 
-/// Seats peers' jobs hold on hosted endpoints: up to a cap.
+/// Seats peers' jobs hold on endpoints this machine only sends requests to
+/// (each endpoint's `limits.concurrent_calls` bounds its own).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct CardHostedSeats {
-    /// Hosted jobs other machines submitted that run now.
+pub struct CardUnmanagedSeats {
+    /// Jobs other machines submitted that run now on an unmanaged endpoint.
     pub held_by_peer_jobs: u32,
-    /// `remote.concurrent_cap`; `null` is unbounded.
-    pub cap: Option<u32>,
 }
 
 /// The battery policy the operator wrote, and whether it refuses a start now.
@@ -472,7 +481,7 @@ pub(crate) fn card_seats(
         busy_policy: policy.into(),
         counts_own_work: false,
         local: local.into_iter().map(|(model, held)| CardLocalSeat { model: model.to_string(), held_by_peer_job: held }).collect(),
-        hosted: CardHostedSeats { held_by_peer_jobs: seats.hosted_held as u32, cap: seats.hosted_cap.map(|c| c as u32) },
+        unmanaged: CardUnmanagedSeats { held_by_peer_jobs: seats.unmanaged_held as u32 },
         waiting: seats.waiting as u32,
     }
 }
@@ -730,8 +739,8 @@ pub(crate) mod tests {
         assert!(!by_name(&cards, "cloud").is_default);
     }
 
-    fn snap(local: &[&str], hosted: usize, cap: Option<usize>, waiting: usize) -> SeatSnapshot {
-        SeatSnapshot { local_held: local.iter().map(|s| s.to_string()).collect(), hosted_held: hosted, hosted_cap: cap, waiting }
+    fn snap(local: &[&str], unmanaged: usize, waiting: usize) -> SeatSnapshot {
+        SeatSnapshot { local_held: local.iter().map(|s| s.to_string()).collect(), unmanaged_held: unmanaged, waiting }
     }
 
     fn seat_of<'a>(seats: &'a CardSeats, model: &str) -> &'a CardLocalSeat {
@@ -744,13 +753,13 @@ pub(crate) mod tests {
     #[test]
     fn seats_state_what_peer_jobs_hold_and_say_they_do_not_count_own_work() {
         let cards = card_profiles(&mixed_registry());
-        let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, Some(3), 2), &cards, None);
+        let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, 2), &cards, None);
         assert_eq!(seats.busy_policy, CardBusyPolicy::Queue);
         assert!(!seats.counts_own_work, "the listener never sees this machine's own dispatches");
         assert!(seat_of(&seats, "qwen-35b").held_by_peer_job);
         assert!(!seat_of(&seats, "qwen-4b").held_by_peer_job, "the managed model nobody holds");
         assert_eq!(seats.local.len(), 2);
-        assert_eq!(seats.hosted, CardHostedSeats { held_by_peer_jobs: 1, cap: Some(3) });
+        assert_eq!(seats.unmanaged, CardUnmanagedSeats { held_by_peer_jobs: 1 });
         assert_eq!(seats.waiting, 2);
         let wire = serde_json::to_string(&seats).unwrap();
         assert!(!wire.contains("free"), "no seat field may read as free: {wire}");
@@ -762,7 +771,7 @@ pub(crate) mod tests {
     fn the_utility_model_is_not_a_seat() {
         let cards = card_profiles(&mixed_registry());
         let models = |utility| {
-            card_seats(BusyPolicy::Refuse, &snap(&[], 0, None, 0), &cards, utility)
+            card_seats(BusyPolicy::Refuse, &snap(&[], 0, 0), &cards, utility)
                 .local
                 .into_iter()
                 .map(|s| s.model)
@@ -776,14 +785,14 @@ pub(crate) mod tests {
     /// A model a peer job holds is listed even when no work profile names it.
     #[test]
     fn a_held_model_is_listed_whatever_the_profiles_say() {
-        let seats = card_seats(BusyPolicy::Refuse, &snap(&["orphan"], 0, None, 0), &[], None);
+        let seats = card_seats(BusyPolicy::Refuse, &snap(&["orphan"], 0, 0), &[], None);
         assert_eq!(seats.local, vec![CardLocalSeat { model: "orphan".into(), held_by_peer_job: true }]);
     }
 
     #[test]
-    fn an_unbounded_hosted_cap_is_null_and_held_jobs_still_count() {
-        let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, None, 0), &[], None);
-        assert_eq!(seats.hosted, CardHostedSeats { held_by_peer_jobs: 4, cap: None });
+    fn held_endpoint_jobs_count() {
+        let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, 0), &[], None);
+        assert_eq!(seats.unmanaged, CardUnmanagedSeats { held_by_peer_jobs: 4 });
     }
 
     fn now(thermal: Option<&str>, battery: Option<BatteryCharge>) -> HostSampleNow {
@@ -1067,7 +1076,7 @@ pub(crate) mod tests {
                 busy_policy: CardBusyPolicy::Queue,
                 counts_own_work: false,
                 local: vec![CardLocalSeat { model: "qwen".into(), held_by_peer_job: true }],
-                hosted: CardHostedSeats { held_by_peer_jobs: 1, cap: Some(3) },
+                unmanaged: CardUnmanagedSeats { held_by_peer_jobs: 1 },
                 waiting: 0,
             }),
             governor: CardGovernor {

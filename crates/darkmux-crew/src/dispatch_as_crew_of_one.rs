@@ -175,7 +175,6 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         registry,
         &facts,
         &est,
-        1,
         host_factory,
         &mut |record| {
             let _ = darkmux_flow::record(record);
@@ -1000,7 +999,6 @@ mod tests {
         let kind = registry.get("dispatch.internal").expect("dispatch.internal is a Tier 1 builtin");
         let ctx = crate::step_kinds::StepRunCtx::new(
             crate::test_run(),
-            None,
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),

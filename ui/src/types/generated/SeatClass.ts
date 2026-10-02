@@ -3,4 +3,4 @@
 /**
  * What a step consumes: the model seat it claims.
  */
-export type SeatClass = "local_model" | "remote_endpoint" | "no_model" | "local_model_unresolved" | "unknown";
+export type SeatClass = "local_model" | "unmanaged_endpoint" | "no_model" | "local_model_unresolved" | "unknown";

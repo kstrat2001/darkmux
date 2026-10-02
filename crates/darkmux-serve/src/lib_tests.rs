@@ -2098,7 +2098,7 @@
     #[serial_test::serial]
     async fn health_withholds_this_machine_fields_from_a_proxied_loopback_request() {
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
-            Some((darkmux_types::config::BusyPolicy::Queue, 2));
+            Some(darkmux_types::config::BusyPolicy::Queue);
         let local = loopback_health(&[]).await;
         assert!(local["open_file_limit"].is_number(), "this machine sees its own limit: {local}");
         assert_eq!(local["fleet_busy"]["policy"], "queue", "{local}");
@@ -2319,7 +2319,7 @@
     #[serial_test::serial]
     async fn health_withholds_this_machine_fields_from_a_rebound_or_hostless_request() {
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
-            Some((darkmux_types::config::BusyPolicy::Queue, 2));
+            Some(darkmux_types::config::BusyPolicy::Queue);
         let rebound = loopback_health(REBOUND).await;
         assert!(rebound["open_file_limit"].is_null(), "{rebound}");
         assert!(rebound["fleet_busy"].is_null(), "{rebound}");
@@ -6012,7 +6012,7 @@
     /// admission-time flip) but never actually got a turn on its
     /// concurrency-capped track — `started_ts: None`, exactly the shape
     /// `run_step_graph`'s job closure leaves behind for a step still
-    /// queued behind `remote_cap`/`dispatch_free_cap`. Before this fix the
+    /// queued behind an endpoint's concurrency/`dispatch_free_cap`. Before this fix the
     /// task read `running` (any `NodeStatus::Running` step won,
     /// unconditionally) for as long as that queueing lasted — the issue's
     /// own "RUNNING for an hour with nothing running". It must now read

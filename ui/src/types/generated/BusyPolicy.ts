@@ -4,7 +4,8 @@
  * (#2916 stage 2) What a machine's fleet listener does with a submitted job
  * whose seat is already in use (`fleet.busy_policy`). A job on a LOCAL model
  * holds that model for its whole run (one request at a time per instance);
- * a job on a HOSTED endpoint runs beside others up to this machine's
- * `remote.concurrent_cap`. Past either limit, this policy decides.
+ * a job on an endpoint darkmux does not manage runs beside others on that
+ * endpoint up to its `limits.concurrent_calls` (one at a time when it
+ * declares none). Past either limit, this policy decides.
  */
 export type BusyPolicy = "refuse" | "queue";

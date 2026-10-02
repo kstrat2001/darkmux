@@ -18,7 +18,7 @@
 use super::types::{
     CwdPolicy, MapDispatchOverride, OverrideDispatchCall, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx,
 };
-use crate::remote_budget::RemoteBudget;
+use crate::dispatch_budget::DispatchBudget;
 use crate::step_output::labels;
 use crate::step_config::{
     load, load_checked, ConfigKind, DispatchInternalConfig, MapConfig, ModelCallConfig, NoopConfig,
@@ -31,7 +31,7 @@ use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Compose a step kind's base prompt/message with the gathered output of
 /// its already-`Complete` dependencies. Shared by `dispatch.internal` and
@@ -73,7 +73,7 @@ fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
 /// HOSTED steps (`config.endpoint` present) never call this: an endpoint
 /// deployment name is not something darkmux loads into local residency, so
 /// the bare `config.model` string is already the correct wire value there
-/// — see each `seat()`'s own `RemoteEndpoint` short-circuit.
+/// — see each `seat()`'s own `UnmanagedEndpoint` short-circuit.
 fn local_dispatch_wire_model_id(call: &ModelCallConfig) -> String {
     call.identifier.clone().unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(&call.model, None))
 }
@@ -128,9 +128,9 @@ fn with_residency_lost_hint(wire_model: &str, e: anyhow::Error) -> anyhow::Error
 ///
 /// - a LOCAL model resolved → [`SeatClaim::LocalModel`], wave-planned and
 ///   #1487 lease-protected;
-/// - the winning model is ENDPOINT-BEARING → [`SeatClaim::RemoteEndpoint`],
-///   which is correct and SILENT: it was never going to touch local
-///   residency;
+/// - the winning model is on an UNMANAGED endpoint →
+///   [`SeatClaim::UnmanagedEndpoint`], which is correct and SILENT: it was
+///   never going to touch local residency;
 /// - resolution BROKE (unresolvable role, unloadable registry, no active
 ///   profile, a local model missing `n_ctx`) →
 ///   [`SeatClaim::LocalModelUnresolved`], which the scheduler surfaces
@@ -155,7 +155,7 @@ pub fn resolve_local_seat(
 ) -> SeatClaim {
     match resolve_local_placement_inner(role_id, profile_name, config_path, seat) {
         Ok(placement) => SeatClaim::LocalModel(placement),
-        Err(PlacementMiss::Remote) => SeatClaim::RemoteEndpoint,
+        Err(PlacementMiss::Unmanaged(slot)) => SeatClaim::UnmanagedEndpoint(slot),
         Err(PlacementMiss::ResolutionFailed(reason)) => SeatClaim::LocalModelUnresolved { reason },
     }
 }
@@ -165,7 +165,7 @@ pub fn resolve_local_seat(
 /// endpoint-bearing model was never going to need local residency);
 /// `ResolutionFailed` is the loud one.
 enum PlacementMiss {
-    Remote,
+    Unmanaged(crate::step_kinds::EndpointSlot),
     ResolutionFailed(String),
 }
 
@@ -223,7 +223,9 @@ fn resolve_local_placement_inner_with(
     // error at the placement decision.
     match target.kind {
         darkmux_types::EndpointKind::Managed(_) => {}
-        darkmux_types::EndpointKind::Unmanaged => return Err(PlacementMiss::Remote),
+        darkmux_types::EndpointKind::Unmanaged => {
+            return Err(PlacementMiss::Unmanaged(crate::step_kinds::EndpointSlot::of(&target.endpoint)))
+        }
     }
     let pm = &target.model;
     // (#2902 step 4) The one n_ctx rule (`ProfileModel::require_n_ctx`).
@@ -243,6 +245,88 @@ fn resolve_local_placement_inner_with(
 /// the step names (`config.config_path`), else the default one.
 fn step_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types::ModelEndpoint>> {
     crate::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
+}
+
+/// (#3035) A step's `config.endpoint` when it names a MANAGED endpoint
+/// (`target::step_managed_endpoint`): the local arm still carries that
+/// endpoint's limits.
+fn step_managed_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types::ModelEndpoint>> {
+    crate::target::step_managed_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
+}
+
+/// The LOCAL arm of `dispatch.single_shot` (#3035): a local step whose
+/// `config.endpoint` names a MANAGED endpoint answers to that endpoint's
+/// limits like any other: its window gate, then this call's dispatch cap.
+#[allow(clippy::too_many_arguments)]
+fn local_single_shot_reply(
+    step: &Step,
+    managed_endpoint: Option<&darkmux_types::ModelEndpoint>,
+    call: &ModelCallConfig,
+    wire_model: &str,
+    system: &str,
+    user: &str,
+    (max_tokens, timeout_seconds): (u32, u32),
+    caller: &crate::budget::BudgetCaller<'_>,
+) -> Result<crate::single_shot::SingleShotReply> {
+    use crate::single_shot::{single_shot_chat, SingleShotRequest};
+    let local_cap = match managed_endpoint {
+        Some(ep) => {
+            crate::budget::admit_endpoint(ep, caller)?;
+            let bucket = Mutex::new(DispatchBudget::for_endpoint(ep).map_err(|e| anyhow::anyhow!(e))?);
+            Some(bucket)
+        }
+        None => None,
+    };
+    let req = SingleShotRequest {
+        base_url: None,
+        model: wire_model,
+        system,
+        user,
+        temperature: call.temperature(),
+        max_tokens,
+        timeout_seconds,
+    };
+    let reply = single_shot_chat(&req)
+        .map_err(|e| with_residency_lost_hint(wire_model, e))
+        .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?;
+    if let Some(bucket) = &local_cap {
+        crate::budget::settle_dispatch_live(
+            bucket,
+            crate::budget::conservative_spend(reply.counts.total_tokens(), max_tokens, &format!("{system}{user}")),
+            &step.id,
+            caller,
+        );
+    }
+    Ok(reply)
+}
+
+/// (#3035) The limits a LOCAL step item answers to when its `config.endpoint`
+/// names a managed endpoint: the endpoint (its window gate), the item's own
+/// dispatch cap bucket, and who the budget records are about.
+struct LocalLimits<'a> {
+    endpoint: &'a darkmux_types::ModelEndpoint,
+    bucket: &'a Mutex<DispatchBudget>,
+    label: &'a str,
+    caller: &'a crate::budget::BudgetCaller<'a>,
+}
+
+impl<'a> LocalLimits<'a> {
+    /// The limits for one item, when its step names a managed endpoint.
+    fn of(
+        endpoint: Option<&'a darkmux_types::ModelEndpoint>,
+        bucket: Option<&'a Mutex<DispatchBudget>>,
+        label: &'a str,
+        caller: &'a crate::budget::BudgetCaller<'a>,
+    ) -> Option<Self> {
+        endpoint.zip(bucket).map(|(endpoint, bucket)| Self { endpoint, bucket, label, caller })
+    }
+}
+
+/// One item's own dispatch cap bucket, when its step names a managed endpoint.
+fn item_cap_bucket(endpoint: Option<&darkmux_types::ModelEndpoint>) -> Result<Option<Mutex<DispatchBudget>>> {
+    endpoint
+        .map(|ep| DispatchBudget::for_endpoint(ep).map(Mutex::new).map_err(|e| anyhow::anyhow!(e)))
+        .transpose()
 }
 
 /// Best-effort parse of `failed_tool_invocations` from the internal
@@ -666,8 +750,8 @@ impl StepKind for DispatchInternalStepKind {
 /// **Hosted-arm budgets (#1412, #2902 step 5).** The LOCAL dialect
 /// (LMStudio) is never metered. The HOSTED arm passes the endpoint's
 /// rolling-window budget (`crate::budget::admit_endpoint`) and reserves
-/// against this step's per-step cap (a fresh `RemoteBudget` from
-/// `remote.max_tokens_per_step`) before the call, and settles the cap with
+/// against this call's dispatch cap (a fresh `DispatchBudget` from
+/// `limits.tokens_per_dispatch`) before the call, and settles the cap with
 /// the call's real spend after it. Neither refuses or clamps a call: a
 /// breach warns, and an endpoint `wait` holds the call until there is room.
 pub struct DispatchSingleShotStepKind;
@@ -697,8 +781,8 @@ fn hosted_single_shot_step_payload(
     let counts = &reply.counts;
     StepResultPayload {
         // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
-        // spelling) The per-step cap, under the key v3.13.0 shipped.
-        remote_max_tokens_per_execution: budget,
+        // spelling) The per-dispatch cap, under the key v3.13.0 shipped.
+        tokens_per_dispatch: budget,
         max_tokens_requested: Some(u64::from(max_tokens_requested)),
         max_tokens_sent: Some(u64::from(max_tokens_sent)),
         prompt_tokens: counts.prompt,
@@ -844,8 +928,10 @@ impl StepKind for DispatchSingleShotStepKind {
             Err(e) => return SeatClaim::LocalModelUnresolved { reason: format!("{e:#}") },
         };
         let call = &cfg.call;
-        if !matches!(step_endpoint(call), Ok(None)) {
-            return SeatClaim::RemoteEndpoint;
+        match step_endpoint(call) {
+            Ok(None) => {}
+            Ok(Some(ep)) => return SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::of(&ep)),
+            Err(_) => return SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::unresolved()),
         }
         let Some(min_ctx) = call.n_ctx.and_then(|n| n.as_u32()) else {
             return SeatClaim::LocalModelUnresolved {
@@ -873,10 +959,7 @@ impl DispatchSingleShotStepKind {
         input: &BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        use crate::single_shot::{
-            single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
-            SingleShotRequest,
-        };
+        use crate::single_shot::{single_shot_chat_hosted, HostedSingleShotRequest};
         // Records go out live through the scheduler's emitter when there is
         // one, else batch into the outcome (see `StepBookend`).
         let ctx = run_ctx.live();
@@ -898,6 +981,8 @@ impl DispatchSingleShotStepKind {
         // records and the actual call can never disagree about what was
         // dispatched.
         let endpoint = step_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let managed_endpoint =
+            step_managed_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
         let wire_model = step_wire_model(call, is_hosted);
         let system = call.system.as_deref().unwrap_or("");
@@ -946,26 +1031,25 @@ impl DispatchSingleShotStepKind {
         let mut flow_records = Vec::new();
 
         let call_started = std::time::Instant::now();
+        // Who this call's budget records are about, for both arms.
+        let budget_caller = crate::budget::BudgetCaller {
+            session,
+            execution,
+            role_id: None,
+            model: Some(wire_model.as_ref()),
+            phase_id: Some(&task.phase_id),
+            profiles_file: call.config_path.as_deref(),
+        };
         let reply = if let Some(endpoint) = &endpoint {
 
             // (#2902 step 5) Both budgets before the network, never after:
-            // the endpoint's window, then this step's per-step cap. A breach
+            // the endpoint's window, then this call's dispatch cap. A breach
             // warns; an endpoint `wait` holds the call (the step stays live,
             // its heartbeat beating) until there is room. Nothing is clamped.
-            let budget_caller = crate::budget::BudgetCaller {
-                session,
-                execution,
-                role_id: None,
-                model: Some(wire_model.as_ref()),
-                phase_id: Some(&task.phase_id),
-                profiles_file: call.config_path.as_deref(),
-            };
             crate::budget::admit_endpoint(endpoint, &budget_caller)?;
-            let step_bucket = std::sync::Mutex::new(
-                RemoteBudget::from_config(None).map_err(|e| anyhow::anyhow!(e.to_string()))?,
-            );
-            let budget = step_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
-            crate::budget::admit_step(&step_bucket, max_tokens);
+            let dispatch_bucket =
+                std::sync::Mutex::new(DispatchBudget::for_endpoint(endpoint).map_err(|e| anyhow::anyhow!(e))?);
+            let budget = dispatch_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
 
             let req = HostedSingleShotRequest {
                 endpoint,
@@ -977,16 +1061,14 @@ impl DispatchSingleShotStepKind {
             };
             let reply = single_shot_chat_hosted(&req)
                 .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?;
-            crate::budget::settle_step_live(
-                &step_bucket,
-                max_tokens,
+            crate::budget::settle_dispatch_live(
+                &dispatch_bucket,
                 crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens, &req.body()?),
-                1,
                 &step.id,
                 &budget_caller,
             );
 
-            // (#1412) Surface actual spend the same way `dispatch_remote`
+            // (#1412) Surface actual spend the same way `dispatch_unmanaged`
             // embeds totals in its `dispatch complete` record, so a hosted
             // single-shot step's token usage is visible even without the
             // full per-step bucket regime.
@@ -1011,19 +1093,16 @@ impl DispatchSingleShotStepKind {
 
             reply
         } else {
-            let temperature = call.temperature();
-            let req = SingleShotRequest {
-                base_url: None,
-                model: wire_model.as_ref(),
+            local_single_shot_reply(
+                step,
+                managed_endpoint.as_ref(),
+                call,
+                wire_model.as_ref(),
                 system,
-                user: &user,
-                temperature,
-                max_tokens,
-                timeout_seconds,
-            };
-            single_shot_chat(&req)
-                .map_err(|e| with_residency_lost_hint(wire_model.as_ref(), e))
-                .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?
+                &user,
+                (max_tokens, timeout_seconds),
+                &budget_caller,
+            )?
         };
 
         // (#2902 step 1a) The one usage record for this one model call, from
@@ -1048,7 +1127,7 @@ impl DispatchSingleShotStepKind {
                 None,
                 wire_model.as_ref(),
                 &usage_endpoint,
-                endpoint.as_ref().and_then(|ep| ep.named_id()),
+                endpoint.as_ref().or(managed_endpoint.as_ref()).and_then(|ep| ep.named_id()),
             )),
         );
         match ctx {
@@ -1081,14 +1160,11 @@ impl DispatchSingleShotStepKind {
 
 // ─── dispatch.map (#1442) ───────────────────────────────────────────────
 
-// (#1442) `RemoteBudget` (`crate::remote_budget`, #1877's shared home) lets
-// the SCHEDULER own a `bucket_group -> Arc<Mutex<RemoteBudget>>` map and
-// hand the same bucket to sibling `dispatch.map` steps (the "allowance
-// multiplication" carry-forward — see that type's doc and `StepRunCtx`).
-// The budget-0 divergence (a grouped-or-ungrouped `dispatch.map` completes
-// `Ok` with every item skipped rather than a step-level `Err`, unlike
-// `dispatch.single_shot`'s hosted arm) is unchanged and documented on `run`
-// below.
+// (#3035) Each `dispatch.map` item is one dispatch, so each hosted item gets
+// its own `DispatchBudget` (`crate::dispatch_budget`) from its endpoint's
+// `limits.tokens_per_dispatch`. The pre-5.0 step-level allowance shared
+// across a step's items by `bucket_group` is gone: a whole-run budget is the
+// endpoint's rolling `limits.window`.
 
 
 /// (#1442) One `dispatch.map` item's outcome, serialized (in input-collection
@@ -1358,8 +1434,8 @@ fn resolve_map_collection(
 /// caller-supplied strategy (which is what would make it a Tier 2 pattern).
 /// It is [`DispatchSingleShotStepKind`]'s sibling that ITERATES — the same
 /// LOCAL/HOSTED dialect split, the same per-item `max_tokens` clamp, the same
-/// per-item record shape — with a per-item loop and a step-scoped remote
-/// bucket ([`RemoteBudget`]) added on top. That there is no genuinely-new
+/// per-item record shape — with a per-item loop and a per-item token cap
+/// bucket ([`DispatchBudget`]) added on top. That there is no genuinely-new
 /// *pluggable algorithm* (only a new outer loop shape over existing
 /// primitives) is why it lands in `builtins` and not `patterns/`.
 ///
@@ -1391,7 +1467,7 @@ fn resolve_map_collection(
 /// to 2 attempts total), stopping early the moment a non-empty reply lands.
 /// Tokens are accumulated across EVERY attempt (an empty reasoning-model reply
 /// still burns — and is billed — its whole completion budget), and the hosted
-/// arm draws from the remote bucket on each attempt (a retry is another
+/// arm draws from the item's token cap on each attempt (a retry is another
 /// billable call). The block stays Tier-1-pure and domain-blind:
 /// `retry_on_empty` is a plain config integer, not review-specific knowledge.
 ///
@@ -1588,9 +1664,8 @@ impl DispatchMapStepKind {
     /// (#1442) The shared map body behind both the ctx-free [`StepKind::run`]
     /// and the streaming [`StepKind::run_streaming`]. `ctx` is `None` for the
     /// unit-test/no-scheduler path (records batch into
-    /// `StepOutcome.flow_records`, bucket is step-scoped) and `Some` for the
-    /// scheduler path (records emit LIVE, a named `bucket_group` shares one
-    /// allowance across sibling steps).
+    /// `StepOutcome.flow_records`) and `Some` for the scheduler path
+    /// (records emit LIVE).
     fn run_map(
         &self,
         step: &Step,
@@ -1640,6 +1715,8 @@ impl DispatchMapStepKind {
         // actual per-item calls can never disagree about what was
         // dispatched.
         let endpoint = step_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let managed_endpoint =
+            step_managed_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
         let wire_model = step_wire_model(call, is_hosted);
         let user_template = cfg.user_template.as_str();
@@ -1715,22 +1792,6 @@ impl DispatchMapStepKind {
             Some(wire_model.to_string()),
         );
 
-        // The per-step cap. When the step named a `bucket_group`, the
-        // SCHEDULER already resolved the group's SHARED bucket and handed it
-        // in through `ctx.remote_bucket()`, so sibling steps of the group
-        // meter one allowance between them (#1442). Ungrouped (or ctx-free)
-        // steps get their own step-scoped bucket. `bucket_budget` (u64,
-        // optional) is a launcher-stamped number in the step's own config;
-        // absent, `remote.max_tokens_per_step` applies, and (#2902 step
-        // 5) with neither there is no cap at all. Local items never
-        // draw from it.
-        let bucket: Arc<Mutex<RemoteBudget>> = match run_ctx.remote_bucket() {
-            Some(shared) => shared.clone(),
-            None => Arc::new(Mutex::new(
-                RemoteBudget::from_config(cfg.bucket.bucket_budget.map(|c| c.0))
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-            )),
-        };
         // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
         // threaded into every item's arm; `None` on all production paths.
         let ovr = run_ctx.dispatch_override();
@@ -1771,15 +1832,26 @@ impl DispatchMapStepKind {
             let user = user_template.replace("{item}", &map_item_text(payload));
             let mut calls: Vec<MapCall> = Vec::new();
             let res = match &endpoint {
-                Some(ep) => map_hosted_item(
-                    index, &bucket, ep, wire_model.as_ref(), item_system, &user, max_tokens,
-                    timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
-                    &step.id, &budget_caller,
-                ),
-                None => map_local_item(
-                    index, wire_model.as_ref(), item_system, &user, temperature, max_tokens,
-                    timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
-                ),
+                Some(ep) => {
+                    // One item is one dispatch: its own token cap bucket.
+                    let item_bucket =
+                        Mutex::new(DispatchBudget::for_endpoint(ep).map_err(|e| anyhow::anyhow!(e))?);
+                    map_hosted_item(
+                        index, &item_bucket, ep, wire_model.as_ref(), item_system, &user, max_tokens,
+                        timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
+                        &step.id, &budget_caller,
+                    )
+                }
+                None => {
+                    // (#3035) A managed `config.endpoint` carries its limits:
+                    // one item is one dispatch with its own cap bucket.
+                    let item_bucket = item_cap_bucket(managed_endpoint.as_ref())?;
+                    let limits = LocalLimits::of(managed_endpoint.as_ref(), item_bucket.as_ref(), &step.id, &budget_caller);
+                    map_local_item(
+                        index, wire_model.as_ref(), item_system, &user, temperature, max_tokens,
+                        timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls, limits.as_ref(),
+                    )
+                }
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(session, execution, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
@@ -1822,7 +1894,7 @@ impl DispatchMapStepKind {
                             endpoint.is_some(),
                             wire_model.as_ref(),
                             &usage_endpoint,
-                            endpoint.as_ref().and_then(|ep| ep.named_id()),
+                            endpoint.as_ref().or(managed_endpoint.as_ref()).and_then(|ep| ep.named_id()),
                         )),
                     ),
                     &mut batched,
@@ -2208,6 +2280,7 @@ fn map_local_item(
     retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
     calls: &mut Vec<MapCall>,
+    limits: Option<&LocalLimits<'_>>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
     // (#1442) Cumulative dispatch wall-clock across every attempt, as the
@@ -2220,6 +2293,23 @@ fn map_local_item(
     let mut error_budget = retry_on_error;
     let mut error_retries_used = 0u32;
     loop {
+        // (#3035) A managed endpoint's window gate, then this item's dispatch
+        // cap reservation, before every attempt. Only a run stopped during a
+        // wait (or limits that cannot be used) ends the item, with nothing sent.
+        if let Some(l) = limits {
+            if let Err(e) = crate::budget::admit_endpoint(l.endpoint, l.caller) {
+                return MapItemResult {
+                    index,
+                    ok: false,
+                    content: String::new(),
+                    error: Some(format!("{e:#}")),
+                    served_model: None,
+                    wall_ms,
+                    retried: error_retries_used,
+                    ..MapItemResult::tokens_of(calls)
+                };
+            }
+        }
         let req = SingleShotRequest {
             base_url: None,
             model,
@@ -2246,6 +2336,12 @@ fn map_local_item(
             None => single_shot_chat(&req),
         };
         wall_ms += t0.elapsed().as_millis() as u64;
+        if let Some(l) = limits {
+            let spent = dispatch.as_ref().map_or(0, |r| {
+                crate::budget::conservative_spend(r.counts.total_tokens(), max_tokens, &format!("{system}{user}"))
+            });
+            crate::budget::settle_dispatch_live(l.bucket, spent, l.label, l.caller);
+        }
         match dispatch {
             Ok(reply) => {
                 calls.push(MapCall::from_reply(&reply));
@@ -2317,8 +2413,8 @@ fn map_local_item(
 
 /// (#1442) One HOSTED map item: the budgeted sibling of [`map_local_item`].
 /// Each attempt (including a `retry_on_empty` or `retry_on_error`, #1605,
-/// retry) first passes the endpoint's rolling-window budget and the SHARED
-/// per-step bucket (#2902 step 5: `crate::budget`), then settles its real cost
+/// retry) first passes the endpoint's rolling-window budget and the item's
+/// own token cap bucket (#3035: `crate::budget`), then settles its real cost
 /// against the cap after the call. No attempt is ever skipped or clamped for
 /// budget: a breach warns, and an endpoint `wait` holds the attempt until
 /// there is room. Only a run stopped during a wait (Ctrl-C, `mission abort`)
@@ -2326,7 +2422,7 @@ fn map_local_item(
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
-    bucket: &Arc<Mutex<RemoteBudget>>,
+    bucket: &Mutex<DispatchBudget>,
     endpoint: &darkmux_types::ModelEndpoint,
     model: &str,
     system: &str,
@@ -2337,7 +2433,7 @@ fn map_hosted_item(
     retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
     calls: &mut Vec<MapCall>,
-    step_label: &str,
+    dispatch_label: &str,
     caller: &crate::budget::BudgetCaller<'_>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
@@ -2386,14 +2482,12 @@ fn map_hosted_item(
         }
     };
     loop {
-        // (#2902 step 5) The endpoint's window, then the shared per-step cap
-        // (which RESERVES this attempt's cap, so concurrent siblings of one
-        // `bucket_group` see each other). The endpoint budget may warn or,
+        // (#2902 step 5, #3035) The endpoint's window, then the item's own
+        // token cap (which RESERVES this attempt's cap). The endpoint budget may warn or,
         // under `wait`, hold; only a run stopped during a wait (or limits
         // that cannot be used) returns here, and then nothing is sent.
         let admitted = crate::budget::admit_endpoint(endpoint, caller);
         if admitted.is_ok() {
-            crate::budget::admit_step(bucket, max_tokens);
         }
         if let Err(e) = admitted {
             return MapItemResult {
@@ -2426,12 +2520,10 @@ fn map_hosted_item(
         match dispatch {
             Ok(reply) => {
                 calls.push(MapCall::from_reply(&reply));
-                crate::budget::settle_step_live(
+                crate::budget::settle_dispatch_live(
                     bucket,
-                    clamped,
                     crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), clamped, &body),
-                    1,
-                    step_label,
+                    dispatch_label,
                     caller,
                 );
                 if reply.model.is_some() {
@@ -2461,7 +2553,7 @@ fn map_hosted_item(
             Err(e) => {
                 // Release the reservation — a dispatch-level error spent
                 // nothing (the pre-reserve accounting billed 0 here too).
-                crate::budget::settle_step_live(bucket, clamped, 0, 1, step_label, caller);
+                crate::budget::settle_dispatch_live(bucket, 0, dispatch_label, caller);
                 if error_budget == 0 {
                     return MapItemResult {
                         index,
@@ -2518,10 +2610,9 @@ impl StepKind for DispatchMapStepKind {
 
     /// (#1442 gate C3) LIVE per-item emission through the [`StepRunCtx`]
     /// channel when the scheduler supplies one (so a 30-item map lands items
-    /// on the graph page as they finish, never batched at wave-drain), and
-    /// the scheduler-supplied shared `bucket_group` bucket when the step
-    /// names one. A context with no emitter (a step run on its own) batches
-    /// every record into `StepOutcome.flow_records`.
+    /// on the graph page as they finish, never batched at wave-drain). A
+    /// context with no emitter (a step run on its own) batches every record
+    /// into `StepOutcome.flow_records`.
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
         self.run_map(step, task, input, ctx)?.into_outcome(&step.id)
     }
@@ -2530,8 +2621,8 @@ impl StepKind for DispatchMapStepKind {
     /// answers this kind can give, which the old `Option<Placement>` had to
     /// squeeze into one `None`:
     ///
-    /// - `endpoint` present → [`SeatClaim::RemoteEndpoint`]. Nothing local
-    ///   to load; the hosted cap is exactly the right bound for it.
+    /// - `endpoint` present → [`SeatClaim::UnmanagedEndpoint`]. Nothing local
+    ///   to load; the endpoint's own `limits.concurrent_calls` bounds it.
     /// - the collection is EMPTY → [`SeatClaim::NoModel`]. The
     ///   short-circuit: a guaranteed no-op needs no model (ported
     ///   generically from the review verify seat, #1442), and this claim is
@@ -2556,8 +2647,10 @@ impl StepKind for DispatchMapStepKind {
         };
         let call = &cfg.call;
         // (#2902 step 3) Same rule as `dispatch.single_shot`'s seat.
-        if !matches!(step_endpoint(call), Ok(None)) {
-            return SeatClaim::RemoteEndpoint;
+        match step_endpoint(call) {
+            Ok(None) => {}
+            Ok(Some(ep)) => return SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::of(&ep)),
+            Err(_) => return SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::unresolved()),
         }
         match resolve_map_collection(step, task, input) {
             Ok(items) if items.is_empty() => return SeatClaim::NoModel,
@@ -2747,7 +2840,7 @@ impl StepKind for ProceduralShellStepKind {
     /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied shell command and
     /// speaks to no model at all. Before this hook it said nothing, and
     /// silence classified it as a hosted-endpoint dispatch: a wave of these
-    /// queued one at a time behind `remote.concurrent_cap`, which a mission
+    /// queued one at a time behind a serial endpoint, which a mission
     /// launch sets to 1. They now run on the dispatch-free track under
     /// `runtime.dispatch_free_concurrency`.
     fn seat(
@@ -2905,7 +2998,7 @@ impl StepKind for ProceduralNoopStepKind {
     /// (#2394) [`SeatClaim::NoModel`] — this kind returns a fixed string and
     /// speaks to no model at all. Before this hook it said nothing, and
     /// silence classified it as a hosted-endpoint dispatch: a wave of these
-    /// queued one at a time behind `remote.concurrent_cap`, which a mission
+    /// queued one at a time behind a serial endpoint, which a mission
     /// launch sets to 1. They now run on the dispatch-free track under
     /// `runtime.dispatch_free_concurrency`.
     fn seat(
@@ -2951,6 +3044,7 @@ impl StepKind for ProceduralNoopStepKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -3002,7 +3096,7 @@ mod tests {
     /// materializes a real bus). None of `seat()`'s Tier 1 builtin
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
-        StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+        StepRunCtx::new(crate::test_run(), None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
     }
 
     // ── #2614 review: resume_precheck / message ordering ────────────────
@@ -3060,7 +3154,7 @@ mod tests {
     /// have helped, redispatches, and only then discovers resume was
     /// never possible on this role shape at all. `pr-reviewer` is a real
     /// built-in, tool-less role (same fixture
-    /// `dispatch_remote_refuses_resume_from_before_the_http_call` in
+    /// `dispatch_unmanaged_refuses_resume_from_before_the_http_call` in
     /// `dispatch_internal_tests.rs` uses) pinned at a `config_path`
     /// profiles registry whose only profile targets a REMOTE endpoint —
     /// no HTTP mock needed, since a correct refusal never dials it.
@@ -3434,7 +3528,6 @@ mod tests {
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
-            None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
         let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
@@ -3615,7 +3708,6 @@ mod tests {
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
-            None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
         let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
@@ -3667,7 +3759,7 @@ mod tests {
         // reaches `StepBookend`'s Drop for this kind; the only route is a
         // genuine panic between `StepBookend::new` (bookend creation) and
         // `bookend.close` (after the per-item loop). This test drives that
-        // panic through the SAME seam a real `bucket_group` sibling failure
+        // panic through the SAME seam a real sibling failure
         // would use in production: the `MapDispatchOverride` test seam
         // (`StepRunCtx::dispatch_override`, already exercised in
         // `scheduler.rs`'s `dispatch_override_intercepts_dispatch_map_items_
@@ -3699,7 +3791,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
-            None,
             Some(ovr),
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
@@ -3969,7 +4060,7 @@ mod tests {
     /// `procedural_shell_past_the_deadline_is_killed_and_errors_with_the_bound`,
     /// `procedural_shell_exports_the_running_darkmux_binarys_path`,
     /// `procedural_shell_valid_ambient_cwd_still_works_with_no_config`, and
-    /// `scheduler::tests::dispatch_free_siblings_do_not_serialize_behind_the_remote_cap`
+    /// `scheduler::tests::dispatch_free_siblings_do_not_serialize_behind_a_serial_endpoint`
     /// (which runs shell steps on scheduler worker THREADS — same process,
     /// same global). Re-run that mutation after adding any
     /// `procedural.shell` test with no `cwd`/`workdir`.
@@ -4526,9 +4617,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_map_hosted_claims_a_remote_endpoint() {
-        // An endpoint-bearing (remote) map loads nothing locally — and says
-        // REMOTE, which is what `remote.concurrent_cap` is for.
+    fn dispatch_map_hosted_claims_an_unmanaged_endpoint() {
+        // A map on an unmanaged endpoint loads nothing locally and claims the
+        // endpoint, which `limits.concurrent_calls` bounds.
         let s = map_step(json!({
             "model": "gpt-5.1",
             "user_template": "check {item}",
@@ -4538,7 +4629,7 @@ mod tests {
         }));
         assert!(matches!(
             DispatchMapStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx()),
-            SeatClaim::RemoteEndpoint
+            SeatClaim::UnmanagedEndpoint(_)
         ));
     }
 
@@ -4556,7 +4647,7 @@ mod tests {
         darkmux_types::ModelEndpoint { url: Some("http://127.0.0.1:1".to_string()), ..Default::default() }
     }
 
-    /// (#2902 step 5) A spent per-step cap under `warn` never skips or
+    /// (#2902 step 5, #3035) A spent dispatch cap under `warn` never skips or
     /// clamps a map item: the call fires with the FULL requested cap, and
     /// the item is ok. (Pre-4.0 this item was skipped with a named reason,
     /// and a nearly-spent bucket clamped the cap.)
@@ -4564,11 +4655,10 @@ mod tests {
     #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_spent_step_cap_under_warn_never_skips_or_clamps_an_item() {
         let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the step budget's `budget.warn` goes to the real flow sink otherwise
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(1_000), darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(Some(1_000), darkmux_types::BudgetPolicy::Warn)));
         {
             let mut b = bucket.lock().unwrap();
-            b.admit_reserve(0);
-            b.settle(0, 5_000, 1);
+                        b.settle(5_000);
             assert!(b.exhausted());
         }
         let sent = Arc::new(Mutex::new(Vec::<u32>::new()));
@@ -4588,17 +4678,17 @@ mod tests {
         assert!(out.ok, "{out:?}");
         assert_eq!(out.content, "answer");
         assert_eq!(*sent.lock().unwrap(), vec![4_096], "fired once, with the full cap");
-        assert_eq!(bucket.lock().unwrap().used(), 5_700, "settled with the real spend");
+        assert_eq!(bucket.lock().unwrap().settled(), 5_700, "settled with the real spend");
     }
 
-    /// The step cap settles with the amount the call's usage record carries:
+    /// The dispatch cap settles with the amount the call's usage record carries:
     /// a reply that reported a split and no total settles prompt +
     /// completion, as its record's `total_tokens` does, not the whole
     /// granted cap (which is only for a reply that reported nothing). The
     /// item's own total is the same number.
     #[test]
     fn a_map_call_settles_the_amount_its_usage_record_carries() {
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             Ok(crate::single_shot::SingleShotReply {
                 content: "answer".into(),
@@ -4613,7 +4703,7 @@ mod tests {
         );
         let record = serde_json::to_value(map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None)).unwrap();
         assert_eq!(record["total_tokens"], 42);
-        assert_eq!(bucket.lock().unwrap().used(), 42, "settled with the record's amount, not the 4096 cap");
+        assert_eq!(bucket.lock().unwrap().settled(), 42, "settled with the record's amount, not the 4096 cap");
         assert_eq!(out.total_tokens, Some(42));
     }
 
@@ -4623,7 +4713,7 @@ mod tests {
     /// that reported nothing, and its record carries no total.
     #[test]
     fn a_map_call_with_no_prompt_count_settles_the_cap_plus_its_prompt() {
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             Ok(crate::single_shot::SingleShotReply {
                 content: "answer".into(),
@@ -4642,7 +4732,7 @@ mod tests {
         // `max_tokens` bounds only the completion: the prompt the request
         // carried is charged too, by its estimate, never 0.
         let prompt = darkmux_trajectory::estimate_tokens("sys") + darkmux_trajectory::estimate_tokens("user");
-        let used = bucket.lock().unwrap().used();
+        let used = bucket.lock().unwrap().settled();
         assert!(used >= 4_096 + prompt as u64, "spend unknown: the cap plus the prompt estimate, got {used}");
         assert_eq!(out.total_tokens, None);
     }
@@ -4665,7 +4755,7 @@ mod tests {
     /// empty success.
     #[test]
     fn an_errored_then_empty_item_reports_the_error_not_a_fabricated_success() {
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
         let calls = Arc::new(Mutex::new(0usize));
         let seen = Arc::clone(&calls);
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
@@ -4720,7 +4810,7 @@ mod tests {
             *seen.lock().unwrap() += 1;
             anyhow::bail!("must not be called")
         });
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
         let caller = crate::budget::tests::mission_caller("m-aborted");
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
@@ -4753,7 +4843,7 @@ mod tests {
                 counts: darkmux_trajectory::UsageCounts { total: Some(12), ..Default::default() },
             })
         });
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(10), darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(Some(10), darkmux_types::BudgetPolicy::Warn)));
         let ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({ "url": "https://h.example/v1" })).unwrap();
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
@@ -4764,7 +4854,7 @@ mod tests {
         assert!(out.ok, "{out:?}");
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
-        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(12), Some(10)), "{w}");
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("dispatch"), Some(12), Some(10)), "{w}");
     }
 
     /// (#2902 step 5 review C1) The endpoint gate fires on the map path: a
@@ -4779,7 +4869,7 @@ mod tests {
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
             })
         });
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
                 0, &bucket, &budgeted_ep("warn"), "gpt-5.1", "sys", "user", 1_000, 1, 0, 0, Some(&ovr),
@@ -4887,13 +4977,18 @@ mod tests {
     /// A registry naming endpoint `azure` at `url` (no limits), returning
     /// the tempdir guard and the registry path.
     fn azure_registry(url: &str) -> (tempfile::TempDir, String) {
+        azure_registry_with(url, json!(null))
+    }
+
+    /// [`azure_registry`] with `limits` on the endpoint (`null`: none).
+    fn azure_registry_with(url: &str, limits: serde_json::Value) -> (tempfile::TempDir, String) {
         let reg = tempfile::TempDir::new().unwrap();
         let pf = reg.path().join("profiles.json");
         std::fs::write(
             &pf,
             json!({
                 "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
-                "endpoints": {"azure": {"url": url}},
+                "endpoints": {"azure": {"url": url, "limits": limits}},
             })
             .to_string(),
         )
@@ -4905,25 +5000,24 @@ mod tests {
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted
     /// `dispatch.single_shot` against a NAMED endpoint stamps that id on its
     /// usage record (what the endpoint's window sums by), and settles the
-    /// REPLY's total into the per-step bucket: a 10-token cap and a
-    /// 12-token reply warn with `spent: 12`. Settling 0 (or the reservation)
-    /// would leave the bucket silent.
+    /// REPLY's total into the dispatch's token cap: a 10-token
+    /// `tokens_per_dispatch` and a 12-token reply warn with `spent: 12`.
+    /// Settling 0 (or the reservation) would leave the bucket silent.
     #[test]
-    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
+    #[serial_test::serial]
     fn a_named_hosted_single_shot_stamps_its_endpoint_id_and_settles_the_reply() {
         let server = httpmock::MockServer::start();
         let mock = usage_mock(&server, true);
-        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let (_reg, pf) =
+            azure_registry_with(&format!("{}/v1", server.base_url()), json!({"tokens_per_dispatch": 10}));
         let s = step(
             "s1",
             "dispatch.single_shot",
             json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
-        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "10")], || {
-            crate::budget::with_test_env(env.clone(), || {
-                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
-            })
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         mock.assert_hits(1);
@@ -4932,30 +5026,145 @@ mod tests {
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
-        assert_eq!(w["scope"], "step");
+        assert_eq!(w["scope"], "dispatch");
         assert_eq!(w["spent"], 12, "the reply's total, not the 5-token grant: {w}");
         assert_eq!(w["limit"], 10);
     }
 
-    /// (#2902 step 5 review, zero doctrine) A per-step cap of 0 is NO cap:
-    /// a 12-token reply against `0` warns nothing and reports no budget,
-    /// where a real cap of 10 warns (the test above).
+    /// A registry naming a MANAGED endpoint `lms` with `limits`, returning the
+    /// tempdir guard and the registry path.
+    fn lms_registry_with(limits: serde_json::Value) -> (tempfile::TempDir, String) {
+        let reg = tempfile::TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            json!({
+                "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                "endpoints": {"lms": {"managed": "lmstudio", "limits": limits}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let path = pf.to_str().unwrap().to_string();
+        (reg, path)
+    }
+
+    /// (#3035) A LOCAL `dispatch.single_shot` whose `config.endpoint` names a
+    /// MANAGED endpoint answers to its limits: a 10-token `tokens_per_dispatch`
+    /// and a 12-token reply warn with `spent: 12`, and the usage record names
+    /// the endpoint's id.
     #[test]
-    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
-    fn a_zero_step_cap_is_no_cap_and_never_warns() {
+    #[serial_test::serial]
+    fn a_managed_endpoint_step_settles_its_dispatch_cap_and_stamps_its_id() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let (_reg, pf) = lms_registry_with(json!({"tokens_per_dispatch": 10}));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "m", "n_ctx": 1, "user": "hi", "endpoint": "lms", "config_path": pf, "max_tokens": 5 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let url = server.base_url();
+        let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+        unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", &url) };
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+        let out = out.expect("the mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "single_shot (managed)");
+        assert_eq!(rec["payload"]["endpoint_id"], "lms", "{rec}");
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert_eq!((w["spent"].as_u64(), w["limit"].as_u64()), (Some(12), Some(10)), "{w}");
+    }
+
+    /// (#3035, #1442 C4) A managed step call whose reply reports no usage is
+    /// charged the granted cap (5) plus its prompt, so a 10-token cap warns.
+    #[test]
+    #[serial_test::serial]
+    fn a_managed_endpoint_step_that_reports_no_usage_is_charged_the_granted_cap() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, false);
+        let (_reg, pf) = lms_registry_with(json!({"tokens_per_dispatch": 10}));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "m", "n_ctx": 1, "user": "hi", "endpoint": "lms", "config_path": pf, "max_tokens": 50 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+        unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", server.base_url()) };
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+        out.expect("the mock answers");
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert!(w["spent"].as_u64().unwrap() >= 50, "{w}");
+    }
+
+    /// (#3035) A local `dispatch.map` on a managed endpoint: each item is one
+    /// dispatch with its own cap, so two 12-token replies against a 10-token
+    /// cap warn twice (once per item), never once for the step.
+    #[test]
+    #[serial_test::serial]
+    fn a_managed_endpoint_map_gives_each_item_its_own_dispatch_cap() {
         let server = httpmock::MockServer::start();
         let _mock = usage_mock(&server, true);
-        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let (_reg, pf) = lms_registry_with(json!({"tokens_per_dispatch": 10}));
+        let s = map_step(json!({
+            "model": "m", "n_ctx": 1, "user_template": "check {item}", "collection": ["a", "b"],
+            "endpoint": "lms", "config_path": pf, "max_tokens": 5,
+        }));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+        unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", server.base_url()) };
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+        let results: Vec<MapItemResult> = serde_json::from_str(&out.expect("the mock answers").output).unwrap();
+        assert!(results.iter().all(|r| r.ok), "{results:?}");
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn; 2], "one warning per item");
+    }
+
+    /// (#2902 step 5 review, zero doctrine) A per-dispatch cap of 0 is NO
+    /// cap: a 12-token reply against `0` warns nothing and reports no budget,
+    /// where a real cap of 10 warns (the test above).
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_dispatch_cap_is_no_cap_and_never_warns() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, true);
+        let (_reg, pf) =
+            azure_registry_with(&format!("{}/v1", server.base_url()), json!({"tokens_per_dispatch": 0}));
         let s = step(
             "s1",
             "dispatch.single_shot",
             json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
-        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
-            crate::budget::with_test_env(env.clone(), || {
-                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
-            })
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         assert!(env.actions().is_empty(), "no cap, no warning: {:?}", env.actions());
@@ -4964,7 +5173,7 @@ mod tests {
             .iter()
             .find(|r| r["action"] == "step.result" && r["payload"].get("max_tokens_sent").is_some())
             .unwrap_or_else(|| panic!("the step's telemetry record: {recs:#?}"));
-        assert!(step_rec["payload"].get("remote_max_tokens_per_execution").is_none(), "no cap is reported: {step_rec}");
+        assert!(step_rec["payload"].get("tokens_per_dispatch").is_none(), "no cap is reported: {step_rec}");
     }
 
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted `dispatch.map`
@@ -5601,7 +5810,7 @@ mod tests {
         }
     }
 
-    /// (#2902 step 5) A per-step cap of 0 under the default `warn` skips
+    /// (#2902 step 5) A dispatch cap of 0 under the default `warn` skips
     /// nothing: every hosted item is dispatched (counted through the
     /// override), each is ok. Pre-4.0 every item was skipped.
     #[test]
@@ -5618,11 +5827,11 @@ mod tests {
             "model": "gpt-5.1",
             "user_template": "check {item}",
             "collection": ["a", "b", "c"],
-            "endpoint": { "url": "https://example.com" },
+            "endpoint": { "url": "https://example.com", "limits": { "tokens_per_dispatch": 0 } },
         }));
-        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap()
-        });
+        let out = DispatchMapStepKind
+            .run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+            .unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 3);
@@ -5654,12 +5863,13 @@ mod tests {
         }
     }
 
-    /// (#2902 step 5) Item 1 spends the whole 100-token per-step cap;
-    /// under the default `warn`, items 2 and 3 are still dispatched and ok,
-    /// each reporting its real usage.
+    /// (#3035) Each item is one dispatch with its own 100-token cap. Every
+    /// item spends all of it, so each warns once (three warnings, not one
+    /// shared allowance), and under the default `warn` all three are still
+    /// dispatched and ok, each reporting its real usage.
     #[test]
     #[serial_test::serial]
-    fn dispatch_map_a_step_cap_reached_mid_collection_keeps_going_under_warn() {
+    fn dispatch_map_each_item_has_its_own_dispatch_cap_and_keeps_going_under_warn() {
         let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the step budget's `budget.warn` goes to the real flow sink otherwise
         clear_hosted_override();
         install_hosted_override(|_req| Ok(hosted_reply(Some(100))));
@@ -5667,9 +5877,10 @@ mod tests {
             "model": "gpt-5.1",
             "user_template": "check {item}",
             "collection": ["a", "b", "c"],
-            "endpoint": { "url": "https://example.com" },
+            "endpoint": { "url": "https://example.com", "limits": { "tokens_per_dispatch": 100 } },
         }));
-        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "100")], || {
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = crate::budget::with_test_env(env.clone(), || {
             DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap()
         });
         clear_hosted_override();
@@ -5679,6 +5890,11 @@ mod tests {
             assert!(r.ok, "item {} dispatched: {r:?}", r.index);
             assert_eq!(r.total_tokens, Some(100));
         }
+        assert_eq!(
+            env.actions(),
+            vec![darkmux_flow::FlowAction::BudgetWarn; 3],
+            "one warning per item: each item is its own dispatch with its own cap"
+        );
     }
 
     #[test]
@@ -5689,11 +5905,6 @@ mod tests {
         // result array never fabricates a number the endpoint didn't send.
         // (The bucket still charges the conservative clamped grant so an
         // omitting endpoint can't run the whole collection off the meter.)
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_hosted_override(|_req| Ok(hosted_reply(None)));
         let s = map_step(json!({
@@ -5711,12 +5922,6 @@ mod tests {
             results.iter().all(|r| r.total_tokens.is_none()),
             "no fabricated token count when the endpoint omitted usage"
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     // ── (#1442) dispatch.map retry_on_empty ─────────────────────────────
@@ -5745,11 +5950,6 @@ mod tests {
         // First attempt returns empty (but bills 50), the retry returns real
         // content (bills 70). retry_on_empty=1 → the item ends ok with the
         // non-empty content and tokens SUMMED across both attempts.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_scripted_hosted(vec![("", Some(50)), ("flag", Some(70))]);
         let s = map_step(json!({
@@ -5766,12 +5966,6 @@ mod tests {
         assert!(results[0].ok, "the retry produced usable content");
         assert_eq!(results[0].content, "flag");
         assert_eq!(results[0].total_tokens, Some(120), "tokens billed across BOTH attempts");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -5780,11 +5974,6 @@ mod tests {
         // Both attempts empty (bill 50 + 60). retry_on_empty=1 exhausts, and
         // the item ends ok:true with EMPTY content (dispatched, no usable
         // result) and the full spend billed — never a flag from nothing.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_scripted_hosted(vec![("", Some(50)), ("   ", Some(60))]);
         let s = map_step(json!({
@@ -5801,12 +5990,6 @@ mod tests {
         assert!(results[0].ok, "it dispatched — the empty content is a real, honest zero");
         assert!(results[0].content.is_empty(), "no usable content after the retries");
         assert_eq!(results[0].total_tokens, Some(110), "every attempt's spend billed");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -5814,11 +5997,6 @@ mod tests {
     fn dispatch_map_retry_on_empty_default_off_accepts_the_first_empty_reply() {
         // With no retry_on_empty configured (default 0), an empty reply is
         // accepted as-is on the FIRST attempt — one call, tokens from it only.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         // Second entry would be non-empty — if a retry (wrongly) fired we'd
         // see "would-be-retry" content and 90 total tokens instead.
@@ -5836,12 +6014,6 @@ mod tests {
         assert!(results[0].ok);
         assert!(results[0].content.is_empty(), "default off does not retry the empty reply");
         assert_eq!(results[0].total_tokens, Some(40), "exactly one call was made");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     // ── (#1605) dispatch.map retry_on_error ──────────────────────────────
@@ -5887,11 +6059,6 @@ mod tests {
         // First attempt errors (a transient blip); retry_on_error=1 fires
         // ONE retry, which succeeds. The item ends ok:true and exactly TWO
         // calls fired — not zero, not more than the bounded budget.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         let calls = install_scripted_hosted_outcomes(vec![
             Err(anyhow!("transient: connection reset")),
@@ -5912,12 +6079,6 @@ mod tests {
         assert_eq!(results[0].content, "flag");
         assert_eq!(results[0].retried, 1, "exactly one error-retry was consumed");
         assert_eq!(calls.get(), 2, "exactly two calls fired: the failed attempt + the one retry");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -5926,11 +6087,6 @@ mod tests {
         // Every attempt errors. retry_on_error=1 permits exactly ONE retry —
         // two calls total, then the item isolates as ok:false carrying the
         // LAST attempt's error. A THIRD call would mean the bound leaked.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         let calls = install_scripted_hosted_outcomes(vec![
             Err(anyhow!("first failure")),
@@ -5956,12 +6112,6 @@ mod tests {
             results[0].error
         );
         assert_eq!(calls.get(), 2, "bounded to exactly one retry — never a third call");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -5971,11 +6121,6 @@ mod tests {
         // policy, preserved for every caller that doesn't opt in), a single
         // dispatch error isolates on the FIRST attempt — exactly one call,
         // matching pre-#1605 behavior byte-for-byte.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         let calls = install_scripted_hosted_outcomes(vec![
             Err(anyhow!("boom")),
@@ -5994,12 +6139,6 @@ mod tests {
         assert!(!results[0].ok);
         assert_eq!(results[0].retried, 0, "no retry budget — never retried");
         assert_eq!(calls.get(), 1, "exactly one call — the historical no-retry-on-error behavior");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -6079,11 +6218,6 @@ mod tests {
     #[test]
     #[serial_test::serial] // mutates the remote-budget env var
     fn dispatch_map_hosted_telemetry_reports_its_seat_as_remote() {
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_hosted_delayed(0, None, Some(42));
         let s = map_step(json!({
@@ -6094,12 +6228,6 @@ mod tests {
         }));
         let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
         clear_hosted_override();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
         let out = out.expect("the overridden hosted transport must not fail the step");
 
         let telemetry: Vec<&darkmux_flow::FlowRecord> =
@@ -6189,11 +6317,6 @@ mod tests {
         //
         // Contract violations recur — this is the second (#1272 was the
         // first) — so this asserts the SHAPE, not one field.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_hosted_delayed(1, None, Some(42));
         let s = map_step(json!({
@@ -6209,7 +6332,6 @@ mod tests {
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
-            None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
         DispatchMapStepKind
@@ -6217,12 +6339,6 @@ mod tests {
             .unwrap();
         drop(ctx);
         clear_hosted_override();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
 
         let emitted: Vec<darkmux_flow::FlowRecord> = rx
             .into_iter()
@@ -6323,7 +6439,6 @@ mod tests {
         let ctx = StepRunCtx::new(
             crate::test_run(),
             Some(tx),
-            None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
@@ -6461,7 +6576,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
-            None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
@@ -6621,7 +6735,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a"],
         }));
-        let ctx = StepRunCtx::new(crate::test_run(), None, None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let ctx = StepRunCtx::new(crate::test_run(), None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
         DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
 
         // (2) — see doc above: past one full beat interval, a still-ticking
@@ -6788,7 +6902,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
-            None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
@@ -6968,11 +7081,6 @@ mod tests {
         // real (seam-controlled) ~15ms — the HOSTED item must surface BOTH the
         // served model verbatim and a nonzero cumulative wall, in its result,
         // its per-item flow record, AND (wall) the step aggregate's sum.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_hosted_delayed(15, Some("served-model-x"), Some(10));
         let s = map_step(json!({
@@ -7006,12 +7114,6 @@ mod tests {
             results[0].wall_ms,
             "the aggregate's total_wall_ms is the sum of the per-item walls"
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -7020,11 +7122,6 @@ mod tests {
         // An endpoint that omits `model` yields an honest `None` served_model —
         // never a fabricated empty string and never the requested model echoed
         // back as if served.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         install_hosted_delayed(0, None, Some(10));
         let s = map_step(json!({
@@ -7047,12 +7144,6 @@ mod tests {
             Some("gpt-5.1"),
             "the requested model is never echoed into served_model"
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     #[test]
@@ -7097,11 +7188,6 @@ mod tests {
         // proves two calls ran; `wall_ms` is their CUMULATIVE sum (>= the 40ms
         // floor of two 20ms sleeps, minus <2ms of millis truncation) — the same
         // per-attempt accumulation `total_tokens` already uses.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "500000");
-        }
         clear_hosted_override();
         // A scripted seam that also sleeps 20ms per call: empty (bills 50),
         // then content (bills 70).
@@ -7139,85 +7225,57 @@ mod tests {
             results[0].wall_ms
         );
         assert_eq!(results[0].served_model.as_deref(), Some("served-r"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     // ── (#1412, #2902 step 5) dispatch.single_shot hosted-arm budgets ───
 
-    fn with_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
-        let prev: Vec<(String, Option<String>)> =
-            vars.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
-        for (k, v) in vars {
-            unsafe { std::env::set_var(k, v) };
-        }
-        let out = f();
-        for (k, v) in prev {
-            unsafe {
-                match v {
-                    Some(v) => std::env::set_var(&k, v),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        out
-    }
-
-    /// (#2902 step 5) A per-step cap of 0 is no cap (the zero doctrine:
+    /// (#2902 step 5) A per-dispatch cap of 0 is no cap (the zero doctrine:
     /// a `0` on a darkmux bound means unbounded): the hosted call is
     /// ATTEMPTED (proven by the hosted arm's own error context against an
     /// unroutable port), and the error is the network's, never a budget
     /// refusal. Pre-4.0, 0 refused.
     #[test]
     #[serial_test::serial]
-    fn dispatch_single_shot_hosted_arm_under_warn_calls_even_with_a_zero_step_cap() {
+    fn dispatch_single_shot_hosted_arm_under_warn_calls_even_with_a_zero_dispatch_cap() {
         let s = step(
             "s1",
             "dispatch.single_shot",
-            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1" }, "timeout_seconds": 1 }),
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1", "limits": { "tokens_per_dispatch": 0 } }, "timeout_seconds": 1 }),
         );
-        let msg = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
-            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err())
-        });
+        let msg = format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err());
         assert!(msg.contains("dispatch.single_shot (hosted)"), "the call was attempted: {msg}");
         assert!(!msg.contains("budget"), "no budget refusal: {msg}");
     }
 
-    /// (#2902 step 5, operator 2026-09-27) The per-step cap has no `wait`:
-    /// a step whose policy says `wait` is refused before anything is sent,
-    /// naming the value and the valid ones, never run as some other policy.
+    /// (#3035) A `wait` policy needs a rolling window: a dispatch's own cap has
+    /// nothing that frees room. A step whose inline endpoint says `wait` with
+    /// only `tokens_per_dispatch` is refused before anything is sent, naming
+    /// the policy and the window, never run as some other policy.
     #[test]
     #[serial_test::serial]
-    fn dispatch_single_shot_refuses_a_step_policy_of_wait_before_sending() {
+    fn dispatch_single_shot_refuses_a_wait_policy_with_no_window_before_sending() {
         let s = step(
             "s1",
             "dispatch.single_shot",
-            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1" }, "timeout_seconds": 1 }),
+            json!({
+                "model": "gpt-5.1", "user": "hi", "timeout_seconds": 1,
+                "endpoint": { "url": "http://127.0.0.1:1", "limits": { "tokens_per_dispatch": 5, "policy": "wait" } },
+            }),
         );
-        let msg = with_env(
-            &[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0"), ("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "wait")],
-            || format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err()),
+        let msg = format!(
+            "{:#}",
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err()
         );
-        assert!(msg.contains("`wait`") && msg.contains("remote.step_budget_policy"), "{msg}");
-        assert!(msg.contains("off") && msg.contains("warn"), "{msg}");
+        assert!(msg.contains("`wait`") && msg.contains("window"), "{msg}");
         assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
     }
 
     #[test]
     #[serial_test::serial]
-    fn dispatch_single_shot_local_arm_is_unmetered_by_the_remote_budget() {
-        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
+    fn dispatch_single_shot_local_arm_names_no_endpoint_and_so_meters_nothing() {
         let url_key = "DARKMUX_LMSTUDIO_URL";
-        let prev_budget = std::env::var(budget_key).ok();
         let prev_url = std::env::var(url_key).ok();
         unsafe {
-            // A spent per-step cap. If the LOCAL dialect were (wrongly)
-            // gated by it, the error would name the budget. It must not.
-            std::env::set_var(budget_key, "0");
             std::env::set_var(url_key, "http://127.0.0.1:1");
         }
 
@@ -7232,7 +7290,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             !msg.contains("budget"),
-            "the LOCAL dialect must never be gated by DARKMUX_REMOTE_MAX_TOKENS_PER_STEP: {msg}"
+            "a local step that names no endpoint has no limits to be gated by: {msg}"
         );
         assert!(
             msg.contains("dispatch.single_shot (local)"),
@@ -7240,10 +7298,6 @@ mod tests {
         );
 
         unsafe {
-            match prev_budget {
-                Some(v) => std::env::set_var(budget_key, v),
-                None => std::env::remove_var(budget_key),
-            }
             match prev_url {
                 Some(v) => std::env::set_var(url_key, v),
                 None => std::env::remove_var(url_key),
@@ -7314,7 +7368,7 @@ mod tests {
             resolve_local_placement_inner_with("coder", name, mapped.map(str::to_string), Some(cfg), "step:s")
                 .map(|p| p.model_key)
                 .map_err(|e| match e {
-                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::Unmanaged(_) => "unmanaged".to_string(),
                     PlacementMiss::ResolutionFailed(r) => r,
                 })
         };
@@ -7356,7 +7410,7 @@ mod tests {
             resolve_local_placement_inner_with("coder", name, None, Some(cfg), "step:s")
                 .map(|p| p.model_key)
                 .map_err(|e| match e {
-                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::Unmanaged(_) => "unmanaged".to_string(),
                     PlacementMiss::ResolutionFailed(r) => r,
                 })
         };
@@ -7392,14 +7446,14 @@ mod tests {
             resolve_local_placement_inner_with("coder", Some(name), None, Some(cfg), "step:s")
                 .map(|p| p.model_key)
                 .map_err(|e| match e {
-                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::Unmanaged(_) => "unmanaged".to_string(),
                     PlacementMiss::ResolutionFailed(r) => r,
                 })
         };
         assert_eq!(pick("local"), Ok("m-local".into()));
-        assert_eq!(pick("named"), Err("remote".into()));
+        assert_eq!(pick("named"), Err("unmanaged".into()));
         let err = pick("dangling").unwrap_err();
-        assert!(err.contains("nope") && err != "remote", "{err}");
+        assert!(err.contains("nope") && err != "unmanaged", "{err}");
     }
 
     // ─── (#2902 step 1a) usage conformance: one record per model call ──
@@ -7543,7 +7597,7 @@ mod tests {
     ) -> (usize, Vec<serde_json::Value>) {
         let s = map_step(config);
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
         let _ = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
         drop(ctx);
         let recs: Vec<serde_json::Value> = rx

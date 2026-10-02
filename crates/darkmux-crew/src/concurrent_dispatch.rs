@@ -6,9 +6,9 @@
 //! the RAM-safety mechanism a batch of ready-to-run local dispatches needs.
 //! This module does not reinvent that arithmetic; it adds the missing
 //! EXECUTION half: given a batch of jobs (each either bound to a local
-//! model placement or unbound/remote), run them for real, honoring the
-//! wave partitioning for local jobs and a separate concurrency cap for
-//! remote ones.
+//! model placement or a call to an unmanaged endpoint), run them for real,
+//! honoring the wave partitioning for local jobs and each endpoint's own
+//! `limits.concurrent_calls` for the others.
 //!
 //! # Planning vs execution
 //!
@@ -38,7 +38,7 @@
 //! than letting the panic vanish and strand the job's Step `Running` — see
 //! `run_bounded`'s reconcile step.
 //!
-//! # Local waves vs the remote batch
+//! # Local waves vs the endpoint batches
 //!
 //! Local jobs execute wave-by-wave: each wave IS the gestalt-computed "safe
 //! to co-reside" set. Within a wave, jobs are further grouped by resident
@@ -46,12 +46,14 @@
 //! interleaved with its sibling identifiers (see the "Open item" section
 //! below, now CLOSED) — but capped, per identifier, at that resident
 //! instance's own declared concurrency (#2772). Only once every job in a
-//! wave has finished does the executor move to the next wave. Remote/hosted
-//! jobs aren't RAM-bound (the #1177/#1260 residency-free design — a remote
-//! seat consumes zero local pool), so they run in their OWN
-//! `remote_cap`-bounded batch, **interleaved with the local wave track
-//! rather than blocked behind it**: both tracks are spawned as sibling
-//! scoped threads inside one outer `thread::scope`, so their wall-clock
+//! wave has finished does the executor move to the next wave. Calls to an
+//! endpoint darkmux does not manage aren't RAM-bound (the #1177/#1260
+//! residency-free design: such a seat consumes zero local pool), so each
+//! endpoint's calls run in their OWN batch, bounded by that endpoint's
+//! `limits.concurrent_calls` (one at a time when it declares none, #3035),
+//! **interleaved with the local wave track and with every other endpoint
+//! rather than blocked behind them**: every track is spawned as a sibling
+//! scoped thread inside one outer `thread::scope`, so their wall-clock
 //! windows genuinely overlap.
 //!
 //! # Flow-record ordering under concurrency
@@ -98,7 +100,7 @@
 //! deep per resident instance instead of firing at once.
 
 use anyhow::{anyhow, bail, Result};
-use crate::step_kinds::SeatClaim;
+use crate::step_kinds::{EndpointSlot, SeatClaim};
 use darkmux_flow::FlowRecord;
 use darkmux_gestalt::{
     is_darkmux_owned, plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Deadline,
@@ -107,7 +109,7 @@ use darkmux_gestalt::{
 };
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_types::residency_lease;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -309,17 +311,20 @@ pub fn lms_host_factory() -> Box<dyn ModelHost> {
     Box::new(LmsHost::new())
 }
 
-/// Run `jobs` to completion on THREE independent, genuinely interleaved
-/// tracks (#2394), one per seat class:
+/// Run `jobs` to completion on independent, genuinely interleaved tracks
+/// (#2394), one per seat class:
 ///
 /// - [`SeatClaim::LocalModel`] — gestalt's co-residency wave packing.
-/// - [`SeatClaim::RemoteEndpoint`] — a `remote_cap`-bounded concurrent
-///   batch. Also where [`SeatClaim::LocalModelUnresolved`] lands: #1509's
-///   fail-open behavior, unchanged, but the CALLER has already said so out
-///   loud (see `scheduler::run_step_graph`'s classification block).
+/// - [`SeatClaim::UnmanagedEndpoint`] — one batch PER ENDPOINT, each bounded
+///   by its own `limits.concurrent_calls` (one at a time when it declares
+///   none, #3035; the once-per-process note says so). Also where
+///   [`SeatClaim::LocalModelUnresolved`] lands, as one batch of its own run
+///   one at a time: #1509's fail-open behavior, unchanged, but the CALLER
+///   has already said so out loud (see `scheduler::run_step_graph`'s
+///   classification block).
 /// - [`SeatClaim::NoModel`] — a `dispatch_free_cap`-bounded concurrent
 ///   batch of its OWN. A step that speaks to no model has no business
-///   queueing behind a cap that exists to protect a hosted endpoint's rate
+///   queueing behind a limit that exists to protect an endpoint's rate
 ///   limit; #2394 is what that cost live.
 ///
 /// Returns one entry per job, in COMPLETION order (not input order —
@@ -338,10 +343,9 @@ pub fn run_bounded<T: Send + 'static>(
     jobs: Vec<QueuedJob<T>>,
     facts: &Facts,
     est: &(dyn FootprintEstimator + Sync),
-    remote_cap: usize,
     // (#2394) The concurrency ceiling for `SeatClaim::NoModel` jobs — the
     // caller-resolved `config_access::dispatch_free_concurrency()` (which
-    // is itself never below 1). For both caps `0` means unbounded
+    // is itself never below 1). `0` means unbounded
     // (`config_access::jobs_at_once`), the darkmux bound convention.
     dispatch_free_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
@@ -355,7 +359,8 @@ pub fn run_bounded<T: Send + 'static>(
     // decides — only how this executor re-associates its own output.
     let mut local_by_seat: HashMap<String, (usize, DispatchJob<T>)> = HashMap::new();
     let mut placements: Vec<Placement> = Vec::new();
-    let mut remote_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
+    // (#3035) One batch per unmanaged endpoint, keyed by the endpoint.
+    let mut endpoint_jobs: BTreeMap<String, EndpointBatch<T>> = BTreeMap::new();
     // (#2394) The dispatch-free track. Its own vec, its own cap, its own
     // sibling thread — never merged into `remote_jobs`.
     let mut dispatch_free_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
@@ -378,11 +383,15 @@ pub fn run_bounded<T: Send + 'static>(
                 local_by_seat.insert(placement.seat.clone(), (q.index, q.job));
                 placements.push(placement);
             }
-            SeatClaim::RemoteEndpoint => remote_jobs.push((q.index, q.job)),
+            SeatClaim::UnmanagedEndpoint(slot) => endpoint_jobs.entry(slot.key().to_string()).or_insert_with(|| EndpointBatch::new(slot)).jobs.push((q.index, q.job)),
             // #1509's fail-open, unchanged: a local seat we could not place
             // still runs, just without a wave load or a residency lease. The
             // caller has already surfaced it loudly by the time it gets here.
-            SeatClaim::LocalModelUnresolved { .. } => remote_jobs.push((q.index, q.job)),
+            // One at a time, alongside no endpoint's batch.
+            SeatClaim::LocalModelUnresolved { .. } => {
+                let slot = EndpointSlot::unresolved_local();
+                endpoint_jobs.entry(slot.key().to_string()).or_insert_with(|| EndpointBatch::new(slot)).jobs.push((q.index, q.job))
+            }
             SeatClaim::NoModel => dispatch_free_jobs.push((q.index, q.job)),
         }
     }
@@ -401,8 +410,15 @@ pub fn run_bounded<T: Send + 'static>(
                 run_local_waves(schedule, local_by_seat, &results, est, host_factory, facts.utility_binding.as_deref())
             })
         });
-        let remote_track = (!remote_jobs.is_empty())
-            .then(|| spawn_scoped_named(scope, || run_capped_batches(remote_jobs, remote_cap, &results)));
+        let endpoint_tracks: Vec<_> = endpoint_jobs
+            .into_values()
+            .map(|batch| {
+                note_serial_endpoint(&batch.slot, batch.jobs.len());
+                let width = batch.slot.width();
+                let results = &results;
+                spawn_scoped_named(scope, move || run_capped_batches(batch.jobs, width, results))
+            })
+            .collect();
         // (#2394) The third sibling. Same batching mechanism as the remote
         // track, a DIFFERENT cap — and running on its own thread means a
         // long dispatch-free wait never occupies a hosted-endpoint slot.
@@ -425,7 +441,7 @@ pub fn run_bounded<T: Send + 'static>(
         if let Some(h) = local_track {
             let _ = h.join();
         }
-        if let Some(h) = remote_track {
+        for h in endpoint_tracks {
             let _ = h.join();
         }
         if let Some(h) = dispatch_free_track {
@@ -1076,33 +1092,96 @@ pub(crate) fn ensure_wave_loaded(
 /// concurrently via a nested `thread::scope`, moving to the next batch once
 /// the current one finishes.
 ///
-/// `cap` is the caller-resolved ceiling for THAT track —
-/// `config_access::remote_concurrent_cap()` for the hosted-endpoint track,
+/// `cap` is the ceiling for THAT track: an endpoint's
+/// [`EndpointSlot::width`] for an endpoint's batch,
 /// `config_access::dispatch_free_concurrency()` for the dispatch-free one.
 /// `0` means unbounded (`config_access::jobs_at_once`): one batch holding
-/// every job. The two tracks share this code and share nothing else:
+/// every job. The tracks share this code and share nothing else:
 /// separate vecs, separate caps, separate threads.
+/// (#3035) One unmanaged endpoint's queued jobs and the slot they claimed.
+struct EndpointBatch<T> {
+    slot: EndpointSlot,
+    jobs: Vec<(usize, DispatchJob<T>)>,
+}
+
+impl<T> EndpointBatch<T> {
+    fn new(slot: EndpointSlot) -> Self {
+        Self { slot, jobs: Vec::new() }
+    }
+}
+
+/// (#3035) Say, once per endpoint per process, that an endpoint with no
+/// `limits.concurrent_calls` runs its calls one at a time, when that costs
+/// something (two or more calls are queued for it at once). darkmux never
+/// guesses a number: the operator sets one, or accepts the serial default.
+///
+/// "Serial" is scoped to ONE darkmux process: two missions, radio, or a fleet
+/// job against the same endpoint at the same time are not serialized together,
+/// and nothing here enforces across processes.
+fn note_serial_endpoint(slot: &EndpointSlot, queued: usize) {
+    static NOTED: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let noted = NOTED.get_or_init(|| Mutex::new(HashSet::new()));
+    note_serial_endpoint_in(slot, queued, noted, &mut |line| {
+        #[cfg(test)]
+        SAID.with(|said| said.borrow_mut().push(line.to_string()));
+        eprintln!("{line}")
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`note_serial_endpoint`] said on this thread (a test reads it).
+    static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`note_serial_endpoint`] against an explicit "already said" set and sink.
+fn note_serial_endpoint_in(
+    slot: &EndpointSlot,
+    queued: usize,
+    noted: &Mutex<HashSet<String>>,
+    say: &mut dyn FnMut(&str),
+) {
+    if slot.declared().is_some() || queued < 2 || !slot.is_endpoint() {
+        return;
+    }
+    if !noted.lock().unwrap_or_else(|p| p.into_inner()).insert(slot.key().to_string()) {
+        return;
+    }
+    say(&format!(
+        "darkmux: endpoint {} has no limits.concurrent_calls; its calls run one at a time. \
+         Set it to run them in parallel.",
+        slot.key()
+    ));
+}
+
 fn run_capped_batches<T: Send + 'static>(
     mut remote_jobs: Vec<(usize, DispatchJob<T>)>,
     cap: usize,
     results: &ResultsSink<T>,
 ) {
     for batch in remote_jobs.chunks_mut(darkmux_types::config_access::jobs_at_once(cap)) {
-        std::thread::scope(|batch_scope| {
-            for (index, job) in batch {
-                let index = *index;
-                // `job` is `DispatchJob<T>` (owned `Box<dyn FnOnce +
-                // Send>`) sitting behind a `&mut` chunk slot — `take()` its
-                // place with a no-op so the closure can move the real one
-                // into the spawned thread without fighting the borrow
-                // checker over a `chunks_mut` slice element.
-                let job: DispatchJob<T> = std::mem::replace(job, Box::new(|| unreachable!()));
-                spawn_scoped_named(batch_scope, move || {
-                    let outcome = job();
-                    results.lock().expect("results mutex poisoned").push((index, outcome));
-                });
-            }
-        });
+        // A batch whose job panicked re-panics at the end of its scope. That
+        // must not end the track: the jobs queued behind it (one at a time on
+        // an endpoint with no declared concurrency, #3035) still run. The
+        // panicked job left no result of its own; `run_bounded` reconciles
+        // its index into a terminal `Err` (#1452).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|batch_scope| {
+                for (index, job) in batch.iter_mut() {
+                    let index = *index;
+                    // `job` is `DispatchJob<T>` (owned `Box<dyn FnOnce +
+                    // Send>`) sitting behind a `&mut` chunk slot — `take()` its
+                    // place with a no-op so the closure can move the real one
+                    // into the spawned thread without fighting the borrow
+                    // checker over a `chunks_mut` slice element.
+                    let job: DispatchJob<T> = std::mem::replace(job, Box::new(|| unreachable!()));
+                    spawn_scoped_named(batch_scope, move || {
+                        let outcome = job();
+                        results.lock().expect("results mutex poisoned").push((index, outcome));
+                    });
+                }
+            });
+        }));
     }
 }
 
@@ -2979,7 +3058,7 @@ mod tests {
             QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
             QueuedJob { index: 2, seat: SeatClaim::LocalModel(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 3, "every job ran (none refused — pool-less budget-only case never blocks)");
         assert_eq!(marker.load(Ordering::SeqCst), 3, "every job's body actually executed");
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
@@ -3007,7 +3086,7 @@ mod tests {
             QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("fits", 8_000)), job: ok_job(0, marker.clone()) },
             QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("too-big", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 1, "only the fitting job's body ran");
         let refused = results.iter().find(|(i, _)| *i == 1).expect("index 1 present");
@@ -3045,7 +3124,7 @@ mod tests {
             QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("shared", 8_000)), job: ok_job(0, marker.clone()) },
             QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("shared", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2, "both jobs ran despite sharing one resident placement");
     }
@@ -3108,7 +3187,7 @@ mod tests {
                 },
             })
             .collect();
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_one)
+        let results = run_bounded(jobs, &facts, &est, 4, &host_factory_parallel_one)
             .expect("planning never fails under Auto");
         assert_eq!(results.len(), 4);
         assert_eq!(marker.load(Ordering::SeqCst), 4, "every job still completes — starved, not lost");
@@ -3175,7 +3254,7 @@ mod tests {
                 },
             })
             .collect();
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_four)
+        let results = run_bounded(jobs, &facts, &est, 4, &host_factory_parallel_four)
             .expect("planning never fails under Auto");
         assert_eq!(results.len(), 4);
         assert_eq!(marker.load(Ordering::SeqCst), 4);
@@ -3277,7 +3356,7 @@ mod tests {
                 },
             },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_two_residents)
+        let results = run_bounded(jobs, &facts, &est, 4, &host_factory_two_residents)
             .expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2);
@@ -3355,7 +3434,7 @@ mod tests {
             seat: SeatClaim::LocalModel(placement("m", 8_000)),
             job: ok_job(0, marker.clone()),
         }];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &factory).expect("planning never fails under Auto");
         assert!(results[0].1.is_ok(), "the wave must run");
         assert_eq!(
             *unloads.lock().unwrap(),
@@ -3364,18 +3443,18 @@ mod tests {
         );
     }
 
-    /// Remote jobs never touch `plan_waves`'s local-model arithmetic at
+    /// Unmanaged-endpoint jobs never touch `plan_waves`'s local-model arithmetic at
     /// all — an empty local set plus an unconfigured budget/catalog is a
     /// legal, always-fits input.
     #[test]
-    fn run_bounded_runs_remote_jobs_capped_and_independent_of_local() {
+    fn run_bounded_runs_unmanaged_endpoint_jobs_independent_of_local() {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let marker = Arc::new(AtomicU32::new(0));
         let jobs = (0..5)
-            .map(|i| QueuedJob { index: i, seat: SeatClaim::RemoteEndpoint, job: ok_job(i, marker.clone()) })
+            .map(|i| QueuedJob { index: i, seat: SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)), job: ok_job(i, marker.clone()) })
             .collect();
-        let results = run_bounded(jobs, &facts, &est, 2, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 5);
         assert_eq!(marker.load(Ordering::SeqCst), 5);
         let mut indices: Vec<usize> = results.iter().map(|(i, _)| *i).collect();
@@ -3385,15 +3464,15 @@ mod tests {
 
     /// (#2394) The two cap-bounded tracks are INDEPENDENT: a
     /// `SeatClaim::NoModel` job is bounded by `dispatch_free_cap`, and
-    /// `remote_cap` — even at 1, its default — does not touch
+    /// an endpoint's serial default does not touch
     /// it. Timed, because the whole bug was a timing one: four jobs each
-    /// sleeping 200ms under `remote_cap: 1` must finish in ~200ms, not
+    /// sleeping 200ms must finish in ~200ms, not
     /// ~800ms.
     ///
     /// **Red before the fix**: there was no third track. Every dispatch-free
     /// job was a `Residency::Remote` job, so this ran in four sequential
     /// 200ms batches. The scheduler-level twin of this
-    /// (`dispatch_free_siblings_do_not_serialize_behind_the_remote_cap`)
+    /// (`dispatch_free_siblings_do_not_serialize_behind_a_serial_endpoint`)
     /// measured 12.16s against a 3s expectation on the real
     /// `procedural.shell` kind.
     #[test]
@@ -3416,15 +3495,15 @@ mod tests {
             })
             .collect();
         let t0 = std::time::Instant::now();
-        // remote_cap = 1 (its default); dispatch_free_cap = 4.
-        let results = run_bounded(jobs, &facts, &est, 1, 4, &mock_host_factory).expect("planning never fails under Auto");
+        // dispatch_free_cap = 4.
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         let elapsed = t0.elapsed();
         assert_eq!(results.len(), 4);
         assert_eq!(marker.load(Ordering::SeqCst), 4);
         assert!(
             elapsed < Duration::from_millis(600),
             "four dispatch-free jobs at 200ms each must overlap under their OWN cap, never \
-             serialize behind remote_cap=1 — got {elapsed:?}"
+             serialize behind a serial endpoint — got {elapsed:?}"
         );
     }
 
@@ -3453,7 +3532,7 @@ mod tests {
             })
             .collect();
         let t0 = std::time::Instant::now();
-        let results = run_bounded(jobs, &facts, &est, 8, 1, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 1, &mock_host_factory).expect("planning never fails under Auto");
         let elapsed = t0.elapsed();
         assert_eq!(results.len(), 4);
         assert!(
@@ -3464,37 +3543,90 @@ mod tests {
         assert_eq!(marker.load(Ordering::SeqCst), 4);
     }
 
-    /// (#2394 / #1509) An UNRESOLVED local seat keeps its historical
-    /// behavior — it rides the remote track, cap and all — rather than
-    /// silently gaining the dispatch-free track's much wider ceiling. The
-    /// class is new; the scheduling of this case is not.
-    /// (#2916 stage 2 review C2) `remote.concurrent_cap = 0` is UNBOUNDED on
-    /// the hosted track, as it is on the fleet listener's hosted seats: the
-    /// jobs overlap. It used to be clamped to 1, so one setting meant two
-    /// things.
-    #[test]
-    fn a_zero_remote_cap_is_unbounded_not_one() {
-        let est = FixedEstimator::default();
-        let facts = Facts::default();
-        let jobs = (0..3)
-            .map(|i| QueuedJob {
-                index: i,
-                seat: SeatClaim::LocalModelUnresolved { reason: "no active profile".to_string() },
-                job: Box::new(move || {
-                    std::thread::sleep(Duration::from_millis(150));
-                    Ok((i, vec![]))
-                }),
-            })
-            .collect();
-        let t0 = std::time::Instant::now();
-        let results = run_bounded(jobs, &facts, &est, 0, 8, &mock_host_factory).expect("planning never fails under Auto");
-        assert_eq!(results.len(), 3);
-        let elapsed = t0.elapsed();
-        assert!(elapsed < Duration::from_millis(400), "three 150ms jobs at cap 0 must overlap, got {elapsed:?}");
+    /// A job that records how many of its siblings are in flight at once
+    /// (the high-water mark), so a test reads the real concurrency instead of
+    /// inferring it from wall-clock time.
+    fn tracked_job(
+        i: usize,
+        in_flight: &Arc<AtomicUsize>,
+        high_water: &Arc<AtomicUsize>,
+        hold: Duration,
+    ) -> DispatchJob<usize> {
+        let (in_flight, high_water) = (in_flight.clone(), high_water.clone());
+        Box::new(move || {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            high_water.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(hold);
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok((i, vec![]))
+        })
     }
 
+    fn endpoint_jobs(
+        key: &str,
+        concurrent_calls: Option<u32>,
+        range: std::ops::Range<usize>,
+        in_flight: &Arc<AtomicUsize>,
+        high_water: &Arc<AtomicUsize>,
+    ) -> Vec<QueuedJob<usize>> {
+        range
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::UnmanagedEndpoint(EndpointSlot::new(key, concurrent_calls)),
+                job: tracked_job(i, in_flight, high_water, Duration::from_millis(60)),
+            })
+            .collect()
+    }
+
+    /// (#3035) An unmanaged endpoint that declares no `limits.concurrent_calls`
+    /// runs its calls ONE AT A TIME: darkmux never guesses a number.
     #[test]
-    fn an_unresolved_local_seat_still_rides_the_remote_cap() {
+    fn an_unmanaged_endpoint_without_concurrent_calls_runs_its_calls_one_at_a_time() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let jobs = endpoint_jobs("azure", None, 0..4, &in_flight, &high_water);
+        let results = run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 8, &mock_host_factory).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(high_water.load(Ordering::SeqCst), 1, "no declared concurrency: serial");
+    }
+
+    /// (#3035) With `limits.concurrent_calls = N`, up to N of that endpoint's
+    /// calls run at once, never more.
+    #[test]
+    fn concurrent_calls_n_runs_at_most_n_at_once() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let jobs = endpoint_jobs("azure", Some(2), 0..6, &in_flight, &high_water);
+        let results = run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 8, &mock_host_factory).unwrap();
+        assert_eq!(results.len(), 6);
+        assert_eq!(high_water.load(Ordering::SeqCst), 2, "two at once, never three");
+    }
+
+    /// (#3035) `concurrent_calls: 0` is unbounded, the darkmux bound
+    /// convention: every call overlaps.
+    #[test]
+    fn concurrent_calls_zero_is_unbounded() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let jobs = endpoint_jobs("azure", Some(0), 0..4, &in_flight, &high_water);
+        run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 8, &mock_host_factory).unwrap();
+        assert_eq!(high_water.load(Ordering::SeqCst), 4);
+    }
+
+    /// (#3035) Endpoints do not wait on each other: two serial endpoints run
+    /// one call each at once.
+    #[test]
+    fn different_endpoints_do_not_wait_on_each_other() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut jobs = endpoint_jobs("azure", None, 0..2, &in_flight, &high_water);
+        jobs.extend(endpoint_jobs("openai", None, 2..4, &in_flight, &high_water));
+        run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 8, &mock_host_factory).unwrap();
+        assert_eq!(high_water.load(Ordering::SeqCst), 2, "one call per endpoint at once: neither serial endpoint holds the other");
+    }
+
+    /// (#2394 / #1509) An UNRESOLVED local seat keeps its historical
+    /// behavior (it runs one at a time), rather than silently gaining the
+    /// dispatch-free track's much wider ceiling. The class is new; the
+    /// scheduling of this case is not.
+    #[test]
+    fn an_unresolved_local_seat_runs_one_at_a_time() {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let marker = Arc::new(AtomicU32::new(0));
@@ -3513,16 +3645,72 @@ mod tests {
             })
             .collect();
         let t0 = std::time::Instant::now();
-        // remote_cap=1 serializes them; dispatch_free_cap=8 would not — so a
+        // One at a time serializes them; dispatch_free_cap=8 would not — so a
         // finish under ~240ms would prove they took the wrong track.
-        let results = run_bounded(jobs, &facts, &est, 1, 8, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 8, &mock_host_factory).expect("planning never fails under Auto");
         let elapsed = t0.elapsed();
         assert_eq!(results.len(), 3);
         assert_eq!(marker.load(Ordering::SeqCst), 3);
         assert!(
             elapsed >= Duration::from_millis(300),
-            "an unresolved LOCAL seat must stay on the remote track (serialized at \
-             remote_cap=1, ~360ms), never fall through to the dispatch-free one — got {elapsed:?}"
+            "an unresolved LOCAL seat must run one at a time (~360ms), never fall through to \
+             the dispatch-free track — got {elapsed:?}"
+        );
+    }
+
+    /// (#3035) `run_bounded` itself says it: two calls queued for an endpoint
+    /// with no `limits.concurrent_calls` print the note once (a later batch for
+    /// the same endpoint stays quiet), and an endpoint that declares one never does.
+    #[test]
+    fn run_bounded_says_a_serial_endpoint_runs_one_at_a_time_once() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let run = |key: &str, calls: Option<u32>| {
+            let jobs = endpoint_jobs(key, calls, 0..2, &in_flight, &high_water);
+            run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 8, &mock_host_factory).unwrap();
+        };
+        SAID.with(|said| said.borrow_mut().clear());
+        run("serial-note-azure", None);
+        run("serial-note-azure", None);
+        run("serial-note-declared", Some(2));
+        let said = SAID.with(|said| said.borrow().clone());
+        assert_eq!(
+            said,
+            vec![
+                "darkmux: endpoint serial-note-azure has no limits.concurrent_calls; its calls run one at a time. \
+                 Set it to run them in parallel."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// (#3035) The once-per-launch note: said when an endpoint with no
+    /// `limits.concurrent_calls` has two or more calls queued, said once per
+    /// endpoint, and never for an endpoint that declares one, a single call,
+    /// or the fail-open slots.
+    #[test]
+    fn the_serial_note_is_said_once_per_endpoint_and_only_when_it_costs_something() {
+        let noted = Mutex::new(HashSet::new());
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        let mut say = |line: &str| said.borrow_mut().push(line.to_string());
+        let azure = EndpointSlot::new("azure", None);
+        note_serial_endpoint_in(&azure, 1, &noted, &mut say);
+        note_serial_endpoint_in(&EndpointSlot::new("azure", Some(2)), 5, &noted, &mut say);
+        note_serial_endpoint_in(&EndpointSlot::unresolved(), 5, &noted, &mut say);
+        note_serial_endpoint_in(&EndpointSlot::unresolved_local(), 5, &noted, &mut say);
+        assert!(said.borrow().is_empty(), "nothing to say yet: {:?}", said.borrow());
+        note_serial_endpoint_in(&azure, 2, &noted, &mut say);
+        note_serial_endpoint_in(&azure, 9, &noted, &mut say);
+        note_serial_endpoint_in(&EndpointSlot::new("openai", None), 3, &noted, &mut say);
+        assert_eq!(
+            *said.borrow(),
+            vec![
+                "darkmux: endpoint azure has no limits.concurrent_calls; its calls run one at a time. \
+                 Set it to run them in parallel."
+                    .to_string(),
+                "darkmux: endpoint openai has no limits.concurrent_calls; its calls run one at a time. \
+                 Set it to run them in parallel."
+                    .to_string(),
+            ]
         );
     }
 
@@ -3538,10 +3726,10 @@ mod tests {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let jobs: Vec<QueuedJob<()>> = vec![
-            QueuedJob { index: 0, seat: SeatClaim::RemoteEndpoint, job: Box::new(|| panic!("boom in a remote job")) },
-            QueuedJob { index: 1, seat: SeatClaim::RemoteEndpoint, job: Box::new(|| Ok(((), vec![]))) },
+            QueuedJob { index: 0, seat: SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)), job: Box::new(|| panic!("boom in a remote job")) },
+            QueuedJob { index: 1, seat: SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)), job: Box::new(|| Ok(((), vec![]))) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2, "both indices accounted for — the panicked one is not dropped");
         let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
         assert!(panicked.1.is_err(), "the panicked job's index comes back as a terminal Err");
@@ -3568,7 +3756,7 @@ mod tests {
             },
             QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("m2", 8_000)), job: ok_job(1, marker.clone()) },
         ];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2, "both local indices accounted for — the panicked one is not dropped");
         let panicked = results.iter().find(|(i, _)| *i == 0).expect("index 0 present despite the panic");
         assert!(panicked.1.is_err(), "the panicked local job's index comes back as a terminal Err");
@@ -3582,10 +3770,10 @@ mod tests {
         let facts = Facts::default();
         let jobs = vec![QueuedJob::<()> {
             index: 0,
-            seat: SeatClaim::RemoteEndpoint,
+            seat: SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)),
             job: Box::new(|| Err(anyhow!("boom"))),
         }];
-        let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
+        let results = run_bounded(jobs, &facts, &est, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 1);
         let (idx, outcome) = &results[0];
         assert_eq!(*idx, 0);

@@ -176,7 +176,15 @@ fn nothing_is_enforced_unless_a_window_budget_is_set_and_not_off() {
     assert_eq!(EndpointBudget::of(&ModelEndpoint::reference("x")), Ok(None), "no limits");
     let mut inline = named(serde_json::json!({"window": {"period": "1d", "tokens": 10}}));
     inline.source = EndpointSource::Inline;
-    assert_eq!(EndpointBudget::of(&inline), Ok(None), "inline: no id to sum by");
+    let err = EndpointBudget::of(&inline).unwrap_err();
+    assert!(err.contains("inline endpoint") && err.contains("by id"), "inline: no id to sum by, so a counting window is refused: {err}");
+    let mut inline_off = named(serde_json::json!({"policy": "off", "window": {"period": "1d", "tokens": 10}}));
+    inline_off.source = EndpointSource::Inline;
+    assert_eq!(EndpointBudget::of(&inline_off), Ok(None), "an inline window that counts nothing is inert");
+    let mut inline_cap = named(serde_json::json!({"tokens_per_dispatch": 10, "concurrent_calls": 2}));
+    inline_cap.source = EndpointSource::Inline;
+    assert_eq!(EndpointBudget::of(&inline_cap), Ok(None), "an inline endpoint's per-dispatch cap and concurrency need no id");
+    assert_eq!(crate::dispatch_budget::DispatchBudget::for_endpoint(&inline_cap).unwrap().budget(), Some(10));
     let off = named(serde_json::json!({"policy": "off", "window": {"period": "1d", "tokens": 10}}));
     assert_eq!(EndpointBudget::of(&off), Ok(None), "policy off counts nothing");
     // (5th review MF2) `off` with a 0 is still off: the gate admits, never
@@ -190,9 +198,35 @@ fn nothing_is_enforced_unless_a_window_budget_is_set_and_not_off() {
     let mut managed = named(serde_json::json!({"window": {"period": "1d", "tokens": 10}}));
     managed.url = None;
     managed.managed = Some(darkmux_types::ManagedBackend::Lmstudio.into());
-    assert_eq!(EndpointBudget::of(&managed), Ok(None), "a managed endpoint's local calls are not budgeted");
+    let b = EndpointBudget::of(&managed).unwrap().expect("(#3035) a managed endpoint's window is budgeted too");
+    assert_eq!((b.endpoint_id.as_str(), b.policy), ("azure", BudgetPolicy::Warn));
     let per_dispatch_only = named(serde_json::json!({"tokens_per_dispatch": 5}));
-    assert_eq!(EndpointBudget::of(&per_dispatch_only), Ok(None), "tokens_per_dispatch is not enforced");
+    assert_eq!(EndpointBudget::of(&per_dispatch_only), Ok(None), "the per-dispatch cap is the dispatch bucket's, not the window gate's");
+}
+
+/// (#3035) `concurrent_calls` on a managed endpoint is an error at the gate
+/// and at preflight's registry pass, naming the scheduler; on an unmanaged
+/// one it is fine.
+#[test]
+fn concurrent_calls_on_a_managed_endpoint_is_refused_at_the_gate_and_at_preflight() {
+    let mut managed = named(serde_json::json!({"concurrent_calls": 2, "window": {"period": "1d", "tokens": 10}}));
+    managed.url = None;
+    managed.managed = Some(darkmux_types::ManagedBackend::Lmstudio.into());
+    let err = EndpointBudget::of(&managed).unwrap_err();
+    assert!(err.contains("concurrent_calls") && err.contains("scheduler") && err.contains("azure"), "{err}");
+    assert!(crate::dispatch_budget::DispatchBudget::for_endpoint(&managed).is_err(), "the dispatch cap reads limits the same way");
+    let unmanaged = named(serde_json::json!({"concurrent_calls": 2, "window": {"period": "1d", "tokens": 10}}));
+    assert!(EndpointBudget::of(&unmanaged).is_ok());
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1, "endpoint": "lms"}]}},
+        "endpoints": {"lms": {"managed": "lmstudio", "limits": {"concurrent_calls": 2}}},
+    }))
+    .unwrap();
+    reg.materialize_endpoints();
+    let invalid = darkmux_types::config_enum::invalid_endpoint_limits(&reg);
+    assert_eq!(invalid.len(), 1, "{invalid:?}");
+    let line = invalid[0].to_string();
+    assert!(line.contains("endpoints.lms.limits") && line.contains("scheduler"), "{line}");
 }
 
 /// A budget written without a policy is `warn`; an unregistered policy is
@@ -739,33 +773,34 @@ fn a_zero_budget_built_directly_waits_until_raised() {
     assert!(said.contains("until its window has room") && !said.contains("budget is 0"), "{said}");
 }
 
-// ── The per-step cap ─────────────────────────────────────────────────────
+// ── The per-dispatch cap ─────────────────────────────────────────────────
 
+/// (#3035) Under `warn` the cap never holds a call and warns once on the
+/// crossing; the record's `step` field names the dispatch.
 #[test]
-fn a_step_under_warn_never_holds_and_warns_once_on_crossing() {
-    use darkmux_types::config::StepBudgetPolicy;
+fn a_dispatch_under_warn_never_holds_and_warns_once_on_crossing() {
     let env = FakeEnv::new(vec![]);
-    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1_000), StepBudgetPolicy::Warn));
+    let bucket = Mutex::new(crate::dispatch_budget::DispatchBudget::new(Some(1_000), BudgetPolicy::Warn));
     for _ in 0..3 {
-        admit_step(&bucket, 4_096);
-        settle_step(&bucket, 4_096, 600, 1, "probe", &solo_caller(), &env);
+        settle_dispatch(&bucket, 600, "probe", &solo_caller(), &env);
     }
     assert_eq!(env.slept_ms.get(), 0);
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "one warning, at the crossing");
     let p = env.payload(darkmux_flow::FlowAction::BudgetWarn);
-    assert_eq!((p["scope"].as_str(), p["step"].as_str()), (Some("step"), Some("probe")));
+    assert_eq!((p["scope"].as_str(), p["dispatch"].as_str()), (Some("dispatch"), Some("probe")));
+    let said = env.said.borrow()[0].clone();
+    assert!(said.contains("limits.tokens_per_dispatch") && said.contains("1200 of 1000"), "{said}");
 }
 
-/// (operator, 2026-09-27) The per-step cap has `off` and `warn` only:
-/// `wait` is refused by the registry (preflight, doctor, `config set`,
-/// help all read it).
+/// (#3035) A `wait` policy applies to the window, so the per-dispatch cap
+/// beside it warns and never holds.
 #[test]
-fn the_step_policy_refuses_wait() {
-    use darkmux_types::config_enum::{ConfigEnum, ENUM_SETTINGS};
-    assert_eq!(darkmux_types::config::StepBudgetPolicy::TOKENS, &["off", "warn"]);
-    let s = ENUM_SETTINGS.iter().find(|s| s.key == "remote.step_budget_policy").unwrap();
-    assert_eq!(s.canonical("wait"), None);
-    assert_eq!(s.canonical("warn"), Some("warn"));
+fn a_dispatch_cap_under_wait_warns_and_never_holds() {
+    let env = FakeEnv::new(vec![]);
+    let bucket = Mutex::new(crate::dispatch_budget::DispatchBudget::new(Some(100), BudgetPolicy::Wait));
+    settle_dispatch(&bucket, 700, "d", &solo_caller(), &env);
+    assert_eq!(env.slept_ms.get(), 0, "nothing waited");
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
 }
 
 // ── The in-run pacer ─────────────────────────────────────────────────────
@@ -967,16 +1002,14 @@ fn a_day_file_rewritten_larger_is_read_again() {
 /// (a lost line continuation in the source).
 #[test]
 fn budget_messages_have_no_double_spaces() {
-    use darkmux_types::config::StepBudgetPolicy;
     let env = FakeEnv::new(vec![(T0 - DAY + 90, 1_000)]);
     let caller = mission_caller("m1");
     admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env).unwrap();
     admit_with(budget(BudgetPolicy::Warn, Some(10), None, None), &caller, &env).unwrap();
     admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &solo_caller(), &FakeEnv::new(vec![]).stopped("x"))
         .unwrap_err();
-    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1), StepBudgetPolicy::Warn));
-    admit_step(&bucket, 1);
-    settle_step(&bucket, 1, 5, 1, "s1", &caller, &env);
+    let bucket = Mutex::new(crate::dispatch_budget::DispatchBudget::new(Some(1), BudgetPolicy::Warn));
+    settle_dispatch(&bucket, 5, "s1", &caller, &env);
     let dir = tempfile::tempdir().unwrap();
     let stop_env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped("x");
     let mut pacer = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);

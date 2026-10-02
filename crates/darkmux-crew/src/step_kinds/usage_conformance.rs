@@ -69,16 +69,16 @@ const ROSTER: &[CallSite] = &[
     },
     CallSite {
         file: "src/dispatch_internal.rs",
-        caller: "dispatch_remote",
+        caller: "dispatch_unmanaged",
         transport: "remote_chat_completion(",
         duty: Duty::Emits {
-            writer_in: ("src/dispatch_internal.rs", "dispatch_remote"),
-            test: "dispatch_internal::tests::usage_conformance_dispatch_remote",
+            writer_in: ("src/dispatch_internal.rs", "dispatch_unmanaged"),
+            test: "dispatch_internal::tests::usage_conformance_dispatch_unmanaged",
         },
     },
     CallSite {
         file: "src/dispatch_internal.rs",
-        caller: "probe_remote_endpoint",
+        caller: "probe_unmanaged_endpoint",
         transport: "remote_chat_completion(",
         duty: Duty::Exempt(
             "`doctor --probe`: a 64-token connectivity check with no session id and no \
@@ -117,7 +117,7 @@ const ROSTER: &[CallSite] = &[
     },
     CallSite {
         file: "src/step_kinds/builtins.rs",
-        caller: "run_single_shot",
+        caller: "local_single_shot_reply",
         transport: "single_shot_chat(",
         duty: Duty::Emits {
             writer_in: ("src/step_kinds/builtins.rs", "run_single_shot"),
@@ -328,7 +328,7 @@ fn every_roster_path_calls_the_writer() {
 
 /// (#2902 step 5) The budget half of the same roster: every HOSTED call
 /// site (a call darkmux sends to an endpoint it does not manage) passes the
-/// endpoint budget gate and reserves against the per-step cap BEFORE its
+/// endpoint budget gate and reserves against its dispatch's token cap BEFORE its
 /// call and settles the cap AFTER it, or is named here as exempt with the
 /// reason. Keyed off [`ROSTER`], whose own sweep already fails on any
 /// unrostered transport call, so a new hosted path cannot ship without
@@ -339,13 +339,13 @@ fn every_roster_path_calls_the_writer() {
 /// the call, fails here. Behavioral proof that each gate FIRES lives beside
 /// each path (`the_endpoint_gate_fires_on_a_hosted_map_item`,
 /// `the_endpoint_gate_fires_on_a_hosted_single_shot_step`,
-/// `dispatch_internal::tests::the_endpoint_gate_fires_on_dispatch_remote`,
+/// `dispatch_internal::tests::the_endpoint_gate_fires_on_dispatch_unmanaged`,
 /// and for the agentic container the pacer's own tests in `budget_tests`).
 ///
 /// The entry points above these primitives need no row of their own: radio's
 /// answering seat, `darkmux acp`, `dispatch.unit`, the lab providers, the fleet
 /// runner and every mission `dispatch.internal` step reach a hosted endpoint
-/// only through `dispatch::dispatch` (-> `dispatch_remote`, or the container
+/// only through `dispatch::dispatch` (-> `dispatch_unmanaged`, or the container
 /// path below) or through the `dispatch.single_shot` / `dispatch.map` kinds.
 #[test]
 fn every_hosted_call_site_passes_the_budget_gates() {
@@ -359,11 +359,11 @@ fn every_hosted_call_site_passes_the_budget_gates() {
     const BUDGETS: &[(&str, Budget)] = &[
         ("single_shot_chat_hosted", Budget::Transport),
         (
-            "dispatch_remote",
-            Budget::Gated { gate_in: ("src/dispatch_internal.rs", "dispatch_remote"), call: "remote_chat_completion(" },
+            "dispatch_unmanaged",
+            Budget::Gated { gate_in: ("src/dispatch_internal.rs", "dispatch_unmanaged"), call: "remote_chat_completion(" },
         ),
         (
-            "probe_remote_endpoint",
+            "probe_unmanaged_endpoint",
             Budget::Exempt(
                 "`darkmux doctor --probe`: an operator-run 64-token connectivity check, not work; \
                  it is the tool for checking an endpoint that a budget may be holding",
@@ -394,8 +394,7 @@ fn every_hosted_call_site_passes_the_budget_gates() {
                 let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{}::{} lacks `{needle}` (comments do not count)", gate_in.0, gate_in.1));
                 let call_at = at(call);
                 assert!(at("crate::budget::admit_endpoint(") < call_at, "{}: the endpoint gate runs before `{call}`", gate_in.1);
-                assert!(at("crate::budget::admit_step(") < call_at, "{}: the per-step reservation precedes `{call}`", gate_in.1);
-                assert!(at("crate::budget::settle_step_live(") > call_at, "{}: the per-step cap settles after `{call}`", gate_in.1);
+                assert!(at("crate::budget::settle_dispatch_live(") > call_at, "{}: the per-dispatch cap settles after `{call}`", gate_in.1);
                 checked += 1;
             }
             Budget::Transport => {}
@@ -407,14 +406,20 @@ fn every_hosted_call_site_passes_the_budget_gates() {
     let builtins = read_src("src/step_kinds/builtins.rs");
     let map_calls = production_lines(&builtins).iter().map(|l| calls_on_line(l, "map_hosted_dispatch(")).sum::<usize>();
     assert_eq!(map_calls, 1, "map_hosted_dispatch has one caller, the gated map_hosted_item");
-    // The container path: the runtime calls a hosted brain INSIDE Docker, so
-    // the gate runs before the container starts and the pacer rides the
-    // host sampler between turns.
+    // The container path: the runtime calls its brain (hosted or managed,
+    // #3035) INSIDE Docker, so the gate runs before the container starts and
+    // the pacer rides the host sampler between turns.
     let di = prod("src/dispatch_internal.rs");
     let dispatch = fn_body(&di, "dispatch");
-    let gate = dispatch.find("crate::budget::admit_endpoint(\n            &t.endpoint").expect("pre-start gate (not a comment)");
+    let gate = dispatch.find("admit_container_start(&opts, &execution, limits_pm)?").expect("pre-start gate (not a comment)");
     let spawn = dispatch.find("bookend.open(").expect("the start record");
     assert!(gate < spawn, "the pre-start gate runs before the dispatch starts");
-    assert!(dispatch.contains("crate::budget::BudgetPacer::new("), "the pacer gets the budget");
+    assert!(fn_body(&di, "admit_container_start").contains("crate::budget::admit_endpoint("), "the pre-start gate gates on the endpoint's window");
+    assert!(fn_body(&di, "pacer_for").contains("crate::budget::BudgetPacer::new("), "the pacer gets the budget");
+    assert!(
+        dispatch.contains("pacer_for(limits_pm, opts.config_path.as_deref())?"),
+        "(#3035) the pacer is built from the brain's endpoint, managed or hosted (behavior: \
+         `a_managed_brains_window_pauses_the_runtime_between_turns_through_the_pace_file`)"
+    );
     assert!(fn_body(&di, "run_telemetry_sampler").contains("pacer.on_tick("), "the pacer ticks");
 }

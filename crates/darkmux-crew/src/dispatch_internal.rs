@@ -629,7 +629,7 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// `dispatch.start` flow record. NOT "before any side effect" — two
 /// things still run earlier in `dispatch()` and are unaffected by this
 /// hoist: the remote-endpoint fork
-/// (which early-returns through `dispatch_remote`, a real HTTP call and a
+/// (which early-returns through `dispatch_unmanaged`, a real HTTP call and a
 /// real token spend, so on that path this gate is never reached at all —
 /// #2561), and `check_docker_preflight` (a `docker pull` of the runtime
 /// image on a cold cache; every production call site passes
@@ -2130,7 +2130,7 @@ pub struct DockerRunConfig {
     /// tool, OR for any role when `force_container` (#1199) opts a tool-less
     /// dispatch into the container path for bench-substrate consistency (a
     /// tool-less role otherwise stays on the light single-shot
-    /// `dispatch_remote` path). The URL itself never carries a credential
+    /// `dispatch_unmanaged` path). The URL itself never carries a credential
     /// (auth travels in a header, not the URL — see `remote_needs_auth`), so
     /// it's safe to include in this `Debug`-derived, test-asserted struct.
     pub remote_chat_url: Option<String>,
@@ -2834,33 +2834,29 @@ fn single_shot_cap(cap: Option<u32>, reasoning_effort: Option<&str>) -> u32 {
     cap.unwrap_or(if reasoning_effort.is_some() { 16384 } else { 4096 })
 }
 
-/// If this dispatch's resolved model is REMOTE, return the pieces the hosted
-/// path needs (role, system prompt, model). `Ok(None)` ⇒ local — the caller
-/// falls through to the unchanged container path (which re-loads the role;
-/// role load is cheap embedded-string work).
-fn try_resolve_remote_target(
-    opts: &DispatchOpts,
-) -> Result<Option<(crate::types::Role, String, crate::target::Target)>> {
+/// This dispatch's role and its resolved [`crate::target::Target`], whichever
+/// kind of endpoint the target is. `Ok(None)` when the role is unknown (the
+/// main path raises the canonical "role not found") or no registry loads.
+/// Both the hosted route and the container route read their endpoint's
+/// limits from this one resolution (#3035: limits apply to any endpoint).
+fn resolve_dispatch_route(opts: &DispatchOpts) -> Result<Option<(crate::types::Role, crate::target::Target)>> {
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let role = match roles.iter().find(|r| r.id == opts.role_id) {
         Some(r) => r.clone(),
         None => return Ok(None), // let the main path raise the canonical "role not found"
     };
-    let pm = match resolve_target(
+    let target = resolve_target(
         &role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
         opts.allow_utility_model,
-    )? {
-        // (#2902 review C4) An exhaustive match on the kind, so a new kind
-        // (#2916's fleet machine) is a compile error here, not a silent
-        // fall onto one arm.
-        Some(t) => match t.kind {
-            darkmux_types::EndpointKind::Unmanaged => t,
-            darkmux_types::EndpointKind::Managed(_) => return Ok(None), // managed ⇒ container path
-        },
-        None => return Ok(None),
-    };
+    )?;
+    Ok(target.map(|t| (role, t)))
+}
+
+/// The system prompt of a HOSTED dispatch: the caller's override verbatim,
+/// else the role's prompt (with the specialist preamble for a specialist).
+fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Result<String> {
     // (#1698 Packet B2) `system_prompt_override` is honored HERE too, not
     // just in `dispatch_local_single_shot` — a caller-supplied override
     // must be sent verbatim regardless of which underlying path a profile
@@ -2870,35 +2866,63 @@ fn try_resolve_remote_target(
     // instead (e.g. a literal `{{humor}}` placeholder) plus the specialist
     // preamble the override caller explicitly opted out of — see that
     // field's own doc on `DispatchOpts`.
-    let system_prompt = match &opts.system_prompt_override {
-        Some(text) => text.clone(),
-        None => {
-            // (#1550 cluster item 3) `load_role_prompt_for` honors an
-            // explicit `role.prompt_path` (if the manifest set one) before
-            // falling to the conventional sibling-file/embedded search —
-            // `load_role_prompt` alone never checked it, which let
-            // `darkmux role show` display a path that dispatch then
-            // couldn't find.
-            let role_prompt = crate::loader::load_role_prompt_for(&role).ok_or_else(|| {
-                anyhow!(
-                    "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-                     conventional roles dir, and the embedded table) — hosted dispatch requires one",
-                    opts.role_id,
-                    role.prompt_path
-                )
-            })?;
-            if role.is_specialist() {
-                format!(
-                    "{}\n\n{}",
-                    load_autonomous_dispatch_preamble().trim_end(),
-                    role_prompt
-                )
-            } else {
-                role_prompt
-            }
+    if let Some(text) = &opts.system_prompt_override {
+        return Ok(text.clone());
+    }
+    // (#1550 cluster item 3) `load_role_prompt_for` honors an
+    // explicit `role.prompt_path` (if the manifest set one) before
+    // falling to the conventional sibling-file/embedded search —
+    // `load_role_prompt` alone never checked it, which let
+    // `darkmux role show` display a path that dispatch then
+    // couldn't find.
+    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
+        anyhow!(
+            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
+             conventional roles dir, and the embedded table) — hosted dispatch requires one",
+            opts.role_id,
+            role.prompt_path
+        )
+    })?;
+    Ok(if role.is_specialist() {
+        format!("{}\n\n{}", load_autonomous_dispatch_preamble().trim_end(), role_prompt)
+    } else {
+        role_prompt
+    })
+}
+
+/// How a dispatch's resolved target routes: hosted (an endpoint darkmux only
+/// sends requests to) or through the container/local path (a managed one).
+enum DispatchRoute {
+    Unmanaged { role: Box<crate::types::Role>, system_prompt: String, target: Box<crate::target::Target> },
+    Managed(Box<crate::target::Target>),
+}
+
+/// [`resolve_dispatch_route`], classified by the target's kind and, for a
+/// hosted one, with its system prompt. `Ok(None)` ⇒ no role or registry.
+fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
+    let Some((role, target)) = resolve_dispatch_route(opts)? else { return Ok(None) };
+    // (#2902 review C4) An exhaustive match on the kind, so a new kind
+    // (#2916's fleet machine) is a compile error here, not a silent
+    // fall onto one arm.
+    Ok(Some(match target.kind {
+        darkmux_types::EndpointKind::Unmanaged => {
+            let system_prompt = unmanaged_system_prompt(opts, &role)?;
+            DispatchRoute::Unmanaged { role: Box::new(role), system_prompt, target: Box::new(target) }
         }
-    };
-    Ok(Some((role, system_prompt, pm)))
+        darkmux_types::EndpointKind::Managed(_) => DispatchRoute::Managed(Box::new(target)),
+    }))
+}
+
+/// If this dispatch's resolved model is REMOTE (an unmanaged endpoint),
+/// return the pieces the hosted path needs (role, system prompt, target).
+/// `None` ⇒ the container path.
+fn try_resolve_unmanaged_target(
+    opts: &DispatchOpts,
+) -> Result<Option<(crate::types::Role, String, crate::target::Target)>> {
+    Ok(match route_dispatch(opts)? {
+        Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => Some((*role, system_prompt, *target)),
+        Some(DispatchRoute::Managed(_)) | None => None,
+    })
 }
 
 /// Data-boundary predicate: operator identity (`~/.darkmux/identity.md`)
@@ -2918,7 +2942,7 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
 /// while it is still choosing what to put IN that message.
 ///
 /// Deliberately reuses `resolve_target` — the SAME
-/// resolution `try_resolve_remote_target` routes on — so the predicate
+/// resolution `try_resolve_unmanaged_target` routes on — so the predicate
 /// cannot drift from where the dispatch actually goes. A cheap alternative
 /// (reading `radio.answerer_profile` and looking it up directly) would
 /// re-implement the role-aware/`default_profile` precedence and silently
@@ -2928,7 +2952,7 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
 /// remote, withhold). Uncertainty never degrades to permissiveness — the
 /// cost of a false `true` is a thinner grounding bundle; the cost of a
 /// false `false` is private data on someone else's server.
-pub fn dispatch_resolves_remote(
+pub fn dispatch_resolves_unmanaged(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
@@ -2941,7 +2965,7 @@ pub fn dispatch_resolves_remote(
     };
     // (#2914) A work question: the utility model is set aside here too.
     match resolve_target(role, profile_name, config_path, false) {
-        // (#2902 review C4) Exhaustive on the kind; see `try_resolve_remote_target`.
+        // (#2902 review C4) Exhaustive on the kind; see `try_resolve_unmanaged_target`.
         Ok(Some(t)) => match t.kind {
             darkmux_types::EndpointKind::Unmanaged => true,
             darkmux_types::EndpointKind::Managed(_) => false,
@@ -2993,7 +3017,7 @@ impl LocalTarget {
 /// fallback), or a quarantined profile — in each case there is no local
 /// instance to check. Resolves through `resolve_target`,
 /// the SAME resolution the dispatch itself routes on (as
-/// [`dispatch_resolves_remote`] does), and mints the identifier the way
+/// [`dispatch_resolves_unmanaged`] does), and mints the identifier the way
 /// the wire does (`Target::wire_model`), so the instance checked is the
 /// instance sent to.
 pub fn dispatch_local_target(
@@ -3191,7 +3215,7 @@ pub struct ProbeReport {
 /// presence (which `darkmux doctor` checks offline for free). Costs a few
 /// real tokens on a paid endpoint, which is why it only runs under the
 /// opt-in `doctor --probe`, never by default.
-pub fn probe_remote_endpoint(
+pub fn probe_unmanaged_endpoint(
     ep: &darkmux_types::ModelEndpoint,
     model_id: &str,
     timeout_seconds: u32,
@@ -3458,7 +3482,7 @@ pub(crate) fn parse_hosted_response(
     // Require the MESSAGE object, not the content field (#1222 packet 2):
     // some OpenAI-compat reasoning backends omit `content` entirely on
     // length-truncation, and both consumers already treat missing content
-    // as "" (`dispatch_remote`'s `.unwrap_or("")` extraction; the probe's
+    // as "" (`dispatch_unmanaged`'s `.unwrap_or("")` extraction; the probe's
     // documented empty-content-still-proves-routing contract). The #1135
     // healthy-while-broken guard stays: a body with no choices at all
     // (an error page, an unexpected shape) is still loud.
@@ -3473,7 +3497,7 @@ pub(crate) fn parse_hosted_response(
 }
 
 /// (#2902 step 1a) Emit one single-shot call's usage record through the
-/// process-wide sink — the same sink the bookends of `dispatch_remote` and
+/// process-wide sink — the same sink the bookends of `dispatch_unmanaged` and
 /// `dispatch_local_single_shot` go through — with the SAME role, session
 /// and phase those bookends carry, so the record joins its run.
 fn emit_single_shot_usage(
@@ -3550,8 +3574,8 @@ pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectToke
 }
 
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
-/// unmanaged endpoint (`try_resolve_remote_target`).
-fn dispatch_remote(
+/// unmanaged endpoint (`try_resolve_unmanaged_target`).
+fn dispatch_unmanaged(
     opts: &DispatchOpts,
     execution: &ExecutionId,
     _role: &crate::types::Role,
@@ -3574,9 +3598,9 @@ fn dispatch_remote(
     let auth = remote_auth_header(ep)?;
     let phase = opts.phase_id.as_deref();
 
-    // (#2902 step 5) The budgets, BEFORE any bookend is emitted: the
-    // endpoint's rolling-window budget, then this dispatch's per-step cap (a
-    // bare hosted dispatch is one step). Neither refuses a valid config: a
+    // (#2902 step 5, #3035) The budgets, BEFORE any bookend is emitted: the
+    // endpoint's rolling-window budget, then this dispatch's own token cap
+    // (`limits.tokens_per_dispatch`). Neither refuses a valid config: a
     // breach warns, or under an endpoint `wait` this blocks until there is
     // room (the wait is reported and extends the run's wall-clock bound). A
     // wait whose run is stopped (Ctrl-C, `mission abort`) returns before
@@ -3604,12 +3628,11 @@ fn dispatch_remote(
         profiles_file: opts.config_path.as_deref(),
     };
     crate::budget::admit_endpoint(ep, &budget_caller)?;
-    let step_bucket = std::sync::Mutex::new(
-        crate::remote_budget::RemoteBudget::from_config(None).map_err(|e| anyhow!(e.to_string()))?,
+    let dispatch_bucket = std::sync::Mutex::new(
+        crate::dispatch_budget::DispatchBudget::for_endpoint(ep).map_err(|e| anyhow!(e))?,
     );
-    crate::budget::admit_step(&step_bucket, 0);
 
-    // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
+    // (#1230 Packet 0) `dispatch_unmanaged` previously had NO bookend guard at
     // all — a panic mid-hosted-call (or any future early return added
     // between `open` and the terminal records below) could orphan a
     // `dispatch start` with no terminal. Same shared guard as the container
@@ -3727,16 +3750,14 @@ fn dispatch_remote(
             ep.named_id(),
         ),
     );
-    crate::budget::settle_step_live(
-        &step_bucket,
-        0,
+    crate::budget::settle_dispatch_live(
+        &dispatch_bucket,
         crate::budget::conservative_hosted_spend(
             counts.total_tokens(),
             single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
             &req_body,
         ),
-        1,
-        "dispatch",
+        &opts.role_id,
         &budget_caller,
     );
 
@@ -3798,7 +3819,7 @@ fn dispatch_remote(
 /// container dispatch (image/workspace/out-dir spin) for a tool-less
 /// single-shot — the routing seat should take a direct single-shot HTTP
 /// path.") Container-free single-shot dispatch to a LOCAL LMStudio-loaded
-/// model — a LOCAL peer of [`dispatch_remote`] above, built to replace
+/// model — a LOCAL peer of [`dispatch_unmanaged`] above, built to replace
 /// `dispatch::dispatch` as the `local_dispatch` primitive
 /// `darkmux_fleet::routing::dispatch_routed_via` takes (the EXACT
 /// substitution seam #1509 built for `dispatch_as_crew_of_one` — see that
@@ -3809,7 +3830,7 @@ fn dispatch_remote(
 /// (#2914) the ROUTING seat, its first caller, moved to the lean utility
 /// path (`crate::utility::run_utility_single_shot`).
 ///
-/// Mirrors [`dispatch_remote`]'s shape — bookended `dispatch start`/
+/// Mirrors [`dispatch_unmanaged`]'s shape — bookended `dispatch start`/
 /// `dispatch complete`/`dispatch error` flow records (contract 2, dispatch
 /// liveness), one HTTP call, no agent loop — but resolves + calls a LOCAL
 /// LMStudio model via `crate::single_shot::single_shot_chat` instead of a
@@ -3822,7 +3843,7 @@ fn dispatch_remote(
 /// "faster" dispatch.
 ///
 /// A resolved profile pointing at a REMOTE endpoint still takes the light
-/// REMOTE path ([`dispatch_remote`]) — this function does not itself speak
+/// REMOTE path ([`dispatch_unmanaged`]) — this function does not itself speak
 /// to LMStudio unconditionally; it decides local-vs-remote the same way
 /// [`dispatch`] does, just without ever falling through to the container.
 ///
@@ -3842,7 +3863,7 @@ fn dispatch_remote(
 /// this container-free primitive.
 ///
 /// **`opts.json` is also NOT honored (fresh-review finding, named rather
-/// than silently gapped).** [`dispatch_remote`] builds the `{"result":
+/// than silently gapped).** [`dispatch_unmanaged`] builds the `{"result":
 /// "stop", "final_assistant": ..., "metrics": {...}}` envelope when
 /// `opts.json` is set; this function always returns the bare completion
 /// text in `stdout`, regardless of `opts.json`. `radio-router` (this
@@ -3878,15 +3899,17 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // function's own doc) never the container either, since the tool-less
     // check above already ruled out the one case `dispatch()` would force
     // through the container for a remote target.
-    if let Some((remote_role, system_prompt, pm)) = try_resolve_remote_target(&opts)? {
+    // (#3035) A managed target's endpoint carries limits like any other.
+    let (hosted, managed_pm) = split_route(route_dispatch(&opts)?);
+    if let Some((remote_role, system_prompt, pm)) = hosted {
         // (#2580 follow-up, same class as `dispatch()`'s own guard a few
-        // hundred lines below) `dispatch_remote` never reads `resume_from`
+        // hundred lines below) `dispatch_unmanaged` never reads `resume_from`
         // — no checkpoint, no container, nothing to resume INTO. This
         // container-free primitive is `dispatch_routed_via`'s
         // substitutable `local_dispatch` seam (see this function's own
         // doc), not just radio's private helper, so a future caller that
         // passes `resume_from` through unexamined would hit the exact
-        // #2561 bypass this refuses before `dispatch_remote` is ever
+        // #2561 bypass this refuses before `dispatch_unmanaged` is ever
         // called: no HTTP request, no `dispatch.start` record, no tokens
         // spent.
         if opts.resume_from.is_some() {
@@ -3903,7 +3926,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 opts.role_id
             );
         }
-        return dispatch_remote(&opts, execution, &remote_role, &system_prompt, &pm);
+        return dispatch_unmanaged(&opts, execution, &remote_role, &system_prompt, &pm);
     }
 
     // (#1698 Packet B2) `system_prompt_override` skips BOTH the loader
@@ -3935,7 +3958,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // (#147, fresh-review finding) Operator-identity augmentation — this
     // function's execution has ALREADY established, by reaching this line,
     // that the resolved brain is LOCAL (a remote resolution returned above
-    // via `dispatch_remote`), so `identity_augmentation_allowed`'s own
+    // via `dispatch_unmanaged`), so `identity_augmentation_allowed`'s own
     // remote-vs-local gate is trivially satisfied here; called
     // unconditionally rather than re-deriving that already-settled check.
     // Load-bearing, not cosmetic: `radio-router` was TOOL-LESS pre-#1698
@@ -3968,6 +3991,19 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
 
     let session = &opts.session;
     let phase = opts.phase_id.as_deref();
+
+    // (#3035) The managed endpoint's limits, before any bookend: its
+    // rolling window (a `wait` holds the call, reported) and this
+    // dispatch's own token cap.
+    let budget_caller = crate::budget::BudgetCaller {
+        role_id: Some(&opts.role_id),
+        session,
+        execution,
+        model: Some(&model_id),
+        phase_id: phase,
+        profiles_file: opts.config_path.as_deref(),
+    };
+    let dispatch_bucket = admit_local_single_shot(&opts, managed_pm.as_ref(), &model_id, &budget_caller)?;
 
     let mut flow_sink = |r: darkmux_flow::FlowRecord| {
         let _ = darkmux_flow::record(r);
@@ -4046,10 +4082,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             // LMStudio 400s on when the instance is gone instead of silently
             // JIT-loading a fresh copy the way a bare key did. Say what that
             // actually means before handing the raw error on.
-            let e = match residency_lost_detail(&model_id, &format!("{e:#}")) {
-                Some(msg) => e.context(msg),
-                None => e,
-            };
+            let e = with_residency_lost_context(&model_id, e);
             // (#2344) The call is over — stop the beat before the terminal.
             if let Some(em) = session_emitter.take() {
                 em.stop();
@@ -4087,13 +4120,22 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             Some(&opts.role_id),
             &model_id,
             &crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref()),
-            None,
+            tailer_endpoint_id(managed_pm.as_ref()).as_deref(),
         ),
     );
-
+    settle_local_single_shot(
+        dispatch_bucket.as_ref(),
+        crate::budget::conservative_spend(
+            reply.counts.total_tokens(),
+            req.max_tokens,
+            &format!("{system_prompt}{}", opts.message),
+        ),
+        &opts.role_id,
+        &budget_caller,
+    );
 
     // The call's own counts, the ones its usage record carries, through the
-    // same `single_call_complete` as `dispatch_remote`.
+    // same `single_call_complete` as `dispatch_unmanaged`.
     let complete_payload = single_call_complete(
         &crate::dispatch_envelope::DirectTokens::of(&reply.counts),
         wall_ms,
@@ -4935,7 +4977,7 @@ pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<(
     if opts.resume_from.is_none() {
         return Ok(());
     }
-    let Some((role, _system_prompt, _pm)) = try_resolve_remote_target(opts)? else {
+    let Some((role, _system_prompt, _pm)) = try_resolve_unmanaged_target(opts)? else {
         return Ok(()); // local — the ordinary container/checkpoint path applies
     };
     if container_path_required(&role, opts.force_container) {
@@ -4946,13 +4988,13 @@ pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<(
 
 /// (#2614 review, Also-fix — duplication) Single source of truth for the
 /// refusal text `refuse_resume_on_bare_hosted_path` above and `dispatch()`'s
-/// own inline `dispatch_remote` guard below both emit — before this, the
+/// own inline `dispatch_unmanaged` guard below both emit — before this, the
 /// two sites carried a byte-identical ten-line message hand-copied twice,
 /// which is exactly the drift risk this same commit's own rationale (for
 /// deleting the CLI wrapper's duplicate resume-checkpoint hoist) argues
 /// against. `dispatch()`'s own call site still duplicates the CALL to this
 /// function (`bail!(resume_from_bare_hosted_refusal(&opts.role_id))`), not
-/// the message text — `every_dispatch_remote_call_site_is_guarded_
+/// the message text — `every_dispatch_unmanaged_call_site_is_guarded_
 /// against_resume_from`'s textual scanner requires the guard's `if` block
 /// to contain a diverging construct naming the anchor phrase, and
 /// deliberately does not chase that anchor into an ordinary helper
@@ -4976,11 +5018,142 @@ pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
     )
 }
 
-/// (#2902 step 5) The `endpoints` id a container dispatch's per-turn usage
-/// records carry: the hosted brain's, when it was named by id; `None` for a
-/// local brain. What an endpoint's window budget sums those turns by.
-fn tailer_endpoint_id(agentic: Option<&crate::target::Target>) -> Option<String> {
-    agentic.and_then(|t| t.endpoint.named_id().map(str::to_string))
+/// (#2902 step 5, #3035) The `endpoints` id a container dispatch's per-turn
+/// usage records carry: the brain's endpoint, when it was named by id (hosted
+/// or managed alike); `None` when the profile model names none. What an
+/// endpoint's window budget sums those turns by.
+fn tailer_endpoint_id(target: Option<&crate::target::Target>) -> Option<String> {
+    target.and_then(|t| t.endpoint.named_id().map(str::to_string))
+}
+
+/// The runtime's built-in per-call completion cap (`loop_runner::
+/// MAX_TOKENS_PER_CALL`), what a container turn that reports no usage is
+/// charged when `runtime.max_tokens_per_call` is unset.
+const RUNTIME_MAX_TOKENS_PER_CALL: u32 = 10_000;
+
+/// (#3035) The bucket for one container dispatch's token cap
+/// (`limits.tokens_per_dispatch` on its brain's endpoint), when the target
+/// has one that counts. The tailer settles each model call into it.
+fn dispatch_cap_for(
+    target: Option<&crate::target::Target>,
+) -> Result<Option<Mutex<crate::dispatch_budget::DispatchBudget>>> {
+    let Some(t) = target else { return Ok(None) };
+    let bucket = crate::dispatch_budget::DispatchBudget::for_endpoint(&t.endpoint).map_err(|e| anyhow!(e))?;
+    Ok(bucket.counts().then(|| Mutex::new(bucket)))
+}
+
+/// `e` with [`residency_lost_detail`]'s explanation attached when its
+/// message says darkmux's own namespaced instance went away (#2240).
+fn with_residency_lost_context(model_id: &str, e: anyhow::Error) -> anyhow::Error {
+    match residency_lost_detail(model_id, &format!("{e:#}")) {
+        Some(msg) => e.context(msg),
+        None => e,
+    }
+}
+
+/// (#3035) A managed endpoint's limits ahead of the container-free local
+/// single-shot: its window gate (behind a heartbeat for the hosted path's
+/// reason: a call the gate holds is live work, and only an endpoint that HAS
+/// a window budget can hold one), then this dispatch's token cap bucket.
+fn admit_local_single_shot(
+    opts: &DispatchOpts,
+    target: Option<&crate::target::Target>,
+    model_id: &str,
+    caller: &crate::budget::BudgetCaller<'_>,
+) -> Result<Option<Mutex<crate::dispatch_budget::DispatchBudget>>> {
+    let Some(t) = target else { return Ok(None) };
+    let ep = &t.endpoint;
+    let _gate_beat = matches!(crate::budget::EndpointBudget::of(ep), Ok(Some(_))).then(|| {
+        darkmux_flow::session_presence::spawn_session_emitter(
+            &opts.session,
+            Some(opts.role_id.clone()),
+            Some(model_id.to_string()),
+        )
+    });
+    crate::budget::admit_endpoint(ep, caller)?;
+    dispatch_cap_for(target)
+}
+
+/// (#3035) Settle the local single-shot's reply into its dispatch cap, when
+/// the managed endpoint sets one that counts.
+fn settle_local_single_shot(
+    bucket: Option<&Mutex<crate::dispatch_budget::DispatchBudget>>,
+    charge: u64,
+    role_id: &str,
+    caller: &crate::budget::BudgetCaller<'_>,
+) {
+    if let Some(bucket) = bucket {
+        crate::budget::settle_dispatch_live(bucket, charge, role_id, caller);
+    }
+}
+
+/// (#2902 step 5, #3035) The in-run half of a container brain's window budget:
+/// a pacer that pauses the runtime BETWEEN turns through the thermal governor's
+/// pace file (reason `budget`), for a managed brain and a hosted one alike. At
+/// the start, and on a single-shot call, the same budget is held by the
+/// polling gate (`crate::budget::admit_endpoint`) instead. `None` when the
+/// endpoint has no counting window.
+fn pacer_for(
+    target: Option<&crate::target::Target>,
+    config_path: Option<&str>,
+) -> Result<Option<crate::budget::BudgetPacer>> {
+    let Some(t) = target else { return Ok(None) };
+    Ok(crate::budget::EndpointBudget::of(&t.endpoint)
+        .map_err(|e| anyhow!(e))?
+        .map(|b| crate::budget::BudgetPacer::new(b, config_path.map(str::to_string))))
+}
+
+/// A classified route as its two halves: the hosted pieces
+/// (role, system prompt, target) and the managed target.
+type SplitRoute = (Option<(crate::types::Role, String, crate::target::Target)>, Option<crate::target::Target>);
+
+/// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
+fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
+    match route {
+        Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => (Some((*role, system_prompt, *target)), None),
+        Some(DispatchRoute::Managed(target)) => (None, Some(*target)),
+        None => (None, None),
+    }
+}
+
+/// (#2902 step 5, #3035) A container brain calls its endpoint from inside
+/// the container, turn after turn, whether that endpoint is hosted or a
+/// managed local one: either carries limits. Its window budget is checked
+/// HERE, before the container (or its image) is touched: a `wait` holds the
+/// start, reported, and a stopped run (Ctrl-C, `mission abort`) returns
+/// before anything was sent. Between turns the host sampler's budget pacer
+/// takes over, pausing the runtime through the pace file the way the thermal
+/// governor does.
+fn admit_container_start(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    target: Option<&crate::target::Target>,
+) -> Result<()> {
+    let Some(t) = target else { return Ok(()) };
+    // (#2902 step 5 review) A held start is live work: a heartbeat while
+    // the gate may wait (no bookend: contract 2 keeps those around model
+    // work). Only for an endpoint that HAS a budget, the one case the
+    // gate can hold (a heartbeat costs a spawn and a Redis round trip,
+    // ~250 ms, on every hosted start). Dropped when the gate returns;
+    // the container path's own emitter takes over from there.
+    let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {
+        darkmux_flow::session_presence::spawn_session_emitter(
+            &opts.session,
+            Some(opts.role_id.clone()),
+            Some(t.model.id.clone()),
+        )
+    });
+    crate::budget::admit_endpoint(
+        &t.endpoint,
+        &crate::budget::BudgetCaller {
+            role_id: Some(&opts.role_id),
+            session: &opts.session,
+            execution,
+            model: Some(&t.model.id),
+            phase_id: opts.phase_id.as_deref(),
+            profiles_file: opts.config_path.as_deref(),
+        },
+    )
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
@@ -5002,7 +5175,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // endpoint forks two ways, decided by whether the ROLE grants any tools:
     //
     //   - Tool-less role (e.g. `pr-reviewer`, empty `tool_palette.allow`) →
-    //     the light single-shot `dispatch_remote` path: one chat-completions
+    //     the light single-shot `dispatch_unmanaged` path: one chat-completions
     //     call, no Docker, no container. Structurally can't use tools
     //     anyway, so the heavier container path would add cost for nothing.
     //   - Tool-granting role (e.g. `code-reviewer`) → falls through to the
@@ -5021,21 +5194,23 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // One execution, whichever way this dispatch runs (hosted single-shot or
     // container): every record of it below names this id.
     let execution = execution_for(opts.resume_from.as_deref());
-    let remote_target = try_resolve_remote_target(&opts)?;
+    // (#3035) A managed target's endpoint carries limits like any other: its
+    // window gate, its per-dispatch cap and its `endpoint_id` stamp.
+    let (hosted, managed_pm) = split_route(route_dispatch(&opts)?);
     let mut agentic_pm: Option<crate::target::Target> = None;
-    if let Some((role, system_prompt, pm)) = remote_target {
+    if let Some((role, system_prompt, pm)) = hosted {
         // (#1199) `force_container` routes even a tool-less role through the
         // container/agentic path so benches get one consistent substrate
         // (trajectory + per-turn telemetry) regardless of where the brain is.
         if container_path_required(&role, opts.force_container) {
             agentic_pm = Some(pm);
         } else {
-            // (#2561) `dispatch_remote` never reads `resume_from` — it has
+            // (#2561) `dispatch_unmanaged` never reads `resume_from` — it has
             // no checkpoint, no container, nothing to resume INTO. Before
             // #2561 this fell straight through to the HTTP call below,
             // silently starting a fresh single-shot dispatch (real token
             // spend, success exit) under a flag that looked like it would
-            // resume. Refuse HERE, before `dispatch_remote` is even
+            // resume. Refuse HERE, before `dispatch_unmanaged` is even
             // called — no HTTP request goes out, no `dispatch.start`
             // record is emitted, no tokens spend. This is the same
             // promise `validate_resume_checkpoint` states for the container
@@ -5055,43 +5230,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // still covers this guard.
                 bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
-            return dispatch_remote(&opts, &execution, &role, &system_prompt, &pm);
+            return dispatch_unmanaged(&opts, &execution, &role, &system_prompt, &pm);
         }
     }
 
-    // (#2902 step 5) An agentic-remote brain calls its endpoint from inside
-    // the container, turn after turn. Its budget is checked HERE, before the
-    // container (or its image) is touched: a `wait` holds the start,
-    // reported, and a stopped run (Ctrl-C, `mission abort`) returns before
-    // anything was sent. Between turns the host sampler's budget pacer takes
-    // over, pausing the runtime through the pace file the way the thermal
-    // governor does.
-    if let Some(t) = &agentic_pm {
-        // (#2902 step 5 review) A held start is live work: a heartbeat while
-        // the gate may wait (no bookend: contract 2 keeps those around model
-        // work). Only for an endpoint that HAS a budget, the one case the
-        // gate can hold (a heartbeat costs a spawn and a Redis round trip,
-        // ~250 ms, on every hosted start). Dropped when the gate returns;
-        // the container path's own emitter takes over from there.
-        let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {
-            darkmux_flow::session_presence::spawn_session_emitter(
-                &opts.session,
-                Some(opts.role_id.clone()),
-                Some(t.model.id.clone()),
-            )
-        });
-        crate::budget::admit_endpoint(
-            &t.endpoint,
-            &crate::budget::BudgetCaller {
-                role_id: Some(&opts.role_id),
-                session: &opts.session,
-                execution: &execution,
-                model: Some(&t.model.id),
-                phase_id: opts.phase_id.as_deref(),
-                profiles_file: opts.config_path.as_deref(),
-            },
-        )?;
-    }
+    let limits_pm = agentic_pm.as_ref().or(managed_pm.as_ref());
+    admit_container_start(&opts, &execution, limits_pm)?;
 
     // (#2294) PREFLIGHT: does this workdir's git directory live outside
     // what gets bind-mounted? A `.git` that is a POINTER FILE (`gitdir:
@@ -5246,8 +5390,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // leaves the machine — local dispatches only (data-boundary decision,
     // #1405 review). A dispatch whose resolved brain is a remote endpoint is
     // skipped here (the agentic-remote container path, where `agentic_pm` is
-    // set) and never augmented on the single-shot `dispatch_remote` path
-    // above (whose system prompt comes from `try_resolve_remote_target`,
+    // set) and never augmented on the single-shot `dispatch_unmanaged` path
+    // above (whose system prompt comes from `try_resolve_unmanaged_target`,
     // which builds it without identity).
     let system_prompt = if identity_augmentation_allowed(agentic_pm.is_some()) {
         crate::dispatch::augment_prompt_with_identity(&system_prompt)
@@ -5324,7 +5468,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // which needs `host_out` to exist) — see its own doc. Refusing here
     // means: no model load, no eviction, no directory materialization, no
     // `dispatch.start` flow record. It does NOT mean "before anything at
-    // all" — the `dispatch_remote` early
+    // all" — the `dispatch_unmanaged` early
     // return (#2561) and `check_docker_preflight` both ran above.
     //
     // `intended_workspace` mirrors, without creating it, whatever step 4
@@ -5374,7 +5518,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    that's phase 2+ scope when the recommendation registry
     //    activates per-hardware tuple selection.
     // (#1187) An agentic-remote dispatch already has its model resolved (via
-    // `try_resolve_remote_target`'s profile-based lookup, done up front so
+    // `try_resolve_unmanaged_target`'s profile-based lookup, done up front so
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
@@ -5393,7 +5537,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
-    // SAME field the light single-shot `dispatch_remote` path already sets
+    // SAME field the light single-shot `dispatch_unmanaged` path already sets
     // (see its `label` var). Missing this was a real gap: the viewer's route
     // display (`sp.endpoint` in `ui/src/lenses/session/sessionRun.ts`; the
     // legacy `viewer.html`'s copy of this logic retired along with that
@@ -5402,10 +5546,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // dispatch that correctly ran on Azure would still show up in the
     // viewer as a local dispatch, an operator-sovereignty violation (the
     // operator has no way to tell where the model actually ran).
-    let remote_endpoint_raw_label = agentic_pm.as_ref().and_then(crate::target::Target::route_label);
+    let unmanaged_endpoint_raw_label = agentic_pm.as_ref().and_then(crate::target::Target::route_label);
     eprintln!(
         "darkmux dispatch: model={model}{}",
-        remote_endpoint_raw_label
+        unmanaged_endpoint_raw_label
             .as_deref()
             .map(|l| format!(" — brain: {l}"))
             .unwrap_or_default()
@@ -5610,11 +5754,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         allowed_tools.as_deref(),
         &opts.brief_refs,
     )?;
-    // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
+    // (#1187 follow-up) Mirror `dispatch_unmanaged`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
     // field ⇒ rendered as local LMStudio), so this must be set whenever the
     // container's brain is actually remote.
-    if let Some(label) = &remote_endpoint_raw_label {
+    if let Some(label) = &unmanaged_endpoint_raw_label {
         dispatch_start_payload.endpoint = Some(label.clone());
     }
     // (#2114 follow-up) Resume provenance the viewer/flow log render —
@@ -6141,13 +6285,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902 step 1a) The endpoint fact on every per-turn usage record:
         // the hosted label when the brain is endpoint-staffed, else the
         // resolved LMStudio base (host-side form; see `usage::lmstudio_endpoint`).
-        Some(remote_endpoint_raw_label.clone().unwrap_or_else(|| {
+        Some(unmanaged_endpoint_raw_label.clone().unwrap_or_else(|| {
             crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())
         })),
         // (#2902 step 5) The `endpoints` id a hosted brain's turns go
         // through, stamped on each turn's usage record so the endpoint's
         // window budget sums them.
-        tailer_endpoint_id(agentic_pm.as_ref()),
+        tailer_endpoint_id(limits_pm),
+        dispatch_cap_for(limits_pm)?,
         // (#2902 step 1b) The compactor's endpoint: always the LMStudio base,
         // hosted brain or not (the runtime never routes the compactor through
         // the hosted URL; `runtime/src/main.rs`, #1187).
@@ -6272,12 +6417,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         crate::thermal_governor::ThermalGovernorConfig::from_env()?,
         // (#2902 step 5) The in-run half of an agentic-remote brain's
         // endpoint budget (the pre-start half ran before `dispatch start`).
-        match &agentic_pm {
-            Some(t) => crate::budget::EndpointBudget::of(&t.endpoint)
-                .map_err(|e| anyhow!(e))?
-                .map(|b| crate::budget::BudgetPacer::new(b, opts.config_path.clone())),
-            None => None,
-        },
+        pacer_for(limits_pm, opts.config_path.as_deref())?,
     );
 
     // (#2642) External, whole-`dispatch()`-level panic-injection hook for
@@ -6557,7 +6697,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &stderr,
         exit_code,
         &trajectory_summary,
-        remote_endpoint_raw_label.as_deref(),
+        unmanaged_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
         opts.resume_from.as_deref(),
@@ -7369,6 +7509,7 @@ fn spawn_guarded_tailer(
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
     endpoint_id: Option<String>,
+    dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
@@ -7398,6 +7539,7 @@ fn spawn_guarded_tailer(
             record_context,
             endpoint,
             endpoint_id,
+            dispatch_cap,
             compactor_endpoint,
             live,
         )
@@ -7448,6 +7590,7 @@ fn run_tailer(
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
     endpoint_id: Option<String>,
+    dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
 ) -> TrajectorySummary {
@@ -7471,6 +7614,7 @@ fn run_tailer(
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
     .with_endpoint_id(endpoint_id)
+    .with_dispatch_cap(dispatch_cap)
     .with_compactor_endpoint(compactor_endpoint)
     .with_record_context(record_context)
     // (#2928) The live channel, off when `runtime.live_sample_ms` is 0.
@@ -7611,7 +7755,7 @@ fn build_dispatch_complete_payload(
     stderr: &str,
     exit_code: i32,
     summary: &TrajectorySummary,
-    remote_endpoint_raw_label: Option<&str>,
+    unmanaged_endpoint_raw_label: Option<&str>,
     host_stats: &HostStats,
     host_extras: &HostExtras,
     resume_from: Option<&std::path::Path>,
@@ -7667,10 +7811,10 @@ fn build_dispatch_complete_payload(
         reasoning_tokens: fold.tokens.reasoning,
         cached_tokens: fold.tokens.cached,
         // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
-        // parity with `dispatch_remote`'s completion record, and needed by any
+        // parity with `dispatch_unmanaged`'s completion record, and needed by any
         // future by-endpoint consumer (#1186) that reads the terminal record
         // rather than the start record.
-        endpoint: remote_endpoint_raw_label.map(str::to_string),
+        endpoint: unmanaged_endpoint_raw_label.map(str::to_string),
         // (#2111) Same compact host-pressure summary as the envelope's
         // `host_window` (`enrich_envelope_with_summary`) — reaching the FLOW
         // RECORD too, not just the CLI's own `--json` stdout.
@@ -9033,6 +9177,10 @@ struct TailerState {
     /// stamped as `endpoint_id` on each per-turn usage record (what the
     /// endpoint's window budget sums). `None` for a local brain.
     endpoint_id: Option<String>,
+    /// (#3035) This dispatch's token cap (`limits.tokens_per_dispatch` on its
+    /// brain's endpoint): each model call settles into it, and the first
+    /// crossing warns once. `None` when the endpoint sets no counting cap.
+    dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     /// (#2902 step 1b) The endpoint the runtime's COMPACTOR client called:
     /// always the resolved LMStudio base (host-side form), because the
     /// runtime never routes the compactor through a hosted brain's URL or
@@ -9180,6 +9328,7 @@ impl TailerState {
             compaction_threshold: None,
             endpoint: None,
             endpoint_id: None,
+            dispatch_cap: None,
             compactor_endpoint: None,
             record_context: None,
             live: None,
@@ -9213,6 +9362,12 @@ impl TailerState {
     /// (#2902 step 5) The hosted brain's `endpoints` id; see the field.
     fn with_endpoint_id(mut self, endpoint_id: Option<String>) -> Self {
         self.endpoint_id = endpoint_id;
+        self
+    }
+
+    /// (#3035) The dispatch's token cap bucket; see the field.
+    fn with_dispatch_cap(mut self, cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>) -> Self {
+        self.dispatch_cap = cap;
         self
     }
 
@@ -9422,6 +9577,7 @@ impl TailerState {
             compaction_threshold: None,
             endpoint: None,
             endpoint_id: None,
+            dispatch_cap: None,
             compactor_endpoint: None,
             record_context: None,
             live: None,
@@ -9654,7 +9810,32 @@ impl TailerState {
             self.endpoint.as_deref().unwrap_or_default(),
             self.endpoint_id.as_deref(),
         );
+        self.settle_dispatch_cap(m);
         self.emit_telemetry(darkmux_flow::FlowSource::Tokens, darkmux_flow::Payload::TelemetryTokens(tokens_payload));
+    }
+
+    /// (#3035) Settle one model call's spend into this dispatch's token cap,
+    /// warning once when the dispatch's total reaches it. A call that
+    /// reported no usage adds nothing (the cap counts what the endpoint said).
+    fn settle_dispatch_cap(&self, m: &darkmux_trajectory::ModelCompleted) {
+        let Some(bucket) = &self.dispatch_cap else { return };
+        // The prompt the container sent is not visible here; the granted
+        // per-call cap is what bounds a turn that reports no usage.
+        let granted = darkmux_types::config_access::max_tokens_per_call().unwrap_or(RUNTIME_MAX_TOKENS_PER_CALL);
+        let spent = crate::budget::conservative_spend(
+            darkmux_trajectory::UsageCounts::of(m.usage.as_ref()).total_tokens(),
+            granted,
+            "",
+        );
+        let caller = crate::budget::BudgetCaller {
+            session: &self.session,
+            execution: &self.execution,
+            role_id: Some(&self.role_id),
+            model: Some(&self.model),
+            phase_id: self.phase_id.as_deref(),
+            profiles_file: None,
+        };
+        crate::budget::settle_dispatch_live(bucket, spent, &self.role_id, &caller);
     }
 
     /// A tool call ran: its record, the finding or mod it emitted, and

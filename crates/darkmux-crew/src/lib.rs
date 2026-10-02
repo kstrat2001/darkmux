@@ -139,12 +139,10 @@ pub mod pace_file;
 // floor, and PAUSE a run in flight that crosses it. Consumes #2705's charge
 // telemetry. A machine with NO battery is never gated; see the module doc.
 pub mod power_policy;
-// (#1877 first extraction) The shared remote-token-bucket type — the
-// promotion of what was two hand-copied buckets (`step_kinds::MapRemoteBucket`
-// and `darkmux-lab`'s own `RemoteBucket`) into one public home both the
-// `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
+// (#3035) One dispatch's token cap, `endpoints.<id>.limits.tokens_per_dispatch`
+// (before 5.0: the per-step `remote.max_tokens_per_step` bucket, #1877).
 pub mod budget;
-pub mod remote_budget;
+pub mod dispatch_budget;
 pub mod retired_state;
 // (#2421) Mission-envelope records-emitted aggregation — see the module doc
 // for why this lives here rather than in `darkmux-serve`.

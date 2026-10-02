@@ -38,7 +38,7 @@ pub struct DispatchOpts {
     /// every record the dispatch emits carries that run without a lookup.
     pub session: SessionId,
     /// (#2480) Despite the name, this bounds ONLY the tool-less single-call
-    /// paths: `dispatch_remote`'s `curl -m <n>` on a hosted-endpoint call,
+    /// paths: `dispatch_unmanaged`'s `curl -m <n>` on a hosted-endpoint call,
     /// and `dispatch_local_single_shot`'s equivalent (the RADIO answering
     /// seat). The container-agentic path (`dispatch_internal::dispatch`,
     /// what `darkmux dispatch <role>` runs by default) never reads this
@@ -274,7 +274,7 @@ pub struct DispatchOpts {
     /// `DockerRunConfig::resume_checkpoint = true` so `--resume` reaches
     /// the container. `None` (every existing caller) preserves the
     /// fresh-start behavior exactly. A remote-endpoint dispatch never
-    /// reaches THIS gate at all — it forks to `dispatch_remote` before
+    /// reaches THIS gate at all — it forks to `dispatch_unmanaged` before
     /// this check runs — so it carries its OWN refusal instead (#2561,
     /// closed by #2580): both `dispatch()`'s remote fork and the
     /// `dispatch_local_single_shot` primitive refuse `resume_from` before
@@ -793,13 +793,13 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
 /// would resolve to a remote endpoint — the data-boundary question a caller
 /// that COMPOSES its own payload must answer before assembling it. Fails
 /// closed (unresolvable ⇒ `true`). See
-/// `dispatch_internal::dispatch_resolves_remote`'s own doc.
-pub fn dispatch_resolves_remote(
+/// `dispatch_internal::dispatch_resolves_unmanaged`'s own doc.
+pub fn dispatch_resolves_unmanaged(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
 ) -> bool {
-    crate::dispatch_internal::dispatch_resolves_remote(role_id, profile_name, config_path)
+    crate::dispatch_internal::dispatch_resolves_unmanaged(role_id, profile_name, config_path)
 }
 
 /// (#2917) The local LM Studio instance a dispatch would send to — see

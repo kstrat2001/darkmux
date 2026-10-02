@@ -902,6 +902,65 @@ darkmux release.
   reserved for that handoff and read by nothing yet, so it changes no admission
   decision.
 
+- **Limits belong to the endpoint, and the `remote` block is gone** (CONFIG 2.3,
+  #3035). "Remote" was the wrong axis: a local server on the same machine is an
+  endpoint too, and what matters is whether darkmux manages it.
+  `remote.max_tokens_per_step` (and its 4.0 name `remote.max_tokens_per_execution`),
+  `remote.step_budget_policy` and `remote.concurrent_cap` are retired, with
+  `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`, `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`,
+  `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP`.
+  A leftover `remote` key in `config.json` is refused at preflight by every
+  consuming entry point until you delete it, and `darkmux doctor` fails it;
+  `config set` refuses the old keys. A leftover `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` or
+  `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` is refused (ignoring a spend cap would
+  remove it); `DARKMUX_REMOTE_CONCURRENT_CAP` and `DARKMUX_REMOTE_STEP_BUDGET_POLICY`
+  only warn.
+  **Nothing is carried over: limits are off until you set them per endpoint.**
+  **Migration:** move `remote.max_tokens_per_step` to
+  `endpoints.<id>.limits.tokens_per_dispatch`, `remote.step_budget_policy` to
+  `endpoints.<id>.limits.policy`, and `remote.concurrent_cap` to
+  `endpoints.<id>.limits.concurrent_calls` in `profiles.json`, then delete the
+  `remote` block from `config.json` (and the env vars from your shell rc).
+  Behavior that changes with it:
+  - The token cap is **per dispatch** (one role execution) and applies to any
+    endpoint, managed or not, under the endpoint's `policy` (`warn` once a cap
+    is set, `off`, or `wait` for its rolling `window`). Each `dispatch.map` item
+    is one dispatch with its own cap; a container dispatch settles each model
+    call into its cap as it lands. A `dispatch.map` step's `bucket_group` and
+    `bucket_budget` are removed: a config naming either is refused, pointing at
+    the endpoint's `limits.window`, which is how a whole-run budget is written now.
+  - **An endpoint darkmux does not manage runs its calls one at a time** unless
+    it declares `limits.concurrent_calls` (`0` is unbounded), within one darkmux
+    process: two missions, radio or a fleet job at the same endpoint at once are
+    not serialized together. darkmux says so once per launch when it matters,
+    and never guesses a number. Different
+    endpoints no longer wait on each other. On a **managed** endpoint
+    `concurrent_calls` is refused at validation (preflight and doctor): the
+    scheduler owns its parallelism. The same number bounds how many fleet jobs
+    from other machines hold one endpoint at once.
+  - A **managed** endpoint's window and per-dispatch cap are enforced too. A
+    `wait` holds the dispatch and keeps its seat: between container turns it
+    reuses the thermal governor's pace file, and at the start or on a
+    single-shot call it is the existing polling gate.
+  - `policy: wait` with no `window` is refused (a dispatch's own spend never
+    expires, so nothing would free room). An inline `config.endpoint` object can
+    carry `tokens_per_dispatch` and `concurrent_calls`, and a window on one is
+    refused: name the endpoint under `endpoints` instead.
+  - `darkmux doctor`'s `endpoints` row shows each endpoint's limits, its
+    per-dispatch cap, how many of its calls run at once, and its window spend.
+  - The machine card is schema 1.2: `seats.hosted.cap` is gone (there is no
+    machine-wide hosted cap), and `/health`'s `fleet_busy` loses `hosted_cap`.
+    `run_step_graph` and `run_bounded` lose their `remote_cap` parameter.
+  - **"remote" and "hosted" are renamed out of the wire** (FLOW 2.0.0 and card 1.2
+    are unreleased, so no version moved): `budget.*` payload `scope` `step` is
+    `dispatch` and its `step` field is `dispatch`; `step start` `seat_class`
+    `remote_endpoint` is `unmanaged_endpoint`; `step result`
+    `remote_max_tokens_per_execution` is `tokens_per_dispatch`; the card's
+    `seats.hosted` is `seats.unmanaged` (an older card's `hosted` still reads);
+    an envelope's `remote_budgets` is `dispatch_budgets` (the old key still
+    reads, never written); `machine list` says `unmanaged N`; doctor's
+    `remote endpoint credentials` row is `unmanaged endpoint credentials`.
+
 - **`darkmux machine list --deep` is retired.** The card is the default content
   of `machine list`, so there is nothing to ask for; the flag is refused, naming
   that. **Migration:** drop the flag. A script that read `--json`'s `specs`,

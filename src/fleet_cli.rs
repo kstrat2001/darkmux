@@ -810,12 +810,9 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         },
         busy: crate::doctor::BusyFacts {
             running: daemon_health().as_ref().and_then(running_busy_settings),
-            configured: darkmux_types::config_access::fleet_busy_policy().ok().map(|policy| {
-                crate::doctor::BusySettings {
-                    policy,
-                    hosted_cap: darkmux_types::config_access::remote_concurrent_cap(),
-                }
-            }),
+            configured: darkmux_types::config_access::fleet_busy_policy()
+                .ok()
+                .map(|policy| crate::doctor::BusySettings { policy }),
         },
         local_machine: darkmux_flow::resolve_machine_id(),
         clock_skews: fleet_clock_skews(),
@@ -877,7 +874,6 @@ fn running_busy_settings(health: &serde_json::Value) -> Option<crate::doctor::Bu
     let busy = health.get("fleet_busy")?;
     Some(crate::doctor::BusySettings {
         policy: darkmux_types::config::BusyPolicy::parse(busy.get("policy")?.as_str()?)?,
-        hosted_cap: u32::try_from(busy.get("hosted_cap")?.as_u64()?).ok()?,
     })
 }
 
@@ -1344,16 +1340,13 @@ mod tests {
     /// settings; anything malformed is "no report", never a guess.
     #[test]
     fn the_running_busy_settings_are_read_from_health() {
-        let got = running_busy_settings(&serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": 3}}));
-        assert_eq!(
-            got,
-            Some(crate::doctor::BusySettings { policy: darkmux_types::config::BusyPolicy::Queue, hosted_cap: 3 })
-        );
+        let got = running_busy_settings(&serde_json::json!({"fleet_busy": {"policy": "queue"}}));
+        assert_eq!(got, Some(crate::doctor::BusySettings { policy: darkmux_types::config::BusyPolicy::Queue }));
         for bad in [
             serde_json::json!({}),
             serde_json::json!({"fleet_busy": null}),
-            serde_json::json!({"fleet_busy": {"policy": "sometimes", "hosted_cap": 1}}),
-            serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": -1}}),
+            serde_json::json!({"fleet_busy": {"policy": "sometimes"}}),
+            serde_json::json!({"fleet_busy": {"hosted_cap": 1}}),
         ] {
             assert_eq!(running_busy_settings(&bad), None, "{bad}");
         }

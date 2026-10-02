@@ -18,7 +18,6 @@
 //! Nothing in this module dispatches a model any more.
 
 use super::bundle::BundleSkipReport;
-use darkmux_crew::remote_budget::RemoteBudgetRecord;
 use darkmux_crew::run_outcome::RunOutcome;
 // (#1877 item 2) The run-record + run-observability substrate lives in
 // `darkmux-crew`; the run emitter aliases keep their review-era names.
@@ -278,6 +277,19 @@ pub struct NeedsCheckCluster {
 
 // ─── the envelope ─────────────────────────────────────────────────────────
 
+/// One bucket's outcome row in an archived review envelope (#1260; `stage` is
+/// the old review pipeline's label: `probe`, `judge-pass1`, ...). A READ type:
+/// nothing in production builds one, and an old envelope's rows still parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchBudgetRecord {
+    pub stage: String,
+    pub max_tokens: u64,
+    pub used_tokens: u64,
+    pub exhausted: bool,
+    /// Calls skipped because the bucket was exhausted (pre-4.0 only; always 0 now).
+    pub skipped_calls: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReviewEnvelope {
     pub case_id: String,
@@ -332,10 +344,10 @@ pub struct ReviewEnvelope {
     /// (#1260/#1177 — operator decision) Remote token-bucket accounting: one
     /// record per labeled bucket that made (or, before 4.0, skipped) at least
     /// one REMOTE call. Empty (and unserialized) on local-only runs. Since
-    /// #2902 step 5 a bucket is a per-step cap that never skips a call, so a
+    /// #2902 step 5 a bucket is a dispatch cap that never skips a call, so a
     /// new row's `skipped_calls` is 0; old envelopes still read.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_budgets: Vec<RemoteBudgetRecord>,
+    #[serde(default, alias = "remote_budgets", skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_budgets: Vec<DispatchBudgetRecord>,
     /// (#1299) The `needs_check` tier clustered by `(file, mechanism-family)`
     /// when it exceeded [`NEEDS_CHECK_CLUSTER_THRESHOLD`] — a renderer emits
     /// one "N related concerns" bullet per cluster instead of N raw ones, so
@@ -437,7 +449,7 @@ fn usize_is_zero(n: &usize) -> bool {
 ///   into the pre-#1876 behavior via `judge_gate_outcome`'s Gate 1) — the
 ///   SAME condition that has always meant "produced no signal."
 /// - [`RunOutcome::Partial`] — `env.degenerate` is `None` but at least one
-///   `remote_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
+///   `dispatch_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
 ///   carries `skipped_calls > 0`. Only an envelope recorded before 4.0 can
 ///   (#2902 step 5: no call is skipped for budget any more); it is kept so
 ///   those still read as they did. This is the #1876 fix's own case: the
@@ -455,7 +467,7 @@ pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
         return RunOutcome::Empty { reason: reason.clone() };
     }
     let reasons: Vec<String> = env
-        .remote_budgets
+        .dispatch_budgets
         .iter()
         // (#1876/#1877 QA follow-up) Exact stage names, not a `starts_with`
         // prefix — a future `judge-*` row that ISN'T one of the two real
@@ -484,10 +496,10 @@ pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
 /// (the pass-1 wording) would be factually wrong on both halves: the flags
 /// were judged, and `env.judged.len()` is the wrong denominator (pass-2's
 /// docket is pass-1's CONFIRMS, not the whole run).
-fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &RemoteBudgetRecord) -> String {
+fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &DispatchBudgetRecord) -> String {
     // (#1876/#1877 QA follow-up) "{used} of {max} tokens used" reads like a
     // typo when `used` overshoots `max` — which it routinely does, by
-    // design: the ceiling is SOFT (`RemoteBudget`'s own module doc), so a
+    // design: the ceiling is SOFT (`DispatchBudget`'s own module doc), so a
     // grant can land a reply that reports usage slightly above what was
     // admitted. "exceeded its N-token allowance" states the same fact
     // without inviting a "did you mean 500000 of 500497?" double-take.
@@ -560,11 +572,8 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
     RunOutcome::Complete
 }
 
-// (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
-// `darkmux_crew::remote_budget` (as `RemoteBudgetRecord`/`RemoteBudget`) —
-// the shared home for what used to be two hand-copied buckets. (#2902 step
-// 5) The bucket no longer clamps or skips, so the per-caller grant floors
-// (`MIN_VIABLE_MAP_GRANT`, and this pipeline's judge floor) are gone.
+// (#3035) The per-dispatch bucket (`DispatchBudget`) lives in `darkmux_crew::dispatch_budget`;
+// the pipeline's grant floors are gone with the funnel.
 
 // (#1877 item 2) `seat_identifier`/`seat_endpoint_host`/`seat_endpoint`/
 // `SeatStaffingSnapshot`/`StaffingSnapshot`/`staffing_snapshot` moved to

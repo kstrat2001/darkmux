@@ -232,7 +232,7 @@ fn config_near_miss_in_a_list_item_names_the_closest() {
 fn config_retired_keys_name_their_replacement() {
     let keys = config_keys(json!({"remote": {"max_tokens_per_execution": 5}, "dirs": {"notebook": "/x"}}));
     let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
-    assert!(msgs.iter().any(|m| m.contains("`remote.max_tokens_per_execution`: renamed to `remote.max_tokens_per_step`")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("`remote`: removed in 5.0") && m.contains("endpoints.<id>.limits")), "{msgs:?}");
     assert!(msgs.iter().any(|m| m.contains("`dirs.notebook`: removed in 4.0")), "{msgs:?}");
 }
 
@@ -457,7 +457,7 @@ fn a_file_path_cannot_forge_an_output_line() {
 /// Every `config.json` key a released darkmux ever had and this one does
 /// not, from `git log` of `config.rs`: each is named with what replaced it,
 /// never a near-miss guess (`orchestrator` used to read "did you mean
-/// `remote`?").
+/// `redis`?").
 #[test]
 fn every_historical_config_key_is_named_as_retired() {
     let doc = json!({
@@ -466,7 +466,7 @@ fn every_historical_config_key_is_named_as_retired() {
         "review": {"judge_concurrency": 2, "judge_fail_on_any_skip": true},
         "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r", "crew": "/c"},
         "radio": {"router_profile": "p"},
-        "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
+        "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn", "concurrent_cap": 2},
         "runtime": {"telemetry_record_every_samples": 5, "daemon_auth_enabled": true, "log_level": "debug"},
         "machine_rollup": {"enabled": true, "period_seconds": 60},
     });
@@ -474,9 +474,9 @@ fn every_historical_config_key_is_named_as_retired() {
     let not_retired: Vec<String> =
         keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
     assert!(not_retired.is_empty(), "{not_retired:#?}");
-    assert_eq!(keys.len(), 14, "{keys:#?}");
+    assert_eq!(keys.len(), 13, "the retired `remote` block is one key: {keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME", "`runtime.log_level`: removed in 5.0", "`machine_rollup`: removed in 5.0"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote`: removed in 5.0 (#3035)", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME", "`runtime.log_level`: removed in 5.0", "`machine_rollup`: removed in 5.0"] {
         assert!(msg.contains(says), "{says}: {msg}");
     }
 }

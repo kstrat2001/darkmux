@@ -70,7 +70,7 @@ pub struct DoctorReport {
 /// everything doctor can read for itself, and a check that needs root-crate
 /// state (which this crate cannot depend on) is invoked separately by `main.rs`
 /// with the state passed in and its result appended to the report. It is the
-/// same shape as `probe_remote_endpoints`, but taking an input.
+/// same shape as `probe_unmanaged_endpoints`, but taking an input.
 #[derive(Debug, Clone)]
 pub struct EmbeddedSkill {
     pub name: String,
@@ -188,7 +188,7 @@ pub fn run() -> DoctorReport {
         check_host_probe(),
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
-        check_remote_endpoint_credentials(),
+        check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -2645,9 +2645,9 @@ fn resolved_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
 }
 
-/// Settings RENAMED or RETIRED in 4.0 with no alias
+/// Settings RENAMED or RETIRED with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
-/// per-step cap's `remote.max_tokens_per_execution`, `DARKMUX_CREW_DIR`). A
+/// `remote.*` limits 5.0 moved to each endpoint, `DARKMUX_CREW_DIR`). A
 /// leftover env var is read by nothing; one whose loss would change behavior
 /// is refused by every command but `doctor` and `config` and fails this row,
 /// and one whose loss changes nothing is ignored with a warning and warns
@@ -2838,9 +2838,10 @@ fn check_step_command_timeout() -> Check {
 /// without reading `config.json`. Mirrors `check_step_command_timeout`'s
 /// provenance-display shape exactly.
 ///
-/// Said out loud in the message: this is NOT `remote.concurrent_cap`. The
-/// two were the same number before #2394 only because dispatch-free steps
-/// had no seat class of their own, which is the bug.
+/// Said out loud in the message: this is NOT an endpoint's
+/// `limits.concurrent_calls`. The two were the same number before #2394 only
+/// because dispatch-free steps had no seat class of their own, which is the
+/// bug.
 fn check_dispatch_free_concurrency() -> Check {
     let name = "runtime.dispatch_free_concurrency";
     let env_set = std::env::var("DARKMUX_DISPATCH_FREE_CONCURRENCY")
@@ -2864,7 +2865,7 @@ fn check_dispatch_free_concurrency() -> Check {
         message: format!(
             "{n} ({provenance}) — dispatch-free steps (procedural.shell/noop, mods.gate, \
              records.gather, deliver.github_review) run this many at a time, on their own \
-             track; the hosted-endpoint cap (remote.concurrent_cap) does not govern them"
+             track; an endpoint's limits.concurrent_calls does not govern them"
         ),
         hint: None,
     }
@@ -4157,8 +4158,8 @@ fn describe_host_probe(
 /// own `security find-generic-password -s <keychain>` invocation exactly,
 /// so this validates the SAME lookup the real dispatch path performs, not
 /// an approximation of it — no `-a $USER`, no `-w`).
-fn check_remote_endpoint_credentials() -> Check {
-    let name = "remote endpoint credentials";
+fn check_unmanaged_endpoint_credentials() -> Check {
+    let name = "unmanaged endpoint credentials";
     let registry = match profiles::load_registry(None) {
         Ok(r) => r,
         Err(e) => {
@@ -4166,7 +4167,7 @@ fn check_remote_endpoint_credentials() -> Check {
                 name: name.into(),
                 status: Status::Warn,
                 message: format!(
-                    "can't check remote endpoint credentials (profile registry load failed: {e:#})"
+                    "can't check unmanaged endpoint credentials (profile registry load failed: {e:#})"
                 ),
                 hint: None,
             };
@@ -4295,32 +4296,46 @@ fn check_endpoints() -> Check {
     }
 }
 
-/// The budget half of one endpoint's line.
+/// The per-dispatch cap half of an endpoint's line (#3035), empty when none.
+fn dispatch_cap_note(limits: Option<&darkmux_types::UsageLimits>) -> String {
+    let Some(cap) = limits.and_then(|l| l.dispatch_cap()) else { return String::new() };
+    let policy = limits.and_then(|l| l.resolved_policy().ok()).unwrap_or(darkmux_types::BudgetPolicy::Off);
+    format!("; per-dispatch cap {cap} tokens ({})", if policy.counts() { "warn" } else { "off" })
+}
+
+/// How many of an endpoint's calls run at once (#3035): the scheduler's call
+/// on a managed endpoint, the declared `concurrent_calls` (one at a time when
+/// absent) on an unmanaged one.
+fn concurrency_note(kind: darkmux_types::EndpointKind, limits: Option<&darkmux_types::UsageLimits>) -> String {
+    match (kind.is_managed(), limits.and_then(|l| l.concurrent_calls)) {
+        (true, _) => "; parallelism is the scheduler's".to_string(),
+        (false, None) => "; calls run one at a time (no limits.concurrent_calls)".to_string(),
+        (false, Some(0)) => "; calls run unbounded in parallel (limits.concurrent_calls 0)".to_string(),
+        (false, Some(n)) => format!("; up to {n} calls at once"),
+    }
+}
+
+/// The limits half of one endpoint's line (#3035): the per-dispatch cap, how
+/// many of its calls run at once, and the window budget with its spend.
 fn endpoint_budget_note(
     id: &str,
     ep: &darkmux_types::ModelEndpoint,
     spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
 ) -> String {
-    let Some(limits) = ep.known_limits() else { return String::new() };
-    let unenforced = match (limits.tokens_per_dispatch.is_some(), limits.concurrent_calls.is_some()) {
-        (false, false) => "",
-        _ => " (tokens_per_dispatch and concurrent_calls are shown, not enforced)",
-    };
+    let Ok(kind) = ep.kind() else { return String::new() };
+    let limits = ep.known_limits();
+    let mut notes = dispatch_cap_note(limits);
+    notes.push_str(&concurrency_note(kind, limits));
+    let Some(limits) = limits else { return notes };
+    let window_set = limits.window.as_ref().is_some_and(|w| w.is_set());
     let mut named = ep.clone();
     named.source = darkmux_types::EndpointSource::Named(id.to_string());
-    match darkmux_crew::budget::EndpointBudget::of(&named) {
+    notes.push_str(&match darkmux_crew::budget::EndpointBudget::of(&named) {
         Err(_) => String::new(), // the Fail row names it
-        Ok(None) if ep.kind().is_ok_and(|k| k.is_managed()) && limits.window.as_ref().is_some_and(|w| w.is_set()) => {
-            format!("; window budget not enforced on a managed endpoint (budgets apply to calls sent to an endpoint darkmux does not manage){unenforced}")
-        }
         Ok(None) => match limits.resolved_policy() {
-            Ok(darkmux_types::BudgetPolicy::Off) if limits.window.as_ref().is_some_and(|w| w.is_set()) => {
-                format!("; budget off (nothing is counted){unenforced}")
-            }
-            _ if limits.window.as_ref().is_some_and(|w| w.is_set()) => {
-                format!("; window budget unusable (its period does not parse){unenforced}")
-            }
-            _ => format!("; no window budget{unenforced}"),
+            Ok(darkmux_types::BudgetPolicy::Off) if window_set => "; window budget off (nothing is counted)".to_string(),
+            _ if window_set => "; window budget unusable (its period does not parse)".to_string(),
+            _ => "; no window budget".to_string(),
         },
         Ok(Some(b)) => {
             let entries = spend(&b);
@@ -4334,13 +4349,10 @@ fn endpoint_budget_note(
             };
             let policy = darkmux_types::config_enum::ConfigEnum::token(b.policy);
             let warn_at = b.warn_at.map(|f| format!(", early warning at {:.0}%", f * 100.0)).unwrap_or_default();
-            format!(
-                "; budget {policy}{warn_at}: {spent} in {} calls over the last {}{unenforced}",
-                entries.len(),
-                b.period
-            )
+            format!("; budget {policy}{warn_at}: {spent} in {} calls over the last {}", entries.len(), b.period)
         }
-    }
+    });
+    notes
 }
 
 /// Pure decision for [`check_endpoints`]; `spend` reads one budget's window.
@@ -4404,20 +4416,20 @@ fn endpoints_status(
 /// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
 /// Opt-in via `darkmux doctor --probe` because each probe is a real API
 /// call: a paid endpoint bills a few tokens per probe. The offline
-/// `remote endpoint credentials` check proves the Keychain item EXISTS;
+/// `unmanaged endpoint credentials` check proves the Keychain item EXISTS;
 /// this proves the whole chain WORKS — DNS, TLS, credential validity,
 /// deployment routing, api-version — by driving one minimal chat
 /// completion through the exact URL/auth/POST path a real hosted
 /// dispatch uses. One probe per distinct (url, model) pair: profiles
 /// that share an endpoint declaration are probed once, not billed once
 /// per profile.
-pub fn probe_remote_endpoints() -> Vec<Check> {
+pub fn probe_unmanaged_endpoints() -> Vec<Check> {
     const PROBE_TIMEOUT_SECONDS: u32 = 30;
     let registry = match profiles::load_registry(None) {
         Ok(r) => r,
         Err(e) => {
             return vec![Check {
-                name: "probe: remote endpoints".into(),
+                name: "probe: unmanaged endpoints".into(),
                 status: Status::Warn,
                 message: format!(
                     "can't probe remote endpoints (profile registry load failed: {e:#})"
@@ -4458,7 +4470,7 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
                 continue; // identical endpoint declaration already probed this run
             }
             let name = format!("probe: {profile_name}/{}", model.id);
-            match darkmux_crew::dispatch_internal::probe_remote_endpoint(
+            match darkmux_crew::dispatch_internal::probe_unmanaged_endpoint(
                 ep,
                 &model.id,
                 PROBE_TIMEOUT_SECONDS,
@@ -4501,7 +4513,7 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
 
     if checks.is_empty() {
         checks.push(Check {
-            name: "probe: remote endpoints".into(),
+            name: "probe: unmanaged endpoints".into(),
             status: Status::Pass,
             message: "no profile models declare a remote endpoint — nothing to probe".into(),
             hint: None,
@@ -9129,7 +9141,7 @@ mod tests {
         assert!(check.message.contains('8'), "{}", check.message);
         assert!(check.message.contains("default"), "provenance named: {}", check.message);
         assert!(
-            check.message.contains("remote.concurrent_cap"),
+            check.message.contains("limits.concurrent_calls"),
             "the message must say WHICH cap does not govern these steps — that confusion IS \
              the #2394 bug: {}",
             check.message
@@ -11718,21 +11730,26 @@ mod tests {
         r
     }
 
-    /// A leftover renamed or retired env var fails, named with its exact
-    /// rename; nothing set passes. (A leftover old `config.json` key is an
-    /// unknown key, failed by the user-file keys row.)
+    /// (#3035) A leftover `remote.*` env var names the `endpoints.<id>.limits`
+    /// field that replaced it. The two spend-cap vars FAIL (the command is
+    /// refused: ignoring a cap removes it); the concurrency and policy vars
+    /// only warn (ignoring them is slower or quieter, never unsafe). Nothing
+    /// set passes. (A leftover old `config.json` key is
+    /// an unknown key, failed by the user-file keys row.)
     #[test]
-    fn renamed_budget_settings_are_named_with_the_exact_rename() {
-        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
-        let c = renamed_settings_status(&env);
-        assert_eq!(c.status, Status::Fail, "{}", c.message);
-        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is refused"), "{}", c.message);
-        assert!(
-            c.message.contains("delete it unless you chose that number (500000 was darkmux's old default)"),
-            "{}",
-            c.message
-        );
-        assert!(c.message.contains("set remote.max_tokens_per_step only if you want one"), "{}", c.message);
+    fn retired_remote_env_vars_warn_naming_the_endpoint_limit() {
+        for (var, field, status, verdict) in [
+            ("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "limits.tokens_per_dispatch", Status::Fail, "is refused"),
+            ("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "limits.tokens_per_dispatch", Status::Fail, "is refused"),
+            ("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "limits.policy", Status::Warn, "is ignored"),
+            ("DARKMUX_REMOTE_CONCURRENT_CAP", "limits.concurrent_calls", Status::Warn, "is ignored"),
+        ] {
+            let env = |k: &str| (k == var).then(|| "5".to_string());
+            let c = renamed_settings_status(&env);
+            assert_eq!(c.status, status, "{var}: {}", c.message);
+            assert!(c.message.contains(&format!("env var {var} (5) {verdict}")), "{}", c.message);
+            assert!(c.message.contains(field) && c.message.contains("endpoints.<id>"), "{}", c.message);
+        }
         assert_eq!(renamed_settings_status(&|_| None).status, Status::Pass);
     }
 
@@ -11763,8 +11780,8 @@ mod tests {
 
     /// (#2902 steps 4 and 5) `endpoints` lists what each declared endpoint
     /// is, by name only (never a secret), with its budget policy and the
-    /// spend in its rolling window; the per-dispatch and concurrency limits
-    /// are marked not enforced.
+    /// spend in its rolling window, its per-dispatch cap, and how many of its
+    /// calls run at once (#3035).
     #[test]
     fn endpoints_check_lists_each_endpoint_with_its_budget_and_window_spend() {
         let r = materialized(
@@ -11790,8 +11807,14 @@ mod tests {
             "absent policy + a set budget = warn, with the window's spend: {}",
             c.message
         );
-        assert!(c.message.contains("shown, not enforced"), "{}", c.message);
+        assert!(
+            c.message.contains("per-dispatch cap 500000 tokens (warn)")
+                && c.message.contains("calls run one at a time (no limits.concurrent_calls)"),
+            "the cap and the serial default are both said: {}",
+            c.message
+        );
         assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
+        assert!(c.message.contains("parallelism is the scheduler's"), "{}", c.message);
         assert_eq!(asked, vec!["azure".to_string()], "only a counting budget reads the window");
         let floor = endpoints_status(&r, &mut |_| vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::partial(500))]);
         assert!(
@@ -11799,6 +11822,37 @@ mod tests {
             "an unknown spend is a floor, never a small number: {}",
             floor.message
         );
+    }
+
+    /// (#3035) A managed endpoint's window and cap are enforced like any
+    /// other, and a declared `concurrent_calls` is shown as how many calls run
+    /// at once; `concurrent_calls` on a managed endpoint is a Fail naming the
+    /// scheduler.
+    #[test]
+    fn endpoints_check_shows_limits_on_a_managed_endpoint_and_declared_concurrency() {
+        let r = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1,"endpoint":"lms"},{"id":"g","endpoint":"azure"}]}},
+                "endpoints":{
+                    "lms":{"managed":"lmstudio","limits":{"tokens_per_dispatch":9000,"window":{"period":"1h","tokens":100000}}},
+                    "azure":{"url":"https://h.example/v1","limits":{"concurrent_calls":3}}}}"#,
+        );
+        let mut asked = Vec::new();
+        let c = endpoints_status(&r, &mut |b| {
+            asked.push(b.endpoint_id.clone());
+            vec![(1, darkmux_crew::budget::Spend::full(40_000))]
+        });
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert_eq!(asked, vec!["lms".to_string()], "the managed endpoint's window is read: {}", c.message);
+        assert!(c.message.contains("per-dispatch cap 9000 tokens (warn)") && c.message.contains("spent 40000 tokens"), "{}", c.message);
+        assert!(!c.message.contains("not enforced"), "{}", c.message);
+        assert!(c.message.contains("up to 3 calls at once"), "{}", c.message);
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1,"endpoint":"lms"}]}},
+                "endpoints":{"lms":{"managed":"lmstudio","limits":{"concurrent_calls":2}}}}"#,
+        );
+        let c = endpoints_status(&bad, &mut no_spend);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("endpoints.lms.limits") && c.message.contains("scheduler"), "{}", c.message);
     }
 
     /// (#2902 step 5) An unregistered budget policy is Fail, naming the raw
@@ -11820,7 +11874,7 @@ mod tests {
                 "endpoints":{"e":{"url":"https://h.example/v1","limits":{"policy":"off","window":{"period":"1d","tokens":5}}}}}"#,
         );
         let c = endpoints_status(&off, &mut |_| panic!("an `off` budget must not read the window"));
-        assert!(c.message.contains("budget off (nothing is counted)"), "{}", c.message);
+        assert!(c.message.contains("window budget off (nothing is counted)"), "{}", c.message);
         // (review M2) Unreadable limits are Fail too, by path, never "no budget".
         let typo = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
@@ -15501,11 +15555,11 @@ mod tests {
         assert!(text.contains("profiles.p.models[1].endpoint"), "{text}");
     }
 
-    // ─── #85/#91: check_remote_endpoint_credentials tests ───────
+    // ─── #85/#91: check_unmanaged_endpoint_credentials tests ───────
 
     #[serial_test::serial]
     #[test]
-    fn check_remote_endpoint_credentials_passes_when_no_endpoint_declared() {
+    fn check_unmanaged_endpoint_credentials_passes_when_no_endpoint_declared() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         let registry_json = r#"{
             "profiles": {
@@ -15516,14 +15570,14 @@ mod tests {
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let check = check_remote_endpoint_credentials();
+        let check = check_unmanaged_endpoint_credentials();
         assert_eq!(check.status, Status::Pass);
         assert!(check.message.contains("no profile models declare a remote endpoint"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_remote_endpoint_credentials_passes_when_endpoint_has_no_auth() {
+    fn check_unmanaged_endpoint_credentials_passes_when_endpoint_has_no_auth() {
         // A remote endpoint with no auth block at all (e.g. an
         // unauthenticated proxy) is valid and must not be flagged —
         // `auth_type.is_none()` skips it entirely (not even counted).
@@ -15542,14 +15596,14 @@ mod tests {
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let check = check_remote_endpoint_credentials();
+        let check = check_unmanaged_endpoint_credentials();
         assert_eq!(check.status, Status::Pass);
         assert!(check.message.contains("no profile models declare a remote endpoint"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_remote_endpoint_credentials_warns_when_keychain_field_missing() {
+    fn check_unmanaged_endpoint_credentials_warns_when_keychain_field_missing() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         let registry_json = r#"{
             "profiles": {
@@ -15568,7 +15622,7 @@ mod tests {
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let check = check_remote_endpoint_credentials();
+        let check = check_unmanaged_endpoint_credentials();
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("endpoint `azure`"), "{}", check.message);
         // (#1312) The message now names BOTH credential sources (keychain OR
@@ -15580,7 +15634,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_remote_endpoint_credentials_warns_when_keychain_item_absent() {
+    fn check_unmanaged_endpoint_credentials_warns_when_keychain_item_absent() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         let registry_json = r#"{
             "profiles": {
@@ -15602,7 +15656,7 @@ mod tests {
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let check = check_remote_endpoint_credentials();
+        let check = check_unmanaged_endpoint_credentials();
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("not found on this machine"));
         let hint = check.hint.as_deref().unwrap_or("");
@@ -15611,7 +15665,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_remote_endpoint_credentials_satisfied_by_present_key_env() {
+    fn check_unmanaged_endpoint_credentials_satisfied_by_present_key_env() {
         // (#1312) A declared `key_env` var that is PRESENT in the environment
         // satisfies the credential — even with a bogus/absent keychain item.
         let var = "DARKMUX_DOCTOR_TEST_KEY_ENV_1312";
@@ -15642,7 +15696,7 @@ mod tests {
         );
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let check = check_remote_endpoint_credentials();
+        let check = check_unmanaged_endpoint_credentials();
         assert_eq!(check.status, Status::Pass, "present key_env should satisfy: {}", check.message);
 
         unsafe {
@@ -15660,11 +15714,11 @@ mod tests {
         ));
     }
 
-    // ─── #1177: doctor --probe (probe_remote_endpoints) ─────────────
+    // ─── #1177: doctor --probe (probe_unmanaged_endpoints) ─────────────
 
     #[serial_test::serial]
     #[test]
-    fn probe_remote_endpoints_reports_nothing_to_probe() {
+    fn probe_unmanaged_endpoints_reports_nothing_to_probe() {
         let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
         let registry_json = r#"{
             "profiles": {
@@ -15675,7 +15729,7 @@ mod tests {
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let checks = probe_remote_endpoints();
+        let checks = probe_unmanaged_endpoints();
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, Status::Pass);
         assert!(checks[0].message.contains("nothing to probe"));
@@ -15683,7 +15737,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn probe_remote_endpoints_probes_once_per_distinct_endpoint_and_reports_cost() {
+    fn probe_unmanaged_endpoints_probes_once_per_distinct_endpoint_and_reports_cost() {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -15737,7 +15791,7 @@ mod tests {
         );
         std::fs::write(&config_path, registry_json).unwrap();
 
-        let checks = probe_remote_endpoints();
+        let checks = probe_unmanaged_endpoints();
         assert_eq!(checks.len(), 1, "shared endpoint+model probes exactly once");
         assert_eq!(checks[0].status, Status::Pass);
         assert!(checks[0].message.contains("round-trip ok"), "{}", checks[0].message);

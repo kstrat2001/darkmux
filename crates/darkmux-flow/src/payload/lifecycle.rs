@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 pub enum SeatClass {
     /// A local model, placed and leased.
     LocalModel,
-    /// A hosted endpoint.
-    RemoteEndpoint,
+    /// A seat on an endpoint darkmux does not manage.
+    UnmanagedEndpoint,
     /// No model at all.
     NoModel,
     /// A local model whose placement could not be resolved: it runs with no wave load and no
@@ -208,10 +208,10 @@ pub struct StepResultPayload {
     /// The step kind, or the coder-phase step (`mission.worktree`, `mission.coder`,
     /// `mission.verify`).
     pub kind: String,
-    /// A hosted single-shot's per-step cap.
+    /// A hosted single-shot's per-dispatch cap (`limits.tokens_per_dispatch`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
-    pub remote_max_tokens_per_execution: Option<u64>,
+    pub tokens_per_dispatch: Option<u64>,
     /// What the step asked the endpoint for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
@@ -343,7 +343,7 @@ impl StepResultPayload {
         Self {
             step_id: step_id.to_string(),
             kind: kind.to_string(),
-            remote_max_tokens_per_execution: None,
+            tokens_per_dispatch: None,
             max_tokens_requested: None,
             max_tokens_sent: None,
             prompt_tokens: None,
@@ -636,8 +636,8 @@ impl Attribution for GhVerbExecutedPayload {}
 pub enum BudgetScope {
     /// An endpoint's rolling-window budget.
     Endpoint,
-    /// A step's per-step cap.
-    Step,
+    /// A dispatch's token cap (`limits.tokens_per_dispatch`).
+    Dispatch,
     /// A value this build does not name, read from an archive written by another version.
     /// Never written.
     #[serde(other)]
@@ -694,7 +694,7 @@ pub enum BreachLevel {
     Unknown,
 }
 
-/// An endpoint budget or a per-step cap acted: the payload of `budget.warn`, `budget.wait`,
+/// An endpoint budget or a dispatch's token cap acted: the payload of `budget.warn`, `budget.wait`,
 /// `budget.resume` and `budget.stop`. One type for the four: `scope` and `message` are always
 /// there; the rest belongs to the action and the scope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -708,10 +708,10 @@ pub struct BudgetPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub endpoint_id: Option<String>,
-    /// On a per-step cap: the step.
+    /// On a dispatch's token cap: the dispatch (a role id, or a step id for a step's own call).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub step: Option<String>,
+    pub dispatch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub policy: Option<BudgetPolicyKind>,

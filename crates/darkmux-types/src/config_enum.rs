@@ -35,9 +35,8 @@
 //! **Adding an enum setting** is: implement [`ConfigEnum`] with
 //! [`config_enum!`], add an [`EnumSetting::of`] entry to [`ENUM_SETTINGS`],
 //! and write the typed accessor as a one-line call to
-//! `config_access::resolve_enum`. Nothing else. The per-step cap's
-//! `remote.step_budget_policy` (#2902 step 5) is exactly those three lines
-//! plus a `Scope` list. The conformance tests below iterate the
+//! `config_access::resolve_enum`. Nothing else. `fleet.mode` is exactly those
+//! three lines plus a `Scope` list. The conformance tests below iterate the
 //! registry, so the new entry inherits the preflight/doctor/config-set/help
 //! assertions without a test of its own, and `every_enum_in_the_config_schema_is_registered`
 //! fails until an enum declared in the config schema is registered.
@@ -505,7 +504,7 @@ pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|
 /// written: unreadable (one mistyped field, `"tokens": "2M"`, makes the whole
 /// value unreadable, and an unreadable budget must never silently count
 /// nothing), or readable but invalid (a set window whose `period` does not
-/// parse, `warn_at` outside (0, 1)). An unregistered `policy` in readable
+/// parse, `warn_at` outside (0, 1), `concurrent_calls` on a managed endpoint). An unregistered `policy` in readable
 /// limits is [`bad_endpoint_budget_policies`]'s, not this. Covers
 /// `endpoints.<id>`.
 pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
@@ -520,7 +519,7 @@ pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetti
                 if l.resolved_policy().is_err() {
                     return None; // bad_endpoint_budget_policies names it
                 }
-                l.validate().err()
+                l.validate().err().or_else(|| ep.concurrent_calls_allowed().err())
             }
         }
     }
@@ -653,9 +652,6 @@ fn read_thermal_pause_at(c: &DarkmuxConfig) -> Option<&str> {
 fn read_thermal_resume_at(c: &DarkmuxConfig) -> Option<&str> {
     c.runtime.as_ref()?.thermal.as_ref()?.resume_at.as_deref()
 }
-fn read_remote_step_budget_policy(c: &DarkmuxConfig) -> Option<&str> {
-    c.remote.as_ref()?.step_budget_policy.as_deref()
-}
 fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.mode.as_deref()
 }
@@ -719,15 +715,6 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fair",
         DISPATCHING,
         read_thermal_resume_at,
-    ),
-    // (#2902 step 5) The per-step cap's policy (`off` / `warn`). Shipped
-    // `warn`: with no cap set (the shipped state) nothing is counted.
-    EnumSetting::of::<crate::config::StepBudgetPolicy>(
-        "remote.step_budget_policy",
-        Some("DARKMUX_REMOTE_STEP_BUDGET_POLICY"),
-        "warn",
-        DISPATCHING,
-        read_remote_step_budget_policy,
     ),
     EnumSetting::of::<crate::config::FleetMode>(
         "fleet.mode",
@@ -972,7 +959,6 @@ mod tests {
         check::<crate::endpoint::ManagedBackend>();
         check::<crate::endpoint::Dialect>();
         check::<crate::endpoint::BudgetPolicy>();
-        check::<crate::config::StepBudgetPolicy>();
     }
 
     /// The production half of a source file: everything before its test

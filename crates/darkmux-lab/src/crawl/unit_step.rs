@@ -1058,19 +1058,19 @@ impl StepKind for DispatchUnitStepKind {
 
     /// (#2321, #2394) Declare what the unit consumes, in the terms the
     /// scheduler's wave packer reads. Before #2394 a kind could stay silent
-    /// here and was queued as a REMOTE job under `remote_cap` (1 on the launch
-    /// path), which is how sibling units of one plan ran strictly one at a
-    /// time on an already-resident model — 3× the wall-clock of the same three
+    /// here and was queued as an unmanaged-endpoint job, one at a time, which
+    /// is how sibling units of one plan ran strictly one at a time on an
+    /// already-resident model — 3× the wall-clock of the same three
     /// units wave-packed; `seat` is now required, so silence is a compile
     /// error. The dispatch below runs the Task's OWN `role_id` (#2310 P4c —
     /// see `run`'s own doc) with no explicit profile (`profile_name: None`),
     /// which the dispatch resolves as `role_profiles.<role>` first,
     /// `default_profile` second — and `resolve_local_seat` resolves the very
     /// same way (#2329 review), so the wave leases the model the dispatch will
-    /// actually use. An endpoint-bearing profile is `RemoteEndpoint`; a
+    /// actually use. An unmanaged-endpoint profile is `UnmanagedEndpoint`; a
     /// registry that cannot resolve yields `LocalModelUnresolved { reason }`,
     /// which the scheduler reports loudly (a `step seat unresolved` record)
-    /// and runs under the remote cap; the dispatch then surfaces the real
+    /// and runs one at a time; the dispatch then surfaces the real
     /// error itself.
     fn seat(
         &self,
@@ -1346,7 +1346,7 @@ impl StepKind for DispatchUnitStepKind {
                 message: message.clone(),
                 session: draw_session_id.clone(),
                 // (#2542) This field bounds ONLY the tool-less single-call
-                // paths (`dispatch_remote`'s `curl -m`, the single-shot
+                // paths (`dispatch_unmanaged`'s `curl -m`, the single-shot
                 // path) — see `DispatchOpts::timeout_seconds`'s own doc.
                 // Every shipped crawl-unit role is tool-granting and runs in
                 // a container, the ONE path that field never reaches, so it

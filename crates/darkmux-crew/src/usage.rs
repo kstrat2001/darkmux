@@ -38,7 +38,7 @@
 //! seam both single-shot transports return):
 //!
 //! - the container path's per-turn tailer (`dispatch_internal`, `"turn"`)
-//! - `dispatch_remote` and `dispatch_local_single_shot` (`"single_shot"`)
+//! - `dispatch_unmanaged` and `dispatch_local_single_shot` (`"single_shot"`)
 //! - the `dispatch.single_shot` step kind, both arms (`"single_shot"`)
 //! - `dispatch.map`, one record per model call of each item, retries included
 //!   (`"map_item"`, via `map_call_token_payload`)
@@ -193,7 +193,7 @@ pub fn utility_marker_record(job_role_id: &str, model: &str, payload: darkmux_fl
 pub struct CallFacts<'a> {
     pub call_kind: CallKind,
     /// (#2914) The role the call ran for, when the call site runs one (the
-    /// container path, `dispatch_remote`, `dispatch_local_single_shot`); a
+    /// container path, `dispatch_unmanaged`, `dispatch_local_single_shot`); a
     /// `dispatch.single_shot`/`dispatch.map` STEP runs no role (`None`).
     /// Read only by [`call_purpose`].
     pub role_id: Option<&'a str>,

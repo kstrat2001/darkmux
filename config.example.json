@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.2",
+  "schema_version": "2.3",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -64,11 +64,6 @@
         "answerer_profile": ""
       }
     }
-  },
-  "remote": {
-    "max_tokens_per_step": null,
-    "step_budget_policy": null,
-    "concurrent_cap": 1
   },
   "power": {
     "min_battery_pct": 50,

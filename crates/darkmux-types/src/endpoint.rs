@@ -121,9 +121,9 @@ crate::config_enum!(Dialect, "endpoint dialect", [
 
 /// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
 /// Registered on the #2947 `ConfigEnum` rule: an unregistered value is
-/// refused at preflight, never resolved to a fallback. (`wait` is an
-/// endpoint budget's value only: the per-step cap, `remote.step_budget_policy`,
-/// has `off` and `warn`, `config::StepBudgetPolicy`.)
+/// refused at preflight, never resolved to a fallback. `wait` governs the
+/// rolling `window` only (a dispatch's own spend never expires, so nothing
+/// would free room under `tokens_per_dispatch`); there the cap warns.
 ///
 /// There is deliberately no action that stops a run: a hard stop is the
 /// operator's own `darkmux mission abort`.
@@ -154,36 +154,47 @@ impl BudgetPolicy {
     }
 }
 
-/// Standard usage limits for one endpoint.
+/// Standard usage limits for one endpoint, managed or not (#3035: "remote"
+/// was the wrong axis, so the old `remote.*` knobs live here, per endpoint).
 ///
-/// **What is enforced (#2902 step 5).** The rolling `window` budget
-/// (`tokens`, `calls`, or both, over `period`), under `policy` (`off` /
-/// `warn` / `wait`, see [`BudgetPolicy`]), with an optional early warning
-/// at `warn_at` (a fraction of the budget). Enforcement applies to an
-/// endpoint darkmux does not manage (the calls it SENDS), declared in the
-/// `endpoints` map and named by id, because the usage records it sums are
-/// keyed by that id (`endpoint_id`).
+/// **Spend limits apply to any endpoint.** `tokens_per_dispatch` caps what
+/// ONE dispatch (one role execution) may spend there; `window` is a rolling
+/// budget (`tokens`, `calls`, or both, over `period`) summed from this
+/// machine's usage records, which carry the endpoint's id (`endpoint_id`),
+/// so the endpoint must be declared in the `endpoints` map and named by id.
+/// `policy` (`off` / `warn` / `wait`, see [`BudgetPolicy`]) says what a
+/// breach does, and absent means `warn` once a budget is set; with none,
+/// nothing is counted. `warn_at` is an early warning at a fraction of the
+/// `window` budget. Under `wait` a dispatch that finds the window full
+/// pauses in place, holding its seat, until the window has room.
 ///
-/// **What is not.** `tokens_per_dispatch` and `concurrent_calls` are parsed,
-/// validated and shown by `darkmux doctor`, and change nothing:
-/// `remote.max_tokens_per_step` (the per-step cap) and
-/// `remote.concurrent_cap` still apply. Whether the per-endpoint pair
-/// replaces those two is not decided (#2902).
+/// **`concurrent_calls` is for an endpoint darkmux does NOT manage.** It is
+/// how many calls to it run at once; absent, they run one at a time and
+/// darkmux says so once per launch (it never guesses a number). On a managed
+/// endpoint darkmux's scheduler owns parallelism (residency and the
+/// backend's parallel slots), so declaring it there is refused
+/// ([`ModelEndpoint::validate`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UsageLimits {
-    /// Tokens one dispatch (one execution) may spend at this endpoint. Not
-    /// enforced (see the type doc).
+    /// Tokens one dispatch (one role execution) may spend at this endpoint,
+    /// managed or not. Reaching it is surfaced once (`warn`) and the dispatch
+    /// keeps going; `0` is no cap (a `0` bound is unbounded, never
+    /// "instantly"). A whole-run budget is `window`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_per_dispatch: Option<u64>,
-    /// Calls in flight at once. Not enforced (see the type doc).
+    /// Calls in flight at once, on an endpoint darkmux does not manage;
+    /// refused on a managed one. Absent: one at a time, within ONE darkmux
+    /// process (two missions, radio or a fleet job at the same endpoint are not
+    /// serialized together). `0` is unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrent_calls: Option<u32>,
     /// A budget over a rolling period of time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<UsageWindow>,
     /// What a breach does. Absent: `warn` once a budget is set (with no
-    /// budget set, nothing is counted either way). Read leniently: an
-    /// unknown value is kept and refused by name at preflight.
+    /// budget set, nothing is counted either way). `wait` needs a `window`.
+    /// Read leniently: an unknown value is kept and refused by name at
+    /// preflight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<Lenient<BudgetPolicy>>,
     /// An early warning at this fraction of the budget (e.g. `0.8`), ahead
@@ -262,6 +273,17 @@ impl UsageLimits {
         parts.join(" · ")
     }
 
+    /// True when any spend budget is set: the rolling `window`, or a
+    /// per-dispatch cap (a `0` cap is no cap).
+    pub fn has_budget(&self) -> bool {
+        self.window.as_ref().is_some_and(UsageWindow::is_set) || self.dispatch_cap().is_some()
+    }
+
+    /// The per-dispatch token cap, when one is set (`0` is none).
+    pub fn dispatch_cap(&self) -> Option<u64> {
+        self.tokens_per_dispatch.filter(|n| *n > 0)
+    }
+
     /// The window budget, when one is set and its period parses.
     pub fn window_budget(&self) -> Option<WindowBudget> {
         let w = self.window.as_ref().filter(|w| w.is_set())?;
@@ -269,29 +291,44 @@ impl UsageLimits {
     }
 
     /// The policy in force. Written: that value (an unregistered one is an
-    /// error naming it). Absent: `warn` when a window budget is set, `off`
-    /// otherwise, so a budget the operator writes warns by default and no
-    /// budget counts nothing.
+    /// error naming it). Absent: `warn` when a budget is set (a window or a
+    /// per-dispatch cap), `off` otherwise, so a budget the operator writes
+    /// warns by default and no budget counts nothing.
     pub fn resolved_policy(&self) -> Result<BudgetPolicy, String> {
         match &self.policy {
             Some(Lenient::Known(p)) => Ok(*p),
             Some(Lenient::Unrecognized(raw)) => Err(raw.as_str().map(str::to_string).unwrap_or_else(|| raw.to_string())),
-            None if self.window.as_ref().is_some_and(UsageWindow::is_set) => Ok(BudgetPolicy::Warn),
+            None if self.has_budget() => Ok(BudgetPolicy::Warn),
             None => Ok(BudgetPolicy::Off),
         }
+    }
+
+    /// A counting policy needs a budget to govern, and `wait` needs a rolling
+    /// window (a dispatch's own spend never expires, so nothing would free
+    /// room under `tokens_per_dispatch` alone).
+    fn validate_policy_has_a_budget(&self, p: BudgetPolicy) -> Result<(), String> {
+        if p.counts() && !self.has_budget() {
+            return Err(format!(
+                "limits.policy `{}` is set but no budget is: a policy with no budget governs \
+                 nothing. Set `tokens_per_dispatch` or `window` (`period` and `tokens` or `calls`), \
+                 or drop `policy`",
+                crate::config_enum::ConfigEnum::token(p)
+            ));
+        }
+        if p == BudgetPolicy::Wait && !self.window.as_ref().is_some_and(UsageWindow::is_set) {
+            return Err("limits.policy `wait` needs a rolling `window` budget: a dispatch's own spend never \
+                 expires, so nothing would free room under `tokens_per_dispatch` alone. Set `window`, \
+                 or use `warn`"
+                .to_string());
+        }
+        Ok(())
     }
 
     /// Shape checks: the window's period, `warn_at`'s range, and the
     /// policy's value.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(Lenient::Known(p)) = &self.policy {
-            if p.counts() && !self.window.as_ref().is_some_and(UsageWindow::is_set) {
-                return Err(format!(
-                    "limits.policy `{}` is set but no `window` budget is: a policy with no budget governs \
-                     nothing. Set `window` (`period` and `tokens` or `calls`), or drop `policy`",
-                    crate::config_enum::ConfigEnum::token(*p)
-                ));
-            }
+            self.validate_policy_has_a_budget(*p)?;
         }
         if let Some(w) = &self.window {
             // (zero doctrine) A `0` on a darkmux bound means unbounded,
@@ -650,17 +687,35 @@ impl ModelEndpoint {
                     .to_string());
             }
         }
-        match &self.limits {
-            None => {}
-            Some(Lenient::Known(limits)) => limits.validate()?,
-            Some(Lenient::Unrecognized(raw)) => {
-                return Err(format!(
-                    "`limits` could not be read ({raw}): expect `tokens_per_dispatch` and \
-                     `concurrent_calls` as numbers and a `window` object"
-                ))
-            }
+        self.validate_limits()
+    }
+
+    /// THE rule (#3035) that `limits.concurrent_calls` is for an endpoint
+    /// darkmux does not manage: `Err` with the operator's message when a
+    /// managed endpoint declares it. Preflight, doctor and the runtime gate
+    /// all ask here.
+    pub fn concurrent_calls_allowed(&self) -> Result<(), String> {
+        let declared = self.known_limits().is_some_and(|l| l.concurrent_calls.is_some());
+        if declared && self.kind().is_ok_and(EndpointKind::is_managed) {
+            return Err(CONCURRENT_CALLS_ON_MANAGED.to_string());
         }
         Ok(())
+    }
+
+    /// The endpoint's `limits` as written: readable, every shape rule, and no
+    /// `concurrent_calls` on a managed endpoint (#3035).
+    fn validate_limits(&self) -> Result<(), String> {
+        match &self.limits {
+            None => Ok(()),
+            Some(Lenient::Known(limits)) => {
+                limits.validate()?;
+                self.concurrent_calls_allowed()
+            }
+            Some(Lenient::Unrecognized(raw)) => Err(format!(
+                "`limits` could not be read ({raw}): expect `tokens_per_dispatch` and \
+                 `concurrent_calls` as numbers and a `window` object"
+            )),
+        }
     }
 }
 
@@ -687,6 +742,12 @@ pub fn url_host(url: &str) -> Option<String> {
     let authority = rest.split('/').next().unwrap_or(rest);
     Some(authority.rsplit('@').next().unwrap_or(authority).to_string())
 }
+
+/// (#3035) Why `limits.concurrent_calls` is refused on a managed endpoint.
+const CONCURRENT_CALLS_ON_MANAGED: &str = "`limits.concurrent_calls` is for an endpoint darkmux does not \
+     manage: on a managed endpoint darkmux's scheduler owns parallelism (residency and the backend's parallel \
+     slots), so it is not yours to set. Remove it; the spend limits (`tokens_per_dispatch`, `window`, `policy`, \
+     `warn_at`) do apply here";
 
 /// Auth for an endpoint. The secret is **never** stored here — only where it
 /// lives: a macOS Keychain item *name* and/or an environment variable's
@@ -1187,6 +1248,48 @@ mod tests {
         );
         let line = rewrites[3].line();
         assert!(line.contains("endpoints.\"api.x.ai-2\"") && line.contains("\"endpoint\": \"api.x.ai-2\""), "{line}");
+    }
+
+    fn ep(json: &str) -> ModelEndpoint {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// (#3035) `concurrent_calls` is a limit on an endpoint darkmux does NOT
+    /// manage. On a managed one the scheduler owns parallelism (residency and
+    /// the backend's parallel slots), so declaring it is refused by
+    /// `validate`, naming the scheduler; the spend limits stay legal there.
+    /// The decision is `is_managed()`, never "is LM Studio".
+    #[test]
+    fn concurrent_calls_on_a_managed_endpoint_is_refused_naming_the_scheduler() {
+        let managed = ep(r#"{"managed":"lmstudio","limits":{"concurrent_calls":2}}"#);
+        let err = managed.validate().unwrap_err();
+        assert!(err.contains("concurrent_calls") && err.contains("scheduler"), "{err}");
+        let spend = ep(
+            r#"{"managed":"lmstudio","limits":{"tokens_per_dispatch":9000,"policy":"warn","warn_at":0.8,
+                "window":{"period":"1d","tokens":100000}}}"#,
+        );
+        assert!(spend.validate().is_ok(), "spend limits apply to a managed endpoint: {:?}", spend.validate());
+        let unmanaged = ep(r#"{"url":"https://h/v1","limits":{"concurrent_calls":2}}"#);
+        assert!(unmanaged.validate().is_ok(), "{:?}", unmanaged.validate());
+    }
+
+    /// (#3035) The per-dispatch cap is a budget in its own right: with only
+    /// `tokens_per_dispatch` set the policy defaults to `warn`; `wait` needs a
+    /// rolling `window` (a dispatch's own spend never expires, so nothing
+    /// would free room); a policy with no budget at all still refuses.
+    #[test]
+    fn the_per_dispatch_cap_counts_by_default_and_wait_needs_a_window() {
+        let cap_only: UsageLimits = serde_json::from_str(r#"{"tokens_per_dispatch":9000}"#).unwrap();
+        assert_eq!(cap_only.resolved_policy(), Ok(BudgetPolicy::Warn));
+        assert!(cap_only.validate().is_ok());
+        let off: UsageLimits = serde_json::from_str(r#"{"tokens_per_dispatch":9000,"policy":"off"}"#).unwrap();
+        assert_eq!(off.resolved_policy(), Ok(BudgetPolicy::Off));
+        let wait_no_window: UsageLimits = serde_json::from_str(r#"{"tokens_per_dispatch":9000,"policy":"wait"}"#).unwrap();
+        let err = wait_no_window.validate().unwrap_err();
+        assert!(err.contains("wait") && err.contains("window"), "{err}");
+        let nothing: UsageLimits = serde_json::from_str(r#"{"policy":"warn"}"#).unwrap();
+        assert!(nothing.validate().is_err(), "a policy with no budget governs nothing");
+        assert_eq!(UsageLimits::default().resolved_policy(), Ok(BudgetPolicy::Off), "no budget, nothing counted");
     }
 
     #[test]

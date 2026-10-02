@@ -150,7 +150,7 @@ mod tests {
         /// (#2394) [`SeatClaim::NoModel`] — this kind is a test stub; it
     /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
     /// and, per command, by `runtime.step_command_timeout_seconds` — never
-    /// by the hosted-endpoint cap.
+    /// by an endpoint's concurrency limit.
     fn seat(
         &self,
         _step: &Step,
@@ -204,7 +204,7 @@ mod tests {
         fn of(claim: &SeatClaim) -> Self {
             match claim {
                 SeatClaim::LocalModel(_) => SeatClass::Local,
-                SeatClaim::RemoteEndpoint => SeatClass::Remote,
+                SeatClaim::UnmanagedEndpoint(_) => SeatClass::Remote,
                 SeatClaim::NoModel => SeatClass::NoModel,
                 SeatClaim::LocalModelUnresolved { .. } => SeatClass::Unresolved,
             }
@@ -215,7 +215,7 @@ mod tests {
     /// representative step config where the answer depends on it. The kinds
     /// that run no model (`procedural.*`, `mods.gate`, `records.gather`,
     /// `deliver.github_review`) must be `NoModel`: claiming `Remote` puts them
-    /// behind the hosted-endpoint cap, which a mission launch sets to 1, so
+    /// behind the a serial endpoint's one-at-a-time limit, so
     /// independent shell and gate steps run one at a time (#2394).
     fn expected_seat(kind_id: &str) -> Option<(SeatClass, serde_json::Value)> {
         use serde_json::json;

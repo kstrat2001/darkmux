@@ -207,14 +207,11 @@ fn profile_phrase(p: &CardProfile, voice: Voice) -> String {
 /// the seat block never counts this machine's own work, so it never says
 /// "free".
 fn seats_line(seats: &CardSeats) -> String {
-    let hosted = match seats.hosted.cap {
-        Some(cap) => format!("{}/{cap}", seats.hosted.held_by_peer_jobs),
-        None => format!("{}/unbounded", seats.hosted.held_by_peer_jobs),
-    };
+    let unmanaged = seats.unmanaged.held_by_peer_jobs;
     let held = seats.local.iter().filter(|s| s.held_by_peer_job).count();
     let scope = if seats.counts_own_work { "" } else { " (jobs from other machines only)" };
     format!(
-        "seats{scope}: {held} local held, hosted {hosted}, {} waiting, busy policy {}",
+        "seats{scope}: {held} local held, unmanaged {unmanaged}, {} waiting, busy policy {}",
         seats.waiting,
         policy_word(seats.busy_policy)
     )
@@ -444,7 +441,7 @@ pub(crate) fn render_grounding(view: &FleetView) -> String {
          from the card that machine states about itself. \"liveness\" is whether the machine sent a recent \
          presence beat (\"no beat seen\" is not proof it is down). A profile is a named model setup; \
          \"managed\" means the machine loads and serves the model itself, \"unmanaged\" means it only sends \
-         requests to a hosted endpoint; the model ids after the colon are the models that profile runs. A profile is not a \
+         requests to an endpoint; the model ids after the colon are the models that profile runs. A profile is not a \
          loaded model. The \"loaded now\" block is the answer to where a model is loaded: it lists, per model, the \
          machines that have it loaded right now; a model that appears only in a profile is not loaded. \"the user's machine\" is the \
          machine where the user asked the question; \"accepts from the user's machine\" is what that machine lets \
@@ -542,7 +539,7 @@ pub(crate) mod tests {
             "default_profile": "deep", "profiles_error": null,
             "seats": {"busy_policy": "queue", "counts_own_work": false,
                       "local": [{"model": "qwen", "held_by_peer_job": true}, {"model": "small", "held_by_peer_job": false}],
-                      "hosted": {"held_by_peer_jobs": 1, "cap": 3}, "waiting": 0},
+                      "unmanaged": {"held_by_peer_jobs": 1}, "waiting": 0},
             "governor": {"thermal": {"state": "nominal", "cpu_speed_limit_pct": 100}, "battery": null,
                          "battery_gate": {"floor_pct": 50, "refuse_start_below_min": true,
                                           "pause_running_below_min": true, "refusing_start": false}},
@@ -682,7 +679,7 @@ pub(crate) mod tests {
         }
         assert!(out.contains("profiles: deep (managed), cloud (unmanaged)"), "{out}");
         assert!(!out.contains("managed: qwen"), "the text table keeps its profile line: {out}");
-        assert!(out.contains("hosted 1/3") && out.contains("busy policy queue") && out.contains("thermal: nominal"), "{out}");
+        assert!(out.contains("unmanaged 1,") && out.contains("busy policy queue") && out.contains("thermal: nominal"), "{out}");
     }
 
     /// The seat line says whose jobs it counts, and never says "free": the

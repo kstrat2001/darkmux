@@ -33,9 +33,9 @@ pub mod sweep;
 pub use kinds::*;
 
 use crate::types::Step;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use darkmux_types::param_scalar::is_placeholder;
-use darkmux_types::user_files::{key_issues_at, no_retired, top_level_keys, Issue, KeyIssue};
+use darkmux_types::user_files::{key_issues_at, top_level_keys, Issue, KeyIssue};
 use std::fmt;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use std::borrow::Cow;
@@ -203,13 +203,28 @@ impl ConfigKind {
         format!("rename {}", pairs.join(" and "))
     }
 
+    /// The line naming what replaced a retired key of this kind's config, for
+    /// a refusal (#3035: a `dispatch.map` step's `bucket_group` and
+    /// `bucket_budget`). `path` is the key as written under `config`.
+    pub fn retired_key(self, path: &str) -> Option<String> {
+        match (self, path) {
+            (Self::DispatchMap, "bucket_group" | "bucket_budget") => Some(
+                "removed in 5.0 (#3035): the token cap is per dispatch now, `endpoints.<id>.limits.tokens_per_dispatch` \
+                 in profiles.json, and a budget for a whole run is the endpoint's rolling `endpoints.<id>.limits.window`. \
+                 Nothing is shared between a step's items any more. Delete the key"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Every schema issue in `config` (`Null` reads as an empty object)
     /// against this kind's struct, with paths written under `prefix`. A
     /// config that is neither an object nor null is one wrong-type issue at
     /// `prefix`.
     pub fn issues(self, config: &Value, prefix: &str) -> Vec<KeyIssue> {
         match object_config(config) {
-            Ok(object) => with_config_type!(self, T => key_issues_at::<T>(&object, &no_retired, prefix)),
+            Ok(object) => with_config_type!(self, T => key_issues_at::<T>(&object, &|path| self.retired_key(path), prefix)),
             Err(_) => vec![KeyIssue {
                 path: prefix.to_string(),
                 issue: Issue::WrongType { expected: "an object".to_string(), got: json_type(config).to_string() },
@@ -260,7 +275,11 @@ impl ConfigKind {
     /// included: what its `load` decides, without running anything.
     pub fn loads(self, config: &Value) -> Result<(), String> {
         with_config_type!(self, T => {
-            let typed = T::deserialize(&*object_config(config)?).map_err(|e| e.to_string())?;
+            let object = object_config(config)?;
+            if let Some(retired) = self.issues(&object, "config").into_iter().find(|i| matches!(i.issue, Issue::Retired(_))) {
+                return Err(retired.to_string());
+            }
+            let typed = T::deserialize(&*object).map_err(|e| e.to_string())?;
             typed.check().map_err(|v| v.to_string())
         })
     }
@@ -305,6 +324,11 @@ fn json_type(value: &Value) -> &'static str {
 /// same), else the parse error.
 pub fn load<T: DeserializeOwned>(step: &Step, kind: ConfigKind) -> Result<T> {
     let config = object_config(&step.config).map_err(|why| anyhow!("step `{}`: `{}` config: {why}", step.id, kind.id()))?;
+    // A retired key never loads as an ignored one: it is refused naming what
+    // replaced it, wherever the config is read (the gate refuses it too).
+    if let Some(retired) = kind.issues(&config, "config").into_iter().find(|i| matches!(i.issue, Issue::Retired(_))) {
+        bail!("step `{}`: `{}` config: {retired}", step.id, kind.id());
+    }
     T::deserialize(&*config).map_err(|parse| {
         let named: Vec<String> = kind
             .issues(&config, "config")
@@ -346,18 +370,6 @@ impl JsonSchema for ConfigKind {
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
-
-/// The token allowance group a `dispatch.map` step names, with the budget a
-/// launcher stamped for it. Only that kind meters through a group. Read
-/// tolerantly: the scheduler resolves the group before the kind loads (and
-/// refuses) the rest of the config.
-pub fn bucket_of(kind: &str, config: &Value) -> Option<(String, Option<u64>)> {
-    if ConfigKind::from_id(kind)? != ConfigKind::DispatchMap {
-        return None;
-    }
-    let spec = BucketSpec::deserialize(config).ok()?;
-    Some((spec.bucket_group?, spec.bucket_budget.map(|c| c.0)))
-}
 
 /// The model-call keys of a `dispatch.single_shot` / `dispatch.map` step.
 pub fn model_call(kind: &str, config: &Value) -> Option<ModelCallConfig> {

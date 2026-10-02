@@ -414,7 +414,6 @@ fn boot_setup(setup: &Setup) -> Fleet {
                 "accept_work": accept_work,
                 "busy_policy": busy_policy
             },
-            "remote": {"concurrent_cap": 1},
             "power": {"refuse_start_below_min": false, "pause_running_below_min": false}
         })
         .to_string(),
@@ -535,14 +534,14 @@ fn the_receiver_refuses_at_once_and_the_sender_shows_why() {
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 0, "nothing ran on beta");
     assert_eq!(beta_dispatch_starts(&f), 0, "beta started a dispatch for a refused job");
 
-    // Busy on the hosted seat (beta's remote.concurrent_cap is 1).
+    // Busy on the endpoint's seat (beta's `mock` endpoint declares no limits.concurrent_calls, so one job at a time).
     f.mock.delay_ms.store(4_000, Ordering::SeqCst);
     let first = dispatch(&f.alpha, "cloud@beta", &["--no-wait"]);
     assert!(first.status.success(), "{}", text(&first));
     let second = dispatch(&f.alpha, "cloud@beta", &[]);
     assert!(!second.status.success(), "{}", text(&second));
     let why = text(&second);
-    assert!(why.contains("busy: beta") && why.contains("remote.concurrent_cap"), "{why}");
+    assert!(why.contains("busy: beta") && why.contains("limits.concurrent_calls"), "{why}");
     // Only the first job ever started on beta: the busy one never did.
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(beta_dispatch_starts(&f), 1, "beta started a dispatch for the refused busy job");
@@ -692,9 +691,9 @@ fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_acce
     assert_eq!(cloud["endpoint_kind"], "unmanaged", "beta's hosted profile: {cloud}");
     assert_eq!(card["default_profile"], "cloud");
     assert_eq!(card["seats"]["busy_policy"], "refuse", "beta's listener is running: {card}");
-    assert_eq!(card["seats"]["hosted"]["cap"], 1);
+    assert!(card["seats"]["unmanaged"].get("cap").is_none(), "concurrency is per endpoint now, so the card states no machine-wide cap (#3035): {card}");
     assert_eq!(card["seats"]["counts_own_work"], false, "the seat block says it does not count beta's own work: {card}");
-    assert!(card["seats"]["hosted"].get("free").is_none(), "no field reads as free: {card}");
+    assert!(card["seats"]["unmanaged"].get("free").is_none(), "no field reads as free: {card}");
     assert!(card.get("accepts").is_none() && card.get("grant").is_none(), "a card states no grant itself: {card}");
     assert_eq!(card["cache_ttl_ms"], 2000, "beta serves its card from a cache and says so");
     assert_eq!(view["cache_ttl_ms"], 5000);
@@ -794,7 +793,7 @@ fn a_running_job_shows_as_a_seat_held_by_a_peer_job_in_the_peers_card() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let (_, answer) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
-        if answer["card"]["seats"]["hosted"]["held_by_peer_jobs"] == 1 {
+        if answer["card"]["seats"]["unmanaged"]["held_by_peer_jobs"] == 1 {
             assert_eq!(answer["card"]["seats"]["counts_own_work"], false);
             break;
         }
@@ -1126,8 +1125,8 @@ fn a_check_gives_the_answer_a_run_would_and_runs_nothing() {
     refused(&check("deep", None, "k3"), RefusalCode::ProfileNotAllowed);
     refused(&check("nope", None, "k4"), RefusalCode::ProfileUndefined);
 
-    // Busy: beta's hosted seat is held by a slow job (remote.concurrent_cap
-    // is 1, busy_policy refuse). A check says so, and holds nothing itself.
+    // Busy: beta's endpoint seat is held by a slow job (the endpoint declares
+    // no limits.concurrent_calls, busy_policy refuse). A check says so, and holds nothing itself.
     f.mock.delay_ms.store(3_000, Ordering::SeqCst);
     let (code, _) = post_to_beta(&f, &WorkSubmission::new(answering_job("cloud", "k5-running"), false));
     assert_eq!(code, 202);
