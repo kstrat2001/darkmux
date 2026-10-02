@@ -408,6 +408,9 @@ use std::path::Path;
 //           and judged by its value (`LeftoverValue`, #3057).
 //           Nothing is carried over: limits are off until set per endpoint.
 //           Folded into a minor bump like 2.2's removals.
+//           Also ADDED `redis.telemetry_maxlen` (the retention cap of the
+//           hub's machine-telemetry stream; unreleased, so folded into 2.3).
+//           An older binary refuses a config carrying it as an unknown key.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)

@@ -1511,6 +1511,8 @@ impl RedisSink {
     pub fn url(&self) -> &str { self.url.expose_for_probe() }
     pub fn stream(&self) -> &str { &self.stream }
     pub fn max_len(&self) -> Option<usize> { self.max_len }
+    pub fn telemetry_stream(&self) -> &str { &self.telemetry_stream }
+    pub fn telemetry_max_len(&self) -> Option<usize> { self.telemetry_max_len }
 }
 
 impl FlowSink for RedisSink {
@@ -1865,6 +1867,17 @@ impl FlowSink for TeeSink {
 /// unreachable when the sink builds, the warning logs to stderr and the
 /// default sink continues without it. Operators see the connection
 /// failure loudly; the audit + casual substrates stay intact.
+/// The Redis sink as `config_access` resolves it (env > config.json > default):
+/// the work stream and cap, the telemetry stream and ITS cap (`0` is
+/// unbounded for both), under the process's sink policy. (#2101)
+fn redis_sink_from_config(url: &str) -> Result<RedisSink> {
+    use darkmux_types::config_access as c;
+    let cap = |n: usize| (n != 0).then_some(n);
+    Ok(RedisSink::new(url, &c::redis_stream(), cap(c::redis_maxlen()))?
+        .with_policy(sink_policy())
+        .with_telemetry(&c::redis_telemetry_stream(), cap(c::redis_telemetry_maxlen())))
+}
+
 fn build_default_sink() -> Arc<dyn FlowSink> {
     let mut sinks: Vec<Arc<dyn FlowSink>> = Vec::new();
 
@@ -1899,20 +1912,11 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
         // default) so a config-only operator's `redis.stream`/`redis.maxlen`
         // aren't silently dropped. The `0 → None` (unbounded) translation stays
         // at this call site per the accessor's contract.
-        let stream = darkmux_types::config_access::redis_stream();
-        let max_len = match darkmux_types::config_access::redis_maxlen() {
-            0 => None,
-            n => Some(n),
-        };
-        let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream();
-        let telemetry_max_len = match darkmux_types::config_access::redis_telemetry_maxlen() {
-            0 => None,
-            n => Some(n),
-        };
-
-        match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
+        let sink = redis_sink_from_config(raw_url.expose_for_probe());
+        match sink {
             Ok(redis_sink) => {
-                let redis_sink = redis_sink.with_policy(sink_policy()).with_telemetry(&telemetry_stream, telemetry_max_len);
+                let (stream, max_len) = (redis_sink.stream().to_string(), redis_sink.max_len());
+                let (telemetry_stream, telemetry_max_len) = (redis_sink.telemetry_stream().to_string(), redis_sink.telemetry_max_len());
                 // (#1955) The URL is deliberately NOT printed.
                 //
                 // `RawRedisUrl`'s redaction covers the PASSWORD (#213/#229)
@@ -2528,6 +2532,29 @@ mod tests {
         assert_eq!(FlowAction::DispatchTurnHeartbeat.hub_stream(), None);
         assert_eq!(FlowAction::MachineTelemetry.hub_stream(), Some(HubStream::Telemetry));
         assert_eq!(FlowAction::DispatchTool.hub_stream(), Some(HubStream::Work));
+    }
+
+    /// (#2101) The configured telemetry stream and cap are the ones the default
+    /// sink applies, not the work stream's: dropping the `with_telemetry` call
+    /// silently gave samples the work cap.
+    #[test]
+    #[serial_test::serial]
+    fn the_configured_telemetry_cap_is_the_one_applied() {
+        let vars = ["DARKMUX_REDIS_STREAM", "DARKMUX_REDIS_MAXLEN", "DARKMUX_REDIS_TELEMETRY_MAXLEN"];
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_STREAM", "t:flow");
+            std::env::set_var("DARKMUX_REDIS_MAXLEN", "111");
+            std::env::set_var("DARKMUX_REDIS_TELEMETRY_MAXLEN", "222");
+        }
+        let sink = redis_sink_from_config("redis://127.0.0.1:1").unwrap();
+        unsafe { std::env::set_var("DARKMUX_REDIS_TELEMETRY_MAXLEN", "0") };
+        let unbounded = redis_sink_from_config("redis://127.0.0.1:1").unwrap();
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+        assert_eq!((sink.stream(), sink.max_len()), ("t:flow", Some(111)));
+        assert_eq!((sink.telemetry_stream(), sink.telemetry_max_len()), ("t:flow:telemetry", Some(222)));
+        assert_eq!(unbounded.telemetry_max_len(), None, "0 is unbounded");
     }
 
     #[test]

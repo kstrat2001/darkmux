@@ -3786,7 +3786,7 @@ async fn catalog_records_response(
             // missions lens now LISTS a peer's mission (#1705) and clicking
             // through to replay it returns zero records: a dead end created by
             // making the mission visible in the first place.
-            let fleet = fleet_flow_records();
+            let fleet = fleet_flow_records_with_samples();
             let (mut records, truncated, mut records_scanned) =
                 collect_records_by_field(&dir, &fleet.records, key.field(), &id);
             // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
@@ -4083,7 +4083,7 @@ async fn aggregate_flow_records_for_date(
     let date_owned = date.to_string();
     let url_owned = url.clone();
     let redis_task = tokio::task::spawn_blocking(move || {
-        read_flow_records_from_redis(url_owned.expose_for_probe(), Some(&date_owned))
+        read_flow_records_from_redis(url_owned.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
     });
     let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
 
@@ -4372,6 +4372,28 @@ fn read_fleet_snapshot_file(path: &StdPath) -> Option<FleetRead> {
 /// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
 /// COUNT 10000` cap as every other read of this stream.
 pub(crate) fn fleet_flow_records() -> FleetRead {
+    fleet_flow_records_in(FleetScope::Work)
+}
+
+/// What a read of the hub's streams returns. Machine samples are half the
+/// entries a full read parses (measured: 300 ms for 10k work entries, 610 ms
+/// with 10k samples beside them), and only a session's host charts use them,
+/// so the run and mission listings read the work stream alone. (#2101)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FleetScope {
+    /// Work records only.
+    Work,
+    /// Work records and the machine-telemetry stream.
+    WithSamples,
+}
+
+/// [`fleet_flow_records`] plus the machine samples, for a session's replay
+/// (host charts join them by time).
+fn fleet_flow_records_with_samples() -> FleetRead {
+    fleet_flow_records_in(FleetScope::WithSamples)
+}
+
+fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
     // (#1705) Short-TTL shared cache. The read costs ~344ms over a tailnet
     // (measured: `XREVRANGE … COUNT 10000` against the hub), and the viewer
     // polls `/runs` and `/flow-missions` on a timer — so without this the
@@ -4387,9 +4409,9 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
     // human-perceptible staleness in a lens that renders whole missions,
     // and well over the poll interval it is protecting.
     const FLEET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-    static FLEET_CACHE: std::sync::OnceLock<std::sync::Mutex<FleetCache>> =
-        std::sync::OnceLock::new();
-    let cache = FLEET_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    static FLEET_CACHES: [std::sync::OnceLock<std::sync::Mutex<FleetCache>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let cache = FLEET_CACHES[scope as usize].get_or_init(|| std::sync::Mutex::new(None));
     // A stale entry is deliberately RETAINED rather than cleared: the
     // failure path below serves it if the refresh fails.
     // A hit inside the TTL is a SUCCESSFUL read at most `FLEET_CACHE_TTL`
@@ -4418,7 +4440,7 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
         // substrate by design, and warning about it would be the bug.
         return FleetRead { records: Vec::new(), state: source_state::SourceState::Off };
     };
-    match read_flow_records_from_redis(url.expose_for_probe(), None).map(|r| r.records) {
+    match read_flow_records_from_redis(url.expose_for_probe(), None, scope).map(|r| r.records) {
         Ok(records) => {
             if let Ok(mut guard) = cache.lock() {
                 *guard = Some((std::time::SystemTime::now(), records.clone()));
@@ -4505,6 +4527,7 @@ fn bound_redis_response(conn: &redis::Connection) {
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
+    scope: FleetScope,
 ) -> Result<SourceRead, anyhow::Error> {
     use anyhow::Context;
     // `None` = the WHOLE capped stream, no date filter (#1705): the
@@ -4553,30 +4576,33 @@ fn read_flow_records_from_redis(
     // (#2101) Both hub streams in ONE round trip (a tailnet read of this size
     // costs ~344ms): the work records and the machine samples, which ride
     // separate streams so samples cannot evict work records.
-    let (raw, raw_telemetry): (redis::Value, redis::Value) = redis::pipe()
-        .cmd("XREVRANGE")
-        .arg(&stream)
-        .arg("+")
-        .arg("-")
-        .arg("COUNT")
-        // (#1715) Was a bare `10000` literal, independent of the
-        // `MAX_FLOW_FILE_RECORDS` const defined below in this file —
-        // matched by convention, not enforced. Single-sourced now.
-        .arg(MAX_FLOW_FILE_RECORDS)
-        .cmd("XREVRANGE")
-        .arg(&telemetry_stream)
-        .arg("+")
-        .arg("-")
-        .arg("COUNT")
-        .arg(MAX_FLOW_FILE_RECORDS)
+    let xrevrange = |stream: &str| {
+        let mut cmd = redis::cmd("XREVRANGE");
+        cmd.arg(stream).arg("+").arg("-").arg("COUNT")
+            // (#1715) Was a bare `10000` literal, independent of the
+            // `MAX_FLOW_FILE_RECORDS` const defined below in this file —
+            // matched by convention, not enforced. Single-sourced now.
+            .arg(MAX_FLOW_FILE_RECORDS);
+        cmd
+    };
+    let mut pipe = redis::pipe();
+    pipe.add_command(xrevrange(&stream));
+    if scope == FleetScope::WithSamples {
+        pipe.add_command(xrevrange(&telemetry_stream));
+    }
+    let mut replies: Vec<redis::Value> = pipe
         .query(&mut conn)
         .with_context(|| format!("XREVRANGE on {stream} and {telemetry_stream}"))?;
+    let raw_telemetry = (replies.len() > 1).then(|| replies.remove(1));
+    let raw = replies.remove(0);
     let work = records_from_xrevrange(raw, date, darkmux_types::config_access::redis_maxlen())?;
-    let telemetry =
-        records_from_xrevrange(raw_telemetry, date, darkmux_types::config_access::redis_telemetry_maxlen())?;
+    let telemetry_records = match raw_telemetry {
+        Some(raw) => records_from_xrevrange(raw, date, darkmux_types::config_access::redis_telemetry_maxlen())?.records,
+        None => Vec::new(),
+    };
     // `cut` is the work stream's alone: the telemetry stream is a live-state
     // window by design, so its trimming never means a day's work is missing.
-    Ok(SourceRead { records: merge_by_hub_id(work.records, telemetry.records), cut: work.cut })
+    Ok(SourceRead { records: merge_by_hub_id(work.records, telemetry_records), cut: work.cut })
 }
 
 /// A record's hub id (`<ms>-<seq>`, #3017) as a sort key.
@@ -5046,11 +5072,23 @@ fn redis_tail_lines(
     // (#2101) One task per hub stream, all feeding the one channel, so the
     // work stream and the telemetry stream each keep their own cursor and
     // their own failure budget.
+    let mut tasks = tokio::task::JoinSet::new();
     for stream_name in stream_names {
-        tokio::spawn(redis_tail_task(tx.clone(), url.clone(), stream_name, date_filter.clone()));
+        tasks.spawn(redis_tail_task(tx.clone(), url.clone(), stream_name, date_filter.clone()));
     }
+    drop(tx);
+    tokio::spawn(end_tail_when_any_task_ends(tasks));
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// When one stream's tail task exits (its failure budget spent, or the
+/// consumer gone), stop the rest so the channel closes and the client
+/// reconnects; a tail alive on one stream only would look healthy while a
+/// whole stream of records never arrived. (#2101)
+async fn end_tail_when_any_task_ends(mut tasks: tokio::task::JoinSet<()>) {
+    let _ = tasks.join_next().await;
+    tasks.abort_all();
 }
 
 /// The spawned producer half of [`redis_tail_lines`] — named (rather than an

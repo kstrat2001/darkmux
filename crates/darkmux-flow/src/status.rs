@@ -94,6 +94,14 @@ pub struct RedisStatus {
     pub telemetry_stream: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry_max_len: Option<usize>,
+    /// The telemetry stream's length and oldest/newest entry ids, as `xlen`,
+    /// `oldest_ts` and `newest_ts` are for the work stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_xlen: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_oldest_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_newest_ts: Option<String>,
     pub reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reachability_error: Option<String>,
@@ -380,6 +388,49 @@ pub(crate) fn compute_near_max_len(cap: Option<usize>, xlen: Option<u64>, read_c
     }
 }
 
+/// What one stream's probe read: its length, oldest and newest entry ids, and
+/// the distinct schema strings of its newest entries.
+#[derive(Default)]
+struct StreamProbe {
+    xlen: Option<u64>,
+    oldest_id: Option<String>,
+    newest_id: Option<String>,
+    schemas: Vec<String>,
+}
+
+fn probe_stream(conn: &mut redis::Connection, stream: &str) -> StreamProbe {
+    let xlen = redis::cmd("XLEN").arg(stream).query::<u64>(conn).ok();
+    // XINFO STREAM <key> would give first-entry / last-entry IDs in one
+    // shot, but parsing its mixed-array response across redis-rs versions
+    // is fragile. XRANGE/XREVRANGE with COUNT 1 is unambiguous.
+    let oldest_id: Option<String> = redis::cmd("XRANGE")
+        .arg(stream)
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(1)
+        .query::<Vec<(String, Vec<(String, String)>)>>(conn)
+        .ok()
+        .and_then(|v| v.into_iter().next().map(|(id, _)| id));
+    let (newest_id, schemas) = redis::cmd("XREVRANGE")
+        .arg(stream)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(100)
+        .query::<Vec<(String, Vec<(String, String)>)>>(conn)
+        .map(|entries| {
+            let newest = entries.first().map(|(id, _)| id.clone());
+            let schemas: Vec<String> = entries
+                .iter()
+                .filter_map(|(_, fields)| fields.iter().find(|(k, _)| k == "schema").map(|(_, v)| v.clone()))
+                .collect();
+            (newest, schemas)
+        })
+        .unwrap_or((None, vec![]));
+    StreamProbe { xlen, oldest_id, newest_id, schemas }
+}
+
 /// Probe Redis: open a connection, run XLEN + XREVRANGE for oldest/newest,
 /// time the round-trip. Returns the status + the list of distinct schema
 /// strings observed in the last 100 entries (for skew detection).
@@ -395,6 +446,9 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
                     max_len: cfg.max_len,
                     telemetry_stream: cfg.telemetry_stream.clone(),
                     telemetry_max_len: cfg.telemetry_max_len,
+                    telemetry_xlen: None,
+                    telemetry_oldest_ts: None,
+                    telemetry_newest_ts: None,
                     reachable: false,
                     reachability_error: Some(format!("client open: {e}")),
                     xlen: None,
@@ -423,6 +477,9 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
                     max_len: cfg.max_len,
                     telemetry_stream: cfg.telemetry_stream.clone(),
                     telemetry_max_len: cfg.telemetry_max_len,
+                    telemetry_xlen: None,
+                    telemetry_oldest_ts: None,
+                    telemetry_newest_ts: None,
                     reachable: false,
                     reachability_error: Some(format!("connect: {e}")),
                     xlen: None,
@@ -444,44 +501,21 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
     // reads, so none legitimately takes a second.
     bound_redis_response(&conn);
 
-    let xlen_res: redis::RedisResult<u64> = redis::cmd("XLEN").arg(&cfg.stream).query(&mut conn);
-    let xlen = xlen_res.ok();
+    let work = probe_stream(&mut conn, &cfg.stream);
+    // A peer that did not answer the first command is not asked three more
+    // about the second stream: a wedged hub costs the same bounded wait as
+    // before the telemetry stream existed.
+    let telemetry = if work.xlen.is_some() {
+        probe_stream(&mut conn, &cfg.telemetry_stream)
+    } else {
+        StreamProbe::default()
+    };
+    let xlen = work.xlen;
 
-    // XINFO STREAM <key> would give first-entry / last-entry IDs in one
-    // shot, but parsing its mixed-array response across redis-rs versions
-    // is fragile. XRANGE/XREVRANGE with COUNT 1 is unambiguous.
-    let oldest_id: Option<String> = redis::cmd("XRANGE")
-        .arg(&cfg.stream)
-        .arg("-")
-        .arg("+")
-        .arg("COUNT")
-        .arg(1)
-        .query::<Vec<(String, Vec<(String, String)>)>>(&mut conn)
-        .ok()
-        .and_then(|v| v.into_iter().next().map(|(id, _)| id));
-    let (newest_id, schemas) = redis::cmd("XREVRANGE")
-        .arg(&cfg.stream)
-        .arg("+")
-        .arg("-")
-        .arg("COUNT")
-        .arg(100)
-        .query::<Vec<(String, Vec<(String, String)>)>>(&mut conn)
-        .map(|entries| {
-            let newest = entries.first().map(|(id, _)| id.clone());
-            let schemas: Vec<String> = entries
-                .iter()
-                .filter_map(|(_, fields)| {
-                    fields
-                        .iter()
-                        .find(|(k, _)| k == "schema")
-                        .map(|(_, v)| v.clone())
-                })
-                .collect();
-            (newest, schemas)
-        })
-        .unwrap_or((None, vec![]));
-
-    let mut observed = schemas;
+    // Schema skew reads both streams: an idle peer that only writes samples
+    // must stay visible.
+    let mut observed = work.schemas;
+    observed.extend(telemetry.schemas);
     observed.sort();
     observed.dedup();
 
@@ -499,8 +533,11 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
             reachable: true,
             reachability_error: None,
             xlen,
-            oldest_ts: oldest_id,
-            newest_ts: newest_id,
+            oldest_ts: work.oldest_id,
+            newest_ts: work.newest_id,
+            telemetry_xlen: telemetry.xlen,
+            telemetry_oldest_ts: telemetry.oldest_id,
+            telemetry_newest_ts: telemetry.newest_id,
             last_probe_ms: Some(last_probe_ms),
             near_max_len,
         },
@@ -584,6 +621,24 @@ fn health_marker(state: HealthState) -> &'static str {
     }
 }
 
+/// The telemetry stream, reachability and error lines of the Redis section.
+fn write_stream_health_lines(out: &mut String, r: &RedisStatus) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "  telemetry:    {}", r.telemetry_stream);
+    let _ = writeln!(
+        out,
+        "  telemetry_max_len: {}",
+        r.telemetry_max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
+    );
+    let _ = writeln!(out, "  reachable:    {}", r.reachable);
+    if let Some(err) = r.reachability_error.as_ref() {
+        let _ = writeln!(out, "  error:        {err}");
+    }
+    if let Some(n) = r.telemetry_xlen {
+        let _ = writeln!(out, "  telemetry_xlen: {n}");
+    }
+}
+
 /// Human-readable rendering of a `FlowStatus`. The CLI's default
 /// (non-`--json`) output.
 pub fn format_status_human(status: &FlowStatus) -> String {
@@ -605,16 +660,7 @@ pub fn format_status_human(status: &FlowStatus) -> String {
             "  max_len:      {}",
             r.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
         );
-        let _ = writeln!(out, "  telemetry:    {}", r.telemetry_stream);
-        let _ = writeln!(
-            out,
-            "  telemetry_max_len: {}",
-            r.telemetry_max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
-        );
-        let _ = writeln!(out, "  reachable:    {}", r.reachable);
-        if let Some(err) = r.reachability_error.as_ref() {
-            let _ = writeln!(out, "  error:        {err}");
-        }
+        write_stream_health_lines(&mut out, r);
         if let Some(n) = r.xlen {
             let _ = writeln!(out, "  xlen:         {n}");
         }
@@ -2431,5 +2477,62 @@ mod hooks_status_tests {
         let rendered = format_status_human(&status);
         assert!(!rendered.contains("rejected by receiver"), "{rendered}");
         assert!(!rendered.contains("last rejection reason"), "{rendered}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod telemetry_stream_probe_tests {
+    use super::*;
+
+    /// (#2101) The probe reports the telemetry stream's own length and ids, and
+    /// its schema strings feed the skew sample, against a real redis-server.
+    #[test]
+    fn probe_redis_reports_the_telemetry_stream_and_its_schemas() {
+        let Ok(dir) = tempfile::tempdir() else { return };
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let Ok(child) = std::process::Command::new("redis-server")
+            .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no", "--bind", "127.0.0.1", "--dir"])
+            .arg(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        };
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _guard = Kill(child);
+        let url = format!("redis://127.0.0.1:{port}");
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let mut conn = loop {
+            if let Ok(c) = client.get_connection() {
+                break c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let add = |conn: &mut redis::Connection, stream: &str, schema: &str| {
+            redis::cmd("XADD").arg(stream).arg("*").arg("schema").arg(schema).arg("record").arg("{}").query::<String>(conn).unwrap();
+        };
+        add(&mut conn, "t:flow", "2.0.0");
+        add(&mut conn, "t:flow:telemetry", "1.9.0");
+        add(&mut conn, "t:flow:telemetry", "1.9.0");
+        let cfg = RedisCfg {
+            url: RawRedisUrl::new(url),
+            stream: "t:flow".to_string(),
+            max_len: Some(10),
+            telemetry_stream: "t:flow:telemetry".to_string(),
+            telemetry_max_len: Some(10),
+        };
+        let (status, schemas) = probe_redis(&cfg);
+        assert_eq!(status.xlen, Some(1));
+        assert_eq!(status.telemetry_xlen, Some(2));
+        assert!(status.telemetry_oldest_ts.is_some() && status.telemetry_newest_ts.is_some());
+        assert_eq!(schemas, ["1.9.0", "2.0.0"], "an idle peer's samples keep its schema visible");
     }
 }

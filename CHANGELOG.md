@@ -71,8 +71,16 @@ darkmux release.
   writes it, `config set` validates it, `doctor` and `flow status` show it).
   `GET /flow/<date>`, `/runs`, `/flow-missions` and the live tail read both streams
   and merge them in hub order; the outage backfill never re-sends a sample (the
-  next one supersedes it). `flow status --json` gains `telemetry_stream`
-  and `telemetry_max_len` (`tests/cli-json.golden` regenerated).
+  next one supersedes it). `flow status --json` gains `telemetry_stream`,
+  `telemetry_max_len`, `telemetry_xlen`, `telemetry_oldest_ts` and `telemetry_newest_ts`
+  (`tests/cli-json.golden` regenerated); the schema-skew sample reads both streams.
+  `/runs` and `/flow-missions` read the work stream only (a full read of both
+  doubled the parse cost, 300 ms to 610 ms for 10k entries each); a session's
+  replay reads both for its host charts. A live tail on one stream only is closed
+  so the client reconnects.
+  **Trade:** the outage backfill re-sends work records only, so a relayed run's
+  host chart has a hole over the outage window. `redis.telemetry_maxlen` is part of
+  config schema 2.3; an older binary refuses it as an unknown key.
   **Upgraders:** the old samples stay on the work stream until they age out; no
   action needed.
 - **Hub outage watermark hardening** (#3062 follow-ups). The watermark's generation
