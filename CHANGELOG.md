@@ -1461,6 +1461,11 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **Selecting text on a card or row never clicks it.** A drag that selects
+  text, or a double-click that selects a word, no longer drills the fleet
+  machine card, a run row, an event row, or a mission step; a plain click
+  still does.
+
 - **A long mission no longer floods the fleet's Redis stream with heartbeats (#2101).** `dispatch.turn.heartbeat` (every two seconds per running execution) was most of a crawl's records, so one pass evicted every other machine's records from the capped stream many times over. The Redis sink, live and in the outage backfill, now skips it; the local day file keeps every heartbeat, and a peer's run stays live through its tool and turn records.
 - **The local flow sink follows `DARKMUX_HOME` in test builds too (#2101).** The shipped binary already wrote flows under the resolved root; the test-build sink kept a scratch dir of its own that ignored it, so it was the one place the root did not scope a `dirs.*` default. It now resolves through `flows_dir()` like everything else, and a test pins that every dir default (flows, findings, mods, lab, hooks, liveness, caches, the fleet file) lands under a scratch `DARKMUX_HOME`.
 - **A run's resume origin can no longer be forged by the model (#2972).** The record of a run's workspace path, mount mode and image used to sit in the out-dir the container mounts read-write, so a model could flip `workspace_read_only` and have a `:ro` run resumed read-write, or steer the resume hint. It now lives beside the out-dir (`<out-dir>.resume_origin.json`), where the container never mounts it, and the old in-out-dir file is never read. A checkpoint with no such record (every one written before 5.0) is refused for resume with a message to start the dispatch fresh. The record is written 0600 without following a planted symlink, read only when this user owns it, removed together with its out-dir, counted by `doctor` when its dir is gone, and a dispatch is refused if any mount (workspace, cache, attachments) would contain it.

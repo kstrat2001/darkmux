@@ -12,6 +12,7 @@ import { panelAgeLabel } from "./format";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { AnsiText } from "./ansi";
 import type { PanelResponse } from "../../types/generated/PanelResponse";
+import { onIntentClick } from "../../lib/clickIntent";
 
 /**
  * The console lens — `#lens=console&panel=<id>`. Pure port of
@@ -221,7 +222,7 @@ function PanelTab({ id, label, active, onSelect }: { id: PanelId; label: string;
       data-arg={id}
       role="button"
       tabIndex={0}
-      onClick={() => onSelect(id)}
+      onClick={onIntentClick(() => onSelect(id))}
       onKeyDown={(e: ReactKeyboardEvent<HTMLSpanElement>) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();

@@ -9,6 +9,7 @@
 import type { ReactNode } from "react";
 import { fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type StepMeter } from "./graph";
 import { fmtElapsed } from "../../lib/format";
+import { onIntentClick } from "../../lib/clickIntent";
 
 /** `tools` is OPTIONAL here (unlike {@link StepMeter}'s own required field)
  * so this same renderer also takes a task-level {@link
@@ -126,7 +127,7 @@ export function StepRow({
         clickable
           ? (e) => {
               e.stopPropagation();
-              onSelect!(step.id);
+              onIntentClick(() => onSelect!(step.id))(e);
             }
           : undefined
       }

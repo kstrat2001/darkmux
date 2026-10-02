@@ -425,6 +425,33 @@ describe("RunsBoard", () => {
     }
   });
 
+  it("a click that ends a text selection inside a run row does not navigate (select-not-click)", async () => {
+    mockFetch();
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-mode";
+    meta.content = "live";
+    document.head.appendChild(meta);
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      const label = screen.getByText("m1");
+      const row = label.closest(".labrunrow")!;
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.click(row);
+      expect(window.location.hash).toBe("");
+      window.getSelection()!.removeAllRanges();
+      fireEvent.click(row);
+      expect(window.location.hash).toBe("#mission=m1");
+    } finally {
+      meta.remove();
+      window.getSelection()?.removeAllRanges();
+      window.location.hash = "";
+    }
+  });
+
   it("clicking a tracked mission row with NO daemon behind the page surfaces a visible, honest notice — not a silent no-op or a broken nav", async () => {
     mockFetch();
     renderBoard();
