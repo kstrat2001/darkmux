@@ -149,6 +149,13 @@ function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetM
   };
 }
 
+/** `row`'s card, stating that its machine serves radio (`serves_radio`) and
+ * `profiles` profiles (`serves_profiles`). */
+function servingRadio(row: FleetMachine, profiles = 3): FleetMachine {
+  if (row.card.state !== "available") throw new Error("a card that was read");
+  return { ...row, card: { ...row.card, card: { ...row.card.card, serves_radio: true, serves_profiles: profiles } } };
+}
+
 /** This daemon's own row: the machine serving the page. */
 function selfRow(specs: Partial<MachineSpecsResponse>): FleetMachine {
   return viewRow(specs, { is_this_machine: true, accepts: { state: "this_machine" } });
@@ -1151,6 +1158,12 @@ describe("FleetLens", () => {
 // directly (same as the scrubbed-playhead test above), not `mockFleetFetch`
 // — the pager reads only `buildFleetCard`'s output, which this path drives
 // with no separate live/playback branch to mock around.
+// (W3) The tube is the pager: it carries the position in its name, the count
+// line carries it in words ("3 running · 1/3").
+const tube = () => screen.getByRole("button", { name: /^execution \d+ of \d+/ });
+const pos = () => /(\d+\/\d+)/.exec(document.querySelector(".runs")!.textContent!)![1];
+const pageRole = () => /^execution \d+ of \d+(?:, ([^:]+))?:/.exec(tube().getAttribute("aria-label")!)?.[1] ?? null;
+
 describe("FleetLens pager (#2881)", () => {
   const D0 = Date.parse("2026-08-26T10:00:00.000Z");
   const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
@@ -1177,21 +1190,18 @@ describe("FleetLens pager (#2881)", () => {
 
   it("defaults to the busiest (generating) execution's own tube, role and rate — not the machine aggregate", async () => {
     renderThree(5);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
-    // The rate line shows s1's OWN reading (100 tok/s), not the machine's
-    // summed total (also 100 here, since only s1 is generating — see the
-    // next assertion for where the total actually shows up).
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    expect(pos()).toBe("1/3");
+    expect(pageRole()).toBe("coder");
+    // The rate line shows s1's OWN reading (100 tok/s).
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
     // (#2886 pass 5, MUST — fresh-reviewer finding F5) Pin what the TUBE
     // component itself receives, not just the neighboring text — a bug that
     // hits only the tube's own props (e.g. still reading the machine
     // aggregate) would leave every text assertion in this file green.
     expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: 100, state: "generating" });
-    // (#2881) "the machine total moves to the count line" — no separate
-    // "all" page.
-    expect(document.querySelector(".runs--live")!.textContent).toBe("3 running · 100 tok/s");
+    // The count line is the machine's running count and the shown position.
+    expect(document.querySelector(".runs--live")!.textContent).toBe("3 running · 1/3");
   });
 
   // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
@@ -1222,11 +1232,11 @@ describe("FleetLens pager (#2881)", () => {
         <FleetLens records={missionRecords} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     // 9 seat executions, 1 collapsed run.
-    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/9");
+    expect(pos()).toBe("1/9");
     const countEl = document.querySelector(".runs--live, .runs")!;
-    expect(countEl.textContent).toBe("1 run · 9 executions · 100 tok/s");
+    expect(countEl.textContent).toBe("1 run · 1/9 executions");
   });
 
   it("(#2890) PROMPT: the status line carries the estimated size; the tube is handed no center", async () => {
@@ -1269,7 +1279,7 @@ describe("FleetLens pager (#2881)", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__pager")).toBeNull();
+    expect(document.querySelector('.mach-scope[role="button"]')).toBeNull();
     // The count line has NO tok/s suffix at N=1 — that's still the rate
     // line's job, as before.
     expect(document.querySelector(".runs--live")!.textContent).toBe("1 running");
@@ -1282,10 +1292,10 @@ describe("FleetLens pager (#2881)", () => {
     const scopeProps = () =>
       JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
     renderThree(5);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
     expect(scopeProps()).toMatchObject({ state: "generating", centerLabel: "100", centerUnit: "tok/s", centerCarried: false });
-    fireEvent.click(screen.getByLabelText("next execution"));
+    fireEvent.click(tube());
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
     // (#2890) The same center as the run page's: the countdown over "resting".
     expect(scopeProps()).toMatchObject({ centerLabel: "13s", centerUnit: "resting" });
@@ -1320,37 +1330,53 @@ describe("FleetLens pager (#2881)", () => {
 
   it("an arrow click changes the page and does not fire the card's machine drill-in", async () => {
     renderThree(5);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     expect(window.location.hash).toBe("");
-    fireEvent.click(screen.getByLabelText("next execution"));
-    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("2/3");
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    fireEvent.click(tube());
+    expect(pos()).toBe("2/3");
+    expect(pageRole()).toBe("reviewer");
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
     // (#1903-shaped) The arrow is its own tap target — stopPropagation kept
     // it from ALSO firing the outer card's `machineDrillHash` click.
     expect(window.location.hash).toBe("");
   });
 
-  // (#2886 pass 5, MUST — fresh-reviewer finding F5) No test clicked the
-  // PREVIOUS arrow specifically — a mutation wiring it to the SAME `+1` the
-  // next arrow uses stayed green. Wrap-around from page 1 is the
-  // distinguishing case: `+1` would land on page 2 (indistinguishable from
-  // clicking "next"); a correct `-1` wraps to the LAST page.
-  it("the previous arrow moves BACKWARD (wraps to the last page from page 1), not the same direction as next", async () => {
+  // (W3) The tube cycles forward and wraps: from the last page, one more
+  // tap lands on page 1. A mutation dropping the `% length` leaves the last
+  // page stuck, or walks off the end.
+  it("a tap on the tube shows the next execution and wraps from the last to the first", async () => {
     renderThree(5);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
-    fireEvent.click(screen.getByLabelText("previous execution"));
-    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("3/3");
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("fetch-render");
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    expect(pos()).toBe("1/3");
+    expect(tube().getAttribute("aria-label")).toBe("execution 1 of 3, coder: show the next one");
+    fireEvent.click(tube());
+    fireEvent.click(tube());
+    expect(pos()).toBe("3/3");
+    expect(pageRole()).toBe("fetch-render");
+    fireEvent.click(tube());
+    expect(pos()).toBe("1/3");
+    expect(pageRole()).toBe("coder");
+  });
+
+  it("the tube is a keyboard control: Enter and Space cycle, and it keeps focus", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    const el = tube();
+    el.focus();
+    fireEvent.keyDown(el, { key: "Enter" });
+    expect(pos()).toBe("2/3");
+    fireEvent.keyDown(tube(), { key: " " });
+    expect(pos()).toBe("3/3");
+    expect(document.activeElement, "the same element, still focused").toBe(el);
+    expect(window.location.hash, "a key on the tube does not open the machine").toBe("");
   });
 
   it("the picked page sticks until that execution ends, then falls forward to the new busiest among what's left", async () => {
     const { rerender } = renderThree(5);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     // Pick s2 (reviewer, resting) — one click forward from the default s1.
-    fireEvent.click(screen.getByLabelText("next execution"));
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    fireEvent.click(tube());
+    expect(pageRole()).toBe("reviewer");
 
     // s2 ends; s1 (generating) and s3 (prompt) are still running.
     const afterS2Ends: NormRecord[] = [
@@ -1366,8 +1392,8 @@ describe("FleetLens pager (#2881)", () => {
     // Still a pager (2 executions left), but the sticky pick (s2) is gone —
     // falls forward to the new busiest (s1, generating), not to whichever
     // index s2 used to occupy.
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2"));
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    await waitFor(() => expect(pos()).toBe("1/2"));
+    expect(pageRole()).toBe("coder");
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
   });
 
@@ -1424,7 +1450,7 @@ describe("FleetLens pager (#2881)", () => {
         </QueryClientProvider>,
       );
       // Initial pick: s1 is the faster of the two (100 vs 10 tok/s).
-      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+      await waitFor(() => expect(pageRole()).toBe("coder"));
 
       // s2's rate now FAR exceeds s1's (2000 chars -> 250 tok/s vs s1's
       // unchanged 100) — recomputing "busiest" from scratch would flip to
@@ -1435,7 +1461,7 @@ describe("FleetLens pager (#2881)", () => {
           <FleetLens records={twoGenerating(2_000)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
         </QueryClientProvider>,
       );
-      expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+      expect(pageRole()).toBe("coder");
       expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
     });
 
@@ -1447,7 +1473,7 @@ describe("FleetLens pager (#2881)", () => {
           <FleetLens records={twoGenerating(80)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
         </QueryClientProvider>,
       );
-      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+      await waitFor(() => expect(pageRole()).toBe("coder"));
 
       // s1 now rests (a real state-class change); s2 keeps generating.
       // s2 is STRICTLY busier now (generating beats rest) — this is a real
@@ -1458,7 +1484,7 @@ describe("FleetLens pager (#2881)", () => {
           <FleetLens records={s1Rests} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
         </QueryClientProvider>,
       );
-      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer"));
+      await waitFor(() => expect(pageRole()).toBe("reviewer"));
       expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("250 tok/s");
     });
   });
@@ -1494,11 +1520,11 @@ describe("FleetLens pager (#2881)", () => {
         <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 40_000} />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     // Default page is s1 (generating beats stalled/no-signal either way).
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
-    fireEvent.click(screen.getByLabelText("next execution"));
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(pageRole()).toBe("coder");
+    fireEvent.click(tube());
+    expect(pageRole()).toBe("reviewer");
     expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("stalled");
     expect(latestTokenScopeProps()).toMatchObject({ state: "stalled" });
   });
@@ -1526,9 +1552,9 @@ describe("FleetLens pager (#2881)", () => {
         <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 20_000} />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
-    fireEvent.click(screen.getByLabelText("next execution"));
-    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    fireEvent.click(tube());
+    expect(pageRole()).toBe("reviewer");
     // (#2955 review) The plain no-signal status line, dim dot, not the reading.
     expect(document.querySelector(".mach .stat")!.textContent).toBe("disconnected");
     expect(document.querySelector(".mach-scope__rate")).toBeNull();
@@ -1634,14 +1660,14 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     mockFleetFetch({
       specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
       view: [
-        viewRow(
+        servingRadio(viewRow(
           { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
           {
             entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
             liveness: "no_beat",
             accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
           },
-        ),
+        )),
       ],
       runs: [],
     });
@@ -1661,19 +1687,93 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     const lbl = document.querySelector(".savlbl")!;
     expect(lbl.textContent).toBe("tokens seen · last 24h");
     expect(lbl.getAttribute("title")).toBe("Counts only machines whose records reach this viewer. Not streaming here: studio.");
-    // The radio seat is an icon in the name row whose tooltip says what it
-    // means; the rest of the grant stays words, and the whole grant stays in
-    // the hardware line's tooltip.
+    // A card states only its own machine. The icon comes from the peer's own
+    // `serves_radio`; the grant it holds for the serving machine (profiles, the
+    // radio seat in `accepts`) is on no card.
     const spec = studio.querySelector(".spec")!;
-    expect(spec.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review");
-    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
-    const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
-    expect(radio.getAttribute("title")).toBe("accepts radio: this machine will answer radio questions sent from here (radio-host)");
-    expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
-    // This machine's own card shows no grant.
+    expect(spec.textContent).toBe("Apple M1 Max · 32 GB");
+    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB");
+    const radio = studio.querySelector('.serves [data-testid="radio-seat"]')!;
+    expect(radio.getAttribute("title")).toBe("studio serves radio: it answers radio questions for peers it allows.");
+    expect(studio.querySelector(".name [data-testid=\"radio-seat\"], .name [data-testid=\"profiles-served\"]"), "the name row holds no serves facts").toBeNull();
+    const served = studio.querySelector('.serves [data-testid="profiles-served"]')!;
+    expect(served.getAttribute("title")).toBe("studio serves 3 profiles to peers it allows.");
+    expect(served.textContent).toBe("3 profiles");
+    expect(studio.querySelector(".serves")!.textContent).toBe("serves 3 profiles · radio");
+    // Profiles, then radio.
+    expect(served.compareDocumentPosition(radio) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const selfCard = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
+    expect(selfCard.querySelector('[data-testid="radio-seat"]')).toBeNull();
+    expect(selfCard.querySelector('[data-testid="profiles-served"]')).toBeNull();
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
     expect(self.querySelector('[data-testid="radio-seat"]')).toBeNull();
+  });
+
+  // The fleet must read the same from any server: two different serving
+  // machines hold different `accepts` for the SAME peer (a grant, none, or no
+  // answer), and its card is identical. The icon follows the peer's own card.
+  it.each([
+    ["granted to the serving machine", { state: "granted", accepts: { peer_name: "laptop", profiles: ["p"], roles: ["radio-host"], images: [], workspace: false } }],
+    ["not listed by the peer", { state: "not_listed" }],
+    ["unknown to the serving machine", { state: "unknown" }],
+  ] as const)("a peer's card is the same whichever machine serves the view (%s)", async (_label, accepts) => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        servingRadio(
+          viewRow(
+            { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+            { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }, liveness: "no_beat", accepts: accepts as never },
+          ),
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    expect(studio.querySelector('.serves [data-testid="radio-seat"]')).not.toBeNull();
+    expect(studio.querySelector('.serves [data-testid="profiles-served"]')!.textContent).toBe("3 profiles");
+    expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB");
+    expect(studio.textContent).not.toMatch(/runs |accepts nothing|radio-host/);
+  });
+
+  it("a peer whose card does not state serves_radio shows no icon, whatever the serving machine's grant says", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        viewRow(
+          { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+          {
+            entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
+            accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: [], roles: ["radio-host"], images: [], workspace: false } },
+          },
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    expect(document.querySelector('[data-testid="radio-seat"]')).toBeNull();
+    expect(document.querySelector('[data-testid="profiles-served"]')).toBeNull();
+  });
+
+  it("one profile reads in the singular, and a card stating 0 shows no profiles icon", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        servingRadio(viewRow({ machine_id: "studio", machine_uid: "u-studio" }, { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 } }), 1),
+        servingRadio(viewRow({ machine_id: "mini", machine_uid: "u-mini" }, { entry: { id: "mini", address: "100.64.1.3:8765", added_unix_ms: 1000 } }), 0),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(3));
+    const byName = (n: string) => [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === n)!;
+    expect(byName("studio").querySelector('[data-testid="profiles-served"]')!.getAttribute("title")).toBe("studio serves 1 profile to peers it allows.");
+    expect(byName("mini").querySelector('[data-testid="profiles-served"]')).toBeNull();
+    expect(byName("mini").querySelector('[data-testid="radio-seat"]')).not.toBeNull();
   });
 
   // The inverse: with the same row unreachable and presence silent, the
@@ -2198,7 +2298,7 @@ describe("FleetLens — a card says checking… until its first data arrives (#2
     const queryClient = newClient();
     renderFleetLens({}, queryClient);
     await waitForFleetQueriesSettled(queryClient);
-    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
     expect(queryClient.getQueryState(queryKeys.runs())?.status, "/runs is still unanswered").toBe("pending");
     const card = document.querySelector(".mach")!;
     // (#2955) The live reading is the status line: shown at once, in
@@ -2209,8 +2309,7 @@ describe("FleetLens — a card says checking… until its first data arrives (#2
     expect(card.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
     expect(cardScope(card)).toMatchObject({ state: "generating" });
     expect(card.querySelector(".mach-scope__rate")!.textContent).toMatch(/tok\/s$/);
-    expect(card.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2");
-    expect(card.querySelector(".runs")!.textContent).toMatch(/^2 running · /);
+    expect(card.querySelector(".runs")!.textContent).toBe("2 running · 1/2");
     expect(card.querySelector(".mach-util")!.getAttribute("data-visual")).toBe("radio");
     expect(utilLabel(card)).toMatch(/radio routing$/);
   });
@@ -2757,9 +2856,10 @@ describe("(#2911) fleet card wording", () => {
     const card = document.querySelector(".mach")!;
     const stat = card.querySelector(".stat")!;
     expect(card.querySelector(".mach-scope__rate"), "the reading is the status line itself").toBe(stat);
-    expect(stat.querySelector(".dot"), "the status dot stays on the line").not.toBeNull();
+    expect(stat.querySelector(".lamp-dot"), "the status lamp stays on the line").not.toBeNull();
+    expect(stat.querySelector(".lamp-dot")!.getAttribute("data-form")).toBe("filled");
     expect(stat.textContent).toBe("100 tok/s");
-    expect(textRows(card)).toEqual(["stat", "runs"]);
+    expect(textRows(card)).toEqual(["stat", "runs", "serves"]);
   });
 
   it("(#2955) a card with nothing running has the same two text rows", async () => {
@@ -2770,7 +2870,20 @@ describe("(#2911) fleet card wording", () => {
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(document.querySelector(".mach .stat")!.textContent).toBe("dispatch in flight");
-    expect(textRows(document.querySelector(".mach")!)).toEqual(["stat", "runs"]);
+    expect(textRows(document.querySelector(".mach")!)).toEqual(["stat", "runs", "serves"]);
+  });
+
+  it("(rec 1, rec 2) an idle card's lamp is a hollow ring, and its empty serves line keeps its place", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach .stat")!.textContent).toBe("idle"));
+    expect(document.querySelector(".mach .stat")!.getAttribute("data-lamp")).toBe("hollow");
+    expect(document.querySelector(".mach .stat .lamp-dot")!.getAttribute("data-form")).toBe("hollow");
+    const serves = document.querySelector(".mach .serves");
+    expect(serves, "the serves line is reserved even when empty").not.toBeNull();
+    expect(serves!.textContent).toBe("");
   });
 
   it("a machine with nothing running still says 'idle' in the tube", async () => {

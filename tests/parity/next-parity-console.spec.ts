@@ -124,6 +124,8 @@ const AUTO_PANELS: readonly (readonly [string, string])[] = [
   ["config-list", "panel=config-list"],
   ["lab-fixture-list", "panel=lab-fixture-list"],
   ["run-list", "panel=run-list"],
+  // 5.0: the deep link the fleet cards will use, naming a machine.
+  ["profile-list", "panel=profile-list&opt.machine=darkbook"],
 ];
 
 test.describe("next-parity: console lens (Packet 6)", () => {

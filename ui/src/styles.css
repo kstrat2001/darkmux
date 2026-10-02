@@ -3825,8 +3825,8 @@ body {
   }
   .mach .name .mach-util {
     position: absolute;
-    top: 10px;
-    right: 10px;
+    top: 14px;
+    right: 16px;
     margin-left: 0;
   }
 }
@@ -3906,31 +3906,6 @@ body {
   opacity: 0.5;
   font-style: italic;
 }
-/* The radio seat a peer grants (`components/RadioSeatIcon.tsx`), beside the
-   HUB badge in the card's name row: never shrinks, and under the row's own
-   height so it changes no box's size. */
-.radio-seat {
-  flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
-  color: var(--accent);
-}
-.radio-seat svg {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-/* What the peer lets this machine do rides the hardware line. Beside the
-   phone's tube there is no room for it (it would clip to "·…"), so it is
-   dropped there; the full line stays in the tooltip. The radio seat icon
-   goes with it: in the name row it cut the machine's name to a few letters,
-   and a touch screen shows no tooltip to explain it. */
-@media (max-width: 560px) {
-  .mach .spec__grant,
-  .mach .name .radio-seat {
-    display: none;
-  }
-}
 .mach .stat {
   margin-top: 12px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
@@ -3952,7 +3927,7 @@ body {
    spec-guaranteed rule, not a browser quirk, is that an absolutely
    positioned child contributes NOTHING to its container's own size — so
    this container's height is set ONLY by its in-flow text children
-   (`.stat`/`.mach-scope__pager`/`.runs`, however many of those a given card
+   (`.stat`/`.runs`/`.serves`, however many of those a given card
    has; a live reading is the `.stat` line itself since #2955), before the tube's size is computed at all. */
 .mach-body--scope {
   position: relative;
@@ -4068,6 +4043,17 @@ body {
   max-height: none;
   margin: auto 0;
 }
+/* (W3) With 2+ executions the tube is the control that shows the next one
+   (`role="button"`), so it takes the tap. */
+.mach:has(> .mach-body--scope) .mach-scope[role="button"] {
+  pointer-events: auto;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.mach:has(> .mach-body--scope) .mach-scope[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
 @media (max-width: 560px) {
   .mach:has(> .mach-body--scope) {
     --tube: clamp(104px, calc(100vw - 262px), 150px);
@@ -4093,10 +4079,22 @@ body {
   .mach:has(> .mach-body--scope) > .spec {
     margin-right: 0;
   }
+  /* The readout (status, count, serves) shares the tube's axis. */
   .mach:has(> .mach-body--scope) > .mach-body--scope {
     display: flex;
     flex-direction: column;
+    align-items: center;
+    text-align: center;
     padding-right: 0;
+  }
+  /* Full-width lines with centered text, so a line's box does not change
+     with its words. */
+  .mach:has(> .mach-body--scope) > .mach-body--scope > .stat,
+  .mach:has(> .mach-body--scope) > .mach-body--scope > .serves {
+    align-self: stretch;
+  }
+  .mach:has(> .mach-body--scope) > .mach-body--scope > .runs {
+    max-width: 100%;
   }
   .mach:has(> .mach-body--scope) .mach-scope {
     position: static;
@@ -4140,69 +4138,10 @@ body {
     display: inline;
   }
 }
-/* (#2881) The pager: a small row under the rate line, sized by its own
-   text/tap-targets rather than any fixed constant — see `.mach-scope`'s own
-   doc for the ONE thing that must not grow the card (the tube), which this
-   row is not. Arrows are `role="button"` divs, matching `.runs--live`'s own
-   nested-tap-target shape (`FleetLens.tsx`'s doc next to `selectPage`) —
-   both need `stopPropagation` so a click doesn't ALSO fire the card body's
-   `machineDrillHash`. */
-/* (#2881, UI review 2026-09-25) A grid, not flex: both arrows sit in fixed
-   32px tracks and the label takes `minmax(0, 1fr)`, so a long label
-   ellipsizes on one line instead of wrapping (a flex item's automatic
-   minimum size forced the wrap) and paging never moves a tap target. One
-   line matters beyond looks: every extra row grows the text block the
-   tube is sized from. */
-.mach-scope__pager {
-  margin-top: 4px;
-  display: grid;
-  grid-template-columns: 32px auto minmax(0, 1fr) 32px;
-  align-items: center;
-  column-gap: 5px;
-  min-width: 0;
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
-  color: var(--dim);
-}
-/* (#2886 pass 5, MUST — fresh-reviewer finding F8) The GLYPH is ~11px, but
-   the TAP TARGET is >= 32px square (`min-width`/`min-height`, real layout
-   space, centered via `inline-flex` — not an invisible pseudo-element
-   expansion, which would silently overlap the rate line above or
-   `.runs--live` below and intercept taps meant for them). This is the only
-   place the pager row's height grows beyond its text — a real, visible
-   accommodation for the tap target, not the tube's own concern (that stays
-   governed entirely by the surrounding TEXT rows, unchanged by this rule). */
-.mach-scope__pager-btn {
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 32px;
-  min-height: 32px;
-  color: var(--dim);
-}
-.mach-scope__pager-btn:hover {
-  color: var(--fg);
-}
-.mach-scope__pager-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-.mach-scope__pager-n {
-  color: var(--fg);
-  font-variant-numeric: tabular-nums;
-  min-width: 3ch;
-  text-align: right;
-}
-.mach-scope__pager-role {
-  opacity: 0.8;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
+  font-variant-numeric: tabular-nums;
   color: var(--fg);
   /* (#2881) One line, ellipsized: a wrapped count grows the text block the
      tube is sized from, and the card with it. */
@@ -4235,26 +4174,75 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.mach .dot {
+/* A second line that is not a count ("not streaming", "—") reads as a
+   qualifier, in the dim color. */
+.mach .runs--quiet {
+  color: var(--dim);
+}
+/* (rec 2) What the machine serves, in words, under the count. A FIXED line:
+   its height is reserved whether or not it has words, so a machine that
+   serves nothing is the size of one that serves both. */
+.mach .serves {
+  margin-top: 5px;
+  height: 14px;
+  font: calc(11px * var(--fs-scale)) / 14px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* The phone's text column is 186px: the widest serves line ("serves 12 profiles
+   · radio") needs the unscaled 11px to fit it. */
+@media (max-width: 560px) {
+  .mach .serves {
+    font-size: 11px;
+  }
+}
+/* The status lamp (`components/LampDot.tsx`): its form says what the viewer
+   knows (filled: proven work, ring: proven quiet, dashed: no reading, plain
+   and dim: offline) and, while a reading is on the line, it takes the
+   reading's color, as the run page's state lamps do. */
+.mach .stat {
+  --lit: var(--accent);
+  --lamp-unlit: var(--dim);
+  --lamp-size: 8px;
+}
+.mach .stat[data-lamp="dashed"],
+.mach .stat[data-lamp="off"] {
+  --lit: var(--dim);
+}
+.mach .stat .lamp-dot {
   display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
   margin-right: 7px;
   vertical-align: middle;
+}
+/* The line clips its overflow (one line, ellipsized), which would cut the lit
+   lamp's glow to the line's box: a padding the same size as a negative margin
+   gives the glow room and moves nothing. */
+.mach .stat {
+  padding: 4px 8px;
+  margin: 8px -8px -4px;
+}
+.mach .stat.mach-scope__rate {
+  --lit: var(--scope-phosphor);
+}
+.mach .stat.mach-scope__rate[data-tone="prompt"] {
+  --lit: var(--lamp-prompt);
+}
+.mach .stat.mach-scope__rate[data-tone="tools"] {
+  --lit: var(--lamp-tools);
+}
+.mach .stat.mach-scope__rate[data-tone="rest"] {
+  --lit: var(--lamp-rest);
+}
+.mach .stat.mach-scope__rate[data-tone="stalled"] {
+  --lit: var(--lamp-stall);
 }
 .mach.absent {
   opacity: 0.45;
 }
-.mach.absent .dot,
-/* (#2958) A card with no data yet: the absent dot's "no reading" color,
-   without dimming the card (it is not known to be offline either). */
-.mach.nosignal .dot {
-  background: var(--dim);
-  box-shadow: none;
-}
-
 /* (Mobile fix pass) `.mach`'s fixed 248px width left 122px of dead space to
    its right inside a 370px `.fleet` row at 402px viewport (a single card
    can never reach `.fleet`'s own `flex-wrap` — there's nothing to wrap
@@ -9078,6 +9066,8 @@ body {
   white-space: nowrap;
 }
 .scope-lamp {
+  --lamp-unlit: var(--lamp-off);
+  --lamp-size: 7px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -9088,19 +9078,34 @@ body {
   opacity: 0.55;
   font-variant-numeric: tabular-nums;
 }
-.scope-lamp__dot {
-  width: 7px;
-  height: 7px;
+/* The lamp dot (`components/LampDot.tsx`), shared by the state lamps above and
+   the fleet card's status line. Its color is the surrounding `--lit`; its form
+   (data-form) says what the dot knows: filled and glowing is proven work, a
+   ring is proven quiet, a dashed ring is no reading, plain is unlit (or, on a
+   card, offline: `--lamp-unlit` is the card's dim). */
+.lamp-dot {
+  width: var(--lamp-size);
+  height: var(--lamp-size);
+  flex: none;
+  box-sizing: border-box;
   border-radius: 50%;
-  background: var(--lamp-off);
+  background: var(--lamp-unlit);
+}
+.lamp-dot[data-form="filled"] {
+  background: var(--lit);
+  box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
+}
+.lamp-dot[data-form="hollow"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--lit);
+}
+.lamp-dot[data-form="dashed"] {
+  background: transparent;
+  border: 1.5px dashed var(--lit);
 }
 .scope-lamp[data-on="true"] {
   opacity: 1;
   color: var(--lit);
-}
-.scope-lamp[data-on="true"] .scope-lamp__dot {
-  background: var(--lit);
-  box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
 }
 /* (#2890) The lit GEN lamp reads "gen" or "think": its label keeps the
    longer word's width, so flipping between them never shifts the row. */
@@ -9273,6 +9278,14 @@ body {
    included; the larger tube and ring leave the unit clear of the trace. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {
   font-size: max(9px, calc(var(--tube) * 0.068));
+}
+/* (W1) The desktop card's tube is large enough for a legible center word:
+   a tenth of the tube (13px at the usual 134px), so "idle" and "no model
+   working" read at 100% zoom. A phone's tube keeps the size above. */
+@media (min-width: 561px) {
+  .token-scope-bezel--card .token-scope-center .token-scope-u {
+    font-size: calc(var(--tube) * 0.1);
+  }
 }
 @media (max-width: 560px) {
   /* A phone card's tube is ~128px: a tighter unit keeps "think tok/s"

@@ -86,7 +86,7 @@ OUT = ROOT / "docs" / "demo"
 # Duplicated deliberately and asserted below: if the allowlist grows, this
 # script should FAIL rather than silently publish a demo missing a tab.
 PANEL_IDS = ["mission-status", "role-list", "machine-status", "config-list",
-             "flow-status", "lab-fixture-list", "run-list", "doctor"]
+             "flow-status", "lab-fixture-list", "run-list", "profile-list", "doctor"]
 
 # The width the console's own default lands near. A fixture is captured at ONE
 # width — `fetchPanel` ignores `cols` on the static path rather than pretend

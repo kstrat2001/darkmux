@@ -158,6 +158,7 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 
 ```bash
 darkmux profile list                  # list configured profiles
+darkmux profile list --machine studio # the profiles a roster peer lets this machine use (--remote: every peer)
 darkmux machine status                # what's loaded; which profile (if any) matches
 darkmux lab characterize              # one-command "QA my Mac": dispatch a smoke workload, get a verdict
 darkmux lab run quick-q               # the smoke workload directly

@@ -190,6 +190,9 @@ function installCorpusRoutes(page, meta) {
     if (p === "/panel/role-list") return json("panel-role-list.json");
     if (p === "/panel/config-list") return json("panel-config-list.json");
     if (p === "/panel/lab-fixture-list") return json("panel-lab-fixture-list.json");
+    // 5.0: `profile-list` is hand-written (no real roster peer to record), a
+    // sanitized two-profile answer for `opt.machine=darkbook`.
+    if (p === "/panel/profile-list") return json("panel-profile-list.json");
     // (#1905 step 3) `run-list` is the console's DEFAULT panel now
     // (`panels.ts::DEFAULT_PANEL_ID`) — every console golden's bare landing
     // replays this fixture. Captured for real off a genuinely empty

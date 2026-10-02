@@ -21,12 +21,13 @@ console
 run list
 mission status
 machine status
+profile list
 flow status
 role list
 config list
 lab fixture list
 doctor
-$ darkmux run list --kind all ▾ [--all] [--usage]
+MacBook-Pro $ darkmux run list --kind all ▾ [--all] [--usage]
 captured 20:54:23
 · 4ms
 re-run

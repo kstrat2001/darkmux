@@ -33,7 +33,7 @@ import {
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
-import { grantWords, specsLine, rowSeen, type Grant, type RowFacts, type Standing } from "./viewRows";
+import { specsLine, rowSeen, type RowFacts, type Standing } from "./viewRows";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -49,6 +49,7 @@ import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
+import { LampForm } from "../../lib/lamp";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -141,12 +142,6 @@ export function statusReason(
 ): string | undefined {
   if (face.absent) return `offline: ${card.note ?? "its presence beat stopped"}`;
   return face.notStreaming ? notStreamingStatus(card.note === null).reason : undefined;
-}
-
-/** The card's subtitle: the hardware line, then what the peer lets this
- * machine do. One line, so the card keeps its height. */
-export function specLine(card: { spec: string; grant: Grant | null }): string {
-  return card.grant ? `${card.spec} · ${grantWords(card.grant)}` : card.spec;
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
@@ -248,7 +243,7 @@ export type SpecUnknownReason = "not-reported" | "not-seen";
  * apart. `not-reported` is verbatim the legacy string (viewer.html's
  * `specdim` fallback). */
 export function specUnknownLabel(reason: SpecUnknownReason): string {
-  return reason === "not-seen" ? "hardware unknown — nothing received" : "hardware not reported";
+  return reason === "not-seen" ? "hardware unknown (nothing received)" : "hardware not reported";
 }
 
 /** (#2881) The pager's default page when the operator hasn't picked one:
@@ -314,11 +309,12 @@ export interface FleetCard {
    *  ("not listening"); the status line's tooltip carries it. `null` for a
    *  machine the view read, and for one the view does not hold. */
   note: string | null;
-  /** What this peer lets this machine do (`viewRows.Grant`); `null` for
-   *  this machine's own card and for any peer without a grant to show. */
-  grant: Grant | null;
   /** The machine's own card declares `fleet.mode hub`. */
   hub: boolean;
+  /** The machine's own card says it serves radio. */
+  servesRadio: boolean;
+  /** How many profiles the machine's own card says it serves; 0 shows nothing. */
+  servesProfiles: number;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -455,7 +451,7 @@ export function buildFleetCard(
    * route). Every run's lifecycle is read as of it. */
   t: number,
   /** The fleet view's row for this machine, when the view holds one: its
-   * hardware line, status note, grant and standing replace the flow-derived
+   * hardware line, status note and standing replace the flow-derived
    * ones. */
   row: RowFacts | null = null,
   /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
@@ -506,7 +502,7 @@ export function buildFleetCard(
 }
 
 /** What a card says about WHO the machine is and whether it is up. A machine
- * the view holds reads its hardware line, status note, grant and standing
+ * the view holds reads its hardware line, status note and standing
  * from its row; any other (an unverified source, a beating machine nobody
  * rostered, a replay) reads presence and the flow window. */
 function cardIdentity(
@@ -526,8 +522,9 @@ function cardIdentity(
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
       note: null,
-      grant: null,
       hub: false,
+      servesRadio: false,
+      servesProfiles: 0,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
       availability: "known" as const,
       self: false,
@@ -543,8 +540,9 @@ function cardIdentity(
     spec,
     specUnknown: spec ? null : ("not-reported" as const),
     note: row.note,
-    grant: row.grant,
     hub: row.hub,
+    servesRadio: row.servesRadio,
+    servesProfiles: row.servesProfiles,
     standing: row.standing,
     availability: machineAvailability({ self: row.isSelf, seen: rowSeen(row), standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
@@ -668,8 +666,9 @@ export function buildFleetCardBase(
     spec: id.spec,
     specUnknown: id.specUnknown,
     note: id.note,
-    grant: id.grant,
     hub: id.hub,
+    servesRadio: id.servesRadio,
+    servesProfiles: id.servesProfiles,
     standing,
     availability: id.availability,
     active,
@@ -727,9 +726,11 @@ export interface CardFace {
   absent: boolean;
   /** Drawn as active. */
   active: boolean;
-  /** The word is neither idle nor a reading nor offline (the dot takes the
-   *  no-reading gray). */
+  /** The word is neither idle nor a reading nor offline (the card reads as
+   *  having no reading). */
   noSignal: boolean;
+  /** The status lamp's form, from the same inputs as `stat`: `lampFormOf`. */
+  lamp: LampForm;
   /** The word is one of the not-streaming forms. */
   notStreaming: boolean;
   /** Replaces the running-count line ("N running" / "—"); `null` keeps it. */
@@ -761,6 +762,25 @@ function statusWord(f: { absent: boolean; active: boolean; notStreaming: boolean
   if (f.notStreaming) return notStreamingStatus(f.cardRead).word;
   return f.idleKnown ? "idle" : CHECKING_STAT;
 }
+
+/** The status lamp's form (#3030), from the same inputs and in the same
+ * precedence as `statusWord`: offline is dim filled, work a record or a
+ * `/runs` row proves is filled, idle (proven quiet) is hollow, and every other
+ * word (the not-streaming forms, whose machine is never `idleKnown`, and
+ * "checking…") says the viewer has no reading, so it is dashed. A live
+ * execution's reading rides `active`, so it is filled too. */
+function lampFormOf(f: { absent: boolean; active: boolean; idleKnown: boolean }): LampForm {
+  if (f.absent) return LampForm.Off;
+  if (f.active) return LampForm.Filled;
+  return f.idleKnown ? LampForm.Hollow : LampForm.Dashed;
+}
+
+/** The status line's tooltip while the page is disconnected. */
+export const DISCONNECTED_REASON = "disconnected: this page lost its daemon";
+
+/** The lamp beside "disconnected": the page lost the daemon, so there is no
+ * reading, whatever the card's last records said. */
+export const DISCONNECTED_LAMP = LampForm.Dashed;
 
 /** (#2958) A POSITIVE reading shows as soon as the source that produced it
  *  has it; a NEGATIVE claim waits until every source that could contradict
@@ -810,6 +830,7 @@ export function cardFace(
     absent,
     active,
     noSignal: !absent && !card.active && !idleKnown,
+    lamp: lampFormOf({ absent, active: card.active, idleKnown }),
     notStreaming,
     secondLine: notStreaming ? notStreamingStatus(cardRead).secondLine : null,
     tube,
@@ -940,4 +961,37 @@ export function withLiveReadings(
 /** (5.0 R3) The names of the machines whose records never reach this viewer. */
 export function notStreamedNames(cards: readonly Pick<FleetCard, "name" | "availability">[]): string[] {
   return cards.flatMap((c) => (c.availability === "not_streamed" ? [c.name] : []));
+}
+
+/** One thing a machine serves, as the card's serves line names it. */
+export interface ServesPart {
+  kind: "profiles" | "radio";
+  text: string;
+}
+
+/** What the machine's own card says it serves, as words: profiles (with the
+ * count) then radio. Empty for a machine that serves nothing or does not say. */
+export function servesParts(profiles: number, radio: boolean): ServesPart[] {
+  const parts: ServesPart[] = [];
+  if (profiles > 0) parts.push({ kind: "profiles", text: `${profiles} ${profiles === 1 ? "profile" : "profiles"}` });
+  if (radio) parts.push({ kind: "radio", text: "radio" });
+  return parts;
+}
+
+/** The serves line's whole text: "serves 3 profiles · radio", or "" when there
+ * is nothing to say (the line keeps its height regardless). */
+export function servesLine(profiles: number, radio: boolean): string {
+  const parts = servesParts(profiles, radio);
+  return parts.length ? `serves ${parts.map((p) => p.text).join(" · ")}` : "";
+}
+
+/** The count line. With one execution it is the plain count; with several it
+ * ends in the shown execution's position ("2 running · 1/2"), and when a
+ * mission folds its seats into fewer runs it names the executions
+ * ("1 run · 5/9 executions"), since nine pages under one "running" would read
+ * as a bug. */
+export function executionCountText(f: { runsCount: number; runsLabel: string; executions: number; position: number }): string {
+  if (f.executions < 2) return `${f.runsCount} ${f.runsLabel}`;
+  if (f.runsCount === f.executions) return `${f.runsCount} ${f.runsLabel} · ${f.position}/${f.executions}`;
+  return `${f.runsCount} ${f.runsCount === 1 ? "run" : "runs"} · ${f.position}/${f.executions} executions`;
 }

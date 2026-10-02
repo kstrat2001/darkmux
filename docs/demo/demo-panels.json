@@ -103,6 +103,25 @@
     "panel": "mission-status",
     "stderr_tail": ""
   },
+  "profile-list": {
+    "age_ms": 0,
+    "ansi_text": "\u001b[1;36mregistry: /home/demo/.darkmux/profiles.json\u001b[0m\n\n\u001b[1;36mdeep\u001b[0m \u001b[32m(default)\u001b[0m\n  - default    qwen3.6-35b-a3b-turboquant-mlx @ ctx 262144\n\n\u001b[1;36mfast\u001b[0m\n  - default    qwen3-4b-instruct-2507 @ ctx 32768\n",
+    "argv": [
+      "profile",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1790328465930,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 5,
+    "opts": {
+      "remote": "off"
+    },
+    "panel": "profile-list",
+    "stderr_tail": ""
+  },
   "role-list": {
     "age_ms": 0,
     "ansi_text": "id                     description                                                     skills       escalation\nanalyst                Data/system analyst who reads run outputs, logs, metrics,\u2026      1            bail-with-explanation\ncode-reviewer          Senior reviewer who reads PR diffs, identifies issues, le\u2026      1            bail-with-explanation\ncoder                  Implements features described by the user. Reads existing\u2026      2            bail-with-explanation\ncrawler                Scans a bounded scope of a codebase for ONE named pattern\u2026      1            bail-with-explanation\ndesign-reviewer        A senior reviewer who evaluates design proposals (UX, arc\u2026      2            bail-with-explanation\nmission-compiler       Utility-family role that takes unstructured intent and em\u2026      1            bail-with-explanation\npr-reviewer            Tool-less PR code reviewer for CI: reads a unified diff p\u2026      1            bail-with-explanation\nradio-host             Specialist-family ANSWERING seat for the `darkmux radio` \u2026      0            bail-with-explanation\nradio-router           Utility-family ROUTING seat for `darkmux radio` (#1698 Pa\u2026      0            bail-with-explanation\nreviewer               Reviews one unit of a code change against a set of named \u2026      1            bail-with-explanation\nscribe                 Drafts lab notebook entries and prose from run data + use\u2026      1            bail-with-explanation\ntest-designer          Plans test strategies, selects edge cases, and writes tes\u2026      2            bail-with-explanation\ntool-bench             Harness role for the tool-call bench (#1196): retrieves r\u2026      1            bail-with-explanation\n",

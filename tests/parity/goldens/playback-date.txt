@@ -26,7 +26,7 @@ GENERATED
 37
 DISPATCHES
 MacBook-Pro
-hardware unknown — nothing received
+hardware unknown (nothing received)
 idle
 0 running
 idle

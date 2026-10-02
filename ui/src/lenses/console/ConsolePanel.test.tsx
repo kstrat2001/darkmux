@@ -75,6 +75,62 @@ describe("ConsolePanel", () => {
     expect(screen.getByText("mission status", { selector: ".runchip" })).not.toHaveClass("on");
   });
 
+  // A deep link `#lens=console&panel=profile-list&opt.machine=darkbook` opens the
+  // panel AND runs it for that machine: the request carries `opt.machine`, and
+  // the command line reads the command that was run.
+  it("a profile-list deep link runs for its machine and shows the command it ran", async () => {
+    const body = {
+      ...MISSION_STATUS_BODY,
+      panel: "profile-list",
+      argv: ["profile", "list", "--machine", "darkbook"],
+      opts: { remote: "off", machine: "darkbook" },
+      ansi_text: "darkbook: 2 profiles available to this machine",
+    };
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/panel/profile-list") ? jsonResponse(body) : jsonResponse({ machines: [] }, 404)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("profile-list", { machine: "darkbook" });
+    await waitFor(() => expect(screen.getByText(/darkbook: 2 profiles available/)).toBeInTheDocument());
+    const panelCall = fetchMock.mock.calls.map(([u]) => String(u)).find((u) => u.startsWith("/panel/profile-list"));
+    expect(panelCall).toContain("opt.machine=darkbook");
+    expect(screen.getByText("profile list", { selector: ".runchip" })).toHaveClass("on");
+    expect(screen.getByText(/--machine darkbook/)).toBeInTheDocument();
+  });
+
+  // The roster names come from /fleet/view; picking one clears `--remote`,
+  // because a machine and every peer are different asks.
+  it("picking a machine from the roster token turns --remote off and asks for that machine", async () => {
+    const body = { ...MISSION_STATUS_BODY, panel: "profile-list", argv: ["profile", "list", "--remote"], ansi_text: "all peers" };
+    const fetchMock = vi.fn((url: string) => {
+      if (url.startsWith("/panel/profile-list")) return Promise.resolve(jsonResponse(body));
+      if (url.startsWith("/fleet/view")) return Promise.resolve(jsonResponse({ machines: [{ entry: { id: "studio" } }, { entry: { id: "darkbook" } }] }));
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("profile-list", { remote: "on" });
+    await waitFor(() => expect(screen.getByText(/all peers/)).toBeInTheDocument());
+    expect(screen.getByRole("switch", { name: /--remote/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByText(/--machine \(this machine\)/));
+    await waitFor(() => expect(screen.getByRole("option", { name: "studio" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("option", { name: "studio" }));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.map(([u]) => String(u)).some((u) => u.includes("opt.machine=studio") && !u.includes("opt.remote"))).toBe(true),
+    );
+    expect(screen.getByRole("switch", { name: /--remote/ })).toHaveAttribute("aria-checked", "false");
+  });
+
+  // A panel runs on the machine serving the viewer; the command line says
+  // which, so a relationship command's subject ("this machine") is explicit.
+  it("the command line names the machine the daemon runs it on, and falls back to a bare $", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/machine/specs") ? jsonResponse({ machine_id: "MacBook-Pro" }) : jsonResponse(RUN_LIST_DEFAULT_BODY)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("");
+    await waitFor(() => expect(screen.getByText(/MacBook-Pro \$ darkmux run list/)).toBeInTheDocument());
+  });
+
   it("selecting doctor (manual-only) does NOT auto-fetch — shows the not-yet-run placeholder", async () => {
     const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
     vi.stubGlobal("fetch", fetchMock);
@@ -153,12 +209,13 @@ describe("ConsolePanel", () => {
     // Three CLI panels have now been fetched once each (run-list on the
     // default landing, role-list, mission-status) — this is the baseline
     // every further tab switch should reuse rather than add to.
-    const callsAfterAllVisited = fetchMock.mock.calls.length;
+    const panelCalls = () => fetchMock.mock.calls.filter(([u]) => String(u).startsWith("/panel/")).length;
+    const callsAfterAllVisited = panelCalls();
 
     fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
 
-    expect(fetchMock.mock.calls.length).toBe(callsAfterAllVisited);
+    expect(panelCalls()).toBe(callsAfterAllVisited);
   });
 
   it("mission-status stays selectable and unaffected by the default's change", async () => {

@@ -2395,7 +2395,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn a_read_panel_follows_the_read_posture() {
-        for id in ["mission-status", "role-list", "machine-status", "flow-status", "lab-fixture-list", "run-list"] {
+        for id in ["mission-status", "role-list", "machine-status", "flow-status", "lab-fixture-list", "run-list", "profile-list"] {
             let s = panel_status(AuthEnv::Off, remote_peer(), id, &[]).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{id} with read auth off");
             let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;

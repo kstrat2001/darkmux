@@ -46,6 +46,7 @@ mod mod_cli;
 // `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
 mod machine_list;
+mod profile_remote;
 mod fleet_defaults;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
@@ -1615,7 +1616,17 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
         ProfileCmd::List {
             profiles: cli::ProfilesFileArg { profiles },
             json: cli::JsonFlag { json },
-        } => cmd_profiles(profiles.as_deref(), json),
+            machine,
+            remote,
+        } => {
+            // (None from `run`: the named machine is this one, so the plain
+            // local list answers.)
+            let target = profile_remote::Target::from_flags(machine.as_deref(), remote);
+            match target.map(|t| profile_remote::run(t, json)).transpose()?.flatten() {
+                Some(code) => Ok(code),
+                None => cmd_profiles(profiles.as_deref(), json),
+            }
+        }
         ProfileCmd::Scan {
             profiles: cli::ProfilesFileArg { profiles },
         } => cmd_scan(profiles.as_deref()),

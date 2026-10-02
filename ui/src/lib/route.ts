@@ -44,7 +44,7 @@ export type RunsKind = (typeof RUNS_KINDS)[number];
 
 /** The console lens's panel allowlist — a straight port of `viewer.html`'s
  * `PANELS` id list (`crates/darkmux-serve/src/panel.rs::PANEL_IDS` is the
- * server-side twin, hard-capped at 8 BASE VERBS by its own doctrine
+ * server-side twin, hard-capped at 9 BASE VERBS by its own doctrine
  * assertion). Kept here, next to `RUNS_KINDS`, because both exist for the
  * SAME reason: `parseRoute` needs a closed set to validate a hash param
  * against before trusting it. Console-lens-only concerns (tab labels, which
@@ -65,6 +65,7 @@ export const PANEL_IDS = [
   "flow-status",
   "lab-fixture-list",
   "run-list",
+  "profile-list",
   "doctor",
 ] as const;
 export type PanelId = (typeof PANEL_IDS)[number];

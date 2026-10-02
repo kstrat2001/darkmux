@@ -28,6 +28,8 @@ mod list  ModList
 mod show  ModRecord
 profile draft  ProfileDraft
 profile list  ProfileList
+profile list --machine <peer>  PeerProfileList
+profile list --remote  PeerProfileList
 role list  RoleList
 role show  RoleShow
 run list  RunListOutput
@@ -49,6 +51,11 @@ ActiveWait
   resumes_in_secs: uint64 | null
   message: string
 Attribution = "per_process" | "estimated" | "unavailable" | "unknown"
+AvailableProfile
+  name: string
+  address: string
+  models: string[]
+  description: string | null
 BatteryCharge
   charge_pct: uint8
   on_ac: boolean
@@ -573,6 +580,8 @@ MachineCard
   governor: CardGovernor
   fleet_mode?: DeclaredFleetMode | null
   hosts_fleet_redis?: boolean | null
+  serves_radio?: boolean | null
+  serves_profiles?: uint32 | null
   fleet_defaults?: CardFleetDefaults | null
   generated_at_ms: uint64
   gather_ms: uint64
@@ -742,6 +751,9 @@ ModelRow
 NodeKind = "phase" | "task"
 NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error" | "unknown"
 Owner = "darkmux" | "user" | "unknown"
+PeerProfileList
+  peers: PeerProfiles[]
+PeerProfiles = { machine: string; profiles: AvailableProfile[]; state: "listed" } | { machine: string; reason: string; state: "unreadable" }
 PhaseDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting" | "degraded"
 PhaseJson
   id: string

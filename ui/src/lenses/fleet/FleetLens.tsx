@@ -1,7 +1,7 @@
 import { judgementAt } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { fitTubes } from "./tubeFit";
 import { scopeCenter } from "../../lib/scopeCenter";
 import { useQuery } from "@tanstack/react-query";
@@ -14,7 +14,6 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
 import { HubBadge } from "../../components/HubBadge";
-import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
 import { cardOrderKey, orderCards } from "./cardOrder";
 import { useCardOrderGate } from "./cardOrderGate";
@@ -35,7 +34,10 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, statusReason, cardFace, notStreamedNames, DISCONNECTED_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
+import { ServesLine } from "../../components/ServesLine";
+import { LampDot } from "../../components/LampDot";
+import { LampForm } from "../../lib/lamp";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, statusReason, cardFace, notStreamedNames, executionCountText, DISCONNECTED_STAT, DISCONNECTED_LAMP, DISCONNECTED_REASON, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import { rowFacts, rowSpecs } from "./viewRows";
@@ -118,9 +120,44 @@ function machineRunsHash(machineKey: string, runningSessionIds: string[]): strin
   return machineDrillHash(machineKey);
 }
 
+/** The props of a card's tube wrapper. With 2+ executions the tube itself is
+ * the control (W3): a tap or Enter / Space shows the next one, wrapping. It
+ * keeps focus (the element is never remounted), and `onCycle` stops the event
+ * so the tap does not also open the machine, as the running count's does
+ * (#1903). Otherwise it is decoration, with the replay note on hover (#2928:
+ * replay has only the 2 s heartbeats). */
+function tubeProps(f: {
+  paged: boolean;
+  position: number;
+  count: number;
+  role: string | null;
+  onCycle: (e: { stopPropagation: () => void }) => void;
+  replayNote: string | undefined;
+}) {
+  if (!f.paged) return { title: f.replayNote };
+  return {
+    role: "button",
+    tabIndex: 0,
+    "aria-label": `execution ${f.position} of ${f.count}${f.role ? `, ${f.role}` : ""}: show the next one`,
+    title: f.role ? `${f.role} · tap for the next execution` : "tap for the next execution",
+    onClick: f.onCycle,
+    onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        f.onCycle(e);
+      }
+    },
+  };
+}
+
 /** The card's name row: the machine icon, its name, what its own card
- * declares (HUB), the radio seat it grants this machine, and the utility
- * strip. One row, so a badge never changes the card's height. */
+ * declares (HUB) and the utility strip. One row, so a badge never changes
+ * the card's height. What the machine serves has its own line under the count.
+ *
+ * A fleet card shows only facts about its own machine. A relationship with
+ * the machine serving the viewer (a grant, a radio permission) is not a card
+ * fact: the same fleet must read the same from any server. Relationships live
+ * in the console, which runs commands on the serving machine. */
 function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuietKnown: boolean }) {
   return (
     <div className="name">
@@ -134,9 +171,6 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
       </span>
       {/* (#3022) What the machine's own card declares. */}
       <HubBadge declared={card.hub} />
-      {/* The radio seat this peer grants: an icon in the name row, where a
-          narrow card's ellipsis cannot cut it. */}
-      {card.grant?.radio ? <RadioSeatIcon /> : null}
       {/* (#2915) The utility strip: a fixed box at the end of the name row,
           always present, so a job starting or ending never changes the
           card's layout. See `UtilityGlyph`. */}
@@ -145,17 +179,14 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
   );
 }
 
-/** The card's subtitle line: the hardware, then (on a desktop) what the peer
- * lets this machine do; when no hardware is known, "hardware not reported" in
- * the dim style. Never a status. One line, so the card keeps its height. */
+/** The card's subtitle line: the hardware; when no hardware is known,
+ * "hardware not reported" in the dim style. Never a status. One line, so the
+ * card keeps its height. */
 function CardSpec({ card }: { card: FleetCard }) {
   return (
-    <div className="spec" title={specLine(card) || undefined}>
+    <div className="spec" title={card.spec || undefined}>
       {card.spec ? (
-        <>
-          {card.spec}
-          {card.grant?.text ? <span className="spec__grant"> · {card.grant.text}</span> : null}
-        </>
+        card.spec
       ) : (
         <span className="specdim">{specDimLabel(card)}</span>
       )}
@@ -1077,10 +1108,11 @@ export function FleetLens({
           // the ONE per-execution reading that N=1 and N=2+ both render
           // from; there is no separate "aggregate" rendering path left for
           // N=1 to keep in sync with this one.
-          const selectPage = (e: { stopPropagation: () => void }, dir: 1 | -1) => {
+          // (W3) A tap on the tube shows the next execution, wrapping.
+          const cycleExecution = (e: { stopPropagation: () => void }) => {
             e.stopPropagation();
             if (execs.length < 2 || selectedIdx < 0) return;
-            const next = execs[(selectedIdx + dir + execs.length) % execs.length];
+            const next = execs[(selectedIdx + 1) % execs.length];
             setPinnedPageByUid((m) => ({ ...m, [card.uid]: next.sessionId }));
           };
           return (
@@ -1206,7 +1238,7 @@ export function FleetLens({
                         : undefined
                   }
                 >
-                  <span className="dot" />
+                  <LampDot form={LampForm.Filled} />
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
                       // lamp with no reading yet (fewer than two same-turn
@@ -1268,61 +1300,11 @@ export function FleetLens({
                           })}
                 </div>
               ) : (
-                <div className="stat" title={statusReason(card, face)}>
-                  <span className="dot" />
+                <div className="stat" data-lamp={readingNoSignal ? DISCONNECTED_LAMP : face.lamp} title={readingNoSignal ? DISCONNECTED_REASON : statusReason(card, face)}>
+                  <LampDot form={readingNoSignal ? DISCONNECTED_LAMP : face.lamp} />
                   {/* (#2958) "idle" before its sources answer is a default,
                       not a reading: see `cardFace`. */}
                   {readingNoSignal ? DISCONNECTED_STAT : face.stat}
-                </div>
-              )}
-              {/* (#2881) The pager: shown only with 2+ running executions —
-                  "no pager with one execution" is `pagerActive`'s own
-                  `execs.length >= 2` gate. The arrows are their own tap
-                  targets, matching the running-count control directly below
-                  (`.runs--live`, #1903) — same nested-interactive-control
-                  shape, same reason: a click here must not ALSO fire the
-                  card body's `machineDrillHash` handler underneath it. */}
-              {pagerActive && face.tube === "reading" && selectedExec && (
-                <div className="mach-scope__pager" data-testid="fleet-pager">
-                  <div
-                    className="mach-scope__pager-btn"
-                    role="button"
-                    tabIndex={0}
-                    aria-label="previous execution"
-                    onClick={(e) => selectPage(e, -1)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        selectPage(e, -1);
-                      }
-                    }}
-                  >
-                    ‹
-                  </div>
-                  <span className="mach-scope__pager-n">
-                    {selectedIdx + 1}/{execs.length}
-                  </span>
-                  {/* (#2881) Always rendered, even empty, so the right arrow's
-                      column never moves between pages; one line, ellipsized,
-                      with the full label in the tooltip. */}
-                  <span className="mach-scope__pager-role" title={selectedExec.role ?? undefined}>
-                    {selectedExec.role ?? ""}
-                  </span>
-                  <div
-                    className="mach-scope__pager-btn"
-                    role="button"
-                    tabIndex={0}
-                    aria-label="next execution"
-                    onClick={(e) => selectPage(e, 1)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        selectPage(e, 1);
-                      }
-                    }}
-                  >
-                    ›
-                  </div>
                 </div>
               )}
               {/* (#1903) The running count's own tap target — a SIBLING
@@ -1365,15 +1347,10 @@ export function FleetLens({
                 // (#2958) "0 running" before every source has answered is a
                 // default, not a count: the app's "not yet measured" mark,
                 // in the same one-line slot. One or more is a reading.
-                if (face.secondLine !== null) return <div className="runs">{face.secondLine}</div>;
-                if (!face.countShown) return <div className="runs">—</div>;
+                if (face.secondLine !== null) return <div className="runs runs--quiet">{face.secondLine}</div>;
+                if (!face.countShown) return <div className="runs runs--quiet">—</div>;
                 const runsHash = machineRunsHash(encodeMachineKey(machineKeyCtx, card.uid), card.runningSessionIds);
-                const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
-                const countText = pagerActive
-                  ? card.runsCount === execs.length
-                    ? `${card.runsCount} ${card.runsLabel} · ${rateText}`
-                    : `${card.runsCount} ${card.runsCount === 1 ? "run" : "runs"} · ${execs.length} ${execs.length === 1 ? "execution" : "executions"} · ${rateText}`
-                  : `${card.runsCount} ${card.runsLabel}`;
+                const countText = executionCountText({ runsCount: card.runsCount, runsLabel: card.runsLabel, executions: execs.length, position: selectedIdx + 1 });
                 if (!runsHash) {
                   return <div className="runs">{countText}</div>;
                 }
@@ -1399,12 +1376,22 @@ export function FleetLens({
                   </div>
                 );
               })()}
+              {/* (rec 2) What the machine's own card says it serves, in words:
+                  a fixed line, empty (and the same height) when it serves
+                  nothing or does not say. */}
+              <ServesLine machine={card.name} profiles={card.servesProfiles} radio={card.servesRadio} />
               {face.tube === "reading" && selectedExec && (
                 <div
                   className="mach-scope"
                   data-testid="fleet-token-scope"
-                  // (#2928) Replay has only the 2 s heartbeats; said on hover.
-                  title={playhead != null || !livePolling ? REPLAY_GRANULARITY_NOTE : undefined}
+                  {...tubeProps({
+                    paged: pagerActive,
+                    position: selectedIdx + 1,
+                    count: execs.length,
+                    role: selectedExec.role,
+                    onCycle: cycleExecution,
+                    replayNote: playhead != null || !livePolling ? REPLAY_GRANULARITY_NOTE : undefined,
+                  })}
                 >
                   <TokenScope
                     // Same rule as the run page's tile — a stale rate from

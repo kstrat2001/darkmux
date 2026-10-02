@@ -15,7 +15,7 @@
 // Each state first asserts the words it must show, so a fixture that slid
 // into another state fails here rather than measuring one state N times.
 const { test, expect } = require("@playwright/test");
-const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
+const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
 const RUN = {
   modelbox: ".session-run .modelbox",
@@ -51,7 +51,11 @@ async function statLook(page) {
     e.appendChild(probe);
     const dim = getComputedStyle(probe).color;
     probe.remove();
-    return { color: cs.color, weight: cs.fontWeight, dot: getComputedStyle(e.querySelector(".dot")).backgroundColor, dim };
+    const lamp = e.querySelector(".lamp-dot");
+    const ls = getComputedStyle(lamp);
+    // The lamp's color is its fill, or its stroke when it is a dashed ring.
+    const lampColor = lamp.dataset.form === "dashed" ? ls.borderTopColor : ls.backgroundColor;
+    return { color: cs.color, weight: cs.fontWeight, lamp: lamp.dataset.form, lampColor, dim };
   });
 }
 
@@ -259,14 +263,13 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         const idle = rows.find((r) => r.state === "finished");
         expect(ns, "the disconnected state was measured").toBeTruthy();
         expect({ color: ns.look.color, weight: ns.look.weight }, "disconnected: the plain status words").toEqual({ color: idle.look.color, weight: idle.look.weight });
-        expect(ns.look.dot, "disconnected: the dim dot").toBe(ns.look.dim);
+        expect({ form: ns.look.lamp, color: ns.look.lampColor }, "disconnected: the dim dashed lamp").toEqual({ form: "dashed", color: ns.look.dim });
       }
       // (#2955, operator 2026-09-27) The card is also the same size idle and
       // running, on a desktop as on a phone: the reading rides the status
       // line instead of a line of its own. Idle states here: a finished run
       // and a mission between model steps ("dispatch in flight", no
-      // reading). One execution only: a second one adds the pager row (the
-      // fixme below).
+      // reading). Two executions are measured below: the tube pages them.
       expect(rows.filter((r) => !r.running).map((r) => r.state)).toEqual(expect.arrayContaining(["finished", "between-steps"]));
       for (const key of ["card", "cardScope", "stat"]) {
         const groups = sizeGroups(rows, key);
@@ -333,17 +336,17 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 }
 
 // The fleet view's rows draw the same card: a peer the daemon read (hardware
-// and what it lets this machine do, on the subtitle line) and one it could
-// not read (a typed status on that line) are the size of this machine's own
-// card, in every state.
+// on the subtitle line) and one it could not read (a typed status on that
+// line) are the size of this machine's own card, in every state. The peer
+// row carries a grant for the serving machine, which the card must not show; it
+// states `serves_radio` itself, which draws "serves radio" on its serves line.
 for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   test(`fleet card: a peer the view read, and one it could not, keep this machine's card size (${vpName})`, async ({ browser }) => {
     const finished = STATES.find((s) => s.id === "finished");
     const heights = [];
     for (const [label, rows, peerSpec] of [
       ["self alone", [SELF_ROW], null],
-      // The radio seat in the grant is an icon, not words, and adds no height.
-      ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB · runs diff-review"],
+      ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB"],
       ["peer unreachable, not listening", [SELF_ROW, OFFLINE_ROW], "hardware not reported"],
     ]) {
       const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
@@ -356,11 +359,11 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       if (peerSpec) {
         await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
         await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "online");
-        await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
+        await expect(page.locator(".mach").nth(1).locator(".serves"), `${label}: the serves line`).toHaveText(peerSpec === "hardware not reported" ? "" : "serves 12 profiles · radio");
         // The count line below the status says why (the read card's variant).
         if (peerSpec !== "hardware not reported") await expect(page.locator(".mach .runs").nth(1), `${label}: the peer's second line`).toHaveText("not streaming");
-        // Shown on a desktop; on a phone it gives the name its room (no tooltip on touch).
-        if (peerSpec !== "hardware not reported") await expect(page.locator(".mach").nth(1).locator(".name .radio-seat")).toBeVisible({ visible: viewport.width > 560 });
+        // In words, on both widths (a touch screen has no tooltip to explain an icon).
+        if (peerSpec !== "hardware not reported") await expect(page.locator(".mach").nth(1).locator(".serves")).toBeVisible();
       }
       await page.waitForTimeout(400);
       const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope });
@@ -369,6 +372,37 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     }
     const distinct = new Set(heights.flatMap((h) => h.split(": ")[1].split(", ").map((wh) => wh.split("x")[1])));
     expect(distinct.size, `card heights differ across states (${vpName}):\n  ${heights.join("\n  ")}`).toBe(1);
+  });
+}
+
+// The serves line ("serves 12 profiles · radio") changes no card's size: a card
+// with both, one with one, one with neither, and one unreadable are the same
+// size, and the words show on a desktop and on a phone alike. The name row
+// holds identity, the HUB chip and the robot only.
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: serves both, one and none keep the same card size (${vpName})`, async ({ browser }) => {
+    const finished = STATES.find((s) => s.id === "finished");
+    const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+    const page = await ctx.newPage();
+    await page.clock.setFixedTime(finished.nowMs);
+    const rows = [SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW];
+    await installLayoutRoutes(page, { fleetView: rows });
+    await page.goto("/index.html#lens=fleet");
+    await expect(page.locator(CARD.card)).toHaveCount(rows.length);
+    const card = (name) => page.locator(".mach").filter({ has: page.locator(".mach-name", { hasText: new RegExp(`^${name}$`) }) });
+    await expect(card("layout-peer").locator(".serves"), "both").toHaveText("serves 12 profiles · radio");
+    await expect(card("layout-one-icon").locator(".serves"), "one").toHaveText("serves 1 profile");
+    await expect(card("layout-no-icon").locator(".serves"), "none: the line is there, empty").toHaveText("");
+    await expect(card("layout-no-icon").locator(".serves")).toHaveCount(1);
+    await expect(page.locator(".mach .name .profiles-served, .mach .name .radio-seat"), "the name row holds no serves facts").toHaveCount(0);
+    await expect(card("layout-peer").locator(".serves")).toBeVisible();
+    // Never clipped: the widest line fits its slot.
+    await expectFits(card("layout-peer").locator(".serves"), `serves line (${vpName})`);
+    await page.waitForTimeout(400);
+    const m = await measure(page, { card: CARD.card });
+    const sizes = new Set(m.card.map((b) => `${b.w}x${b.h}`));
+    expect(sizes.size, `card sizes differ (${vpName}): ${m.card.map((b) => `${b.w}x${b.h}`).join(", ")}`).toBe(1);
+    await ctx.close();
   });
 }
 
@@ -382,40 +416,93 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 // line reserved) is the operator's design call, so it is recorded, not decided.
 test.fixme("run page MODEL section: the same size live and finished with the thermal governor armed (owner: the operator's call on ACTIVE TIME's sub line)", async () => {});
 
-// (#2955 review) The pager: with two executions running, the card grows the
-// pager row ("‹ 1/2 coder ›", 32px tap targets) under the status line. On a
-// phone the tube beside the text already sets the card's height, so it
-// stays one size (measured, and pinned live below). On a desktop it does
-// not: 318px with the pager vs 282px with one execution, measured on
-// origin/main + #2955's branch. Where the pager lives is its own design
-// call, so the desktop case is recorded here, not decided here.
+// (W3) Two executions: the tube pages them ("2 running · 1/2"), and there is no
+// pager row, so the card is the size of one running a single execution, on a
+// desktop as on a phone.
 async function pagerRows(browser, viewport) {
   const rows = [];
   for (const state of [STATES.find((s) => s.id === "generating"), MULTI]) {
     const { ctx, page } = await openState(browser, viewport, state, { mode: "live", surface: "fleet" });
     await expect(page.locator(CARD.card)).toHaveCount(1);
-    await expect(page.locator(".mach-scope__pager"), `${state.id}: the pager`).toHaveCount(state === MULTI ? 1 : 0);
-    if (state === MULTI) await expect(page.locator(".mach-scope__pager-n")).toHaveText("1/2");
+    await expect(page.locator(".mach-scope__pager"), `${state.id}: no pager row`).toHaveCount(0);
+    if (state === MULTI) {
+      await expect(page.locator(".runs")).toHaveText("2 running · 1/2");
+      const tube = page.locator('.mach-scope[role="button"]');
+      await expect(tube).toHaveAttribute("aria-label", /^execution 1 of 2/);
+      await tube.click();
+      await expect(page.locator(".runs")).toHaveText("2 running · 2/2");
+      await expect(tube).toHaveAttribute("aria-label", /^execution 2 of 2/);
+      await tube.press("Enter");
+      await expect(page.locator(".runs")).toHaveText("2 running · 1/2");
+    }
     await page.waitForTimeout(400);
-    rows.push({ state: state.id, ...(await measure(page, { card: CARD.card, cardScope: CARD.cardScope })) });
+    rows.push({ state: state.id, ...(await measure(page, { card: CARD.card, cardScope: CARD.cardScope, stat: STAT, runs: ".mach .runs", serves: ".mach .serves" })) });
     await ctx.close();
   }
   return rows;
 }
-test("fleet card: the same size with a second execution's pager (phone, live)", async ({ browser }) => {
-  const rows = await pagerRows(browser, VIEWPORTS.phone);
-  for (const key of ["card", "cardScope"]) {
-    const groups = sizeGroups(rows, key);
-    expect(groups, `${key} changed size with the pager (phone):\n  ${groups.join("\n  ")}`).toHaveLength(1);
-  }
-});
-test.fixme("fleet card: the same size with a second execution's pager (desktop, live) (owner: the operator's call on where the pager lives)", async ({ browser }) => {
-  const rows = await pagerRows(browser, VIEWPORTS.desktop);
-  for (const key of ["card", "cardScope"]) {
-    const groups = sizeGroups(rows, key);
-    expect(groups, `${key} changed size with the pager (desktop):\n  ${groups.join("\n  ")}`).toHaveLength(1);
-  }
-});
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: the same size with a second execution (${vpName}, live)`, async ({ browser }) => {
+    const rows = await pagerRows(browser, viewport);
+    for (const key of ["card", "cardScope", "stat", "serves"]) {
+      const groups = sizeGroups(rows, key);
+      expect(groups, `${key} changed size with a second execution (${vpName}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+    }
+  });
+}
+
+// One size in EVERY state a machine card can be in, each state alone on its
+// page (beside others a desktop grid stretches the row, which would hide a
+// card that grew): every run-page state, two executions, a peer read but not
+// streaming (serving both, one, nothing), offline, and the "checking…" a card
+// says before its first data.
+const EMPTY_DAY = Date.parse("2030-01-01T12:00:00Z");
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: one size in every state, 2+ executions included (${vpName})`, async ({ browser }) => {
+    const rows = [];
+    const measureCard = async (page, id) => {
+      await page.waitForTimeout(400);
+      const m = await measure(page, { card: CARD.card });
+      expect(m.card, `${id}: exactly one card`).toHaveLength(1);
+      rows.push({ state: id, card: m.card[0] });
+    };
+    for (const state of [...STATES, MULTI]) {
+      const { ctx, page } = await openState(browser, viewport, state, { mode: "live", surface: "fleet" });
+      await expect(page.locator(CARD.card)).toHaveCount(1);
+      await measureCard(page, state.id);
+      await ctx.close();
+    }
+    for (const [id, row, stat] of [
+      ["peer: online, not streaming, serves both", PEER_ROW, "online"],
+      ["peer: online, not streaming, serves one", ONE_ICON_ROW, "online"],
+      ["peer: online, not streaming, serves none", NO_ICON_ROW, "online"],
+      ["peer: offline", OFFLINE_ROW, "offline"],
+    ]) {
+      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const page = await ctx.newPage();
+      await page.clock.setFixedTime(EMPTY_DAY);
+      await installLayoutRoutes(page, { fleetView: [row] });
+      await page.goto("/index.html#lens=fleet");
+      await expect(page.locator(CARD.card)).toHaveCount(1);
+      await expect(page.locator(".mach .stat"), `${id}: the status`).toHaveText(stat);
+      await measureCard(page, id);
+      await ctx.close();
+    }
+    {
+      const state = STATES.find((s) => s.id === "finished");
+      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const page = await ctx.newPage();
+      await page.clock.setFixedTime(state.nowMs);
+      await installLayoutRoutes(page, { holdRuns: true });
+      await page.goto("/index.html#lens=fleet");
+      await expect(page.locator(".mach .stat")).toHaveText("checking…");
+      await measureCard(page, "checking…");
+      await ctx.close();
+    }
+    const groups = sizeGroups(rows, "card");
+    expect(groups, `a card changed size between states (${vpName}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+  });
+}
 
 // (#2955 review) On a phone, "tool gen · write · 18s" does not fit the fleet
 // card's status line and is ellipsized (scrollWidth 203 > clientWidth 184 at

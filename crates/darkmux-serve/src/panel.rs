@@ -45,13 +45,25 @@
 //!
 //! The struct shape IS the legality proof (see [`PanelOpt`]/
 //! [`PanelOptValue`]): there is no field that could hold a placeholder, a
-//! format string, or a client-echoed value, so `--machine <id>` cannot be
-//! written down at all. Only a `(name, value)` LOOKUP KEY crosses the wire;
+//! format string, or a client-echoed value, so a machine id cannot be
+//! written down in a table at all (the one exception is the roster-valued opt
+//! below). Only a `(name, value)` LOOKUP KEY crosses the wire;
 //! the server owns every literal argv fragment it could ever resolve to.
 //! This is the SAME trust mechanism the panel id itself already used, one
 //! level down. An unknown name or an unknown value for a known name is a
 //! 400 naming the legal set — never a pass-through, never silently ignored
 //! (see [`resolve_opts`]).
+//!
+//! ### The one roster-valued opt (`profile-list`'s `machine`)
+//!
+//! `profile-list` also declares [`PanelSpec::roster_opt`]: `opt.machine=<name>`
+//! drives `--machine <name>`. This is the single exception to "no client string
+//! reaches argv", and it is still a closed set: the legal values are the names
+//! in THIS machine's own roster (`darkmux_fleet::load_roster`), and the value
+//! is accepted only by exact (case-insensitive) membership. The argv gets the
+//! roster's own spelling of the id, never the client's bytes, so the client
+//! chooses among server-owned strings exactly as it does for every static opt.
+//! A name not in the roster is a 400 naming the roster, like any unknown value.
 //!
 //! There is no `mission-status-all`: the unlimited board is `mission-status`
 //! with `opt.all=all`, and a request for the old id is an unknown panel (404).
@@ -176,8 +188,9 @@ pub(crate) struct PanelOptValue {
 /// One declared, closed option group for a panel — e.g. `--kind` on
 /// `run-list` (#1911). The struct shape IS the legality proof: it has no
 /// field that could hold a placeholder, a format string, or a
-/// client-echoed value, so `--machine <id>` cannot be written down here at
-/// all. A client transmits a `(name, value)` pair used ONLY as a lookup key
+/// client-echoed value, so a machine id cannot be written down here at
+/// all (the one roster-valued opt is [`PanelSpec::roster_opt`], validated
+/// against the roster, not a table). A client transmits a `(name, value)` pair used ONLY as a lookup key
 /// into this table; the argv tokens appended are the table's OWN literals.
 pub(crate) struct PanelOpt {
     /// Query-param key (`opt.<name>`) AND the opts-bar group label. By
@@ -308,7 +321,28 @@ pub(crate) struct PanelSpec {
     /// Who may run it — see [`PanelAudience`]. One classification per panel,
     /// stated in [`panel_spec`]'s table.
     pub(crate) audience: PanelAudience,
+    /// The name of this panel's roster-valued opt, if it declares one: its
+    /// value is a roster machine name, validated by [`resolve_roster_opt`]
+    /// against the roster and driving `--machine <name>`. See the module doc.
+    pub(crate) roster_opt: Option<&'static str>,
 }
+
+/// `profile list`'s `--remote` toggle: every peer's profiles this machine may
+/// use. Default `off` is the local list. Conflicts with the roster `machine`
+/// opt, which [`resolve_roster_opt`] refuses.
+const PROFILE_LIST_REMOTE_OPT: PanelOpt = PanelOpt {
+    name: "remote",
+    values: &[
+        PanelOptValue { value: "off", argv: &[] },
+        PanelOptValue { value: "on", argv: &["--remote"] },
+    ],
+};
+
+const PROFILE_LIST_OPTS: &[PanelOpt] = &[PROFILE_LIST_REMOTE_OPT];
+
+/// The roster-valued opt's name on `profile-list`, and the flag it drives.
+const ROSTER_MACHINE_OPT: &str = "machine";
+const ROSTER_MACHINE_FLAG: &str = "--machine";
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
 /// variants — a verb with declared opts is still one id here). Test-only
@@ -327,6 +361,7 @@ pub(crate) const PANEL_IDS: &[&str] = &[
     "flow-status",
     "lab-fixture-list",
     "run-list",
+    "profile-list",
     "doctor",
 ];
 
@@ -366,6 +401,11 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         // (#1911) The CLI twin of the RUNS lens's union — see
         // `src/run_list.rs`'s own module doc. Read: the same rows as `/runs`.
         "run-list" => ("run-list", &["run", "list"], true, PANEL_CACHE_TTL, RUN_LIST_OPTS, Read),
+        // Read: the profiles THIS machine's own grants let it use (its own
+        // registry, or a roster peer's card), the same facts `machine list`
+        // prints; it reveals only this machine's own allow-list entry on
+        // each peer, not the peer's allow-list.
+        "profile-list" => ("profile-list", &["profile", "list"], true, PANEL_CACHE_TTL, PROFILE_LIST_OPTS, Read),
         // Manual-run only (#1286): never auto-refreshed by the viewer,
         // TTL 0 so an explicit re-run is always a real run, and rate-
         // floored server-side (see MANUAL_MIN_INTERVAL) because
@@ -387,7 +427,8 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     // for its sibling. A future panel that reads the fleet stream must flip
     // this deliberately too — see `only_these_ids_need_a_fleet_snapshot`.
     let needs_fleet_snapshot = matches!(id, "run-list" | "mission-status");
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience })
+    let roster_opt = matches!(id, "profile-list").then_some(ROSTER_MACHINE_OPT);
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience, roster_opt })
 }
 
 /// One resolved `(name, value)` opt selection, in [`PanelSpec::opts`]'
@@ -482,6 +523,66 @@ fn variant_key(spec_id: &str, resolved: &[ResolvedOpt]) -> String {
 /// declared opts.
 fn opts_map(resolved: &[ResolvedOpt]) -> std::collections::BTreeMap<String, String> {
     resolved.iter().map(|r| (r.name.to_string(), r.value.to_string())).collect()
+}
+
+/// Take the roster-valued opt (if `spec` declares one) out of `requested` and
+/// check it against `roster_ids` (#3045). Returns the roster's own spelling of
+/// the chosen id, or `None` when no machine was chosen (absent or empty).
+///
+/// Removing it from `requested` is what keeps [`resolve_opts`] unchanged: that
+/// function still sees only static opts, and still rejects any name a panel
+/// does not declare. A panel with no roster opt leaves `machine` in place, so
+/// `resolve_opts` refuses it as unknown. `remote_on` is whether the static
+/// `remote` toggle is set: a machine and `--remote` together are the same
+/// conflict the CLI refuses.
+fn resolve_roster_opt(
+    spec: &PanelSpec,
+    requested: &mut HashMap<String, String>,
+    roster_ids: &[String],
+    remote_on: bool,
+) -> Result<Option<String>, String> {
+    let Some(name) = spec.roster_opt else { return Ok(None) };
+    let Some(raw) = requested.remove(name) else { return Ok(None) };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let Some(id) = roster_ids.iter().find(|id| id.eq_ignore_ascii_case(&raw)) else {
+        return Err(format!(
+            "unknown value \"{raw}\" for option \"{name}\" on panel \"{}\" — legal values: {}\n",
+            spec.id,
+            if roster_ids.is_empty() { "(the roster is empty)".to_string() } else { roster_ids.join(", ") }
+        ));
+    };
+    if remote_on {
+        return Err(format!(
+            "options \"{name}\" and \"remote\" cannot be combined on panel \"{}\": pick one machine or every peer\n",
+            spec.id
+        ));
+    }
+    Ok(Some(id.clone()))
+}
+
+/// The panel's argv, cache key and opts echo with the chosen roster machine
+/// folded in. The key keeps [`variant_key`]'s `id?name=value&…` shape, so the
+/// machine is just one more non-default pair.
+fn with_roster_choice(
+    argv: Vec<&'static str>,
+    key: String,
+    mut echo: std::collections::BTreeMap<String, String>,
+    machine: Option<&str>,
+) -> (Vec<String>, String, std::collections::BTreeMap<String, String>) {
+    let mut argv: Vec<String> = argv.into_iter().map(String::from).collect();
+    let Some(id) = machine else { return (argv, key, echo) };
+    argv.extend([ROSTER_MACHINE_FLAG.to_string(), id.to_string()]);
+    let joiner = if key.contains('?') { '&' } else { '?' };
+    echo.insert(ROSTER_MACHINE_OPT.to_string(), id.to_string());
+    (argv, format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"), echo)
+}
+
+/// The roster's machine ids, from this machine's own roster. An unreadable
+/// roster has no legal machines: the opt then 400s with an empty roster.
+fn roster_machine_ids() -> Vec<String> {
+    darkmux_fleet::load_roster().map(|r| r.machines.keys().cloned().collect()).unwrap_or_default()
 }
 
 /// Pull `opt.<name>=<value>` pairs out of the full raw query map, stripping
@@ -781,6 +882,28 @@ fn admit_panel_request(
     Ok(spec)
 }
 
+/// The request's opt selections resolved into what runs: the argv, the cache
+/// key and the `opts` echo. The roster-valued opt is taken out first, so
+/// [`resolve_opts`] sees static opts only. The roster read is blocking disk,
+/// and only a panel that declares such an opt and was sent a value pays it.
+async fn resolve_selection(
+    spec: &PanelSpec,
+    params: &HashMap<String, String>,
+) -> Result<(Vec<String>, String, std::collections::BTreeMap<String, String>), (StatusCode, String)> {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, msg);
+    let mut requested = extract_opt_params(params);
+    let machine = match (spec.roster_opt, requested.contains_key(ROSTER_MACHINE_OPT)) {
+        (Some(_), true) => {
+            let roster = tokio::task::spawn_blocking(roster_machine_ids).await.unwrap_or_default();
+            let remote_on = requested.get("remote").is_some_and(|v| v == "on");
+            resolve_roster_opt(spec, &mut requested, &roster, remote_on).map_err(bad)?
+        }
+        _ => None,
+    };
+    let resolved = resolve_opts(spec, &requested).map_err(bad)?;
+    Ok(with_roster_choice(compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
+}
+
 pub(crate) async fn panel_handler(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -795,10 +918,7 @@ pub(crate) async fn panel_handler(
 
     // `opt.<name>` query params. An unknown name or value is a 400, never
     // silently ignored.
-    let requested = extract_opt_params(&params);
-    let resolved = resolve_opts(&spec, &requested).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let final_argv = compose_argv(&spec, &resolved);
-    let key = variant_key(id, &resolved);
+    let (final_argv, key, opts_echo) = resolve_selection(&spec, &params).await?;
 
     // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
     // `u16`) resolves to the default width rather than failing the whole
@@ -935,8 +1055,8 @@ pub(crate) async fn panel_handler(
 
     let body = PanelResponse {
         panel: id.to_string(),
-        argv: final_argv.iter().map(|a| a.to_string()).collect(),
-        opts: opts_map(&resolved),
+        argv: final_argv.clone(),
+        opts: opts_echo,
         captured_ts_ms: current_millis(),
         gather_ms,
         exit_code: output.status.code(),
@@ -1017,17 +1137,18 @@ mod tests {
             assert_eq!(spec.id, *id, "a spec must report the id it was looked up by");
             assert!(!spec.argv.is_empty(), "{id} has empty argv");
         }
-        // 8 as of `run-list` (#1911). Bumping this number is the doctrine
+        // 8 as of `run-list` (#1911), 9 with `profile-list` (5.0). Bumping this number is the doctrine
         // decision: an entry is legal only if it neither dispatches a model
         // (#1286) nor mutates, so the worst case of a bug here stays a wrong
         // READING. This now counts 8 BASE VERBS, not 8 id/argv combinations
         // (#1911) — a verb's VARIANTS (its declared `opts`) grow the option
         // space, not this list; see `variant_cross_product_stays_bounded`
         // for that guard instead. If growth ever comes from wanting
-        // operator-supplied VALUES with no closed set (`--machine <id>`,
-        // `--since <when>`), stop — an open value space is not an
-        // allowlist, and that surface is a lens, not a panel.
-        assert_eq!(PANEL_IDS.len(), 8, "allowlist growth is a doctrine decision, not a drive-by");
+        // operator-supplied VALUES with no closed set (`--since <when>`),
+        // stop — an open value space is not an allowlist, and that surface
+        // is a lens, not a panel. (`profile-list`'s `machine` is closed: the
+        // roster's own names, see the module doc.)
+        assert_eq!(PANEL_IDS.len(), 9, "allowlist growth is a doctrine decision, not a drive-by");
     }
 
     /// (#1914, widened #1711) `run-list` and `mission-status` are the ONLY
@@ -1178,7 +1299,10 @@ mod tests {
     /// The cache-growth guard #1911 calls for: a bound on the TOTAL variant
     /// cross-product, not just the base-verb count layer 3 already guards.
     /// Today: `mission-status` (2) + `run-list` (4×2×2=16, #2902 added the
-    /// `usage` toggle) + six no-opt panels (1 each) = 24.
+    /// `usage` toggle) + `profile-list` (2: its `remote` toggle) + six no-opt
+    /// panels (1 each) = 26. `profile-list`'s roster `machine` opt adds one
+    /// variant per roster machine, validated by membership, so it is bounded by
+    /// the roster and is not counted here.
     #[test]
     fn variant_cross_product_stays_bounded() {
         let mut total = 0usize;
@@ -1188,7 +1312,7 @@ mod tests {
             total += variants;
         }
         assert!(
-            total <= 24,
+            total <= 26,
             "variant cross-product grew to {total} — bumping the bound is a doctrine \
              decision (#1911), not a drive-by"
         );
@@ -1550,6 +1674,16 @@ mod tests {
         assert!(body.contains("unknown option"), "{body}");
         assert!(body.contains("machine"), "{body}");
         assert!(body.contains("kind"), "must name the legal set: {body}");
+    }
+
+    /// `profile-list` takes a machine, validated against the roster: a name
+    /// the roster lacks is a 400 naming VALUES, not "unknown option".
+    #[tokio::test]
+    async fn handler_validates_the_profile_list_machine_against_the_roster() {
+        let (status, body) = panel_get("/panel/profile-list?opt.machine=no-such-machine-in-any-roster", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unknown value") && body.contains("legal values"), "{body}");
+        assert!(!body.contains("unknown option"), "machine is a declared opt of profile-list: {body}");
     }
 
     #[tokio::test]
@@ -1952,5 +2086,86 @@ mod tests {
         let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
         let now = captured - Duration::from_secs(60);
         assert_eq!(cache_entry_age_ms_at(captured, now), u64::MAX);
+    }
+
+    // ── profile-list: the roster-valued `machine` opt (5.0) ───────────
+
+    fn roster() -> Vec<String> {
+        vec!["studio".to_string(), "mini".to_string()]
+    }
+
+    fn req(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn profile_list_is_a_read_panel_over_the_profile_verb() {
+        let spec = panel_spec("profile-list").unwrap();
+        assert_eq!(spec.argv, &["profile", "list"]);
+        assert_eq!(spec.audience, PanelAudience::Read);
+        assert_eq!(spec.roster_opt, Some("machine"));
+        assert!(!spec.needs_fleet_snapshot);
+        let others = PANEL_IDS.iter().filter(|id| **id != "profile-list");
+        assert!(others.into_iter().all(|id| panel_spec(id).unwrap().roster_opt.is_none()), "only profile-list takes a machine");
+    }
+
+    #[test]
+    fn a_roster_machine_becomes_the_roster_own_spelling_in_argv_key_and_echo() {
+        let spec = panel_spec("profile-list").unwrap();
+        let mut requested = req(&[("machine", "STUDIO")]);
+        let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
+        assert_eq!(machine.as_deref(), Some("studio"), "the roster's spelling, not the client's bytes");
+        let resolved = resolve_opts(&spec, &requested).unwrap();
+        let (argv, key, echo) =
+            with_roster_choice(compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref());
+        assert_eq!(argv, vec!["profile", "list", "--machine", "studio"]);
+        assert_eq!(key, "profile-list?machine=studio");
+        assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
+    }
+
+    #[test]
+    fn no_machine_is_the_local_list_with_the_plain_key() {
+        let spec = panel_spec("profile-list").unwrap();
+        for raw in [req(&[]), req(&[("machine", "")])] {
+            let mut requested = raw;
+            let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
+            assert_eq!(machine, None);
+            let resolved = resolve_opts(&spec, &requested).unwrap();
+            let (argv, key, echo) =
+                with_roster_choice(compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), None);
+            assert_eq!((argv, key.as_str()), (vec!["profile".to_string(), "list".to_string()], "profile-list"));
+            assert!(!echo.contains_key("machine"));
+        }
+    }
+
+    #[test]
+    fn a_machine_that_is_not_in_the_roster_is_refused_naming_the_roster() {
+        let spec = panel_spec("profile-list").unwrap();
+        for bad in ["nowhere", "studio --remote", "../studio", "studio&remote=on"] {
+            let err = resolve_roster_opt(&spec, &mut req(&[("machine", bad)]), &roster(), false).unwrap_err();
+            assert!(err.contains("legal values: studio, mini"), "{bad}: {err}");
+        }
+        let empty = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &[], false).unwrap_err();
+        assert!(empty.contains("the roster is empty"), "{empty}");
+    }
+
+    #[test]
+    fn a_machine_and_remote_together_are_refused() {
+        let spec = panel_spec("profile-list").unwrap();
+        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &roster(), true).unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn remote_is_a_static_toggle_and_machine_is_unknown_to_every_other_panel() {
+        let spec = panel_spec("profile-list").unwrap();
+        let resolved = resolve_opts(&spec, &req(&[("remote", "on")])).unwrap();
+        assert_eq!(compose_argv(&spec, &resolved), vec!["profile", "list", "--remote"]);
+        assert_eq!(variant_key(spec.id, &resolved), "profile-list?remote=on");
+        // A panel with no roster opt leaves `machine` for `resolve_opts` to refuse.
+        let run = panel_spec("run-list").unwrap();
+        let mut requested = req(&[("machine", "studio")]);
+        assert_eq!(resolve_roster_opt(&run, &mut requested, &roster(), false), Ok(None));
+        assert!(resolve_opts(&run, &requested).unwrap_err().contains("unknown option \"machine\""));
     }
 }

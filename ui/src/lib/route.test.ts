@@ -134,6 +134,15 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
   });
 
+  it("a profile-list deep link carries a roster machine; the same name on another panel drops", () => {
+    setHash("#lens=console&panel=profile-list&opt.machine=darkbook");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "profile-list", opts: { machine: "darkbook" } });
+    setHash("#lens=console&panel=profile-list&opt.remote=on");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "profile-list", opts: { remote: "on" } });
+    setHash("#lens=console&panel=profile-list");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "profile-list", opts: {} });
+  });
+
   it("run-list is a real, addressable panel id", () => {
     setHash("#lens=console&panel=run-list");
     expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });

@@ -21,12 +21,13 @@ console
 run list
 mission status
 machine status
+profile list
 flow status
 role list
 config list
 lab fixture list
 doctor
-$ darkmux doctor
+MacBook-Pro $ darkmux doctor
 captured 20:54:25
 · manual-run only
 · 1923ms

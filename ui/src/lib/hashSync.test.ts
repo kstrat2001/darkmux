@@ -139,6 +139,14 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
+  it("a profile-list machine round-trips as opt.machine, and the default (this machine) writes nothing", () => {
+    const route: Route = { kind: "console", panelId: "profile-list", opts: { machine: "darkbook" } };
+    expect(canonicalHash(route)).toBe("lens=console&panel=profile-list&opt.machine=darkbook");
+    expect(roundTrip(route)).toEqual(route);
+    const local: Route = { kind: "console", panelId: "profile-list", opts: { machine: "(this machine)" } };
+    expect(canonicalHash(local)).toBe("lens=console&panel=profile-list");
+  });
+
   it("the unlimited mission board is written as panel=mission-status&opt.all=all", () => {
     const route: Route = { kind: "console", panelId: "mission-status", opts: { all: "all" } };
     expect(canonicalHash(route)).toBe("lens=console&panel=mission-status&opt.all=all");
