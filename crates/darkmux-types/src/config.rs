@@ -706,6 +706,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         line: "removed with the review funnel (#2310): `review` runs as a mission config now. Delete the block",
     },
     RetiredSetting {
+        // flow-action-guard:allow — a retired config key, refused by name
         key: "gh.enabled",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
@@ -713,6 +714,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         line: "renamed to `cmd.enabled` (#2003)",
     },
     RetiredSetting {
+        // flow-action-guard:allow — a retired config key, refused by name
         key: "gh.allowed",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
