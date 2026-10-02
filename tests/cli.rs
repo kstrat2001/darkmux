@@ -13919,3 +13919,97 @@ fn a_lessons_store_from_a_newer_darkmux_is_refused_not_read_as_empty() {
         assert!(!so.contains("no lessons recorded yet") && !so.contains("\"lessons\": []"), "{args:?}: {so}");
     }
 }
+
+/// Run `cmd` with its stderr on a pseudo-terminal and return what it wrote
+/// there. The child sees an interactive stderr; stdin and stdout stay null.
+#[cfg(unix)]
+fn stderr_on_a_pty(mut cmd: std::process::Command) -> String {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills both fds on success; each is wrapped exactly once.
+    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert_eq!(rc, 0, "openpty failed");
+    let (master, slave) = unsafe { (std::fs::File::from_raw_fd(master), std::fs::File::from_raw_fd(slave)) };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(slave));
+    // Drain the master while the child runs: macOS discards what a closed
+    // slave still holds, so reading after the exit would lose the output.
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        // EIO at hangup is the normal end of a pty read.
+        let _ = (&master).read_to_string(&mut out);
+        out
+    });
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd); // closes the parent's copy of the slave so the read ends
+    child.wait().unwrap();
+    let out = reader.join().unwrap();
+    out
+}
+
+/// (5.0) Diagnostic lines go quiet on an interactive terminal and stay in
+/// logs. One refused launch, three stderr kinds: a pipe (a CI log) keeps the
+/// `[darkmux-liveness]` marker, a terminal drops it but still prints the
+/// refusal, `--verbose` on a terminal brings it back, and the heartbeat file
+/// is written in every case.
+#[cfg(unix)]
+#[test]
+fn liveness_markers_stay_out_of_a_terminal_but_not_out_of_logs() {
+    let args = ["mission", "launch", "no-such-config-for-quiet-test"];
+    let heartbeat_written = |cmd: &std::process::Command| {
+        let dir = darkmux_home_of(cmd).join("liveness");
+        std::fs::read_dir(dir).map(|d| d.count() > 0).unwrap_or(false)
+    };
+
+    let mut piped = darkmux_std_cmd();
+    piped.args(args);
+    let out = piped.output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(log.contains("[darkmux-liveness]") && log.contains("process-start"), "a pipe keeps the markers: {log}");
+    assert!(heartbeat_written(&piped));
+
+    let mut tty = darkmux_std_cmd();
+    tty.args(args);
+    let probe = darkmux_home_of(&tty);
+    let screen = stderr_on_a_pty({
+        let mut c = darkmux_std_cmd();
+        c.args(args).env("DARKMUX_HOME", &probe);
+        c
+    });
+    assert!(!screen.contains("[darkmux-liveness]"), "a terminal gets no markers: {screen}");
+    assert!(screen.contains("no-such-config-for-quiet-test"), "the refusal still prints on a terminal: {screen}");
+    assert!(heartbeat_written(&tty), "the heartbeat file is written on a terminal too");
+
+    let mut loud = darkmux_std_cmd();
+    loud.args(args).arg("--verbose");
+    let screen = stderr_on_a_pty(loud);
+    assert!(screen.contains("[darkmux-liveness]"), "--verbose brings the markers back: {screen}");
+
+    let mut env_on = darkmux_std_cmd();
+    env_on.args(args).env("DARKMUX_VERBOSE", "1");
+    let screen = stderr_on_a_pty(env_on);
+    assert!(screen.contains("[darkmux-liveness]"), "DARKMUX_VERBOSE=1 brings the markers back: {screen}");
+}
+
+/// (5.0) A sink-enabled banner follows the same rule as the liveness marker:
+/// a pipe keeps it, a terminal does not, `--verbose` restores it.
+#[cfg(unix)]
+#[test]
+fn sink_banners_stay_out_of_a_terminal_but_not_out_of_logs() {
+    let audit = TempDir::new().unwrap();
+    let args = ["flow", "note", "--text", "quiet-banner-probe", "--source", "orchestrator"];
+    let build = |extra: &[&str]| {
+        let mut c = darkmux_std_cmd();
+        c.args(args).args(extra).env("DARKMUX_AUDIT_DIR", audit.path());
+        c
+    };
+    let out = build(&[]).output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(log.contains("flow: AuditFileSink enabled"), "a pipe keeps the banner: {log}");
+    let screen = stderr_on_a_pty(build(&[]));
+    assert!(!screen.contains("AuditFileSink enabled"), "a terminal gets no banner: {screen}");
+    let screen = stderr_on_a_pty(build(&["--verbose"]));
+    assert!(screen.contains("flow: AuditFileSink enabled"), "--verbose restores it: {screen}");
+}

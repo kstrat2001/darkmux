@@ -220,7 +220,7 @@
 //!   (`crates/darkmux-flow/src/lib.rs::build_default_sink`), which print
 //!   UNCONDITIONALLY on stderr the first time any process touches the flow
 //!   crate, i.e. every `mission launch` subprocess this file spawns.
-//!   Observed live leaking into the Zed panel ("flow: Redis sink enabled —
+//!   Observed live leaking into the Zed panel ("flow: Redis sink enabled:
 //!   ... composed via TeeSink"). [`forwardable_chunk_text`] now drops any
 //!   line starting with the flow crate's own `"flow: "` prefix — narrowly,
 //!   not a broad heuristic — before it ever reaches the chat.

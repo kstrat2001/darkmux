@@ -1819,7 +1819,7 @@ pub fn dispatch_answerer_call_with(
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
     let (seat, source) = resolve_answering(overrides, crate::fleet_defaults::hub_default)
         .map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
-    eprintln!("radio: answering seat: {}", SeatProvenance::of(&seat, source).describe(darkmux_flow::presence::now_ms()));
+    darkmux_types::diag_eprintln!("radio: answering seat: {}", SeatProvenance::of(&seat, source).describe(darkmux_flow::presence::now_ms()));
     let cap = answer_token_cap();
     let (profile_name, machine, system_prompt_override, single_shot, seat_label) = match &seat {
         AnsweringSeat::Here { explicit } => {

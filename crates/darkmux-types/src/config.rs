@@ -1156,6 +1156,13 @@ pub struct RuntimeBehaviorConfig {
     /// that module's doc — it must work before config/Redis/audit/flow are
     /// touched), so it does its own minimal raw peek at this same key.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub liveness_retention_hours: Option<u64>,
+    /// (5.0) Print informational stderr lines (liveness markers, sink
+    /// banners, dispatch progress headers) even on an interactive terminal.
+    /// Absent or `false`: they print only when stderr is not a terminal (logs,
+    /// pipes), under `--verbose`, or with `DARKMUX_VERBOSE=1`. Warnings and
+    /// errors always print. Resolved by `darkmux_types::diagnostics`, which
+    /// peeks this key raw because the liveness floor runs before config.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub verbose: Option<bool>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2268,6 +2275,7 @@ impl DarkmuxConfig {
                 // (#2653) Visible `168` (7 days) — the built-in default,
                 // discoverable and one edit from a tighter/looser window.
                 liveness_retention_hours: Some(168),
+                verbose: Some(false),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {

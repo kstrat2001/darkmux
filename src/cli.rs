@@ -65,6 +65,11 @@ fn build_version_static() -> &'static str {
 #[derive(Parser)]
 #[command(name = "darkmux", version = build_version_static(), about = "Mission orchestrator and lab for local AI")]
 pub(crate) struct Cli {
+    /// Print informational diagnostics (liveness markers, sink banners,
+    /// dispatch progress headers) even on an interactive terminal. Also
+    /// `DARKMUX_VERBOSE=1` / `runtime.verbose`. On `doctor`, print every check.
+    #[arg(long, short = 'v', global = true)]
+    pub(crate) verbose: bool,
     #[command(subcommand)]
     pub(crate) command: Cmd,
 }
@@ -295,11 +300,9 @@ pub(crate) enum Cmd {
     /// Also covers RAM and power. Reports pass/warn/fail with actionable
     /// hints. Exit 0 if no failures, else 1.
     Doctor {
-        /// (#1130) Print every check. Default output is issues-only — the
-        /// build identity line + any warnings/failures, with the passing
-        /// checks collapsed to a count. Use `-v` to see the full list.
-        #[arg(long, short = 'v')]
-        verbose: bool,
+        // (#1130) Default output is issues-only: the build identity line +
+        // any warnings/failures, with the passing checks collapsed to a
+        // count. The global `-v` / `--verbose` prints the full list.
         /// (#1177) Live-probe each profile model's remote endpoint with ONE
         /// minimal chat completion through the same URL/auth path a real
         /// dispatch uses — verifies the credential actually WORKS (the
