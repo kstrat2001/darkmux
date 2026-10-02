@@ -443,6 +443,7 @@ pub struct StepOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointSlot {
     key: String,
+    label: String,
     kind: SlotKind,
     concurrent_calls: Option<u32>,
 }
@@ -461,25 +462,40 @@ enum SlotKind {
 impl EndpointSlot {
     /// A slot for the endpoint `key` with the declared `concurrent_calls`.
     pub fn new(key: impl Into<String>, concurrent_calls: Option<u32>) -> Self {
-        Self { key: key.into(), kind: SlotKind::Endpoint, concurrent_calls }
+        let key = key.into();
+        Self { label: key.clone(), key, kind: SlotKind::Endpoint, concurrent_calls }
     }
 
     /// The slot `ep` claims: keyed by [`darkmux_types::ModelEndpoint::seat_key`],
-    /// carrying its declared `concurrent_calls`.
+    /// carrying its declared `concurrent_calls`. Its [`label`](Self::label) is
+    /// the endpoint's id, or a fixed phrase for an inline endpoint: a URL can
+    /// carry userinfo or a key, so it is never shown.
     pub fn of(ep: &darkmux_types::ModelEndpoint) -> Self {
-        Self::new(ep.seat_key(), ep.known_limits().and_then(|l| l.concurrent_calls))
+        let mut slot = Self::new(ep.seat_key(), ep.known_limits().and_then(|l| l.concurrent_calls));
+        slot.label = ep.named_id().map_or_else(|| "an inline endpoint".to_string(), str::to_string);
+        slot
+    }
+
+    /// The name that may be shown to a person or a peer: the endpoint's id,
+    /// never its URL.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn fail_open(key: &str, kind: SlotKind) -> Self {
+        Self { key: key.to_string(), label: key.to_string(), kind, concurrent_calls: None }
     }
 
     /// The slot of a step whose endpoint could not be resolved: `run` refuses
     /// it with the reason, and until then it waits its turn alone.
     pub fn unresolved() -> Self {
-        Self { key: "(unresolved endpoint)".to_string(), kind: SlotKind::Unresolved, concurrent_calls: None }
+        Self::fail_open("(unresolved endpoint)", SlotKind::Unresolved)
     }
 
     /// The slot the unresolved-local-seat fail-open claims (#1509): one at a
     /// time, in a batch of its own. Not an endpoint, so it is never noted.
     pub fn unresolved_local() -> Self {
-        Self { key: "(unresolved local seat)".to_string(), kind: SlotKind::UnresolvedLocal, concurrent_calls: None }
+        Self::fail_open("(unresolved local seat)", SlotKind::UnresolvedLocal)
     }
 
     /// True for a real endpoint's slot, false for the fail-open slots.
@@ -906,5 +922,27 @@ pub trait StepKind: Send + Sync {
     /// ambient working directory must override this and say so.
     fn cwd_policy(&self) -> CwdPolicy {
         CwdPolicy::NoAmbientDependency
+    }
+}
+
+#[cfg(test)]
+mod endpoint_slot_tests {
+    use super::*;
+
+    /// (5.0) An inline endpoint's slot stays keyed by its URL (two inline
+    /// endpoints are two seats), but the name that may be shown never
+    /// carries any part of it: a URL can hold userinfo or a key.
+    #[test]
+    fn an_inline_endpoints_label_carries_no_part_of_its_url() {
+        let ep = darkmux_types::ModelEndpoint {
+            url: Some("https://user:hunter2@api.example.com/v1?key=sekret".into()),
+            ..Default::default()
+        };
+        let slot = EndpointSlot::of(&ep);
+        assert!(slot.key().contains("api.example.com"), "the key stays unique per URL");
+        for leak in ["hunter2", "sekret", "example.com", "https"] {
+            assert!(!slot.label().contains(leak), "{leak} leaked into the label {:?}", slot.label());
+        }
+        assert!(slot.is_endpoint());
     }
 }

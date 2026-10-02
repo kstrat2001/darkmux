@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(k.current_name_by_uid.get("UID-A").map(String::as_str), Some("MacBook-Pro"));
         assert_eq!(k.uids_by_name.get("laptop").map(|s| s.len()), Some(1));
         assert_eq!(k.uids_by_name.get("MacBook-Pro-shared").map(|s| s.len()), Some(2), "a shared name keeps both uids");
-        assert!(k.uidless_names.contains("old-box"));
+        assert!(!k.uids_by_name.contains_key("old-box"), "a record with no uid names no machine");
         assert!(!k.current_name_by_uid.contains_key("UID-Z"), "only .jsonl flow files are read");
     }
 

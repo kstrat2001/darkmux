@@ -293,6 +293,13 @@ pub enum Refusal {
     AmbiguousEntry { names: Vec<String> },
     /// Addressed to another machine name.
     Misaddressed { target: String },
+    /// The job names a hardware uid and this machine cannot read its own, so
+    /// it cannot confirm the job is its own; it does not fall back to the name.
+    UidUnconfirmable { target: String },
+    /// Resolving the job's profile on this machine failed unexpectedly (the
+    /// resolver panicked). Not a config problem the sender or operator can
+    /// name; the code is still `bad_config`, the receiver-side class.
+    ResolutionFailed { detail: String },
     /// Part of the job is outside the peer's allow-list entry.
     OutOfScope { peer: String, item: OutOfScope },
     /// The connection came from THIS machine's own node.
@@ -431,7 +438,7 @@ impl Refusal {
     pub fn http_status(&self) -> u16 {
         match self {
             Refusal::Token => 401,
-            Refusal::Misaddressed { .. } => 421,
+            Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => 421,
             Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
             Refusal::NoWorkProfile { .. } => 422,
             Refusal::Busy { .. }
@@ -440,6 +447,7 @@ impl Refusal {
             | Refusal::TooManyAtOnce { .. }
             | Refusal::NoTokenConfigured
             | Refusal::IdentityUnavailable { .. }
+            | Refusal::ResolutionFailed { .. }
             | Refusal::BadConfig { .. } => 503,
             Refusal::NotOnOverlay { .. }
             | Refusal::NotAllowed { .. }
@@ -459,8 +467,8 @@ impl Refusal {
             Refusal::NoTokenConfigured | Refusal::Token => RefusalCode::Token,
             Refusal::IdentityUnavailable { .. } | Refusal::NotOnOverlay { .. } => RefusalCode::Identity,
             Refusal::NotAllowed { .. } => RefusalCode::NotListed,
-            Refusal::AmbiguousEntry { .. } | Refusal::BadConfig { .. } => RefusalCode::BadConfig,
-            Refusal::Misaddressed { .. } => RefusalCode::Misaddressed,
+            Refusal::AmbiguousEntry { .. } | Refusal::BadConfig { .. } | Refusal::ResolutionFailed { .. } => RefusalCode::BadConfig,
+            Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => RefusalCode::Misaddressed,
             Refusal::OutOfScope { item, .. } => item.code(),
             Refusal::FromSelf => RefusalCode::FromSelf,
             Refusal::UtilityProfile { .. } => RefusalCode::ProfileNotAllowed,
@@ -476,7 +484,16 @@ impl Refusal {
     /// The sentence the sender prints. `receiver` is this machine's name.
     /// Never contains a node id, a token, or a hardware id.
     pub fn reason(&self, receiver: &str) -> String {
-        match self {
+        self.identity_reason(receiver)
+            .or_else(|| self.address_reason(receiver))
+            .or_else(|| self.capacity_reason(receiver))
+            .or_else(|| self.request_reason(receiver))
+            .expect("every refusal is worded by exactly one group")
+    }
+
+    /// Why the connection or its sender was refused. `None` for a refusal of another group.
+    fn identity_reason(&self, receiver: &str) -> Option<String> {
+        Some(match self {
             Refusal::NoTokenConfigured => format!(
                 "{receiver} has no fleet token configured, so it takes no work from other machines \
                  (the fleet token is the serve token: Keychain item `darkmux-serve-token`, read only \
@@ -504,16 +521,28 @@ impl Refusal {
                  remove all but one with `darkmux machine untrust <name>` on {receiver}",
                 names.join(", ")
             ),
+            Refusal::FromSelf => format!(
+                "{receiver} does not take fleet work from itself; run it locally (address the \
+                 profile without `@{receiver}`)"
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Why the job was refused for where it is addressed or what it asks for. `None` for a refusal of another group.
+    fn address_reason(&self, receiver: &str) -> Option<String> {
+        Some(match self {
             Refusal::Misaddressed { target } => format!(
                 "this is {receiver}, not {target}: the address the sender used for {target} reaches \
                  {receiver}. On the sender, `darkmux machine list` shows the entry; point {target} at \
                  {target}'s own tailnet DNS name, or send the job to {receiver} by that name"
             ),
-            Refusal::OutOfScope { peer, item } => item.reason(receiver, peer),
-            Refusal::FromSelf => format!(
-                "{receiver} does not take fleet work from itself; run it locally (address the \
-                 profile without `@{receiver}`)"
+            Refusal::UidUnconfirmable { target } => format!(
+                "{receiver} cannot read its own hardware identity, so it cannot confirm this job for \
+                 {target} is its own, and it does not fall back to the name; on {receiver}, the \
+                 `machine uid` row of `darkmux doctor` says why its uid is unreadable. Then send again"
             ),
+            Refusal::OutOfScope { peer, item } => item.reason(receiver, peer),
             Refusal::UtilityProfile { profile } => format!(
                 "profile {profile} resolves only to {receiver}'s utility model; utility work is never \
                  taken from another machine (#2914)"
@@ -521,12 +550,21 @@ impl Refusal {
             Refusal::NoWorkProfile { role, detail } => format!(
                 "{receiver} cannot resolve a work profile for role {role}: {detail}"
             ),
-            Refusal::SchemaMismatch { got } => format!(
-                "{receiver} speaks work-submission schema v{WORK_JOB_SCHEMA_VERSION} (it takes the same major \
-                 version with a minor up to its own), the sender sent v{got}; run a darkmux with the same \
-                 major version on both machines, and the newer minor on the receiver"
+            Refusal::BoundaryUnmanaged { profile } => format!(
+                "{receiver}'s profile {profile} runs on a hosted endpoint, and this job may go only to \
+                 a model {receiver} serves itself (boundary managed_only)"
             ),
-            Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::BoundaryUnknown => format!(
+                "{receiver} does not know the boundary this job carries, so it cannot enforce it and \
+                 does not run the job; run the same darkmux version on both machines"
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Why the job was refused for want of a seat. `None` for a refusal of another group.
+    fn capacity_reason(&self, receiver: &str) -> Option<String> {
+        Some(match self {
             Refusal::TooManyAtOnce { peer } => format!(
                 "{receiver} is already handling as many requests from {peer} as it takes at once; \
                  retry when one finishes"
@@ -543,20 +581,29 @@ impl Refusal {
                 "busy: {receiver} is running other work on that seat ({what}), and {peer} already \
                  has as many jobs queued on {receiver} as it may. Retry when one finishes"
             ),
-            Refusal::BoundaryUnmanaged { profile } => format!(
-                "{receiver}'s profile {profile} runs on a hosted endpoint, and this job may go only to \
-                 a model {receiver} serves itself (boundary managed_only)"
+            _ => return None,
+        })
+    }
+
+    /// Why the request itself was refused. `None` for a refusal of another group.
+    fn request_reason(&self, receiver: &str) -> Option<String> {
+        Some(match self {
+            Refusal::SchemaMismatch { got } => format!(
+                "{receiver} speaks work-submission schema v{WORK_JOB_SCHEMA_VERSION} (it takes the same major \
+                 version with a minor up to its own), the sender sent v{got}; run a darkmux with the same \
+                 major version on both machines, and the newer minor on the receiver"
             ),
-            Refusal::BoundaryUnknown => format!(
-                "{receiver} does not know the boundary this job carries, so it cannot enforce it and \
-                 does not run the job; run the same darkmux version on both machines"
-            ),
+            Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::ResolutionFailed { detail } => {
+                format!("{receiver} could not resolve a profile for this job ({detail}); retry, and if it repeats, look at {receiver}'s `darkmux serve` log")
+            }
             Refusal::BadConfig { detail } => format!(
                 "{receiver} cannot run work until its own config is fixed (on {receiver}: \
                  `darkmux doctor`, then restart `darkmux serve`, which reads config once at \
                  start). {detail}"
             ),
-        }
+            _ => return None,
+        })
     }
 
     pub fn reply(&self, receiver: &str) -> SubmissionReply {
@@ -736,8 +783,10 @@ pub fn check_scope(
     job: &WorkJob,
     resolution: ProfileResolution,
 ) -> std::result::Result<ScopedJob, Refusal> {
-    if !job.is_addressed_to(receiver, receiver_uid) {
-        return Err(Refusal::Misaddressed { target: job.target_machine.clone() });
+    match job.addressing(receiver, receiver_uid) {
+        crate::job::Addressing::Addressed => {}
+        crate::job::Addressing::OtherMachine => return Err(Refusal::Misaddressed { target: job.target_machine.clone() }),
+        crate::job::Addressing::UidUnconfirmable => return Err(Refusal::UidUnconfirmable { target: job.target_machine.clone() }),
     }
     if !admitted.roles.iter().any(|r| r == &job.role_id) {
         return Err(admitted.out_of_scope(OutOfScope::Role { role: job.role_id.clone(), allowed: admitted.roles.clone() }));
@@ -826,6 +875,7 @@ pub fn classify_profile(
                 let slot = darkmux_crew::step_kinds::EndpointSlot::of(&t.endpoint);
                 crate::seats::WorkSeat::Unmanaged {
                     endpoint: slot.key().to_string(),
+                    label: slot.label().to_string(),
                     model,
                     concurrent_calls: slot.declared(),
                 }
@@ -1855,9 +1905,8 @@ mod tests {
         assert!(!sentence.contains("OTHER-UID") && !sentence.contains("MY-UID"), "no uid is printed: {sentence}");
     }
 
-    /// (#3028) No uid on the job (an 8.0 sender, or one that has not learned
-    /// it), or none on the receiver (it cannot read its own): the name check
-    /// is what it was.
+    /// (#3028) No uid on the job (a sender that has not learned it): the name
+    /// check decides.
     #[test]
     fn without_a_uid_on_either_side_the_name_decides() {
         let mut j = job(None);
@@ -1867,12 +1916,26 @@ mod tests {
             Err(Refusal::Misaddressed { .. })
         ));
         j.target_machine_uid = Some("SOME-UID".into());
-        assert!(
-            matches!(check_scope("studio", None, &laptop_admitted(), &j, work("host")), Err(Refusal::Misaddressed { .. })),
-            "a receiver that cannot name its own uid cannot confirm one"
-        );
+        j.target_machine_uid = None;
         j.target_machine = "studio".into();
         assert!(check_scope("studio", None, &laptop_admitted(), &j, work("host")).is_ok());
+    }
+
+    /// (5.0) A job that carries a uid never falls back to the name: a
+    /// receiver that cannot read its own uid refuses it, even under the
+    /// right name, and says so readably.
+    #[test]
+    fn a_uid_addressed_job_is_refused_by_a_receiver_with_no_uid_even_under_its_name() {
+        let mut j = job(None);
+        j.target_machine = "studio".into();
+        j.target_machine_uid = Some("SOME-UID".into());
+        let refusal = check_scope("studio", None, &laptop_admitted(), &j, work("host")).unwrap_err();
+        assert!(matches!(refusal, Refusal::UidUnconfirmable { .. }), "{refusal:?}");
+        assert_eq!(refusal.http_status(), 421);
+        assert_eq!(refusal.code(), RefusalCode::Misaddressed);
+        let sentence = refusal.reason("studio");
+        assert!(sentence.contains("`machine uid` row of `darkmux doctor`"), "{sentence}");
+        assert!(sentence.contains("cannot read its own hardware identity") && !sentence.contains("SOME-UID"), "{sentence}");
     }
 
     #[test]
@@ -2052,6 +2115,7 @@ mod tests {
             (Refusal::NotAllowed { node_name: s(), ask: TrustAsk::default() }, RefusalCode::NotListed),
             (Refusal::AmbiguousEntry { names: vec![s()] }, RefusalCode::BadConfig),
             (Refusal::Misaddressed { target: s() }, RefusalCode::Misaddressed),
+            (Refusal::UidUnconfirmable { target: s() }, RefusalCode::Misaddressed),
             (Refusal::OutOfScope { peer: s(), item: OutOfScope::Workspace }, RefusalCode::WorkspaceNotAllowed),
             (Refusal::OutOfScope { peer: s(), item: OutOfScope::Role { role: s(), allowed: vec![] } }, RefusalCode::RoleNotAllowed),
             (Refusal::OutOfScope { peer: s(), item: OutOfScope::Image { image: s() } }, RefusalCode::ImageNotAllowed),
@@ -2068,6 +2132,7 @@ mod tests {
             (Refusal::BoundaryUnmanaged { profile: s() }, RefusalCode::Boundary),
             (Refusal::BoundaryUnknown, RefusalCode::Boundary),
             (Refusal::BadConfig { detail: s() }, RefusalCode::BadConfig),
+            (Refusal::ResolutionFailed { detail: s() }, RefusalCode::BadConfig),
         ];
         for (refusal, code) in all {
             assert_eq!(refusal.code(), code, "{refusal:?}");
@@ -2104,7 +2169,7 @@ mod tests {
     }
 
     fn hosted(profile: &str) -> ProfileResolution {
-        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "azure".into(), model: "gpt".into(), concurrent_calls: None } }
+        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "azure".into(), label: "azure".into(), model: "gpt".into(), concurrent_calls: None } }
     }
 
     /// The boundary is checked against the profile the job RESOLVES to:
@@ -2346,7 +2411,7 @@ mod tests {
         );
         assert_eq!(
             classify_profile(&reg, &r, Some("cloud"), None, "studio"),
-            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), model: "gpt-x".into(), concurrent_calls: None } }
+            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), label: "api".into(), model: "gpt-x".into(), concurrent_calls: None } }
         );
         // (#3035) The endpoint's own `limits.concurrent_calls` rides the seat.
         let limited = registry(
@@ -2356,7 +2421,7 @@ mod tests {
         );
         assert_eq!(
             classify_profile(&limited, &r, Some("cloud"), None, "studio"),
-            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), model: "gpt-x".into(), concurrent_calls: Some(3) } }
+            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), label: "api".into(), model: "gpt-x".into(), concurrent_calls: Some(3) } }
         );
     }
 

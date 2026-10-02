@@ -36,10 +36,6 @@ pub struct FleetIdentityKnowledge {
     /// hostname-derived id. A name traces to a machine only when it maps to
     /// exactly one uid.
     pub uids_by_name: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    /// machine_ids seen in flow history with no uid attached (records written
-    /// before flow records carried `machine_uid`). Known names whose machine
-    /// cannot be identified further.
-    pub uidless_names: std::collections::BTreeSet<String>,
     /// This machine's own resolved machine_id, even when its hardware uid
     /// could not be read (non-macOS, `ioreg` failing).
     pub local_name: Option<String>,
@@ -172,15 +168,12 @@ pub fn gather_identity_knowledge(
         let Ok(file) = std::fs::File::open(&path) else { continue };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             let Some((name, uid)) = record_identity(&line) else { continue };
-            match uid {
-                Some(uid) => {
-                    known.uids_by_name.entry(name.clone()).or_default().insert(uid.clone());
-                    known.current_name_by_uid.insert(uid, name);
-                }
-                None => {
-                    known.uidless_names.insert(name);
-                }
-            }
+            // A record without a uid names no machine. The field is optional
+            // (a machine whose `machine_uid()` fails writes records without
+            // it), so such a record is skipped, not matched by name.
+            let Some(uid) = uid else { continue };
+            known.uids_by_name.entry(name.clone()).or_default().insert(uid.clone());
+            known.current_name_by_uid.insert(uid, name);
         }
     }
     // (#2924 C-b) A `DARKMUX_MACHINE_ID` override is a per-shell name, not

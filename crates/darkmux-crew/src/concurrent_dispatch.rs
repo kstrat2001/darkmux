@@ -1150,7 +1150,7 @@ fn note_serial_endpoint_in(
     say(&format!(
         "darkmux: endpoint {} has no limits.concurrent_calls; its calls run one at a time. \
          Set it to run them in parallel.",
-        slot.key()
+        slot.label()
     ));
 }
 
