@@ -166,6 +166,12 @@ pub enum KnobValue {
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     Number(serde_json::Number),
     Text(String),
+    /// A value no darkmux wrote (an array, an object), kept verbatim from an archive written by
+    /// another version. It reads as UNKNOWN: it is never `null`, which means uncapped. Never
+    /// written by this build.
+    #[cfg_attr(feature = "ts-export", ts(skip))]
+    #[schemars(skip)]
+    Unrecognized(serde_json::Value),
 }
 
 impl KnobValue {
@@ -225,8 +231,9 @@ impl From<String> for KnobValue {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Knob {
-    /// The resolved value; `null` for an uncapped knob.
-    #[serde(default, deserialize_with = "super::context::lenient")]
+    /// The resolved value; `null` for an uncapped knob. A value no darkmux wrote reads as
+    /// [`KnobValue::Unrecognized`], never as `null`.
+    #[serde(default)]
     pub value: Option<KnobValue>,
     /// The tier that resolved it.
     pub source: KnobSource,
@@ -248,26 +255,26 @@ pub struct RuntimeBounds {
     pub max_turns: Knob,
     pub max_tokens: Knob,
     // The knobs below were added over time, so an older archive's block lacks them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub reasoning_checkpoint_interval_tokens: Option<Knob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub turn_delay_ms: Option<Knob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub feedback_injection: Option<Knob>,
     /// The detection regime the run executed under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub detection_degeneracy_policy: Option<Knob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub thermal_pacing_enabled: Option<Knob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub battery_pause_enabled: Option<Knob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub battery_pause_floor_pct: Option<Knob>,
 }
@@ -316,8 +323,9 @@ pub struct DispatchStartPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub turn_delay_ms: Option<u64>,
-    /// The resolved runtime knobs with provenance.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The resolved runtime knobs with provenance. A malformed block costs the bounds, never the
+    /// record around it.
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub bounds: Option<RuntimeBounds>,
     /// The flow schema this run's own records were written against, so a consumer can tell a run

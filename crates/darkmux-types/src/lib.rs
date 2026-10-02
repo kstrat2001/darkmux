@@ -267,8 +267,8 @@ pub struct Tier1Config {
 /// working-memory artifact. Per-slot caps are soft limits in
 /// characters; the compactor truncates if a slot exceeds its cap.
 ///
-/// `slot_caps` defaults to the v0.1 commitment table (see
-/// `RuntimeCompactionConfig::default_slot_caps`); operator-supplied
+/// `slot_caps` defaults to the v0.1 commitment table (the runtime crate's
+/// `default_slot_caps_v0_1`); operator-supplied
 /// entries override matching defaults at consume-time. Unknown slot
 /// names are accepted (forward-compat for per-role schema extensions
 /// in v0.2+).
@@ -373,34 +373,6 @@ pub struct RuntimeCompactionConfig {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-impl RuntimeCompactionConfig {
-    /// v0.1 default per-slot character caps per #354's commitment
-    /// table. Operator-supplied entries in `tier2.slot_caps` override
-    /// matching defaults at consume-time (this function returns the
-    /// fallback set; merge with operator config in the consumer).
-    ///
-    /// No consumer in this PR — Step 4 of #352 (tier-2 structured-slot
-    /// extraction) wires up the consumer that reads slot caps to size
-    /// the compactor's output. The function ships in Step 2 so the
-    /// v0.1 commitments table lives next to the schema it describes,
-    /// rather than getting authored separately when Step 4 lands.
-    #[allow(dead_code)]
-    pub fn default_slot_caps() -> BTreeMap<String, u32> {
-        let entries: &[(&str, u32)] = &[
-            ("objective", 1024),
-            ("current_truth.active_files", 4096),
-            ("current_truth.test_outcomes", 2048),
-            ("current_truth.external_state", 2048),
-            ("completed_decisions", 4096),
-            ("errors_to_preserve", 2048),
-            ("next_concrete_actions", 1024),
-            ("verify_criteria", 1024),
-            ("phase_id", 256),
-        ];
-        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
-    }
 }
 
 // (#1426 phase 3) `RegistryHooks`/`ProfileHookCommand` (the registry's
@@ -1597,25 +1569,6 @@ mod tests {
         assert!(obj.contains_key("model"));
         assert!(obj.contains_key("maxHistoryShare"));
         assert!(!obj.contains_key("extras"));
-    }
-
-    /// v0.1 default slot caps match the commitment table from #354.
-    /// Operator-supplied slot names in `tier2.slot_caps` override
-    /// these at consume-time (the helper returns the fallback set;
-    /// merging is the consumer's responsibility).
-    #[test]
-    fn default_slot_caps_v0_1_table() {
-        let caps = RuntimeCompactionConfig::default_slot_caps();
-        assert_eq!(caps.len(), 9);
-        assert_eq!(caps.get("objective"), Some(&1024));
-        assert_eq!(caps.get("current_truth.active_files"), Some(&4096));
-        assert_eq!(caps.get("current_truth.test_outcomes"), Some(&2048));
-        assert_eq!(caps.get("current_truth.external_state"), Some(&2048));
-        assert_eq!(caps.get("completed_decisions"), Some(&4096));
-        assert_eq!(caps.get("errors_to_preserve"), Some(&2048));
-        assert_eq!(caps.get("next_concrete_actions"), Some(&1024));
-        assert_eq!(caps.get("verify_criteria"), Some(&1024));
-        assert_eq!(caps.get("phase_id"), Some(&256));
     }
 
     /// Operator-extensibility: arbitrary slot names (including ones

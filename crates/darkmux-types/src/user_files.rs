@@ -1013,16 +1013,10 @@ pub fn open_objects<T: JsonSchema>() -> Vec<String> {
         .collect()
 }
 
-/// `config.json`'s retired keys: a renamed setting names its new key, a
-/// removed one says so and what to do.
+/// `config.json`'s retired keys: the line says what replaced the key (a rename names
+/// the new one) or that it was removed, and what to do.
 pub fn config_retired(path: &str) -> Option<String> {
-    crate::config::RENAMED_SETTINGS
-        .iter()
-        .find(|r| r.old_key == path)
-        .map(|r| format!("renamed to `{}` in 4.0 (#2902); {}", r.new_key, r.advice))
-        .or_else(|| {
-            crate::config::RETIRED_SETTINGS.iter().find(|r| r.key == path).map(|r| r.line.to_string())
-        })
+    crate::config::RETIRED_SETTINGS.iter().find(|r| r.key == path).map(|r| r.line.to_string())
 }
 
 /// A retired `config.json` key still holding a value ignoring which changes
@@ -1079,6 +1073,23 @@ pub fn config_check_text(path: &Path, text: &str) -> ConfigCheck {
     }
     let refused = !matches!(&found.problem, Problem::Keys(keys) if keys.is_empty());
     ConfigCheck { refusal: refused.then_some(found), warnings }
+}
+
+/// What a command that runs no preflight prints about a `config.json` that
+/// a work-starting command would refuse over (the file's problem, and that
+/// commands that start work refuse until it is fixed). `None` for a clean file
+/// or one with only harmless leftovers.
+pub fn config_notice_text(path: &Path, text: &str) -> Option<String> {
+    config_check_text(path, text).refusal.map(|p| {
+        format!("{p}\n  this command does not act on it, but a command that starts work refuses until it is fixed (`darkmux doctor` names the fix)")
+    })
+}
+
+/// [`config_notice_text`] of the resolved `config.json`.
+pub fn config_json_notice() -> Option<String> {
+    config_json_check().refusal.map(|p| {
+        format!("{p}\n  this command does not act on it, but a command that starts work refuses until it is fixed (`darkmux doctor` names the fix)")
+    })
 }
 
 /// [`config_check_text`] of the file at `path`; an absent file is clean.

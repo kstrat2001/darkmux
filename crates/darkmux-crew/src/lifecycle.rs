@@ -452,11 +452,10 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 // ─── Load-by-id ────────────────────────────────────────────────────────
 
 /// Load a phase by its fully-qualified (mission, phase) coordinates. O(1).
-/// Currently every internal caller routes through `load_phase_by_id` (since
-/// the CLI verbs accept a bare phase id and discover the mission from the
-/// JSON itself). Kept as the primary public surface for code that *does*
-/// have both ids in scope (e.g., dispatch when `--mission` lands).
-#[allow(dead_code)]
+/// Production routes through `load_phase_by_id` (the CLI verbs accept a bare
+/// phase id and discover the mission from the JSON itself); only the tests
+/// have both ids in scope.
+#[cfg(test)]
 pub(crate) fn load_phase(mission_id: &str, phase_id: &str) -> Result<Phase> {
     let path = phase_path(mission_id, phase_id);
     if !path.is_file() {

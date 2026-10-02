@@ -1200,9 +1200,7 @@ fn retired_lessons_family_is_unknown_entirely() {
         cmd.args(&args)
             .assert()
             .failure()
-            .stderr(predicate::str::contains("unrecognized subcommand").or(
-                predicate::str::contains("unexpected argument"),
-            ));
+            .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("memory lesson")));
     }
 }
 
@@ -1333,9 +1331,7 @@ fn retired_mission_run_subverb_is_unknown() {
     cmd.args(["mission", "run", "some-mission"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized subcommand").or(
-            predicate::str::contains("unexpected argument"),
-        ));
+        .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("mission launch")));
 }
 
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
@@ -1794,8 +1790,7 @@ fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
 fn retired_top_level_swap_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("swap").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
     );
 }
 
@@ -1803,8 +1798,7 @@ fn retired_top_level_swap_verb_is_unknown() {
 fn retired_top_level_status_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("status").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
     );
 }
 
@@ -1812,8 +1806,7 @@ fn retired_top_level_status_verb_is_unknown() {
 fn retired_top_level_model_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("model").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine eject")),
     );
 }
 
@@ -1821,8 +1814,7 @@ fn retired_top_level_model_verb_is_unknown() {
 fn retired_top_level_fleet_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("fleet").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine list")),
     );
 }
 

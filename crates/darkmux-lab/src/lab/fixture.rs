@@ -32,11 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Parsed `.fixture.json`. Field naming uses snake_case to match
-/// existing manifest conventions in `workloads::types`. Phase 2
-/// (#489) ships the type + parser; Phase 3 + 4 are the consumers
-/// (resolver + doctor), so most fields/methods read as dead-code
-/// until then.
-#[allow(dead_code)]
+/// existing manifest conventions in `workloads::types` (#489).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct FixtureManifest {
     /// (#3035) Data-shape version of this file (`darkmux_types::data_version::LAB_FIXTURE_SCHEMA_VERSION`).
@@ -86,7 +82,6 @@ fn default_version() -> String {
     "1.0".to_string()
 }
 
-#[allow(dead_code)]
 impl FixtureManifest {
     /// Read + parse `.fixture.json` from inside a fixture dir.
     pub(crate) fn load_from_dir(dir: &Path) -> Result<Self> {
@@ -126,14 +121,6 @@ impl FixtureManifest {
             }
         }
         Ok(())
-    }
-
-    /// Returns (definition_name, version) split from `satisfies`.
-    /// Returns `None` when `satisfies` is unset.
-    pub(crate) fn satisfies_parts(&self) -> Option<(&str, &str)> {
-        self.satisfies
-            .as_deref()
-            .and_then(|s| s.split_once('@'))
     }
 
     /// Check whether on-disk fixture dir has all `required_files`
@@ -226,17 +213,6 @@ mod tests {
         write_manifest(tmp.path(), r#"{"name": "demo", "satisfies": "missing-at-sign"}"#);
         let err = FixtureManifest::load_from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("@"), "got: {err}");
-    }
-
-    #[test]
-    fn satisfies_parts_splits_correctly() {
-        let tmp = TempDir::new().unwrap();
-        write_manifest(
-            tmp.path(),
-            r#"{"name": "demo", "satisfies": "tiny-python-suite@1.0"}"#,
-        );
-        let m = FixtureManifest::load_from_dir(tmp.path()).unwrap();
-        assert_eq!(m.satisfies_parts(), Some(("tiny-python-suite", "1.0")));
     }
 
     #[test]

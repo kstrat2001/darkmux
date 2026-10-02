@@ -105,7 +105,6 @@ macro_rules! config_enum {
     ) => {
         impl $ty {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const fn __config_enum_token(self) -> &'static str {
                 match self { $( $ty::$variant => $token ),+ }
             }

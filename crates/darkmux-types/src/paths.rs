@@ -19,11 +19,8 @@ pub enum Scope {
     User,
 }
 
-/// `profiles` is the canonical registry path (`<root>/profiles.json`).
-/// Reserved public-API surface — the active loader in `profiles.rs`
-/// has its own resolution today, but downstream tools that want the
-/// canonical location read it from here.
-#[allow(dead_code)]
+/// The resolved darkmux directories. `profiles` is the canonical registry
+/// path (`<root>/profiles.json`).
 #[derive(Debug, Clone)]
 pub struct DarkmuxPaths {
     pub root: PathBuf,

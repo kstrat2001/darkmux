@@ -236,16 +236,7 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
 }
 
 pub(crate) fn status_label(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Planned => "planned",
-        RunStatus::Running => "running",
-        RunStatus::Complete => "complete",
-        RunStatus::Degraded => "degraded",
-        RunStatus::Error => "error",
-        RunStatus::Escalated => "escalated",
-        RunStatus::Abandoned => "abandoned",
-        RunStatus::Unparseable => "unparseable",
-    }
+    status.as_str()
 }
 
 fn now_unix() -> u64 {

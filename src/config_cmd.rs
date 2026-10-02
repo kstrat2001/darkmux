@@ -392,13 +392,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
              security add-generic-password -U -a \"$USER\" -s {item} -w <value>"
         );
     }
-    // (#2902 step 5) Renamed in 4.0, no alias: name the new key.
-    if let Some(new_key) = darkmux_types::config::RENAMED_SETTINGS.iter().find(|r| r.old_key == key).map(|r| r.new_key) {
-        bail!(
-            "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
-        );
-    }
-    // A retired key names what replaced it, never a near-miss guess.
+    // A retired or renamed key names what replaced it, never a near-miss guess.
     if let Some(line) = darkmux_types::user_files::config_retired(key) {
         bail!("`{key}`: {line}");
     }
@@ -424,7 +418,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
     check_answering_seat(key, value)?;
 
-    let mut root = load_object(path)?;
+    let mut root = load_object_for_write(path)?;
     set_path(&mut root, key, parsed.clone());
 
     // Sanity: the result must still deserialize as a DarkmuxConfig (it will —
@@ -621,6 +615,18 @@ pub(crate) fn load_object(path: &Path) -> Result<Value> {
     }
 }
 
+/// [`load_object`] for a writer: a file written by a newer darkmux is refused
+/// ("upgrade darkmux") instead of being rewritten by a binary that cannot place
+/// its keys (the same refusal every reader gives it, `data_version::newer_refusal`).
+pub(crate) fn load_object_for_write(path: &Path) -> Result<Value> {
+    let root = load_object(path)?;
+    let known = darkmux_types::config::CONFIG_SCHEMA_VERSION;
+    if let Some(found) = darkmux_types::data_version::newer(&root, known) {
+        bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("config", &found, known));
+    }
+    Ok(root)
+}
+
 /// Parse the operator's string arg into the JSON scalar the field expects.
 fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
     Ok(match ty {
@@ -725,6 +731,18 @@ mod tests {
 
     fn tmp() -> NamedTempFile {
         NamedTempFile::new().unwrap()
+    }
+
+    /// A config written by a newer darkmux is refused ("upgrade darkmux") by `config set`,
+    /// and the file is left byte-for-byte as it was.
+    #[test]
+    fn config_set_refuses_a_config_written_by_a_newer_darkmux() {
+        let f = tmp();
+        let original = "{\"schema_version\": \"99.0\", \"from_the_future\": true}\n";
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux") && err.contains("Upgrade darkmux"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
     }
 
     /// (#2765) The knob the operator could not reach. `darkmux config list`

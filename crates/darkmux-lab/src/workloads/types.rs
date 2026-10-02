@@ -201,15 +201,11 @@ pub(crate) struct WorkloadManifest {
 /// A loaded workload manifest, plus where it came from on disk so that
 /// providers can resolve relative paths (promptFile, sandboxSeed) correctly.
 ///
-/// `manifest_path` is reserved public-API surface — the existing providers
-/// consume `manifest` and `base_dir`; tools that want the resolved path read
-/// from this field. `source` is consumed by `lab::run::lab_run`'s per-run
-/// banner (#2553) so an operator can tell which tier actually won.
-#[allow(dead_code)]
+/// `source` is consumed by `lab::run::lab_run`'s per-run banner (#2553) so an
+/// operator can tell which tier actually won.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedWorkload {
     pub manifest: WorkloadManifest,
-    pub manifest_path: std::path::PathBuf,
     pub base_dir: std::path::PathBuf,
     pub source: WorkloadSource,
 }
@@ -263,16 +259,10 @@ pub(crate) struct VerifyOutcome {
     pub details: String,
 }
 
-/// `payload_text` and `trajectory_path` are public-API surface for
-/// downstream consumers (the lab-notebook skill reads them); the CLI's run
-/// summary doesn't, hence the dead-code lint.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct RunResult {
     pub ok: bool,
     pub duration_ms: u128,
-    pub payload_text: Option<String>,
-    pub trajectory_path: Option<std::path::PathBuf>,
     pub verify: Option<VerifyOutcome>,
     pub error: Option<String>,
     /// (F2) The runtime's own `escalation_*` result when the dispatch stopped
@@ -335,16 +325,8 @@ pub enum RunMode {
 /// in the registry. Methods are sync; long-running operations are still wrapped
 /// in `std::process::Command` calls (which block, but darkmux is a single-task
 /// CLI so blocking is fine).
-/// `description` and `teardown` are part of the trait's public surface.
-/// Implementations provide them (description for tooling, teardown
-/// optional with a default impl), but no current call site consumes
-/// them via dynamic dispatch — hence the dead-code lint. Keeping the
-/// trait shape stable for the `lab providers` subcommand + future
-/// per-workload cleanup needs.
-#[allow(dead_code)]
 pub(crate) trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
-    fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
     /// (#2902 re-review C3) The role this workload's dispatches run as, so
     /// `lab run` picks the profile (`role_profiles.<role>`) for the SAME role
@@ -395,9 +377,6 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
-    fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
