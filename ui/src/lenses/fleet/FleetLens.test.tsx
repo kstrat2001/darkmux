@@ -2931,7 +2931,8 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     return [
       { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       // FROZEN_NOW is 10:02; both of these are two minutes in its future.
-      { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
+      { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload: { token_source: "provider", total_tokens: 600 } },
+      { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
   };
 

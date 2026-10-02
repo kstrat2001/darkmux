@@ -343,6 +343,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
+            tokens_utility: None,
             turns_final: None,
             model: None,
             error: error.map(String::from),

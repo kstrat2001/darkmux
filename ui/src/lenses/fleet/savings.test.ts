@@ -107,7 +107,7 @@ describe("tokensOffMeter", () => {
 
 
 
-  it("the single-shot remote fallback (no telemetry family, dispatch.complete carries the totals) counts as cloud", () => {
+  it("a hosted single-shot with no usage record carries no tokens: its complete is not read", () => {
     const data: NormRecord[] = [
       rec({ session_id: "s6", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
       rec({
@@ -117,10 +117,10 @@ describe("tokensOffMeter", () => {
       }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(900);
+    expect(t.total).toBe(0);
   });
 
-  it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
+  it("a local single-shot with no usage record carries no tokens, and still counts as a run", () => {
     const data: NormRecord[] = [
       rec({ session_id: "s8", action: "dispatch.start", handle: "radio-router" }),
       rec({
@@ -130,7 +130,8 @@ describe("tokensOffMeter", () => {
       }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(970);
+    expect(t.total).toBe(0);
+    expect(t.runs).toBe(1);
   });
 
   it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
@@ -152,7 +153,7 @@ describe("tokensOffMeter", () => {
     expect(t.runs).toBe(1); // NOT 2 (no phantom directRun for s9)
   });
 
-  it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
+  it("a cloud single-shot session with no usage record carries no tokens either", () => {
     const data: NormRecord[] = [
       rec({ session_id: "s10", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
       rec({
@@ -162,7 +163,7 @@ describe("tokensOffMeter", () => {
       }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(500);
+    expect(t.total).toBe(0);
   });
 
   // (#2635) `dispatch.single_shot`'s session id is deliberately TASK-scoped
@@ -187,7 +188,7 @@ describe("tokensOffMeter", () => {
       rec({ session_id: "task:t3", action: "dispatch.complete", payload: { total_tokens: 500 } }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(1200);
+    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -201,7 +202,7 @@ describe("tokensOffMeter", () => {
       }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(1200);
+    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -211,7 +212,7 @@ describe("tokensOffMeter", () => {
       rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 700 } }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(1200);
+    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -737,8 +738,10 @@ describe("tokensOffMeter", () => {
     const tAbsent = tokensOffMeter(dataAbsent);
 
     expect(tPresent.runs).toBe(tAbsent.runs);
-    expect(tPresent.total).toBe(tAbsent.total);
-    // And the value both agree on is the truthful one.
+    // The run count agrees; the tokens are the usage records' (#3061): a
+    // completion carries none.
+    expect(tPresent.total).toBe(100);
+    expect(tAbsent.total).toBe(0);
   });
 
 
@@ -924,7 +927,8 @@ describe("tokensOffMeter", () => {
     const tPresent = tokensOffMeter(dataPresent);
 
     expect(tAbsent.runs).toBe(tPresent.runs);
-    expect(tAbsent.total).toBe(tPresent.total);
+    expect(tPresent.total).toBe(500);
+    expect(tAbsent.total).toBe(0);
   });
 
   // (post-review, MINOR — a second population the fix widens) `dispatch.
@@ -1010,20 +1014,14 @@ describe("tokensOffMeter", () => {
     expect(t.runs).toBe(1);
   });
 
-  it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
+  it("a completion carries no tokens: one with only a spend field is unmeasured", () => {
     const data: NormRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),
       rec({ session_id: "s7", action: "dispatch.complete", payload: { endpoint: "gemini", remote_tokens: 1200 } }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(1200);
-    // No prompt/completion split to decompose — it has to land somewhere
-    // visible, or the headline would silently exceed the row beneath it.
+    expect(t.total).toBe(0);
   });
-
-
-
-
 
   it("returns all-zero on an empty window", () => {
     const t = tokensOffMeter([]);
@@ -1036,8 +1034,8 @@ describe("hasAnyTokenCounts", () => {
     expect(hasAnyTokenCounts({})).toBe(false);
   });
 
-  it("is false when all four fields are zero", () => {
-    expect(hasAnyTokenCounts({ total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, remote_tokens: 0 })).toBe(false);
+  it("is false when all three fields are zero", () => {
+    expect(hasAnyTokenCounts({ total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 })).toBe(false);
   });
 
   it("is true when total_tokens is nonzero", () => {
@@ -1052,8 +1050,8 @@ describe("hasAnyTokenCounts", () => {
     expect(hasAnyTokenCounts({ completion_tokens: 5 })).toBe(true);
   });
 
-  it("is true when remote_tokens is nonzero", () => {
-    expect(hasAnyTokenCounts({ remote_tokens: 5 })).toBe(true);
+  it("is false for the retired remote_tokens spelling", () => {
+    expect(hasAnyTokenCounts({ remote_tokens: 5 } as never)).toBe(false);
   });
 });
 
@@ -1410,8 +1408,9 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
       rec({ ts: "2026-08-08T00:11:00Z", session_id: SID, mission_id: "mB", action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: 9999 } }),
     ];
     const t = tokensOffMeter(data);
-    // The 9,999 hosted tokens are present, and on the cloud tile.
-    expect(t.total).toBe(10509);
+    // Run A's usage record counts (510); run B's completion carries no tokens
+    // (#3061: a completion is never read), but it is still a run.
+    expect(t.total).toBe(510);
     expect(t.runs).toBe(2);
   });
 
@@ -1479,7 +1478,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: 500 } }),
     ]);
     expect(t.runs).toBe(1);
-    expect(t.total).toBe(500);
+    expect(t.total).toBe(0); // no usage record: unmeasured (#3061)
   });
 
   /** EXTRA LOCAL RUN must not fire when a token-bearing bookend of the same
@@ -1557,7 +1556,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.total).toBe(5000);
+    expect(t.total).toBe(0); // completions carry no tokens (#3061)
   });
 
   /** The mirror, so the two halves of the pair are visibly symmetric rather
@@ -1572,9 +1571,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
     ]);
     expect(t.runs).toBe(2);
-    // The local seat's own self-describing payload is the only token count
-    // in the record, and it reads local.
-    expect(t.total).toBe(5000);
+    expect(t.total).toBe(0); // completions carry no tokens (#3061)
   });
 });
 
@@ -1628,8 +1625,10 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     // And the terminal values, asserted at the end of the SAME loop rather
     // than in a test of their own. These are byte-identical to the
     // pre-#2709 shape — measured at every playhead of every committed
-    // corpus, maxCloudGain and maxCloudLoss both 0.
-    expect(last.total).toBe(999248);
+    // corpus, maxCloudGain and maxCloudLoss both 0. (#3061) The plain sum of
+    // the corpus's 364 usage records, checked independently of this code;
+    // the 19,391 tokens that only a `dispatch complete` stated are no longer read.
+    expect(last.total).toBe(979857);
   });
 
   /**
@@ -1721,9 +1720,10 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     expect(aligned.runs).toBe(1);
 
     // Same dispatch, mission id present on the telemetry and absent from the
-    // completion. The 4,000 is counted twice and shows as a second run.
+    // completion. The tokens are the usage record's alone (a completion carries
+    // none, #3061), so only the run count skews: a second run.
     const skew = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp(undefined, 4000, "2026-08-08T00:00:02Z")]);
-    expect(skew.total).toBe(8000);
+    expect(skew.total).toBe(4000);
     expect(skew.runs).toBe(2);
   });
 

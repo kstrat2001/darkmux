@@ -86,6 +86,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           may already hold. Readers select entry fields by name and
 //           ignore the marker.
 //
+//           Also (5.0, #3061, folded in, unreleased): a token total is a
+//           plain sum of `telemetry.tokens` usage records, and nothing else.
+//           REMOVED the hosted/local leftovers of the old accounting: the
+//           `remote` flag of a `dispatch.map` usage record, and the
+//           `remote_tokens` field of a `dispatch.complete` (a hosted map
+//           item's spend, which a pre-5.0 reader fell back to when a run had
+//           no usage record; the usage record is the one place a call's tokens
+//           are written). A `dispatch.complete` still states its own
+//           `total_tokens` etc., but no sum reads them. A record from before
+//           5.0 that carries either field is read with the field ignored.
+//
 //           Also (5.0, #3036): REMOVED the `machine.rollup` action and its
 //           payload (the periodic whole-machine heartbeat) together with the
 //           `machine_rollup` config block that gated it. Nothing replaced it:

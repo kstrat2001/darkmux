@@ -83,6 +83,23 @@ darkmux release.
   (`concurrent_width`) are each derived once, shared by the scheduler and a
   fleet receiver's seat book.
 
+- **One token total, from usage records only** (#3061). Every surface sums the
+  `telemetry.tokens` usage records and nothing else: a `dispatch.complete`
+  (and `remote_tokens`, the old hosted-item spelling) is never read for tokens, so
+  a pre-5.0 run with no usage record reads as unmeasured. A run's tokens
+  count under each record's own session and mission, so a resumed dispatch
+  (same execution id, new session) no longer lends its tokens to the first
+  session and leaves its own blank. The run page's tiles, the mission
+  graph's step meter and `GET /runs` now show the same total as
+  `run list` (utility calls included), with the utility part named: a hover on
+  the run page tiles, `tokensUtility` on each graph step (additive), and a
+  `no_run` line in `run list --usage` for calls that belong to no run (radio
+  routing, `doctor --probe`: `doctor --probe` now records its usage). A call
+  that reported only one half of its counts adds that half to every run total,
+  as the usage record's reader already did. `legacy_completes` leaves
+  `--usage --json`; `no_run` joins it. The `remote` flag of a map item's
+  usage record and the `remote_tokens` field of a `dispatch.complete` are
+  removed.
 - **`run list --usage` keys each row on the machine that executed the call**
   (#3061). `localhost` means a different machine to whoever made the call, so
   two machines' LM Studios serving the same model merged into one row (a relayed

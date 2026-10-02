@@ -177,7 +177,7 @@ pub struct StepRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
-    /// (#1432 item 4) FINALIZED token/turn totals folded from this
+    /// (#1432 item 4) The step's token/turn totals folded from this
     /// mission's flow records at page-load time, so a completed step whose
     /// dispatch ran BEFORE the page opened shows its real total immediately
     /// (the page's SSE channel is tail-from-now, so without this a page
@@ -190,7 +190,8 @@ pub struct StepRow {
     /// (which read the `step-<id>` and 4.0 shapes), so pre-rename steps stay
     /// honest-absent rather than mis-folding — pinned by
     /// `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
-    /// the LIVE-increment channel; these are only the terminal totals.
+    /// the LIVE-increment channel; `tokensFinal` is the sum of the step's usage
+    /// records (#3061: the one token sum) and `turnsFinal` its terminals' turns.
     /// Additive camelCase (`tokensFinal`/`turnsFinal`); pre-#1432
     /// consumers ignore them.
     ///
@@ -208,6 +209,12 @@ pub struct StepRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub tokens_final: Option<u64>,
+    /// (#3061) The utility share of `tokens_final` (darkmux's own compaction
+    /// and routing calls inside the step), named so every surface can show the
+    /// one total with its utility part. Absent when none was measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
+    pub tokens_utility: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub turns_final: Option<u64>,
@@ -981,14 +988,15 @@ fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id:
 // expansion primitive itself. See `darkmux_crew::mission_config`'s
 // `MISSION_CONFIG_SCHEMA` doc (schema 2.0) for why.
 
-/// (#1432 item 4) The finalized token/turn totals folded for one step from
-/// this mission's flow records. Mirrors the lens's own
-/// `applyRecordToMetrics` FINAL branch (`ui/src/lenses/mission/graph.ts`,
-/// #1868) so the server backfill and the live SSE channel agree on what
-/// "finalized" means.
+/// (#1432 item 4) The token/turn totals folded for one step from this
+/// mission's flow records: its usage records' sum and its terminals' turns.
+/// The lens's `applyRecordToMetrics` (`ui/src/lenses/mission/graph.ts`, #1868)
+/// folds the same usage records live, and the display takes the larger.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct StepFinals {
     pub tokens: Option<u64>,
+    /// The utility share of `tokens`.
+    pub utility: Option<u64>,
     pub turns: Option<u64>,
     // (#2902 step 2a) The `cloud`/`local_ok` endpoint-presence flags are
     // gone: they fed only the viewer's withdrawn local/cloud split (#2834),
@@ -1074,19 +1082,16 @@ pub fn stamp_session_steps(records: &mut [serde_json::Value], mission_id: &str) 
 }
 
 /// Pure: fold a stream of flow records into per-step FINALIZED totals.
-/// One rule for both figures: a step's tokens and turns are the SUM over every
-/// execution terminal it had (`dispatch.complete` and `dispatch.error`: each
-/// attempt is a new execution with its own id, each `dispatch.map` item one
-/// terminal), so a retried step counts both attempts in both. `step result`
-/// records are never added to those: a `dispatch.map` step also writes per-item
-/// and one aggregate `step result` that already restate the items' tokens, so
-/// their (max) total is only the figure for a step whose executions wrote no
-/// terminal tokens (the review vocabulary's `tokens`, #1445: read as
-/// `total_tokens` by the flow reader's upgrade). Same rule as the page's own
-/// `applyRecordToMetrics`. The per-turn RUNNING increments
-/// (`telemetry.tokens`, `dispatch.turn`) are deliberately NOT folded here:
-/// those stay the page's live SSE channel, so the backfill can never race
-/// ahead of or double-count the live meter.
+/// A step's tokens are the plain sum of its usage records (`telemetry.tokens`,
+/// utility calls included: the one sum every other surface reads, through
+/// `darkmux_crew::usage`), `None` until one reports a count; a terminal's or a
+/// `step result`'s own `total_tokens` is never read (#3061: one owner for
+/// "tokens"). A step's turns are the SUM over every execution terminal it had
+/// (`dispatch.complete` and `dispatch.error`: each attempt is a new execution
+/// with its own id, each `dispatch.map` item one terminal), so a retried step
+/// counts both attempts. The page's live meter folds the same usage records
+/// from its SSE channel and takes the larger of the two figures, so the
+/// backfill can never double-count it.
 /// Pure + iterator-driven so the correlation/fold logic is unit-testable
 /// without touching the filesystem.
 pub(crate) fn fold_step_finals<I>(
@@ -1102,42 +1107,42 @@ where
         let Some(sid) = step_for_record(&rec, step_ids, mission_id) else {
             continue;
         };
-        // (#1445 gate) The review vocabulary's `tokens` is read as
-        // `total_tokens` by the flow reader's upgrade, so one key is read here.
-        match darkmux_flow::reader::payload_of(&rec) {
-            // One execution's terminal (an attempt, a map item): its own tokens and turns.
-            Some(darkmux_flow::Payload::DispatchComplete(p) | darkmux_flow::Payload::DispatchError(p)) => {
-                let entry = acc.entry(sid.to_string()).or_default();
-                if let Some(t) = p.total_tokens {
-                    entry.ended_tokens = Some(entry.ended_tokens.unwrap_or(0).saturating_add(t));
-                }
-                if let Some(n) = p.total_turns {
-                    entry.turns = Some(entry.turns.unwrap_or(0).saturating_add(n));
-                }
+        if let Some(usage) = darkmux_crew::usage::usage_contribution(&rec) {
+            let entry = acc.entry(sid.to_string()).or_default();
+            entry.tokens = entry.tokens.saturating_add(usage.total);
+            if usage.purpose == darkmux_crew::usage::UsagePurpose::Utility {
+                entry.utility = entry.utility.saturating_add(usage.total);
             }
-            Some(darkmux_flow::Payload::StepResult(p)) => {
-                let entry = acc.entry(sid.to_string()).or_default();
-                if let Some(t) = p.total_tokens {
-                    entry.result_tokens = Some(entry.result_tokens.map_or(t, |cur| cur.max(t)));
-                }
+            entry.reported |= usage.reported;
+            continue;
+        }
+        // One execution's terminal (an attempt, a map item): its own turns.
+        if let Some(darkmux_flow::Payload::DispatchComplete(p) | darkmux_flow::Payload::DispatchError(p)) =
+            darkmux_flow::reader::payload_of(&rec)
+        {
+            let entry = acc.entry(sid.to_string()).or_default();
+            if let Some(n) = p.total_turns {
+                entry.turns = Some(entry.turns.unwrap_or(0).saturating_add(n));
             }
-            _ => {}
         }
     }
     acc.into_iter()
-        .map(|(sid, a)| (sid, StepFinals { tokens: a.ended_tokens.or(a.result_tokens), turns: a.turns }))
+        .map(|(sid, a)| {
+            let utility = (a.reported && a.utility > 0).then_some(a.utility);
+            (sid, StepFinals { tokens: a.reported.then_some(a.tokens), utility, turns: a.turns })
+        })
         .collect()
 }
 
-/// What `fold_step_finals` accumulates for one step before choosing its token figure.
+/// What `fold_step_finals` accumulates for one step.
 #[derive(Default)]
 struct FinalsAcc {
-    /// The sum of the `total_tokens` of the step's execution terminals.
-    ended_tokens: Option<u64>,
-    /// The largest `step result` total: the legacy figure for a step whose executions wrote no
-    /// terminal tokens. Used only when there are none, so a step-level aggregate that already
-    /// sums its items (`dispatch.map`) is never added to the item terminals it sums.
-    result_tokens: Option<u64>,
+    /// The sum of the step's usage records' totals.
+    tokens: u64,
+    /// The part of `tokens` that is utility calls.
+    utility: u64,
+    /// Whether any of them reported a count: none means unmeasured, not 0.
+    reported: bool,
     /// The sum of the terminals' `total_turns`.
     turns: Option<u64>,
 }
@@ -1159,11 +1164,11 @@ struct FinalsAcc {
 /// of what the fold found (#1488 follow-up: the client already gates its
 /// live SSE fold on `startTs > 0`; this is the same invariant for the
 /// server's finalized total).
-fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u64>, Option<u64>) {
+fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u64>, Option<u64>, Option<u64>) {
     if !started {
-        return (None, None);
+        return (None, None, None);
     }
-    (fin.and_then(|f| f.tokens), fin.and_then(|f| f.turns))
+    (fin.and_then(|f| f.tokens), fin.and_then(|f| f.utility), fin.and_then(|f| f.turns))
 }
 
 /// Parse a flow day-file stem (`YYYY-MM-DD`) into days since the epoch.
@@ -1475,7 +1480,7 @@ pub fn build_mission_graph(
                     // 46832 finalized tokens folded from an unrelated,
                     // already-closed same-day mission's real verify run.
                     let started = steps.get(step_id).is_some_and(|s| s.started_ts.is_some());
-                    let (tokens_final, turns_final) =
+                    let (tokens_final, tokens_utility, turns_final) =
                         gate_finals_by_started(started, step_finals.get(step_id));
                     match steps.get(step_id) {
                         Some(step) => StepRow {
@@ -1486,6 +1491,7 @@ pub fn build_mission_graph(
                             started_ts: step.started_ts,
                             completed_ts: step.completed_ts,
                             tokens_final,
+                            tokens_utility,
                             turns_final,
                             // (#1481) The seat's resolved model, if its config
                             // stamps one (dispatch.map seats do; procedural /
@@ -1509,6 +1515,7 @@ pub fn build_mission_graph(
                                 started_ts: None,
                                 completed_ts: None,
                                 tokens_final,
+                                tokens_utility,
                                 turns_final,
                                 // (#1481) A synthesized step has no persisted
                                 // config yet — the model resolves at launch and
@@ -1666,20 +1673,65 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn fold_finals_step_result_record_folds_total_tokens() {
-        let step_ids = ids(&["example-judge-step"]);
-        let rec = serde_json::json!({
-            "action": "step.result",
-            "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 4200 }
+    /// One usage record (`telemetry.tokens`) carrying `extra` beside its counts.
+    fn usage_rec(total: u64, extra: serde_json::Value) -> serde_json::Value {
+        let mut rec = serde_json::json!({
+            "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+            "payload": { "call_kind": "turn", "token_source": "provider", "total_tokens": total }
         });
-        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "payload" {
+                rec["payload"].as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
+            } else {
+                rec[k.as_str()] = v.clone();
+            }
+        }
+        rec
+    }
+
+    #[test]
+    fn fold_finals_usage_record_folds_the_steps_tokens_and_a_terminals_total_is_never_read() {
+        let step_ids = ids(&["example-judge-step"]);
+        let recs = vec![
+            usage_rec(4200, serde_json::json!({ "payload": { "step_id": "example-judge-step" } })),
+            // Neither a `step result` nor a terminal states tokens that count.
+            serde_json::json!({ "action": "step.result",
+                                "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 99 } }),
+            serde_json::json!({ "action": "dispatch.complete", "handle": "example-judge-step",
+                                "payload": { "total_tokens": 77 } }),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["example-judge-step"].tokens, Some(4200));
         assert_eq!(out["example-judge-step"].turns, None);
     }
 
-    /// (#1877) `fold_step_finals` folds only `dispatch.complete` and
-    /// `step.result`. A `step.timing` record for the same step, even one
+    /// The step's utility share (compaction inside it) is named beside the one
+    /// total it is part of.
+    #[test]
+    fn fold_finals_names_the_utility_share_of_a_steps_total() {
+        let step_ids = ids(&["s1"]);
+        let recs = vec![
+            usage_rec(100, serde_json::json!({ "payload": { "step_id": "s1" } })),
+            usage_rec(30, serde_json::json!({ "payload": { "step_id": "s1", "call_kind": "compaction", "purpose": "utility" } })),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert_eq!((out["s1"].tokens, out["s1"].utility), (Some(130), Some(30)), "{out:?}");
+    }
+
+    /// A usage record that reported no count leaves the step unmeasured.
+    #[test]
+    fn fold_finals_a_countless_usage_record_leaves_tokens_unmeasured() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+            "payload": { "step_id": "s1", "token_source": "absent", "call_kind": "turn" }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
+        assert_eq!(out["s1"].tokens, None, "{out:?}");
+    }
+
+    /// (#1877) `fold_step_finals` folds only usage records and terminals. A
+    /// `step.timing` record for the same step, even one
     /// with a real `wall_ms`, must produce no entry at all: an entry with a
     /// zeroed field would read as "measured as zero", which is false.
     #[test]
@@ -1706,11 +1758,7 @@ mod tests {
     fn fold_finals_step_timing_record_does_not_disturb_a_sibling_step_result_record() {
         let step_ids = ids(&["s1"]);
         let recs = vec![
-            serde_json::json!({
-                "action": "step.result",
-                "mission_id": "m-this",
-                "payload": { "kind": "k", "step_id": "s1", "total_tokens": 4200 }
-            }),
+            usage_rec(4200, serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } })),
             serde_json::json!({
                 "action": "step.timing",
                 "mission_id": "m-this",
@@ -1721,7 +1769,7 @@ mod tests {
         assert_eq!(
             out["s1"].tokens,
             Some(4200),
-            "the step-result record's folded tokens must survive the sibling step-timing \
+            "the usage record's folded tokens must survive the sibling step-timing \
              record unchanged: {out:?}"
         );
     }
@@ -1765,9 +1813,11 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let recs = vec![
             serde_json::json!({ "action": "dispatch.error", "handle": "s1", "mission_id": "m-this",
-                                "payload": { "total_turns": 2, "total_tokens": 100 } }),
+                                "payload": { "total_turns": 2 } }),
+            usage_rec(100, serde_json::json!({ "handle": "s1", "mission_id": "m-this" })),
             serde_json::json!({ "action": "dispatch.complete", "handle": "s1", "mission_id": "m-this",
-                                "payload": { "total_turns": 3, "total_tokens": 150 } }),
+                                "payload": { "total_turns": 3 } }),
+            usage_rec(150, serde_json::json!({ "handle": "s1", "mission_id": "m-this" })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].turns, Some(5), "{out:?}");
@@ -1776,14 +1826,16 @@ mod tests {
 
     #[test]
     fn fold_finals_a_map_step_counts_its_items_once_beside_its_step_results() {
-        // A `dispatch.map` step writes one terminal per item, a `step result` per item, and one
-        // aggregate `step result` whose total already sums the items. Only the three item
-        // terminals count: 10 + 20 + 30 tokens, 3 turns; the step results add nothing.
+        // A `dispatch.map` step writes one terminal, one usage record and a `step result` per item,
+        // and one aggregate `step result` whose total already sums the items. Only the three usage
+        // records count for tokens (10 + 20 + 30) and the three terminals for turns; the step
+        // results and the terminals' own totals add nothing.
         let step_ids = ids(&["s1"]);
         let mut recs = Vec::new();
         for (i, t) in [10u64, 20, 30].into_iter().enumerate() {
             recs.push(serde_json::json!({ "action": "dispatch.complete", "handle": "s1", "mission_id": "m-this",
                                           "payload": { "item_index": i, "total_turns": 1, "total_tokens": t } }));
+            recs.push(usage_rec(t, serde_json::json!({ "handle": "s1", "mission_id": "m-this", "payload": { "call_kind": "map_item", "index": i } })));
             recs.push(serde_json::json!({ "action": "step.result", "handle": "s1", "mission_id": "m-this",
                                           "payload": { "kind": "dispatch.map", "step_id": "s1", "item_index": i, "total_tokens": t } }));
         }
@@ -1832,15 +1884,8 @@ mod tests {
         // history must keep rendering).
         let step_ids = ids(&["s1", "s2"]);
         let recs = vec![
-            serde_json::json!({
-                "action": "step.result",
-                "mission_id": "m-this",
-                "payload": { "kind": "k", "step_id": "s1", "total_tokens": 100 }
-            }),
-            serde_json::json!({
-                "action": "step.result",
-                "payload": { "kind": "k", "step_id": "s2", "total_tokens": 200 }
-            }),
+            usage_rec(100, serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } })),
+            usage_rec(200, serde_json::json!({ "payload": { "step_id": "s2" } })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(100), "own-stamped record must fold");
@@ -1851,12 +1896,11 @@ mod tests {
     fn fold_finals_dispatch_complete_folds_tokens_turns_via_session_id() {
         // Correlation key 2: a pre-4.0 archive's step session `step-<id>`.
         let step_ids = ids(&["s1"]);
-        let rec = serde_json::json!({
-            "action": "dispatch.complete",
-            "session_id": "step-s1",
-            "payload": { "total_tokens": 15200, "total_turns": 9 }
-        });
-        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
+        let recs = vec![
+            serde_json::json!({ "action": "dispatch.complete", "session_id": "step-s1", "payload": { "total_turns": 9 } }),
+            usage_rec(15200, serde_json::json!({ "session_id": "step-s1" })),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(15200));
         assert_eq!(out["s1"].turns, Some(9));
     }
@@ -1878,13 +1922,12 @@ mod tests {
         )
         .wire();
         for session in [current.as_str(), "step-s1-twin-mission-1757-abc123"] {
-            let rec = serde_json::json!({
-                "action": "dispatch.complete",
-                "session_id": session,
-                "mission_id": mission,
-                "payload": { "total_tokens": 15200, "total_turns": 9 }
-            });
-            let out = fold_step_finals(vec![rec], &step_ids, mission);
+            let recs = vec![
+                serde_json::json!({ "action": "dispatch.complete", "session_id": session, "mission_id": mission,
+                                    "payload": { "total_turns": 9 } }),
+                usage_rec(15200, serde_json::json!({ "session_id": session, "mission_id": mission })),
+            ];
+            let out = fold_step_finals(recs, &step_ids, mission);
             assert_eq!(out["s1"].tokens, Some(15200), "{session}");
             assert_eq!(out["s1"].turns, Some(9), "{session}");
         }
@@ -1959,61 +2002,41 @@ mod tests {
         // so both figures add.
         let step_ids = ids(&["s1"]);
         let recs = vec![
-            serde_json::json!({ "action": "dispatch.complete", "handle": "s1",
-                                "payload": { "total_tokens": 100, "total_turns": 2 } }),
-            serde_json::json!({ "action": "dispatch.complete", "handle": "s1",
-                                "payload": { "total_tokens": 900, "total_turns": 5 } }),
+            serde_json::json!({ "action": "dispatch.complete", "handle": "s1", "payload": { "total_turns": 2 } }),
+            usage_rec(100, serde_json::json!({ "handle": "s1" })),
+            serde_json::json!({ "action": "dispatch.complete", "handle": "s1", "payload": { "total_turns": 5 } }),
+            usage_rec(900, serde_json::json!({ "handle": "s1" })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert_eq!(out["s1"].tokens, Some(1000), "100 + 900: one term per execution");
+        assert_eq!(out["s1"].tokens, Some(1000), "100 + 900: one term per usage record");
         assert_eq!(out["s1"].turns, Some(7), "2 + 5: one term per execution");
     }
 
     #[test]
-    fn fold_finals_endpoint_bearing_step_result_folds_its_total() {
+    fn fold_finals_an_endpoint_bearing_usage_record_folds_its_total() {
         let step_ids = ids(&["s1"]);
-        let rec = serde_json::json!({
-            "action": "step.result",
-            "payload": { "kind": "k", "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
-        });
+        let rec = usage_rec(50, serde_json::json!({ "payload": { "step_id": "s1", "endpoint": "https://api.example/v1" } }));
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(50));
     }
 
     #[test]
-    fn fold_finals_ignores_foreign_steps_and_running_increments() {
+    fn fold_finals_ignores_foreign_steps_and_turn_heartbeats() {
         let step_ids = ids(&["mine"]);
         let recs = vec![
             // Foreign step — not in this mission's set.
             serde_json::json!({ "action": "step.result",
                                 "payload": { "kind": "k", "step_id": "someone-else", "total_tokens": 999 } }),
-            // A RUNNING per-turn increment for my step — NOT a finalized total,
-            // stays the SSE channel's job, must not fold here.
-            serde_json::json!({ "action": "telemetry.tokens", "handle": "mine",
-                                "payload": { "total_tokens": 7 } }),
+            // A per-turn heartbeat folds nothing.
             serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert!(!out.contains_key("mine"), "no finalized record -> no entry (honest absent)");
+        assert!(!out.contains_key("mine"), "no usage record -> no entry (honest absent)");
         assert!(!out.contains_key("someone-else"));
     }
 
     /// (#1445 gate should-fix) `total_tokens` wins when both keys are
     /// present — the same precedence the JS fold applies.
-    #[test]
-    fn fold_finals_total_tokens_wins_over_tokens_fallback() {
-        let step_ids = ids(&["s1"]);
-        let rec = serde_json::json!({
-            "action": "step.result",
-            "payload": { "kind": "k", "step_id": "s1", "total_tokens": 900, "tokens": 100 }
-        });
-        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert_eq!(out["s1"].tokens, Some(900));
-    }
-
-    /// (#2902 step 2a) A matched NON-TERMINAL record folds nothing: the
-    /// endpoint-presence `cloud` flag it used to set is gone (#2834), and a
-    /// start never carries a finalized total.
     #[test]
     fn fold_finals_nonterminal_matched_record_folds_nothing() {
         let step_ids = ids(&["s1"]);
@@ -2027,20 +2050,6 @@ mod tests {
 
     /// (#2902 step 1a) A usage record folds nothing into the finalized
     /// totals: the running per-call sum stays the page's live channel.
-    #[test]
-    fn fold_finals_usage_record_folds_nothing() {
-        let step_ids = ids(&["s1"]);
-        let rec = serde_json::json!({
-            "action": "telemetry.tokens", "handle": "s1",
-            "payload": { "total_tokens": 7, "call_kind": "single_shot", "endpoint": "http://127.0.0.1:1234/v1" }
-        });
-        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert!(!out.contains_key("s1"), "a usage record folds nothing here: {out:?}");
-    }
-
-    /// (#1445 gate consider 4) Colon-era session ids (`step:<id>`, retired in
-    /// #1436) match none of the correlation keys — a mixed-era mission's
-    /// pre-rename steps stay honest-absent rather than mis-folding.
     #[test]
     fn fold_finals_colon_era_session_ids_do_not_fold() {
         let step_ids = ids(&["s1"]);
@@ -2075,16 +2084,18 @@ mod tests {
         // Simulates the confirmed collision: `fold_step_finals` found a
         // real sibling/earlier mission's finalized total under this step's
         // literal id, but the step itself never started.
-        let collided = StepFinals { tokens: Some(46_832), turns: Some(12) };
-        let (tokens, turns) = gate_finals_by_started(false, Some(&collided));
+        let collided = StepFinals { tokens: Some(46_832), utility: Some(10), turns: Some(12) };
+        let (tokens, utility, turns) = gate_finals_by_started(false, Some(&collided));
+        assert_eq!(utility, None);
         assert_eq!(tokens, None, "a not-started step must never show a collided total");
         assert_eq!(turns, None);
     }
 
     #[test]
     fn gate_finals_by_started_keeps_a_started_steps_real_total() {
-        let real = StepFinals { tokens: Some(133_785), turns: Some(9) };
-        let (tokens, turns) = gate_finals_by_started(true, Some(&real));
+        let real = StepFinals { tokens: Some(133_785), utility: Some(785), turns: Some(9) };
+        let (tokens, utility, turns) = gate_finals_by_started(true, Some(&real));
+        assert_eq!(utility, Some(785));
         assert_eq!(tokens, Some(133_785), "a genuinely started step keeps its real total");
         assert_eq!(turns, Some(9));
     }
@@ -2093,7 +2104,7 @@ mod tests {
     fn gate_finals_by_started_started_with_no_fold_is_honest_absent() {
         // Started, but the backfill found nothing for it (mixed-era or
         // truly never-dispatched) — absent, not a manufactured zero.
-        let (tokens, turns) = gate_finals_by_started(true, None);
+        let (tokens, _utility, turns) = gate_finals_by_started(true, None);
         assert_eq!(tokens, None);
         assert_eq!(turns, None);
     }
@@ -2106,9 +2117,8 @@ mod tests {
         std::fs::write(dir.join(format!("{stem}.jsonl")), body).unwrap();
     }
 
-    fn complete_rec(step: &str, tokens: u64) -> serde_json::Value {
-        serde_json::json!({ "action": "dispatch.complete", "handle": step,
-                            "payload": { "total_tokens": tokens } })
+    fn step_usage(step: &str, tokens: u64) -> serde_json::Value {
+        usage_rec(tokens, serde_json::json!({ "handle": step }))
     }
 
     #[test]
@@ -2118,11 +2128,11 @@ mod tests {
         // Mission created on 2026-07-17; margin admits 2026-07-16.
         let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         // OUT of window: a matching record that must NOT fold.
-        write_day_file(tmp.path(), "2020-01-01", &[complete_rec("s1", 999_999)]);
+        write_day_file(tmp.path(), "2020-01-01", &[step_usage("s1", 999_999)]);
         // Margin day (created minus one): folds.
-        write_day_file(tmp.path(), "2026-07-16", &[complete_rec("s1", 100)]);
+        write_day_file(tmp.path(), "2026-07-16", &[step_usage("s1", 100)]);
         // Mission-lifetime day: folds (a second execution's terminal adds).
-        write_day_file(tmp.path(), "2026-07-18", &[complete_rec("s1", 200)]);
+        write_day_file(tmp.path(), "2026-07-18", &[step_usage("s1", 200)]);
         let out = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(
             out["s1"].tokens,
@@ -2140,7 +2150,7 @@ mod tests {
         write_day_file(
             tmp.path(),
             "2026-07-17",
-            &[complete_rec("s1", 100), complete_rec("s1", 900), complete_rec("s1", 950)],
+            &[step_usage("s1", 100), step_usage("s1", 900), step_usage("s1", 950)],
         );
         let out = backfill_step_finals_bounded(tmp.path(), &step_ids, "m-this", created_ts, 1);
         assert_eq!(out["s1"].tokens, Some(100), "cap stops parsing after the first record");
@@ -2154,7 +2164,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
         let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
-        let good = serde_json::to_string(&complete_rec("s1", 4200)).unwrap();
+        let good = serde_json::to_string(&step_usage("s1", 4200)).unwrap();
         std::fs::write(
             tmp.path().join("2026-07-17.jsonl"),
             format!("this is not json\n{{\"truncated\": \n{good}\n"),

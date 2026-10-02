@@ -1109,6 +1109,7 @@ StepRow
   startedTs?: uint64 | null
   completedTs?: uint64 | null
   tokensFinal?: uint64 | null
+  tokensUtility?: uint64 | null
   turnsFinal?: uint64 | null
   model?: string | null
   error?: string | null

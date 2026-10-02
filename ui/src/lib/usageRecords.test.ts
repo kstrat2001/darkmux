@@ -2,10 +2,10 @@
 //
 // One function (`sumUsage`, and its per-record half `usageContribution`)
 // feeds the fleet hero, the run page's tiles and the mission graph's step
-// meter. The only exception is legacy data (a run with no usage records
-// counts its token-bearing `dispatch complete`), isolated in
-// `legacyCompleteCounts`. The shared golden fixture `tests/usage-golden/`
-// pins the answer for this module and for step 2b's Rust aggregator.
+// meter, with the utility part named (#3061: one total everywhere). There is
+// no exception: a `dispatch complete` carries no tokens. The shared golden
+// fixture `tests/usage-golden/` pins the answer for this module and for step
+// 2b's Rust aggregator.
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import type { NormRecord } from "./ingest";
 import { norm, normAll, type RawRecord } from "../testing/records";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import { runRegions } from "../lenses/session/sessionRun";
-import { applyRecordToMetrics, indexGraph, stepDisplayMetrics, type MetricsMap } from "../lenses/mission/graph";
+import { applyRecordToMetrics, indexGraph, seedMetricsFromGraph, stepDisplayMetrics, type MetricsMap } from "../lenses/mission/graph";
 import { measuredCharsPerToken, averageGenerationRate } from "./tokenRate";
 import { turnItems } from "./turnGroups";
 import {
@@ -23,7 +23,6 @@ import {
   handleNamesExecution,
   isCompactionUsage,
   isTurnUsage,
-  legacyCompleteCounts,
   isUsageRecord,
   sumUsage,
   usageContribution,
@@ -49,7 +48,6 @@ interface UsageGolden {
   overall: GoldenTotals;
   excluding_utility: GoldenTotals;
   usage_records: number;
-  legacy_completes_counted: number;
   reported_entries: number;
   by_purpose: Record<string, GoldenTotals>;
   by_call_kind: unknown;
@@ -59,13 +57,13 @@ interface UsageGolden {
 
 const expected = JSON.parse(readFileSync(path.join(GOLDEN_DIR, "expected.json"), "utf8")) as UsageGolden;
 
-/** Group the golden's counted entries (usage records + legacy completes) by
- *  one payload field, `(none)` when an entry does not carry it: the
- *  breakdown step 2b's aggregator reports. Each entry is summed through
- *  `sumUsage` alone, so the breakdown and the total share one arithmetic. */
+/** Group the golden's usage records by one payload field, `(none)` when a
+ *  record does not carry it: the breakdown step 2b's aggregator reports. Each
+ *  record is summed through `sumUsage` alone, so the breakdown and the total
+ *  share one arithmetic. */
 function breakdown(field: string): Record<string, number> {
   const out: Record<string, number> = {};
-  const counted = [...golden.filter((r) => r.action === ACTION.TelemetryTokens), ...legacyCompleteCounts(golden)];
+  const counted = golden.filter((r) => r.action === ACTION.TelemetryTokens);
   for (const r of counted) {
     const p = r.payload as Record<string, unknown>;
     const k = typeof p[field] === "string" ? (p[field] as string) : "(none)";
@@ -75,11 +73,10 @@ function breakdown(field: string): Record<string, number> {
 }
 
 describe("the shared usage golden (tests/usage-golden)", () => {
-  it("overall: a plain sum plus the legacy fallback", () => {
+  it("overall: a plain sum of the usage records", () => {
     const s = sumUsage(golden);
     expect({ total: s.total, input: s.prompt, generated: s.completion, cached: s.cached }).toEqual(expected.overall);
     expect(s.usageRecords).toBe(expected.usage_records);
-    expect(s.legacyCompletes).toBe(expected.legacy_completes_counted);
     expect(s.utility).toBe(expected.by_purpose.utility.total);
   });
 
@@ -111,8 +108,7 @@ describe("the shared usage golden (tests/usage-golden)", () => {
 
   /** (#2902 step 2b review) The ONE value domain, pinned on both sides:
    *  a finite number floors to an integer in [0, 2^53]; a string, bool,
-   *  null or negative reads as 0 and reports nothing; a legacy complete is
-   *  token-bearing by the same reading. `domain.jsonl` covers the low
+   *  null or negative reads as 0 and reports nothing. `domain.jsonl` covers the low
    *  edge, `clamp.jsonl` the high one (kept apart so the sums stay exactly
    *  representable). */
   it.each([
@@ -129,11 +125,10 @@ describe("the shared usage golden (tests/usage-golden)", () => {
     const s = sumUsage(records);
     expect({ total: s.total, input: s.prompt, generated: s.completion, cached: s.cached }).toEqual(exp.overall);
     expect(s.usageRecords).toBe(exp.usage_records);
-    expect(s.legacyCompletes).toBe(exp.legacy_completes_counted);
     expect(s.reported).toBe(exp.reported_entries);
     if (exp.by_requested_model) {
       const out: Record<string, number> = {};
-      const counted = [...records.filter((r) => r.action === ACTION.TelemetryTokens), ...legacyCompleteCounts(records)];
+      const counted = records.filter((r) => r.action === ACTION.TelemetryTokens);
       for (const r of counted) {
         const p = r.payload as Record<string, unknown>;
         const k = typeof p.requested_model === "string" ? p.requested_model : "(none)";
@@ -144,7 +139,7 @@ describe("the shared usage golden (tests/usage-golden)", () => {
   });
 });
 
-// ── the legacy fallback ──────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────
 
 let clock = 0;
 function r(o: RawRecord & { payload?: Record<string, unknown> }): NormRecord {
@@ -183,13 +178,13 @@ describe("usageContribution is sumUsage's per-record half (one arithmetic)", () 
     expect(fold(usageOnly, PURPOSE.utility)).toEqual({ total: w.total, prompt: w.prompt, completion: w.completion, cached: w.cached, utility: 0 });
   });
 
-  it("the provider total wins; a split with no total falls back to prompt + completion, then unmanaged_tokens (an archive's remote_tokens)", () => {
+  it("the provider total wins; a split with no total falls back to prompt + completion", () => {
     clock = 0;
     const amount = (payload: Record<string, unknown>) => usageContribution(usage("s", "h", payload))!;
     expect(amount({ prompt_tokens: 7, completion_tokens: 3, total_tokens: 12 }).total).toBe(12);
     expect(amount({ prompt_tokens: 7, completion_tokens: 3 }).total).toBe(10);
-    expect(amount({ unmanaged_tokens: 5 }).total).toBe(5);
-    expect(amount({ remote_tokens: 5 }).total).toBe(5);
+    expect(amount({ unmanaged_tokens: 5 }).total).toBe(0);
+    expect(amount({ remote_tokens: 5 }).total).toBe(0);
   });
 
   it("cached is null when the record does not report it, and a reported zero stays 0", () => {
@@ -206,54 +201,26 @@ describe("usageContribution is sumUsage's per-record half (one arithmetic)", () 
   });
 });
 
-describe("the legacy fallback (a run with no usage records counts its complete)", () => {
-  it("a run with ZERO usage records counts each token-bearing complete once", () => {
-    const recs = [complete("old", { total_tokens: 100, prompt_tokens: 90, completion_tokens: 10 })];
-    expect(sumUsage(recs)).toMatchObject({ total: 100, prompt: 90, completion: 10, cached: null, legacyCompletes: 1 });
+describe("a dispatch complete carries no tokens (no legacy fallback)", () => {
+  it("a run with ONLY a complete is unmeasured, whatever the complete says", () => {
+    const recs = [complete("old", { total_tokens: 100, prompt_tokens: 90, completion_tokens: 10, remote_tokens: 40 })];
+    expect(sumUsage(recs)).toMatchObject({ total: 0, prompt: 0, completion: 0, cached: null, usageRecords: 0, reported: 0 });
   });
 
-  it("a run with any usage record never reads its complete, even an `absent` one", () => {
-    const withTurn = [usage("s", "coder", { call_kind: CALL_KIND.turn, total_tokens: 40, prompt_tokens: 30, completion_tokens: 10 }), complete("s", { total_tokens: 40 })];
+  it("a run with a usage record counts that record and never its complete, even an `absent` one", () => {
+    const withTurn = [usage("s", "coder", { call_kind: CALL_KIND.turn, total_tokens: 40, prompt_tokens: 30, completion_tokens: 10 }), complete("s", { total_tokens: 999 })];
     expect(sumUsage(withTurn).total).toBe(40);
     const absentOnly = [usage("s", "coder", { call_kind: CALL_KIND.single_shot, token_source: "absent" }), complete("s", { total_tokens: 999 })];
-    expect(sumUsage(absentOnly)).toMatchObject({ total: 0, legacyCompletes: 0 });
+    expect(sumUsage(absentOnly)).toMatchObject({ total: 0, usageRecords: 1, reported: 0 });
   });
 
-  it("keys on the EXECUTION: a sibling's usage record does not hide another execution's complete", () => {
-    // Two executions in one task session (a map's items). Execution A has a
-    // usage record; execution B has only a legacy-shaped complete. Both count.
+  it("counts every usage record whatever execution it names: the sum is of records", () => {
     const named = (rec: NormRecord, execution: string): NormRecord => ({ ...rec, execution_id: execution });
     const recs = [
       named(usage("m.task.t", "s", { call_kind: CALL_KIND.map_item, total_tokens: 10 }, "m"), "exec-a"),
-      named(complete("m.task.t", { total_tokens: 10 }, "m"), "exec-a"),
-      named(complete("m.task.t", { total_tokens: 7 }, "m"), "exec-b"),
+      named(usage("m.task.t2", "s", { call_kind: CALL_KIND.turn, total_tokens: 7 }, "m"), "exec-a"),
     ];
-    expect(sumUsage(recs)).toMatchObject({ total: 17, usageRecords: 1, legacyCompletes: 1 });
-    expect(legacyCompleteCounts(recs).map((x) => x.execution_id)).toEqual(["exec-b"]);
-  });
-
-  it("keys a record that names no execution on its session and mission", () => {
-    // Mission A has usage records; mission B under the same deterministic
-    // session id has only a legacy complete. Both count.
-    const recs = [
-      usage("task-t", "s", { call_kind: CALL_KIND.map_item, total_tokens: 5 }, "A"),
-      complete("task-t", { total_tokens: 5 }, "A"),
-      complete("task-t", { total_tokens: 7 }, "B"),
-    ];
-    expect(sumUsage(recs).total).toBe(12);
-  });
-
-  it("a complete carries cached tokens only when it reports them", () => {
-    expect(sumUsage([complete("a", { total_tokens: 10, cached_tokens: 4 })]).cached).toBe(4);
-    expect(sumUsage([complete("a", { total_tokens: 10 })]).cached).toBeNull();
-  });
-
-  it("an unmanaged_tokens-only complete counts its total", () => {
-    expect(sumUsage([complete("rv", { unmanaged_tokens: 40 })]).total).toBe(40);
-  });
-
-  it("a remote_tokens-only archived complete still counts its total", () => {
-    expect(sumUsage([complete("rv", { remote_tokens: 40 })]).total).toBe(40);
+    expect(sumUsage(recs)).toMatchObject({ total: 17, usageRecords: 2 });
   });
 });
 
@@ -350,15 +317,17 @@ describe("the fleet hero (tokensOffMeter)", () => {
   });
 });
 
-describe("the run page and the mission graph exclude utility (contract 8)", () => {
-  it("the run page's tiles are unchanged by utility records", () => {
+const tileHint = (recs: NormRecord[], sid: string, label: string) =>
+  runRegions(recs, sid, Date.UTC(2026, 8, 27)).metrics.find((m) => m.label === label)?.hintTitle;
+
+describe("the run page and the mission graph count utility and name it (#3061)", () => {
+  it("the run page's tiles count every usage record, and name the utility part on hover", () => {
     const [without, withU] = utilityStreams();
-    for (const sid of ["h1", "task-t3"]) {
-      for (const label of ["TOKENS IN", "TOKENS OUT"]) {
-        expect(tile(withU, sid, label)).toBe(tile(without, sid, label));
-      }
-    }
-    expect(tile(withU, "h1", "TOKENS IN")).toBe("2.00k");
+    // h1: work 900 + 1100 in, plus two compactions (500 + 40 in).
+    expect(tile(without, "h1", "TOKENS IN")).toBe("2.00k");
+    expect(tile(withU, "h1", "TOKENS IN")).toBe("2.54k");
+    expect(tileHint(withU, "h1", "TOKENS IN")).toContain("700 tokens of utility calls");
+    expect(tileHint(without, "h1", "TOKENS IN")).toBeUndefined();
   });
 
   it("a session whose only calls are utility jobs (radio routing) IS that job: its page shows them", () => {
@@ -383,27 +352,37 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
     expect(tile(recs, "ss", "TOKENS OUT")).toBe("9");
   });
 
-  it("a legacy session (complete only) reads its complete", () => {
+  it("a pre-5.0 session (complete only) is unmeasured: its tiles read a dash", () => {
     clock = 0;
     const recs = [
       r({ action: "dispatch.start", session_id: "lg", handle: "analyst", payload: {} }),
       r({ action: "dispatch.complete", session_id: "lg", handle: "analyst", payload: { total_tokens: 70, prompt_tokens: 61, completion_tokens: 9 } }),
     ];
-    expect(tile(recs, "lg", "TOKENS IN")).toBe("61");
+    expect(tile(recs, "lg", "TOKENS IN")).toBe("—");
   });
 
-  it("the mission graph's step meter is the usage sum without utility; a legacy step reads its complete", () => {
+  it("the mission graph's step meter is the usage sum with its utility part named; a complete is never read", () => {
     const [without, withU] = utilityStreams();
     const idx = indexGraph({ nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal" }] }] as never });
     const fold = (recs: NormRecord[]) => recs.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, "m-2"), {});
-    expect(stepDisplayMetrics(fold(withU).cs).tokens).toBe(450);
-    expect(stepDisplayMetrics(fold(without).cs).tokens).toBe(450);
-    // Legacy: no usage record for the step, a finalized total on its complete.
+    expect(stepDisplayMetrics(fold(withU).cs)).toMatchObject({ tokens: 450 + 300, utility: 300 });
+    expect(stepDisplayMetrics(fold(without).cs)).toMatchObject({ tokens: 450, utility: 0 });
+    // No usage record for the step: unmeasured, whatever its complete says.
     const legacy = withU.filter((x) => !(x.action === ACTION.TelemetryTokens && x.session_id === "task-t3"));
-    expect(stepDisplayMetrics(fold(legacy).cs).tokens).toBe(450);
-    // Usage records win over a complete that disagrees.
+    expect(stepDisplayMetrics(fold(legacy).cs).tokens).toBe(0);
+    // A complete that disagrees changes nothing.
     const bumped = withU.map((x) => (x.action === ACTION.DispatchComplete && x.session_id === "task-t3" ? { ...x, payload: { ...(x.payload as object), total_tokens: 9999 } } : x));
-    expect(stepDisplayMetrics(fold(bumped).cs).tokens).toBe(450);
+    expect(stepDisplayMetrics(fold(bumped).cs).tokens).toBe(750);
+  });
+
+  it("the server's per-step total (seeded from the graph) and the live fold are one figure: the larger, never the sum", () => {
+    const [, withU] = utilityStreams();
+    const idx = indexGraph({ nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal" }] }] as never });
+    const live = withU.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, "m-2"), {});
+    const seeded = seedMetricsFromGraph(live, { nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal", tokensFinal: 750, tokensUtility: 300 }] }] } as never);
+    expect(stepDisplayMetrics(seeded.cs)).toMatchObject({ tokens: 750, utility: 300 });
+    const fresh = seedMetricsFromGraph({}, { nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal", tokensFinal: 750, tokensUtility: 300, startedTs: 1790000000 }] }] } as never);
+    expect(stepDisplayMetrics(fresh.cs)).toMatchObject({ tokens: 750, utility: 300 });
   });
 
   it("a retried map item's per-call records sum to the item's tokens on every surface", () => {
@@ -411,7 +390,7 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
     const M = "m-1";
     const start = r({ action: "dispatch.start", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map" } });
     const per = [0, 1, 2].map(() =>
-      usage("task-t9", "mp", { call_kind: CALL_KIND.map_item, purpose: PURPOSE.work, requested_model: "q", endpoint: LMS, token_source: "provider", total_tokens: 10, prompt_tokens: 8, completion_tokens: 2, remote: false, index: 0 }, M),
+      usage("task-t9", "mp", { call_kind: CALL_KIND.map_item, purpose: PURPOSE.work, requested_model: "q", endpoint: LMS, token_source: "provider", total_tokens: 10, prompt_tokens: 8, completion_tokens: 2, index: 0 }, M),
     );
     const recs = [
       start,

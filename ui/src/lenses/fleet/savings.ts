@@ -14,9 +14,8 @@ import { ACTION, CATEGORY, SOURCE, executionOf, type NormRecord } from "../../li
  * INPUT (`prompt_tokens`), GENERATED (`completion_tokens`), CACHED (the
  * provider's `cached_tokens`, over the records that report it; `null`, so no
  * chip, when none does) and UTILITY (the `purpose: utility` records:
- * darkmux's own compaction and radio routing). Legacy runs with no usage
- * records count their `dispatch complete` inside `sumUsage`; nothing here
- * special-cases them.
+ * darkmux's own compaction and radio routing). A `dispatch complete` carries
+ * no tokens in the sum (a record with no usage record reads as unmeasured).
  *
  * GONE, deliberately: the local/cloud/unknown split and its run counts
  * (withdrawn in #2834: an endpoint says what was called, never where or at

@@ -24,7 +24,7 @@ label: string,
  */
 kind: string, status: NodeStatus, startedTs?: number, completedTs?: number, 
 /**
- * (#1432 item 4) FINALIZED token/turn totals folded from this
+ * (#1432 item 4) The step's token/turn totals folded from this
  * mission's flow records at page-load time, so a completed step whose
  * dispatch ran BEFORE the page opened shows its real total immediately
  * (the page's SSE channel is tail-from-now, so without this a page
@@ -37,7 +37,8 @@ kind: string, status: NodeStatus, startedTs?: number, completedTs?: number,
  * (which read the `step-<id>` and 4.0 shapes), so pre-rename steps stay
  * honest-absent rather than mis-folding — pinned by
  * `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
- * the LIVE-increment channel; these are only the terminal totals.
+ * the LIVE-increment channel; `tokensFinal` is the sum of the step's usage
+ * records (#3061: the one token sum) and `turnsFinal` its terminals' turns.
  * Additive camelCase (`tokensFinal`/`turnsFinal`); pre-#1432
  * consumers ignore them.
  *
@@ -53,7 +54,13 @@ kind: string, status: NodeStatus, startedTs?: number, completedTs?: number,
  * total, not just the live SSE meter (which #1488 already gated
  * client-side on `startTs > 0`).
  */
-tokensFinal?: number, turnsFinal?: number, 
+tokensFinal?: number, 
+/**
+ * (#3061) The utility share of `tokens_final` (darkmux's own compaction
+ * and routing calls inside the step), named so every surface can show the
+ * one total with its utility part. Absent when none was measured.
+ */
+tokensUtility?: number, turnsFinal?: number, 
 /**
  * (#1481) The resolved model this step's dispatch ran against, read from
  * the persisted `Step.config` (`model`, else `model_key`). A

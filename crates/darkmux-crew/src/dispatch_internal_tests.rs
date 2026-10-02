@@ -859,7 +859,7 @@
         assert_eq!(p["endpoint"], report.label.as_str());
         assert_eq!(p["total_tokens"], 9);
         assert_eq!(p["purpose"], "work");
-        assert!(rec.get("session_id").map_or(true, |s| s.is_null()), "the probe belongs to no run: {rec}");
+        assert!(rec.get("session_id").is_none_or(|s| s.is_null()), "the probe belongs to no run: {rec}");
     }
 
     #[test]

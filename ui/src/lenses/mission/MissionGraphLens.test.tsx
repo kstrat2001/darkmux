@@ -680,7 +680,8 @@ describe("mission header sub-line and meter (#2332)", () => {
       graph: minted("finalized"),
       flowMissionRecords: [
         { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step" } },
-        { ts: "2026-08-19T00:00:02Z", action: "dispatch.complete", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step", total_turns: 1, total_tokens: 5000, endpoint: "https://cloud.example" } },
+        { ts: "2026-08-19T00:00:02Z", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step", token_source: "provider", total_tokens: 5000, endpoint: "https://cloud.example" } },
+        { ts: "2026-08-19T00:00:03Z", action: "dispatch.complete", handle: "a-step", mission_id: MINTED, payload: { step_id: "a-step", total_turns: 1, endpoint: "https://cloud.example" } },
       ],
     });
     renderLens(MINTED);

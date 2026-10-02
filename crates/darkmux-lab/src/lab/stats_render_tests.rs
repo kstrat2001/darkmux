@@ -169,6 +169,18 @@ fn the_table_has_one_row_per_run_with_its_flags() {
     );
 }
 
+/// (#3061) `run stats` counts a run's COMPLETION tokens only (the stream the
+/// throughput is measured over), never the total `run list` shows. Its table
+/// column and its set row say so, so the two are not read as one figure.
+#[test]
+fn the_completion_only_token_count_is_labeled_as_completion_tokens() {
+    let t = sets_text(&set(vec![run("good-run")]), None);
+    let header = line_starting(&t, "run ");
+    assert!(header.contains("out tok") && !header.contains(" tokens "), "{header}");
+    assert!(line_with(&t, "  tokens (compl.)").contains("20000"), "{t}");
+    assert!(!t.contains("  tokens  "), "no bare `tokens` row: {t}");
+}
+
 /// Set figures print as ranges, and the cost per success is shown.
 #[test]
 fn the_set_summary_prints_ranges_and_cost_per_success() {
