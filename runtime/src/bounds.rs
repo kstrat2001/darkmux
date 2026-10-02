@@ -61,9 +61,11 @@ pub enum BoundKind {
     /// GENERATION_CHECKPOINT_INTERVAL`'s doc for the incident this fixes.
     GenerationCheckpointInterval,
     MaxTokensPerCall,
-    #[allow(dead_code)] // kept: part of the wire contract, see the enum doc
+    // kept: part of the wire contract, see the enum doc
+    #[allow(dead_code)]
     MaxTurns,
-    #[allow(dead_code)] // kept: part of the wire contract, see the enum doc
+    // kept: part of the wire contract, see the enum doc
+    #[allow(dead_code)]
     MaxTokens,
     InactivityTimeout,
 }

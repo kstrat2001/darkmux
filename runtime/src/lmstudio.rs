@@ -268,7 +268,8 @@ pub struct ChatResponse {
     /// OpenAI-shape correlation id for the response. Parsed by serde
     /// for wire-shape parity; not read by the loop today (kept for
     /// future cross-tier diagnostics).
-    #[allow(dead_code)] // kept: serde-read for wire-shape parity, no caller reads it
+    // kept: serde-read for wire-shape parity, no caller reads it
+    #[allow(dead_code)]
     pub id: String,
     /// (#2902 step 1b) The model the server says produced this reply
     /// (OpenAI-compatible `model`). `None` when the server did not send one;
@@ -292,7 +293,8 @@ pub struct Choice {
     /// Multi-choice (`n > 1`) is permitted by the OpenAI spec but
     /// darkmux always requests `n = 1`; the field is parsed for
     /// wire-shape parity in case that ever changes.
-    #[allow(dead_code)] // kept: serde-read for wire-shape parity, no caller reads it
+    // kept: serde-read for wire-shape parity, no caller reads it
+    #[allow(dead_code)]
     pub index: u32,
     pub message: Message,
 
@@ -612,7 +614,8 @@ pub struct ChoiceDelta {
     /// Same multi-choice provision as `Choice.index` above — parsed
     /// for wire-shape parity; the accumulator always treats every
     /// `ChoiceDelta` as if it belongs to choice 0.
-    #[allow(dead_code)] // kept: serde-read for wire-shape parity, no caller reads it
+    // kept: serde-read for wire-shape parity, no caller reads it
+    #[allow(dead_code)]
     pub index: u32,
     #[serde(default)]
     pub delta: Delta,
@@ -627,7 +630,8 @@ pub struct Delta {
     /// Set on the FIRST chunk only (typically `"assistant"`). Parsed
     /// for wire-shape parity; the accumulator hardcodes the role on
     /// `into_response()`.
-    #[allow(dead_code)] // kept: serde-read for wire-shape parity, no caller reads it
+    // kept: serde-read for wire-shape parity, no caller reads it
+    #[allow(dead_code)]
     #[serde(default)]
     pub role: Option<String>,
     /// Incremental response text — append to the accumulator's buffer.
