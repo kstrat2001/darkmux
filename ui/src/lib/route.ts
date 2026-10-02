@@ -61,6 +61,7 @@ export const PANEL_IDS = [
   "mission-status",
   "role-list",
   "machine-status",
+  "machine-list",
   "config-list",
   "flow-status",
   "lab-fixture-list",

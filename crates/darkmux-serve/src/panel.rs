@@ -323,8 +323,19 @@ pub(crate) struct PanelSpec {
     pub(crate) audience: PanelAudience,
     /// The name of this panel's roster-valued opt, if it declares one: its
     /// value is a roster machine name, validated by [`resolve_roster_opt`]
-    /// against the roster and driving `--machine <name>`. See the module doc.
-    pub(crate) roster_opt: Option<&'static str>,
+    /// against the roster and reaching argv as [`RosterOpt::flag`]. See the
+    /// module doc.
+    pub(crate) roster_opt: Option<RosterOpt>,
+}
+
+/// A panel's roster-valued opt: the query name, and how the chosen machine
+/// reaches argv. `profile list` takes it as a flag; `machine status` takes it
+/// as its positional id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RosterOpt {
+    pub(crate) name: &'static str,
+    /// The flag that carries the machine, or `None` for a positional argument.
+    pub(crate) flag: Option<&'static str>,
 }
 
 /// `profile list`'s `--remote` toggle: every peer's profiles this machine may
@@ -340,9 +351,14 @@ const PROFILE_LIST_REMOTE_OPT: PanelOpt = PanelOpt {
 
 const PROFILE_LIST_OPTS: &[PanelOpt] = &[PROFILE_LIST_REMOTE_OPT];
 
-/// The roster-valued opt's name on `profile-list`, and the flag it drives.
+/// The roster-valued opt's query name, shared by every panel that has one.
 const ROSTER_MACHINE_OPT: &str = "machine";
 const ROSTER_MACHINE_FLAG: &str = "--machine";
+
+/// `profile list --machine <name>`.
+const ROSTER_AS_FLAG: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: Some(ROSTER_MACHINE_FLAG) };
+/// `machine status <name>`.
+const ROSTER_AS_POSITIONAL: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: None };
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
 /// variants — a verb with declared opts is still one id here). Test-only
@@ -357,6 +373,7 @@ pub(crate) const PANEL_IDS: &[&str] = &[
     "mission-status",
     "role-list",
     "machine-status",
+    "machine-list",
     "config-list",
     "flow-status",
     "lab-fixture-list",
@@ -387,6 +404,11 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         // Read: resident models and their ownership, the same facts
         // `/machine/status` serves; no fleet listener or allow-list state.
         "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[], Read),
+        // Read: the fleet view's rows, the same facts `GET /fleet/view` serves
+        // (liveness, the card each machine states about itself), worded as the
+        // fleet lens's status line words them. A phone has no tooltips, so this
+        // is the touch path for a machine's status and its reason.
+        "machine-list" => ("machine-list", &["machine", "list"], true, PANEL_CACHE_TTL, &[], Read),
         // LocalOrToken: prints the whole config.json, which holds the
         // listener's port and enablement and the `fleet.accept_work`
         // allow-list (node names, roles, profiles, images).
@@ -427,7 +449,11 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     // for its sibling. A future panel that reads the fleet stream must flip
     // this deliberately too — see `only_these_ids_need_a_fleet_snapshot`.
     let needs_fleet_snapshot = matches!(id, "run-list" | "mission-status");
-    let roster_opt = matches!(id, "profile-list").then_some(ROSTER_MACHINE_OPT);
+    let roster_opt = match id {
+        "profile-list" => Some(ROSTER_AS_FLAG),
+        "machine-status" => Some(ROSTER_AS_POSITIONAL),
+        _ => None,
+    };
     Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience, roster_opt })
 }
 
@@ -541,7 +567,7 @@ fn resolve_roster_opt(
     roster_ids: &[String],
     remote_on: bool,
 ) -> Result<Option<String>, String> {
-    let Some(name) = spec.roster_opt else { return Ok(None) };
+    let Some(RosterOpt { name, .. }) = spec.roster_opt else { return Ok(None) };
     let Some(raw) = requested.remove(name) else { return Ok(None) };
     if raw.is_empty() {
         return Ok(None);
@@ -566,14 +592,16 @@ fn resolve_roster_opt(
 /// folded in. The key keeps [`variant_key`]'s `id?name=value&…` shape, so the
 /// machine is just one more non-default pair.
 fn with_roster_choice(
+    spec: &PanelSpec,
     argv: Vec<&'static str>,
     key: String,
     mut echo: std::collections::BTreeMap<String, String>,
     machine: Option<&str>,
 ) -> (Vec<String>, String, std::collections::BTreeMap<String, String>) {
     let mut argv: Vec<String> = argv.into_iter().map(String::from).collect();
-    let Some(id) = machine else { return (argv, key, echo) };
-    argv.extend([ROSTER_MACHINE_FLAG.to_string(), id.to_string()]);
+    let (Some(id), Some(roster)) = (machine, spec.roster_opt) else { return (argv, key, echo) };
+    argv.extend(roster.flag.map(str::to_string));
+    argv.push(id.to_string());
     let joiner = if key.contains('?') { '&' } else { '?' };
     echo.insert(ROSTER_MACHINE_OPT.to_string(), id.to_string());
     (argv, format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"), echo)
@@ -901,7 +929,7 @@ async fn resolve_selection(
         _ => None,
     };
     let resolved = resolve_opts(spec, &requested).map_err(bad)?;
-    Ok(with_roster_choice(compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
+    Ok(with_roster_choice(spec, compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
 }
 
 pub(crate) async fn panel_handler(
@@ -1137,7 +1165,7 @@ mod tests {
             assert_eq!(spec.id, *id, "a spec must report the id it was looked up by");
             assert!(!spec.argv.is_empty(), "{id} has empty argv");
         }
-        // 8 as of `run-list` (#1911), 9 with `profile-list` (5.0). Bumping this number is the doctrine
+        // 8 as of `run-list` (#1911), 9 with `profile-list`, 10 with `machine-list` (5.0). Bumping this number is the doctrine
         // decision: an entry is legal only if it neither dispatches a model
         // (#1286) nor mutates, so the worst case of a bug here stays a wrong
         // READING. This now counts 8 BASE VERBS, not 8 id/argv combinations
@@ -1148,7 +1176,7 @@ mod tests {
         // stop — an open value space is not an allowlist, and that surface
         // is a lens, not a panel. (`profile-list`'s `machine` is closed: the
         // roster's own names, see the module doc.)
-        assert_eq!(PANEL_IDS.len(), 9, "allowlist growth is a doctrine decision, not a drive-by");
+        assert_eq!(PANEL_IDS.len(), 10, "allowlist growth is a doctrine decision, not a drive-by");
     }
 
     /// (#1914, widened #1711) `run-list` and `mission-status` are the ONLY
@@ -1196,7 +1224,7 @@ mod tests {
         assert!(d.cache_ttl.is_zero(), "an explicit doctor run must be a real run");
         // …and every other panel IS auto-refreshable with a real TTL.
         for id in
-            ["mission-status", "role-list", "machine-status", "config-list", "flow-status", "lab-fixture-list", "run-list"]
+            ["mission-status", "role-list", "machine-status", "machine-list", "config-list", "flow-status", "lab-fixture-list", "run-list"]
         {
             let s = panel_spec(id).unwrap();
             assert!(s.auto_refresh, "{id}");
@@ -1300,9 +1328,10 @@ mod tests {
     /// cross-product, not just the base-verb count layer 3 already guards.
     /// Today: `mission-status` (2) + `run-list` (4×2×2=16, #2902 added the
     /// `usage` toggle) + `profile-list` (2: its `remote` toggle) + six no-opt
-    /// panels (1 each) = 26. `profile-list`'s roster `machine` opt adds one
-    /// variant per roster machine, validated by membership, so it is bounded by
-    /// the roster and is not counted here.
+    /// panels (1 each) = 26, plus `machine-list` (1) = 27. A roster `machine` opt
+    /// (`profile-list`, `machine-status`) adds one variant per roster machine,
+    /// validated by membership, so it is bounded by the roster and is not
+    /// counted here.
     #[test]
     fn variant_cross_product_stays_bounded() {
         let mut total = 0usize;
@@ -1312,7 +1341,7 @@ mod tests {
             total += variants;
         }
         assert!(
-            total <= 26,
+            total <= 27,
             "variant cross-product grew to {total} — bumping the bound is a doctrine \
              decision (#1911), not a drive-by"
         );
@@ -2103,10 +2132,10 @@ mod tests {
         let spec = panel_spec("profile-list").unwrap();
         assert_eq!(spec.argv, &["profile", "list"]);
         assert_eq!(spec.audience, PanelAudience::Read);
-        assert_eq!(spec.roster_opt, Some("machine"));
+        assert_eq!(spec.roster_opt, Some(ROSTER_AS_FLAG));
         assert!(!spec.needs_fleet_snapshot);
-        let others = PANEL_IDS.iter().filter(|id| **id != "profile-list");
-        assert!(others.into_iter().all(|id| panel_spec(id).unwrap().roster_opt.is_none()), "only profile-list takes a machine");
+        let others = PANEL_IDS.iter().filter(|id| !matches!(**id, "profile-list" | "machine-status"));
+        assert!(others.into_iter().all(|id| panel_spec(id).unwrap().roster_opt.is_none()), "only these two panels take a machine");
     }
 
     #[test]
@@ -2117,7 +2146,7 @@ mod tests {
         assert_eq!(machine.as_deref(), Some("studio"), "the roster's spelling, not the client's bytes");
         let resolved = resolve_opts(&spec, &requested).unwrap();
         let (argv, key, echo) =
-            with_roster_choice(compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref());
+            with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref());
         assert_eq!(argv, vec!["profile", "list", "--machine", "studio"]);
         assert_eq!(key, "profile-list?machine=studio");
         assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
@@ -2132,7 +2161,7 @@ mod tests {
             assert_eq!(machine, None);
             let resolved = resolve_opts(&spec, &requested).unwrap();
             let (argv, key, echo) =
-                with_roster_choice(compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), None);
+                with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), None);
             assert_eq!((argv, key.as_str()), (vec!["profile".to_string(), "list".to_string()], "profile-list"));
             assert!(!echo.contains_key("machine"));
         }
@@ -2167,5 +2196,46 @@ mod tests {
         let mut requested = req(&[("machine", "studio")]);
         assert_eq!(resolve_roster_opt(&run, &mut requested, &roster(), false), Ok(None));
         assert!(resolve_opts(&run, &requested).unwrap_err().contains("unknown option \"machine\""));
+    }
+
+    // ── machine-list and machine-status's roster machine (5.0) ────────
+
+    #[test]
+    fn machine_list_is_a_read_panel_over_the_fleet_view() {
+        let spec = panel_spec("machine-list").unwrap();
+        assert_eq!(spec.argv, &["machine", "list"]);
+        assert_eq!(spec.audience, PanelAudience::Read);
+        assert!(spec.opts.is_empty() && spec.roster_opt.is_none());
+        assert!(!spec.needs_fleet_snapshot);
+    }
+
+    /// `machine status` takes the machine as its positional id, not a flag, so
+    /// the argv a roster choice produces has no `--machine`.
+    #[test]
+    fn a_machine_status_roster_machine_is_its_positional_id() {
+        let spec = panel_spec("machine-status").unwrap();
+        assert_eq!(spec.roster_opt, Some(ROSTER_AS_POSITIONAL));
+        let mut requested = req(&[("machine", "STUDIO")]);
+        let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
+        let resolved = resolve_opts(&spec, &requested).unwrap();
+        let (argv, key, echo) = with_roster_choice(
+            &spec,
+            compose_argv(&spec, &resolved),
+            variant_key(spec.id, &resolved),
+            opts_map(&resolved),
+            machine.as_deref(),
+        );
+        assert_eq!(argv, vec!["machine", "status", "studio"]);
+        assert_eq!(key, "machine-status?machine=studio");
+        assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
+        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "nowhere")]), &roster(), false).unwrap_err();
+        assert!(err.contains("legal values: studio, mini"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handler_validates_the_machine_status_machine_against_the_roster() {
+        let (status, body) = panel_get("/panel/machine-status?opt.machine=no-such-machine-in-any-roster", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unknown value") && body.contains("legal values"), "{body}");
     }
 }

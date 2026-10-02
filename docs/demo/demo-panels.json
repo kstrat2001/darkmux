@@ -67,6 +67,23 @@
     "panel": "lab-fixture-list",
     "stderr_tail": ""
   },
+  "machine-list": {
+    "age_ms": 0,
+    "ansi_text": "darkmux machine list\n  roster:           fleet.json\n  local machine_id: MacBook-Pro\n\nMACHINE        LIVE  AI-HEADROOM OS            VERSION      LOADED\nMacBook-Pro    live  -           macos aarch64 5.0.0        darkmux:qwen\n  status: idle\n  utility model: qwen3-4b, resident; job: not shown here\n  profiles: none\n  accepts from this machine: unknown\ndarkbook       none  -           macos aarch64 5.0.0        darkmux:qwen\n  status: online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.\n  utility model: qwen3-4b, resident; job: not shown here\n  profiles: none\n  accepts from this machine: unknown\nmini           none  -           -             -            unreachable: its fleet listener did not answer\n  status: offline: not listening\n  ! 1 machine(s) did not answer on their fleet listener (mini): the listener is off or not reachable from here. A machine is visible to the fleet only while its listener runs: enable `fleet.listener` on each (`darkmux doctor` there says why it is not up).\n",
+    "argv": [
+      "machine",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1790328465930,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 5,
+    "opts": {},
+    "panel": "machine-list",
+    "stderr_tail": ""
+  },
   "machine-status": {
     "age_ms": 0,
     "ansi_text": "\u001b[1;36mloaded models \u2014 darkmux-managed\u001b[0m\n  IDENTIFIER                                    MODEL                              CTX       SIZE\n  darkmux:qwen3.5-122b-a10b                     qwen3.5-122b-a10b                  131072    69.79 GB\n  darkmux:qwen3.6-35b-a3b-turboquant-mlx        qwen3.6-35b-a3b-turboquant-mlx     262144    18.45 GB\n  darkmux:qwen3-coder-next-mlx                  qwen3-coder-next-mlx               131072    32.21 GB\n  darkmux:qwen3-4b-instruct-2507                qwen3-4b-instruct-2507             32768     2.15 GB\n\n\u001b[1;36muser state \u2014 not managed by darkmux\u001b[0m\n  (none)\n\n  pool 256 GB \u00b7 darkmux holds 127.8 GB \u00b7 committed 141.4 GB \u00b7 \u001b[32mGREEN\u001b[0m\n",

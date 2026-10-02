@@ -498,6 +498,9 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         if let Some(words) = m.clock_skew_ms.and_then(darkmux_flow::presence::clock_skew_words) {
             out.push_str(&format!("{}\n", style::warn(&format!("  {}: {words}", row_name(view, m)))));
         }
+        for line in crate::card_status::status_lines(m) {
+            out.push_str(&format!("{}\n", style::dim(&line)));
+        }
         if let CardOutcome::Available { card, .. } = &m.card {
             for line in detail_lines(card, &m.accepts) {
                 out.push_str(&format!("{}\n", style::dim(&line)));
@@ -977,5 +980,21 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("DARKMUX_TEST_FLEET_SECTION_OUT") {
             std::fs::write(path, render_grounding(&two_machine_view())).expect("write section");
         }
+    }
+
+    /// (5.0) A phone has no tooltips: each row's status and its reason print
+    /// under it, with the card's utility model, in the fleet card's words.
+    #[test]
+    fn the_text_view_words_each_machines_status_and_reason_under_its_row() {
+        let raw = include_str!("../tests/fixtures/card-status-rows.json");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
+        let machines: Vec<FleetMachine> = rows.iter().map(|r| serde_json::from_value(r["row"].clone()).unwrap()).collect();
+        let text = render_text(&view(machines), "fleet.json");
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {text}"));
+        assert!(lines[at("  status: offline: not listening") - 1].starts_with("mini"), "{text}");
+        assert!(text.contains("  status: online · not streaming: its flow stream doesn't reach this hub"), "{text}");
+        assert!(text.contains("  utility model: qwen3-4b, resident; job: not shown here"), "{text}");
+        assert!(text.contains("  status: running"), "{text}");
     }
 }

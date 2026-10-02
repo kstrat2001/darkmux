@@ -1,0 +1,53 @@
+=== topbar ===
+darkmux
+⟳
+◌LIVE
+LIVE
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2  · last dispatch 2h ago
+
+=== logscope ===
+console
+
+=== stage ===
+run list
+mission status
+machine status
+machine list
+profile list
+flow status
+role list
+config list
+lab fixture list
+doctor
+MacBook-Pro $ darkmux machine list
+captured 20:54:23
+· 213ms
+re-run
+darkmux machine list
+  roster:           fleet.json
+  local machine_id: MacBook-Pro
+
+MACHINE        LIVE  AI-HEADROOM OS            VERSION      LOADED
+MacBook-Pro    live  -           macos aarch64 5.0.0        darkmux:qwen
+  status: idle
+  utility model: qwen3-4b, resident; job: not shown here
+  profiles: none
+  accepts from this machine: unknown
+darkbook       none  -           macos aarch64 5.0.0        darkmux:qwen
+  status: online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.
+  utility model: qwen3-4b, resident; job: not shown here
+  profiles: none
+  accepts from this machine: unknown
+mini           none  -           -             -            unreachable: its fleet listener did not answer
+  status: offline: not listening
+  ! 1 machine(s) did not answer on their fleet listener (mini): the listener is off or not reachable from here. A machine is visible to the fleet only while its listener runs: enable `fleet.listener` on each (`darkmux doctor` there says why it is not up).
+

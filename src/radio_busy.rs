@@ -104,7 +104,7 @@ pub fn plain_status(status: &str) -> Option<&'static str> {
     WORDS.iter().find(|(raw, _)| raw.eq_ignore_ascii_case(status)).map(|(_, plain)| *plain)
 }
 
-fn is_busy_status(status: &str) -> bool {
+pub(crate) fn is_busy_status(status: &str) -> bool {
     LM_STUDIO_BUSY_STATUSES.iter().any(|busy| busy.eq_ignore_ascii_case(status))
 }
 

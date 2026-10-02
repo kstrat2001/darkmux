@@ -103,6 +103,7 @@ mod radio_answer;
 // the residency-lease registry, checked BEFORE a request is sent.
 mod radio_busy;
 mod radio_index;
+mod card_status;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
@@ -1418,7 +1419,24 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
         }
         return Ok(2);
     }
-    render_residents(&models, None, None, json, Some(id))
+    let code = render_residents(&models, None, None, json, Some(id))?;
+    if !json {
+        println!();
+        println!("{}", peer_utility_line(id));
+    }
+    Ok(code)
+}
+
+/// The utility model line for a peer, from the `/machine/specs` it serves (the
+/// same `utility_model` its card carries). A peer whose specs cannot be read,
+/// or an older one that does not state the field, is "not reported", never
+/// "none bound" and never "resident".
+fn peer_utility_line(id: &str) -> String {
+    let stated = fleet_cli::fetch_peer_json(id, "/machine/specs").ok().and_then(|specs| specs.get("utility_model").cloned());
+    match stated {
+        Some(v) => card_status::utility_line(serde_json::from_value::<darkmux_serve::wire::UtilityModel>(v).ok().as_ref()),
+        None => format!("utility model: not reported by `{id}`; job: not shown here"),
+    }
 }
 
 fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
@@ -1477,7 +1495,12 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
             }
             Err(_) => (None, None),
         };
-    render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None)
+    let code = render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None)?;
+    if !json {
+        println!();
+        println!("{}", card_status::utility_line(darkmux_serve::local_utility_model(&loaded).as_ref()));
+    }
+    Ok(code)
 }
 
 /// Shared renderer for `machine status` (local + remote): residents grouped

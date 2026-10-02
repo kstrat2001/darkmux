@@ -117,6 +117,17 @@ darkmux release.
   phase or step listing, a unit whose output did not parse) under `Unreadable:`,
   and a run with nothing else to say but an unreadable input is `degraded`, not a
   clean no-op.
+- **`machine list` words each machine's status and utility model, and the console
+  reaches it** (5.0). Under each row it prints the status in the fleet card's
+  words (idle, running, online · not streaming, not streaming, offline) with the
+  reason when the word has one ("offline: not listening"), and the card's utility
+  model with whether it is resident (`job: not shown here`, since a utility job is
+  a flow record). `machine status` prints the same utility line, for this machine
+  or a roster peer. The status comes from one Rust derivation (`src/card_status.rs`)
+  pinned to the card's own (`cards.ts`) by a shared fixture both test suites read.
+  The console gains a `machine list` panel (a tenth, so a phone has no tooltip to
+  miss), and its `machine status` panel takes a roster machine (`opt.machine`),
+  the same roster-validated opt `profile list` has.
 
 ### Changed (breaking, 4.0)
 

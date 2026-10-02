@@ -21,6 +21,7 @@ console
 run list
 mission status
 machine status
+machine list
 profile list
 flow status
 role list

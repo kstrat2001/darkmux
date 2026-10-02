@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason, servesLine, servesParts, DISCONNECTED_LAMP, executionCountText } from "./cards";
 import { LampForm } from "../../lib/lamp";
-import type { RowFacts } from "./viewRows";
+import { outcomeLine, rowStanding, type RowFacts } from "./viewRows";
+import { machineAvailability } from "../../lib/machineAvailability";
+import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 import type { ExecutionTokenReading } from "../../lib/tokenRate";
@@ -1308,5 +1313,55 @@ describe("the count line with several executions (W3)", () => {
   });
   it("a single execution is the plain count", () => {
     expect(executionCountText({ runsCount: 1, runsLabel: "running", executions: 1, position: 1 })).toBe("1 running");
+  });
+});
+
+/** The rows `src/card_status.rs` reads too (`tests/fixtures/card-status-rows.json`):
+ * `darkmux machine list` words a machine's status from the view's own row, and
+ * must give the answer this card gives for the same row. */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+describe("the card's status, for the rows the Rust twin also answers", () => {
+  interface SharedCase {
+    name: string;
+    row: FleetMachine;
+    active: boolean;
+    expect: { status: string; reason: string | null };
+  }
+  const cases = JSON.parse(
+    readFileSync(path.join(__dirname, "../../../../tests/fixtures/card-status-rows.json"), "utf8"),
+  ) as SharedCase[];
+  const answered = { flow: true, presence: true, sessions: true, runs: true };
+
+  /** The card's word as the Rust status vocabulary names it. */
+  function statusName(face: ReturnType<typeof cardFace>): string {
+    if (face.absent) return "offline";
+    if (face.stat === "dispatch in flight") return "running";
+    if (face.notStreaming) return face.stat === "online" ? "online_not_streaming" : "not_streaming";
+    return face.stat;
+  }
+
+  it.each(cases.map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    const standing = rowStanding(c.row);
+    // The view-only stand-in for "records reach this viewer": a live beat, or this machine.
+    const seen = c.row.is_this_machine || c.row.liveness === "live";
+    const note = outcomeLine(c.row.card);
+    const card = {
+      absent: standing === "offline",
+      active: c.active,
+      runsCount: 0,
+      standing,
+      availability: machineAvailability({ self: c.row.is_this_machine, seen, standing }),
+      note,
+    };
+    const face = cardFace(card, false, answered);
+    expect(statusName(face)).toBe(c.expect.status);
+    expect(statusReason(card, face) ?? null).toBe(c.expect.reason);
+  });
+
+  it("the shared rows cover every status the console shows", () => {
+    expect(new Set(cases.map((c) => c.expect.status))).toEqual(
+      new Set(["idle", "running", "online_not_streaming", "not_streaming", "offline"]),
+    );
   });
 });

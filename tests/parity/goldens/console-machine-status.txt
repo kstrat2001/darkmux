@@ -21,13 +21,14 @@ console
 run list
 mission status
 machine status
+machine list
 profile list
 flow status
 role list
 config list
 lab fixture list
 doctor
-MacBook-Pro $ darkmux machine status
+MacBook-Pro $ darkmux machine status (this machine) ▾
 captured 20:54:23
 · 144ms
 re-run

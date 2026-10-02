@@ -85,7 +85,7 @@ OUT = ROOT / "docs" / "demo"
 # The daemon's own allowlist (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`).
 # Duplicated deliberately and asserted below: if the allowlist grows, this
 # script should FAIL rather than silently publish a demo missing a tab.
-PANEL_IDS = ["mission-status", "role-list", "machine-status", "config-list",
+PANEL_IDS = ["mission-status", "role-list", "machine-status", "machine-list", "config-list",
              "flow-status", "lab-fixture-list", "run-list", "profile-list", "doctor"]
 
 # The width the console's own default lands near. A fixture is captured at ONE

@@ -186,6 +186,8 @@ function installCorpusRoutes(page, meta) {
       return url.searchParams.get("opt.all") === "all" ? json("panel-mission-status-all.json") : json("panel-mission-status.json");
     }
     if (p === "/panel/machine-status") return json("panel-machine-status.json");
+    // 5.0: `machine-list` is hand-written (no real roster to record), a sanitized three-machine answer.
+    if (p === "/panel/machine-list") return json("panel-machine-list.json");
     if (p === "/panel/flow-status") return json("panel-flow-status.json");
     if (p === "/panel/role-list") return json("panel-role-list.json");
     if (p === "/panel/config-list") return json("panel-config-list.json");

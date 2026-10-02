@@ -43,9 +43,9 @@ describe("PANELS", () => {
   // (#1905 step 3) exactly eight pills — the operator's own rejection of a
   // ten-pill render ("can't allow main to have this") is the reason a
   // ninth/tenth client-only entry can never come back silently.
-  it("is exactly nine pills (profile-list is the ninth), matching panel.rs's own doctrine cap — no client-only entries", () => {
-    expect(PANELS).toHaveLength(9);
-    expect(PANEL_IDS).toHaveLength(9);
+  it("is exactly ten pills (machine-list is the tenth), matching panel.rs's own doctrine cap — no client-only entries", () => {
+    expect(PANELS).toHaveLength(10);
+    expect(PANEL_IDS).toHaveLength(10);
   });
 
   it("(#1905 step 3) DEFAULT_PANEL_ID is run-list, and is itself one of the eight allowlisted panels", () => {
@@ -181,9 +181,9 @@ describe("panelOptGroups", () => {
     ]);
   });
 
-  it("six of nine panels declare no options at all", () => {
+  it("seven of ten panels declare no static options", () => {
     const noOpts = PANEL_IDS.filter((id) => panelOptGroups(id).length === 0);
-    expect(noOpts.sort()).toEqual(["config-list", "doctor", "flow-status", "lab-fixture-list", "machine-status", "role-list"].sort());
+    expect(noOpts.sort()).toEqual(["config-list", "doctor", "flow-status", "lab-fixture-list", "machine-list", "machine-status", "role-list"].sort());
   });
 });
 
@@ -252,13 +252,22 @@ describe("PANEL_OPTS pinned against crates/darkmux-serve/src/panel.rs (#1911)", 
 // know when it parses a hash: parse checks the SHAPE of the value, the server
 // checks membership against its roster and 400s on a stranger.
 describe("profile-list's roster-valued machine opt", () => {
-  it("is the one panel with a roster opt, and the server twin declares it too", () => {
-    expect(PANEL_IDS.filter((id) => rosterOptName(id) !== null)).toEqual(["profile-list"]);
+  it("exactly two panels take a roster machine, and the server twin declares it too", () => {
+    expect(PANEL_IDS.filter((id) => rosterOptName(id) !== null).sort()).toEqual(["machine-status", "profile-list"]);
     expect(rosterOptName("profile-list")).toBe("machine");
     const rustSrc = readFileSync(path.join(__dirname, "../../../../crates/darkmux-serve/src/panel.rs"), "utf8");
     expect(rustSrc).toContain('const ROSTER_MACHINE_OPT: &str = "machine"');
     expect(rustSrc).toContain('const ROSTER_MACHINE_FLAG: &str = "--machine"');
     expect(panelArgv("profile-list")).toEqual(["profile", "list"]);
+  });
+
+  it("machine status takes the machine as its positional id, not a flag", () => {
+    expect(composeArgv("machine-status", { machine: "studio" })).toEqual(["machine", "status", "studio"]);
+    expect(composeArgv("machine-status", {})).toEqual(["machine", "status"]);
+    expect(variantKey("machine-status", { machine: "studio" })).toBe("machine-status?machine=studio");
+    expect(machineOpt("machine-status", ["studio"], undefined).values[1].argv).toEqual(["studio"]);
+    expect(sanitizeOptParams("machine-status", { machine: "studio" })).toEqual({ machine: "studio" });
+    expect(composeArgv("machine-list", { machine: "studio" })).toEqual(["machine", "list"]);
   });
 
   it("a deep link's machine survives sanitizing; a stranger panel's does not", () => {
@@ -287,9 +296,9 @@ describe("profile-list's roster-valued machine opt", () => {
   });
 
   it("the menu offers this machine first, then the roster, and keeps a linked name the roster lacks", () => {
-    expect(machineOpt(["studio", "mini"], undefined).values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "mini"]);
-    expect(machineOpt(["studio"], "ghost").values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "ghost"]);
-    expect(machineOpt(["studio"], "studio").values[0].argv).toEqual([]);
+    expect(machineOpt("profile-list", ["studio", "mini"], undefined).values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "mini"]);
+    expect(machineOpt("profile-list", ["studio"], "ghost").values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "ghost"]);
+    expect(machineOpt("profile-list", ["studio"], "studio").values[0].argv).toEqual([]);
   });
 
   it("picking a machine turns remote off and turning remote on forgets the machine", () => {
