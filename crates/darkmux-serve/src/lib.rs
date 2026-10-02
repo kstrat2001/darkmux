@@ -2402,8 +2402,6 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     }
 }
 
-/// `verify.passed` from a run's manifest. `None` is "not checked": the
-/// manifest has `verify: null` (the workload declares none) or no such block.
 /// The review envelopes archived in a run's `funnels.json`. No writer produces
 /// that file any more (the review path became a mission, #2310); only a lab run
 /// recorded before then carries one. It is read leniently, as an archive:
@@ -2413,10 +2411,6 @@ fn read_archived_reviews(run_dir: &StdPath) -> Vec<darkmux_lab::lab::review::Rev
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
-}
-
-fn manifest_verify_passed(manifest: &serde_json::Value) -> Option<bool> {
-    manifest.get("verify")?.get("passed")?.as_bool()
 }
 
 fn build_lab_run_summary(
@@ -2577,14 +2571,12 @@ fn build_lab_run_summary(
     // authoritative artifact it always did.
     // One read of `manifest.json` fills both fields, so the session a row
     // links to and the outcome it reports come from the same write.
-    let manifest = std::fs::read_to_string(dir.join("manifest.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let manifest = darkmux_lab::lab::manifest::RunManifest::read_lenient(dir);
     let session_id = manifest
         .as_ref()
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
+        .and_then(|m| m.session_id.clone())
         .or_else(|| lifecycle_record.as_ref().and_then(|r| r.session_id.clone()));
-    let run_ok = manifest.as_ref().and_then(|v| v.get("ok")).and_then(|v| v.as_bool());
+    let run_ok = manifest.as_ref().and_then(|m| m.ok);
 
     Some(LabRunSummary {
         dir: rel,
@@ -2629,14 +2621,9 @@ fn build_lab_run_summary(
         has_events,
         session_id,
         run_ok,
-        escalation: manifest
-            .as_ref()
-            .and_then(|v| v.get(darkmux_lab::lab::dispatch_end::MANIFEST_ESCALATION_KEY))
-            .and_then(|e| e.as_str().map(str::to_string)),
-        workload: manifest
-            .as_ref()
-            .and_then(|v| v.get("workload").and_then(|w| w.as_str()).map(str::to_string)),
-        verify_passed: manifest.as_ref().and_then(manifest_verify_passed),
+        escalation: manifest.as_ref().and_then(|m| m.escalation.clone()),
+        workload: manifest.as_ref().and_then(|m| m.workload.clone()),
+        verify_passed: manifest.as_ref().and_then(darkmux_lab::lab::manifest::RunManifest::verify_passed),
     })
 }
 

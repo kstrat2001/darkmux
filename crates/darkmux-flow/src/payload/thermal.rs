@@ -1,7 +1,7 @@
 //! Payloads of a run's thermal and battery governors' own records
 //! (`thermal.*`, `battery.pause_unsupported`).
 
-use super::Attribution;
+use super::{Attribution, RecordContext};
 use serde::{Deserialize, Serialize};
 
 /// A resident model the tier-5 eject unloaded.
@@ -43,10 +43,10 @@ pub struct ThermalStopUnresolvedPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for ThermalStopUnresolvedPayload {
@@ -56,7 +56,7 @@ impl Attribution for ThermalStopUnresolvedPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
     fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
@@ -85,10 +85,10 @@ pub struct ThermalTier5EjectPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for ThermalTier5EjectPayload {
@@ -98,7 +98,7 @@ impl Attribution for ThermalTier5EjectPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
     fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
@@ -133,10 +133,10 @@ pub struct ThermalTier5EjectFailedPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for ThermalTier5EjectFailedPayload {
@@ -146,7 +146,7 @@ impl Attribution for ThermalTier5EjectFailedPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
     fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
@@ -175,10 +175,10 @@ pub struct BatteryPauseUnsupportedPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for BatteryPauseUnsupportedPayload {
@@ -188,7 +188,7 @@ impl Attribution for BatteryPauseUnsupportedPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
     fn host_source_slot(&mut self) -> Option<&mut Option<String>> {

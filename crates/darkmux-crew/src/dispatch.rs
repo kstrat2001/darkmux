@@ -237,10 +237,8 @@ pub struct DispatchOpts {
     /// crawl launcher is the one caller that sets this today (`workspace,
     /// source, sha, rule, unit`, per unit); every other caller passes
     /// `None`, which is a complete no-op — no `context` key appears at
-    /// all. Must be a JSON object when `Some` (a non-object is ignored
-    /// rather than corrupting the payload shape — see
-    /// `dispatch_internal::merge_record_context`'s own doc).
-    pub record_context: Option<serde_json::Value>,
+    /// all.
+    pub record_context: Option<darkmux_flow::payload::RecordContext>,
     /// (#2265, 5.0) The spans a planned unit covers, `[{file, start, end}]`,
     /// for the host tailer to stamp onto the FINDINGS this dispatch records
     /// (the one span holding each finding becomes its `context.site`). Kept

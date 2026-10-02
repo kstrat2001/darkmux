@@ -5,6 +5,7 @@
 
 use darkmux_types::Profile;
 use crate::lab::dispatch_end::{DispatchEnd, Dispatched};
+use crate::lab::manifest::{ManifestVerify, ManifestVerifyReport, RunManifest};
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, VerifyReport, WorkloadProvider,
 };
@@ -82,12 +83,7 @@ impl WorkloadProvider for PromptProvider {
     }
 
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport> {
-        let manifest_path = run_dir.join("manifest.json");
-        let meta = if manifest_path.exists() {
-            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&manifest_path)?)?
-        } else {
-            serde_json::Value::Null
-        };
+        let meta = RunManifest::read_or_default(run_dir)?;
         let reply_path = run_dir.join("qa-reply.json");
         let reply = if reply_path.exists() {
             extract_reply_text(&fs::read_to_string(&reply_path)?)
@@ -96,9 +92,8 @@ impl WorkloadProvider for PromptProvider {
         };
         let verify_outcome = run_verify(loaded, &reply);
         let run_id = meta
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .run_id
+            .clone()
             .or_else(|| {
                 run_dir
                     .file_name()
@@ -109,7 +104,7 @@ impl WorkloadProvider for PromptProvider {
         Ok(InspectionReport {
             run_id,
             workload_id: loaded.manifest.workload.id.clone(),
-            walltime_ms: meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
+            walltime_ms: meta.duration_ms.unwrap_or(0) as u128,
             turns: 1,
             compactions: 0,
             // (#2094) A single-turn provider never rests (nothing to rest
@@ -196,7 +191,7 @@ pub struct ManifestInputs<'a> {
 /// provider records a run, including the dispatch's escalation.
 pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
     let run_id = run_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-    let mut manifest_json = serde_json::json!({
+    let mut manifest = RunManifest {
         // v2 added: run_id, profile (now the profile NAME), profile_description.
         // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
         // v5 added: verify, the same field and version as the coding-task
@@ -204,23 +199,26 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // no verify. `darkmux run list` and `/runs` read `verify.passed`
         // from here to show a failed verify beside a good dispatch.
         // v6 (F2) may carry `escalation`, as in the coding-task manifest.
-        "schema_version": 6,
-        "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
-        "run_id": run_id,
-        "workload": m.workload_id,
-        "provider": PromptProvider.id(),
-        "profile": m.profile_name,
-        "profile_description": m.profile_description,
-        "duration_ms": m.duration_ms,
-        "ok": m.end.ok(),
-        "session_id": m.session_id,
-        "verify": m.verify.map(|v| serde_json::json!({
-            "passed": v.passed,
-            "details": v.details,
-        })),
-    });
-    m.end.record_in(&mut manifest_json);
-    fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest_json)?)?;
+        schema_version: Some(6),
+        manifest_schema_version: Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string()),
+        run_id: Some(run_id),
+        workload: Some(m.workload_id.to_string()),
+        provider: Some(PromptProvider.id().to_string()),
+        profile: Some(m.profile_name.to_string()),
+        profile_description: Some(m.profile_description.to_string()),
+        duration_ms: Some(u64::try_from(m.duration_ms).unwrap_or(u64::MAX)),
+        ok: Some(m.end.ok()),
+        session_id: Some(m.session_id.to_string()),
+        verify: Some(m.verify.map(|v| ManifestVerify::Report(Box::new(ManifestVerifyReport {
+            passed: v.passed,
+            details: v.details.clone(),
+            work_gate: None,
+            extras: Default::default(),
+        })))),
+        ..RunManifest::default()
+    };
+    m.end.record_in(&mut manifest);
+    manifest.write(run_dir)?;
     Ok(())
 }
 

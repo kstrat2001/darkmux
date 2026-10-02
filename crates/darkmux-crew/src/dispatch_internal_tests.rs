@@ -1,4 +1,5 @@
     use super::*;
+    use crate::ctx;
     use darkmux_flow::payload::LmsEvent;
     use serial_test::serial;
     use std::io::Write;
@@ -7997,13 +7998,13 @@
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         )
-        .with_record_context(Some(serde_json::json!({
+        .with_record_context(Some(ctx(serde_json::json!({
             "workspace": "acme",
             "source": "acme-core",
             "sha": "abc123",
             "rule": ["swallowed-error"],
             "unit": "u-0001",
-        })));
+        }))));
         state.handle_event(
             r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{\"file\":\"a.rs\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
         );
@@ -8170,10 +8171,10 @@
         // rule / unit. The mission is NOT in it — on the flow record
         // `mission_id`, `phase_id` and `step_id` are TOP-LEVEL fields, which is
         // why the finding record has to capture them separately.
-        state.record_context = Some(serde_json::json!({
+        state.record_context = Some(ctx(serde_json::json!({
             "unit": "u7", "rule": "unnamed-predicate",
             "source": "acme", "sha": "deadbeef",
-        }));
+        })));
         state.phase_id = Some("crawl-1788402801-crawl".into());
         state.step_id = Some("step-7".into());
 
@@ -8393,10 +8394,10 @@
             "create_finding",
             crate::findings::Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
             crate::findings::Scope::default(),
-            Some(serde_json::json!({
+            Some(ctx(serde_json::json!({
                 "source": "app", "sha": "abc",
                 "site": {"file": "src/a.ts", "start": 3, "end": 9}
-            })),
+            }))),
             serde_json::json!({"file": "src/a.ts", "line": 4}),
         );
         crate::findings::materialize(&findings_store, &frec).unwrap();
@@ -8485,7 +8486,7 @@
             600,
             None,
             None,
-            Some(serde_json::json!({"source": "app", "sha": "abc"})),
+            Some(ctx(serde_json::json!({"source": "app", "sha": "abc"}))),
             None,
             None,
             None,
@@ -8502,7 +8503,10 @@
             }
         }
         restore_env(prev);
-        assert_eq!(finding_ctx["site"], serde_json::json!({"file": "src/a.ts", "start": 2, "end": 9}));
+        assert_eq!(
+            finding_ctx.and_then(|c| c.site),
+            Some(darkmux_flow::payload::ContextSite { file: "src/a.ts".into(), start: 2, end: 9 })
+        );
         assert_eq!(mods.len(), 1, "{mods:?}");
         assert_eq!(mods[0].proposer.as_ref().and_then(|p| p.profile.as_deref()), Some("prof-x"));
         assert_eq!(mods[0].site.as_ref().map(|s| (s.start_line, s.end_line)), Some((2, 9)));
@@ -8967,7 +8971,7 @@
                 phase_id: None,
                 step_id: None,
             },
-            Some(serde_json::json!({"unit": "u7"})),
+            Some(ctx(serde_json::json!({"unit": "u7"}))),
             serde_json::json!({"file": "src/x.ts", "line": 82}),
         );
         crate::findings::materialize(&findings_store, &planted).unwrap();
@@ -9066,10 +9070,6 @@
     /// must get the SAME value, or an over-cap emission is whole-or-clipped
     /// depending on which producer wrote it (`sync` replays the flow record,
     /// so it would store the clipped form while the tailer stored the raw one).
-    ///
-    /// Same class, second case: `merge_record_context` no-ops on a NON-object
-    /// `record_context`, so the flow record gets no `context` at all and
-    /// `sync` stores null. The tailer must make the same judgment.
     #[test]
     #[serial] // reaches emit() + the findings store
     fn the_finding_record_stores_exactly_what_the_flow_record_stores() {
@@ -9091,8 +9091,7 @@
             "darkmux:qwen3.6".into(),
         );
         let execution = state.execution.to_string();
-        // A non-object context: the flow record's merge drops it entirely.
-        state.record_context = Some(serde_json::json!("just a string"));
+        state.record_context = None;
 
         let over_cap = serde_json::json!({"why": "z".repeat(MAX_EMITTED_BYTES + 10)});
         state.handle_event(
@@ -9150,11 +9149,11 @@
         );
         assert!(
             flow["payload"].get("context").is_none(),
-            "a non-object record_context is dropped from the flow record"
+            "a dispatch with no record_context writes no context on the flow record"
         );
         assert!(
             rec["context"].is_null(),
-            "…so the finding record must drop it too, not store it verbatim: {rec}"
+            "…and none on the finding record: {rec}"
         );
     }
 
@@ -13789,7 +13788,7 @@ fn an_envelope_without_a_trajectory_path_is_unchanged() {
 /// A `RuntimeBounds` whose four required knobs carry distinguishable values.
 fn test_bounds() -> darkmux_flow::payload::RuntimeBounds {
     use darkmux_flow::payload::{Knob, KnobSource};
-    let knob = |v: u64| Knob { value: Some(serde_json::json!(v)), source: KnobSource::Config, configured_value: None };
+    let knob = |v: u64| Knob { value: Some(v.into()), source: KnobSource::Config, configured_value: None };
     darkmux_flow::payload::RuntimeBounds {
         max_tokens_per_call: knob(4000),
         inactivity_timeout_seconds: knob(600),
@@ -13922,7 +13921,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
 #[test]
 fn bounds_argument_survives_into_the_envelope() {
     let mut distinctive_bounds = test_bounds();
-    distinctive_bounds.max_tokens_per_call.value = Some(serde_json::json!(4321));
+    distinctive_bounds.max_tokens_per_call.value = Some(4321_u64.into());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         "m",

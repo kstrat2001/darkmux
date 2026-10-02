@@ -67,9 +67,7 @@ pub fn lab_compare(run_a: &str, run_b: &str) -> Result<CompareResult> {
 
 /// (F3) The profile a run's manifest records as requested, when it records one.
 fn run_profile(run: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(resolve_run_path(run).join("manifest.json")).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    meta.get("profile").and_then(|v| v.as_str()).map(str::to_string)
+    crate::lab::manifest::RunManifest::read_lenient(&resolve_run_path(run))?.profile
 }
 
 /// (F3) What differs between the two runs besides the thing under test: a

@@ -134,6 +134,10 @@ pub struct Role {
     /// the model emits one final object and stops. Pairing it with a non-empty
     /// tool palette is unsupported — a grammar lock to a fixed shape structurally
     /// precludes emitting `tool_calls`, so mid-loop tool turns can't happen.
+    ///
+    /// A JSON Schema document, handed to the endpoint as written: free-form by
+    /// contract (#3035), since a schema's own keywords are the schema language's,
+    /// not darkmux's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
     /// Path to the sibling `<role-id>.md` prompt file if present. The loader
@@ -788,7 +792,11 @@ pub struct Step {
     pub status: NodeStatus,
     /// Kind-specific config. `serde_json::Value::Null` (the `Default`) for
     /// step kinds that need none (e.g. `procedural.noop` with no `output`
-    /// override).
+    /// override). Typed per kind by `step_config::kinds` (the unknown-key gate
+    /// checks a document against that struct, and the kind reads it through
+    /// `step_config::load`); it is stored as the document's JSON because a
+    /// `{{param}}` placeholder stands in for any value until a launch
+    /// substitutes it (#3035).
     #[serde(default)]
     pub config: serde_json::Value,
     /// The instant this step's own dispatch actually began — the moment

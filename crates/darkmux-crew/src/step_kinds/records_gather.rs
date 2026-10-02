@@ -1426,7 +1426,7 @@ mod tests {
             "create_finding",
             Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
             Scope { mission_id: Some(MISSION.to_string()), phase_id: None, step_id: None },
-            Some(json!({"rule": "existing-solution", "source": "app"})),
+            Some(crate::ctx(json!({"rule": "existing-solution", "source": "app"}))),
             json!({
                 "file": "a.ts", "line": 1, "pattern": "existing-solution", "evidence": "ev",
                 "why": "This module does not call `foo()` anywhere in this file."

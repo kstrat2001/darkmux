@@ -477,12 +477,9 @@ A script or an orchestrator binds to what a verb prints under `--json`, so from 
 
 **The known free-form fields.** Every `any` in the golden is listed under its `# untyped` heading, and `every_untyped_field_is_explained_in_design_md` fails until each is named here with its reason. A script reading one of them gets JSON whose shape the golden does not pin:
 
-- `Knob.value` (inside `DispatchEnvelope.bounds` and `RunStats.bounds`): a resolved runtime knob's value, which is a number, a boolean or a string by knob, or `null` for an uncapped one.
-- `TelemetryDetectorPayload.context` (inside `DispatchEnvelope.detections`): the provenance a dispatch caller supplied, carried verbatim; darkmux never reads inside it.
-- `FindingRecord.context` and `ForFinding.context`: the dispatch's `record_context` verbatim, or `null`. darkmux never reads inside it; its author owns the shape.
-- `FindingRecord.emitted` and `ForFinding.emitted`: the model's tool-call arguments, verbatim and opaque by design.
-- `InputJson.default`: a mission input's declared default, which may be a string, a number or a bool.
-- `Profile.use_when`: the profile author's free-form routing hint, kept as written.
+- `FindingRecord.emitted` and `ForFinding.emitted`: the model's tool-call arguments, verbatim and opaque by design. A model chooses its own keys, and an emission that is not an object is kept as it came.
+- `InputJson.default`: a mission input's declared default, the same free-form JSON an operator passes for that input with `--input` (a string, a number, a bool, or an object such as a workspace spec).
+- `Profile.use_when`: the profile author's free-form routing hint, kept as written. Nothing in darkmux reads it.
 - `Lenient`, `Lenient2`, `Lenient3`, `Lenient4` (a `ManagedBackend`, `Dialect`, `UsageLimits` and `BudgetPolicy` as read from `profiles.json`): each is `T | any` because an unrecognized value from a newer darkmux or a typo is kept and printed as read rather than failing the registry (an enum value on a registry entry is refused where it is used, contract 9); `doctor` reports it.
 
 ## Schema isolation: darkmux owns its own config

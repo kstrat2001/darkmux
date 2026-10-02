@@ -499,6 +499,8 @@ pub struct Profile {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ProfileRuntime>,
+    /// The profile author's routing hint, kept as written. Free-form by contract
+    /// (#3035), and nothing in darkmux reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_when: Option<serde_json::Value>,
     /// Forward-compat overflow — unknown keys land here and

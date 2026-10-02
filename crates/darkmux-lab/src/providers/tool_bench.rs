@@ -27,6 +27,7 @@
 //! No runtime changes; internal runtime only.
 
 // (#2685) One infra-vs-capability rule, beside the schema it serves.
+use crate::lab::manifest::RunManifest;
 use crate::lab::scores;
 use crate::lab::scores::{envelope_meta_with_exit, is_infra_failure, EnvelopeMeta};
 use crate::workloads::types::{
@@ -1252,24 +1253,22 @@ impl WorkloadProvider for ToolBenchProvider {
         let summary = render_summary(&trial_refs, trials_per_task, &scores_path);
         println!("{summary}");
 
-        let mut manifest_json = serde_json::json!({
-                // v3 (4.0): a trial directory carries no `metrics.json`;
-                // its counts are in its `trajectory.jsonl`.
-                "schema_version": 3,
-                "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
-                "run_id": run_id,
-                "workload": wl.id,
-                "provider": self.id(),
-                "profile": profile_name,
-                "profile_description": profile.description.clone().unwrap_or_default(),
-                "duration_ms": duration_ms,
-                "ok": true,
-            });
-        crate::providers::coding_task::record_refused_artifacts(&mut manifest_json, &refused_artifacts);
-        fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest_json)?,
-        )?;
+        RunManifest {
+            // v3 (4.0): a trial directory carries no `metrics.json`;
+            // its counts are in its `trajectory.jsonl`.
+            schema_version: Some(3),
+            manifest_schema_version: Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string()),
+            run_id: Some(run_id.clone()),
+            workload: Some(wl.id.clone()),
+            provider: Some(self.id().to_string()),
+            profile: Some(profile_name.to_string()),
+            profile_description: Some(profile.description.clone().unwrap_or_default()),
+            duration_ms: Some(u64::try_from(duration_ms).unwrap_or(u64::MAX)),
+            ok: Some(true),
+            refused_artifacts: crate::providers::coding_task::refused_records(&refused_artifacts),
+            ..RunManifest::default()
+        }
+        .write(run_dir)?;
 
         let infra = trial_refs.iter().filter(|t| t.score.infra_fail).count();
         let passes = trial_refs.iter().filter(|t| t.score.passed).count();
@@ -1316,12 +1315,7 @@ impl WorkloadProvider for ToolBenchProvider {
     }
 
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport> {
-        let manifest_path = run_dir.join("manifest.json");
-        let meta = if manifest_path.exists() {
-            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&manifest_path)?)?
-        } else {
-            serde_json::Value::Null
-        };
+        let meta = RunManifest::read_or_default(run_dir)?;
         let mut notes = vec![format!("provider={}", self.id())];
         let scores_path = run_dir.join("scores.json");
         if scores_path.exists() {
@@ -1342,9 +1336,8 @@ impl WorkloadProvider for ToolBenchProvider {
         }
         Ok(InspectionReport {
             run_id: meta
-                .get("run_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
+                .run_id
+                .clone()
                 .or_else(|| {
                     run_dir
                         .file_name()
@@ -1353,7 +1346,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 })
                 .unwrap_or_else(|| "(unknown)".into()),
             workload_id: loaded.manifest.workload.id.clone(),
-            walltime_ms: meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
+            walltime_ms: meta.duration_ms.unwrap_or(0) as u128,
             turns: 0,
             compactions: 0,
             // (#2094) tool_bench scores do not read rests.

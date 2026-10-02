@@ -115,8 +115,8 @@ pub struct FindingRecord {
     /// mission. These are the dispatch's OWN scope and are top-level fields on
     /// the flow record, NOT part of `context`; a crawl's context blob carries
     /// workspace / source / sha / rule / unit and no mission id at all. They
-    /// live here for the same reason: `context` is the launcher's, verbatim,
-    /// and darkmux does not write into it.
+    /// live here for the same reason: `context` is the launcher's provenance,
+    /// and the mission scope is not part of it.
     ///
     /// Additive (a record written before them simply lacks the keys, and
     /// `Option` reads that as `None`), so the schema version does not move.
@@ -126,11 +126,14 @@ pub struct FindingRecord {
     pub phase_id: Option<String>,
     #[serde(default)]
     pub step_id: Option<String>,
-    /// The dispatch's `record_context` verbatim when it had one (a crawl's
-    /// workspace / source / sha / rule / unit), else `null`. darkmux does not
-    /// read inside it, and never adds to it.
-    pub context: serde_json::Value,
-    /// The model's arguments, verbatim. Opaque: never parsed, never validated,
+    /// The dispatch's `record_context` when it had one (a crawl's workspace /
+    /// source / sha / rule / unit), else `null`. Host-stamped provenance; the one
+    /// key added to it here is `site` ([`stamp_site`]).
+    #[serde(default, deserialize_with = "darkmux_flow::payload::lenient")]
+    pub context: Option<darkmux_flow::payload::RecordContext>,
+    /// The model's arguments, verbatim. Free-form JSON by contract (#3035): a
+    /// model chooses its own keys, and an emission that is not an object is
+    /// kept as it came, so it stays a `Value`. Opaque: never parsed, never validated,
     /// never reshaped — with ONE named exception, and only when the launcher
     /// said which source the dispatch ran against: a `file` written in the
     /// CONTAINER's coordinates (`/workspace/<source-id>/…`) is mapped back to
@@ -206,10 +209,10 @@ pub fn strip_source_prefix(source_id: &str, raw: &str) -> String {
 }
 
 /// The source id a launcher's `record_context` named, if any.
-pub fn source_id_of(context: Option<&serde_json::Value>) -> Option<String> {
+pub fn source_id_of(context: Option<&darkmux_flow::payload::RecordContext>) -> Option<String> {
     context?
-        .get("source")
-        .and_then(|v| v.as_str())
+        .source
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -248,7 +251,7 @@ pub fn build_record(
     tool_name: &str,
     proposer: Proposer,
     scope: Scope,
-    context: Option<serde_json::Value>,
+    context: Option<darkmux_flow::payload::RecordContext>,
     emitted: serde_json::Value,
 ) -> FindingRecord {
     let source = source_id_of(context.as_ref());
@@ -266,7 +269,7 @@ pub fn build_record(
         mission_id: scope.mission_id,
         phase_id: scope.phase_id,
         step_id: scope.step_id,
-        context: context.unwrap_or(serde_json::Value::Null),
+        context,
         emitted,
         source,
         schema_version: FINDING_SCHEMA_VERSION.to_string(),
@@ -285,7 +288,7 @@ fn span_around(span: &serde_json::Value, file: &str, line: u64) -> Option<(u64, 
 /// `context` as `site: {file, start, end}`. `sites` is the unit's span list
 /// (`DispatchOpts::finding_sites`); the match is made on the record's own
 /// mapped `file` and `line`. A finding with no file/line, outside every span,
-/// or with a non-object context is left exactly as it was: never guessed.
+/// or with no context is left exactly as it was: never guessed.
 pub fn stamp_site(record: &mut FindingRecord, sites: &serde_json::Value) {
     let (Some(file), Some(line)) = (
         record.emitted.get("file").and_then(|v| v.as_str()),
@@ -298,9 +301,9 @@ pub fn stamp_site(record: &mut FindingRecord, sites: &serde_json::Value) {
     else {
         return;
     };
-    let site = serde_json::json!({"file": file, "start": start, "end": end});
-    if let Some(ctx) = record.context.as_object_mut() {
-        ctx.insert("site".to_string(), site);
+    let site = darkmux_flow::payload::ContextSite { file: file.to_string(), start, end };
+    if let Some(ctx) = record.context.as_mut() {
+        ctx.site = Some(site);
     }
 }
 
@@ -384,9 +387,8 @@ pub fn load_at(root: &Path, execution: &str, seq: u64) -> Result<Option<FindingR
 /// history to ground `finding` or `mod` against (see the model-facing prompt
 /// doctrine in `CLAUDE.md`).
 pub fn brief_block(record: &FindingRecord) -> String {
-    let pretty = |v: &serde_json::Value| {
-        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-    };
+    let pretty = |v: &serde_json::Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+    let context = serde_json::to_value(&record.context).unwrap_or(serde_json::Value::Null);
     format!(
         "<finding key=\"{key}\">\n\
          <darkmux-term name=\"finding\">something an earlier agent observed and \
@@ -407,7 +409,7 @@ pub fn brief_block(record: &FindingRecord) -> String {
          `create_mod` tool and name \"{key}\" in `for`.",
         key = record.key,
         mod_term = crate::mods::MOD_TERM,
-        context = pretty(&record.context),
+        context = pretty(&context),
         emitted = pretty(&record.emitted),
     )
 }
@@ -619,7 +621,7 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
                     phase_id: str_field(&rec, "phase_id"),
                     step_id: payload.step_id.clone().or_else(|| str_field(&rec, "step_id")),
                 },
-                payload.context.clone().map(serde_json::Value::Object),
+                payload.context.clone(),
                 emitted.clone(),
             );
             match materialize(store_root, &record)? {
@@ -713,7 +715,7 @@ mod tests {
             "create_finding",
             Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
             Scope::default(),
-            Some(serde_json::json!({"source": "app", "rule": "unnamed-predicate"})),
+            Some(ctx(serde_json::json!({"source": "app", "rule": "unnamed-predicate"}))),
             serde_json::json!({"file": "/workspace/app/src/auth.ts", "line": 3, "why": "w"}),
         );
         assert_eq!(rec.emitted["file"], "src/auth.ts");
@@ -727,7 +729,7 @@ mod tests {
             "create_finding",
             Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
             Scope::default(),
-            Some(serde_json::json!({"source": "app"})),
+            Some(ctx(serde_json::json!({"source": "app"}))),
             serde_json::json!({"file": "app/src/auth.ts"}),
         );
         assert_eq!(bare.emitted["file"], "src/auth.ts");
@@ -759,7 +761,7 @@ mod tests {
             "create_finding",
             Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
             Scope::default(),
-            Some(serde_json::json!({"source": "lib"})),
+            Some(ctx(serde_json::json!({"source": "lib"}))),
             serde_json::json!({"file": "/workspace/app/src/auth.ts"}),
         );
         assert_eq!(other_source.emitted["file"], "/workspace/app/src/auth.ts");
@@ -777,7 +779,7 @@ mod tests {
             "create_finding",
             Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
             Scope::default(),
-            Some(serde_json::json!({"unit": "u7", "rule": "unnamed-predicate"})),
+            Some(ctx(serde_json::json!({"unit": "u7", "rule": "unnamed-predicate"}))),
             serde_json::json!({"file": "src/x.ts", "line": 82, "why": "three unnamed operands"}),
         );
         let block = brief_block(&rec);
@@ -789,6 +791,8 @@ mod tests {
     }
 
     use super::*;
+    use crate::ctx;
+    use darkmux_flow::payload::ContextSite;
     use tempfile::TempDir;
 
     fn proposer() -> Proposer {
@@ -894,7 +898,7 @@ mod tests {
         let back = load_at(tmp.path(), "sess-a", 7).unwrap().expect("round trips");
         assert_eq!(back.key, "sess-a/7");
         assert_eq!(back.emitted, serde_json::json!({"file": "x.ts"}));
-        assert!(back.context.is_null());
+        assert!(back.context.is_none());
         assert!(back.mission_id.is_none());
         assert_eq!(back.schema_version, FINDING_SCHEMA_VERSION);
 
@@ -1084,7 +1088,7 @@ mod tests {
             "create_finding",
             proposer(),
             Scope::default(),
-            Some(serde_json::json!({"source": "app"})),
+            Some(ctx(serde_json::json!({"source": "app"}))),
             serde_json::json!({"file": file, "line": line}),
         )
     }
@@ -1096,17 +1100,17 @@ mod tests {
         ])
     }
 
-    fn site_of(file: &str, line: u64) -> Option<serde_json::Value> {
+    fn site_of(file: &str, line: u64) -> Option<ContextSite> {
         let mut r = finding_at(file, line);
         stamp_site(&mut r, &spans());
-        r.context.get("site").cloned()
+        r.context.and_then(|c| c.site)
     }
 
     #[test]
     fn a_finding_inside_a_span_gets_that_span_as_its_site() {
         assert_eq!(
             site_of("src/b.ts", 42),
-            Some(serde_json::json!({"file": "src/b.ts", "start": 30, "end": 60}))
+            Some(ContextSite { file: "src/b.ts".into(), start: 30, end: 60 })
         );
     }
 
@@ -1126,14 +1130,61 @@ mod tests {
     }
 
     #[test]
-    fn a_finding_with_no_location_or_no_object_context_is_left_alone() {
+    fn a_finding_with_no_location_or_no_context_is_left_alone() {
         let mut r = finding_at("src/b.ts", 42);
         r.emitted = serde_json::json!({"file": "src/b.ts"});
         stamp_site(&mut r, &spans());
-        assert!(r.context.get("site").is_none(), "no line, no site");
+        assert!(r.context.and_then(|c| c.site).is_none(), "no line, no site");
         let mut r = finding_at("src/b.ts", 42);
-        r.context = serde_json::Value::Null;
+        r.context = None;
         stamp_site(&mut r, &spans());
-        assert!(r.context.is_null(), "a non-object context is not turned into one");
+        assert!(r.context.is_none(), "an absent context is not turned into one");
+    }
+
+    /// (#3035, contract 7) A `finding.json` whose `context` has a wrong-typed key, or is no
+    /// object at all, still loads: the finding is an event, and one odd provenance key must
+    /// not erase it from the store.
+    #[test]
+    fn a_finding_with_a_wrong_typed_context_still_loads() {
+        let tmp = TempDir::new().unwrap();
+        for (seq, context) in [(1, serde_json::json!({"unit": 7, "source": "app"})), (2, serde_json::json!("odd"))] {
+            let mut raw = serde_json::to_value(rec_at("sess-ctx", seq, "2026-09-03T01:00:00Z")).unwrap();
+            raw["context"] = context;
+            let dir = tmp.path().join("sess-ctx").join(seq.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+        }
+        let all = load_all_at(tmp.path()).unwrap();
+        assert_eq!(all.len(), 2, "both findings load");
+        assert_eq!(all[0].context.as_ref().and_then(|c| c.source.as_deref()), Some("app"), "the good key survives");
+        assert!(all[0].context.as_ref().is_some_and(|c| c.unit.is_none()));
+        assert!(all[1].context.is_none());
+    }
+
+    /// Operator-run evidence, not CI: `DARKMUX_ROUNDTRIP_FINDINGS=~/.darkmux/findings cargo nextest
+    /// run -p darkmux-crew --run-ignored only real_findings` reads every stored record and checks
+    /// its `context` writes back the JSON it was read from.
+    #[test]
+    #[ignore = "reads an operator's own findings store: set DARKMUX_ROUNDTRIP_FINDINGS"]
+    fn real_findings_round_trip_through_the_typed_record() {
+        let root = std::env::var("DARKMUX_ROUNDTRIP_FINDINGS").expect("names a findings directory");
+        let (mut n, mut with_context, mut bad) = (0, 0, Vec::new());
+        for exec in std::fs::read_dir(&root).unwrap().flatten() {
+            for seq in std::fs::read_dir(exec.path()).into_iter().flatten().flatten() {
+                let Ok(body) = std::fs::read_to_string(seq.path().join("finding.json")) else { continue };
+                let raw: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let rec: FindingRecord = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{}: {e}", seq.path().display()));
+                n += 1;
+                with_context += usize::from(rec.context.is_some());
+                // Whole-record equality is not the question: an old record has no `execution`
+                // and the loader derives one. The typed field is.
+                if serde_json::to_value(&rec).unwrap()["context"] != raw["context"] {
+                    bad.push(seq.path().display().to_string());
+                }
+            }
+        }
+        println!("findings {n}, with a context {with_context}, mismatches {}", bad.len());
+        assert!(bad.is_empty(), "{bad:#?}");
+        assert!(n > 0);
     }
 }

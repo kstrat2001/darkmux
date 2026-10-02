@@ -215,6 +215,12 @@ pub mod user_files;
 // `Materialized` yet).
 pub mod workspace_spec;
 
+/// A test's record context, from its JSON.
+#[cfg(test)]
+pub(crate) fn ctx(v: serde_json::Value) -> darkmux_flow::payload::RecordContext {
+    serde_json::from_value(v).expect("a literal record context parses")
+}
+
 /// A test's session: an ad-hoc dispatch `nonce` in a standalone test run.
 #[cfg(test)]
 pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {

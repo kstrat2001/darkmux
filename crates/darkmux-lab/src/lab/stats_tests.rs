@@ -602,7 +602,7 @@ fn a_knob_this_build_does_not_declare_survives_into_the_stats() {
     .unwrap();
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
     let future = s.bounds.get("tomorrows_knob").expect("the unknown knob is kept");
-    assert_eq!(future.value, Some(serde_json::json!(7)));
+    assert_eq!(future.value, Some(7_u64.into()));
     assert_eq!(future.source, darkmux_flow::payload::KnobSource::Config);
     assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("enforce"), "the policy still reads through the typed knob");
 }
@@ -1053,7 +1053,7 @@ fn with_policy_bound(value: &str) -> FlowFacts {
     f.bounds.insert(
         "detection_degeneracy_policy".into(),
         darkmux_flow::payload::Knob {
-            value: Some(serde_json::json!(value)),
+            value: Some(value.into()),
             source: darkmux_flow::payload::KnobSource::Env,
             configured_value: None,
         },

@@ -44,6 +44,7 @@ use crate::step_config::{load, non_blank, ConfigKind, ConfigRules, DeliverGithub
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
+use darkmux_flow::payload::RuleRef;
 use darkmux_types::session_id::SessionScope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -833,16 +834,11 @@ impl RuleGroup {
 /// resolve the same rule id this module already uses, rather than a
 /// second copy of the same lookup drifting from this one.
 pub(crate) fn rule_id_of(finding: &FindingRecord) -> Option<String> {
-    if let Some(id) = finding.context.get("rule").and_then(|v| v.as_str()) {
-        return Some(id.to_string());
+    let ctx = finding.context.as_ref()?;
+    if let Some(RuleRef::One(id)) = &ctx.rule {
+        return Some(id.clone());
     }
-    finding
-        .context
-        .get("rules")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    ctx.rules.as_ref()?.first().cloned()
 }
 
 /// The rules these findings name that `rule_titles` could not title —
@@ -1821,7 +1817,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
-            context,
+            context: Some(crate::ctx(context)),
             emitted: json!({ "file": file, "line": line, "pattern": "test", "evidence": evidence, "why": why }),
             source: None,
             schema_version: crate::findings::FINDING_SCHEMA_VERSION.to_string(),
@@ -2376,7 +2372,7 @@ mod tests {
             mission_id: None,
             phase_id: None,
             step_id: None,
-            context: json!({ "rule": rule, "confirm": "question" }),
+            context: Some(crate::ctx(json!({ "rule": rule, "confirm": "question" }))),
             emitted: json!({ "pattern": "test", "evidence": "n/a", "why": why }),
             source: None,
             schema_version: crate::findings::FINDING_SCHEMA_VERSION.to_string(),

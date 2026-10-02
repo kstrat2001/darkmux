@@ -29,6 +29,7 @@
 //! one grep.
 
 mod audit;
+mod context;
 mod dispatch;
 mod hook;
 mod lifecycle;
@@ -38,12 +39,13 @@ mod thermal;
 mod usage;
 
 pub use audit::AuditWriteFailedPayload;
+pub use context::{lenient, ContextSite, RecordContext, RuleRef};
 pub use hook::{HookDeliveryPayload, HookDryRunPayload, HookFailedPayload, HookNoticePayload};
 pub use dispatch::{
     BoundRef, BriefRef, BriefRefKind, CheckpointVerdict, DispatchCheckpointPayload, DispatchCompactionPayload,
     DispatchDegeneracyWarningPayload, DispatchEndPayload, DispatchFeedbackPayload, DispatchHeartbeatPayload,
     DispatchReasoningPayload, DispatchRestPayload, DispatchRoutePayload, DispatchStartPayload, DispatchToolPayload,
-    DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource,
+    DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource, KnobValue,
     LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
 };
 pub use lifecycle::{
@@ -125,7 +127,7 @@ impl Serialize for UnreadPayload {
 
 /// The attribution a crew-built record lays over its payload, beyond the
 /// fields the payload's own type names: the graph step a step session names
-/// (`step_id`), the caller's provenance (`context`, a JSON object), and, on a
+/// (`step_id`), the caller's provenance (`context`, a [`RecordContext`]), and, on a
 /// record whose existence or content is a host reading, the scripted source
 /// behind it (`simulated_host_source`). A type carries the field or leaves the
 /// slot `None`, so a payload without it is never attributed.
@@ -139,7 +141,7 @@ pub trait Attribution {
         None
     }
     /// The payload's `context`, when its type has one.
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         None
     }
     /// The payload's `simulated_host_source`, when its type has one.
@@ -192,7 +194,7 @@ macro_rules! flow_payloads {
 
             /// Set the caller's provenance object, when the payload's type
             /// carries one.
-            pub fn attribute_context(&mut self, context: &serde_json::Map<String, Value>) {
+            pub fn attribute_context(&mut self, context: &RecordContext) {
                 match self {
                     $( Payload::$variant(p) => {
                         if let Some(slot) = Attribution::context_slot(p) {

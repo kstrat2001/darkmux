@@ -5,7 +5,6 @@ use crate::workloads::load::load;
 use crate::workloads::registry::with_provider;
 use crate::workloads::types::InspectionReport;
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,10 +35,7 @@ pub fn run_trajectory(run_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
 
 /// The sandbox a run's `manifest.json` names, if any.
 fn legacy_sandbox(run_dir: &Path) -> Option<PathBuf> {
-    fs::read_to_string(run_dir.join("manifest.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|m| m.get("sandbox").and_then(Value::as_str).map(PathBuf::from))
+    crate::lab::manifest::RunManifest::read_lenient(run_dir)?.sandbox.map(PathBuf::from)
 }
 
 pub fn resolve_run_path(run_path: &str) -> PathBuf {
@@ -94,13 +90,15 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         return Err(anyhow::anyhow!("{}: {why}", manifest_path.display()));
     }
     checked_run_trajectory(&run_dir)?;
-    let workload_id = meta
-        .get("workload")
-        .and_then(|v| v.as_str())
+    let manifest: crate::lab::manifest::RunManifest = serde_json::from_value(meta)
+        .with_context(|| format!("reading {} as a run manifest", manifest_path.display()))?;
+    let workload_id = manifest
+        .workload
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("manifest missing 'workload' field"))?;
-    let provider_id = meta
-        .get("provider")
-        .and_then(|v| v.as_str())
+    let provider_id = manifest
+        .provider
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("manifest missing 'provider' field"))?;
 
     // The workload document resolves at the darkmux root, like `lab_run` and

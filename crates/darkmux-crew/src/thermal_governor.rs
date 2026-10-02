@@ -224,7 +224,7 @@ fn write_pace_file_with_delay(host_out: &Path, reason: &'static str, state: &str
 /// dispatch that happens to set `record_context` for its own reasons never
 /// gets a spurious `STOP` file written under it.
 pub fn stop_file_path_from_record_context(
-    record_context: Option<&serde_json::Value>,
+    record_context: Option<&darkmux_flow::payload::RecordContext>,
 ) -> Option<PathBuf> {
     Some(crawl_root_from_record_context(record_context)?.join("STOP"))
 }
@@ -239,7 +239,7 @@ pub fn stop_file_path_from_record_context(
 /// reconstructable from `record_context` alone) for the identical reason:
 /// this function has no signal to tell "default root" from "override."
 pub fn ladder_state_file_path_from_record_context(
-    record_context: Option<&serde_json::Value>,
+    record_context: Option<&darkmux_flow::payload::RecordContext>,
 ) -> Option<PathBuf> {
     Some(crawl_root_from_record_context(record_context)?.join("thermal-ladder.json"))
 }
@@ -250,12 +250,10 @@ pub fn ladder_state_file_path_from_record_context(
 /// filename onto. See [`stop_file_path_from_record_context`]'s own doc for
 /// the full reasoning (the "must not depend on the crawl module" boundary,
 /// the `root:`-override gap, and the manifest-name validation).
-fn crawl_root_from_record_context(record_context: Option<&serde_json::Value>) -> Option<PathBuf> {
-    let ctx = record_context?.as_object()?;
-    if !ctx.contains_key("unit") {
-        return None;
-    }
-    let manifest_name = ctx.get("workspace")?.as_str()?;
+fn crawl_root_from_record_context(record_context: Option<&darkmux_flow::payload::RecordContext>) -> Option<PathBuf> {
+    let ctx = record_context?;
+    ctx.unit.as_ref()?;
+    let manifest_name = ctx.workspace.as_deref()?;
     if !valid_crawl_manifest_name(manifest_name) {
         return None;
     }
@@ -365,12 +363,10 @@ fn valid_crawl_manifest_name(name: &str) -> bool {
 /// function — that gap has no signal in `record_context` to detect at
 /// all, so it can't be distinguished from "derivation succeeded" here
 /// either. Only the two MECHANICALLY DECIDABLE cases above are covered.
-pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -> Option<&'static str> {
-    let ctx = record_context?.as_object()?;
-    if !ctx.contains_key("unit") {
-        return None;
-    }
-    match ctx.get("workspace").and_then(|v| v.as_str()) {
+pub fn stop_file_unresolved_reason(record_context: Option<&darkmux_flow::payload::RecordContext>) -> Option<&'static str> {
+    let ctx = record_context?;
+    ctx.unit.as_ref()?;
+    match ctx.workspace.as_deref() {
         Some(name) if valid_crawl_manifest_name(name) => None,
         Some(name) if name.trim().is_empty() => Some("record_context.workspace is present but empty"),
         // (#2157) A non-empty value that still fails validation — an
@@ -382,7 +378,7 @@ pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -
             "record_context.workspace is not a valid manifest name (must be a single path \
              segment: alphanumeric, `.`, `_`, `-` only — no `/`, no `..`)",
         ),
-        None => Some("record_context.workspace is missing or not a string"),
+        None => Some("record_context.workspace is missing"),
     }
 }
 
@@ -2969,14 +2965,14 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn stop_file_path_derives_from_crawl_record_context() {
-        let ctx = serde_json::json!({
+        let ctx = crate::ctx(serde_json::json!({
             "workspace": "my-manifest",
             "source": "github",
             "sha": "abc123",
             "rule": "some-rule",
             "rules": ["some-rule"],
             "unit": "unit-1",
-        });
+        }));
         let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
         assert!(path.ends_with("crawl/my-manifest/STOP"), "{}", path.display());
     }
@@ -2986,7 +2982,7 @@ mod tests {
         // A record_context that isn't crawl-shaped (no `unit`) must not
         // synthesize a STOP path — avoids a spurious write under an
         // unrelated dispatch's context.
-        let ctx = serde_json::json!({ "workspace": "my-manifest" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "my-manifest" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
@@ -3002,13 +2998,13 @@ mod tests {
         // `PathBuf::join` REPLACES the accumulated path outright when the
         // joined component is absolute — unvalidated, this would return
         // `/etc/passwd/STOP`, discarding `<root>/crawl/` entirely.
-        let ctx = serde_json::json!({ "workspace": "/etc/passwd", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "/etc/passwd", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
     #[test]
     fn stop_file_path_none_for_dotdot_traversal() {
-        let ctx = serde_json::json!({ "workspace": "../../../../etc/passwd", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "../../../../etc/passwd", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
@@ -3016,25 +3012,25 @@ mod tests {
     fn stop_file_path_none_for_nested_dotdot_that_only_escapes_after_joining() {
         // A name that looks locally harmless component-by-component but
         // still escapes `<root>/crawl/` once joined and walked.
-        let ctx = serde_json::json!({ "workspace": "a/../../b", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "a/../../b", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
     #[test]
     fn stop_file_path_none_for_bare_separator() {
-        let ctx = serde_json::json!({ "workspace": "/", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "/", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
     #[test]
     fn stop_file_path_none_for_trailing_separator() {
-        let ctx = serde_json::json!({ "workspace": "my-manifest/", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "my-manifest/", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
     #[test]
     fn stop_file_path_none_for_embedded_empty_component() {
-        let ctx = serde_json::json!({ "workspace": "a//b", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "a//b", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
     }
 
@@ -3044,14 +3040,14 @@ mod tests {
         // The direction most likely to be broken by an over-eager fix: a
         // realistic manifest name (digits, dot, underscore, hyphen) must
         // still produce the expected path.
-        let ctx = serde_json::json!({ "workspace": "crawl_v2.1-final", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "crawl_v2.1-final", "unit": "unit-1" }));
         let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
         assert!(path.ends_with("crawl/crawl_v2.1-final/STOP"), "{}", path.display());
     }
 
     #[test]
     fn stop_file_unresolved_reason_some_when_workspace_is_traversal() {
-        let ctx = serde_json::json!({ "workspace": "../escape", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "../escape", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None, "sibling still returns None");
         assert!(
             stop_file_unresolved_reason(Some(&ctx)).is_some(),
@@ -3125,7 +3121,7 @@ mod tests {
         ];
 
         for name in corpus {
-            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let ctx = crate::ctx(serde_json::json!({ "workspace": name, "unit": "u1" }));
             let Some(path) = stop_file_path_from_record_context(Some(&ctx)) else {
                 continue; // rejected outright — the desired outcome
             };
@@ -3172,7 +3168,7 @@ mod tests {
             let want_lead = c.is_ascii_alphanumeric();
             let want_tail = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
 
-            let lead = serde_json::json!({ "workspace": format!("{c}x"), "unit": "u1" });
+            let lead = crate::ctx(serde_json::json!({ "workspace": format!("{c}x"), "unit": "u1" }));
             assert_eq!(
                 stop_file_path_from_record_context(Some(&lead)).is_some(),
                 want_lead,
@@ -3180,7 +3176,7 @@ mod tests {
                 c as u32
             );
 
-            let tail = serde_json::json!({ "workspace": format!("x{c}"), "unit": "u1" });
+            let tail = crate::ctx(serde_json::json!({ "workspace": format!("x{c}"), "unit": "u1" }));
             assert_eq!(
                 stop_file_path_from_record_context(Some(&tail)).is_some(),
                 want_tail,
@@ -3197,7 +3193,7 @@ mod tests {
     #[test]
     fn ordinary_names_still_resolve() {
         for name in ["a", "1", "acme", "crawl_v2.1-final", "a..b", "a.", "UPPER-case_9"] {
-            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let ctx = crate::ctx(serde_json::json!({ "workspace": name, "unit": "u1" }));
             let path = stop_file_path_from_record_context(Some(&ctx))
                 .unwrap_or_else(|| panic!("legitimate name rejected: {name:?}"));
             assert!(path.ends_with(format!("crawl/{name}/STOP")), "{}", path.display());
@@ -3212,7 +3208,7 @@ mod tests {
     #[test]
     fn very_long_name_is_contained_even_though_accepted() {
         let name = "a".repeat(4096);
-        let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": name, "unit": "u1" }));
         let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root;
         let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
         assert!(path.starts_with(root.join("crawl")));
@@ -3230,7 +3226,7 @@ mod tests {
             "\u{FF0F}x", "1",
         ];
         for name in names {
-            let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
+            let ctx = crate::ctx(serde_json::json!({ "workspace": name, "unit": "u1" }));
             let path = stop_file_path_from_record_context(Some(&ctx));
             let reason = stop_file_unresolved_reason(Some(&ctx));
             assert_eq!(
@@ -3247,7 +3243,7 @@ mod tests {
     fn stop_file_unresolved_reason_none_for_non_crawl_dispatch() {
         // Not crawl-shaped at all — nothing to warn about, and this must
         // agree with stop_file_path_from_record_context's own None here.
-        let ctx = serde_json::json!({ "workspace": "my-manifest" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "my-manifest" }));
         assert_eq!(stop_file_unresolved_reason(Some(&ctx)), None);
         assert_eq!(stop_file_unresolved_reason(None), None);
     }
@@ -3255,7 +3251,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn stop_file_unresolved_reason_none_when_derivation_succeeds() {
-        let ctx = serde_json::json!({ "workspace": "my-manifest", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "my-manifest", "unit": "unit-1" }));
         assert!(stop_file_path_from_record_context(Some(&ctx)).is_some());
         assert_eq!(
             stop_file_unresolved_reason(Some(&ctx)),
@@ -3266,7 +3262,7 @@ mod tests {
 
     #[test]
     fn stop_file_unresolved_reason_some_when_crawl_shaped_but_workspace_missing() {
-        let ctx = serde_json::json!({ "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None, "sibling still returns None");
         assert!(
             stop_file_unresolved_reason(Some(&ctx)).is_some(),
@@ -3277,7 +3273,7 @@ mod tests {
 
     #[test]
     fn stop_file_unresolved_reason_some_when_workspace_empty() {
-        let ctx = serde_json::json!({ "workspace": "   ", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "   ", "unit": "unit-1" }));
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
         assert!(stop_file_unresolved_reason(Some(&ctx)).is_some());
     }
@@ -4721,7 +4717,7 @@ mod tests {
 
     #[test]
     fn ladder_state_file_path_derivation_mirrors_the_stop_file_derivation() {
-        let ctx = serde_json::json!({ "workspace": "my-crawl", "unit": "unit-1" });
+        let ctx = crate::ctx(serde_json::json!({ "workspace": "my-crawl", "unit": "unit-1" }));
         let stop = stop_file_path_from_record_context(Some(&ctx)).unwrap();
         let ladder = ladder_state_file_path_from_record_context(Some(&ctx)).unwrap();
         assert_eq!(stop.parent(), ladder.parent(), "same crawl root, different filename");
@@ -4729,7 +4725,7 @@ mod tests {
 
         // Non-crawl dispatches derive neither.
         assert_eq!(ladder_state_file_path_from_record_context(None), None);
-        let non_crawl = serde_json::json!({ "workspace": "my-crawl" }); // no "unit"
+        let non_crawl = crate::ctx(serde_json::json!({ "workspace": "my-crawl" })); // no "unit"
         assert_eq!(ladder_state_file_path_from_record_context(Some(&non_crawl)), None);
     }
 

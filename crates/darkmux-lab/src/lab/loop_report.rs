@@ -32,7 +32,6 @@ use crate::lab::dispatch_end::DispatchEnd;
 use anyhow::Result;
 use darkmux_trajectory::DetectorCounts;
 use serde::Serialize;
-use std::fs;
 use std::path::Path;
 
 /// Per-run-overridable compaction knobs (the loop-variation axis the trait
@@ -248,7 +247,7 @@ pub fn analyze_run(
     let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
     let (detectors, tool_calls) = (fold.detectors, fold.tool_calls());
     let (turns, compactions) = (fold.turns(), fold.compactions());
-    let sandbox_changed = read_sandbox_changed(&run_dir.join("manifest.json"));
+    let sandbox_changed = read_sandbox_changed(run_dir);
 
     // An escalation exits non-zero but is not a failure: it gets its own
     // verdict before the exit-code-shaped `classify` could call it `Failed`.
@@ -355,15 +354,9 @@ fn build_notes(
 /// the lab's manifest enrichment) to decide whether the sandbox changed.
 /// `None` when either hash is absent (e.g. a self-contained workload with no
 /// baseline, or a run whose final hash failed to compute).
-fn read_sandbox_changed(manifest: &Path) -> Option<bool> {
-    let raw = fs::read_to_string(manifest).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let final_hash = v.get("final_hash").and_then(|h| h.as_str())?;
-    let baseline_hash = v
-        .get("fixture")
-        .and_then(|f| f.get("baseline_hash"))
-        .and_then(|h| h.as_str())?;
-    Some(final_hash != baseline_hash)
+fn read_sandbox_changed(run_dir: &Path) -> Option<bool> {
+    let manifest = crate::lab::manifest::RunManifest::read_lenient(run_dir)?;
+    Some(manifest.final_hash_value()? != manifest.baseline_hash()?)
 }
 
 /// Render a human-readable report to stdout.
@@ -425,6 +418,7 @@ pub fn print_report(report: &LoopReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::TempDir;
 

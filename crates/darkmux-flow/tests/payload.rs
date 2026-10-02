@@ -214,3 +214,141 @@ fn a_dispatch_terminal_always_carries_its_turn_count() {
     let archived: DispatchEndPayload = serde_json::from_str(r#"{"wall_ms": 5}"#).unwrap();
     assert_eq!(archived.total_turns, None);
 }
+
+/// (#3035) The typed `context` and knob values read every shape the archive
+/// holds and write back the JSON they were read from: a `rule` that is a list,
+/// a context key this build does not name, a knob that is a number, a bool, a
+/// string or `null`.
+#[test]
+fn a_record_context_and_a_knob_value_reserialize_to_the_json_they_were_read_from() {
+    let path = format!("{}/tests/fixtures/archive_shapes.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let corpus = std::fs::read_to_string(&path).unwrap();
+    let mut checked = 0;
+    for line in corpus.lines().filter(|l| l.contains("\"archive_shape\": \"roundtrip:")) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let record = darkmux_flow::reader::parse_record(line).expect("a flow record");
+        let payload = record.payload.expect("a payload");
+        assert!(!matches!(payload, Payload::Unread(_)), "{}: read as unread", v["archive_shape"]);
+        // The two fields this change typed; the rest of a payload is pinned elsewhere (a field
+        // a payload type does not name, like `runtime`, is not written back).
+        let back = serde_json::to_value(&payload).unwrap();
+        for field in ["context", "bounds"] {
+            assert_eq!(back.get(field), v["payload"].get(field), "{}: {field}", v["archive_shape"]);
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "the three round-trip shapes are in the corpus");
+}
+
+/// A typed context names what the launcher writes, so an old spelling of one
+/// of its keys must not cost the whole record its type.
+#[test]
+fn a_context_with_a_rule_list_reads_as_a_list_and_keeps_an_unknown_key() {
+    use darkmux_flow::payload::{RecordContext, RuleRef};
+    let ctx: RecordContext =
+        serde_json::from_str(r#"{"workspace":"w","rule":["a","b"],"unit":"u","later":true}"#).unwrap();
+    assert_eq!(ctx.rule, Some(RuleRef::Many(vec!["a".into(), "b".into()])));
+    assert_eq!(ctx.extras.get("later"), Some(&serde_json::json!(true)));
+    assert_eq!(ctx.rules, None);
+}
+
+/// Operator-run evidence, not CI: `DARKMUX_ROUNDTRIP_FLOWS=~/.darkmux/flows cargo nextest run -p
+/// darkmux-flow --run-ignored only real_archive` reads every record of a real archive and checks
+/// that each typed `context` and `bounds` writes back the JSON it was read from.
+#[test]
+#[ignore = "reads an operator's own archive: set DARKMUX_ROUNDTRIP_FLOWS"]
+fn real_archive_context_and_bounds_round_trip() {
+    let dir = std::env::var("DARKMUX_ROUNDTRIP_FLOWS").expect("DARKMUX_ROUNDTRIP_FLOWS names a flows directory");
+    let (mut records, mut typed_fields, mut bad, mut lost_to_typing) = (0usize, 0usize, Vec::new(), Vec::new());
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        for line in text.lines() {
+            let Some(raw) = darkmux_flow::reader::parse_value(line) else { continue };
+            let Some(record) = darkmux_flow::reader::parse_record(line) else { continue };
+            let (Some(payload), Some(raw_payload)) = (record.payload, raw.get("payload")) else { continue };
+            if matches!(payload, Payload::Unread(_)) {
+                // Unread is only acceptable when `context` and `bounds` are not why: strip them,
+                // re-read, and a record that becomes readable was lost to a field this change typed.
+                let mut stripped = raw.clone();
+                if let Some(p) = stripped.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    p.remove("context");
+                    p.remove("bounds");
+                }
+                let readable = darkmux_flow::reader::parse_record(&stripped.to_string())
+                    .and_then(|r| r.payload)
+                    .is_some_and(|p| !matches!(p, Payload::Unread(_)));
+                if readable {
+                    lost_to_typing.push(raw["action"].to_string());
+                }
+                continue;
+            }
+            records += 1;
+            let back = serde_json::to_value(&payload).unwrap();
+            for field in ["context", "bounds"] {
+                let Some(was) = raw_payload.get(field).filter(|v| !v.is_null()) else { continue };
+                // A payload type that does not name the field (a machine-telemetry record
+                // stamped with a context) never carried it: that is not this field's concern.
+                let host_sample = raw["action"].as_str().is_some_and(|a| a.starts_with("machine"));
+                if host_sample && field == "context" {
+                    continue;
+                }
+                typed_fields += 1;
+                if back.get(field) != Some(was) {
+                    bad.push(format!("{} {field}: {was} != {:?}", raw["action"], back.get(field)));
+                }
+            }
+        }
+    }
+    println!(
+        "records {records}, typed context/bounds fields {typed_fields}, mismatches {}, lost to typing {}",
+        bad.len(),
+        lost_to_typing.len()
+    );
+    assert!(lost_to_typing.is_empty(), "records unread because of `context`/`bounds`: {:?}", &lost_to_typing[..lost_to_typing.len().min(5)]);
+    assert!(bad.is_empty(), "{:#?}", &bad[..bad.len().min(5)]);
+    assert!(typed_fields > 0);
+}
+
+/// (#3035, contract 7) Leniency is per FIELD: a wrong-typed `context` key, a wrong-typed
+/// `context`, or a knob value no darkmux wrote costs that field, never the record's type.
+#[test]
+fn a_wrong_typed_context_or_knob_costs_that_field_not_the_payload() {
+    use darkmux_flow::payload::RecordContext;
+    let read = |action: &str, payload: serde_json::Value| {
+        let line = serde_json::json!({"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch",
+            "action": action, "handle": "h", "payload": payload})
+        .to_string();
+        darkmux_flow::reader::parse_record(&line).expect("a record").payload.expect("a payload")
+    };
+    for context in [
+        serde_json::json!({"unit": 7, "source": "app"}),
+        serde_json::json!({"site": {"file": "a.ts", "line": 3}, "source": "app"}),
+        serde_json::json!({"rule": 5, "source": "app"}),
+        serde_json::json!("not an object"),
+    ] {
+        match read("dispatch.complete", serde_json::json!({"result_class": "stop", "wall_ms": 5, "context": context})) {
+            Payload::DispatchComplete(p) => {
+                assert_eq!(p.wall_ms, Some(5), "{context}");
+                let ctx = p.context.unwrap_or_default();
+                assert!(ctx.unit.is_none() && ctx.site.is_none() && ctx.rule.is_none(), "{context}");
+                assert_eq!(ctx.source.is_some(), context.get("source").is_some(), "the good keys survive: {context}");
+            }
+            other => panic!("a typed dispatch.complete, got {other:?} for {context}"),
+        }
+    }
+    let ctx: RecordContext = serde_json::from_value(serde_json::json!({"unit": 7, "model": "m"})).unwrap();
+    assert_eq!((ctx.unit, ctx.model.as_deref()), (None, Some("m")));
+    let start = read("dispatch.start", serde_json::json!({"prompt_chars": 4,
+        "bounds": {"max_tokens_per_call": {"value": null, "source": "built-in"},
+            "inactivity_timeout_seconds": {"value": 600, "source": "config"},
+            "max_turns": {"value": [1], "source": "config"}, "max_tokens": {"value": 9, "source": "env"}}}));
+    match start {
+        Payload::DispatchStart(p) => {
+            assert_eq!(p.prompt_chars, Some(4));
+            let b = p.bounds.expect("bounds");
+            assert_eq!(b.max_turns.value, None);
+            assert_eq!(b.max_tokens.value, Some(9_u64.into()));
+        }
+        other => panic!("a typed dispatch.start, got {other:?}"),
+    }
+}

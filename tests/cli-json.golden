@@ -188,6 +188,10 @@ ConfigShow
   registry: RegistryJson
   residency: ResidencyBlockJson
   warnings: string[]
+ContextSite
+  file: string
+  start: uint64
+  end: uint64
 Correction
   ts: string
   execution_id: string | null
@@ -347,7 +351,7 @@ FindingRecord
   mission_id: string | null
   phase_id: string | null
   step_id: string | null
-  context: any
+  context: RecordContext | null
   emitted: any
   source?: string | null
   schema_version: string
@@ -397,7 +401,7 @@ FlowStatus
 ForFinding
   key: string
   mission_id?: string | null
-  context?: any
+  context?: RecordContext | null
   emitted?: any
   missing?: boolean
 GateOutcome
@@ -505,10 +509,11 @@ IntegrityReport
   note?: string | null
   writer_schema_version?: string | null
 Knob
-  value: any
+  value: KnobValue | null
   source: KnobSource
   configured_value?: Knob | null
 KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote"
+KnobValue = boolean | number | string
 LedgerMessage
   severity: Severity
   text: string
@@ -831,6 +836,18 @@ Range
   median: double
   min: double
   max: double
+RecordContext
+  workspace?: string | null
+  source?: string | null
+  sha?: string | null
+  rule?: RuleRef | null
+  rules?: string[] | null
+  confirm?: string | null
+  unit?: string | null
+  model?: string | null
+  locality?: string | null
+  profile?: string | null
+  site?: ContextSite | null
 RecordsEmitted
   by_action: { [key: string]: uint64 }
   total_records: uint64
@@ -898,6 +915,7 @@ RosterMachineEntry
   added_unix_ms: uint64
   machine_uid?: string | null
   loopback_intended?: boolean | null
+RuleRef = string | string[]
 Run
   id: string
   kind: RunKind
@@ -1145,7 +1163,7 @@ TelemetryDetectorPayload
   area?: DetectorArea | null
   bound?: BoundRef | null
   step_id?: string | null
-  context?: { [key: string]: any } | null
+  context?: RecordContext | null
 ThermalNow
   state: string
   cpu_speed_limit_pct: uint64
@@ -1214,15 +1232,11 @@ VerdictShift = "improved" | "regressed" | "no-change"
 VersionSource = "peer" | "presence" | "unknown"
 
 # untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md
-FindingRecord.context
 FindingRecord.emitted
-ForFinding.context
 ForFinding.emitted
 InputJson.default
-Knob.value
 Lenient
 Lenient2
 Lenient3
 Lenient4
 Profile.use_when
-TelemetryDetectorPayload.context

@@ -8,9 +8,6 @@
 
 use darkmux_trajectory::TerminalResult;
 
-/// The run-manifest key carrying the runtime's `escalation_*` reason.
-pub const MANIFEST_ESCALATION_KEY: &str = "escalation";
-
 /// The three ways a dispatch the lab ran can end.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DispatchEnd {
@@ -48,17 +45,17 @@ impl DispatchEnd {
     /// runtime's reason, written ONLY when the dispatch escalated, so a
     /// manifest without the key never escalated. The one writer of the key;
     /// `serve`'s lab summary is its one reader.
-    pub(crate) fn record_in(&self, manifest: &mut serde_json::Value) {
-        if let (Some(reason), Some(obj)) = (self.escalation(), manifest.as_object_mut()) {
-            obj.insert(MANIFEST_ESCALATION_KEY.to_string(), serde_json::Value::String(reason.to_string()));
+    pub(crate) fn record_in(&self, manifest: &mut crate::lab::manifest::RunManifest) {
+        if let Some(reason) = self.escalation() {
+            manifest.escalation = Some(reason.to_string());
         }
     }
 
     /// The `run inspect` note for a manifest that recorded an escalation, read
     /// back through the key [`Self::record_in`] writes. `None` for a run that
     /// never escalated.
-    pub(crate) fn inspect_note(manifest: &serde_json::Value) -> Option<String> {
-        let reason = manifest.get(MANIFEST_ESCALATION_KEY)?.as_str()?;
+    pub(crate) fn inspect_note(manifest: &crate::lab::manifest::RunManifest) -> Option<String> {
+        let reason = manifest.escalation.as_deref()?;
         Some(format!("outcome=escalated ({reason})"))
     }
 
@@ -96,6 +93,7 @@ impl Dispatched {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lab::manifest::RunManifest;
 
     const ESCALATED: &str = r#"{"result":"escalation_compaction_reread_loop","final_assistant":"x"}"#;
 
@@ -109,17 +107,18 @@ mod tests {
 
     #[test]
     fn the_manifest_carries_the_escalation_only_when_there_was_one() {
-        let mut m = serde_json::json!({"ok": false});
+        let mut m = RunManifest::default();
         DispatchEnd::from_dispatch(1, ESCALATED).record_in(&mut m);
-        assert_eq!(m[MANIFEST_ESCALATION_KEY], "escalation_compaction_reread_loop");
-        let mut plain = serde_json::json!({"ok": false});
+        assert_eq!(m.escalation.as_deref(), Some("escalation_compaction_reread_loop"));
+        let mut plain = RunManifest::default();
         DispatchEnd::Failed.record_in(&mut plain);
-        assert!(plain.get(MANIFEST_ESCALATION_KEY).is_none());
+        assert_eq!(plain.escalation, None);
+        assert!(serde_json::to_value(&plain).unwrap().get("escalation").is_none(), "absent on the wire, never null");
     }
 
     #[test]
     fn inspect_names_a_recorded_escalation_and_is_silent_otherwise() {
-        let mut m = serde_json::json!({"ok": false});
+        let mut m = RunManifest::default();
         assert_eq!(DispatchEnd::inspect_note(&m), None);
         DispatchEnd::from_dispatch(1, ESCALATED).record_in(&mut m);
         assert_eq!(

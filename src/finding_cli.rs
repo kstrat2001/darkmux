@@ -48,7 +48,7 @@ pub fn list(
         // rule / unit and no mission at all). Reading it from `context` was
         // #2288's live-proof gap: every filter matched except this one.
         .filter(|r| mission.is_none_or(|m| r.mission_id.as_deref() == Some(m)))
-        .filter(|r| rule.is_none_or(|x| context_str(r, "rule").as_deref() == Some(x)))
+        .filter(|r| rule.is_none_or(|x| context_rule(r).as_deref() == Some(x)))
         .collect();
 
     if json {
@@ -82,10 +82,11 @@ pub fn list(
         if let Some(m) = r.mission_id.as_deref() {
             context_bits.push(format!("mission={m}"));
         }
-        for field in ["unit", "rule"] {
-            if let Some(v) = context_str(r, field) {
-                context_bits.push(format!("{field}={v}"));
-            }
+        if let Some(v) = r.context.as_ref().and_then(|c| c.unit.as_deref()) {
+            context_bits.push(format!("unit={v}"));
+        }
+        if let Some(v) = context_rule(r) {
+            context_bits.push(format!("rule={v}"));
         }
         let context = if context_bits.is_empty() {
             String::new()
@@ -152,10 +153,9 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
             .map(|m| format!(" on {m}"))
             .unwrap_or_default()
     );
-    if rec.context.is_null() {
-        println!("context   (none)");
-    } else {
-        println!("context   {}", serde_json::to_string(&rec.context)?);
+    match &rec.context {
+        None => println!("context   (none)"),
+        Some(context) => println!("context   {}", serde_json::to_string(context)?),
     }
     // The emission is the model's own argument object. Pretty-printed when it
     // is JSON so it is readable; raw otherwise. Never interpreted.
@@ -216,11 +216,14 @@ they exist in the stream but cannot become records)",
     Ok(0)
 }
 
-/// A record's `context.<field>` as a string, when the launcher supplied one.
-/// Provenance only — the `emitted` blob is never read, and the mission scope
-/// is NOT here (it is the record's own field; see the `--mission` filter).
-fn context_str(rec: &FindingRecord, field: &str) -> Option<String> {
-    rec.context.get(field).and_then(|v| v.as_str()).map(String::from)
+/// A record's `context.rule`, when the launcher named exactly one. Provenance
+/// only — the `emitted` blob is never read, and the mission scope is NOT here
+/// (it is the record's own field; see the `--mission` filter).
+fn context_rule(rec: &FindingRecord) -> Option<String> {
+    match rec.context.as_ref()?.rule.as_ref()? {
+        darkmux_flow::payload::RuleRef::One(id) => Some(id.clone()),
+        darkmux_flow::payload::RuleRef::Many(_) => None,
+    }
 }
 
 /// A one-line, TRUNCATED preview of the raw emission as compact JSON. Not an

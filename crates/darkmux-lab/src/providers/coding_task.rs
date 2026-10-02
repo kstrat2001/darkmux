@@ -6,6 +6,7 @@
 //! Inspect: parse trajectory, identify compactions, classify mode.
 
 use crate::lab::dispatch_end::{DispatchEnd, Dispatched};
+use crate::lab::manifest::{ManifestVerify, ManifestVerifyReport, RefusedArtifactRecord, RunManifest};
 use crate::providers::prompt::{extract_reply_text, run_verify, verify_note};
 use darkmux_types::Profile;
 use crate::workloads::types::{
@@ -428,19 +429,14 @@ impl WorkloadProvider for CodingTaskProvider {
     }
 
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport> {
-        let manifest_path = run_dir.join("manifest.json");
-        let meta = if manifest_path.exists() {
-            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&manifest_path)?)?
-        } else {
-            serde_json::Value::Null
-        };
+        let meta = RunManifest::read_or_default(run_dir)?;
         // Every count is the fold of the run's trajectory: the one reading
         // `run stats` and the live tailer use too.
         let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
         let turns = fold.turns();
         let compactions = fold.compactions();
         let rest_ms = fold.rest_ms();
-        let walltime_ms = meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+        let walltime_ms = meta.duration_ms.unwrap_or(0) as u128;
         // Classify on MODEL time, not raw wall clock. Fast/Slow is a claim
         // about the MODEL's speed; a rested run's wall clock includes real
         // idle time (GPU thermal/power relief between turns, #2094) that
@@ -479,9 +475,8 @@ impl WorkloadProvider for CodingTaskProvider {
         notes.extend(DispatchEnd::inspect_note(&meta));
 
         let run_id = meta
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .run_id
+            .clone()
             .or_else(|| {
                 run_dir
                     .file_name()
@@ -491,15 +486,9 @@ impl WorkloadProvider for CodingTaskProvider {
             .unwrap_or_else(|| "(unknown)".to_string());
         // (#2494) Read the verify outcome back from the manifest. Absent
         // on a pre-v4 manifest, or when the workload declared no verify.
-        let verify = meta.get("verify").and_then(|v| {
-            Some(crate::workloads::types::VerifyReport {
-                passed: v.get("passed")?.as_bool()?,
-                details: v
-                    .get("details")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            })
+        let verify = meta.verify_report().map(|v| crate::workloads::types::VerifyReport {
+            passed: v.passed,
+            details: v.details.clone(),
         });
 
         Ok(InspectionReport {
@@ -1213,7 +1202,7 @@ pub struct ManifestInputs<'a> {
 /// provider records a run, including the dispatch's escalation.
 pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
     let run_id = run_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-    let mut manifest_json = serde_json::json!({
+    let mut manifest = RunManifest {
         // v2 added: run_id, profile (now the profile NAME), profile_description.
         // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
         // v4 (#489 Phase 2) is minted by `enrich_manifest_with_fixture_info`,
@@ -1238,20 +1227,22 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // `metrics.json`; every count is in `trajectory.jsonl`, read
         // through `lab::inspect::run_trajectory`. The enrichers only ever
         // RAISE the version, so a v7 run stays v7.
-        "schema_version": 8,
-        "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
-        "run_id": run_id,
-        "workload": m.workload_id,
-        "provider": CodingTaskProvider.id(),
-        "profile": m.profile_name,
-        "profile_description": m.profile_description,
-        "duration_ms": m.duration_ms,
-        "ok": m.end.ok(),
-        "verify": m.verify.map(|v| serde_json::json!({
-            "passed": v.passed,
-            "details": v.details,
-        })),
-        "session_id": m.session_id,
+        schema_version: Some(8),
+        manifest_schema_version: Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string()),
+        run_id: Some(run_id),
+        workload: Some(m.workload_id.to_string()),
+        provider: Some(CodingTaskProvider.id().to_string()),
+        profile: Some(m.profile_name.to_string()),
+        profile_description: Some(m.profile_description.to_string()),
+        duration_ms: Some(u64::try_from(m.duration_ms).unwrap_or(u64::MAX)),
+        ok: Some(m.end.ok()),
+        verify: Some(m.verify.map(|v| ManifestVerify::Report(Box::new(ManifestVerifyReport {
+            passed: v.passed,
+            details: v.details.clone(),
+            work_gate: None,
+            extras: Default::default(),
+        })))),
+        session_id: Some(m.session_id.to_string()),
         // Always store the sandbox path as absolute in the
         // manifest. Prior to #359 (QA finding), this stored a
         // relative path when sandbox_dir was under cwd — making
@@ -1266,34 +1257,24 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // records *a* path rather than aborting. Degraded provenance in
         // that rare case is acceptable; the absolute-path goal above holds
         // for the normal case.
-        "sandbox": m.sandbox_dir.canonicalize().unwrap_or_else(|_| m.sandbox_dir.to_path_buf()).display().to_string(),
-        "final_hash": m.final_hash,
-    });
-    m.end.record_in(&mut manifest_json);
-    record_refused_artifacts(&mut manifest_json, m.refused_artifacts);
-    fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest_json)?)?;
+        sandbox: Some(m.sandbox_dir.canonicalize().unwrap_or_else(|_| m.sandbox_dir.to_path_buf()).display().to_string()),
+        final_hash: Some(m.final_hash.map(str::to_string)),
+        ..RunManifest::default()
+    };
+    m.end.record_in(&mut manifest);
+    manifest.refused_artifacts = refused_records(m.refused_artifacts);
+    manifest.write(run_dir)?;
     Ok(())
 }
 
-/// (#2869) Write `refused` into a run manifest as `refused_artifacts`.
-/// Additive and present only when something was refused, so a clean run's
-/// manifest is unchanged; the run still finalizes, and this is where the
-/// gap is written down.
-pub(crate) fn record_refused_artifacts(manifest: &mut serde_json::Value, refused: &[RefusedArtifact]) {
+/// (#2869) `refused` as a run manifest's `refused_artifacts`. Additive and
+/// present only when something was refused, so a clean run's manifest is
+/// unchanged; the run still finalizes, and this is where the gap is written down.
+pub(crate) fn refused_records(refused: &[RefusedArtifact]) -> Option<Vec<RefusedArtifactRecord>> {
     if refused.is_empty() {
-        return;
+        return None;
     }
-    if let Some(obj) = manifest.as_object_mut() {
-        obj.insert(
-            "refused_artifacts".to_string(),
-            serde_json::Value::Array(
-                refused
-                    .iter()
-                    .map(|r| serde_json::json!({ "file": r.file, "reason": r.reason }))
-                    .collect(),
-            ),
-        );
-    }
+    Some(refused.iter().map(|r| RefusedArtifactRecord { file: r.file.clone(), reason: r.reason.clone() }).collect())
 }
 
 /// What [`preserve_runtime_artifacts`] did: the names it copied, and the
@@ -1823,16 +1804,17 @@ mod tests {
     }
 
     #[test]
-    fn record_refused_artifacts_writes_the_refusal_into_the_manifest() {
-        let mut m = serde_json::json!({ "schema_version": 5 });
-        record_refused_artifacts(&mut m, &[]);
-        assert!(m.get("refused_artifacts").is_none(), "a clean run's manifest is unchanged");
-        record_refused_artifacts(
-            &mut m,
-            &[RefusedArtifact { file: "findings.jsonl".into(), reason: "`findings.jsonl` is a symlink (not followed)".into() }],
-        );
-        assert_eq!(m["refused_artifacts"][0]["file"], "findings.jsonl");
-        assert!(m["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+    fn refused_records_writes_the_refusal_into_the_manifest() {
+        let mut m = RunManifest { schema_version: Some(5), ..RunManifest::default() };
+        m.refused_artifacts = refused_records(&[]);
+        assert!(serde_json::to_value(&m).unwrap().get("refused_artifacts").is_none(), "a clean run's manifest is unchanged");
+        m.refused_artifacts = refused_records(&[RefusedArtifact {
+            file: "findings.jsonl".into(),
+            reason: "`findings.jsonl` is a symlink (not followed)".into(),
+        }]);
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["refused_artifacts"][0]["file"], "findings.jsonl");
+        assert!(v["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
     }
 
     #[test]
