@@ -1,5 +1,6 @@
 import { scopeCenter } from "../../lib/scopeCenter";
 import { WorkStatus } from "../../components/WorkStatus";
+import { relayedFromText } from "../../lib/relayWords";
 import { Shimmer } from "../../components/Placeholder";
 import { LampDot } from "../../components/LampDot";
 import { LampForm } from "../../lib/lamp";
@@ -482,9 +483,9 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
-/** (#3017) ", asked on <machine>" for relayed work, else nothing. */
-function askedOnSuffix(relay: RunRelay | null): string {
-  return relay ? `, asked on ${relay.asked_on_machine}` : "";
+/** (#3017) ", from <machine>" for relayed work, else nothing. */
+function relayedSuffix(relay: RunRelay | null): string {
+  return relay ? `, ${relayedFromText(relay)}` : "";
 }
 
 /** The pill's tooltip: what the liveness pulse says, except for a run whose
@@ -872,7 +873,7 @@ export function SessionReplay({
         {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName}
-          {askedOnSuffix(relay)})
+          {relayedSuffix(relay)})
         </span>
       </h2>
 

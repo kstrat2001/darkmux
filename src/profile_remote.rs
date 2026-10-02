@@ -19,7 +19,7 @@ use darkmux_types::style;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::machine_list::{card_unreadable_reason, row_name};
+use crate::machine_list::card_unreadable_reason;
 
 /// Which peers a `profile list` call asks about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,18 +113,16 @@ fn peer_entry(row: &FleetMachine, machine: &str) -> PeerProfiles {
 /// error naming the machines there are.
 pub(crate) fn resolve(view: &FleetView, target: Target<'_>) -> Result<Resolved> {
     let peers = |rows: Vec<&FleetMachine>| {
-        Resolved::Peers(PeerProfileList { peers: rows.into_iter().map(|m| peer_entry(m, &row_name(view, m))).collect() })
+        Resolved::Peers(PeerProfileList { peers: rows.into_iter().map(|m| peer_entry(m, &view.row_name(m))).collect() })
     };
     match target {
         Target::EveryPeer => Ok(peers(view.machines.iter().filter(|m| !m.is_this_machine).collect())),
         Target::Machine(name) => {
-            let found = view.machines.iter().find(|m| row_name(view, m).eq_ignore_ascii_case(name));
-            match found {
+            match view.find_row(name) {
                 Some(m) if m.is_this_machine => Ok(Resolved::Local),
                 Some(m) => Ok(peers(vec![m])),
                 None => {
-                    let known: Vec<String> = view.machines.iter().map(|m| row_name(view, m)).collect();
-                    bail!("no machine named `{name}` in the roster (known: {})", known.join(", "))
+                    bail!("no machine named `{name}` in the roster (known: {})", view.selector_names().join(", "))
                 }
             }
         }

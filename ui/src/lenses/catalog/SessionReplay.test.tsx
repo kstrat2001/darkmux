@@ -97,7 +97,7 @@ describe("SessionReplay", () => {
       vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
     );
     renderReplay(sid);
-    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, asked on MacBook-Pro/));
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, from MacBook-Pro/));
   });
 
   it("(#3017) reads the relay origin from the runs board's cached answer, without fetching /runs again", async () => {
@@ -115,7 +115,7 @@ describe("SessionReplay", () => {
         <SessionReplay sessionId={sid} viewerUid={null} />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/asked on MacBook-Pro/));
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/from MacBook-Pro/));
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/runs"))).toHaveLength(0);
   });
 

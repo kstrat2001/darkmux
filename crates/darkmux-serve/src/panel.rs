@@ -59,11 +59,13 @@
 //! `profile-list` also declares [`PanelSpec::roster_opt`]: `opt.machine=<name>`
 //! drives `--machine <name>`. This is the single exception to "no client string
 //! reaches argv", and it is still a closed set: the legal values are the names
-//! in THIS machine's own roster (`darkmux_fleet::load_roster`), and the value
-//! is accepted only by exact (case-insensitive) membership. The argv gets the
-//! roster's own spelling of the id, never the client's bytes, so the client
+//! the fleet view lists (`FleetView::selector_names`: every roster id and this
+//! machine's own name, the set the CLI's `--machine` accepts), and the value is
+//! accepted only by exact (case-insensitive) membership. The argv gets the
+//! view's own spelling of the name, never the client's bytes, so the client
 //! chooses among server-owned strings exactly as it does for every static opt.
-//! A name not in the roster is a 400 naming the roster, like any unknown value.
+//! A name the view does not list is a 400 naming the legal names, like any
+//! unknown value.
 //!
 //! There is no `mission-status-all`: the unlimited board is `mission-status`
 //! with `opt.all=all`, and a request for the old id is an unknown panel (404).
@@ -607,12 +609,6 @@ fn with_roster_choice(
     (argv, format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"), echo)
 }
 
-/// The roster's machine ids, from this machine's own roster. An unreadable
-/// roster has no legal machines: the opt then 400s with an empty roster.
-fn roster_machine_ids() -> Vec<String> {
-    darkmux_fleet::load_roster().map(|r| r.machines.keys().cloned().collect()).unwrap_or_default()
-}
-
 /// The `cols` param, lenient on read (#1911) — see the call site's comment
 /// for why this direction differs from `opt.*`'s fail-closed one. Split
 /// out so the leniency is pinnable by `cols_is_lenient_on_read` without
@@ -912,9 +908,10 @@ fn admit_panel_request(
 
 /// The request's opt selections resolved into what runs: the argv, the cache
 /// key and the `opts` echo. The roster-valued opt is taken out first, so
-/// [`resolve_opts`] sees static opts only. The roster read is blocking disk,
-/// and only a panel that declares such an opt and was sent a value pays it.
+/// [`resolve_opts`] sees static opts only. Only a panel that declares such an
+/// opt and was sent a value reads the daemon's cached fleet view.
 async fn resolve_selection(
+    state: &AppState,
     spec: &PanelSpec,
     params: &HashMap<String, String>,
 ) -> Result<(Vec<String>, String, std::collections::BTreeMap<String, String>), (StatusCode, String)> {
@@ -922,7 +919,9 @@ async fn resolve_selection(
     let mut requested = extract_opt_params(params);
     let machine = match (spec.roster_opt, requested.contains_key(ROSTER_MACHINE_OPT)) {
         (Some(_), true) => {
-            let roster = tokio::task::spawn_blocking(roster_machine_ids).await.unwrap_or_default();
+            // The same names the CLI's `--machine` accepts: every roster id and
+            // this machine's own (`FleetView::selector_names`).
+            let roster = crate::fleet_view::cached_view(state).await.map_err(|(code, msg)| (code, msg.to_string()))?.selector_names();
             let remote_on = requested.get("remote").is_some_and(|v| v == "on");
             resolve_roster_opt(spec, &mut requested, &roster, remote_on).map_err(bad)?
         }
@@ -946,7 +945,7 @@ pub(crate) async fn panel_handler(
 
     // `opt.<name>` query params. An unknown name or value is a 400, never
     // silently ignored.
-    let (final_argv, key, opts_echo) = resolve_selection(&spec, &params).await?;
+    let (final_argv, key, opts_echo) = resolve_selection(&state, &spec, &params).await?;
 
     // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
     // `u16`) resolves to the default width rather than failing the whole
@@ -2176,6 +2175,19 @@ mod tests {
         }
         let empty = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &[], false).unwrap_err();
         assert!(empty.contains("the roster is empty"), "{empty}");
+    }
+
+    /// 5.0: the panel accepts this machine's own name for `profile list
+    /// --machine <self>`, as the CLI does, though the roster does not list it.
+    #[test]
+    fn this_machines_own_name_is_a_legal_machine_though_the_roster_does_not_list_it() {
+        use crate::fleet_view::{gather_view, tests as fv, FLEET_VIEW_CACHE_TTL};
+        let spec = panel_spec("profile-list").unwrap();
+        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![fv::entry("studio")]);
+        let names = gather_view(&s, FLEET_VIEW_CACHE_TTL).selector_names();
+        let machine = resolve_roster_opt(&spec, &mut req(&[("machine", "LAPTOP")]), &names, false).unwrap();
+        assert_eq!(machine.as_deref(), Some("laptop"), "the roster's own spelling of this machine");
+        assert!(resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &names, false).is_ok());
     }
 
     #[test]
