@@ -1349,12 +1349,35 @@ pub(crate) fn mark_execution_completed(out_dirs: &[&Path]) {
     }
 }
 
+/// A clean exit completes the execution: `host_out`, and the origin it
+/// resumed, are marked so a later resume of either is refused
+/// ([`claim_resume_origin`]). Any other exit leaves them resumable.
+fn complete_execution_on_success(exit_code: i32, host_out: &Path, resume_from: Option<&Path>) {
+    if exit_code == 0 {
+        let origins: Vec<&Path> = std::iter::once(host_out).chain(resume_from).collect();
+        mark_execution_completed(&origins);
+    }
+}
+
 fn resume_origin_completed(out_dir: &Path) -> bool {
     read_resume_origin(out_dir)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|origin| origin.get("completed").and_then(|v| v.as_bool()))
         .unwrap_or(false)
+}
+
+/// What a resume settles before any image, model or workspace work: the image
+/// it runs on ([`resume_effective_image`], refusing a different `--image`) and
+/// the origin's execution lock ([`claim_resume_origin`]). A dispatch that is
+/// not a resume keeps its own `--image` and takes no origin lock.
+fn resume_preflight(resume_from: Option<&Path>, image: Option<&str>) -> Result<(Option<String>, ExecutionLock)> {
+    let Some(resume_from) = resume_from else {
+        return Ok((image.map(str::to_string), ExecutionLock { _guards: Vec::new() }));
+    };
+    let image = resume_effective_image(resume_from, image).context("darkmux dispatch --resume-from")?;
+    let lock = claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?;
+    Ok((image, lock))
 }
 
 /// (#2774 review F2) Build tier 4's `resume_hint` — the command an
@@ -4479,6 +4502,42 @@ impl DispatchStop {
     }
 }
 
+/// The terminal record's payload and level for a container dispatch: a clean
+/// exit is a `dispatch.complete` at info, any other a `dispatch.error`.
+fn terminal_payload(exit_code: i32, payload: DispatchEndPayload) -> (darkmux_flow::Payload, darkmux_flow::Level) {
+    if exit_code == 0 {
+        (darkmux_flow::Payload::DispatchComplete(payload), darkmux_flow::Level::Info)
+    } else {
+        (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error)
+    }
+}
+
+/// Whether a container dispatch that did not exit cleanly was ended by a
+/// signal or by a stop scoped to it. Gated on a failed exit: both signals are
+/// sticky, so one that arrived at any point must not turn a genuinely clean
+/// exit-0 result into a discarded "interrupted" error (#2131 NEW-4).
+fn run_was_killed(local_stop: &DispatchStop, exited_cleanly: bool) -> bool {
+    !exited_cleanly && (darkmux_types::interrupt::is_set() || local_stop.is_requested())
+}
+
+/// The error for a container dispatch ended mid-run: by a signal (the
+/// launcher reads [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the
+/// whole run was interrupted"), or by a stop scoped to this dispatch, which is
+/// reported as itself, because a phase stop is not a run-wide interrupt.
+fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyhow::Error {
+    match (darkmux_types::interrupt::is_set(), local_stop.reason()) {
+        (false, Some(reason)) => anyhow!(
+            "darkmux-runtime container dispatch was stopped ({reason}) \
+             : the container `{container_name}` was killed mid-run"
+        ),
+        _ => anyhow!(
+            "darkmux-runtime container dispatch {} \
+             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
+            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
+        ),
+    }
+}
+
 /// (#889, #2131) The teardown both early exits of `dispatch()` share (the
 /// failed wait and the interrupted or stopped run): tell the watchdog the
 /// wait is over, kill the container by name, stop and join the watchdog and
@@ -5534,20 +5593,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // operator's environment and can compile/test in-sandbox. The default path
     // runs a darkmux image directly (binary baked in, no injection).
     //
-    // A resume runs on the image its origin recorded ([`resume_effective_image`]),
-    // and is refused here, before any image work, when `--image` names another.
-    let image_arg: Option<String> = match opts.resume_from.as_deref() {
-        Some(resume_from) => resume_effective_image(resume_from, opts.image.as_deref())
-            .context("darkmux dispatch --resume-from")?,
-        None => opts.image.clone(),
-    };
-    //
-    // And it is the only live execution of that origin ([`claim_resume_origin`]);
-    // the lock is held, with this dispatch's own, until the function returns.
-    let mut execution_lock = match opts.resume_from.as_deref() {
-        Some(resume_from) => claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?,
-        None => ExecutionLock { _guards: Vec::new() },
-    };
+    // A resume runs on the image its origin recorded and is the only live
+    // execution of that origin; see [`resume_preflight`]. The lock is held,
+    // with this dispatch's own, until the function returns.
+    let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
     let inject = image_arg
         .as_deref()
         .is_some_and(|img| !is_darkmux_runtime_image(img));
@@ -6814,8 +6863,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // parsing below instead, and let the LAUNCHER decide what a
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
-    let stop_reason = local_stop.reason();
-    if (darkmux_types::interrupt::is_set() || stop_reason.is_some()) && !output.status.success() {
+    if run_was_killed(&local_stop, output.status.success()) {
         teardown_container_threads(
             &container_name,
             &watchdog_done,
@@ -6837,17 +6885,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (5.0) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
-        return Err(match (darkmux_types::interrupt::is_set(), stop_reason) {
-            (false, Some(reason)) => anyhow!(
-                "darkmux-runtime container dispatch was stopped ({reason}) \
-                : the container `{container_name}` was killed mid-run"
-            ),
-            _ => anyhow!(
-                "darkmux-runtime container dispatch {} \
-                 (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
-                darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
-            ),
-        });
+        return Err(killed_mid_run_error(&container_name, &local_stop));
     }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
@@ -6970,11 +7008,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         opts.resume_from.as_deref(),
         thermal_ladder_summary,
     );
-    let (mut dispatch_complete_payload, level) = if exit_code == 0 {
-        (darkmux_flow::Payload::DispatchComplete(dispatch_complete_payload), darkmux_flow::Level::Info)
-    } else {
-        (darkmux_flow::Payload::DispatchError(dispatch_complete_payload), darkmux_flow::Level::Error)
-    };
+    let (mut dispatch_complete_payload, level) = terminal_payload(exit_code, dispatch_complete_payload);
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     // (#717, #1230 Packet 0) Emit the terminal record through the bookend
@@ -6997,10 +7031,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     workspace_cleanup.disarm();
     // A clean exit completes the execution: a resume of this out-dir, or of
     // the one this resumed, is refused from here on.
-    if exit_code == 0 {
-        let origins: Vec<&Path> = std::iter::once(host_out.as_path()).chain(opts.resume_from.as_deref()).collect();
-        mark_execution_completed(&origins);
-    }
+    complete_execution_on_success(exit_code, &host_out, opts.resume_from.as_deref());
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the

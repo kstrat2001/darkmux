@@ -687,6 +687,26 @@ mod origin_record_tests {
     }
 
     #[test]
+    fn remove_out_dir_also_removes_the_execution_lock_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("darkmux-out-coder-3");
+        fs::create_dir_all(&dir).unwrap();
+        let lock = execution_lock_path(&dir).unwrap();
+        fs::write(&lock, "").unwrap();
+        remove_out_dir(&dir).unwrap();
+        assert!(!lock.exists(), "no orphaned lock file may outlive its dir");
+    }
+
+    #[test]
+    fn a_lock_file_is_orphaned_only_when_its_dir_is_gone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let name = format!("darkmux-out-coder-4{EXECUTION_LOCK_SUFFIX}");
+        assert!(is_orphaned_resume_origin(tmp.path(), &name));
+        fs::create_dir_all(tmp.path().join("darkmux-out-coder-4")).unwrap();
+        assert!(!is_orphaned_resume_origin(tmp.path(), &name));
+    }
+
+    #[test]
     fn a_record_is_orphaned_only_when_its_dir_is_gone() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("darkmux-out-coder-2");

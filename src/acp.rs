@@ -817,6 +817,16 @@ const LAUNCH_CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fr
 /// sweep below is still the right tool for them — this function only
 /// carves the launch children OUT of that sweep; it does not spare them
 /// from being signaled at all, only from being FORCED.
+///
+/// **`process::exit` skips `Drop`, and that is safe here.** The only guard
+/// that stops a container on `Drop` is `ContainerKillGuard`, armed inside
+/// `darkmux_crew`'s container `dispatch()`. This host never runs that
+/// in-process: its seats go through the container-free
+/// `dispatch_local_single_shot` (curl or one LMStudio call; no container to
+/// leave behind) or submit to a peer, and `mission launch` runs as the child
+/// process above, which owns its own guards and receives SIGTERM first. A
+/// future in-process container dispatch would have to kill its container
+/// explicitly before this exit.
 fn reap_on_host_shutdown() {
     eprintln!("[darkmux-acp] shutdown signal received — reaping in-flight dispatch children");
     darkmux_types::interrupt::mark_interrupted();

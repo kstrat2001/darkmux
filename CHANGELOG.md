@@ -1500,6 +1500,24 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
+  aborting a mission, while a run waited on its endpoint budget raised the
+  process-wide interrupt flag, so a mission launch running other phases'
+  dispatches had every one of them killed. The stop now lands on the one
+  dispatch it names; Ctrl-C and SIGTERM still end everything.
+- **A resume keeps its origin's image and has one live execution** (5.0).
+  `--resume-from` with no `--image` runs on the image the original ran on; a
+  different `--image` is refused as `RESUME IMAGE MISMATCH`. A resume while the
+  original (or another resume) still runs is refused naming that execution, and
+  one after the execution ended in success is refused as `RESUME ALREADY
+  COMPLETED`; resuming again after an interrupted or failed run still works.
+  The lock is `<out-dir>.execution.lock`, beside the out-dir like the resume
+  origin record, and `doctor`'s orphan count covers it.
+- **A hosted call that was sent and never answered is charged** (5.0). A timeout
+  or provider error on a hosted single-shot dispatch now writes an `absent`
+  usage record (the endpoint's window counts it as a call) and charges the
+  per-dispatch cap what a reply with no usage is charged: the granted cap plus
+  the estimated prompt. It used to charge nothing.
 - **A fleet seat frees only the claim that took it** (5.0). A retried or
   repeated sender session shares one receiver session id; dropping one of two
   claims under it used to free both, so a cap of 2 could run 3. Each claim now

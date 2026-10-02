@@ -13,7 +13,7 @@
   "crates/darkmux-crew/src/dispatch_internal.rs::TailerState::poll_and_emit": 17,
   "crates/darkmux-crew/src/dispatch_internal.rs::build_docker_run_argv": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::dispatch": 86,
-  "crates/darkmux-crew/src/dispatch_internal.rs::dispatch_local_single_shot": 18,
+  "crates/darkmux-crew/src/dispatch_internal.rs::dispatch_local_single_shot": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::ensure_runtime_binary_cached_at": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::kill_container_persistently": 19,
   "crates/darkmux-crew/src/dispatch_internal.rs::resolve_dispatch_model_with_hosts": 16,
