@@ -38,17 +38,14 @@ fn serve_no_longer_takes_work_off_the_redis_queue() {
     let node = harness.node("node-a").expect("node-a");
     let client = redis::Client::open(node.redis_url.as_str()).unwrap();
     let mut conn = client.get_connection().unwrap();
-    // Anti-vacuity: the daemon really is on this Redis (its presence key
-    // appears), so a missing consumer group means it chose not to consume.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let keys: Vec<String> = redis::cmd("KEYS").arg("darkmux:presence:*").query(&mut conn).unwrap();
-        if !keys.is_empty() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "the daemon never connected to the test Redis");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // Anti-vacuity: the release binary really talks to this Redis (a CLI note
+    // lands on the flow stream), so a missing consumer group means the daemon
+    // chose not to consume, not that it never connected.
+    let note = node.cmd().args(["flow", "note", "--text", "queue probe", "--source", "orchestrator"]).output().unwrap();
+    assert!(note.status.success(), "{}", String::from_utf8_lossy(&note.stderr));
+    let stream = node.redis_stream.as_deref().unwrap_or("darkmux:flow");
+    let len: u64 = redis::cmd("XLEN").arg(stream).query(&mut conn).unwrap();
+    assert!(len > 0, "the release binary never wrote to the test Redis");
     // A job in the last queue shape (v4), exactly what a pre-4.0 peer would XADD.
     let record = r#"{"role_id":"pr-reviewer","message":"hang please","session_id":"s-queue","timeout_seconds":60,"published_at_unix_ms":1,"attempt":1}"#;
     let _: String = redis::cmd("XADD")
