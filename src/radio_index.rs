@@ -215,6 +215,19 @@ mod tests {
         assert!(entries.iter().all(|e| !e.path.split(' ').any(|w| w == "help")), "clap's help verb is not a darkmux verb");
     }
 
+    /// The top-level `doctor` line is what the answering seat reads to describe
+    /// doctor, so it must say what doctor checks, not just that it checks.
+    #[test]
+    fn the_doctor_line_says_what_doctor_checks() {
+        let entries = build_verb_index(&crate::cli::Cli::command());
+        let doctor = entries.iter().find(|e| e.path == "doctor").expect("doctor is a leaf verb");
+        let line = doctor.summary.to_ascii_lowercase();
+        for part in ["config", "profiles", "endpoints", "runtime image", "fleet"] {
+            assert!(line.contains(part), "doctor's one-line summary must name `{part}`: {}", doctor.summary);
+        }
+        assert!(!doctor.summary.ends_with("..."), "not clipped: {}", doctor.summary);
+    }
+
     /// The index has to fit the grounding bundle beside catalog + config +
     /// board with room to spare under the 40K hard cap. The cap in
     /// `radio_answer` is set from this measurement; if the tree grows past

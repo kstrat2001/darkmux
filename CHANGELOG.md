@@ -109,6 +109,9 @@ darkmux release.
   for that command, and `coder-phase` leads with a plain sentence ("fixing a
   failing test") so a fix-the-test request finds it. Tests pin that no retired
   verb, `lab eval` included, appears in the router catalog or the verb index.
+- **`darkmux doctor`'s one-line help says what it checks** (config, profiles,
+  LM Studio and endpoints, runtime image, fleet, flow sinks, state files), so
+  radio describes it correctly.
 
 ### Changed (breaking, 4.0)
 
