@@ -386,8 +386,10 @@ impl UsageFold {
             work: UsageSplit::default(),
             utility: UsageSplit::default(),
         });
-        if label.endpoint.is_some() && (g.endpoint.is_none() || label.endpoint < g.endpoint) {
-            g.endpoint = label.endpoint;
+        if let Some(seen) = label.endpoint {
+            if g.endpoint.as_ref().is_none_or(|kept| seen < *kept) {
+                g.endpoint = Some(seen);
+            }
         }
         let newest = self.machine_ts.get(&key).is_none_or(|seen| label.ts >= *seen);
         if label.machine.is_some() && newest {
