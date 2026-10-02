@@ -137,10 +137,6 @@ pub struct UsagePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub turn_seq: Option<u64>,
-    /// On a `dispatch.map` per-call record: whether the item ran on an unmanaged endpoint.
-    #[serde(default, alias = "remote", skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub unmanaged: Option<bool>,
     /// On a `dispatch.map` per-call record: the item's position. An item that retried emits one
     /// record per attempt, all with this index.
     #[serde(default, skip_serializing_if = "Option::is_none")]

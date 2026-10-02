@@ -24,7 +24,7 @@
  * step reducers work the same way).
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
-import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
+import { PURPOSE, isUsageRecord, usageContribution } from "../../lib/usageRecords";
 import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, receiveKey, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
@@ -316,16 +316,18 @@ export function isAiKind(kind: string | undefined): boolean {
 }
 
 export interface StepMetrics {
+  /** (#3067) The plain sum of every usage record folded so far (utility
+   *  included): the one token sum, the figure the server's `tokensFinal` is
+   *  too. */
   tokRun: number;
-  /** The server's finalized tokens for the step (`seedMetricsFromGraph`); see `turnFinal`. */
+  /** The utility part of `tokRun`. */
+  tokUtilityRun: number;
+  /** The server's tokens for the step (`seedMetricsFromGraph`), the same sum over the
+   *  records on disk; see `turnFinal`. The display takes the larger of it and `tokRun`
+   *  (both are sums of the same records, so never added). */
   tokFinal: number;
-  /** The `total_tokens` of every dispatch terminal folded so far, summed (one term per
-   *  execution: attempts and map items alike), as `turnsEnded` sums turns. */
-  tokEnded: number;
-  /** The largest `step result` total folded: the legacy figure for a step whose executions
-   *  wrote no terminal totals. Only read when `tokEnded` is 0, so a step-level aggregate that
-   *  already sums its items is never added to the item terminals it sums. */
-  tokResult: number;
+  /** The utility part of `tokFinal`. */
+  tokUtilityFinal: number;
   turnRun: number;
   /** The server's finalized turns for the step (`seedMetricsFromGraph`): the sum of its
    *  executions' `total_turns`. */
@@ -337,10 +339,6 @@ export interface StepMetrics {
   turnsEnded: number;
   toolRun: number;
   toolFinal: number;
-  /** (#2902 step 2a) Whether any usage record for this step has been folded.
-   *  Once one has, `tokRun` (their plain sum) IS the step's figure; before
-   *  that (legacy data), the finalized `tokFinal` is. */
-  usageSeen: boolean;
   startTs: number;
   endTs: number;
   /** Newest record ts (ms) correlated to this step — this port's derived
@@ -363,15 +361,14 @@ export interface StepMetrics {
 
 const EMPTY_METRICS: StepMetrics = {
   tokRun: 0,
+  tokUtilityRun: 0,
   tokFinal: 0,
-  tokEnded: 0,
-  tokResult: 0,
+  tokUtilityFinal: 0,
   turnRun: 0,
   turnFinal: 0,
   turnsEnded: 0,
   toolRun: 0,
   toolFinal: 0,
-  usageSeen: false,
   startTs: 0,
   endTs: 0,
   lastTs: 0,
@@ -475,8 +472,8 @@ function attemptBeats(t: { n: number; lastKey: number; ours: boolean }, best: { 
 }
 
 const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
-  "tokRun", "tokFinal", "tokEnded", "tokResult", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
-  "usageSeen", "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
+  "tokRun", "tokUtilityRun", "tokFinal", "tokUtilityFinal", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
+  "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
 ];
 
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
@@ -485,13 +482,12 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
 
 /** The running and final counts one record carries, each read through its own
  *  action's payload type; `null` for a count the record does not have. */
-function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsSoFar: number | null; finalTok: number; totalTurns: number | null } {
+function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsSoFar: number | null; totalTurns: number | null } {
   const count = (n: unknown): number | null => (typeof n === "number" ? n : null);
   const end = endPayloadOf(rec);
   return {
     turnsSoFar: count(payloadOf(rec, ACTION.DispatchTurn)?.turns_so_far),
     toolCallsSoFar: count(payloadOf(rec, ACTION.DispatchTool)?.tool_calls_so_far),
-    finalTok: count((end ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
     totalTurns: count(end?.total_turns),
   };
 }
@@ -528,6 +524,14 @@ function foldSpan(
   }
 }
 
+/** (#3067) Fold one usage record's tokens into a step's running figures: the
+ *  total, and the utility part named beside it. */
+function foldUsage(next: StepMetrics, usage: ReturnType<typeof usageContribution>): void {
+  if (!usage) return;
+  next.tokRun += usage.total;
+  if (usage.purpose === PURPOSE.utility) next.tokUtilityRun += usage.total;
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
@@ -539,15 +543,14 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
 
   const action = rec.action;
-  // (#2902 step 2a) The step's running figure is the plain sum of its usage
-  // records through the one sum's per-record half, darkmux's utility jobs
-  // excluded: a step's meter is its own execution's numbers, never a
-  // sub-execution's (contract 8). `null` for a non-usage record.
-  const usage = usageContribution(rec, { exclude: PURPOSE.utility });
+  // (#2902 step 2a, #3067) The step's running figure is the plain sum of its
+  // usage records through the one sum's per-record half, utility calls
+  // included and named: the same figure the runs board and the server's
+  // `tokensFinal` show. `null` for a non-usage record.
+  const usage = usageContribution(rec);
   const isUsage = isUsageRecord(rec);
   const isTurn = action === ACTION.DispatchTurn;
   const isTool = action === ACTION.DispatchTool;
-  const isStepResult = action === ACTION.StepResult;
   const isStart = action === ACTION.DispatchStart || action === ACTION.StepStart;
   const stepBookended = cur.stepBookended || action === ACTION.StepStart;
   if (stepBookended) next.stepBookended = true;
@@ -556,20 +559,15 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   foldSpan(cur, next, { isStart, isTerminal, failed: action === ACTION.StepError || action === ACTION.DispatchError, recMs, key: receiveKey(rec) });
 
   const fig = recordFigures(rec);
-  const finalTok = fig.finalTok;
   const started = next.startTs > 0;
   if (isUsage && started) {
-    next.usageSeen = true;
-    next.tokRun += usage ? usage.total : 0;
+    foldUsage(next, usage);
   } else if (isTurn && started) {
     next.turnRun = fig.turnsSoFar !== null ? Math.max(next.turnRun, fig.turnsSoFar) : next.turnRun + 1;
   } else if (isTool && started) {
     next.toolRun = fig.toolCallsSoFar !== null ? Math.max(next.toolRun, fig.toolCallsSoFar) : next.toolRun + 1;
   } else if (isDispatchTerminal(action)) {
-    next.tokEnded += finalTok;
     if (fig.totalTurns !== null) next.turnsEnded += fig.totalTurns;
-  } else if (isStepResult) {
-    next.tokResult = Math.max(next.tokResult, finalTok);
   }
 
   if (sameMetrics(next, cur)) return metrics;
@@ -587,6 +585,20 @@ export function hasNoMetricsData(m: {
   return !m.tokensFinal && !m.turnsFinal && !m.toolsFinal && !m.startedMs;
 }
 
+/** A wire count, 0 when absent. */
+function countOf(n: unknown): number {
+  return typeof n === "number" ? n : 0;
+}
+
+/** (#3067) The tokens field of a step's detail, with its utility part named
+ *  beside it: one total, the part that is darkmux's own calls shown, never
+ *  subtracted. */
+function tokenFields(d: DisplayMetrics): { key: string; label: string; value: string }[] {
+  const out = d.tokens ? [{ key: "tokens", label: "tokens", value: fmtTok(d.tokens) }] : [];
+  if (d.tokens && d.utility) out.push({ key: "utility", label: "of which utility", value: fmtTok(d.utility) });
+  return out;
+}
+
 /** `seedMetricsFromGraph` — mission-graph.html. Seeds the accumulator from
  * the finalized totals the server folded into graph.json, taking the max so
  * a live SSE value already climbing is never regressed. */
@@ -594,7 +606,8 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
   let out = metrics;
   for (const n of g?.nodes || []) {
     for (const s of n.steps || []) {
-      const tf = typeof s.tokensFinal === "number" ? s.tokensFinal : 0;
+      const tf = countOf(s.tokensFinal);
+      const uf = countOf(s.tokensUtility);
       const nf = typeof s.turnsFinal === "number" ? s.turnsFinal : 0;
       const st = tsToMs(s.startedTs);
       // A graph step carries no tool total (the server's `StepRow` has none):
@@ -602,14 +615,15 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
       if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: 0, startedMs: st })) continue;
       const cur = out[s.id] || EMPTY_METRICS;
       const ntf = Math.max(cur.tokFinal, tf);
+      const nuf = Math.max(cur.tokUtilityFinal, uf);
       const nnf = Math.max(cur.turnFinal, nf);
       const curSt = cur.startTs || 0;
       const nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && nst === curSt) {
+      if (ntf === cur.tokFinal && nuf === cur.tokUtilityFinal && nnf === cur.turnFinal && nst === curSt) {
         continue;
       }
       if (out === metrics) out = { ...metrics };
-      out[s.id] = { ...cur, tokFinal: ntf, turnFinal: nnf, startTs: nst };
+      out[s.id] = { ...cur, tokFinal: ntf, tokUtilityFinal: nuf, turnFinal: nnf, startTs: nst };
     }
   }
   return out;
@@ -617,19 +631,22 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
 
 export interface DisplayMetrics {
   tokens: number;
+  /** The utility part of `tokens` (compaction, radio routing), named beside it. */
+  utility: number;
   turns: number;
   tools: number;
   has: boolean;
 }
 
 export function stepDisplayMetrics(m: StepMetrics | undefined): DisplayMetrics {
-  if (!m) return { tokens: 0, turns: 0, tools: 0, has: false };
-  // (#2902 step 2a) The usage records' plain sum once any has been folded;
-  // the legacy fallback (no usage records) reads the finalized total.
-  const tokens = stepTokensWithLegacyFallback(m.tokRun, m.usageSeen, Math.max(m.tokFinal, m.tokEnded || m.tokResult)) || 0;
+  if (!m) return { tokens: 0, utility: 0, turns: 0, tools: 0, has: false };
+  // (#2902 step 2a, #3067) The usage records' plain sum: what this page folded
+  // live, or what the server summed from disk, whichever is larger.
+  const tokens = Math.max(m.tokRun, m.tokFinal);
+  const utility = Math.max(m.tokUtilityRun, m.tokUtilityFinal);
   const turns = Math.max(m.turnFinal, m.turnsEnded) || m.turnRun || 0;
   const tools = m.toolFinal || m.toolRun || 0;
-  return { tokens, turns, tools, has: tokens > 0 || turns > 0 || tools > 0 };
+  return { tokens, utility, turns, tools, has: tokens > 0 || turns > 0 || tools > 0 };
 }
 
 export interface MissionTotals {
@@ -1035,7 +1052,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   if (d.turns) fields.push({ key: "turns", label: "turns", value: String(d.turns) });
   if (d.tools) fields.push({ key: "tools", label: "tool calls", value: String(d.tools) });
   // (#2834) The " cloud" suffix is withdrawn — see MissionGraphLens.
-  if (d.tokens) fields.push({ key: "tokens", label: "tokens", value: fmtTok(d.tokens) });
+  fields.push(...tokenFields(d));
 
   const findings = pick(["findings", "finding_count", "findings_count"]);
   if (findings) fields.push({ key: "findings", label: "findings", value: findings });

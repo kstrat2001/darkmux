@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use darkmux_serve::usage_sum::{UsageBreakdown, UsageSplit};
+use darkmux_serve::usage_sum::{UsageBreakdown, UsageGroup, UsageSplit};
 use darkmux_serve::{AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::style;
 
@@ -764,7 +764,14 @@ const GENERATED_COLS: usize = 10;
 /// Endpoint and model columns are sized to their content, capped so one
 /// long deployment label cannot push the counts off a pane.
 const ENDPOINT_MAX_COLS: usize = 40;
+const MACHINE_MAX_COLS: usize = 20;
 const MODEL_MAX_COLS: usize = 28;
+
+/// What the ENDPOINT cell shows: the registry id a named endpoint went
+/// through, else the endpoint string darkmux called.
+fn endpoint_cell(g: &UsageGroup) -> &str {
+    none_or(g.endpoint_id.as_deref().or(g.endpoint.as_deref()))
+}
 
 fn none_or(s: Option<&str>) -> &str {
     s.unwrap_or("(none)")
@@ -803,11 +810,29 @@ fn merged(a: &UsageSplit, b: &UsageSplit) -> UsageSplit {
             (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
         },
         generated: a.generated + b.generated,
+        unreported: a.unreported + b.unreported,
     }
 }
 
-/// The `--usage` section, as lines. One line per endpoint + requested
-/// model carrying the group's ALL tokens; beneath it, `utility` when
+/// The calls that belong to no run (radio routing, a `doctor --probe`) are in
+/// the totals above but on no run's TOKENS cell; say how much, so the rows
+/// plus this line equal the total.
+fn no_run_note(split: &UsageSplit) -> String {
+    let calls = if split.calls == 1 { "call" } else { "calls" };
+    format!("{} {calls} on no run ({} tokens): in the totals, on no run's TOKENS cell", grouped(split.calls), grouped(split.total))
+}
+
+/// The calls a provider answered without a usage block are counted as calls
+/// and add 0 tokens here, the same reading the endpoint window budget takes
+/// (the conservative charge applies only to a dispatch's own cap). Say so
+/// rather than let a short total pass for a complete one.
+fn unreported_note(n: u64) -> String {
+    let calls = if n == 1 { "call" } else { "calls" };
+    format!("{n} {calls} reported no usage: counted in CALLS, 0 tokens each")
+}
+
+/// The `--usage` section, as lines. One line per executing machine +
+/// endpoint + requested model carrying the group's ALL tokens; beneath it, `utility` when
 /// darkmux's own calls (compaction, radio routing) landed there, and
 /// `reported model:` when the reply named a model other than the one
 /// requested — each a fact off the records, nothing inferred. Then the
@@ -819,24 +844,20 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     let o = &b.overall;
     let mut lines = Vec::new();
     let window = if report.default_window { "the default 14-day window" } else { "--since" };
-    let legacy = match o.legacy_completes {
-        0 => String::new(),
-        1 => " · 1 legacy complete".to_string(),
-        n => format!(" · {n} legacy completes"),
-    };
     lines.push(style::header(&format!(
-        "usage since {} ({window}) · {} calls{legacy}",
+        "usage since {} ({window}) · {} calls",
         report.since,
         grouped(o.usage_records)
     )));
 
-    let ep_w = b
+    let machine_w = b
         .groups
         .iter()
-        .map(|g| none_or(g.endpoint.as_deref()).chars().count())
+        .map(|g| none_or(g.machine.as_deref()).chars().count())
         .max()
         .unwrap_or(0)
-        .max("ENDPOINT".len());
+        .max("MACHINE".len());
+    let ep_w = b.groups.iter().map(|g| endpoint_cell(g).chars().count()).max().unwrap_or(0).max("ENDPOINT".len());
     let model_w = b
         .groups
         .iter()
@@ -844,16 +865,26 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
         .max()
         .unwrap_or(0)
         .max("MODEL".len());
-    let (ep_w, model_w) = match width {
-        Some(_) => (ep_w.min(ENDPOINT_MAX_COLS), model_w.min(MODEL_MAX_COLS)),
-        None => (ep_w, model_w),
+    let (machine_w, ep_w, model_w) = match width {
+        Some(_) => (machine_w.min(MACHINE_MAX_COLS), ep_w.min(ENDPOINT_MAX_COLS), model_w.min(MODEL_MAX_COLS)),
+        None => (machine_w, ep_w, model_w),
     };
-    let label = |ep: &str, model: &str| {
-        format!("{:i$}{:<e$} {:<m$} ", "", ellipsize(ep, ep_w), ellipsize(model, model_w), i = USAGE_INDENT, e = ep_w, m = model_w)
+    let label = |machine: &str, ep: &str, model: &str| {
+        format!(
+            "{:i$}{:<a$} {:<e$} {:<m$} ",
+            "",
+            ellipsize(machine, machine_w),
+            ellipsize(ep, ep_w),
+            ellipsize(model, model_w),
+            i = USAGE_INDENT,
+            a = machine_w,
+            e = ep_w,
+            m = model_w
+        )
     };
     lines.push(format!(
         "{}{:>c$} {:>w$} {:>w$} {:>g$} {:>w$}",
-        label("ENDPOINT", "MODEL"),
+        label("MACHINE", "ENDPOINT", "MODEL"),
         "CALLS",
         "INPUT",
         "CACHED",
@@ -867,7 +898,7 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     for g in &b.groups {
         lines.push(format!(
             "{}{}",
-            label(none_or(g.endpoint.as_deref()), none_or(g.requested_model.as_deref())),
+            label(none_or(g.machine.as_deref()), endpoint_cell(g), none_or(g.requested_model.as_deref())),
             usage_numbers(&merged(&g.work, &g.utility))
         ));
         if g.utility.calls > 0 {
@@ -875,7 +906,7 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
                 "{sub_indent}{:<u$} {}",
                 "utility",
                 usage_numbers(&g.utility),
-                u = ep_w + 1 + model_w - 2,
+                u = machine_w + 1 + ep_w + 1 + model_w - 2,
             ));
         }
         if let Some(served) = &g.reported_model {
@@ -888,9 +919,15 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
         utility = merged(&utility, &g.utility);
     }
     let all = merged(&work, &utility);
-    lines.push(format!("{}{}", label("all", ""), usage_numbers(&all)));
+    lines.push(format!("{}{}", label("all", "", ""), usage_numbers(&all)));
     if utility.calls > 0 {
-        lines.push(format!("{}{}", label("utility", ""), usage_numbers(&utility)));
+        lines.push(format!("{}{}", label("utility", "", ""), usage_numbers(&utility)));
+    }
+    if b.no_run.calls > 0 {
+        lines.push(style::dim(&no_run_note(&b.no_run)));
+    }
+    if all.unreported > 0 {
+        lines.push(style::dim(&unreported_note(all.unreported)));
     }
     lines
 }
@@ -899,7 +936,6 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
 mod tests {
     use super::*;
     use clap::ValueEnum;
-    use darkmux_serve::usage_sum::UsageGroup;
 
     fn mk_run(id: &str, kind: RunKind, status: RunStatus, updated_ts: u64) -> Run {
         Run {
@@ -1542,7 +1578,7 @@ mod tests {
     }
 
     fn split(calls: u64, total: u64, input: u64, cached: Option<u64>, generated: u64) -> UsageSplit {
-        UsageSplit { calls, total, input, cached, generated }
+        UsageSplit { calls, total, input, cached, generated, unreported: 0 }
     }
 
     fn sample_report() -> UsageReport {
@@ -1557,12 +1593,14 @@ mod tests {
                     completion: 290,
                     cached: Some(140),
                     utility: 145,
-                    usage_records: 8,
+                    usage_records: 9,
                     reported: 9,
-                    legacy_completes: 1,
                 },
+                no_run: split(2, 110, 95, None, 15),
                 groups: vec![
                     UsageGroup {
+                        machine: Some("laptop".into()),
+                        endpoint_id: None,
                         endpoint: Some("http://127.0.0.1:1234/v1".into()),
                         requested_model: Some("qwen-a".into()),
                         reported_model: None,
@@ -1570,6 +1608,8 @@ mod tests {
                         utility: split(0, 0, 0, None, 0),
                     },
                     UsageGroup {
+                        machine: Some("laptop".into()),
+                        endpoint_id: Some("azure".into()),
                         endpoint: Some("azure:example.azure.com/gpt-x".into()),
                         requested_model: Some("gpt-x".into()),
                         reported_model: Some("gpt-x-2026-01".into()),
@@ -1577,6 +1617,8 @@ mod tests {
                         utility: split(1, 35, 30, None, 5),
                     },
                     UsageGroup {
+                        machine: Some("studio".into()),
+                        endpoint_id: None,
                         endpoint: Some("http://127.0.0.1:1234/v1".into()),
                         requested_model: Some("util-4b".into()),
                         reported_model: None,
@@ -1584,6 +1626,8 @@ mod tests {
                         utility: split(2, 110, 95, None, 15),
                     },
                     UsageGroup {
+                        machine: None,
+                        endpoint_id: None,
                         endpoint: None,
                         requested_model: None,
                         reported_model: None,
@@ -1595,7 +1639,7 @@ mod tests {
         }
     }
 
-    /// One line per endpoint + requested model with the group's ALL
+    /// One line per machine + endpoint + requested model with the group's ALL
     /// tokens; a `utility` line under it when darkmux's own calls landed
     /// there; the served model as a fact under the line when it differs;
     /// `-` for cached wherever nothing reported it; and the totals.
@@ -1604,14 +1648,21 @@ mod tests {
         let lines = usage_lines(&sample_report(), None);
         let text = lines.join("\n");
         assert!(lines[0].starts_with("usage since 2026-09-12T00:00:00Z"), "{text}");
-        assert!(lines[0].contains("8 calls") && lines[0].contains("1 legacy complete"), "{text}");
+        assert!(lines[0].contains("9 calls") && !lines[0].contains("legacy"), "{text}");
+        assert!(text.contains("2 calls on no run (110 tokens)"), "{text}");
         let header = &lines[1];
-        for col in ["ENDPOINT", "MODEL", "CALLS", "INPUT", "CACHED", "GENERATED", "TOTAL"] {
+        for col in ["MACHINE", "ENDPOINT", "MODEL", "CALLS", "INPUT", "CACHED", "GENERATED", "TOTAL"] {
             assert!(header.contains(col), "{col} missing from {header:?}");
         }
         // Every group line carries its endpoint, model and ALL-tokens total.
         let qwen = lines.iter().find(|l| l.contains("qwen-a")).expect("qwen-a line");
-        assert!(qwen.contains("http://127.0.0.1:1234/v1") && qwen.ends_with("360"), "{qwen:?}");
+        assert!(qwen.contains("laptop") && qwen.contains("http://127.0.0.1:1234/v1") && qwen.ends_with("360"), "{qwen:?}");
+        // A named endpoint reads as its registry id, never the raw string; the
+        // same URL on another machine is its own line (#3067).
+        let gpt_line = lines.iter().find(|l| l.contains("gpt-x ")).expect("gpt-x line");
+        assert!(gpt_line.contains("azure ") && !gpt_line.contains("example.azure.com"), "{gpt_line:?}");
+        let util_line = lines.iter().find(|l| l.contains("util-4b")).expect("util-4b line");
+        assert!(util_line.contains("studio") && util_line.contains("http://127.0.0.1:1234/v1"), "{util_line:?}");
         assert!(qwen.contains(" 40 "), "cached reported: {qwen:?}");
         let gpt = lines.iter().position(|l| l.contains("gpt-x ") || l.ends_with("gpt-x")).expect("gpt-x line");
         assert!(lines[gpt].ends_with("535"), "work + utility: {:?}", lines[gpt]);
@@ -1634,6 +1685,17 @@ mod tests {
         for word in ["$", "cost", "local", "cloud", "metered", "saved"] {
             assert!(!text.to_lowercase().contains(word), "{word:?} in {text}");
         }
+    }
+
+    /// (#3067) A call that reported no usage is named under the totals, so a
+    /// short total is not read as a complete one.
+    #[test]
+    fn usage_lines_name_calls_that_reported_no_usage() {
+        let mut report = sample_report();
+        report.breakdown.groups[0].work.unreported = 2;
+        let text = usage_lines(&report, None).join("\n");
+        assert!(text.contains("2 calls reported no usage: counted in CALLS, 0 tokens each"), "{text}");
+        assert!(!usage_lines(&sample_report(), None).join("\n").contains("reported no usage"));
     }
 
     /// (review CONSIDER 5) `--since` alone still names its bound in the
@@ -1666,6 +1728,8 @@ mod tests {
         assert_eq!(groups.len(), 4);
         assert_eq!(groups[1]["reported_model"], "gpt-x-2026-01");
         assert_eq!(groups[1]["work"]["cached"], 100);
+        assert_eq!((groups[1]["machine"].as_str(), groups[1]["endpoint_id"].as_str()), (Some("laptop"), Some("azure")), "{}", groups[1]);
+        assert!(groups[3].get("machine").is_none(), "absent on the wire: {}", groups[3]);
         assert!(groups[1]["utility"].get("cached").is_none(), "absent, never 0: {}", groups[1]);
         assert!(groups[3].get("endpoint").is_none(), "absent on the wire: {}", groups[3]);
         assert_eq!(payload["since"], "2026-09-12T00:00:00Z");

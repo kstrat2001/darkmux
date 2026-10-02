@@ -11,13 +11,12 @@
  * complete-vs-telemetry precedence, no local/cloud classification, no
  * estimates: every figure is a sum of counts a provider reported.
  *
- * THE ONE EXCEPTION is legacy data, isolated in `isLegacyFallbackComplete`: an
- * execution with ZERO usage records (written before flow schema 1.57.0, or by
- * a fleet peer on an older darkmux) counts its token-bearing
- * `dispatch complete` once. An execution with any usage record, even a
- * count-less `token_source: "absent"` one, never reads its complete. The
- * execution is the record's own `execution_id` (`ingest.ts`'s `executionOf`;
- * a pre-4.0 record names none and reads as its session and mission).
+ * There is no exception: a `dispatch complete` carries no tokens here,
+ * whatever its payload says (5.0 dropped the pre-1.57 fallback to it). A run's
+ * figure is every usage record of its session or mission, utility calls
+ * included, with the utility part named (`UsageSum.utility`); the Rust fold
+ * (`usage_sum.rs`) is the same sum and the server's `Run.tokens` /
+ * `tokensFinal` are its answers.
  *
  * `purpose` and `call_kind` values come from the Rust enums
  * (`darkmux_crew::usage::{UsagePurpose, CallKind}`) through their generated
@@ -31,7 +30,7 @@
 
 import type { CallKind } from "../types/generated/CallKind";
 import type { UsagePurpose } from "../types/generated/UsagePurpose";
-import { ACTION, CATEGORY, SOURCE, executionOf, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, type NormRecord } from "./ingest";
 
 /** Every `UsagePurpose` variant a writer produces, by name. A key missing or
  *  extra relative to the generated union is a type error; `unknown` is the
@@ -56,10 +55,6 @@ export interface UsagePayload {
   prompt_tokens?: unknown;
   completion_tokens?: unknown;
   cached_tokens?: unknown;
-  /** What an unmanaged-endpoint `dispatch.map` item spent, on its
-   *  `dispatch.complete`. An archived record spells it `remote_tokens`. */
-  unmanaged_tokens?: unknown;
-  remote_tokens?: unknown;
 }
 
 /** A record's data, in either place it is held: the wire's `payload`, or
@@ -147,7 +142,7 @@ function amountOf(p: UsagePayload, opts: SumOptions): UsageAmount | null {
   if (opts.exclude === purpose) return null;
   const prompt = num(p.prompt_tokens);
   const completion = num(p.completion_tokens);
-  const total = num(p.total_tokens) || prompt + completion || num(p.unmanaged_tokens) || num(p.remote_tokens);
+  const total = num(p.total_tokens) || prompt + completion;
   const cached = isFiniteNumber(p.cached_tokens) ? num(p.cached_tokens) : null;
   return { total, prompt, completion, cached, purpose };
 }
@@ -162,46 +157,9 @@ export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAm
   return amountOf(payloadOf(r), opts);
 }
 
-/** True when a `dispatch complete`'s payload carries any token count. */
+/** True when a usage record's payload carries any token count. */
 export function hasAnyTokenCounts(p: UsagePayload): boolean {
-  return !!(num(p.total_tokens) || num(p.prompt_tokens) || num(p.completion_tokens) || num(p.unmanaged_tokens) || num(p.remote_tokens));
-}
-
-/** THE LEGACY FALLBACK, and the only exception to the plain sum: a
- *  token-bearing `dispatch complete` counts (once) when its execution holds
- *  ZERO usage records. Before flow schema 1.57.0 a single-shot or hosted
- *  call emitted no usage record, so its complete was the only place its
- *  tokens were written; a run with any usage record (even an `absent` one)
- *  is fully described by its records and its complete is never read.
- *  `executionsWithUsage` is the set of executions that hold a usage record.
- *
- *  At the live window's lower edge this rule has a known exposure: a MODERN
- *  execution whose usage records have scrolled out of the window but whose
- *  `dispatch complete` is still inside holds zero usage records here, so it
- *  reads its complete (the writer's whole-run total). The CLI's `--since`
- *  handles the same edge by registering runs from out-of-window usage
- *  records (#2902 step 2b); the viewer's window is a moving 24h, so a run
- *  sits in that state for seconds, and the sum is corrected on the next
- *  poll when the complete scrolls out too. */
-function isLegacyFallbackComplete(r: NormRecord, executionsWithUsage: ReadonlySet<string>): boolean {
-  return r.action === ACTION.DispatchComplete && hasAnyTokenCounts(payloadOf(r)) && !executionsWithUsage.has(executionOf(r));
-}
-
-/** The records the legacy fallback counts, for a reader that needs them
- *  itself (a per-field breakdown). `sumUsage` applies the same rule. */
-export function legacyCompleteCounts<R extends NormRecord>(records: readonly R[]): R[] {
-  const withUsage = new Set<string>();
-  for (const r of records) if (isUsageRecord(r)) withUsage.add(executionOf(r));
-  return records.filter((r) => isLegacyFallbackComplete(r, withUsage));
-}
-
-/** A mission-graph step's token figure: its usage records' sum once any
- *  usage record for it has been seen, else (legacy) the finalized total its
- *  `dispatch complete`/`step result` reported (or the server backfilled).
- *  The same legacy rule as `isLegacyFallbackComplete`, at the grain the
- *  graph folds: a step, not an execution. */
-export function stepTokensWithLegacyFallback(usageSum: number, usageRecordsSeen: boolean, completeTotal: number): number {
-  return usageRecordsSeen ? usageSum : completeTotal;
+  return !!(num(p.total_tokens) || num(p.prompt_tokens) || num(p.completion_tokens));
 }
 
 export interface UsageSum {
@@ -216,42 +174,30 @@ export interface UsageSum {
   utility: number;
   /** Usage records counted (after `exclude`), `absent` ones included. */
   usageRecords: number;
-  /** Counted entries (usage records or legacy completes) that reported a
-   *  count: `0` means nothing measured, which a tile shows as "—", never 0. */
+  /** Usage records that reported a count: `0` means nothing measured, which
+   *  a tile shows as "—", never 0. */
   reported: number;
-  /** Legacy `dispatch complete` records counted (after `exclude`). */
-  legacyCompletes: number;
 }
 
-/** THE sum. Every usage record in `records` (minus `opts.exclude`), plus the
- *  legacy fallback's completes (`isLegacyFallbackComplete`). Linear in
+/** THE sum. Every usage record in `records` (minus `opts.exclude`). Linear in
  *  `records`, one small `amountOf` object per record: the hero recomputes it
  *  on every playback scrub. The per-record arithmetic lives in `amountOf`
  *  alone; this only adds its results up. */
 export function sumUsage(records: readonly NormRecord[], opts: SumOptions = {}): UsageSum {
-  const out: UsageSum = { total: 0, prompt: 0, completion: 0, cached: null, utility: 0, usageRecords: 0, reported: 0, legacyCompletes: 0 };
-  const add = (p: UsagePayload): boolean => {
+  const out: UsageSum = { total: 0, prompt: 0, completion: 0, cached: null, utility: 0, usageRecords: 0, reported: 0 };
+  for (const r of records) {
+    if (!isUsageRecord(r)) continue;
+    const p = payloadOf(r);
     const amount = amountOf(p, opts);
-    if (!amount) return false;
+    if (!amount) continue;
     out.total += amount.total;
     out.prompt += amount.prompt;
     out.completion += amount.completion;
     if (amount.cached !== null) out.cached = (out.cached ?? 0) + amount.cached;
     if (amount.purpose === PURPOSE.utility) out.utility += amount.total;
     if (hasAnyTokenCounts(p)) out.reported++;
-    return true;
-  };
-  const withUsage = new Set<string>();
-  const completes: NormRecord[] = [];
-  for (const r of records) {
-    if (isUsageRecord(r)) {
-      withUsage.add(executionOf(r));
-      if (add(payloadOf(r))) out.usageRecords++;
-    } else if (r.action === ACTION.DispatchComplete) {
-      completes.push(r);
-    }
+    out.usageRecords++;
   }
-  for (const r of completes) if (isLegacyFallbackComplete(r, withUsage) && add(payloadOf(r))) out.legacyCompletes++;
   return out;
 }
 

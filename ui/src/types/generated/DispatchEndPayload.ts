@@ -105,10 +105,6 @@ kind?: string,
  */
 item_index?: number, 
 /**
- * What an unmanaged-endpoint step's item spent.
- */
-unmanaged_tokens?: number, 
-/**
  * The graph step the record belongs to, when its session is a step's.
  */
 step_id?: string, 

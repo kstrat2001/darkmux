@@ -1109,6 +1109,7 @@ StepRow
   startedTs?: uint64 | null
   completedTs?: uint64 | null
   tokensFinal?: uint64 | null
+  tokensUtility?: uint64 | null
   turnsFinal?: uint64 | null
   model?: string | null
   error?: string | null
@@ -1185,7 +1186,9 @@ UidSource = "card" | "declared" | "flow_history" | "unknown"
 UnavailableWhy = "no_card_route" | "other_schema_major" | "unparseable" | "unknown"
 UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "pin_not_saved" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown"
 UsageGroup
+  machine?: string | null
   endpoint?: string | null
+  endpoint_id?: string | null
   requested_model?: string | null
   reported_model?: string | null
   work: UsageSplit
@@ -1201,12 +1204,14 @@ UsageReport
   default_window: boolean
   overall: UsageSum
   groups: UsageGroup[]
+  no_run: UsageSplit
 UsageSplit
   calls: uint64
   total: uint64
   input: uint64
   cached?: uint64 | null
   generated: uint64
+  unreported: uint64
 UsageSum
   total: uint64
   prompt: uint64
@@ -1215,7 +1220,6 @@ UsageSum
   utility: uint64
   usage_records: uint64
   reported: uint64
-  legacy_completes: uint64
 UsageWindow
   period?: string | null
   tokens?: uint64 | null

@@ -5609,6 +5609,7 @@
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
+            tokens_utility: None,
             turns_final: None,
             model: None,
             error: None,
@@ -5642,6 +5643,7 @@
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
+            tokens_utility: None,
             turns_final: None,
             model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
             error: None,
@@ -6507,15 +6509,22 @@
         // mission was just minted with created_ts = now — a hardcoded date
         // would silently fall out of the window when run later.
         let flows = TempDir::new().unwrap();
-        let rec = serde_json::json!({
+        let complete = serde_json::json!({
             "action": "dispatch.complete",
             "session_id": "step-ran-step",
-            "payload": { "total_tokens": 12345, "total_turns": 7 }
+            "payload": { "total_tokens": 99999, "total_turns": 7 }
+        });
+        // The step's tokens are its usage records' sum: the terminal's own
+        // `total_tokens` (99999) is never read.
+        let usage = serde_json::json!({
+            "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+            "session_id": "step-ran-step",
+            "payload": { "call_kind": "turn", "token_source": "provider", "total_tokens": 12345 }
         });
         let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
         std::fs::write(
             flows.path().join(format!("{today}.jsonl")),
-            format!("{}\n", serde_json::to_string(&rec).unwrap()),
+            format!("{}\n{}\n", serde_json::to_string(&complete).unwrap(), serde_json::to_string(&usage).unwrap()),
         )
         .unwrap();
 

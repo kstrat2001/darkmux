@@ -108,8 +108,7 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
 
   // (#1607) Savings-hero attribution harness. Three sessions, one per tier:
   // a positively-LOCAL one (bookends, no endpoint), a CLOUD one whose
-  // completion names an endpoint and reports spend only as `remote_tokens`
-  // (the review path's actual shape), and an UNKNOWN one — a `task:` seat
+  // completion names an endpoint (a completion states no tokens), and an UNKNOWN one — a `task:` seat
   // session with tokens and no bookend of its own. viewer-savings.spec.js
   // asserts the three-way split, and specifically that unknown is NOT
   // credited to local.

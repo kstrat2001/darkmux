@@ -40,8 +40,6 @@ enum Duty {
     /// A transport itself (it has no session to attribute a record to; its
     /// callers emit).
     Transport,
-    /// Deliberately emits none, with the reason.
-    Exempt(&'static str),
 }
 
 struct CallSite {
@@ -80,10 +78,10 @@ const ROSTER: &[CallSite] = &[
         file: "src/dispatch_internal.rs",
         caller: "probe_unmanaged_endpoint",
         transport: "remote_chat_completion(",
-        duty: Duty::Exempt(
-            "`doctor --probe`: a 64-token connectivity check with no session id and no \
-             bookends, so a usage record would belong to no run. Open question for #2902.",
-        ),
+        duty: Duty::Emits {
+            writer_in: ("src/dispatch_internal.rs", "probe_unmanaged_endpoint"),
+            test: "dispatch_internal::tests::usage_conformance_probe_unmanaged_endpoint",
+        },
     },
     CallSite {
         file: "src/dispatch_internal.rs",
@@ -250,8 +248,7 @@ fn every_transport_call_site_is_on_the_roster() {
                 found, rostered,
                 "{file}: {found} production call(s) of `{transport}` but {rostered} on the usage \
                  roster. A new model call path must decide its usage record (#2902): emit one \
-                 through `crate::usage` and add a `CallSite` with its behavioral test, or add an \
-                 `Exempt` entry saying why it cannot."
+                 through `crate::usage` and add a `CallSite` with its behavioral test."
             );
         }
     }
@@ -300,7 +297,7 @@ fn every_roster_path_calls_the_writer() {
         .iter()
         .filter_map(|c| match c.duty {
             Duty::Emits { writer_in, test } => Some((writer_in, test)),
-            Duty::Transport | Duty::Exempt(_) => None,
+            Duty::Transport => None,
         })
         .collect();
     sites.push((
@@ -313,16 +310,6 @@ fn every_roster_path_calls_the_writer() {
             WRITER.iter().any(|w| body.contains(w)),
             "{file}::{func} must emit its usage record through `crate::usage` (behavioral test: {test})"
         );
-    }
-    for c in ROSTER {
-        if let Duty::Exempt(why) = c.duty {
-            assert!(
-                !why.is_empty(),
-                "{}::{} is exempt without a reason",
-                c.file,
-                c.caller
-            );
-        }
     }
 }
 

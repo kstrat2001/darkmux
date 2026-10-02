@@ -43,9 +43,10 @@ test('the hero states one total, counts the unattributable, and claims no attrib
 
   // Fixture (`tests/fixtures/savings-flow.jsonl`), by tier:
   //   local   1,000  — `sess-local`, bookends and no endpoint anywhere
-  //   cloud   5,700  — `sess-cloud` 5,000 (completion names an endpoint and
-  //                    reports spend only as `remote_tokens`, the review
-  //                    path's real shape) + `sess-direct` 700
+  //   cloud   5,700  — `sess-cloud` 5,000 (its completion names an endpoint)
+  //                    + `sess-direct` 700 (usage record; its completion
+  //                    names an endpoint and states no tokens, since a
+  //                    completion carries none)
   //   unknown 1,200  — `task:probe-seat` 300 (a seat session with tokens and
   //                    no bookend of its own) + `sess-errored` 900 (its start
   //                    named no endpoint and its terminal is `dispatch

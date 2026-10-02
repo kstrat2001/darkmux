@@ -1,16 +1,14 @@
 {
-  "_doc": "(#2902 step 2b review) The ONE value domain both sums read a count in: a finite number is floored to an integer and clamped to [0, 2^53]; anything else (a string, a bool, null, a negative number) reads as 0 and reports nothing. `cached_tokens` is present when the record carries a finite number (then read the same way, so -3 is a reported 0), absent otherwise. The legacy complete's own 'reported' test uses the same rule: a complete whose counts are all negative or non-numeric is not token-bearing and is never counted. Shared by the viewer's TS tests and the Rust aggregator.",
+  "_doc": "(#2902 step 2b review, 5.0) The ONE value domain both sums read a count in: a finite number is floored to an integer and clamped to [0, 2^53]; anything else (a string, a bool, null, a negative number) reads as 0 and reports nothing. `cached_tokens` is present when the record carries a finite number (then read the same way, so -3 is a reported 0), absent otherwise. `dispatch complete` records in domain.jsonl carry counts of every shape on purpose: none of them is read. Shared by the viewer's TS tests and the Rust aggregator.",
   "usage_records": 3,
-  "legacy_completes_counted": 2,
-  "reported_entries": 4,
+  "reported_entries": 2,
   "overall": {
-    "total": 22,
-    "input": 8,
-    "generated": 4,
+    "total": 6,
+    "input": 3,
+    "generated": 2,
     "cached": 0
   },
   "by_requested_model": {
-    "edge-m": 6,
-    "(none)": 16
+    "edge-m": 6
   }
 }

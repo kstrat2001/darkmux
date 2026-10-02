@@ -25,10 +25,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
 //           field is `dispatch`; `step start` `seat_class` `remote_endpoint`
 //           is `unmanaged_endpoint`; `step result` `remote_max_tokens_per_execution`
-//           is `tokens_per_dispatch`; the `remote` flag on a `telemetry.tokens`
-//           or `step result` payload is `unmanaged` and a `dispatch.complete`
-//           `remote_tokens` is `unmanaged_tokens`, the old keys read from an
-//           archive and are never written; `hub_id`, the Redis stream id the
+//           is `tokens_per_dispatch`; the `remote` flag on a `step result`
+//           payload is `unmanaged`, the old key read from an archive and
+//           never written (a `telemetry.tokens` payload and a
+//           `dispatch.complete` carry neither flag nor `remote_tokens` at all,
+//           #3067); `hub_id`, the Redis stream id the
 //           daemon adds to a record it reads off the fleet hub, is not a
 //           stored field: no flow file holds it)
 //           per event. Every action is a `FlowAction` variant (`action.rs`),
@@ -84,6 +85,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           itself is unchanged, so its identity matches the copy a reader
 //           may already hold. Readers select entry fields by name and
 //           ignore the marker.
+//
+//           Also (5.0, #3067, folded in, unreleased): a token total is a
+//           plain sum of `telemetry.tokens` usage records, and nothing else.
+//           REMOVED the hosted/local leftovers of the old accounting: the
+//           `remote` flag of a `dispatch.map` usage record, and the
+//           `remote_tokens` field of a `dispatch.complete` (a hosted map
+//           item's spend, which a pre-5.0 reader fell back to when a run had
+//           no usage record; the usage record is the one place a call's tokens
+//           are written). A `dispatch.complete` still states its own
+//           `total_tokens` etc., but no sum reads them. A record from before
+//           5.0 that carries either field is read with the field ignored.
 //
 //           Also (5.0, #3036): REMOVED the `machine.rollup` action and its
 //           payload (the periodic whole-machine heartbeat) together with the

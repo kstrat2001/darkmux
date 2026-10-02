@@ -199,7 +199,7 @@ fn table_text(out: &mut String, set: &StatsSet) {
     let w = set.runs.iter().map(|s| s.run.len()).chain(set.errors.iter().map(|e| e.run.len())).max().unwrap_or(3).max(3);
     p!(out,
         "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  flags",
-        "run", "verify", "active", "rest", "turns", "tok/s", "billed", "tokens", "cuts", "pkgW", "duty", "J/1ktok"
+        "run", "verify", "active", "rest", "turns", "tok/s", "billed", "out tok", "cuts", "pkgW", "duty", "J/1ktok"
     );
     for s in &set.runs {
         let mut f = flags(s);
@@ -262,7 +262,7 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
         ("active", |s| s.active_ms, &secs),
         ("rest", |s| s.rest_ms, &secs),
         ("turns", |s| s.turns, &int),
-        ("tokens", |s| s.completion_tokens, &int),
+        ("tokens (compl.)", |s| s.completion_tokens, &int),
         ("tok/s", |s| s.tok_per_s, &one),
         ("billed share", |s| s.billed_gen_fraction, &pct),
         ("gpu W busy", |s| s.gpu_w_busy, &one),

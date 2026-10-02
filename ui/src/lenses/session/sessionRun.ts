@@ -60,7 +60,7 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { PURPOSE, isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
+import { isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
@@ -433,17 +433,20 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
   }
 }
 
-/** (#2902 step 2a) An execution's OWN token numbers: the plain sum of its
- *  usage records (the one `sumUsage`, legacy fallback included), minus
- *  darkmux's utility jobs (compaction, radio routing): a sub-execution is
- *  never blended into the primary (CLAUDE.md contract 8). A session whose
- *  ONLY calls are utility jobs (a radio-routing dispatch) IS that job, so its
- *  page shows them. `null` when nothing was measured (the tile shows "—").
- *  Replaces #2759's hardcoded utility-role handle list. */
-function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number } | null {
-  const own = sumUsage(records, { exclude: PURPOSE.utility });
-  const s = own.usageRecords + own.legacyCompletes > 0 ? own : sumUsage(records);
-  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion } : null;
+/** (#2902 step 2a, #3067) An execution's token numbers: the plain sum of its
+ *  usage records, ALL of them (the one `sumUsage`, the figure the runs board's
+ *  TOKENS cell and the server's `Run.tokens` show), with the utility part
+ *  (compaction, radio routing) named beside it as `utility` rather than left
+ *  out: a page showing less than its row is two answers for one run. `null`
+ *  when nothing was measured (the tile shows "—"). */
+function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number; utility: number } | null {
+  const s = sumUsage(records);
+  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion, utility: s.utility } : null;
+}
+
+/** The three token figures a tile reads, each `null` when nothing was measured. */
+function tokenFigures(tok: ReturnType<typeof executionTokens>): { tokIn: number | null; tokOut: number | null; tokUtility: number | null } {
+  return { tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, tokUtility: tok ? tok.utility : null };
 }
 
 interface MissionModelRollup {
@@ -451,6 +454,7 @@ interface MissionModelRollup {
   turns: number | null;
   tokIn: number | null;
   tokOut: number | null;
+  tokUtility: number | null;
   ctxPeak: number;
   ctxNow: number;
   nctx: number;
@@ -501,7 +505,7 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
  *  telemetry finding real numbers on its inner sessions), not per-seat
  *  breakdown. */
 function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRollup {
-  const acc: MissionModelRollup = { hasEvidence: false, turns: null, tokIn: null, tokOut: null, ctxPeak: 0, ctxNow: 0, nctx: 0, loadLines: [] };
+  const acc: MissionModelRollup = { hasEvidence: false, turns: null, tokIn: null, tokOut: null, tokUtility: null, ctxPeak: 0, ctxNow: 0, nctx: 0, loadLines: [] };
   for (const g of siblings) {
     const fig = executionFigures(g.records);
     if (fig) addFigures(acc, fig);
@@ -510,14 +514,14 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
 }
 
 /** One inner execution's MODEL numbers, or `null` when it did no model
- *  work. (#2902 step 2a) Its own tokens, utility excluded. */
+ *  work. (#3067) Its tokens, utility named beside them. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
   const tok = executionTokens(own);
   const cx = contextFigures(tel);
   const loads = bySource(tel, SOURCE.Lms).filter(isLoad);
   const turns = turnCount(own);
-  const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
+  const fig = { turns, ...tokenFigures(tok), ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
   return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
 }
 
@@ -550,6 +554,7 @@ function addFigures(acc: MissionModelRollup, f: ModelFigures & { loads: NormReco
   acc.turns = addOpt(acc.turns, f.turns);
   acc.tokIn = addOpt(acc.tokIn, f.tokIn);
   acc.tokOut = addOpt(acc.tokOut, f.tokOut);
+  acc.tokUtility = addOpt(acc.tokUtility, f.tokUtility);
   acc.ctxPeak = Math.max(acc.ctxPeak, f.ctxPeak);
   acc.ctxNow = Math.max(acc.ctxNow, f.ctxNow);
   acc.nctx = Math.max(acc.nctx, f.nctx);
@@ -848,9 +853,17 @@ interface ModelFigures {
   turns: number | null;
   tokIn: number | null;
   tokOut: number | null;
+  /** The utility part of `tokIn + tokOut` (compaction, radio routing), named
+   *  rather than left out; `null` when nothing was measured. */
+  tokUtility: number | null;
   ctxPeak: number;
   ctxNow: number;
   nctx: number;
+}
+
+/** (#3067) The hover text naming the utility part of the token tiles. */
+function utilityHintOf(tokUtility: number | null): string | undefined {
+  return tokUtility ? `includes ${fmtC(tokUtility)} tokens of utility calls (compaction, radio routing)` : undefined;
 }
 
 /** (#2759) The MODEL pane's numbers: this run's own when it has telemetry,
@@ -864,6 +877,7 @@ function effectiveFigures(own: ModelFigures, ownEvidence: boolean, rollup: Missi
     turns: rollup.turns ?? own.turns,
     tokIn: rollup.tokIn ?? own.tokIn,
     tokOut: rollup.tokOut ?? own.tokOut,
+    tokUtility: rollup.tokUtility ?? own.tokUtility,
     ctxPeak: ctx.ctxPeak,
     ctxNow: ctx.ctxNow,
     nctx: ctx.nctx,
@@ -1621,12 +1635,9 @@ export function runRegions(
   const remoteEp = sp.endpoint || endPayloadOf(c)?.endpoint;
   const model = modelOf(d, remoteEp, distinct);
 
-  // (#2902 step 2a) The plain sum of this attempt's usage records, utility
-  // excluded; a legacy run with none reads its `dispatch complete` through
-  // the same function's legacy fallback.
-  const ownTok = executionTokens(c ? [...tel, c] : tel);
-  const tokIn = ownTok ? ownTok.prompt : null;
-  const tokOut = ownTok ? ownTok.completion : null;
+  // (#2902 step 2a, #3067) The plain sum of this attempt's usage records, all
+  // purposes, the utility part named.
+  const { tokIn, tokOut, tokUtility } = tokenFigures(executionTokens(c ? [...tel, c] : tel));
 
   // ── brief ──────────────────────────────────────────────────────────
   // (#2011) Same `runWallMs` the WALL CLOCK tile shows. The two lines report
@@ -1659,8 +1670,8 @@ export function runRegions(
   const missionRuns = missionIdForRollup ? runIndex(data).groupsOfMission(missionIdForRollup) : [];
   const rollup =
     !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(missionRuns.filter((g) => g !== run?.group)) : null;
-  const eff = effectiveFigures({ turns: turnsValue, tokIn, tokOut, ctxPeak, ctxNow, nctx }, ownHasTelemetryEvidence, rollup);
-  const { turns: effTurnsValue, tokIn: effTokIn, tokOut: effTokOut } = eff;
+  const eff = effectiveFigures({ turns: turnsValue, tokIn, tokOut, tokUtility, ctxPeak, ctxNow, nctx }, ownHasTelemetryEvidence, rollup);
+  const { turns: effTurnsValue, tokIn: effTokIn, tokOut: effTokOut, tokUtility: effTokUtility } = eff;
   const ctxTileFigures = ctxTile(eff, done);
 
   // (#1973) Did this unit do MODEL work at all?
@@ -1729,8 +1740,12 @@ export function runRegions(
     push(modelIdx, { value: String(tools.calls), label: "TOOL CALLS", sub: `${tools.failed} failed` });
     push(modelIdx, { value: activeElapsed, label: "ACTIVE TIME", hintTitle: ACTIVE_HINT_TITLE, sub: activeTimeSub(done, wallSub, rests.get("thermal"), armed.thermal === true) });
   }
-  push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN" });
-  push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT" });
+  // (#3067) The tiles count every usage record of the run, the figure the runs
+  // board shows; the part that is darkmux's own utility calls is named in the
+  // tiles' hover text (no layout of its own).
+  const utilityHint = utilityHintOf(effTokUtility);
+  push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN", hintTitle: utilityHint });
+  push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT", hintTitle: utilityHint });
   // A single-shot call records no `telemetry.context` sample and neither
   // bookend names the model's window, so its prompt has nothing to be a share
   // of: the tile reads a dash rather than a guessed window.

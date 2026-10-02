@@ -701,7 +701,8 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   const yesterday = JSON.parse(readFileSync(path.join(CORPUS_DIR, "flow-yesterday.json"), "utf8"));
   let stamped = 0;
   for (const r of yesterday.records) {
-    if (r?.action !== "dispatch.complete") continue;
+    // (#3067) A token total is a sum of usage records; a completion carries none.
+    if (r?.action !== "telemetry.tokens") continue;
     if (!r.payload || typeof r.payload !== "object") continue;
     if (typeof r.payload.completion_tokens !== "number") continue;
     // ONLY records outside `fleet.txt`'s own 24h boundary. That window is
@@ -715,7 +716,7 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   }
   // The mutation has to BITE, or both assertions below pass vacuously —
   // which is the exact failure this whole test exists to rule out.
-  expect(stamped, "the mutation must add tokens to at least one yesterday completion").toBeGreaterThan(0);
+  expect(stamped, "the mutation must add tokens to at least one yesterday usage record").toBeGreaterThan(0);
 
   const installMutated = async () => {
     installCorpusRoutes(page, meta);

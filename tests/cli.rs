@@ -7028,8 +7028,8 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
 /// (#2902 step 2b) The verb end to end: the TOKENS column, `--usage`'s
 /// breakdown (text and `--json`), `--since` as a duration and as a date,
 /// and a bad `--since` refused by name. Two dispatch sessions in today's
-/// day file: one with usage records (its complete is NOT read), one legacy
-/// with tokens only on its complete (read once, the legacy rule).
+/// day file: one with usage records (its complete is NOT read), one pre-5.0
+/// with tokens only on its complete (no usage record: nothing measured).
 #[test]
 fn run_list_usage_breakdown_end_to_end() {
     let home = TempDir::new().unwrap();
@@ -7070,29 +7070,27 @@ fn run_list_usage_breakdown_end_to_end() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let tokens = |id: &str| json["runs"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("{id} in {json}"))["tokens"].clone();
     assert_eq!(tokens("sess-modern"), 1290, "work + utility; the complete's 99,999 is never read");
-    assert_eq!(tokens("sess-legacy"), 700, "the legacy rule reads the complete once");
+    assert!(tokens("sess-legacy").is_null(), "a complete carries no tokens: nothing measured");
     let usage = &json["usage"];
     assert_eq!(usage["default_window"], true);
-    assert_eq!(usage["overall"]["total"], 1990);
+    assert_eq!(usage["overall"]["total"], 1290);
     assert_eq!(usage["overall"]["cached"], 300);
     assert_eq!(usage["overall"]["utility"], 90);
-    assert_eq!(usage["overall"]["legacy_completes"], 1);
     let groups = usage["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 3, "{groups:#?}");
+    assert_eq!(groups.len(), 2, "{groups:#?}");
     assert_eq!(groups[0]["work"]["total"], 1200);
     assert_eq!(groups[0]["reported_model"], "qwen-a-served");
-    assert!(groups[1].get("endpoint").is_none(), "the legacy complete carries no endpoint: {}", groups[1]);
-    assert_eq!(groups[2]["utility"]["total"], 90);
+    assert_eq!(groups[1]["utility"]["total"], 90);
 
     // Text: the TOKENS column and the breakdown under the table.
     let out = run(&["run", "list", "--usage", "--all"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(text.contains("TOKENS"), "{text}");
-    assert!(text.contains("1.29k") && text.contains(" 700 "), "{text}");
+    assert!(text.contains("1.29k"), "{text}");
     assert!(text.contains("usage since ") && text.contains("the default 14-day window"), "{text}");
     assert!(text.contains("reported model: qwen-a-served"), "{text}");
-    assert!(text.contains("1,990"), "{text}");
+    assert!(text.contains("1,290"), "{text}");
 
     // --since as a duration keeps today's rows; as a far-future date it
     // keeps none and the breakdown is empty.
@@ -7100,7 +7098,7 @@ fn run_list_usage_breakdown_end_to_end() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["total"], 2, "{json}");
     assert_eq!(json["usage"]["default_window"], false);
-    assert_eq!(json["usage"]["overall"]["total"], 1990);
+    assert_eq!(json["usage"]["overall"]["total"], 1290);
     let out = run(&["run", "list", "--json", "--usage", "--since", "2999-01-01"]);
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["total"], 0, "{json}");
@@ -7121,6 +7119,50 @@ fn run_list_usage_breakdown_end_to_end() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--since") && err.contains("24h") && err.contains("YYYY-MM-DD"), "{err}");
+}
+
+/// (#3067) The verb end to end over two machines' records that name the
+/// same `localhost` endpoint and model: two rows, each with its machine, in
+/// `--json` and in the text MACHINE column; the overall sums both.
+#[test]
+fn run_list_usage_keys_rows_on_the_executing_machine() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let now = darkmux_flow::ts_utc_now();
+    let usage = |machine: &str, uid: &str, total: u64| {
+        serde_json::json!({
+            "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+            "session_id": format!("s-{machine}"), "execution_id": format!("exec-{machine}"), "handle": "coder",
+            "machine_id": machine, "machine_uid": uid,
+            "payload": { "call_kind": "turn", "purpose": "work", "requested_model": "phi-4", "endpoint": "http://localhost:1234/v1", "token_source": "provider", "prompt_tokens": total - 1, "completion_tokens": 1, "total_tokens": total }
+        })
+    };
+    let body: String = [usage("laptop", "UID-A", 100), usage("studio", "UID-B", 30)].iter().map(|r| format!("{r}\n")).collect();
+    fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
+    let run = |args: &[&str]| {
+        darkmux_cmd()
+            .args(args)
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .env("DARKMUX_LAB_DIR", lab.path())
+            .env_remove("DARKMUX_REDIS_URL")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["run", "list", "--json", "--usage", "--all"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let groups = json["usage"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{groups:#?}");
+    assert_eq!((groups[0]["machine"].as_str(), groups[0]["work"]["total"].as_u64()), (Some("laptop"), Some(100)));
+    assert_eq!((groups[1]["machine"].as_str(), groups[1]["work"]["total"].as_u64()), (Some("studio"), Some(30)));
+    assert_eq!(json["usage"]["overall"]["total"], 130);
+    let out = run(&["run", "list", "--usage", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("MACHINE"), "{text}");
+    assert_eq!(text.matches("http://localhost:1234/v1").count(), 2, "one row per machine: {text}");
 }
 
 // ── crawl --dry-run (#1959) ──

@@ -494,8 +494,8 @@ describe("applyRecordToMetrics", () => {
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { total_tokens: 120 } }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_tokens: 500, total_turns: 3 } }), idx, "m1");
     const d = stepDisplayMetrics(m["a-step"]);
-    // (#2902 step 2a) The usage records' plain sum IS the step's figure once
-    // any has been seen; the complete's total is only the legacy fallback.
+    // (#2902 step 2a, #3067) The usage records' plain sum IS the step's figure;
+    // a complete's own total is never read.
     expect(d.tokens).toBe(120);
     expect(d.turns).toBe(3);
   });
@@ -516,21 +516,27 @@ describe("applyRecordToMetrics", () => {
     expect(stepDisplayMetrics(m["a-step"]).turns).toBe(7);
   });
 
-  it("a retried step counts both attempts in tokens and turns (a failed attempt's error terminal included)", () => {
+  const usageRec = (total: number, payload: Record<string, unknown> = {}) =>
+    rec({ handle: "a-step", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { token_source: "provider", total_tokens: total, ...payload } });
+
+  it("a retried step counts both attempts in tokens (usage records) and turns (terminals, a failed attempt's error terminal included)", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
-    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.error", payload: { total_turns: 2, total_tokens: 100 } }), idx, "m1");
+    m = applyRecordToMetrics(m, usageRec(100), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.error", payload: { total_turns: 2, total_tokens: 7777 } }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
-    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_turns: 3, total_tokens: 150 } }), idx, "m1");
+    m = applyRecordToMetrics(m, usageRec(150), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_turns: 3, total_tokens: 7777 } }), idx, "m1");
     const d = stepDisplayMetrics(m["a-step"]);
     expect(d.turns).toBe(5);
     expect(d.tokens).toBe(250);
   });
 
-  it("a map step's items count once beside its per-item and aggregate step results", () => {
+  it("a map step's tokens are its usage records once, whatever its per-item and aggregate step results say", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
     for (const [i, t] of [10, 20, 30].entries()) {
+      m = applyRecordToMetrics(m, usageRec(t, { call_kind: "map_item", index: i }), idx, "m1");
       m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { item_index: i, total_turns: 1, total_tokens: t } }), idx, "m1");
       m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "step.result", payload: { kind: "dispatch.map", item_index: i, total_tokens: t } }), idx, "m1");
     }
@@ -540,11 +546,19 @@ describe("applyRecordToMetrics", () => {
     expect(d.turns).toBe(3);
   });
 
-  it("a step whose executions wrote no terminal tokens reads its step result's total (the review vocabulary)", () => {
+  it("a step result's total is never read for tokens", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "step.result", payload: { kind: "k", total_tokens: 700 } }), idx, "m1");
-    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(700);
+    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(0);
+  });
+
+  it("the utility part of a step's usage is named beside its total", () => {
+    let m: MetricsMap = {};
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
+    m = applyRecordToMetrics(m, usageRec(100), idx, "m1");
+    m = applyRecordToMetrics(m, usageRec(30, { call_kind: "compaction", purpose: "utility" }), idx, "m1");
+    expect(stepDisplayMetrics(m["a-step"])).toMatchObject({ tokens: 130, utility: 30 });
   });
 
   it("the server's finalized turns and the folded terminals are not added together", () => {
@@ -557,11 +571,11 @@ describe("applyRecordToMetrics", () => {
     expect(stepDisplayMetrics(m["a-step"]).turns).toBe(7);
   });
 
-  it("(legacy) a step with no usage record reads its finalized total", () => {
+  it("a step with no usage record is unmeasured: its complete's total is not read", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_tokens: 500, total_turns: 3 } }), idx, "m1");
-    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(500);
+    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(0);
   });
 
   // Either dispatch terminal closes the step's span.
@@ -633,14 +647,13 @@ describe("applyRecordToMetrics", () => {
 describe("seedMetricsFromGraph", () => {
   it("seeds finalized totals and takes the max against a live value already climbing", () => {
     const g: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], tokensFinal: 900, turnsFinal: 4 }] }, TASK_B] };
-    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, tokEnded: 0, tokResult: 0, turnRun: 0, turnFinal: 0, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 } };
+    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 0, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs: 0, endTs: 0, lastTs: 0 } };
     m = seedMetricsFromGraph(m, g);
     expect(m["a-step"].tokFinal).toBe(900);
-    // the live running sum is untouched, but `stepDisplayMetrics` prefers
-    // the FINALIZED total once one exists (mission-graph.html's own
-    // `stepDisplayMetrics`: "the finalized total when the dispatch closed,
-    // else the running per-turn sum" — not a max of the two).
-    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(900);
+    // The live running sum is untouched, and `stepDisplayMetrics` takes the
+    // larger of it and the server's total (both sum the same usage records,
+    // so they are never added).
+    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(950);
   });
 
   it("is a no-op (same reference) when nothing in the graph has any backfill data", () => {
@@ -669,9 +682,9 @@ describe("hasNoMetricsData", () => {
 describe("missionTotals", () => {
   it("sums every step's own figure (no local/cloud/unknown split)", () => {
     const m: MetricsMap = {
-      a: { tokRun: 0, tokFinal: 100, tokEnded: 0, tokResult: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
-      b: { tokRun: 0, tokFinal: 50, tokEnded: 0, tokResult: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
-      c: { tokRun: 0, tokFinal: 30, tokEnded: 0, tokResult: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      a: { tokRun: 0, tokFinal: 100, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs: 0, endTs: 0, lastTs: 0 },
+      b: { tokRun: 0, tokFinal: 50, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs: 0, endTs: 0, lastTs: 0 },
+      c: { tokRun: 0, tokFinal: 30, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs: 0, endTs: 0, lastTs: 0 },
     };
     const tot = missionTotals(m);
     expect(tot).toEqual({ total: 180, turns: 3 });
@@ -732,7 +745,7 @@ describe("formatting helpers", () => {
 // token counts with no idea which step took the hour.
 describe("stepMeterFor wall time (#2269)", () => {
   const T0 = 1_756_900_000_000;
-  const base = { tokRun: 0, tokFinal: 10, tokEnded: 0, tokResult: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false };
+  const base = { tokRun: 0, tokFinal: 10, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0 };
   it("a completed step carries its wall time (end − start) and is not generating", () => {
     const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" as const };
     const m = { ...base, startTs: T0, endTs: T0 + 335_000, lastTs: T0 + 335_000 };

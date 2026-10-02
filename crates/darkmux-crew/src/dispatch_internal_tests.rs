@@ -827,6 +827,41 @@
         assert!(request.contains("\"model\":\"probe-model-x\""), "{request}");
     }
 
+    /// (#3067) The probe is a real model call that spends real tokens, so it
+    /// leaves ONE usage record like every other call (the roster's duty), on
+    /// no run: it carries no session, and the breakdown shows it as a call
+    /// that belongs to no run.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_FLOWS_DIR
+    fn usage_conformance_probe_unmanaged_endpoint() {
+        let (base_url, _rx) = one_shot_http_mock(
+            r#"{"model":"served-by-mock","usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":9},"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let flows_dir = TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let ep = darkmux_types::ModelEndpoint { url: Some(base_url), ..Default::default() };
+        let report = probe_unmanaged_endpoint(&ep, "probe-model-x", 15);
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let report = report.unwrap();
+        let records = drain_flow_records(flows_dir.path());
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "probe_unmanaged_endpoint");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "probe-model-x");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        assert_eq!(p["endpoint"], report.label.as_str());
+        assert_eq!(p["total_tokens"], 9);
+        assert_eq!(p["purpose"], "work");
+        assert!(rec.get("session_id").is_none_or(|s| s.is_null()), "the probe belongs to no run: {rec}");
+    }
+
     #[test]
     fn probe_unmanaged_endpoint_surfaces_the_endpoint_error_verbatim() {
         // An HTTP-200-with-error-object body (curl without --fail also maps

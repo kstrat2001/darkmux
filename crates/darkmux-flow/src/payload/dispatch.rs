@@ -542,10 +542,6 @@ pub struct DispatchEndPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub item_index: Option<u64>,
-    /// What an unmanaged-endpoint step's item spent.
-    #[serde(default, alias = "remote_tokens", skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
-    pub unmanaged_tokens: Option<u64>,
     /// The graph step the record belongs to, when its session is a step's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -1207,7 +1203,6 @@ impl DispatchEndPayload {
             resumed_from: None,
             kind: None,
             item_index: None,
-            unmanaged_tokens: None,
             step_id: None,
             context: None,
         }
