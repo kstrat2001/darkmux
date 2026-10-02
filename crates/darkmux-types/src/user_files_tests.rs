@@ -190,12 +190,12 @@ fn check_dir_reads_every_json_file_and_skips_the_rest() {
 
 // ── config.json ──
 
+/// Every key issue the gate finds, before a harmless retired leftover is
+/// moved to a warning (`config_check_text`, #3057).
 fn config_keys(doc: Value) -> Vec<KeyIssue> {
-    let text = doc.to_string();
-    match config_problem(&text) {
-        Some(FileProblem { problem: Problem::Keys(k), .. }) => k,
-        other => panic!("expected unknown keys, got {other:?}"),
-    }
+    let keys = key_issues::<crate::config::DarkmuxConfig>(&doc, &config_retired);
+    assert!(!keys.is_empty(), "expected unknown keys in {doc}");
+    keys
 }
 
 fn config_problem(text: &str) -> Option<FileProblem> {
@@ -602,4 +602,132 @@ fn config_json_with_a_newer_marker_is_refused_for_its_version() {
     std::fs::write(&path, r#"{"schema_version": "99.0", "from_the_future": true}"#).unwrap();
     let fp = config_json_problem_at(&path).expect("refused");
     assert!(matches!(fp.problem, Problem::Newer { .. }), "{fp}");
+}
+
+// ── (#3057) a retired key at its old default warns; a value that was set refuses ──
+
+fn config_check(doc: Value) -> ConfigCheck {
+    config_check_text(Path::new("config.json"), &doc.to_string())
+}
+
+fn warned(check: &ConfigCheck) -> Vec<&str> {
+    check.warnings.iter().map(|w| w.key.as_str()).collect()
+}
+
+/// A real 4.x install (darkbook): what `darkmux init` wrote, verbatim. 5.0
+/// retired every one of these keys, and none holds a value that ignoring
+/// changes, so the config must warn and refuse nothing.
+#[test]
+fn the_retired_keys_init_wrote_at_their_defaults_warn_and_refuse_nothing() {
+    let check = config_check(json!({
+        "runtime": {"log_level": "info", "daemon_auth_enabled": false, "telemetry_record_every_samples": 5},
+        "remote": {"max_tokens_per_step": null, "step_budget_policy": "warn", "concurrent_cap": 1},
+        "machine_rollup": {"enabled": false, "period_seconds": 60}
+    }));
+    assert_eq!(check.refusal, None);
+    let mut keys = warned(&check);
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["machine_rollup", "remote", "runtime.daemon_auth_enabled", "runtime.log_level", "runtime.telemetry_record_every_samples"]
+    );
+    let line = check.warnings.iter().find(|w| w.key == "machine_rollup").unwrap().to_string();
+    assert!(line.starts_with("machine_rollup in config.json is ignored: removed in 5.0"), "{line}");
+}
+
+/// Every older `init` default (3.x wrote `remote.max_tokens_per_execution:
+/// 500000`, `orchestrator: ""`, a `review` block and a `gh` block).
+#[test]
+fn every_older_init_default_warns() {
+    let check = config_check(json!({
+        "orchestrator": "",
+        "review": {"judge_concurrency": 1, "judge_fail_on_any_skip": false},
+        "gh": {"enabled": false, "allowed": []},
+        "remote": {"max_tokens_per_execution": 500000, "concurrent_cap": 4}
+    }));
+    assert_eq!(check.refusal, None);
+    assert_eq!(check.warnings.len(), 4, "{:?}", check.warnings);
+}
+
+/// A spend cap that was actually set: ignoring it removes the cap.
+#[test]
+fn a_set_spend_cap_is_still_refused() {
+    for block in [json!({"max_tokens_per_step": 50000}), json!({"max_tokens_per_execution": 250000})] {
+        let check = config_check(json!({"remote": block}));
+        let refusal = check.refusal.unwrap_or_else(|| panic!("{block} must be refused"));
+        assert!(refusal.to_string().contains("`remote`: removed in 5.0"), "{refusal}");
+        assert!(check.warnings.is_empty(), "{:?}", check.warnings);
+    }
+}
+
+/// A feature the operator turned on: ignoring it silently drops it.
+#[test]
+fn machine_rollup_turned_on_is_still_refused() {
+    let check = config_check(json!({"machine_rollup": {"enabled": true, "period_seconds": 60}}));
+    assert!(check.refusal.is_some());
+    assert!(check.warnings.is_empty());
+}
+
+#[test]
+fn the_other_retired_gates_that_were_turned_on_are_still_refused() {
+    for doc in [
+        json!({"runtime": {"daemon_auth_enabled": true}}),
+        json!({"gh": {"enabled": true, "allowed": []}}),
+        json!({"gh": {"enabled": false, "allowed": ["x"]}}),
+        json!({"remote": {"unknown_child": 1}}),
+        json!({"remote": 5}),
+        json!({"dirs": {"crew": "/x"}}),
+    ] {
+        assert!(config_check(doc.clone()).refusal.is_some(), "{doc} must be refused");
+    }
+}
+
+/// One unsafe key does not drag the harmless ones into the refusal, and does
+/// not hide them: the refusal names only what is unsafe.
+#[test]
+fn a_harmless_leftover_beside_an_unsafe_one_still_warns() {
+    let check = config_check(json!({
+        "runtime": {"log_level": "info"},
+        "remote": {"max_tokens_per_step": 50000},
+    }));
+    assert_eq!(warned(&check), ["runtime.log_level"]);
+    let refusal = check.refusal.expect("the cap is refused").to_string();
+    assert!(refusal.contains("`remote`") && !refusal.contains("log_level"), "{refusal}");
+}
+
+/// A genuinely unknown key is not a leftover: it refuses as before.
+#[test]
+fn an_unknown_key_beside_a_harmless_leftover_still_refuses() {
+    let check = config_check(json!({"runtime": {"log_level": "info"}, "redis": {"hots": "h"}}));
+    assert_eq!(warned(&check), ["runtime.log_level"]);
+    assert!(check.refusal.unwrap().to_string().contains("redis.hots"));
+}
+
+/// The per-key judgment, one row each.
+#[test]
+fn each_retired_key_is_judged_by_its_value() {
+    let harmless = [
+        ("runtime.log_level", json!("info")),
+        ("remote.max_tokens_per_step", json!(null)),
+        ("remote.step_budget_policy", json!("warn")),
+        ("remote.step_budget_policy", json!(null)),
+        ("remote.concurrent_cap", json!(1)),
+        ("remote.concurrent_cap", json!(64)),
+        ("machine_rollup.enabled", json!(false)),
+        ("machine_rollup.period_seconds", json!(60)),
+        ("dirs.ack", json!("/any/where")),
+    ];
+    for (key, value) in harmless {
+        assert!(crate::config::leftover_is_harmless(key, &value), "{key} = {value} must warn");
+    }
+    let unsafe_values = [
+        ("remote.max_tokens_per_step", json!(50000)),
+        ("remote.step_budget_policy", json!("wait")),
+        ("machine_rollup.enabled", json!(true)),
+        ("runtime.log_level", json!("debug")),
+        ("not.retired", json!(null)),
+    ];
+    for (key, value) in unsafe_values {
+        assert!(!crate::config::leftover_is_harmless(key, &value), "{key} = {value} must refuse");
+    }
 }

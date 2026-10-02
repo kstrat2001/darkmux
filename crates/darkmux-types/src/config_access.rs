@@ -1133,8 +1133,9 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
 /// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
 /// `config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
 /// them is `refuse_retired_env`, called once at CLI entry; `doctor` reads this
-/// list to report them. A leftover `config.json` key is refused as an unknown
-/// key instead (`user_files`).
+/// list to report them. A leftover `config.json` key is judged by its value
+/// instead: refused as an unknown key, or only warned about at its old default
+/// (`user_files::config_check_text`, #3057).
 pub fn retired_env_leftovers() -> Vec<crate::config::RetiredLeftover> {
     crate::config::retired_env_leftovers(&env_str)
 }

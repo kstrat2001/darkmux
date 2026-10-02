@@ -2340,7 +2340,9 @@ const USER_FILE_KEYS_CHECK_NAME: &str = "user file keys";
 
 /// (4.0) One Fail row per user file (`darkmux_types::user_files`) that
 /// carries a key its schema does not know or is not JSON, with the same
-/// message the preflight refuses with, and one Pass row when there is none.
+/// message the preflight refuses with; one Warn row per retired `config.json`
+/// key still at a value ignoring which changes nothing (#3057, it refuses
+/// nothing); and one Pass row when there is neither.
 /// Loading ignores an unknown key, so this and the preflight are where it
 /// surfaces. The crawl's workspace spec has no fixed location; its launch
 /// refuses it where it is loaded.
@@ -2348,7 +2350,8 @@ pub fn check_user_file_keys() -> Vec<Check> {
     use darkmux_types::user_files::UserFileKind;
     let problems: Vec<darkmux_types::user_files::FileProblem> =
         UserFileKind::ALL.into_iter().flat_map(user_file_problems).collect();
-    user_file_key_rows(&problems)
+    let warnings = darkmux_types::user_files::config_json_warnings();
+    user_file_key_rows(&problems, &warnings)
 }
 
 /// Every problem in the files of `kind`, from the crate that owns its type.
@@ -2406,8 +2409,11 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
 }
 
 /// Pure row builder for [`check_user_file_keys`].
-fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Vec<Check> {
-    if problems.is_empty() {
+fn user_file_key_rows(
+    problems: &[darkmux_types::user_files::FileProblem],
+    warnings: &[darkmux_types::user_files::LeftoverWarning],
+) -> Vec<Check> {
+    if problems.is_empty() && warnings.is_empty() {
         return vec![Check {
             name: USER_FILE_KEYS_CHECK_NAME.into(),
             status: Status::Pass,
@@ -2440,7 +2446,19 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
                 hint: Some(user_file_hint(p)),
             }
         })
+        .chain(warnings.iter().map(leftover_warning_row))
         .collect()
+}
+
+/// A retired `config.json` key at a value ignoring which changes nothing: a
+/// Warn row, since nothing refuses to start over it (#3057).
+fn leftover_warning_row(w: &darkmux_types::user_files::LeftoverWarning) -> Check {
+    Check {
+        name: format!("{USER_FILE_KEYS_CHECK_NAME}: config.json"),
+        status: Status::Warn,
+        message: format!("{}. It holds its old default, so nothing refuses to start over it", w.to_string().trim_end_matches('.')),
+        hint: Some("delete it from config.json; it is safe to remove".to_string()),
+    }
 }
 
 /// (#2947) THE doctor check for enum-typed settings: one row per entry of
@@ -2652,7 +2670,8 @@ fn resolved_config_path() -> std::path::PathBuf {
 /// is refused by every command but `doctor` and `config` and fails this row,
 /// and one whose loss changes nothing is ignored with a warning and warns
 /// here, each naming the replacement. A leftover old `config.json` key is an
-/// unknown key, which the user-file keys row fails.
+/// unknown key, which the user-file keys row fails, or a warning there when it
+/// holds its old default (#3057).
 fn check_renamed_budget_settings() -> Check {
     renamed_settings_status(&|k| std::env::var(k).ok())
 }
@@ -16995,7 +17014,7 @@ mod user_file_key_tests {
 
     #[test]
     fn a_clean_set_is_one_pass_row() {
-        let rows = user_file_key_rows(&[]);
+        let rows = user_file_key_rows(&[], &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, Status::Pass);
     }
@@ -17014,7 +17033,7 @@ mod user_file_key_tests {
             .iter()
             .filter_map(|p| darkmux_types::user_files::config_json_problem_at(p))
             .collect();
-        let rows = user_file_key_rows(&problems);
+        let rows = user_file_key_rows(&problems, &[]);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().all(|r| r.status == Status::Fail));
         assert_eq!(rows[0].name, "user file keys: typo.json");
@@ -17028,6 +17047,40 @@ mod user_file_key_tests {
         assert!(rows[1].message.contains("not valid JSON"), "{}", rows[1].message);
     }
 
+    /// (#3057) darkbook's real config: every retired key `init` wrote, at
+    /// the value it wrote. Doctor shows each as a Warn row (never a Fail),
+    /// and no Pass row claims every key is known.
+    #[test]
+    fn retired_keys_at_their_old_defaults_are_warn_rows_not_fail_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"runtime": {"log_level": "info"},
+                "remote": {"max_tokens_per_step": null, "step_budget_policy": "warn", "concurrent_cap": 1},
+                "machine_rollup": {"enabled": false, "period_seconds": 60}}"#,
+        )
+        .unwrap();
+        let check = darkmux_types::user_files::config_check_at(&path);
+        assert_eq!(check.refusal, None);
+        let rows = user_file_key_rows(&[], &check.warnings);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r.status == Status::Warn), "{rows:?}");
+        assert!(rows.iter().any(|r| r.message.contains("remote in config.json is ignored: removed in 5.0")), "{rows:?}");
+        assert!(rows.iter().all(|r| r.hint.as_deref().is_some_and(|h| h.contains("safe to remove"))), "{rows:?}");
+    }
+
+    /// (#3057) A cap that was set is still a Fail row.
+    #[test]
+    fn a_retired_key_holding_a_set_value_is_still_a_fail_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"remote": {"max_tokens_per_step": 50000}}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("a set cap refuses");
+        let rows = user_file_key_rows(&[problem], &[]);
+        assert_eq!(rows[0].status, Status::Fail);
+    }
+
     /// A `config.json` value of the wrong type (one of which drops every
     /// setting to its default on load) is a Fail row with the preflight's
     /// message.
@@ -17037,7 +17090,7 @@ mod user_file_key_tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"redis": {"enabled": true, "port": "x"}}"#).unwrap();
         let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
-        let rows = user_file_key_rows(&[problem]);
+        let rows = user_file_key_rows(&[problem], &[]);
         assert_eq!(rows[0].status, Status::Fail);
         assert!(rows[0].message.contains("`redis.port` must be an integer from 0 to 65535, got \"x\""), "{}", rows[0].message);
     }
@@ -17049,7 +17102,7 @@ mod user_file_key_tests {
         let path = dir.path().join("a\n  \u{202e}ok.json");
         std::fs::write(&path, r#"{"rediss": 1}"#).unwrap();
         let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
-        let row = &user_file_key_rows(&[problem])[0];
+        let row = &user_file_key_rows(&[problem], &[])[0];
         for text in [&row.name, &row.message] {
             assert!(!text.contains('\n') && !text.contains('\u{202e}'), "{text:?}");
         }
@@ -17067,7 +17120,7 @@ mod user_file_key_tests {
         )
         .unwrap();
         let problem = darkmux_profiles::profiles::user_file_problem(&path).unwrap();
-        let row = &user_file_key_rows(&[problem])[0];
+        let row = &user_file_key_rows(&[problem], &[])[0];
         assert_eq!(row.status, Status::Fail);
         assert!(row.message.contains("profiles.p.models[0].endpoint"), "{}", row.message);
         assert!(row.message.contains("endpoints.\"api.example\""), "{}", row.message);
@@ -17105,7 +17158,7 @@ mod user_file_hint_tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, text).unwrap();
         let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
-        user_file_key_rows(&[problem]).remove(0)
+        user_file_key_rows(&[problem], &[]).remove(0)
     }
 
     /// (review minor) Each kind of problem says its own consequence: an
