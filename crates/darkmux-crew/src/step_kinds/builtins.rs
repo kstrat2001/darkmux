@@ -880,6 +880,60 @@ impl ExecutionBookends<'_> {
     }
 }
 
+/// (#2925) A hosted `dispatch.single_shot` call failed: under the one hosted
+/// error policy ([`crate::dispatch_internal::call_may_have_spent`]) a call the
+/// endpoint may have processed is counted (an `absent` usage record) and
+/// charged against the dispatch cap like a reply with no usage; any other
+/// failure spends nothing. `step_and_endpoint` is the step id and the
+/// endpoint label its records carry.
+fn charge_failed_hosted_step_call(
+    err: &anyhow::Error,
+    req: &crate::single_shot::HostedSingleShotRequest<'_>,
+    bucket: &Mutex<DispatchBudget>,
+    caller: &crate::budget::BudgetCaller<'_>,
+    ctx: Option<&StepRunCtx>,
+    step_and_endpoint: (&str, &str),
+) {
+    if !crate::dispatch_internal::call_may_have_spent(err) {
+        return;
+    }
+    let (step_id, endpoint_label) = step_and_endpoint;
+    let usage = crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        darkmux_flow::FlowSource::Tokens,
+        step_id,
+        caller.session,
+        caller.execution,
+        Some(req.model),
+        None,
+        darkmux_flow::Payload::TelemetryTokens(crate::usage::usage_payload(
+            &crate::usage::CallFacts {
+                call_kind: crate::usage::CallKind::SingleShot,
+                role_id: None,
+                requested_model: req.model,
+                reported_model: None,
+                endpoint: endpoint_label,
+                endpoint_id: req.endpoint.named_id(),
+            },
+            &darkmux_trajectory::UsageCounts::default(),
+        )),
+    );
+    match ctx {
+        Some(c) => c.emit(usage),
+        None => {
+            let _ = darkmux_flow::record(usage);
+        }
+    }
+    if let Ok(body) = req.body() {
+        crate::budget::settle_dispatch_live(
+            bucket,
+            crate::dispatch_internal::unanswered_hosted_spend(err, req.max_tokens, &body),
+            step_id,
+            caller,
+        );
+    }
+}
+
 impl StepKind for DispatchSingleShotStepKind {
     fn id(&self) -> &'static str {
         ConfigKind::DispatchSingleShot.id()
@@ -1062,45 +1116,14 @@ impl DispatchSingleShotStepKind {
             let reply = match single_shot_chat_hosted(&req) {
                 Ok(reply) => reply,
                 Err(e) => {
-                    // The one hosted-error policy (`call_may_have_spent`): a
-                    // call the endpoint may have processed is charged and
-                    // counted like a reply with no usage; any other spends
-                    // nothing.
-                    if crate::dispatch_internal::call_may_have_spent(&e) {
-                        let usage_endpoint = endpoint_label.clone().unwrap_or_default();
-                        let usage = crate::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Info,
-                            darkmux_flow::FlowSource::Tokens,
-                            &step.id,
-                            session,
-                            execution,
-                            Some(wire_model.as_ref()),
-                            None,
-                            darkmux_flow::Payload::TelemetryTokens(crate::usage::usage_payload(
-                                &crate::usage::CallFacts {
-                                    call_kind: crate::usage::CallKind::SingleShot,
-                                    role_id: None,
-                                    requested_model: wire_model.as_ref(),
-                                    reported_model: None,
-                                    endpoint: &usage_endpoint,
-                                    endpoint_id: endpoint.named_id(),
-                                },
-                                &darkmux_trajectory::UsageCounts::default(),
-                            )),
-                        );
-                        match ctx {
-                            Some(c) => c.emit(usage),
-                            None => {
-                                let _ = darkmux_flow::record(usage);
-                            }
-                        }
-                        crate::budget::settle_dispatch_live(
-                            &dispatch_bucket,
-                            crate::dispatch_internal::unanswered_hosted_spend(&e, max_tokens, &req.body()?),
-                            &step.id,
-                            &budget_caller,
-                        );
-                    }
+                    charge_failed_hosted_step_call(
+                        &e,
+                        &req,
+                        &dispatch_bucket,
+                        &budget_caller,
+                        ctx,
+                        (&step.id, endpoint_label.as_deref().unwrap_or_default()),
+                    );
                     return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
                 }
             };
@@ -4879,7 +4902,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0, "the transport is never called");
     }
 
-    /// (5.0) One policy for a failed hosted call, on the map arm: a timeout
+    /// (#2925) One policy for a failed hosted call, on the map arm: a timeout
     /// after sending or a 5xx charges the conservative no-usage amount and is
     /// counted as a call; a failure before sending, a 4xx and a 429 spend
     /// nothing and are not counted.

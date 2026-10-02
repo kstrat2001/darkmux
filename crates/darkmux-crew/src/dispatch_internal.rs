@@ -3459,7 +3459,7 @@ fn failure(kind: HostedFailure, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(HostedFailureError { kind, message: message.into() })
 }
 
-/// (5.0) THE one policy for a hosted call that failed: did the endpoint
+/// (#2925) THE one policy for a hosted call that failed: did the endpoint
 /// possibly process it, so that it may have been billed? A timeout or dropped
 /// reply after the request was sent, and a 5xx, may have been; a failure
 /// before sending, a 4xx (400, 401, 403, ...) and a 429 never were. An error
@@ -3746,7 +3746,7 @@ fn emit_single_shot_usage(
     ));
 }
 
-/// (5.0) A hosted call that was SENT and never answered (a timeout, a dropped
+/// (#2925) A hosted call that was SENT and never answered (a timeout, a dropped
 /// connection, a provider error) still happened, and may have been billed
 /// before it failed, so it is charged like a reply that reported no usage:
 /// an `absent` usage record, which the endpoint's window counts as a call,
@@ -4553,7 +4553,7 @@ fn docker_kill_by_name(container_name: &str) {
     let _ = Command::new("docker").args(["kill", container_name]).output();
 }
 
-/// (5.0) A stop that ends ONE dispatch: the budget pacer saw this run's
+/// (#2925) A stop that ends ONE dispatch: the budget pacer saw this run's
 /// own mission aborted or finalized, or its own phase abandoned
 /// (`budget::run_stop_reason`). Deliberately NOT `interrupt::mark_interrupted`:
 /// that flag is process-global and sticky, so a mission launch running steps
@@ -5618,6 +5618,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     }
 
     let limits_pm = agentic_pm.as_ref().or(managed_pm.as_ref());
+    // A resume runs on the image its origin recorded and is the only live
+    // execution of that origin; see [`resume_preflight`]. Settled BEFORE the
+    // budget gate: a resume that is going to be refused must not first sit in
+    // a `wait` on the endpoint's window, behind the very run it collides with.
+    // The lock is held, with this dispatch's own, until the function returns.
+    let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
     admit_container_start(&opts, &execution, limits_pm)?;
 
     // (#2294) PREFLIGHT: does this workdir's git directory live outside
@@ -5683,11 +5689,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // into it (bind-mount + entrypoint override) so the coder runs in the
     // operator's environment and can compile/test in-sandbox. The default path
     // runs a darkmux image directly (binary baked in, no injection).
-    //
-    // A resume runs on the image its origin recorded and is the only live
-    // execution of that origin; see [`resume_preflight`]. The lock is held,
-    // with this dispatch's own, until the function returns.
-    let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
     let inject = image_arg
         .as_deref()
         .is_some_and(|img| !is_darkmux_runtime_image(img));
@@ -6622,7 +6623,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    // (5.0) This dispatch's own stop: see `DispatchStop`.
+    // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(container_name.clone());
     // (#threshold) Effective compaction threshold the runtime triggers at:
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
@@ -6973,7 +6974,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // explicitly in the `Ok` arm above (the child is dead either
         // way; there is nothing left to deregister here).
         //
-        // (5.0) A stop scoped to this dispatch is reported as itself,
+        // (#2925) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
         return Err(killed_mid_run_error(&container_name, &local_stop));
@@ -8058,7 +8059,7 @@ fn run_tailer(
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
-        // (5.0) A stop scoped to THIS dispatch (its phase abandoned, its
+        // (#2925) A stop scoped to THIS dispatch (its phase abandoned, its
         // mission aborted): same flush-then-kill as an interrupt, but only
         // this container is touched, never another dispatch's child.
         if local_stop.is_requested() {
@@ -8724,7 +8725,7 @@ fn run_telemetry_sampler(
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
     mut budget_pacer: Option<crate::budget::BudgetPacer>,
-    // (5.0) Where a phase- or mission-scoped stop lands: this dispatch only.
+    // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
     local_stop: DispatchStop,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
@@ -9263,7 +9264,7 @@ fn run_telemetry_sampler(
                     // (#2902 step 5 review MF1) The run was stopped while the
                     // pacer held it (`mission abort` writes only terminal state;
                     // this is where it reaches a paused container). End it
-                    // the way an interrupt does, for THIS dispatch only (5.0): the
+                    // the way an interrupt does, for THIS dispatch only (#2925): the
                     // tailer kills this container on the stop, and the launcher
                     // takes its abort path. The process-global interrupt flag is
                     // not touched: it would end every other phase's dispatch. The

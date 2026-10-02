@@ -618,7 +618,7 @@
         crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None)
     }
 
-    /// (5.0) One real `run_telemetry_sampler` for a dispatch of `phase` in
+    /// (#2925) One real `run_telemetry_sampler` for a dispatch of `phase` in
     /// `mission`, reading stops from disk the way production does. Returns
     /// its stop flag and join handle; it runs until that flag is set.
     fn spawn_paced_sampler(
@@ -667,7 +667,7 @@
         stops.iter().all(|s| s.is_requested())
     }
 
-    /// (5.0) Abandoning ONE phase ends that phase's dispatch and no other:
+    /// (#2925) Abandoning ONE phase ends that phase's dispatch and no other:
     /// the stop lands on the dispatch's own `DispatchStop`, never on the
     /// process-global interrupt flag that a concurrent dispatch of another
     /// phase (same mission) also reads. Real sampler threads, real disk read.
@@ -698,7 +698,7 @@
         assert!(!other, "the other phase's dispatch keeps running: {:?}", stop_2.reason());
     }
 
-    /// (5.0) The inverse: a mission aborted on disk ends EVERY dispatch of
+    /// (#2925) The inverse: a mission aborted on disk ends EVERY dispatch of
     /// that mission, each through its own stop.
     #[test]
     #[serial]
@@ -724,7 +724,7 @@
         assert!(!global, "still no process-global interrupt");
     }
 
-    /// (5.0) The tailer honors a dispatch-scoped stop like an interrupt:
+    /// (#2925) The tailer honors a dispatch-scoped stop like an interrupt:
     /// it flushes and ends its loop (here with no container to kill) while
     /// its own stop flag is never set. A tailer that ignored the stop would
     /// hang this test past its bound.
@@ -3177,7 +3177,7 @@
         }
     }
 
-    /// (5.0) The one charging policy, class by class: charged are a timeout
+    /// (#2925) The one charging policy, class by class: charged are a timeout
     /// or dropped reply after sending, an unreadable body, and a 5xx; not
     /// charged are a failure before sending, every 4xx and a 429.
     #[test]
@@ -3321,7 +3321,7 @@
         (result, charged, unreported, sources)
     }
 
-    /// (5.0) A hosted call that was sent and timed out is charged ONCE, the
+    /// (#2925) A hosted call that was sent and timed out is charged ONCE, the
     /// conservative way a reply with no usage is: one `absent` usage record
     /// (the endpoint's window counts it as a call) and the granted cap plus
     /// the estimated prompt against the dispatch's cap.

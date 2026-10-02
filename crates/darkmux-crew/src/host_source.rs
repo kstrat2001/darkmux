@@ -570,6 +570,11 @@ pub(crate) const PRODUCER_SOURCE_PATHS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
     (
+        "crates/darkmux-crew/tests/mock_dispatch_proof.rs",
+        "consumer: a live-container proof that reads the flow stream back and matches on \
+         `dispatch.rest` and `dispatch.error`; it builds no record",
+    ),
+    (
         "crates/darkmux-flow/src/action.rs",
         "the action vocabulary itself: every wire string is declared there, and nothing \
          there builds a record",

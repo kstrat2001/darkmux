@@ -1513,11 +1513,14 @@ darkmux release.
   COMPLETED`; resuming again after an interrupted or failed run still works.
   The lock is `<out-dir>.execution.lock`, beside the out-dir like the resume
   origin record, and `doctor`'s orphan count covers it.
-- **A hosted call that was sent and never answered is charged** (5.0). A timeout
-  or provider error on a hosted single-shot dispatch now writes an `absent`
-  usage record (the endpoint's window counts it as a call) and charges the
-  per-dispatch cap what a reply with no usage is charged: the granted cap plus
-  the estimated prompt. It used to charge nothing.
+- **A hosted call the endpoint may have processed is charged, once, one way** (5.0).
+  A timeout or dropped reply after the request was sent, an unreadable reply,
+  and a 5xx write an `absent` usage record (the endpoint's window counts it as
+  a call) and charge the per-dispatch cap what a reply with no usage is charged:
+  the granted cap plus the estimated prompt. A failure before sending, a 4xx
+  (400, 401, 403) and a 429 charge nothing. `dispatch`, `dispatch.single_shot`
+  and `dispatch.map` share the rule; the last two used to charge nothing on any
+  error.
 - **A fleet seat frees only the claim that took it** (5.0). A retried or
   repeated sender session shares one receiver session id; dropping one of two
   claims under it used to free both, so a cap of 2 could run 3. Each claim now
