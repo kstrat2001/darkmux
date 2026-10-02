@@ -188,7 +188,7 @@ describe("tokensOffMeter", () => {
       rec({ session_id: "task:t3", action: "dispatch.complete", payload: { total_tokens: 500 } }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
+    expect(t.total).toBe(0); // completes carry no tokens (#3067); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -202,7 +202,7 @@ describe("tokensOffMeter", () => {
       }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
+    expect(t.total).toBe(0); // completes carry no tokens (#3067); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -212,7 +212,7 @@ describe("tokensOffMeter", () => {
       rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 700 } }),
     ];
     const t = tokensOffMeter(data);
-    expect(t.total).toBe(0); // completes carry no tokens (#3061); each is still a run
+    expect(t.total).toBe(0); // completes carry no tokens (#3067); each is still a run
     expect(t.runs).toBe(2);
   });
 
@@ -738,7 +738,7 @@ describe("tokensOffMeter", () => {
     const tAbsent = tokensOffMeter(dataAbsent);
 
     expect(tPresent.runs).toBe(tAbsent.runs);
-    // The run count agrees; the tokens are the usage records' (#3061): a
+    // The run count agrees; the tokens are the usage records' (#3067): a
     // completion carries none.
     expect(tPresent.total).toBe(100);
     expect(tAbsent.total).toBe(0);
@@ -1409,7 +1409,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     ];
     const t = tokensOffMeter(data);
     // Run A's usage record counts (510); run B's completion carries no tokens
-    // (#3061: a completion is never read), but it is still a run.
+    // (#3067: a completion is never read), but it is still a run.
     expect(t.total).toBe(510);
     expect(t.runs).toBe(2);
   });
@@ -1478,7 +1478,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: 500 } }),
     ]);
     expect(t.runs).toBe(1);
-    expect(t.total).toBe(0); // no usage record: unmeasured (#3061)
+    expect(t.total).toBe(0); // no usage record: unmeasured (#3067)
   });
 
   /** EXTRA LOCAL RUN must not fire when a token-bearing bookend of the same
@@ -1556,7 +1556,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.total).toBe(0); // completions carry no tokens (#3061)
+    expect(t.total).toBe(0); // completions carry no tokens (#3067)
   });
 
   /** The mirror, so the two halves of the pair are visibly symmetric rather
@@ -1571,7 +1571,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
     ]);
     expect(t.runs).toBe(2);
-    expect(t.total).toBe(0); // completions carry no tokens (#3061)
+    expect(t.total).toBe(0); // completions carry no tokens (#3067)
   });
 });
 
@@ -1625,7 +1625,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     // And the terminal values, asserted at the end of the SAME loop rather
     // than in a test of their own. These are byte-identical to the
     // pre-#2709 shape — measured at every playhead of every committed
-    // corpus, maxCloudGain and maxCloudLoss both 0. (#3061) The plain sum of
+    // corpus, maxCloudGain and maxCloudLoss both 0. (#3067) The plain sum of
     // the corpus's 364 usage records, checked independently of this code;
     // the 19,391 tokens that only a `dispatch complete` stated are no longer read.
     expect(last.total).toBe(979857);
@@ -1721,7 +1721,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
 
     // Same dispatch, mission id present on the telemetry and absent from the
     // completion. The tokens are the usage record's alone (a completion carries
-    // none, #3061), so only the run count skews: a second run.
+    // none, #3067), so only the run count skews: a second run.
     const skew = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp(undefined, 4000, "2026-08-08T00:00:02Z")]);
     expect(skew.total).toBe(4000);
     expect(skew.runs).toBe(2);

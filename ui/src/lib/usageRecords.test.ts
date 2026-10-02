@@ -2,7 +2,7 @@
 //
 // One function (`sumUsage`, and its per-record half `usageContribution`)
 // feeds the fleet hero, the run page's tiles and the mission graph's step
-// meter, with the utility part named (#3061: one total everywhere). There is
+// meter, with the utility part named (#3067: one total everywhere). There is
 // no exception: a `dispatch complete` carries no tokens. The shared golden
 // fixture `tests/usage-golden/` pins the answer for this module and for step
 // 2b's Rust aggregator.
@@ -320,7 +320,7 @@ describe("the fleet hero (tokensOffMeter)", () => {
 const tileHint = (recs: NormRecord[], sid: string, label: string) =>
   runRegions(recs, sid, Date.UTC(2026, 8, 27)).metrics.find((m) => m.label === label)?.hintTitle;
 
-describe("the run page and the mission graph count utility and name it (#3061)", () => {
+describe("the run page and the mission graph count utility and name it (#3067)", () => {
   it("the run page's tiles count every usage record, and name the utility part on hover", () => {
     const [without, withU] = utilityStreams();
     // h1: work 900 + 1100 in, plus two compactions (500 + 40 in).

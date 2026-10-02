@@ -494,7 +494,7 @@ describe("applyRecordToMetrics", () => {
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { total_tokens: 120 } }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_tokens: 500, total_turns: 3 } }), idx, "m1");
     const d = stepDisplayMetrics(m["a-step"]);
-    // (#2902 step 2a, #3061) The usage records' plain sum IS the step's figure;
+    // (#2902 step 2a, #3067) The usage records' plain sum IS the step's figure;
     // a complete's own total is never read.
     expect(d.tokens).toBe(120);
     expect(d.turns).toBe(3);

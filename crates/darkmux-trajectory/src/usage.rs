@@ -212,7 +212,7 @@ mod tests {
         assert_eq!((sum.cached, sum.reasoning), (Some(6), Some(4)), "a later call that omits a field leaves it alone");
     }
 
-    /// (#3061) One rule for a half-reported call: the run's total counts what
+    /// (#3067) One rule for a half-reported call: the run's total counts what
     /// the call DID report (its prompt half alone is a floor on the spend),
     /// the same figure a usage record's display sum shows. A sum that dropped
     /// the half would read a prompt-only call as free.
@@ -316,7 +316,7 @@ mod tests {
         s.add(&UsageCounts { prompt: Some(5), completion: Some(1), ..Default::default() });
         s.add(&UsageCounts::default());
         s.add(&UsageCounts { completion: Some(7), ..Default::default() });
-        assert_eq!((s.prompt, s.completion, s.total), (15, 10, 33), "a call with no known total adds the halves it reported (#3061)");
+        assert_eq!((s.prompt, s.completion, s.total), (15, 10, 33), "a call with no known total adds the halves it reported (#3067)");
         assert_eq!(s.reasoning, None, "no call reported reasoning");
         s.add(&UsageCounts { reasoning: Some(0), ..Default::default() });
         assert_eq!(s.reasoning, Some(0), "a reported 0 is a 0");

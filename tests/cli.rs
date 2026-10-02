@@ -7121,7 +7121,7 @@ fn run_list_usage_breakdown_end_to_end() {
     assert!(err.contains("--since") && err.contains("24h") && err.contains("YYYY-MM-DD"), "{err}");
 }
 
-/// (#3061) The verb end to end over two machines' records that name the
+/// (#3067) The verb end to end over two machines' records that name the
 /// same `localhost` endpoint and model: two rows, each with its machine, in
 /// `--json` and in the text MACHINE column; the overall sums both.
 #[test]

@@ -3244,7 +3244,7 @@ pub fn probe_unmanaged_endpoint(
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
     let counts = darkmux_trajectory::UsageCounts::of_reply(&resp);
     let served_model = resp.get("model").and_then(|m| m.as_str()).map(str::to_string);
-    // (#3061) A probe spends real tokens: it leaves the one usage record every
+    // (#3067) A probe spends real tokens: it leaves the one usage record every
     // model call leaves, on no run (it has no session and no bookends).
     let payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {

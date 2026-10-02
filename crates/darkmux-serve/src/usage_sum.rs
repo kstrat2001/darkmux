@@ -14,7 +14,7 @@
 //! side's own test over the same files).
 //!
 //! A run's tokens are the records that name its session or mission, each
-//! record counted under ITS OWN session and mission (#3061: a resumed
+//! record counted under ITS OWN session and mission (#3067: a resumed
 //! dispatch reuses its execution id under a new session, so the execution is
 //! not the unit of attribution; the record is). A record naming neither
 //! (radio routing, a `doctor --probe`) belongs to no run: it is in the
@@ -106,7 +106,7 @@ pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -
 }
 
 /// One line of the breakdown: everything darkmux invoked one way. The key
-/// is the MACHINE that executed the call (#3061: `localhost` is a different
+/// is the MACHINE that executed the call (#3067: `localhost` is a different
 /// machine to whoever made the call, so the same URL on two machines is two
 /// lines), the endpoint it called (its registry id when the record carries
 /// one, else the endpoint string), the model it requested, and the model the
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(o.total, 6 * (1u64 << 53), "six clamped maxima, exactly");
     }
 
-    /// (#3061) A resumed dispatch reuses its execution id under a NEW session,
+    /// (#3067) A resumed dispatch reuses its execution id under a NEW session,
     /// so the execution is not the unit of attribution: each record counts
     /// under its OWN session. The resumed pair's two sessions read their own
     /// tokens, neither the other's.
@@ -592,7 +592,7 @@ mod tests {
         serde_json::json!({"ts":"2026-10-02T06:00:00Z","action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":format!("s-{machine}"),"execution_id":format!("exec-{machine}-{model}-{purpose}-{total:?}"),"machine_id":machine,"machine_uid":uid,"payload":p})
     }
 
-    /// (#3061) `localhost` means a different machine to whoever made the
+    /// (#3067) `localhost` means a different machine to whoever made the
     /// call: the same URL and model on two machines are two rows, and the
     /// overall still sums both.
     #[test]

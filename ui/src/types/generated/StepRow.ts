@@ -38,7 +38,7 @@ kind: string, status: NodeStatus, startedTs?: number, completedTs?: number,
  * honest-absent rather than mis-folding — pinned by
  * `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
  * the LIVE-increment channel; `tokensFinal` is the sum of the step's usage
- * records (#3061: the one token sum) and `turnsFinal` its terminals' turns.
+ * records (#3067: the one token sum) and `turnsFinal` its terminals' turns.
  * Additive camelCase (`tokensFinal`/`turnsFinal`); pre-#1432
  * consumers ignore them.
  *
@@ -56,7 +56,7 @@ kind: string, status: NodeStatus, startedTs?: number, completedTs?: number,
  */
 tokensFinal?: number, 
 /**
- * (#3061) The utility share of `tokens_final` (darkmux's own compaction
+ * (#3067) The utility share of `tokens_final` (darkmux's own compaction
  * and routing calls inside the step), named so every surface can show the
  * one total with its utility part. Absent when none was measured.
  */

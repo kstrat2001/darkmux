@@ -86,7 +86,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           may already hold. Readers select entry fields by name and
 //           ignore the marker.
 //
-//           Also (5.0, #3061, folded in, unreleased): a token total is a
+//           Also (5.0, #3067, folded in, unreleased): a token total is a
 //           plain sum of `telemetry.tokens` usage records, and nothing else.
 //           REMOVED the hosted/local leftovers of the old accounting: the
 //           `remote` flag of a `dispatch.map` usage record, and the

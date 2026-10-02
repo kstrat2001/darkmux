@@ -7348,7 +7348,7 @@ mod tests {
         assert_eq!(widened.usage.overall.total, 900, "widened past the edge, the usage records are read");
     }
 
-    /// (#3061) A resumed dispatch reuses its execution id under a new session:
+    /// (#3067) A resumed dispatch reuses its execution id under a new session:
     /// each session's row reads its own tokens (the first no longer carries
     /// the resumed one's, the resumed one is no longer `-`), and the rows plus
     /// the sessionless calls (radio routing) are the overall.

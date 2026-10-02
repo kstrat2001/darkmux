@@ -191,7 +191,7 @@ pub struct StepRow {
     /// honest-absent rather than mis-folding — pinned by
     /// `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
     /// the LIVE-increment channel; `tokensFinal` is the sum of the step's usage
-    /// records (#3061: the one token sum) and `turnsFinal` its terminals' turns.
+    /// records (#3067: the one token sum) and `turnsFinal` its terminals' turns.
     /// Additive camelCase (`tokensFinal`/`turnsFinal`); pre-#1432
     /// consumers ignore them.
     ///
@@ -209,7 +209,7 @@ pub struct StepRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub tokens_final: Option<u64>,
-    /// (#3061) The utility share of `tokens_final` (darkmux's own compaction
+    /// (#3067) The utility share of `tokens_final` (darkmux's own compaction
     /// and routing calls inside the step), named so every surface can show the
     /// one total with its utility part. Absent when none was measured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1085,7 +1085,7 @@ pub fn stamp_session_steps(records: &mut [serde_json::Value], mission_id: &str) 
 /// A step's tokens are the plain sum of its usage records (`telemetry.tokens`,
 /// utility calls included: the one sum every other surface reads, through
 /// `darkmux_crew::usage`), `None` until one reports a count; a terminal's or a
-/// `step result`'s own `total_tokens` is never read (#3061: one owner for
+/// `step result`'s own `total_tokens` is never read (#3067: one owner for
 /// "tokens"). A step's turns are the SUM over every execution terminal it had
 /// (`dispatch.complete` and `dispatch.error`: each attempt is a new execution
 /// with its own id, each `dispatch.map` item one terminal), so a retried step

@@ -316,7 +316,7 @@ export function isAiKind(kind: string | undefined): boolean {
 }
 
 export interface StepMetrics {
-  /** (#3061) The plain sum of every usage record folded so far (utility
+  /** (#3067) The plain sum of every usage record folded so far (utility
    *  included): the one token sum, the figure the server's `tokensFinal` is
    *  too. */
   tokRun: number;
@@ -524,7 +524,7 @@ function foldSpan(
   }
 }
 
-/** (#3061) Fold one usage record's tokens into a step's running figures: the
+/** (#3067) Fold one usage record's tokens into a step's running figures: the
  *  total, and the utility part named beside it. */
 function foldUsage(next: StepMetrics, usage: ReturnType<typeof usageContribution>): void {
   if (!usage) return;
@@ -543,7 +543,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
 
   const action = rec.action;
-  // (#2902 step 2a, #3061) The step's running figure is the plain sum of its
+  // (#2902 step 2a, #3067) The step's running figure is the plain sum of its
   // usage records through the one sum's per-record half, utility calls
   // included and named: the same figure the runs board and the server's
   // `tokensFinal` show. `null` for a non-usage record.
@@ -590,7 +590,7 @@ function countOf(n: unknown): number {
   return typeof n === "number" ? n : 0;
 }
 
-/** (#3061) The tokens field of a step's detail, with its utility part named
+/** (#3067) The tokens field of a step's detail, with its utility part named
  *  beside it: one total, the part that is darkmux's own calls shown, never
  *  subtracted. */
 function tokenFields(d: DisplayMetrics): { key: string; label: string; value: string }[] {
@@ -640,7 +640,7 @@ export interface DisplayMetrics {
 
 export function stepDisplayMetrics(m: StepMetrics | undefined): DisplayMetrics {
   if (!m) return { tokens: 0, utility: 0, turns: 0, tools: 0, has: false };
-  // (#2902 step 2a, #3061) The usage records' plain sum: what this page folded
+  // (#2902 step 2a, #3067) The usage records' plain sum: what this page folded
   // live, or what the server summed from disk, whichever is larger.
   const tokens = Math.max(m.tokRun, m.tokFinal);
   const utility = Math.max(m.tokUtilityRun, m.tokUtilityFinal);

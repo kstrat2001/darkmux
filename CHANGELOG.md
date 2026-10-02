@@ -83,7 +83,7 @@ darkmux release.
   (`concurrent_width`) are each derived once, shared by the scheduler and a
   fleet receiver's seat book.
 
-- **One token total, from usage records only** (#3061). Every surface sums the
+- **One token total, from usage records only** (#3067). Every surface sums the
   `telemetry.tokens` usage records and nothing else: a `dispatch.complete`
   (and `remote_tokens`, the old hosted-item spelling) is never read for tokens, so
   a pre-5.0 run with no usage record reads as unmeasured. A run's tokens
@@ -101,7 +101,7 @@ darkmux release.
   usage record and the `remote_tokens` field of a `dispatch.complete` are
   removed.
 - **`run list --usage` keys each row on the machine that executed the call**
-  (#3061). `localhost` means a different machine to whoever made the call, so
+  (#3067). `localhost` means a different machine to whoever made the call, so
   two machines' LM Studios serving the same model merged into one row (a relayed
   radio answer from the Studio read as the laptop's). Rows are now (machine,
   endpoint, model): a MACHINE column, and `--json` groups gain additive

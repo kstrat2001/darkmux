@@ -495,7 +495,7 @@ mod tests {
         assert!(usage_payload(&facts(None), &counts).endpoint_id.is_none());
         assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default()).endpoint_id.as_deref(), Some("azure"), "an absent-usage record still names its endpoint");
     }
-    /// (#3061) One rule for a half-reported call across the wire: what a
+    /// (#3067) One rule for a half-reported call across the wire: what a
     /// usage record's reader counts for it is what the run total
     /// (`TokenSum`, via `UsageCounts::floor_tokens`) counts, for every shape
     /// of reported counts.

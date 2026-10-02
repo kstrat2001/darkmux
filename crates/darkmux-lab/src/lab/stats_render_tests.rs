@@ -169,7 +169,7 @@ fn the_table_has_one_row_per_run_with_its_flags() {
     );
 }
 
-/// (#3061) `run stats` counts a run's COMPLETION tokens only (the stream the
+/// (#3067) `run stats` counts a run's COMPLETION tokens only (the stream the
 /// throughput is measured over), never the total `run list` shows. Its table
 /// column and its set row say so, so the two are not read as one figure.
 #[test]

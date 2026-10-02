@@ -1658,7 +1658,7 @@ mod tests {
         let qwen = lines.iter().find(|l| l.contains("qwen-a")).expect("qwen-a line");
         assert!(qwen.contains("laptop") && qwen.contains("http://127.0.0.1:1234/v1") && qwen.ends_with("360"), "{qwen:?}");
         // A named endpoint reads as its registry id, never the raw string; the
-        // same URL on another machine is its own line (#3061).
+        // same URL on another machine is its own line (#3067).
         let gpt_line = lines.iter().find(|l| l.contains("gpt-x ")).expect("gpt-x line");
         assert!(gpt_line.contains("azure ") && !gpt_line.contains("example.azure.com"), "{gpt_line:?}");
         let util_line = lines.iter().find(|l| l.contains("util-4b")).expect("util-4b line");
@@ -1687,7 +1687,7 @@ mod tests {
         }
     }
 
-    /// (#3061) A call that reported no usage is named under the totals, so a
+    /// (#3067) A call that reported no usage is named under the totals, so a
     /// short total is not read as a complete one.
     #[test]
     fn usage_lines_name_calls_that_reported_no_usage() {

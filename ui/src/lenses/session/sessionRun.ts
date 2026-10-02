@@ -433,7 +433,7 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
   }
 }
 
-/** (#2902 step 2a, #3061) An execution's token numbers: the plain sum of its
+/** (#2902 step 2a, #3067) An execution's token numbers: the plain sum of its
  *  usage records, ALL of them (the one `sumUsage`, the figure the runs board's
  *  TOKENS cell and the server's `Run.tokens` show), with the utility part
  *  (compaction, radio routing) named beside it as `utility` rather than left
@@ -514,7 +514,7 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
 }
 
 /** One inner execution's MODEL numbers, or `null` when it did no model
- *  work. (#3061) Its tokens, utility named beside them. */
+ *  work. (#3067) Its tokens, utility named beside them. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
   const tok = executionTokens(own);
@@ -861,7 +861,7 @@ interface ModelFigures {
   nctx: number;
 }
 
-/** (#3061) The hover text naming the utility part of the token tiles. */
+/** (#3067) The hover text naming the utility part of the token tiles. */
 function utilityHintOf(tokUtility: number | null): string | undefined {
   return tokUtility ? `includes ${fmtC(tokUtility)} tokens of utility calls (compaction, radio routing)` : undefined;
 }
@@ -1635,7 +1635,7 @@ export function runRegions(
   const remoteEp = sp.endpoint || endPayloadOf(c)?.endpoint;
   const model = modelOf(d, remoteEp, distinct);
 
-  // (#2902 step 2a, #3061) The plain sum of this attempt's usage records, all
+  // (#2902 step 2a, #3067) The plain sum of this attempt's usage records, all
   // purposes, the utility part named.
   const { tokIn, tokOut, tokUtility } = tokenFigures(executionTokens(c ? [...tel, c] : tel));
 
@@ -1740,7 +1740,7 @@ export function runRegions(
     push(modelIdx, { value: String(tools.calls), label: "TOOL CALLS", sub: `${tools.failed} failed` });
     push(modelIdx, { value: activeElapsed, label: "ACTIVE TIME", hintTitle: ACTIVE_HINT_TITLE, sub: activeTimeSub(done, wallSub, rests.get("thermal"), armed.thermal === true) });
   }
-  // (#3061) The tiles count every usage record of the run, the figure the runs
+  // (#3067) The tiles count every usage record of the run, the figure the runs
   // board shows; the part that is darkmux's own utility calls is named in the
   // tiles' hover text (no layout of its own).
   const utilityHint = utilityHintOf(effTokUtility);

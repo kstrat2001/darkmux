@@ -827,7 +827,7 @@
         assert!(request.contains("\"model\":\"probe-model-x\""), "{request}");
     }
 
-    /// (#3061) The probe is a real model call that spends real tokens, so it
+    /// (#3067) The probe is a real model call that spends real tokens, so it
     /// leaves ONE usage record like every other call (the roster's duty), on
     /// no run: it carries no session, and the breakdown shows it as a call
     /// that belongs to no run.
