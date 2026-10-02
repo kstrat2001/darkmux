@@ -1263,28 +1263,6 @@ mod tests {
         assert_eq!(a, round_tripped);
     }
 
-    /// A `mission.json` written before `mission pause` was retired can say
-    /// `"status":"paused"` and carry a `paused_ts`. It still loads, reads as
-    /// `Active`, and a re-save drops the retired key and the paused label.
-    #[test]
-    fn a_legacy_paused_mission_loads_as_active_and_resaves_clean() {
-        let legacy = serde_json::json!({
-            "id": "m-old",
-            "description": "left by an older binary",
-            "status": "paused",
-            "phase_ids": [],
-            "created_ts": 1700000000u64,
-            "started_ts": 1700000100u64,
-            "paused_ts": 1700000200u64,
-        });
-        let m: Mission = serde_json::from_value(legacy).expect("a paused mission must still load");
-        assert_eq!(m.status, MissionStatus::Active);
-        assert_eq!(m.started_ts, Some(1700000100));
-        let s = serde_json::to_string(&m).unwrap();
-        assert!(s.contains(r#""status":"active""#), "got {s}");
-        assert!(!s.contains("paused"), "the retired label and key must not be written back, got {s}");
-    }
-
     /// The canonical (post-rename) wire shape round-trips, and writing a
     /// `Finalized` mission always emits the new field/value names —
     /// self-migration happens the next time the mission is saved.
@@ -1454,7 +1432,7 @@ mod tests {
 
     /// (#3035) A status a newer darkmux wrote reads as `Unknown`, never an
     /// error, in every persisted status enum; a known one still reads as
-    /// itself and `paused` still reads as `Active`.
+    /// itself and a retired `paused` reads as `Unknown`.
     #[test]
     fn a_status_from_a_newer_darkmux_reads_as_unknown_not_an_error() {
         let m: MissionStatus = serde_json::from_str("\"suspended\"").unwrap();
@@ -1463,7 +1441,7 @@ mod tests {
         assert_eq!(p, PhaseStatus::Unknown);
         let n: NodeStatus = serde_json::from_str("\"skipped\"").unwrap();
         assert_eq!(n, NodeStatus::Unknown);
-        assert_eq!(serde_json::from_str::<MissionStatus>("\"paused\"").unwrap(), MissionStatus::Active);
+        assert_eq!(serde_json::from_str::<MissionStatus>("\"paused\"").unwrap(), MissionStatus::Unknown);
         assert_eq!(serde_json::from_str::<MissionStatus>("\"aborted\"").unwrap(), MissionStatus::Aborted);
         assert_eq!(serde_json::from_str::<NodeStatus>("\"error\"").unwrap(), NodeStatus::Error);
         // A whole mission file naming one still loads.

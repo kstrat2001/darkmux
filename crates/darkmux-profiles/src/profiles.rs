@@ -43,7 +43,7 @@ pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileP
             .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
             .collect()
     };
-    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired, &inline_endpoints)?;
+    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &|_| None, &inline_endpoints)?;
     if let Problem::Keys(keys) = &mut found.problem {
         keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. }));
         if keys.is_empty() {
@@ -51,35 +51,6 @@ pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileP
         }
     }
     Some(found)
-}
-
-/// `profiles.json`'s retired keys (path with array indices dropped), named
-/// instead of guessed at: every key a past registry schema had and this one
-/// does not, from `git log` (`every_historical_registry_key_is_named_as_retired`).
-fn registry_retired(path: &str) -> Option<String> {
-    let line = match path {
-        "crews" => "removed in 2.0 (#1426): review staffing is derived from the active profile's roster; delete it",
-        "hooks" => "removed with the `swap` verb (#1426): nothing runs pre/post-swap commands; delete it",
-        "profiles.*.models.role" => {
-            "removed in #590: a model no longer declares a role; bind roles to profiles with \
-             `darkmux config set role_profiles.<role> <profile>`. Delete it"
-        }
-        "profiles.*.runtime.config_path" | "profiles.*.runtime.configPath" => {
-            "removed with the openclaw runtime (#1405); delete it"
-        }
-        "profiles.*.runtime.contextTokens" => "renamed to `context_tokens` (#709)",
-        "profiles.*.runtime.compaction.mode"
-        | "profiles.*.runtime.compaction.model"
-        | "profiles.*.runtime.compaction.customInstructions"
-        | "profiles.*.runtime.compaction.maxHistoryShare"
-        | "profiles.*.runtime.compaction.recentTurnsPreserve" => {
-            "an openclaw compaction setting, removed with that runtime (#1405): darkmux's compaction reads \
-             `strategy`, `threshold_tokens` / `threshold_ratio`, `tier1`, `tier2`, `reserve` and \
-             `custom_instructions`. Delete it"
-        }
-        _ => return None,
-    };
-    Some(line.to_string())
 }
 
 pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
@@ -191,8 +162,7 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
 ///
 /// (#1426 ship-2) The `crews` map retired from the schema, so it is no longer
 /// quarantined per-entry — a `crews` key overflows into `ProfileRegistry.extras`
-/// and the load survives it; the unknown-key gate refuses it
-/// (`registry_retired`).
+/// and the load survives it; the unknown-key gate refuses it.
 fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     let mut root: serde_json::Value = serde_json::from_str(raw)?;
 

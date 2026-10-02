@@ -8,15 +8,15 @@ use super::*;
 /// family, an exact duplicate, a SIBLING mission whose id is a hyphen-extension
 /// (the #849 prefix-bleed regression), and a wrong-source note.
 const DAY: &str = concat!(
-    r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
-    r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
+    r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s1","handle":"Do not rename the field."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s2","handle":"Use cargo test -p foo."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s1","handle":"Do not rename the field."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"auth.phase.s1","handle":"crew shipped it!"}"#, "\n",
     // An adjudication note with empty text — never a correction.
-    r#"{"ts":"2026-06-21T12:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"   "}"#, "\n",
-    // The 4.0 grammar: this mission's phase `s2`, and the sibling's `s1`.
-    r#"{"ts":"2026-06-21T12:40:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s2","handle":"The current grammar reads too."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:30:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s1","handle":"   "}"#, "\n",
+    // A later note on this mission's phase `s2`, and one on the sibling's `s1`.
+    r#"{"ts":"2026-06-21T12:40:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s2","handle":"Also this mission."}"#, "\n",
     r#"{"ts":"2026-06-21T12:50:00Z","action":"operator.note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Also auth-v2 ONLY."}"#, "\n",
     // Unparsable line — skipped, must not poison the rest of the file.
     "{not json at all", "\n",
@@ -54,7 +54,7 @@ fn scan_exact_set_scopes_to_the_mission_family_and_excludes_siblings() {
             Scope::Phases(&PhaseSessions::new("auth", ["s1", "s2"].map(String::from))),
         )
     });
-    assert_eq!(got.len(), 4, "three unique (one in the 4.0 grammar) + one verbatim duplicate, undeduped: {got:?}");
+    assert_eq!(got.len(), 4, "three unique + one verbatim duplicate, undeduped: {got:?}");
     assert!(
         !got.iter().any(|c| c.text.contains("auth-v2")),
         "sibling mission auth-v2 must NOT bleed into auth (#849 prefix-bleed regression): {got:?}"

@@ -106,9 +106,9 @@
 //! to launchd (pid 1) or a root daemon is swept on the next read; an
 //! earlier revision's `proc_pidinfo` read answered nothing across users
 //! and left exactly those orphans in place (#2917 re-review M-A). A lease
-//! with no stamp (written by an older binary) or a pid whose start time
-//! cannot be read keeps the old fail-safe for PINNING (it still pins), but
-//! is not VERIFIED, and
+//! with no stamp (its writer could not read its own start time) or a pid
+//! whose start time cannot be read keeps the fail-safe for PINNING (it
+//! still pins), but is not VERIFIED, and
 //! [`live_loaded_models_by_process`] — the read that backs a user-visible
 //! busy claim — returns only verified leases.
 //!
@@ -131,11 +131,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-/// `models` (unchanged name/shape from before #2672 — every existing
-/// hand-written test/production lease JSON with no `loaded` key stays
-/// valid) is the FULL desired set; `loaded` (`#[serde(default)]`, so an
-/// older file / a lease from a pre-#2672 binary reads as "nothing
-/// confirmed loaded yet") is the subset of `models` this holder has
+/// `models` is the FULL desired set; `loaded` (`#[serde(default)]`, so a
+/// lease with no `loaded` key reads as "nothing confirmed loaded yet") is
+/// the subset of `models` this holder has
 /// actually confirmed resident — see `LeaseGuard::mark_loaded`'s doc for
 /// why that distinction exists and how it's used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,8 +144,7 @@ struct LeaseFile {
     loaded: Vec<String>,
     /// (#2917) The writer's process start time ([`process_start_stamp`]),
     /// so a reader can tell the writer from a later process that reused
-    /// its pid. `None` on a lease from an older binary, or where the start
-    /// time could not be read; see the module doc's pid-liveness section.
+    /// its pid. `None` where the start time could not be read; see the module doc's pid-liveness section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started: Option<u64>,
 }
@@ -523,8 +520,8 @@ fn live_foreign_leases(own_pid: u32) -> Vec<ForeignLease> {
                 continue;
             }
             (Some(_), Some(_)) => true,
-            // No stamp to compare (an older binary's lease), or the live
-            // pid's start time is unreadable: still pins (the fail-safe
+            // No stamp to compare (the writer could not read its own start
+            // time), or the live pid's start time is unreadable: still pins (the fail-safe
             // direction), but is not verified.
             _ => false,
         };
@@ -610,7 +607,7 @@ pub fn live_leased_models(own_pid: u32) -> Vec<String> {
 /// Same scan, liveness sweep and leniency as [`live_leased_models`], with
 /// one addition: only a VERIFIED lease counts — its pid's start time
 /// matches the one stamped when it was written. A lease that cannot be
-/// verified (an older binary's, or a pid whose start time is unreadable)
+/// verified (no stamp, or a pid whose start time is unreadable)
 /// may belong to whatever process now holds a reused pid, and a claim this
 /// read backs is shown to the user, so it says less rather than risk
 /// naming the wrong process (see the module doc's pid-liveness section).
@@ -670,11 +667,9 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 /// `kinfo_proc.kp_proc.p_starttime`, in microseconds since the epoch. This
 /// read works for a process owned by ANY user, which is the point: a
 /// reused pid after a reboot lands on launchd (pid 1) or a root daemon.
-/// (#2917 re-review M-A: the previous read, `proc_pidinfo(PROC_PIDTBSDINFO)`,
+/// (#2917 re-review M-A: an earlier read, `proc_pidinfo(PROC_PIDTBSDINFO)`,
 /// answers nothing for another user's process, so an orphan on such a pid
-/// was never swept. Both read the kernel's same `p_start`, in the same
-/// unit, so a lease stamped by the older binary still compares; a test
-/// pins that equality.) Linux: `/proc/<pid>/stat` field 22 (start time in
+/// was never swept.) Linux: `/proc/<pid>/stat` field 22 (start time in
 /// clock ticks since boot), world-readable unless `/proc` is mounted with
 /// `hidepid`. Elsewhere: `None`.
 #[cfg(target_os = "macos")]
@@ -991,36 +986,6 @@ mod tests {
         }
         let _ = holder.kill();
         let _ = holder.wait();
-    }
-
-    /// (#2917 re-review M-A) Leases written before the sysctl read carry a
-    /// `proc_pidinfo` stamp (microseconds since the epoch). The new read
-    /// must produce the SAME value for the same process, or every live
-    /// holder written by the previous binary would be swept on upgrade.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_sysctl_stamp_equals_the_proc_pidinfo_stamp_older_leases_carry() {
-        fn proc_pidinfo_stamp(pid: u32) -> Option<u64> {
-            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-            // SAFETY: correctly sized writable buffer; return value checked.
-            let n = unsafe {
-                libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
-            };
-            if n != size {
-                return None;
-            }
-            // SAFETY: filled by the call above.
-            let info = unsafe { info.assume_init() };
-            Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
-        }
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        for pid in [std::process::id(), child.id()] {
-            assert!(process_start_stamp(pid).is_some());
-            assert_eq!(process_start_stamp(pid), proc_pidinfo_stamp(pid), "pid {pid}");
-        }
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     /// (#2917 re-review C-4) The sweep must not delete a lease a NEW
