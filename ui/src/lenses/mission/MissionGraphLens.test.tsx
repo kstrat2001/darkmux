@@ -82,6 +82,8 @@ const GRAPH: MissionGraph = {
 // (#2332) The host readout is gated to RUNNING missions — a machine fact on a
 // finalized mission is noise — so the readout tests render this twin.
 const RUNNING_GRAPH: MissionGraph = { ...GRAPH, mission_status: "active" };
+/** A record of the mission, naming the machine it runs on. */
+const MISSION_REC = { ts: new Date().toISOString(), action: "step.start", mission_id: "m1", step_id: "a-step", session_id: "s-a", machine_uid: "UID-A", machine_id: "box-a" };
 
 function mockFetch(
   opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean } = {},
@@ -427,15 +429,41 @@ describe("MissionGraphLens", () => {
     expect(lastEventsCall(onEvents)?.[1]).toBe(false);
   });
 
-  it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
-    mockFetch({ graph: RUNNING_GRAPH });
+    // (5.0 R2) The readout is the machine the mission runs ON.
+  it("(5.0 R2) a peer's newer host sample never reads as this mission's machine activity", async () => {
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    const t = new Date().toISOString();
+    seedLiveTail(queryClient, [
+      { ts: t, action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 11, gpu_pct: 12 } },
+      { ts: new Date(Date.now() + 1000).toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-PEER", payload: { cpu_pct: 91, gpu_pct: 92 } },
+    ]);
+    await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
+    expect(document.querySelector(".mproc")?.textContent).toContain("12%");
+    expect(document.querySelector(".mproc")?.textContent).not.toContain("92%");
+  });
+
+  it("(5.0 R2) with only another machine's sample, the readout is absent", async () => {
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    seedLiveTail(queryClient, [
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-PEER", payload: { cpu_pct: 91, gpu_pct: 92 } },
+    ]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector(".mproc")).toBeNull();
+  });
+
+it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(document.querySelector(".mproc")).toBeNull();
 
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -449,13 +477,13 @@ describe("MissionGraphLens", () => {
     expect(document.querySelector(".mproc b.hot")?.textContent).toBe("72%");
   });
   it("(#2413) shows the host-activity readout from a machine-scoped machine.telemetry sample (cpu_pct/gpu_pct shape, no session_id)", async () => {
-    mockFetch({ graph: RUNNING_GRAPH });
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(document.querySelector(".mproc")).toBeNull();
 
     seedLiveTail(queryClient, [
-      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", payload: { cpu_pct: 41, gpu_pct: 72, mem_pct: 0.5, sampled_at_ms: Date.now(), interval_ms: 5000 } },
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 41, gpu_pct: 72, mem_pct: 0.5, sampled_at_ms: Date.now(), interval_ms: 5000 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -472,7 +500,7 @@ describe("MissionGraphLens", () => {
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 41, gpu: 72 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 41, gpu: 72 } },
     ]);
     await new Promise((r) => setTimeout(r, 50));
     expect(document.querySelector(".mproc")).toBeNull();
@@ -483,13 +511,13 @@ describe("MissionGraphLens", () => {
     // Host telemetry is never stamped with a mission_id (it's a whole-box
     // sample, not per-dispatch) — this proves the readout isn't accidentally
     // filtered through `recordInMission` the way the events pane is.
-    mockFetch({ graph: RUNNING_GRAPH });
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 10, gpu: 5 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 10, gpu: 5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -503,7 +531,7 @@ describe("MissionGraphLens", () => {
   });
 
   it("(#1483) a telemetry.process sample expires after the 12s freshness window, on the next render", async () => {
-    mockFetch({ graph: RUNNING_GRAPH });
+    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
@@ -512,7 +540,7 @@ describe("MissionGraphLens", () => {
     try {
       seedLiveTail(queryClient, [
         // flow-action-guard:allow — a retired action, as an archive still holds it
-        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 10, gpu: 5 } },
+        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 10, gpu: 5 } },
       ]);
       await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
 

@@ -111,6 +111,10 @@ export interface LastKnownSample {
 }
 
 export interface DrawerScope {
+  /** (5.0 R2) The ONE machine this scope's readings belong to: the machine
+   *  that ran a dispatch (a relayed run ran elsewhere), else this machine.
+   *  `null` when nothing names it. */
+  machineUid: string | null;
   scopeLabel: string;
   samples: ProcSamplePoint[];
   /** (#2107 phone feedback) Set only when `samples` is empty on the
@@ -132,9 +136,11 @@ export interface DrawerScope {
  * always wants "this machine, last 10 min" regardless of which app route
  * is current, since IT is what the route names. */
 export function rollingWindowSamples(records: NormRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
+  // (5.0 R2) An unresolved machine (`uid` null) matches no sample: it used to
+  // mean "unfiltered", which averaged every machine's load into one gauge.
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
   return recordsSince(recordsAsOf(records, nowMs), cutoff)
-    .filter((r) => isHostSampleRecord(r) && (uid == null || sameUid(uidOf(r), uid)))
+    .filter((r) => isHostSampleRecord(r) && sameUid(uidOf(r), uid))
     .sort(byTime)
     .map(toPoint);
 }
@@ -150,7 +156,7 @@ export function findLastKnownSample(records: NormRecord[], uid: string | null, n
   let best: { r: NormRecord; ts: number } | null = null;
   for (const r of records) {
     if (!isHostSampleRecord(r)) continue;
-    if (uid != null && !sameUid(uidOf(r), uid)) continue;
+    if (!sameUid(uidOf(r), uid)) continue;
     const ts = r.tMs;
     // The result states when it was measured, so an untimed sample cannot be it.
     if (ts === null || ts > nowMs) continue;
@@ -176,8 +182,14 @@ export function resolveDrawerScope(
   // with no id/time/machine bound would just be the same unscoped window
   // wearing a "this mission" label.
   if (route.kind === "dispatch") {
-    const scoped = routeRecords.filter(isHostSampleRecord).sort(byTime);
+    // (5.0 R2) The machine that ran the dispatch, from its own start record
+    // (else its first record naming one). Its samples only: another machine's
+    // never join, whatever the route's records hold.
+    const ran = routeRecords.find((r) => r.action === ACTION.DispatchStart && r.machine_uid) ?? routeRecords.find((r) => !isHostSampleRecord(r) && r.machine_uid);
+    const machineUid = ran?.machine_uid ?? localUid;
+    const scoped = routeRecords.filter((r) => isHostSampleRecord(r) && (ran == null || sameUid(r.machine_uid, ran.machine_uid))).sort(byTime);
     return {
+      machineUid,
       scopeLabel: "this dispatch",
       samples: scoped.map(toPoint),
       lastKnown: null,
@@ -185,8 +197,27 @@ export function resolveDrawerScope(
   }
   const samples = rollingWindowSamples(rollingWindow, localUid, nowMs);
   return {
+    machineUid: localUid,
     scopeLabel: DRAWER_ROLLING_SCOPE_LABEL,
     samples,
     lastKnown: samples.length === 0 ? findLastKnownSample(rollingWindow, localUid, nowMs) : null,
   };
+}
+
+/** (5.0 R2) Whether the scope's readings belong to a machine other than the
+ *  one this daemon runs on (a relayed dispatch ran elsewhere). Its specs and
+ *  this daemon's own load are then not that machine's. */
+export function scopeIsPeer(scope: DrawerScope, localUid: string | null): boolean {
+  return scope.machineUid != null && localUid != null && !sameUid(scope.machineUid, localUid);
+}
+
+/** Whether to poll this daemon's live load: while the surface is open, for
+ *  this machine, and not on a replay (a recorded day is not NOW). */
+export function wantsDaemonLoad(isOpen: boolean, isPeer: boolean, route: Route): boolean {
+  return isOpen && !isPeer && route.kind !== "playback";
+}
+
+/** This daemon's specs, only when the scope describes this machine. */
+export function specsForScope<T>(isPeer: boolean, specs: T | null): T | null {
+  return isPeer ? null : specs;
 }

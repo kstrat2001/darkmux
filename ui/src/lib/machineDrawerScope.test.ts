@@ -3,7 +3,7 @@ import { resolveDrawerScope, findLastKnownSample, DRAWER_ROLLING_SCOPE_LABEL } f
 import type { NormRecord } from "./ingest";
 import { norm } from "../testing/records";
 
-const proc = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm({
+const proc = (ts: string, cpu: number, machine_uid = "UID-A"): NormRecord => norm({
   ts,
   category: "telemetry",
   source: "host",
@@ -42,7 +42,7 @@ describe("resolveDrawerScope (#2107)", () => {
     const routeRecords = [proc("2026-01-01T00:00:00Z", 999)];
     // The rolling window's own last-10-minute sample — MUST appear.
     const rolling = [proc("2026-01-01T00:09:00Z", 42)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, rolling, null, now);
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, rolling, "UID-A", now);
     expect(s.scopeLabel).toBe(DRAWER_ROLLING_SCOPE_LABEL);
     expect(s.samples.map((p) => p.cpu)).toEqual([42]);
   });
@@ -70,11 +70,12 @@ describe("resolveDrawerScope (#2107)", () => {
   // machine's GPU into "this machine"'s gauges. #2647 tracks the
   // dispatch-route host-wide-sample gap; this is the SAME shape of gap on
   // the localUid side, reachable on any non-dispatch route.
-  it("(#2646 CONSIDER 2) with no known local uid, a mission route's rolling window does NOT filter by machine — a peer's sample leaks in alongside the local one", () => {
+  it("(5.0 R2) with no known local uid, a mission route's rolling window has NO samples: never every machine's, averaged", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");
     const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine"), proc("2026-01-01T00:09:30Z", 11, "this-machine")];
     const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
-    expect(s.samples.map((p) => p.cpu)).toEqual([99, 11]);
+    expect(s.samples).toEqual([]);
+    expect(s.lastKnown).toBeNull();
   });
 
   it("on every other route, rolls a last-10-minute window of the live tail", () => {
@@ -84,7 +85,7 @@ describe("resolveDrawerScope (#2107)", () => {
       proc("2026-01-01T00:12:00Z", 2), // 8 min ago — inside
       proc("2026-01-01T00:19:00Z", 3), // 1 min ago — inside
     ];
-    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, "UID-A", now);
     expect(s.scopeLabel).toBe(DRAWER_ROLLING_SCOPE_LABEL);
     expect(s.samples.map((p) => p.cpu)).toEqual([2, 3]);
   });
@@ -96,11 +97,19 @@ describe("resolveDrawerScope (#2107)", () => {
     expect(s.samples.map((p) => p.cpu)).toEqual([11]);
   });
 
-  it("with no known local uid, the rolling window does not filter by machine (best-effort default)", () => {
+  it("(5.0 R2) with no known local uid, the rolling window matches no machine's samples", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");
     const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine")];
     const s = resolveDrawerScope({ kind: "runs", runsKind: "all", lab: null, machine: null }, [], rolling, null, now);
-    expect(s.samples.map((p) => p.cpu)).toEqual([99]);
+    expect(s.samples).toEqual([]);
+  });
+
+  it("(5.0 R2) a relayed dispatch's scope names the machine that ran it and keeps only its samples", () => {
+    const ran = norm({ ts: "2026-01-01T00:00:00Z", session_id: "s1", action: "dispatch.start", machine_uid: "UID-DARK" });
+    const routeRecords = [ran, proc("2026-01-01T00:00:01Z", 91, "UID-DARK"), proc("2026-01-01T00:00:02Z", 7, "UID-MAC")];
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "s1", missionId: null }, routeRecords, [], "UID-MAC", 0);
+    expect(s.machineUid).toBe("UID-DARK");
+    expect(s.samples.map((p) => p.cpu)).toEqual([91]);
   });
 });
 
@@ -117,7 +126,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
   it("(#2559) a mission route with an empty rolling window still finds a last-known sample outside it", () => {
     const now = Date.parse("2026-01-01T01:00:00Z");
     const rolling = [proc("2026-01-01T00:20:00Z", 70)]; // 40 min ago — outside the 10-min window
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, "UID-A", now);
     expect(s.samples).toEqual([]);
     expect(s.lastKnown?.point.cpu).toBe(70);
   });
@@ -125,7 +134,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
   it("is null on the rolling branch when the window has real samples", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");
     const rolling = [proc("2026-01-01T00:09:00Z", 50)];
-    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, "UID-A", now);
     expect(s.samples.length).toBe(1);
     expect(s.lastKnown).toBeNull();
   });
@@ -136,7 +145,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
       proc("2026-01-01T00:00:00Z", 30), // 1h ago — outside the 10-min window
       proc("2026-01-01T00:20:00Z", 70), // 40 min ago — still outside, but MORE recent
     ];
-    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, "UID-A", now);
     expect(s.samples).toEqual([]);
     expect(s.lastKnown?.point.cpu).toBe(70);
     expect(s.lastKnown?.ts).toBe(Date.parse("2026-01-01T00:20:00Z"));
@@ -152,7 +161,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
   it("gives up past the lookback window rather than reporting an ancient stray record", () => {
     const now = Date.parse("2026-01-03T00:00:00Z");
     const rolling = [proc("2026-01-01T00:00:00Z", 40)]; // 2 days ago
-    expect(findLastKnownSample(rolling, null, now)).toBeNull();
+    expect(findLastKnownSample(rolling, "UID-A", now)).toBeNull();
   });
 
   it("is null when nothing was ever seen at all", () => {
@@ -164,7 +173,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
 
 // ─── (#2413) machine.telemetry — the machine-scoped replacement ──────────
 
-const machineTelemetry = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm({
+const machineTelemetry = (ts: string, cpu: number, machine_uid = "UID-A"): NormRecord => norm({
   ts,
   category: "machinery",
   source: "host",
@@ -177,7 +186,7 @@ describe("machine.telemetry recognition (#2413)", () => {
   it("the rolling window recognizes machine.telemetry and reads its cpu_pct/mem_pct/gpu_pct shape", () => {
     const now = Date.parse("2026-01-01T00:00:02Z");
     const rolling = [machineTelemetry("2026-01-01T00:00:00Z", 33), machineTelemetry("2026-01-01T00:00:02Z", 66)];
-    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, "UID-A", now);
     expect(s.samples.map((p) => p.cpu)).toEqual([33, 66]);
     expect(s.samples.map((p) => p.mem)).toEqual([33, 66]);
     expect(s.samples.map((p) => p.gpu)).toEqual([33, 66]);
@@ -204,7 +213,7 @@ describe("machine.telemetry recognition (#2413)", () => {
   it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a mission route's rolling window", () => {
     const now = Date.parse("2026-01-01T00:00:02Z");
     const rolling = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, "UID-A", now);
     expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
   });
 });

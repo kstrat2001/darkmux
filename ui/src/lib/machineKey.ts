@@ -225,6 +225,12 @@ export interface DecodedMachineKey {
 
 const NOT_FOUND: DecodedMachineKey = { uid: null, key: null, stale: false };
 
+/** The uid a machine route's key names; `null` when the route has no key (it
+ *  is this machine's page) or the key names no machine. */
+export function drilledUidOf(ctx: MachineKeyContext, key: string | null): string | null {
+  return key == null ? null : decodeMachineKey(ctx, key).uid;
+}
+
 /** Resolve a hash key (or an old link's uid) to the machine it names. */
 export function decodeMachineKey(ctx: MachineKeyContext, key: string): DecodedMachineKey {
   const { keyOf, uidOf, declaredUid } = keyTable(ctx);

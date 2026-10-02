@@ -2,7 +2,7 @@
 // `/flow/<date>/stream` that answers with SSE headers and then stays open, so
 // a live page's EventSource reaches `open` and the page reads as connected.
 // (Python's `http.server`, which the sibling suites use, cannot hold a
-// response open; a live run page that never connects reads "no signal".)
+// response open; a live run page that never connects reads "disconnected".)
 //
 // Every other request is answered by the suite's own `page.route` handlers
 // (`lib/layout-fixture.js`) before it reaches this server.

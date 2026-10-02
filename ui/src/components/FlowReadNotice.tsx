@@ -4,7 +4,7 @@ import type { FlowReadFailure } from "../hooks/useFlowWindow";
  * (#2965) A `/flow/<day>` read failed. The flow window settles with no
  * records from that day, which reads exactly like a quiet day: every card
  * would say "idle · 0 running" off a read that never happened. The cards and
- * the machine page hold "no signal" for the claims that read backs (see
+ * the machine page hold "checking…" for the claims that read backs (see
  * `cardFace`'s doc, #2958); this says why.
  *
  * Mounted once, from `App.tsx`'s notice row beside `FleetCoverageNotice`,
@@ -28,7 +28,7 @@ export function FlowReadNotice({ failure }: { failure: FlowReadFailure | null })
     <div className="fleetcov" data-state="flow-unreadable" role="status">
       <span className="fleetcov__icon">⚠</span>
       <span>
-        {which} failed to load ({failure.message}), so machines say no signal rather than idle.
+        {which} failed to load ({failure.message}), so machines say checking… rather than idle.
       </span>
     </div>
   );

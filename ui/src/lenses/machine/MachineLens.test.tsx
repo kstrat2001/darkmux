@@ -564,7 +564,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
   });
 
-  it("(#2958) the Utility section says no signal and '—' counts while the flow window is unanswered, then its reading", async () => {
+  it("(#2958) the Utility section says checking… and '—' counts while the flow window is unanswered, then its reading", async () => {
     let open = () => {};
     const flow = new Promise<void>((r) => {
       open = r;
@@ -576,8 +576,8 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
       expect(el).toBeTruthy();
       return el as HTMLElement;
     });
-    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
-    expect(section.querySelector(".mach-util")?.getAttribute("aria-label")).toMatch(/no signal$/);
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("checking…");
+    expect(section.querySelector(".mach-util")?.getAttribute("aria-label")).toMatch(/checking…$/);
     // The model comes from /machine/specs, a reading: it shows at once.
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("darkmux:qwen3-4b");
     expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
@@ -591,7 +591,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     ]);
   });
 
-  it("(#2958) a remote machine page says no signal, not idle, while the flow window is unanswered", async () => {
+  it("(#2958) a remote machine page says checking…, not idle, while the flow window is unanswered", async () => {
     let open = () => {};
     const flow = new Promise<void>((r) => {
       open = r;
@@ -603,21 +603,38 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     });
     const { container } = renderMachine("remote-uid");
     await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")).not.toBeNull());
-    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("checking…");
     const section = container.querySelector('[data-testid="machine-utility"]')!;
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("—");
-    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("checking…");
 
     open();
     await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
   });
 
+  // (5.0 R3) A peer nothing reaches this viewer from (no record, no beat) is
+  // not "idle with 0 calls": the page says its data is not reported.
+  it("(5.0 R3) a peer with no records and no beat reads not reported, never idle or 0 calls", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      roster: [{ id: "darkbook", address: "100.64.0.9:8765", added_unix_ms: 1, machine_uid: "u-quiet" }],
+      flowToday: [{ ts: new Date().toISOString(), machine_uid: "U-SELF", machine_id: "MacBook-Pro", action: "dispatch.start", session_id: "s1" }],
+    });
+    const { container } = renderMachine("u-quiet");
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toMatch(/not reported/));
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("not reported");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("not reported");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
+    expect(container.textContent).not.toMatch(/0 calls|idle/);
+  });
+
   // (#2965) A failed flow read settles the window, but it is not an answer
   // that nothing happened: the page's "idle" lines are negative claims about
-  // exactly the records that are missing. They hold "no signal", as on the
+  // exactly the records that are missing. They hold "checking…", as on the
   // fleet page, and the app-level `FlowReadNotice` names the failure.
-  it("(#2965) a remote machine page says no signal, not idle, when the flow read fails", async () => {
+  it("(#2965) a remote machine page says checking…, not idle, when the flow read fails", async () => {
     mockMachineFetch({
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
       liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
@@ -630,12 +647,12 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 50));
     });
-    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("checking…");
     const section = container.querySelector('[data-testid="machine-utility"]')!;
-    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("checking…");
   });
 
-  it("(#2965) this machine's Utility section says no signal, not idle, when the flow read fails", async () => {
+  it("(#2965) this machine's Utility section says checking…, not idle, when the flow read fails", async () => {
     mockMachineFetch({ ...withUtility, failFlow: 500 });
     const { container } = renderMachine(null);
     const section = await waitFor(() => {
@@ -646,14 +663,14 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 50));
     });
-    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("checking…");
     expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
   });
 
   // (#2958 second review, point 2) Only the FIRST answer counts, as on the
   // fleet page: at UTC midnight the flow window rolls to a new day's key,
-  // which starts out pending, and the page must not go back to "no signal".
-  it("(#2958) does not return to 'no signal' when the flow window rolls to a new day at UTC midnight", async () => {
+  // which starts out pending, and the page must not go back to "checking…".
+  it("(#2958) does not return to 'checking…' when the flow window rolls to a new day at UTC midnight", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     try {
       vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
@@ -697,7 +714,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect(container.querySelector(".machine-lens__health")?.getAttribute("data-state")).toBe("loading");
     expect(container.textContent).not.toContain("no samples in the last 10 min");
     expect(section.querySelector(".mm-utility__facts")?.textContent).toBe("window — · —");
-    expect(container.querySelector(".machine-drawer__idle-line")?.textContent).toBe("no signal");
+    expect(container.querySelector(".machine-drawer__idle-line")?.textContent).toBe("checking…");
 
     specs.open();
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());

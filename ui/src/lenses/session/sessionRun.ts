@@ -61,14 +61,14 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { PURPOSE, sumUsage } from "../../lib/usageRecords";
+import { PURPOSE, isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
 import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
-import { sameUid } from "../../lib/machineIdentity";
+import { sameMachine, sameUid } from "../../lib/machineIdentity";
 
 /** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
  *  section's ACTIVE TIME has its own, below: it shows wall minus rest). */
@@ -535,7 +535,11 @@ function turnCount(records: readonly NormRecord[]): number | null {
   if (stated.length > 0) return stated.reduce((a, b) => a + b, 0);
   const runtime = bySource(records, SOURCE.Runtime).slice(-1)[0];
   const sofar = Number((runtime?.fields as Record<string, unknown> | undefined)?.turns);
-  return runtime && Number.isFinite(sofar) ? sofar : null;
+  if (runtime && Number.isFinite(sofar)) return sofar;
+  // (5.0 R3) A single-shot run has no turn records: until its terminal states
+  // the count, each work call made so far is one turn.
+  const calls = records.filter(isSingleShotWorkUsage).length;
+  return calls > 0 ? calls : null;
 }
 
 const addOpt = (a: number | null, b: number | null): number | null => (b == null ? a : (a ?? 0) + b);
@@ -700,10 +704,13 @@ function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): Atte
  * record's, else its first record's) too: a multi-machine playback fixture
  * would otherwise render every machine's samples on every run's pane. */
 function hostSamplesOf(visible: readonly NormRecord[], ctx: RunContext): NormRecord[] {
-  const runMachineUid = ctx.d?.machine_uid ?? ctx.firstSessRec?.machine_uid ?? null;
+  // (5.0 R2) One identity rule: by uid when both sides carry one, else by a
+  // name spelling. A run that names no machine at all matches no sample;
+  // it never accepts every machine's.
+  const runMachine = ranOn(ctx.d, ctx.firstSessRec);
   const inWindow = (t: number) => t >= ctx.startTs && (ctx.closeTs == null || t <= ctx.closeTs);
   return visible.filter(
-    (r) => r.action === ACTION.MachineTelemetry && (runMachineUid == null || sameUid(r.machine_uid, runMachineUid)) && (r.tMs === null || inWindow(r.tMs)),
+    (r) => r.action === ACTION.MachineTelemetry && sameMachine({ uid: r.machine_uid, name: r.machine_id }, runMachine) && (r.tMs === null || inWindow(r.tMs)),
   );
 }
 
@@ -771,7 +778,14 @@ function routeLabel(ep: string | undefined, on: { name: string; uid: string }, v
   return `${label} · ${rest}`;
 }
 
-function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string, timing: string): BriefEntry[] {
+/** (5.0 R3) The route row: stated by a dispatch start or a terminal naming the
+ *  endpoint. Without either (a partial peer feed, a mission-level session that
+ *  makes no model call) there is nothing to assert. */
+function briefRoute(d: NormRecord | null, ep: string | undefined, first: NormRecord | null | undefined, viewerUid: string | null): string | null {
+  return d?.action === ACTION.DispatchStart || ep ? routeLabel(ep, ranOn(d, first), viewerUid) : null;
+}
+
+function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string | null, timing: string): BriefEntry[] {
   const rows: BriefEntry[] = [];
   pushKv(rows, "route", route);
   pushKv(rows, "image", sp.image);
@@ -1042,7 +1056,10 @@ function avgHighTile(label: string, m: { avg: number | null; high: number | null
 /** The CPU / RAM / GPU tiles for whichever figures were sampled. (#2413 M4)
  *  A model-work run whose host join came up empty says so ("no host
  *  samples", the machine drawer's words) rather than silently dropping the
- *  tiles; a run with no model work has nothing to sample. */
+ *  tiles; a run with no model work has nothing to sample. The run's own
+ *  records are on screen, so its machine streams here: `machine.telemetry`
+ *  rides the same flow stream, and a missing sample means the sampler did
+ *  not cover the run. */
 function hostTiles(agg: ReturnType<typeof hostAggregate>, hasModelWork: boolean): Tile[] {
   const tiles: Tile[] = [];
   if (agg.cpu.high != null) tiles.push(avgHighTile("CPU", agg.cpu));
@@ -1588,7 +1605,7 @@ export function runRegions(
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
   const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(endTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const ep = remoteEp;
-  const briefRows = briefRowsOf(sp, model, d, routeLabel(ep, ranOn(d, firstSessRec), viewerUid), briefTiming);
+  const briefRows = briefRowsOf(sp, model, d, briefRoute(d, ep, firstSessRec, viewerUid), briefTiming);
   const { promptLines, disclosures } = promptOf(sp);
 
   // No "run" heading inside the block: the region's own `<h2>` directly above

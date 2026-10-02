@@ -21,6 +21,7 @@ const proc = (
   ts,
   category: "telemetry",
   source: "host",
+  machine_uid: "UID-A",
   // flow-action-guard:allow — a retired action, as an archive still holds it
   action: "telemetry.process",
   payload: { cpu, gpu, mem },
@@ -116,7 +117,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={rolling}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -139,7 +140,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={rolling}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -188,7 +189,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -208,7 +209,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -227,7 +228,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -256,7 +257,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={ignoredRouteRecords}
         flowWindow={rolling}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -291,7 +292,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "playback", date: "2026-08-26" }}
         routeRecords={dayRecords}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -314,7 +315,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         nowMsOverride={NOW}
         liveMachines={new Map()}
         specs={null}
@@ -455,7 +456,7 @@ describe("MachineDrawer (#2107)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -493,7 +494,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -510,6 +511,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
     const oldSample: NormRecord = norm({
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
       category: "telemetry",
+      machine_uid: "UID-A",
       source: "host",
       // flow-action-guard:allow — a retired action, as an archive still holds it
       action: "telemetry.process",
@@ -520,7 +522,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[oldSample]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -544,7 +546,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={[]}
         flowWindow={rolling}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -574,7 +576,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[proc("2026-01-01T00:19:00Z", 10, 68, 20)]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -600,7 +602,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={rolling}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -640,7 +642,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -675,7 +677,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -779,7 +781,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -789,6 +791,29 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     );
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // (5.0 R2) A replay describes a recorded day: today's live load belongs to
+  // NOW, so it is neither polled nor shown there.
+  it("(5.0 R2) a past-date replay never polls or shows today's live daemon load", async () => {
+    const fetchMock = stubDaemonFetch();
+    render(
+      <MachineDrawer
+        route={{ kind: "playback", date: "2025-12-01" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog").textContent).not.toMatch(/56%|50% avg/);
   });
 
   // (operator warm-up finding) The daemon's ring samples continuously
@@ -802,7 +827,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -832,7 +857,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -872,7 +897,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={ignoredRouteRecords}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -927,7 +952,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -962,7 +987,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1007,7 +1032,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1081,7 +1106,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 1, 2, 3)]}
         flowWindow={[proc("2026-01-01T00:19:00Z", 30, 55, 40)]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1138,7 +1163,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1196,7 +1221,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 1, 2, 3)]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1355,7 +1380,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1432,7 +1457,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1476,7 +1501,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1516,7 +1541,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1543,7 +1568,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1574,7 +1599,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1635,7 +1660,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1678,7 +1703,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -1829,7 +1854,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
@@ -2040,7 +2065,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={SPECS_WITH_MODEL_DATA}
         liveStatus="live"
@@ -2071,7 +2096,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
         route={{ kind: "fleet" }}
         routeRecords={[]}
         flowWindow={[]}
-        localUid={null}
+        localUid="UID-A"
         liveMachines={new Map()}
         specs={SPECS_WITH_MODEL_DATA}
         liveStatus="live"
@@ -2090,5 +2115,66 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
     expect(panel.textContent).toContain("Apple M5 Max");
     expect(panel.textContent).toContain("memory free for AI");
     assertNoModelData(panel.textContent ?? "");
+  });
+});
+
+// (5.0 R2) The Machine info panel describes ONE machine: the one whose
+// readings it shows. A relayed dispatch ran elsewhere, so the panel names
+// that machine and never fills its rows from this daemon.
+describe("MachineDrawer — a relayed dispatch describes the machine that ran it (5.0 R2)", () => {
+  const T = "2026-01-01T00:10:00Z";
+  const MBP = { machine_uid: "UID-MBP", machine_id: "MacBook-Pro" };
+  const DARK = { machine_uid: "UID-DARK", machine_id: "darkbook" };
+  const relayed: NormRecord[] = normAll([
+    { ts: T, session_id: "s1", action: "dispatch.start", handle: "radio", ...DARK },
+    { ts: "2026-01-01T00:10:05Z", action: "machine.telemetry", category: "machinery", source: "host", ...DARK, payload: { cpu_pct: 91, mem_pct: 40, gpu_pct: 5 } },
+    { ts: "2026-01-01T00:10:09Z", session_id: "s1", action: "dispatch.complete", ...DARK, payload: {} },
+  ]);
+  const SPECS = { machine_id: "MacBook-Pro", machine_uid: "uid-mbp", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472, os: "macos" } as never;
+
+  it("names the executing machine, shows its gauges, and carries nothing from this machine's specs or daemon load", async () => {
+    const fetchMock = vi.fn(() => Promise.reject(new Error("no daemon")));
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <MachineDrawer
+        route={{ kind: "dispatch", dispatchId: "s1" } as never}
+        routeRecords={relayed}
+        flowWindow={relayed}
+        localUid="UID-MBP"
+        liveMachines={new Map()}
+        specs={SPECS}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    const text = () => screen.getByRole("dialog").textContent ?? "";
+    await waitFor(() => expect(text()).toContain("darkbook"));
+    expect(text()).not.toContain("MacBook-Pro");
+    expect(text()).not.toContain("M5 Max");
+    expect(text()).toContain("91%");
+    // This daemon is not polled for a machine it is not.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("a dispatch that ran on this machine still reads this machine's name and hardware", async () => {
+    const own = normAll([{ ts: T, session_id: "s1", action: "dispatch.start", handle: "radio", ...MBP }]);
+    render(
+      <MachineDrawer
+        route={{ kind: "dispatch", dispatchId: "s1" } as never}
+        routeRecords={own}
+        flowWindow={own}
+        localUid="UID-MBP"
+        liveMachines={new Map()}
+        specs={SPECS}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() => expect(screen.getByRole("dialog").textContent).toContain("M5 Max"));
+    expect(screen.getByRole("dialog").textContent).toContain("MacBook-Pro");
   });
 });

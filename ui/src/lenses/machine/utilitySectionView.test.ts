@@ -24,12 +24,12 @@ describe("(#2915) the machine page's Utility section", () => {
     expect(v.liveLine).toBe("idle");
   });
 
-  test("(#2958) before the page's records have arrived the live line says no signal, not idle", () => {
+  test("(#2958) before the page's records have arrived the live line says checking…, not idle", () => {
     const v = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: row, settled: false });
-    expect(v.liveLine).toBe("no signal");
+    expect(v.liveLine).toBe("checking…");
     expect(v.noSignal).toBe(true);
     // A running job is not shown either: nothing has been read yet.
-    expect(utilitySectionView({ data: [start(0, "radio_routing")], uid: U, nowMs: ms(3), specs: specs({}), isLocal: true, residentRow: null, settled: false }).liveLine).toBe("no signal");
+    expect(utilitySectionView({ data: [start(0, "radio_routing")], uid: U, nowMs: ms(3), specs: specs({}), isLocal: true, residentRow: null, settled: false }).liveLine).toBe("checking…");
     // Counts are "—" and an unknown model is not "not seen" yet; a model
     // named by /machine/specs is a reading and shows.
     expect(v.jobs.every((j) => j.calls === "—" && j.tokens === "—")).toBe(true);

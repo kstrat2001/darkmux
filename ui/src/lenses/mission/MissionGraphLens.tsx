@@ -84,6 +84,7 @@ import {
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
+import { sameUid } from "../../lib/machineIdentity";
 import { isHostSampleRecord, toPoint } from "../../lib/machineDrawerScope";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 import type { MissionGraph } from "../../types/generated/MissionGraph";
@@ -178,20 +179,21 @@ function isHostSampleWithPayload(r: NormRecord): boolean {
  * inline stamp gives, reached a different way because this port's data flow
  * is a fold, not a per-message reducer.
  *
- * MACHINE-level, not mission-scoped, matching legacy exactly: `tail` is the
- * live tail UNFILTERED by mission (`recordInMission` is never applied to
- * this source) — a host sample corroborates the whole box, not one mission. */
-function useProcReadout(tail: NormRecord[] | undefined): ProcSample | null {
+ * MACHINE-level, not mission-scoped: a host sample is never stamped with a
+ * mission id, so it is matched by the MACHINE the mission runs on
+ * (`machineUid`), never taken from whichever machine sampled last (5.0 R2);
+ * a mission that names no machine yet shows no readout. */
+function useProcReadout(tail: NormRecord[] | undefined, machineUid: string | null): ProcSample | null {
   const latest = useMemo(() => {
-    if (!tail || !tail.length) return null;
+    if (!tail || !tail.length || machineUid === null) return null;
     let found: NormRecord | null = null;
     for (const r of tail) {
-      if (!isHostSampleWithPayload(r)) continue;
+      if (!isHostSampleWithPayload(r) || !sameUid(r.machine_uid, machineUid)) continue;
       // Latest by time; an untimed sample only when nothing timed is found.
       if (!found || (r.tMs !== null && (found.tMs === null || r.tMs >= found.tMs))) found = r;
     }
     return found;
-  }, [tail]);
+  }, [tail, machineUid]);
 
   const [proc, setProc] = useState<ProcSample | null>(null);
   useEffect(() => {
@@ -622,7 +624,10 @@ export function MissionGraphLens({
   // while its run is in flight on the run page too.
   const stepRecords = useMemo(() => (idx ? recordsByStep(ascendingRecords, idx, missionId) : new Map<string, Map<string, NormRecord[]>>()), [ascendingRecords, idx, missionId]);
   const phases = useMemo(() => stepPhasesAt(stepRecords, now, policy), [stepRecords, now, policy]);
-  const proc = useProcReadout(flowTailQuery.data);
+  // (5.0 R2) The readout is the machine the mission is running ON (the newest
+  // of its own records that names one), never whichever machine sampled last.
+  const ranOnUid = useMemo(() => [...events].reverse().find((r) => r.machine_uid)?.machine_uid ?? null, [events]);
+  const proc = useProcReadout(flowTailQuery.data, ranOnUid);
 
   // Needs `now` (elapsed time for a still-running step) — computed here,
   // after `now` itself, rather than beside `selectedStep`/`selectedStepRecords`

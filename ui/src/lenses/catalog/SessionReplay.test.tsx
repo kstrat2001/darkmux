@@ -891,9 +891,14 @@ describe("SessionReplay", () => {
   });
 
   it("the route line says this machine when the page's own identity is the run's machine", async () => {
-    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-dispatch-task-list.json"), "utf8"));
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
-    renderReplay("task-list", "00000000-0000-4000-8000-ABFCA7779F06");
+    const uid = "00000000-0000-4000-8000-ABFCA7779F06";
+    const own = { machine_uid: uid, machine_id: "MacBook-Pro", session_id: "s-route" };
+    const raw = [
+      { ts: "2026-01-01T00:00:00Z", action: "dispatch.start", handle: "coder", ...own, payload: {} },
+      { ts: "2026-01-01T00:00:05Z", action: "dispatch.complete", ...own, payload: { total_turns: 1, wall_ms: 5000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: raw, count: raw.length, truncated: false, generated_at_ms: 0 }), { status: 200 }))));
+    renderReplay("s-route", uid);
     await waitFor(() => expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument());
   });
 
@@ -908,7 +913,8 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent?.toLowerCase()).toContain("complete"));
     expect(screen.getByText(/LIST-STEP/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
-    expect(screen.getByText("LMStudio · local · MacBook-Pro")).toBeInTheDocument();
+    // (5.0 R3) A step that made no model call asserts no route.
+    expect(screen.queryByText(/LMStudio/)).toBeNull();
     expect(screen.getByText(/^\d\d:28:40 → \d\d:28:42 \(0:02\)$/)).toBeInTheDocument();
     expect(screen.getByText("0:02")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
@@ -1227,7 +1233,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     ];
   }
 
-  it("shows 'no signal' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
+  it("shows 'disconnected' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
     vi.setSystemTime(t0);
@@ -1241,14 +1247,14 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     // (#2890) The tube shows static (the `nosignal` state) with an empty
     // center, and the words sit under the lamps.
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
-    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("no signal");
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
   });
 
   // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
   // read as connected REGARDLESS of the live `connected` prop — history is
   // not affected by whether the live page happens to be connected right
   // now. Same stale fixture, `connected={false}`, but now WITH a playhead —
-  // the genuine historical stall must show, not a false "no signal".
+  // the genuine historical stall must show, not a false "disconnected".
   it("a scrubbed playhead ignores the live connected=false and shows the REAL historical stall", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
@@ -1268,7 +1274,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
   // live connection right now, not about the history being viewed.
   // `lastContactMs` here sits BEFORE the stalled execution's own deadline
   // (t0-38_000 + 30_000 = t0-8_000), which — if NOT withheld — would
-  // downgrade a genuine historical stall to "no signal".
+  // downgrade a genuine historical stall to "disconnected".
   it("a scrubbed playhead withholds lastContactMs too, so a stale half-open value can't downgrade real history", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
@@ -1491,9 +1497,9 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: false, centerUnit: null });
   });
 
-  it("no signal is its own state with the words under the lamps", () => {
+  it("disconnected is its own state with the words under the lamps", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: null, noSignal: true }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "no signal" });
+    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "disconnected" });
   });
 
   it("finished: the average, 'avg tok/s', and the partial-average qualifier as the note", () => {

@@ -557,6 +557,33 @@ describe("App", () => {
     expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
+  // (5.0 R2) A machine page's event log is that machine's records, never the
+  // whole fleet's under that machine's name.
+  it("(5.0 R2) the machine page's event log lists only that machine's records", async () => {
+    window.location.hash = "#lens=machine";
+    const now = Date.now();
+    const rec = (uid: string, name: string, sid: string) => ({ ts: new Date(now - 60_000).toISOString(), machine_uid: uid, machine_id: name, session_id: sid, action: "dispatch.start", handle: "coder" });
+    const flow = [rec("UID-MAC", "MacBook-Pro", "s-mac"), rec("UID-DARK", "darkbook", "s-dark"), rec("UID-DARK", "darkbook", "s-dark2")];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/machine/specs") return Promise.resolve(new Response(JSON.stringify({ machine_id: "MacBook-Pro", machine_uid: "uid-mac" }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(flow), { status: 200 }));
+        return mockFleetLikeFetch()(url);
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+    expect(document.getElementById("logbody")!.textContent).not.toContain("darkbook");
+  });
+
   it("keeps the event-log column VISIBLE on the console lens (#1066)", async () => {
     window.location.hash = "#lens=console";
     vi.stubGlobal(
@@ -1120,6 +1147,44 @@ describe("App", () => {
       await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
     } finally {
       meta.remove();
+      window.location.hash = "";
+    }
+  });
+
+  // (5.0 R2) A static build has no daemon specs and an empty live window, so the
+  // machine page's "self" is the machine fixture's own machine, found in the
+  // committed day.
+  it("(5.0 R2) a static build's machine page lists the fixture machine's records, not none and not everyone's", async () => {
+    const metas = [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-machine-src", "./demo-machine.json"],
+    ].map(([name, content]) => {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+      return meta;
+    });
+    window.location.hash = "#lens=machine&r2static";
+    const rec = (uid: string, name: string, sid: string) => ({ ts: "2026-08-26T10:00:00.000Z", machine_uid: uid, machine_id: name, session_id: sid, action: "dispatch.start", handle: "coder" });
+    const jsonl = [rec("UID-W", "Workstation", "s-w"), rec("UID-S", "Studio", "s-s1"), rec("UID-S", "Studio", "s-s2")].map((r) => JSON.stringify(r)).join("\n");
+    const machine = { specs: { machine_id: "Workstation", machine_uid: null }, resources: {} };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "./demo-flow.jsonl") return Promise.resolve(new Response(jsonl, { status: 200 }));
+        if (path === "./demo-machine.json") return Promise.resolve(new Response(JSON.stringify(machine), { status: 200 }));
+        return Promise.resolve(new Response(JSON.stringify({ runs: [] }), { status: 200 }));
+      }),
+    );
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+      expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+      expect(document.getElementById("logbody")!.textContent).not.toContain("Studio");
+    } finally {
+      for (const m of metas) m.remove();
       window.location.hash = "";
     }
   });
@@ -1820,7 +1885,7 @@ describe("App — presence coverage on the masthead", () => {
   });
 
   // (#2965) A failed `/flow/<day>` read has its own notice, in the same
-  // app-level notice row: the cards and the machine page hold "no signal"
+  // app-level notice row: the cards and the machine page hold "checking…"
   // for it, and this says why. Presence is healthy here, so the only notice
   // on the page is the flow one.
   it("shows the flow-read notice when a flow read fails, and names the failure", async () => {
@@ -1866,8 +1931,8 @@ describe("App — presence coverage on the masthead", () => {
   // (#2965 review) The failure is not sticky. Nothing else refetches a
   // `flowDate` key (the live tail writes `flowTail`), so a failed day has to
   // retry itself: one blip, and the page heals at the next retry instead of
-  // holding "no signal" until a reload.
-  it("clears the notice and the card's 'no signal' once a failed read succeeds on retry", async () => {
+  // holding "checking…" until a reload.
+  it("clears the notice and the card's 'checking…' once a failed read succeeds on retry", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     try {
       mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
@@ -1886,7 +1951,7 @@ describe("App — presence coverage on the masthead", () => {
       );
       const { container } = renderApp();
       await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
-      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("checking…"));
       await act(async () => {
         vi.advanceTimersByTime(21_000);
       });
@@ -1933,7 +1998,7 @@ describe("App — presence coverage on the masthead", () => {
     const { container } = renderApp();
     await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
     expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')!.textContent).toContain("401 Unauthorized");
-    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("checking…"));
   });
 
   it("shows no flow-read notice when the flow reads succeed — the inverted case", async () => {

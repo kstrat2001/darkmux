@@ -51,7 +51,7 @@ import {
 } from "./Meter";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
-import { resolveDrawerScope } from "../lib/machineDrawerScope";
+import { resolveDrawerScope, scopeIsPeer, specsForScope, wantsDaemonLoad } from "../lib/machineDrawerScope";
 import { injectedMeta } from "../lib/injectedMeta";
 import { firstRecordDate, todayUTC } from "../lib/flow";
 import { displayNameOf } from "../lib/machineIdentity";
@@ -830,7 +830,11 @@ export function useMachineStatsContent({
   // can see while closed. `null` when disabled/unreachable/not-yet-resolved
   // /closed, in which case [[effectiveHostAggregate]] falls back to the
   // pre-#2107 dispatch-derived aggregate unchanged.
-  const daemonLoad = useDaemonLoad(isOpen);
+  // (5.0 R2) This panel describes `scope.machineUid`. When that is another
+  // machine (a relayed dispatch), this daemon's own load, hardware and
+  // specs are not its readings: they are neither polled nor shown.
+  const isPeer = scopeIsPeer(scope, localUid);
+  const daemonLoad = useDaemonLoad(wantsDaemonLoad(isOpen, isPeer, route));
   const agg = useMemo(
     () => effectiveHostAggregate(isDispatch, dispatchAgg, daemonLoad),
     [isDispatch, dispatchAgg, daemonLoad],
@@ -844,8 +848,9 @@ export function useMachineStatsContent({
     ? scope.samples.length === 0
     : scope.samples.length === 0 && daemonLoad == null;
 
+  const hostSpecs = specsForScope(isPeer, specs);
   const machineName =
-    localUid != null ? displayNameOf(flowWindow, liveMachines, specs, localUid) : null;
+    scope.machineUid != null ? displayNameOf(flowWindow, liveMachines, hostSpecs, scope.machineUid) : null;
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
 
@@ -1006,8 +1011,8 @@ export function useMachineStatsContent({
   // CPU clusters section already reports per-cluster MHz, which is the
   // honest form, since the clusters run at different speeds and a single
   // "clock speed" row would have to pick one.
-  const ramTotal = specs?.ram_total_bytes ?? null;
-  const ramForAi = specs?.ram_free_for_ai_bytes ?? null;
+  const ramTotal = hostSpecs?.ram_total_bytes ?? null;
+  const ramForAi = hostSpecs?.ram_free_for_ai_bytes ?? null;
   // (#2250 follow-up) Each `Kv` returns null on an empty value, so an
   // unknown field drops its own row — but a fragment is ALWAYS truthy, so
   // guarding the section on the element itself rendered a bare "System
@@ -1016,9 +1021,9 @@ export function useMachineStatsContent({
   // code did when these were plain strings.
   const identityValues = [
     machineName ?? "",
-    specs?.cpu_brand ?? "",
+    hostSpecs?.cpu_brand ?? "",
     fmtGbBytes(ramTotal),
-    specs?.os ?? "",
+    hostSpecs?.os ?? "",
   ];
   const hasIdentity = identityValues.some((v) => v !== "");
   const identityBlock = (

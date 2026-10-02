@@ -37,7 +37,7 @@ function unreachableLine(reason: UnreachableReason): string {
     case "pin_mismatch":
       return "identity mismatch";
     case "listener_off":
-      return "listener off";
+      return "not listening";
     case "auth_required":
       return "auth required";
     case "refused_by_peer":
@@ -212,9 +212,19 @@ export interface RowFacts {
   /** What the peer lets this machine do; `null` for this machine's own row. */
   grant: Grant | null;
   standing: Standing;
+  /** The view's own answer on whether the machine's presence beat is live. */
+  liveness: Liveness;
   isSelf: boolean;
   /** The row's card declares `fleet.mode hub`. */
   hub: boolean;
+}
+
+/** Whether this viewer is receiving the row's machine. A view whose presence
+ * says the beat stopped (`no_beat`) outranks the window: a day-old record
+ * still sitting in it is history, not a stream. The window answers only when
+ * presence could not. */
+export function rowSeen(row: Pick<RowFacts, "known" | "liveness">): boolean {
+  return row.liveness !== "no_beat" && row.known;
 }
 
 /** The uid a card is keyed by. This machine's own row, when the daemon
@@ -258,6 +268,7 @@ export function rowFacts(
     note: outcomeLine(row.card),
     grant: row.is_this_machine ? null : grantOf(row.accepts),
     standing: rowStanding(row),
+    liveness: row.liveness,
     isSelf: row.is_this_machine,
     hub: rowIsHub(row),
   };
