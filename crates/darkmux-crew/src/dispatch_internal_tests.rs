@@ -725,17 +725,19 @@
     }
 
     /// (#2925) The tailer honors a dispatch-scoped stop like an interrupt:
-    /// it flushes and ends its loop (here with no container to kill) while
-    /// its own stop flag is never set. A tailer that ignored the stop would
-    /// hang this test past its bound.
+    /// it flushes, runs `docker kill <this container>` (a shim on PATH records
+    /// the call) and ends its loop, while its own stop flag is never set. A
+    /// tailer that ignored the stop would hang this test past its bound.
     #[test]
     #[serial]
     fn the_tailer_ends_on_its_dispatchs_own_stop() {
         darkmux_types::interrupt::reset_for_test();
+        let shim_dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&shim_dir);
         let out = TempDir::new().unwrap();
-        let local_stop = DispatchStop::new("darkmux-test-no-such-container".into());
+        let local_stop = DispatchStop::new("darkmux-test-local-stop".into());
         local_stop.request("phase `p` of mission `m` is abandoned".into());
-        let started = Instant::now();
+        let handoff = local_stop.watchdog_handoff();
         let handle = thread::spawn(move || {
             run_tailer(
                 out.path().to_path_buf(),
@@ -765,10 +767,133 @@
         while !handle.is_finished() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
-        assert!(handle.is_finished(), "the tailer must end on a dispatch-scoped stop");
-        assert!(started.elapsed() < Duration::from_secs(20));
+        let finished = handle.is_finished();
+        restore_path(prev_path);
+        assert!(finished, "the tailer must end on a dispatch-scoped stop");
         handle.join().unwrap();
+        let recorded = std::fs::read_to_string(&record_path).expect("the stop ran `docker`");
+        assert_eq!(recorded.trim(), "kill darkmux-test-local-stop", "kills this dispatch's container, only it");
+        assert!(!handoff.load(Ordering::SeqCst), "a kill that worked does not wake the watchdog");
     }
+
+    /// A `docker` shim on PATH that records every call and fails the first
+    /// `kill` it sees (a counter file beside it), then succeeds. `ps` prints a
+    /// container id while a `running` file exists beside the shim.
+    fn install_scripted_docker(dir: &TempDir) -> (std::path::PathBuf, Option<String>) {
+        let record = dir.path().join("invoked-with.txt");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = warm-up ] && exit 0\necho \"$@\" >> {rec}\n\
+             if [ \"$1\" = kill ]; then\n  n=$(cat {cnt} 2>/dev/null || echo 0)\n  echo $((n+1)) > {cnt}\n  [ \"$n\" = 0 ] && exit 1\nfi\n\
+             if [ \"$1\" = ps ] && [ -e {run} ]; then echo abc123; fi\nexit 0\n",
+            rec = record.display(),
+            cnt = dir.path().join("kills").display(),
+            run = dir.path().join("running").display(),
+        );
+        let path = dir.path().join("docker");
+        std::fs::write(&path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::process::Command::new(&path).arg("warm-up").status().unwrap();
+        let prev = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        (record, prev)
+    }
+
+    /// A failed local-stop `docker kill` hands the container to the
+    /// watchdog's retried kill at once: the watchdog wakes as abandoned (not on
+    /// its 600 s deadline) and kills again, and that second kill lands.
+    #[test]
+    #[serial]
+    fn a_failed_local_stop_kill_hands_off_to_the_watchdogs_retried_kill() {
+        let dir = TempDir::new().unwrap();
+        let (record, prev_path) = install_scripted_docker(&dir);
+        let stop = DispatchStop::new("darkmux-test-handoff".into());
+        let (_guard, handle) = spawn_guarded_watchdog(
+            &stop.watchdog_handoff(),
+            "darkmux-test-handoff".to_string(),
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+        );
+        stop.kill_container(); // the shim fails this first kill
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let finished = handle.is_finished();
+        restore_path(prev_path);
+        assert!(finished, "the watchdog never took the handoff");
+        assert_eq!(handle.join().unwrap(), WatchdogWake::Abandoned, "woken by the handoff, not the deadline");
+        let kills = std::fs::read_to_string(&record).unwrap().lines().filter(|l| l.starts_with("kill ")).count();
+        assert_eq!(kills, 2, "the stop's own kill failed once, the watchdog's retried kill landed");
+    }
+
+    /// A succeeding local-stop kill leaves the watchdog alone.
+    #[test]
+    #[serial]
+    fn a_successful_local_stop_kill_does_not_wake_the_watchdog() {
+        let dir = TempDir::new().unwrap();
+        let (_record, prev_path) = install_fake_docker(&dir);
+        let stop = DispatchStop::new("darkmux-test-ok".into());
+        stop.kill_container();
+        restore_path(prev_path);
+        assert!(!stop.watchdog_handoff().load(Ordering::SeqCst));
+    }
+
+    /// The lock outlives nothing: after a SIGKILL of darkmux the lock is gone
+    /// but the container runs on. A resume asks docker, and is refused while
+    /// the origin's recorded container is up.
+    #[test]
+    #[serial]
+    fn a_resume_is_refused_while_the_origins_container_is_still_running() {
+        let (_ws, prior, _) = origin_dir();
+        record_origin_container(prior.path(), "darkmux-dispatch-orphan");
+        let dir = TempDir::new().unwrap();
+        let (record, prev_path) = install_scripted_docker(&dir);
+        std::fs::write(dir.path().join("running"), "").unwrap();
+        let refused = claim_resume_origin(prior.path()).err().map(|e| e.to_string());
+        std::fs::remove_file(dir.path().join("running")).unwrap();
+        let allowed = claim_resume_origin(prior.path()).is_ok();
+        restore_path(prev_path);
+        let msg = refused.expect("refused while the container is up");
+        assert!(msg.contains("RESUME REFUSED") && msg.contains("darkmux-dispatch-orphan") && msg.contains("docker kill"), "{msg}");
+        assert!(allowed, "allowed once the container is gone");
+        let ps = std::fs::read_to_string(&record).unwrap();
+        assert!(ps.contains("name=^darkmux-dispatch-orphan$"), "asked docker about the recorded name: {ps}");
+    }
+
+    /// A dispatch that has stamped its identity holds its out-dir's lock:
+    /// nobody else can take it, and `dispatch()` stamps through this one
+    /// function.
+    #[test]
+    fn a_running_dispatch_holds_its_out_dir_execution_lock() {
+        let out = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let out_dir = out.path().join("darkmux-out-held");
+        std::fs::create_dir(&out_dir).unwrap();
+        let lock_path = darkmux_types::paths::execution_lock_path(&out_dir).unwrap();
+        let mut held = ExecutionLock { _guards: Vec::new() };
+        stamp_own_execution(&mut held, &out_dir, (ws.path(), false, None), &ExecutionId::mint()).unwrap();
+        assert!(
+            darkmux_types::flock::try_lock_exclusive_owned(&lock_path).unwrap().is_none(),
+            "another try_lock on the running dispatch's lock fails"
+        );
+        assert!(read_resume_origin(&out_dir).is_ok(), "and its origin record was written");
+        drop(held);
+        assert!(darkmux_types::flock::try_lock_exclusive_owned(&lock_path).unwrap().is_some(), "released on drop");
+
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").expect("the test module declaration")];
+        assert_eq!(
+            src.matches("stamp_own_execution(\n        &mut execution_lock,").count(),
+            1,
+            "dispatch() stamps its identity and takes its lock through stamp_own_execution"
+        );
+    }
+
 
     /// Hosted-response classification (pure): the happy path passes through;
     /// object-shaped errors (Azure/OpenAI) and ARRAY-shaped errors (Google's

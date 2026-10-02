@@ -1270,6 +1270,38 @@ pub(crate) fn resume_effective_image(
     }
 }
 
+/// A dispatch's own identity at start: its host-only resume-origin record and
+/// its out-dir's execution lock, held until `lock` drops. From here a resume of
+/// this out-dir is refused while the dispatch runs.
+fn stamp_own_execution(
+    lock: &mut ExecutionLock,
+    host_out: &Path,
+    workspace: (&Path, bool, Option<&str>),
+    execution: &ExecutionId,
+) -> Result<()> {
+    let (path, read_only, image) = workspace;
+    write_resume_origin_meta(host_out, path, read_only, image, execution);
+    hold_own_execution_lock(lock, host_out)
+}
+
+/// Record the container this dispatch runs in, in its resume-origin record, so
+/// a later resume can tell the container is still up after the darkmux
+/// process that started it (and held the lock) was killed. Best effort.
+fn record_origin_container(host_out: &Path, container_name: &str) {
+    update_origin_field(host_out, "container", serde_json::Value::String(container_name.to_string()));
+}
+
+/// Set one key in `out_dir`'s host-only origin record, keeping the rest.
+fn update_origin_field(out_dir: &Path, key: &str, value: serde_json::Value) {
+    let Ok(raw) = read_resume_origin(out_dir) else { return };
+    let Ok(mut origin) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let Some(obj) = origin.as_object_mut() else { return };
+    obj.insert(key.to_string(), value);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&origin) {
+        let _ = write_private_no_follow(&resume_origin_path(out_dir), &bytes);
+    }
+}
+
 /// Holds one execution's exclusive lock for as long as it lives (released
 /// on drop, and by the kernel if the process dies).
 pub(crate) struct ExecutionLock {
@@ -1281,7 +1313,7 @@ pub(crate) struct ExecutionLock {
 fn try_lock_out_dir(out_dir: &Path) -> Result<Option<darkmux_types::flock::FlockGuard>> {
     let path = darkmux_types::paths::execution_lock_path(out_dir)
         .ok_or_else(|| anyhow!("{} has no name to derive an execution lock path from", out_dir.display()))?;
-    darkmux_types::flock::try_lock_exclusive(&path)
+    darkmux_types::flock::try_lock_exclusive_owned(&path)
 }
 
 /// One live execution per out-dir. A dispatch holds its own out-dir's lock
@@ -1303,15 +1335,27 @@ pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
             resume_from.display()
         );
     }
-    match try_lock_out_dir(resume_from).context("locking the resume origin")? {
-        Some(guard) => Ok(ExecutionLock { _guards: vec![guard] }),
-        None => bail_resume!(
-            "darkmux dispatch: RESUME REFUSED — {named} (out-dir {}) is still running; a second \
+    let Some(guard) = try_lock_out_dir(resume_from).context("locking the resume origin")? else {
+        bail_resume!(
+            "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) is still running; a second \
              run would share its execution id and workspace. Wait for it to end (or stop it), then \
              resume",
             resume_from.display()
-        ),
+        );
+    };
+    // The lock lives only as long as the darkmux process: after a SIGKILL of
+    // it the container keeps running with no lock held. Ask docker too.
+    if let Some(name) = origin_container(resume_from) {
+        if probe_container_liveness(&name) == Liveness::Running {
+            bail_resume!(
+                "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its container `{name}` \
+                 running, though the darkmux process that started it is gone. Stop it \
+                 (`docker kill {name}`), then resume",
+                resume_from.display()
+            );
+        }
     }
+    Ok(ExecutionLock { _guards: vec![guard] })
 }
 
 /// Take `host_out`'s own execution lock into `held`, so a resume of THIS
@@ -1338,14 +1382,7 @@ pub(crate) fn hold_own_execution_lock(held: &mut ExecutionLock, host_out: &Path)
 /// behavior and never a wrong refusal.
 pub(crate) fn mark_execution_completed(out_dirs: &[&Path]) {
     for dir in out_dirs {
-        let path = resume_origin_path(dir);
-        let Ok(raw) = read_resume_origin(dir) else { continue };
-        let Ok(mut origin) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-        let Some(obj) = origin.as_object_mut() else { continue };
-        obj.insert("completed".to_string(), serde_json::Value::Bool(true));
-        if let Ok(bytes) = serde_json::to_vec_pretty(&origin) {
-            let _ = write_private_no_follow(&path, &bytes);
-        }
+        update_origin_field(dir, "completed", serde_json::Value::Bool(true));
     }
 }
 
@@ -1357,6 +1394,13 @@ fn complete_execution_on_success(exit_code: i32, host_out: &Path, resume_from: O
         let origins: Vec<&Path> = std::iter::once(host_out).chain(resume_from).collect();
         mark_execution_completed(&origins);
     }
+}
+
+/// The container name `out_dir`'s dispatch recorded, when it recorded one.
+fn origin_container(out_dir: &Path) -> Option<String> {
+    let raw = read_resume_origin(out_dir).ok()?;
+    let origin: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    origin.get("container")?.as_str().map(str::to_string)
 }
 
 fn resume_origin_completed(out_dir: &Path) -> bool {
@@ -4657,11 +4701,20 @@ fn docker_kill_by_name(container_name: &str) {
 struct DispatchStop {
     reason: Arc<Mutex<Option<String>>>,
     container_name: String,
+    /// The watchdog's "main thread is gone, kill now" flag (its retried,
+    /// probe-confirmed kill). Set when this stop's own single `docker kill`
+    /// fails, so a stuck container is never left to the inactivity timeout,
+    /// which is off when the timeout is 0.
+    watchdog_handoff: Arc<AtomicBool>,
 }
 
 impl DispatchStop {
     fn new(container_name: String) -> Self {
-        Self { reason: Arc::new(Mutex::new(None)), container_name }
+        Self {
+            reason: Arc::new(Mutex::new(None)),
+            container_name,
+            watchdog_handoff: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Record why this dispatch must end. The first reason wins.
@@ -4678,9 +4731,21 @@ impl DispatchStop {
         self.reason().is_some()
     }
 
-    /// Stop this dispatch's container, and only it.
+    /// Stop this dispatch's container, and only it. A failed `docker kill`
+    /// hands the container to the watchdog's retried kill at once.
     fn kill_container(&self) {
-        docker_kill_by_name(&self.container_name);
+        let killed = Command::new("docker")
+            .args(["kill", &self.container_name])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !killed {
+            self.watchdog_handoff.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The flag the watchdog is built on, so [`Self::kill_container`] can wake it.
+    fn watchdog_handoff(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.watchdog_handoff)
     }
 }
 
@@ -6174,8 +6239,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace path/mount-mode into its own host_out, unconditionally —
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
-    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, image_arg.as_deref(), &execution);
-    hold_own_execution_lock(&mut execution_lock, &host_out)?;
+    stamp_own_execution(
+        &mut execution_lock,
+        &host_out,
+        (&workspace, opts.workspace_read_only, image_arg.as_deref()),
+        &execution,
+    )?;
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -6325,6 +6394,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             })
             .collect::<String>()
     );
+    record_origin_container(&host_out, &container_name);
 
     // Build the complete docker-run argv via the pure function (#842).
     // All inputs are resolved above; this is a single deterministic call.
@@ -6812,7 +6882,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // `docker kill`. `watchdog_abandoned` means "the main thread is GONE
     // (panicked) — stop waiting on the deadline and kill now"; it can only
     // ever ADD urgency, never suppress a kill.
-    let watchdog_abandoned = Arc::new(AtomicBool::new(false));
+    let watchdog_abandoned = local_stop.watchdog_handoff();
     // (#2232) What the persistent kill established, as a `KillDisposition`
     // code. Read once, below, to decide what the timeout marker may claim —
     // only `Confirmed` licenses "was killed by the watchdog".

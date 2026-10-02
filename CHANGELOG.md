@@ -1514,7 +1514,11 @@ darkmux release.
   exit) still works. A run that stops at `max_turns` exits 0, so it counts as
   completed and cannot be resumed.
   The lock is `<out-dir>.execution.lock`, beside the out-dir like the resume
-  origin record, and `doctor`'s orphan count covers it.
+  origin record (opened without following symlinks, and only if this user owns
+  it), and `doctor`'s orphan count covers it. Because a lock dies with the
+  darkmux process, a resume also asks docker and is refused while the origin's
+  recorded container is still running. If a phase stop's `docker kill` fails, the
+  watchdog's retried kill takes over at once.
 - **A hosted call the endpoint may have processed is charged, once, one way** (5.0).
   A timeout or dropped reply after the request was sent, an unreadable reply,
   and a 5xx write an `absent` usage record (the endpoint's window counts it as

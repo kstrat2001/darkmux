@@ -222,6 +222,49 @@ pub fn try_lock_exclusive(path: &Path) -> Result<Option<FlockGuard>> {
     }
 }
 
+/// [`try_lock_exclusive`] for a lock file that sits at a predictable path in a
+/// directory other local users may write (an out-dir's parent, usually the
+/// temp root): opened with `O_NOFOLLOW`, so a symlink planted at that name is
+/// refused rather than followed, and refused unless this process's effective
+/// uid owns the file, so one planted by another user cannot be used to hold a
+/// lock open or to deny it. `Ok(None)` when another holder has the lock.
+#[cfg(unix)]
+pub fn try_lock_exclusive_owned(path: &Path) -> Result<Option<FlockGuard>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening lock file {} (a symlink there is refused)", path.display()))?;
+    let owner = file.metadata().with_context(|| format!("reading {}", path.display()))?.uid();
+    let me = unsafe { libc::geteuid() };
+    if owner != me {
+        return Err(anyhow!(
+            "lock file {} is owned by uid {owner}, not this process's uid {me}; refusing to use it",
+            path.display()
+        ));
+    }
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(FlockGuard(file)));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(anyhow!("flock(LOCK_EX|LOCK_NB) failed on {}: {}", path.display(), err))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +388,23 @@ mod tests {
 
         let attempt = try_lock_exclusive(&path).unwrap();
         assert!(attempt.is_some(), "must acquire once the prior holder released");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_owned_lock_refuses_a_symlink_and_keeps_exclusion() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real.lock");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("planted.lock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = try_lock_exclusive_owned(&link).err().expect("a symlink is refused, not followed");
+        assert!(err.to_string().contains("symlink"), "{err:#}");
+
+        let path = dir.path().join("mine.lock");
+        let held = try_lock_exclusive_owned(&path).unwrap().expect("first lock");
+        assert!(try_lock_exclusive_owned(&path).unwrap().is_none(), "a second lock on it is refused");
+        drop(held);
+        assert!(try_lock_exclusive_owned(&path).unwrap().is_some(), "free once released");
     }
 }
