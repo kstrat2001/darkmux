@@ -3,9 +3,8 @@
 //! The shapes themselves are `darkmux_flow::payload` types, one typed definition for every
 //! consumer.
 //!
-//! Three surfaces carry these objects: `GET /machine/resources`' `load` block,
-//! the periodic `machine.telemetry` flow record's payload, and the
-//! `machine.rollup` record's window. Each used to build the object by hand with
+//! Two surfaces carry these objects: `GET /machine/resources`' `load` block and
+//! the periodic `machine.telemetry` flow record's payload. Each used to build the object by hand with
 //! `json!`, so the wire shape lived in the builders and in a hand-written
 //! TypeScript copy. Here it is a `Serialize` type, and the TypeScript twin is
 //! generated from it.

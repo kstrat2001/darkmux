@@ -17,7 +17,9 @@
 //!
 //! and the job fits that node's **scope**: a work-class profile the entry
 //! lists (never one that resolves only to the machine's utility model,
-//! #2914), and a `workdir` only when the entry grants `workspace` (#755).
+//! #2914), and a `workdir` only when the entry grants `workspace`, which
+//! grants a receiver PATH only: it never authorizes a fetch, a checkout or a
+//! push (git handoff, #755, gets its own grant).
 //! Deny by default; fail closed (no identity answer = refused); every refusal
 //! is answered at once, with the reason, never a silent timeout.
 //!
@@ -1528,6 +1530,7 @@ mod tests {
             roles: Some(vec!["radio-host".into()]),
             images: Some(vec!["rust:slim".into()]),
             workspace: Some(workspace),
+            repos: None,
             extras: Default::default(),
         }
     }
@@ -1538,6 +1541,46 @@ mod tests {
         // An entry that was never resolved matches nothing.
         m.insert("ghost".to_string(), entry(None, &["host"], true));
         m
+    }
+
+    /// (#755) `repos` is reserved for the git workspace handoff and read by
+    /// nothing here: an allow-list entry carrying it loads from a real
+    /// config.json and is admitted and scoped exactly like the same entry
+    /// without it, `workspace: true` included.
+    #[test]
+    fn a_repos_grant_changes_no_admission_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = serde_json::json!({"fleet": {"accept_work": {"macbook-pro": {
+            "node_id": "nLAPTOP", "profiles": ["host"], "roles": ["radio-host"],
+            "images": ["rust:slim"], "workspace": true, "repos": ["darkmux", "docs"]}}}});
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        let with = read_allow_list(&path).unwrap();
+        assert_eq!(
+            with["macbook-pro"].repos.as_deref(),
+            Some(&["darkmux".to_string(), "docs".to_string()][..]),
+            "the field is carried, not dropped into extras"
+        );
+        let mut without = with.clone();
+        without.get_mut("macbook-pro").unwrap().repos = None;
+
+        let admit_with = match_entry("nLAPTOP", "macbook-pro", &with).unwrap();
+        assert_eq!(admit_with, match_entry("nLAPTOP", "macbook-pro", &without).unwrap());
+        let mut j = job(None);
+        j.workdir = Some("/anywhere".into());
+        let scoped_with = check_scope("studio", None, &admit_with, &j, work("host"));
+        let admit_without = match_entry("nLAPTOP", "macbook-pro", &without).unwrap();
+        assert_eq!(scoped_with, check_scope("studio", None, &admit_without, &j, work("host")));
+        assert!(scoped_with.is_ok(), "workspace still grants the path: {scoped_with:?}");
+
+        // And an entry with `repos` but no `workspace` still refuses a workdir.
+        let mut no_ws = with.clone();
+        no_ws.get_mut("macbook-pro").unwrap().workspace = None;
+        let a = match_entry("nLAPTOP", "macbook-pro", &no_ws).unwrap();
+        assert!(matches!(
+            check_scope("studio", None, &a, &j, work("host")),
+            Err(Refusal::OutOfScope { item: OutOfScope::Workspace, .. })
+        ));
     }
 
     fn job(profile: Option<&str>) -> WorkJob {

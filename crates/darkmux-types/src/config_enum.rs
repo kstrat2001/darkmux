@@ -1052,8 +1052,7 @@ mod tests {
     ///    That is the shape the three drifted settings had before #2947.
     ///
     /// **Limits, stated plainly.** A setting whose value is compared with
-    /// `==` against a literal OUTSIDE those two files (`runtime.log_level`'s
-    /// reader checks `== "debug"`), or an enum declared outside
+    /// `==` against a literal OUTSIDE those two files, or an enum declared outside
     /// darkmux-types that is matched on a config string without
     /// `config_enum!`, is not seen: text scans find declarations and match
     /// arms, not meaning. Those remain a review question.

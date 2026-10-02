@@ -69,8 +69,11 @@ pub struct WorkJob {
     pub profile: Option<String>,
 
     /// Optional `--workdir`, a path on the RECEIVER. Refused unless the
-    /// sender's allow-list entry grants `workspace` (#755), and then only
-    /// under the receiver's worktrees base.
+    /// sender's allow-list entry grants `workspace`, and then only under the
+    /// receiver's worktrees base. `workspace` grants a receiver PATH only. It
+    /// never authorizes a fetch, a checkout or a push. Git handoff (#755)
+    /// gets its own grant, and its checkouts live outside the worktrees
+    /// base, so this grant cannot reach them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 

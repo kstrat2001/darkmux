@@ -933,55 +933,6 @@ pub fn format_client_addr(bind: &str, port: u16) -> String {
     }
 }
 
-// ── Machine-lens aggregate heartbeat (#2775) ──
-// `env(DARKMUX_MACHINE_ROLLUP_ENABLED / _PERIOD_SECONDS) >
-// config.machine_rollup.* > built-in default`. See `MachineRollupConfig`'s
-// own doc for why this is a periodic RECORD rather than a timed hook.
-
-/// The built-in emission period, in seconds. Also the literal
-/// `DarkmuxConfig::with_defaults` writes.
-pub const MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT: u64 = 60;
-
-/// Whether the daemon emits the periodic `machine.rollup` record at all.
-/// Default `false`: this adds steady-state volume to the flow stream, and
-/// nobody pays for a heartbeat they have not subscribed to.
-///
-/// Fail-CLOSED on an unrecognized env token, the same
-/// `parse_bool_token(...).unwrap_or(false)` shape `hooks_enabled` uses — a
-/// typo leaves a gated feature off rather than silently turning it on.
-pub fn machine_rollup_enabled() -> bool {
-    machine_rollup_enabled_with_source().0
-}
-
-/// [`machine_rollup_enabled`] plus WHICH tier resolved it.
-pub fn machine_rollup_enabled_with_source() -> (bool, Source) {
-    if let Some(s) = env_str("DARKMUX_MACHINE_ROLLUP_ENABLED") {
-        return (parse_bool_token(&s).unwrap_or(false), Source::Env);
-    }
-    match config().machine_rollup.as_ref().and_then(|m| m.enabled) {
-        Some(v) => (v, Source::Config),
-        None => (false, Source::BuiltIn),
-    }
-}
-
-/// Seconds between `machine.rollup` emissions. `0` means OFF — the
-/// zero-means-off convention `runtime.host_sampler_interval_ms` and
-/// `redis.maxlen` already use here, never "emit continuously".
-pub fn machine_rollup_period_seconds() -> u64 {
-    machine_rollup_period_seconds_with_source().0
-}
-
-/// [`machine_rollup_period_seconds`] plus WHICH tier resolved it.
-pub fn machine_rollup_period_seconds_with_source() -> (u64, Source) {
-    let cfg = config().machine_rollup.as_ref().and_then(|m| m.period_seconds);
-    let (v, src) = pick_parsed_with_source(
-        "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS",
-        cfg,
-        Some(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT),
-    );
-    (v.unwrap_or(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT), src)
-}
-
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
     inactivity_timeout_seconds_with_source().0
@@ -1510,43 +1461,6 @@ pub fn strict_selection() -> bool {
     }
     config().runtime.as_ref().and_then(|r| r.strict_selection).unwrap_or(false)
 }
-/// (#1311) Diagnostic verbosity. `env(DARKMUX_LOG)` (lower-cased) >
-/// `config.runtime.log_level` > `"info"`. NEVER a secret at any level.
-///
-/// **Scope, stated honestly (#1665 audit):** the ONLY reader anywhere in
-/// this tree is [`debug_logging`] just below, and its ONLY caller is the
-/// tool-less remote `single_shot` dispatch path
-/// (`darkmux_crew::single_shot`). Every value besides `"debug"` (an
-/// `"info"` tier, or anything else an operator sets) has zero effect
-/// anywhere — there is no `"info"`-specific behavior to turn on, just the
-/// absence of `"debug"`'s. And the internal-runtime Docker container path
-/// — the path `dispatch`/`mission launch`/`lab run` actually route through
-/// — never reads this field at all, so `config set runtime.log_level
-/// debug` has no effect on a real container dispatch. `config set` still
-/// accepts it (a real, typed field — nothing here overflows to `extras`),
-/// but "settable" should not be read as "affects every dispatch path"; it
-/// affects exactly the one narrow path described above.
-pub fn log_level() -> String {
-    if let Some(s) = env_str("DARKMUX_LOG") {
-        return s.to_ascii_lowercase();
-    }
-    config()
-        .runtime
-        .as_ref()
-        .and_then(|r| r.log_level.clone())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|| "info".to_string())
-}
-
-/// (#1311) Whether per-call debug logging is on (`log_level() == "debug"`).
-/// See [`log_level`]'s doc for this accessor's real (narrow) scope: today
-/// this is called from exactly one place, `darkmux_crew::single_shot`'s
-/// tool-less remote dispatch path — never from the internal-runtime
-/// container path most real dispatches actually run through.
-pub fn debug_logging() -> bool {
-    log_level() == "debug"
-}
-
 /// (#2774 review C7) The ONE boolean-token vocabulary, shared by the env
 /// tier here and by `darkmux config set`'s `Ty::Bool` coercion.
 ///
@@ -4433,12 +4347,7 @@ mod tests {
     /// it on its own). Add an entry here — never silently widen the
     /// suffix rule — when a value is read exclusively through a helper
     /// whose name doesn't share the base's prefix.
-    const DERIVED_READER_ALIASES: &[(&str, &str)] = &[
-        // `log_level()`'s only reader is `debug_logging()` — see both
-        // accessors' own doc comments for the honest (narrow) scope this
-        // implies.
-        ("log_level", "debug_logging"),
-    ];
+    const DERIVED_READER_ALIASES: &[(&str, &str)] = &[];
 
     /// Accessors this guard KNOWS are currently unread outside their own
     /// unit test, each with a tracking issue — named in place rather than
@@ -4474,7 +4383,7 @@ mod tests {
 
     /// `text` with every LINE-STYLE comment (`//`, `///`, `//!`) dropped —
     /// so a doc comment merely NAMING an accessor at the START of its own
-    /// line (e.g. "resolved via `config_access::log_level`") can't satisfy
+    /// line (e.g. "resolved via `config_access::foo`") can't satisfy
     /// this guard the way an actual call site does. Line-level, not
     /// token-level: matches this codebase's own precedent
     /// (`liveness_conformance`'s `body.contains(...)` textual checks) of
@@ -4486,10 +4395,10 @@ mod tests {
     /// is exactly why they're safe to name rather than fix:
     /// a trailing `// comment` on a real code line still counts as code
     /// (by design — see above); a block comment (`/* ... */`) is NOT
-    /// stripped at all, so `/* log_level( */` would satisfy the guard the
+    /// stripped at all, so `/* foo( */` would satisfy the guard the
     /// same as a real call; and this is a substring scan over TEXT, not a
     /// parse of Rust semantics, so a string literal containing an
-    /// accessor's name (`"log_level("`) would satisfy it too. The guard
+    /// accessor's name (`"foo("`) would satisfy it too. The guard
     /// proves "no textual match anywhere else in the repo", which is
     /// strong evidence of a real dead knob when it fails, but is not a
     /// call-graph — read a passing run as "nothing obviously references
@@ -5111,77 +5020,6 @@ mod tests {
         unsafe { std::env::set_var(k, "8799"); }
         assert_eq!(serve_client_addr(), "127.0.0.1:8799");
         assert_eq!(serve_port(), 8799);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    // ── (#2775) machine_rollup.* ──
-
-    #[serial_test::serial]
-    #[test]
-    fn machine_rollup_is_off_by_default_and_fails_closed_on_a_typo() {
-        let k = "DARKMUX_MACHINE_ROLLUP_ENABLED";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::remove_var(k); }
-
-        assert_eq!(
-            machine_rollup_enabled_with_source(),
-            (false, Source::BuiltIn),
-            "nobody pays stream volume for a heartbeat they did not ask for"
-        );
-
-        unsafe { std::env::set_var(k, "true"); }
-        assert_eq!(machine_rollup_enabled_with_source(), (true, Source::Env));
-
-        // Fail CLOSED on an unrecognized token — a typo must leave a gated
-        // feature off, never silently turn it on. Same rule `hooks_enabled`
-        // follows.
-        unsafe { std::env::set_var(k, "yes-please"); }
-        assert_eq!(
-            machine_rollup_enabled_with_source(),
-            (false, Source::Env),
-            "an unrecognized token reads as off, and still reports the env tier"
-        );
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn machine_rollup_period_env_beats_config_beats_default() {
-        let k = "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::remove_var(k); }
-
-        assert_eq!(
-            machine_rollup_period_seconds_with_source(),
-            (MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT, Source::BuiltIn)
-        );
-        assert_eq!(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT, 60, "one-minute updates");
-        assert_eq!(
-            pick_parsed_with_source::<u64>(k, Some(300), Some(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT)),
-            (Some(300), Source::Config)
-        );
-
-        unsafe { std::env::set_var(k, "300"); }
-        assert_eq!(machine_rollup_period_seconds(), 300);
-
-        // `0` is OFF, and the accessor reports it verbatim rather than
-        // coercing it back to the default — the zero-means-off convention
-        // is the EMITTER's to honor, and silently rewriting the operator's
-        // 0 here would make the config say something it does not mean.
-        unsafe { std::env::set_var(k, "0"); }
-        assert_eq!(machine_rollup_period_seconds(), 0);
-
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

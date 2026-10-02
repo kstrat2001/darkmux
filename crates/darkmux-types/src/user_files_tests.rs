@@ -465,17 +465,32 @@ fn every_historical_config_key_is_named_as_retired() {
         "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r", "crew": "/c"},
         "radio": {"router_profile": "p"},
         "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
-        "runtime": {"telemetry_record_every_samples": 5, "daemon_auth_enabled": true},
+        "runtime": {"telemetry_record_every_samples": 5, "daemon_auth_enabled": true, "log_level": "debug"},
+        "machine_rollup": {"enabled": true, "period_seconds": 60},
     });
     let keys = config_keys(doc);
     let not_retired: Vec<String> =
         keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
     assert!(not_retired.is_empty(), "{not_retired:#?}");
-    assert_eq!(keys.len(), 12, "{keys:#?}");
+    assert_eq!(keys.len(), 14, "{keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME", "`runtime.log_level`: removed in 5.0", "`machine_rollup`: removed in 5.0"] {
         assert!(msg.contains(says), "{says}: {msg}");
     }
+}
+
+/// (#755) `fleet.accept_work.<name>.repos` is a known key, not an unknown
+/// one: a config carrying it passes the user-file gate, and a wrong-typed
+/// value is reported.
+#[test]
+fn the_reserved_repos_grant_passes_the_user_file_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{"fleet":{"accept_work":{"m":{"node_id":"n1","repos":["darkmux"]}}}}"#).unwrap();
+    assert!(config_json_problem_at(&path).is_none(), "{:?}", config_json_problem_at(&path));
+    std::fs::write(&path, r#"{"fleet":{"accept_work":{"m":{"node_id":"n1","repos":"darkmux"}}}}"#).unwrap();
+    let shown = format!("{:?}", config_json_problem_at(&path).expect("a string is not a list of repos"));
+    assert!(shown.contains("repos"), "{shown}");
 }
 
 /// (#2988 review) A wrong-typed value is a reported problem, not a silent

@@ -631,7 +631,6 @@ pub const HOST_READING_ACTIONS: &[(FlowAction, StampDuty)] = &[
     (FlowAction::MachineTelemetry, StampDuty::Stamped),
     (FlowAction::MachineThermal, StampDuty::Stamped),
     (FlowAction::MachineBattery, StampDuty::Stamped),
-    (FlowAction::MachineRollup, StampDuty::Stamped),
     (
         FlowAction::MachineBatteryHealth,
         StampDuty::Exempt(
@@ -1012,7 +1011,7 @@ mod producer_registry_tests {
     #[test]
     fn the_scan_reaches_the_records_the_sweep_was_about() {
         let sources = producer_sources();
-        let found_but_removed_from_the_table: Vec<&str> = ["machine.rollup", "machine.battery", "machine.thermal"]
+        let found_but_removed_from_the_table: Vec<&str> = ["machine.battery", "machine.thermal"]
             .into_iter()
             .filter(|a| audit(&sources).stale.contains(a))
             .collect();

@@ -68,6 +68,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           may already hold. Readers select entry fields by name and
 //           ignore the marker.
 //
+//           Also (5.0, #3036): REMOVED the `machine.rollup` action and its
+//           payload (the periodic whole-machine heartbeat) together with the
+//           `machine_rollup` config block that gated it. Nothing replaced it:
+//           the machine lens reads `GET /machine/resources`. An archive that
+//           holds one reads as an unknown action, which `darkmux doctor`
+//           names.
+//
 //           Also (4.0): the session grammar. `session_id` is the wire
 //           string of a typed `darkmux_types::session_id::SessionId`, one
 //           session within one run, `.`-separated and begun by its run:
@@ -139,7 +146,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           instant `*_at_ms` in epoch milliseconds): `budget.wait`'s
 //           `wait_seconds` / ISO `resume_at` are `wait_ms` / `resume_at_ms`,
 //           `utility.start`'s `stall_after_seconds` is `stall_after_ms`,
-//           `machine.rollup`'s `period_seconds` is `period_ms`,
+//           `machine.rollup`'s `period_seconds` is `period_ms` (that action
+//           is gone since 5.0, see the note above),
 //           `dispatch.complete`'s `live.sampler_us` / `forward_us` are
 //           `sampler_ms` / `forward_ms`, `machine.battery_health`'s
 //           `total_operating_time_hours` / `time_at_soc_hours` are

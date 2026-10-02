@@ -358,7 +358,6 @@ const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
   MachineThermal: { section: "MACHINE", failure: false },
   MachineBattery: { section: "MACHINE", failure: false },
   MachineBatteryHealth: { section: "MACHINE", failure: false },
-  MachineRollup: { section: "MACHINE", failure: false },
   MissionStart: { section: "MISSION", failure: false },
   MissionClose: { section: "MISSION", failure: false },
   MissionAbort: { section: "MISSION", failure: false },

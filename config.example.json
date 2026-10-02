@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.1",
+  "schema_version": "2.2",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -21,7 +21,6 @@
     "mission_wall_clock_timeout_seconds": 0,
     "dispatch_free_concurrency": 8,
     "strict_selection": false,
-    "log_level": "info",
     "feedback_injection": true,
     "check_updates": true,
     "injected_context_fraction": 0.15,
@@ -100,10 +99,6 @@
     "bind": "127.0.0.1",
     "token_keychain": false,
     "read_auth": false
-  },
-  "machine_rollup": {
-    "enabled": false,
-    "period_seconds": 60
   },
   "role_profiles": {}
 }
