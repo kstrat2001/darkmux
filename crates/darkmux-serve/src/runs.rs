@@ -605,7 +605,10 @@ fn build_runs_in(
         let (kind, shape) = classify_mission(mission, &phases_by_id);
         let mut run = mission_to_run(mission, kind, shape.as_ref(), &mission_id_index, &flow_index, now_ms);
         // (#2902 step 2b) Its records carry its `mission_id`.
-        claims.push((runs.len(), Some(mission.id.clone()), Vec::new()));
+        // Its flow sessions too, as a peer's row of the same mission claims them, so
+        // which machine serves a mission never changes who reads a shared session.
+        let sessions = flow_missions.get(&mission.id).map(|a| a.session_ids.clone()).unwrap_or_default();
+        claims.push((runs.len(), Some(mission.id.clone()), sessions));
         // The same key a peer builds for this mission (`flow_mission_to_run`):
         // its newest record's receive key, so a mission sorts alike whichever
         // machine serves it. Local time only when no record names it.
@@ -1111,6 +1114,11 @@ fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<S
         if let Some(mid) = &agg.mission_id {
             idx.entry(mid.clone()).or_default().push(session_id.clone());
         }
+    }
+    // The map's iteration order is per-process; a mission's sessions are read in
+    // id order, so which one represents it never depends on it.
+    for sessions in idx.values_mut() {
+        sessions.sort();
     }
     idx
 }
@@ -2629,8 +2637,8 @@ fn earliest_by_start<'a>(sessions: &[(&'a str, &'a SessionAgg)]) -> Option<(&'a 
         .iter()
         .copied()
         .filter(|(_, s)| s.start_ts.is_some())
-        .min_by(|(_, a), (_, b)| a.start_ts.cmp(&b.start_ts))
-        .or_else(|| sessions.first().copied())
+        .min_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)))
+        .or_else(|| sessions.iter().copied().min_by_key(|(id, _)| *id))
 }
 
 /// Synthesize an untracked [`Run`] for every flow session that opened a
@@ -7559,6 +7567,54 @@ mod tests {
             let u = &built.usage;
             assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total, "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
             assert_eq!((tokens("m-a"), tokens("m-b")), (Some(100), None), "the lower id wins a tie, on every build");
+        }
+    }
+
+    /// (#3067) Which row reads a shared entry never depends on which machine is
+    /// serving: the same records, with m-a minted here (m-b a peer's) and with
+    /// m-b minted here, give the same tokens on the same rows. A local mission
+    /// claims the sessions of its records, as a peer's row of it does.
+    #[test]
+    #[serial_test::serial]
+    fn the_same_records_attribute_the_same_whichever_mission_is_local() {
+        let now = darkmux_flow::ts_utc_now();
+        let start = |mission: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-shared", "mission_id": mission, "handle": "coder" });
+        let records = [start("m-a"), start("m-b"), usage_record(&now, "s-shared", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }))];
+        let serve_with_local = |local: &str| {
+            let _g = CrewGuard::new();
+            darkmux_crew::lifecycle::save_mission(&minimal_mission(local, vec![], None)).unwrap();
+            let flows = TempDir::new().unwrap();
+            write_day_file(flows.path(), &today(), &records);
+            let built = build_runs_with_usage(flows.path(), None, &[], None);
+            let mut by_row: Vec<(String, Option<u64>)> = built.runs.iter().map(|r| (r.id.clone(), r.tokens)).collect();
+            by_row.sort();
+            let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+            assert_eq!(rows + built.usage.no_run.total + built.usage.unlisted.total, built.usage.overall.total);
+            by_row
+        };
+        let (a_local, b_local) = (serve_with_local("m-a"), serve_with_local("m-b"));
+        assert_eq!(a_local, b_local, "the assignment is a property of the records, not of the serving machine");
+    }
+
+    /// (#3067) Two sessions of one mission started in the same instant: the
+    /// row's `dispatch_id` (the representative session, which the client keys
+    /// on) is the lower session id on every build, never an input or hash order.
+    #[test]
+    #[serial_test::serial]
+    fn the_representative_session_of_a_tie_is_the_lower_id_on_every_build() {
+        let now = darkmux_flow::ts_utc_now();
+        let start = |sid: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": sid, "mission_id": "m-tie", "handle": "coder" });
+        for order in [["s-b", "s-a", "s-c"], ["s-c", "s-a", "s-b"], ["s-a", "s-b", "s-c"]] {
+            let _g = CrewGuard::new();
+            darkmux_crew::lifecycle::save_mission(&minimal_mission("m-tie", vec![], None)).unwrap();
+            let flows = TempDir::new().unwrap();
+            let recs: Vec<_> = order.iter().map(|s| start(s)).collect();
+            write_day_file(flows.path(), &today(), &recs);
+            for _ in 0..6 {
+                let built = build_runs_with_usage(flows.path(), None, &[], None);
+                let row = built.runs.iter().find(|r| r.id == "m-tie").expect("the mission row");
+                assert_eq!(row.dispatch_id.as_deref(), Some("s-a"), "input order {order:?}");
+            }
         }
     }
 

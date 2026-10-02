@@ -423,7 +423,11 @@ pub struct UsageIndex {
     /// The entries a run row has read (or that belong to no run): what
     /// [`Self::unlisted`] leaves out.
     claimed: std::cell::RefCell<HashSet<usize>>,
-    /// Each entry's first record time (epoch seconds): the span a row must hold.
+    /// Each entry's first record time (epoch seconds): the time a row's span
+    /// must hold to win it. Two caveats, both deliberate: an entry is never
+    /// split between rows (one entry, one winner, so a session reused by two
+    /// runs goes whole to one), and `--since` drops earlier records, which can
+    /// move an entry's first record and so its winner.
     first_ts: Vec<Option<u64>>,
     pub breakdown: UsageBreakdown,
 }
@@ -879,6 +883,33 @@ mod tests {
 
         // `sum_usage` is the same fold.
         assert_eq!(&sum_usage(records.iter()), s);
+    }
+
+    /// (#3067) `attribute` anchors an entry on its FIRST record's time and ranks the
+    /// rows by whose span holds it: an entry first seen at 10 and last at 20 goes to
+    /// the row spanning 10 even when another row spans 20, and with no span ranking
+    /// the lower receive key would win instead.
+    #[test]
+    fn attribute_anchors_on_the_first_record_and_prefers_the_row_whose_span_holds_it() {
+        let rec = |ts: &str| {
+            serde_json::json!({ "ts": ts, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": "s1", "payload": { "total_tokens": 7 } })
+        };
+        let mut fold = UsageFold::new(None);
+        for ts in ["1970-01-01T00:00:20Z", "1970-01-01T00:00:10Z"] {
+            fold.add(&rec(ts));
+        }
+        let idx = fold.finish();
+        let row = |id: &str, started: u64, ended: Option<u64>, key: u64| RowClaim {
+            session_ids: vec!["s1".into()],
+            started: Some(started),
+            ended,
+            receive_key: key,
+            id: id.into(),
+            ..Default::default()
+        };
+        // r1 spans the first record (10) only; r2 spans the last (20) only and ranks lower on key.
+        let tokens = idx.attribute(&[row("r1", 5, Some(12), 9), row("r2", 15, None, 1)]);
+        assert_eq!(tokens, vec![Some(14), None], "the entry goes to the row spanning its first record");
     }
 
     /// (#3067) Among rows that could read one entry, the row whose span holds

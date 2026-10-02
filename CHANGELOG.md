@@ -255,7 +255,10 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   usage that names no run, and the usage that names a run with no row in the
   listing (a start record outside the window), so the rows plus both equal the
   total (a usage entry two rows could read, such as a task session shared by two peer
-  missions, is counted on one row only, chosen by span, receive key and id); `run list --usage` prints a line for each when non-zero (`unlisted` joins
+  missions, is counted on one row only, chosen by whose span holds the entry's first record, then receive key and id; an entry
+  is never split between rows, and `--since` can move its first record and so its
+  winner; the same records give the same rows whichever machine serves them, and a
+  mission's `dispatch_id` no longer varies between two serves of one archive); `run list --usage` prints a line for each when non-zero (`unlisted` joins
   `--usage --json`). A reported total of 0 beside both halves is their sum and beside one half is no total (a step budget charges it as a missing one). The fleet hero's hover says
   how many tokens it includes with no run or on unlisted runs. The run page's token tiles name the
   run's total on hover when INPUT + GENERATED fall short of it (a total-only
