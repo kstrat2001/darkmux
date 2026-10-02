@@ -45,7 +45,6 @@
   "crates/darkmux-crew/src/workspace_spec/materialize.rs::resolve_one": 38,
   "crates/darkmux-doctor/src/checks_power.rs::describe": 34,
   "crates/darkmux-doctor/src/fleet_submission.rs::trust_row": 19,
-  "crates/darkmux-doctor/src/lib.rs::check_installed_skills_freshness": 22,
   "crates/darkmux-doctor/src/lib.rs::check_mission_config_registry": 17,
   "crates/darkmux-doctor/src/lib.rs::check_roster_identity": 27,
   "crates/darkmux-doctor/src/lib.rs::check_thermal_governor": 22,
@@ -114,7 +113,7 @@
   "src/fleet_cli.rs::trust_at": 30,
   "src/init.rs::ensure_session_start_hook": 17,
   "src/init.rs::init": 24,
-  "src/main.rs::cmd_init": 31,
+  "src/main.rs::cmd_init": 29,
   "src/main.rs::cmd_scan": 25,
   "src/main.rs::run": 22,
   "src/mission_config_cli.rs::render_show_text": 28,
@@ -123,7 +122,7 @@
   "src/radio_busy.rs::router_wait_notice": 19,
   "src/role_cli.rs::role_show_at": 21,
   "src/skills.rs::install_from_disk": 19,
-  "src/skills.rs::install_skills": 27
+  "src/skills.rs::install_skills": 21
  },
  "ts": {
   "ui/src/App.tsx::App": 54,
@@ -157,9 +156,9 @@
   "ui/src/lenses/mission/graph.ts::stepDispatchSessions": 18,
   "ui/src/lenses/mission/timeline.ts::groupTimeline": 17,
   "ui/src/lenses/mission/timeline.ts::taskAggMetrics": 18,
-  "ui/src/lenses/runs/RunsBoard.tsx::RunsBoard": 36,
+  "ui/src/lenses/runs/RunsBoard.tsx::RunsBoard": 35,
   "ui/src/lenses/session/sessionRun.ts::runRegions": 54,
-  "ui/src/lib/eventFilters.ts::activityOf": 22,
+  "ui/src/lib/eventFilters.ts::activityOf": 21,
   "ui/src/lib/liveChannel.ts::LiveStore.ingest": 27,
   "ui/src/lib/liveChannel.ts::liveSampleToWire": 23,
   "ui/src/lib/machineKey.ts::buildKeyTable": 36,

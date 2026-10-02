@@ -34,7 +34,7 @@ import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 
-/** `sc()` — viewer.html:1633. One token-class chip (value over label).
+/** `sc()`. One token-class chip (value over label).
  *
  * `loading` (#2862) renders the shared `Shimmer` in place of `value` — the
  * `settled ? fmtC(...) : ""` sentinel this used to take as `value` moved to
@@ -59,7 +59,7 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
 }
 
 /**
- * `savingsHero()` — viewer.html:1619-1666 (#783, #1186). Always renders,
+ * `savingsHero()` (#783, #1186). Always renders,
  * even at zero — a fresh fleet with no dispatches yet shows "0", not a
  * hidden card (showing "0" that then climbs reads as a live odometer;
  * hiding it made it pop in late on the legacy mobile client — see that
@@ -124,7 +124,7 @@ const SavingsHero = memo(function SavingsHero({
           fleet" named the SOURCE where its neighbor named the SUBJECT.
 
           The window suffix is LIVE-ONLY — `const win=...live-mode...?` last
-          ${h}h`:''` (viewer.html:1660). A replay's numbers cover the recorded
+          ${h}h`:''`. A replay's numbers cover the recorded
           day, not the last 24 hours, and the meta bar already states that
           day's range. (#1800 P2: the suffix was unconditional, so a replayed
           day claimed a window it had not been measured over.) */}
@@ -207,7 +207,7 @@ const SavingsHero = memo(function SavingsHero({
 });
 
 /**
- * The fleet default view — `renderFleet()` (viewer.html:1667-1741): the
+ * The fleet default view — `renderFleet()`: the
  * savings hero, one card per machine, and the recent-activity timeline.
  * `/next`'s default (no-hash) route. See `savings.ts`/
  * `cards.ts`/`timeline.ts` for the ported pure logic this component
@@ -926,7 +926,7 @@ export function FleetLens({
                 now — a replay draws the same rolling window as live,
                 anchored at the playhead, so the window control is a live
                 knob there too, not a dead one. Used to be LIVE-ONLY
-                (`const winCtl=liveMode?...:''`, viewer.html:1764), back when
+                (`const winCtl=liveMode?...:''`), back when
                 a replay drew the whole recorded day with nothing to slide
                 over. */}
             <span className="twin">
