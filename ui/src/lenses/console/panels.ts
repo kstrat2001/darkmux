@@ -165,7 +165,6 @@ export function rosterOptName(id: PanelId): string | null {
  * the console shows verbatim); this just keeps a hash from carrying a value no
  * roster id could be. */
 function isMachineNameShape(v: string): boolean {
-  // eslint-disable-next-line no-control-regex
   return v.length > 0 && v.length <= 128 && v !== LOCAL_MACHINE && !/[\u0000-\u001f\u007f]/.test(v);
 }
 
