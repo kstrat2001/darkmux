@@ -31,7 +31,7 @@ function renderBoard(filters?: FilterSel, kind: "all" | "mission" | "dispatch" |
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={kind} initialRun={null} initialMachineKey={null} initialFilters={filters} />
+      <RunsBoard initialKind={kind} initialLab={null} initialMachineKey={null} initialFilters={filters} />
     </QueryClientProvider>,
   );
 }

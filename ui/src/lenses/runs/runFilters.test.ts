@@ -119,7 +119,7 @@ describe("the stable bar", () => {
 describe("hash round-trip", () => {
   it("writes every selected value and reads the same selection back", () => {
     const s = sel({ status: ["complete", "running"], machine: ["studio"], model: ["qwen"], time: ["24h"], role: [NOT_SET] });
-    const hash = canonicalHash({ kind: "runs", runsKind: "lab", run: null, machine: "studio", filters: s }) as string;
+    const hash = canonicalHash({ kind: "runs", runsKind: "lab", lab: null, machine: "studio", filters: s }) as string;
     const p = new URLSearchParams(hash);
     expect(p.get("kind")).toBe("lab");
     expect(p.getAll("status")).toEqual(["complete", "running"]);
@@ -132,7 +132,7 @@ describe("hash round-trip", () => {
   });
 
   it("a bare machine pin still writes machine=", () => {
-    expect(canonicalHash({ kind: "runs", runsKind: "all", run: null, machine: "studio" })).toBe("lens=runs&machine=studio");
+    expect(canonicalHash({ kind: "runs", runsKind: "all", lab: null, machine: "studio" })).toBe("lens=runs&machine=studio");
   });
 });
 
