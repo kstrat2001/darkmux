@@ -1,12 +1,9 @@
 //! The fleet work job: what one machine asks another to run (#2916).
 //!
-//! Until 4.0 this was the payload of the Redis work queue (`darkmux:work`),
-//! which any node that could write the hub's Redis could fill and any runner
-//! would claim. That queue is retired (#2916): a job now travels in one HTTP
-//! request, straight to the target machine's work-submission listener, which
-//! checks the fleet token and the connecting node before it runs anything
-//! (`submission.rs`). The job's SHAPE checks below are unchanged and still run
-//! on both sides.
+//! A job travels in one HTTP request, straight to the target machine's
+//! work-submission listener, which checks the fleet token and the connecting
+//! node before it runs anything (`submission.rs`). The job's SHAPE checks
+//! below run on both sides.
 
 use anyhow::{anyhow, Result};
 use darkmux_types::session_id::{SessionId, SessionKind};
@@ -176,35 +173,20 @@ pub struct SingleShotJob {
     pub max_completion_tokens: u32,
 }
 
-/// Wire version of a work submission. History: "1"-"4" were the Redis
-/// queue's `schema` tag (#590 single stream, #703 `image`, #1426 retired
-/// `deliver`/`runtime`). "5" (#2916) is the first direct-submission shape:
-/// `target_machine` became required, `profile` was added, and the dead
-/// `attempt` / `published_by_orchestrator` fields were removed. The receiver
-/// reads the envelope's `schema` BEFORE parsing the job, so a sender on
-/// another version gets a reply naming the version, not a field error.
-/// "6" (#2916 stage 2): the reply body became newline-delimited (a queued
-/// job's `queued` lines before its answer) and `profile` never carries a
-/// `profile@machine` address (the sender splits it off). 3.x senders speak
-/// it. "7" (4.0): `session_id` (the job's and the reply's) is a session in
-/// the 4.0 grammar (`darkmux_types::session_id`), read back strictly, so a
-/// v6 sender's free-form session gets the version remedy, not a field
-/// error. "8" (#2954): `phase_id` was removed with the hand-built mission
-/// phase verbs; a v7 job that still carries it is refused with the version
-/// remedy. "8" also gained the optional `single_shot` mode (unreleased, so
-/// it rides the version): a sender that does not write it is unchanged.
+/// Wire version of a work submission, `major.minor` ([`WorkVersion`]). The
+/// receiver reads the envelope's `schema` BEFORE parsing the job, so a sender
+/// on another version gets a reply naming the version, not a field error. A
+/// receiver takes the same major with a minor at or below its own. Unknown
+/// fields are refused within a minor (a sender cannot smuggle fields a
+/// receiver might start interpreting), so the minor is what lets the wire
+/// grow: a new optional field ships as a minor bump, and an older receiver
+/// refuses a newer minor by naming both versions. A shape change that is not
+/// additive is a major bump.
 ///
-/// The version is `major.minor` ([`WorkVersion`]) from "8.0", the release
-/// this wire freezes at. A receiver takes the same major with a minor at or
-/// below its own. Unknown fields are still refused within a minor
-/// (a sender cannot smuggle fields a receiver might start interpreting), so
-/// the minor is what lets the wire grow: a new optional field ships as a
-/// minor bump, and an older receiver refuses a newer minor by naming both
-/// versions. A shape change that is not additive is a major bump. "8.0" added
-/// `boundary`, `mode`, and the reply's `refusal` code and `check` report.
-/// "8.1" (#3028) added the job's optional `target_machine_uid`; a submission
-/// is written at the lowest version that can say its job ([`WorkJob::wire_version`]),
-/// and this constant is the highest a receiver takes.
+/// "8.0" is the base shape. "8.1" (#3028) added the job's optional
+/// `target_machine_uid`; a submission is written at the lowest version that
+/// can say its job ([`WorkJob::wire_version`]), and this constant is the
+/// highest a receiver takes.
 pub const WORK_JOB_SCHEMA_VERSION: &str = "8.1";
 
 /// A work wire version, `major.minor` (see [`WORK_JOB_SCHEMA_VERSION`]).
@@ -262,18 +244,33 @@ pub(crate) const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
 /// Max byte size of `WorkJob.image`. (#838 PR-C.2)
 pub(crate) const MAX_WORK_IMAGE_BYTES: usize = 256;
 
+/// How a job's address reads against the receiver ([`WorkJob::addressing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Addressing {
+    /// The job is for this machine.
+    Addressed,
+    /// The job is for another machine (a different uid, or a different name).
+    OtherMachine,
+    /// The job names a hardware uid and this machine has none to compare.
+    UidUnconfirmable,
+}
+
 impl WorkJob {
     /// (#3028) Whether this job is addressed to the receiver named
     /// `receiver` whose own hardware uid is `receiver_uid`: the ONE
     /// comparison every receiving path makes (a run and a `check` alike).
-    /// When both the job and the receiver have a uid, the uid decides and
-    /// the name is not looked at (a renamed machine still answers to the
-    /// address its sender learned; another machine under the same name does
-    /// not). Otherwise the name decides, as it did before wire 8.1.
-    pub fn is_addressed_to(&self, receiver: &str, receiver_uid: Option<&str>) -> bool {
+    /// A job that carries a uid is decided by the uid alone: a renamed
+    /// machine still answers to the address its sender learned, another
+    /// machine under the same name does not, and a receiver that cannot
+    /// read its own uid cannot confirm one, so it never falls back to the
+    /// name. A job without a uid is decided by the name.
+    pub fn addressing(&self, receiver: &str, receiver_uid: Option<&str>) -> Addressing {
         match (self.target_machine_uid.as_deref(), receiver_uid) {
-            (Some(want), Some(mine)) => want.eq_ignore_ascii_case(mine),
-            _ => same_machine(&self.target_machine, receiver),
+            (Some(want), Some(mine)) if want.eq_ignore_ascii_case(mine) => Addressing::Addressed,
+            (Some(_), Some(_)) => Addressing::OtherMachine,
+            (Some(_), None) => Addressing::UidUnconfirmable,
+            (None, _) if same_machine(&self.target_machine, receiver) => Addressing::Addressed,
+            (None, _) => Addressing::OtherMachine,
         }
     }
 

@@ -148,11 +148,9 @@ mod tests {
         });
     }
 
-    /// (#2924 C-c) A field this binary does not know (a newer binary's
-    /// `loopback_intended`, an operator's hand-added note) survives a
-    /// load -> add -> save cycle, on the entry being updated and on every
-    /// other entry. Without this, an older binary rewriting the roster
-    /// silently dropped `loopback_intended`.
+    /// (#2924 C-c) A field this binary does not know (an operator's
+    /// hand-added note) survives a load -> add -> save cycle, on the entry
+    /// being updated and on every other entry.
     #[test]
     #[serial]
     fn unknown_entry_fields_survive_a_rewrite() {
@@ -429,12 +427,6 @@ mod tests {
         let err = j.validate().unwrap_err().to_string();
         assert!(err.contains("exceeds") && err.contains("role_id"));
     }
-
-    // (#1426 ship-3) The `runtime` field (a single-variant enum after
-    // #1405/#1409) retired entirely in the WORK_JOB_SCHEMA_VERSION 3 to 4
-    // bump. A pre-4 peer's `runtime` key is now an unknown field, see
-    // `work_job_retired_runtime_key_rejected_at_deserialize` and the
-    // version-first claim gate tested in `parse_xreadgroup_version_mismatch_*`.
 
     #[test]
     fn validate_rejects_oversize_message() {

@@ -32,15 +32,12 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// and submission, #2916), which builds peer base URLs from the same
 /// portless form.
 ///
-/// (#2782 C10, superseded by #2924) The one case this reasoning used not to
-/// cover was a loopback SELF entry (`machine add <me> --address
-/// 127.0.0.1:8765`, the old documented recipe), where the port was this
-/// machine's. #2924 retired that recipe (`machine add` refuses loopback
-/// unless `--allow-loopback`), and this machine's own entry is no longer
-/// dialed at its roster address at all: `machine list`/`status`/`resources`
-/// reach it at the local daemon (`serve_client_addr`). So this constant only
-/// ever fills in the port of an address that names ANOTHER machine, or a
-/// deliberate same-host `--allow-loopback` entry, which names its port.
+/// (#2924) `machine add` refuses a loopback address unless `--allow-loopback`,
+/// and this machine's own entry is not dialed at its roster address at all:
+/// `machine list`/`status`/`resources` reach it at the local daemon
+/// (`serve_client_addr`). So this constant only fills in the port of an
+/// address that names ANOTHER machine, or a deliberate same-host
+/// `--allow-loopback` entry, which names its port.
 pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 
 /// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10
@@ -113,8 +110,7 @@ pub struct MachineEntry {
     /// --allow-loopback`: a same-host test fleet, where a loopback address
     /// really does reach the peer. `darkmux doctor`'s `roster addresses` row
     /// reports such an entry as intentional instead of warning about it
-    /// forever. Reset by any later `machine add` without the flag. Absent
-    /// (false) on every entry written before #2924.
+    /// forever. Reset by any later `machine add` without the flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loopback_intended: bool,
 
@@ -135,8 +131,7 @@ pub struct MachineEntry {
     /// machine can rename itself; this is what it goes by now, kept beside
     /// `id` (the key the operator wrote, never rewritten). `@<name>`
     /// addresses resolve against either (`resolve_machine`). `None` until a
-    /// card has been read; absent on every entry written before #3028 and
-    /// then behaving exactly as before.
+    /// card has been read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_name: Option<String>,
 
@@ -455,8 +450,7 @@ pub fn add_machine(
 
 /// (#2916) The roster KEY whose id is `name`: machine names are ASCII
 /// case-insensitive, so an exact key wins, else the one key equal ignoring
-/// case. Two keys differing only in case (a roster written before this
-/// rule) are ambiguous: an error naming both, never a pick by map order.
+/// case. Two keys differing only in case are ambiguous: an error naming both, never a pick by map order.
 /// Ids only: `machine add`/`remove` edit the key the operator wrote, so a
 /// name a peer learned to go by is not a key here (see [`find_machine`]).
 pub fn find_machine_key(roster: &FleetRoster, name: &str) -> Result<Option<String>> {
@@ -581,9 +575,8 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
 ///
 /// Loopback (`127.0.0.1`, `::1`, …) is excluded on purpose: loopback
 /// traffic never traverses `tailscale serve` — an entry at a loopback
-/// address (a same-host test fleet's `--allow-loopback` entry, or an old
-/// self entry from before #2924 retired that recipe) hits a local daemon
-/// directly, so a 404 there is never that failure mode and the hint would
+/// address (a same-host test fleet's `--allow-loopback` entry) hits a local
+/// daemon directly, so a 404 there is never that failure mode and the hint would
 /// be actively wrong.
 pub fn address_host_is_bare_ip(address: &str) -> bool {
     let trimmed = address.trim();

@@ -16239,9 +16239,6 @@ fn roster_name_issue(
         }
         n => return Some(RosterNameIssue::Ambiguous { machines: n }),
     }
-    if known.uidless_names.contains(&e.id) {
-        return None;
-    }
     Some(RosterNameIssue::Unknown)
 }
 
@@ -16535,7 +16532,7 @@ mod roster_identity_tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `current`: (uid, current name). `seen`: (name, uid) pairs from history.
-    fn known(current: &[(&str, &str)], seen: &[(&str, &str)], uidless: &[&str]) -> FleetIdentityKnowledge {
+    fn known(current: &[(&str, &str)], seen: &[(&str, &str)]) -> FleetIdentityKnowledge {
         let mut uids_by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (n, u) in seen {
             uids_by_name.entry(n.to_string()).or_default().insert(u.to_string());
@@ -16546,7 +16543,6 @@ mod roster_identity_tests {
         FleetIdentityKnowledge {
             current_name_by_uid: current.iter().map(|(u, n)| (u.to_string(), n.to_string())).collect(),
             uids_by_name,
-            uidless_names: uidless.iter().map(|s| s.to_string()).collect(),
             local_name: None,
             presence: PresenceState::Read,
             ..Default::default()
@@ -16577,7 +16573,7 @@ mod roster_identity_tests {
     fn an_entry_whose_machine_goes_by_a_learned_name_warns_and_says_either_name_works() {
         let mut e = entry("m1-max-32gb-studio", Some("UID-S"));
         e.current_name = Some("studio".into());
-        let check = check_roster_identity(&[e], &known(&[], &[], &[]));
+        let check = check_roster_identity(&[e], &known(&[], &[]));
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("`m1-max-32gb-studio`") && check.message.contains("`studio`"), "{}", check.message);
         let hint = check.hint.unwrap();
@@ -16591,7 +16587,7 @@ mod roster_identity_tests {
     fn a_learned_name_equal_to_the_id_is_not_a_warning() {
         let mut e = entry("Studio", Some("UID-S"));
         e.current_name = Some("studio".into());
-        let check = check_roster_identity(&[e, entry("mini", None)], &known(&[], &[], &["mini"]));
+        let check = check_roster_identity(&[e, entry("mini", None)], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
@@ -16601,7 +16597,7 @@ mod roster_identity_tests {
     fn a_learned_name_another_entry_already_holds_is_a_duplicate() {
         let mut old = entry("old-studio", Some("UID-S"));
         old.current_name = Some("studio".into());
-        let check = check_roster_identity(&[old, entry("studio", Some("UID-S"))], &known(&[], &[], &[]));
+        let check = check_roster_identity(&[old, entry("studio", Some("UID-S"))], &known(&[], &[]));
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.hint.unwrap().contains("darkmux machine remove old-studio"));
     }
@@ -16610,7 +16606,7 @@ mod roster_identity_tests {
     /// repairs, with the entry's address, and the restart the name needs.
     #[test]
     fn an_entry_whose_declared_uid_now_goes_by_another_name_gets_both_repairs() {
-        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[]);
         k.live_uids.insert("UID-A".into());
         let check = check_roster_identity(&[entry("laptop", Some("UID-A"))], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
@@ -16628,7 +16624,7 @@ mod roster_identity_tests {
     fn a_uidless_entry_traced_by_history_to_one_machine_is_reported_without_risky_repairs() {
         let check = check_roster_identity(
             &[entry("laptop", None)],
-            &known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")], &[]),
+            &known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")]),
         );
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("machine now called `MacBook-Pro`"), "{}", check.message);
@@ -16647,9 +16643,7 @@ mod roster_identity_tests {
             &[entry("m5-ultra-256gb", None)],
             &known(
                 &[("UID-A", "MacBook-Pro")],
-                &[("m5-ultra-256gb", "UID-A"), ("review-scratch", "UID-A"), ("w7-smoke-test", "UID-A")],
-                &[],
-            ),
+                &[("m5-ultra-256gb", "UID-A"), ("review-scratch", "UID-A"), ("w7-smoke-test", "UID-A")]),
         );
         let hint = check.hint.unwrap_or_default();
         assert!(!hint.contains("m5-ultra-256gb.tailnet.example"), "{hint}");
@@ -16664,9 +16658,7 @@ mod roster_identity_tests {
             &[entry("MacBook-Pro-old", None)],
             &known(
                 &[("UID-A", "laptop-a"), ("UID-B", "laptop-b")],
-                &[("MacBook-Pro-old", "UID-A"), ("MacBook-Pro-old", "UID-B")],
-                &[],
-            ),
+                &[("MacBook-Pro-old", "UID-A"), ("MacBook-Pro-old", "UID-B")]),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("2 different machines"), "{}", check.message);
@@ -16678,7 +16670,7 @@ mod roster_identity_tests {
     /// give that name to the retired machine too.
     #[test]
     fn a_replaced_machines_entry_never_offers_a_duplicate_machine_id() {
-        let mut k = known(&[("UID-OLD", "studio-retired"), ("UID-NEW", "studio")], &[], &[]);
+        let mut k = known(&[("UID-OLD", "studio-retired"), ("UID-NEW", "studio")], &[]);
         k.live_uids.extend(["UID-OLD".to_string(), "UID-NEW".to_string()]);
         let check = check_roster_identity(&[entry("studio", Some("UID-OLD"))], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
@@ -16693,7 +16685,7 @@ mod roster_identity_tests {
     /// is known against it, so it is a note, never a warning.
     #[test]
     fn a_uidless_offline_peer_is_a_note_not_a_warning() {
-        let check = check_roster_identity(&[entry("studio", None)], &known(&[("UID-A", "MacBook-Pro")], &[], &[]));
+        let check = check_roster_identity(&[entry("studio", None)], &known(&[("UID-A", "MacBook-Pro")], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("`studio` matches no machine_id"), "{}", check.message);
         assert!(!check.hint.unwrap_or_default().contains("machine remove"), "no removal advice without evidence");
@@ -16702,7 +16694,7 @@ mod roster_identity_tests {
     /// MF-2: the row says when presence was not read.
     #[test]
     fn the_row_says_when_presence_was_not_read() {
-        let mut k = known(&[], &[], &[]);
+        let mut k = known(&[], &[]);
         k.presence = PresenceState::Unreadable;
         let check = check_roster_identity(&[entry("studio", None)], &k);
         assert!(check.message.contains("Redis unreachable"), "{}", check.message);
@@ -16717,7 +16709,7 @@ mod roster_identity_tests {
     /// C-3: this machine's own entry passes even when its uid is unreadable.
     #[test]
     fn this_machines_entry_passes_without_a_readable_uid() {
-        let mut k = known(&[], &[], &[]);
+        let mut k = known(&[], &[]);
         k.local_name = Some("studio".into());
         let check = check_roster_identity(&[entry("studio", None)], &k);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
@@ -16726,7 +16718,7 @@ mod roster_identity_tests {
 
     #[test]
     fn a_rename_repair_never_suggests_a_loopback_address() {
-        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[]);
         k.live_uids.insert("UID-A".into());
         let check = check_roster_identity(&[loopback(entry("laptop", Some("UID-A")))], &k);
         let hint = check.hint.unwrap();
@@ -16738,7 +16730,7 @@ mod roster_identity_tests {
     fn an_entry_named_by_its_machines_current_machine_id_passes() {
         let check = check_roster_identity(
             &[entry("MacBook-Pro", None), entry("studio", Some("UID-B"))],
-            &known(&[("UID-A", "MacBook-Pro"), ("UID-B", "studio")], &[], &[]),
+            &known(&[("UID-A", "MacBook-Pro"), ("UID-B", "studio")], &[]),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(!check.message.contains("Note:"), "{}", check.message);
@@ -16747,20 +16739,13 @@ mod roster_identity_tests {
     /// A declared uid nobody has seen: no evidence against the entry.
     #[test]
     fn a_declared_uid_nobody_has_seen_is_not_a_warning() {
-        let check = check_roster_identity(&[entry("studio", Some("UID-B"))], &known(&[("UID-A", "MacBook-Pro")], &[], &[]));
+        let check = check_roster_identity(&[entry("studio", Some("UID-B"))], &known(&[("UID-A", "MacBook-Pro")], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    #[test]
-    fn a_name_known_only_from_uidless_history_is_not_reported() {
-        let check = check_roster_identity(&[entry("mini-1", None)], &known(&[], &[], &["mini-1"]));
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(!check.message.contains("Note:"), "{}", check.message);
     }
 
     #[test]
     fn an_empty_roster_passes_without_claiming_anything() {
-        let check = check_roster_identity(&[], &known(&[], &[], &[]));
+        let check = check_roster_identity(&[], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass);
     }
 
@@ -16780,7 +16765,7 @@ mod roster_identity_tests {
     /// off.
     #[test]
     fn a_history_trace_to_this_machines_own_uid_is_a_note() {
-        let k = with_local(known(&[], &[("review-scratch", "UID-SELF")], &[]), "UID-SELF", "MacBook-Pro");
+        let k = with_local(known(&[], &[("review-scratch", "UID-SELF")]), "UID-SELF", "MacBook-Pro");
         let check = check_roster_identity(&[entry("review-scratch", None)], &k);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("`review-scratch`"), "{}", check.message);
@@ -16791,7 +16776,7 @@ mod roster_identity_tests {
     /// machine (loopback reaches only here), so it still warns.
     #[test]
     fn a_loopback_entry_traced_to_this_machine_still_warns() {
-        let k = with_local(known(&[], &[("laptop", "UID-SELF")], &[]), "UID-SELF", "MacBook-Pro");
+        let k = with_local(known(&[], &[("laptop", "UID-SELF")]), "UID-SELF", "MacBook-Pro");
         let check = check_roster_identity(&[loopback(entry("laptop", None))], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("now called `MacBook-Pro`"), "{}", check.message);
@@ -16801,7 +16786,7 @@ mod roster_identity_tests {
     /// Following "add MacBook-Pro" would overwrite that correct entry.
     #[test]
     fn a_history_trace_to_an_already_rostered_name_is_a_note() {
-        let k = known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")], &[]);
+        let k = known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")]);
         let check = check_roster_identity(&[entry("laptop", None), entry("MacBook-Pro", None)], &k);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("already has its own roster entry"), "{}", check.message);
@@ -16813,7 +16798,7 @@ mod roster_identity_tests {
     /// correct entry.
     #[test]
     fn a_declared_uid_duplicate_of_a_rostered_machine_is_removed_not_re_added() {
-        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[]);
         k.live_uids.insert("UID-A".into());
         let check = check_roster_identity(&[entry("laptop", Some("UID-A")), entry("MacBook-Pro", None)], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
@@ -16829,7 +16814,7 @@ mod roster_identity_tests {
     fn a_declared_uid_whose_current_name_is_only_historical_gets_the_conservative_repair() {
         let check = check_roster_identity(
             &[entry("laptop", Some("UID-A"))],
-            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
+            &known(&[("UID-A", "MacBook-Pro")], &[]),
         );
         let hint = check.hint.unwrap();
         assert!(!hint.contains("laptop.tailnet.example"), "{hint}");
@@ -16841,7 +16826,7 @@ mod roster_identity_tests {
     /// name for the roster; the row names that provenance.
     #[test]
     fn the_row_names_a_session_machine_id_override() {
-        let mut k = known(&[], &[], &[]);
+        let mut k = known(&[], &[]);
         k.local_name = Some("review-scratch".into());
         k.local_name_from_env = true;
         let check = check_roster_identity(&[entry("studio", None)], &k);
@@ -16852,7 +16837,7 @@ mod roster_identity_tests {
     /// declared uid) is never told to take the session name.
     #[test]
     fn a_session_override_never_renames_this_machines_entry() {
-        let mut k = with_local(known(&[], &[], &[]), "UID-SELF", "review-scratch");
+        let mut k = with_local(known(&[], &[]), "UID-SELF", "review-scratch");
         k.local_name_from_env = true;
         let check = check_roster_identity(&[entry("MacBook-Pro", Some("UID-SELF"))], &k);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
@@ -16863,7 +16848,7 @@ mod roster_identity_tests {
     /// so.
     #[test]
     fn an_unknown_names_note_mentions_a_truncated_history_window() {
-        let mut k = known(&[], &[], &[]);
+        let mut k = known(&[], &[]);
         k.history_truncated_to = Some(120);
         let check = check_roster_identity(&[entry("studio", None)], &k);
         assert!(check.message.contains("last 120 flow files"), "{}", check.message);
@@ -16876,7 +16861,7 @@ mod roster_identity_tests {
 
     #[test]
     fn a_loopback_roster_address_is_reported_with_the_re_add_command() {
-        let check = check_roster_addresses(&[loopback(entry("studio", None)), entry("laptop", None)], &known(&[], &[], &[]));
+        let check = check_roster_addresses(&[loopback(entry("studio", None)), entry("laptop", None)], &known(&[], &[]));
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("`studio` at 127.0.0.1:8765"), "{}", check.message);
         assert!(!check.message.contains("`laptop`"), "{}", check.message);
@@ -16888,7 +16873,7 @@ mod roster_identity_tests {
     /// re-add under the machine's current name, agreeing with the identity row.
     #[test]
     fn a_renamed_loopback_entrys_re_add_uses_the_current_name() {
-        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[]);
         k.live_uids.insert("UID-A".into());
         let e = loopback(entry("laptop", Some("UID-A")));
         let check = check_roster_addresses(std::slice::from_ref(&e), &k);
@@ -16903,7 +16888,7 @@ mod roster_identity_tests {
     /// as the alternative.
     #[test]
     fn a_history_renamed_loopback_entrys_hint_names_the_rename_too() {
-        let k = known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")], &[]);
+        let k = known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")]);
         let check = check_roster_addresses(&[loopback(entry("laptop", None))], &k);
         let hint = check.hint.unwrap();
         assert!(hint.contains("darkmux machine add laptop --address <tailnet-dns-name>"), "{hint}");
@@ -16916,14 +16901,14 @@ mod roster_identity_tests {
     fn an_intended_loopback_entry_is_not_a_warning() {
         let mut e = loopback(entry("peer-a", None));
         e.loopback_intended = true;
-        let check = check_roster_addresses(&[e], &known(&[], &[], &[]));
+        let check = check_roster_addresses(&[e], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("--allow-loopback"), "{}", check.message);
     }
 
     #[test]
     fn non_loopback_roster_addresses_pass() {
-        let check = check_roster_addresses(&[entry("studio", None), entry("laptop", None)], &known(&[], &[], &[]));
+        let check = check_roster_addresses(&[entry("studio", None), entry("laptop", None)], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("2 roster"), "{}", check.message);
     }

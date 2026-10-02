@@ -31,9 +31,11 @@ pub enum WorkSeat {
     /// A model this machine loads and serves itself (a managed endpoint).
     Local { model: String },
     /// An endpoint this machine only sends requests to (an unmanaged one):
-    /// its id (or URL), the model asked of it, and its declared
-    /// `limits.concurrent_calls`.
-    Unmanaged { endpoint: String, model: String, concurrent_calls: Option<u32> },
+    /// its seat key (an id, or the URL of an inline endpoint), the name that
+    /// may be shown to a peer, the model asked of it, and its declared
+    /// `limits.concurrent_calls`. The key is internal and may carry
+    /// credentials; only `label` ever reaches a peer.
+    Unmanaged { endpoint: String, label: String, model: String, concurrent_calls: Option<u32> },
 }
 
 impl WorkSeat {
@@ -74,12 +76,20 @@ pub struct Occupied {
     pub what: String,
 }
 
+/// One claim on a seat: a unique ticket and the session that took it. A
+/// session id is not unique (the receiver derives it from the sender's, so a
+/// retry repeats it), so a guard frees by ticket.
+struct Held {
+    ticket: u64,
+    session: String,
+}
+
 #[derive(Default)]
 struct Book {
     /// Local model -> the session running on it.
-    local: BTreeMap<String, String>,
-    /// Endpoint -> the sessions running on it.
-    unmanaged: BTreeMap<String, Vec<String>>,
+    local: BTreeMap<String, Held>,
+    /// Endpoint -> the claims running on it.
+    unmanaged: BTreeMap<String, Vec<Held>>,
     /// Waiters in arrival order: (seat key, ticket).
     waiting: VecDeque<(String, u64)>,
     next_ticket: u64,
@@ -107,7 +117,7 @@ pub struct SeatSnapshot {
 pub struct SeatGuard {
     owner: Arc<SeatBook>,
     seat: WorkSeat,
-    session: String,
+    ticket: u64,
 }
 
 impl Drop for SeatGuard {
@@ -115,13 +125,13 @@ impl Drop for SeatGuard {
         let mut b = self.owner.book.lock().unwrap_or_else(|p| p.into_inner());
         match &self.seat {
             WorkSeat::Local { model } => {
-                if b.local.get(model) == Some(&self.session) {
+                if b.local.get(model).is_some_and(|h| h.ticket == self.ticket) {
                     b.local.remove(model);
                 }
             }
             WorkSeat::Unmanaged { endpoint, .. } => {
                 if let Some(held) = b.unmanaged.get_mut(endpoint) {
-                    held.retain(|s| s != &self.session);
+                    held.retain(|h| h.ticket != self.ticket);
                     if held.is_empty() {
                         b.unmanaged.remove(endpoint);
                     }
@@ -147,14 +157,14 @@ impl SeatBook {
     /// Why `seat` cannot be taken now, or `None` when it can.
     fn occupied(&self, b: &Book, seat: &WorkSeat) -> Option<Occupied> {
         match seat {
-            WorkSeat::Local { model } => b.local.get(model).map(|s| Occupied { what: format!("{s} is running on {model}") }),
-            WorkSeat::Unmanaged { endpoint, concurrent_calls, .. } => {
+            WorkSeat::Local { model } => b.local.get(model).map(|h| Occupied { what: format!("{} is running on {model}", h.session) }),
+            WorkSeat::Unmanaged { endpoint, label, concurrent_calls, .. } => {
                 let held = b.unmanaged.get(endpoint).map(Vec::as_slice).unwrap_or_default();
                 (held.len() >= seat.width()).then(|| Occupied {
                     what: format!(
-                        "{} job(s) are running on endpoint {endpoint} ({}), {}",
+                        "{} job(s) are running on endpoint {label} ({}), {}",
                         held.len(),
-                        held.join(", "),
+                        held.iter().map(|h| h.session.as_str()).collect::<Vec<_>>().join(", "),
                         match concurrent_calls {
                             Some(n) => format!("its `limits.concurrent_calls` ({n})"),
                             None => "which declares no `limits.concurrent_calls`, so its calls run one at a time".to_string(),
@@ -166,15 +176,16 @@ impl SeatBook {
     }
 
     fn take(self: &Arc<Self>, b: &mut Book, seat: &WorkSeat, session: &str) -> SeatGuard {
+        let ticket = b.next_ticket;
+        b.next_ticket += 1;
+        let held = Held { ticket, session: session.to_string() };
         match seat {
             WorkSeat::Local { model } => {
-                b.local.insert(model.clone(), session.to_string());
+                b.local.insert(model.clone(), held);
             }
-            WorkSeat::Unmanaged { endpoint, .. } => {
-                b.unmanaged.entry(endpoint.clone()).or_default().push(session.to_string())
-            }
+            WorkSeat::Unmanaged { endpoint, .. } => b.unmanaged.entry(endpoint.clone()).or_default().push(held),
         }
-        SeatGuard { owner: Arc::clone(self), seat: seat.clone(), session: session.to_string() }
+        SeatGuard { owner: Arc::clone(self), seat: seat.clone(), ticket }
     }
 
     /// Why a newcomer for `seat` cannot take it now: the seat is held, or an
@@ -286,7 +297,7 @@ impl SeatBook {
     /// Sessions running now (for tests and logs).
     pub fn running(&self) -> Vec<String> {
         let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        b.local.values().cloned().chain(b.unmanaged.values().flatten().cloned()).collect()
+        b.local.values().map(|h| h.session.clone()).chain(b.unmanaged.values().flatten().map(|h| h.session.clone())).collect()
     }
 }
 
@@ -298,7 +309,7 @@ mod tests {
         WorkSeat::Local { model: m.into() }
     }
     fn endpoint(id: &str, concurrent_calls: Option<u32>) -> WorkSeat {
-        WorkSeat::Unmanaged { endpoint: id.into(), model: "gpt-x".into(), concurrent_calls }
+        WorkSeat::Unmanaged { endpoint: id.into(), label: id.into(), model: "gpt-x".into(), concurrent_calls }
     }
 
     fn far() -> Instant {
@@ -534,5 +545,69 @@ mod tests {
         let what = rx.recv_timeout(Duration::from_secs(2)).expect("the wait outlived its deadline");
         assert!(what.as_deref().is_some_and(|w| w.contains("s1")), "{what:?}");
         assert!(book.book.lock().unwrap().waiting.is_empty(), "its ticket is gone");
+    }
+
+    /// (5.0) Two claims under one session id (a retry, or a repeated sender
+    /// session: the receiver's id is deterministic) are two seats. Dropping
+    /// one frees one, so the cap still holds.
+    #[test]
+    fn two_claims_under_one_session_id_free_one_seat_at_a_time() {
+        let book = Arc::new(SeatBook::new());
+        let azure = endpoint("azure", Some(2));
+        let a = book.try_claim(&azure, "s1").unwrap();
+        let b = book.try_claim(&azure, "s1").unwrap();
+        drop(a);
+        let _s2 = book.try_claim(&azure, "s2").expect("one seat freed, so one fits");
+        assert!(book.try_claim(&azure, "s3").is_err(), "3 running on a cap of 2");
+        drop(b);
+        assert_eq!(book.running().len(), 1, "only s2 is left");
+    }
+
+    #[test]
+    fn dropping_both_claims_under_one_session_id_frees_both() {
+        let book = Arc::new(SeatBook::new());
+        let azure = endpoint("azure", Some(2));
+        let a = book.try_claim(&azure, "s1").unwrap();
+        let b = book.try_claim(&azure, "s1").unwrap();
+        drop(a);
+        drop(b);
+        assert!(book.running().is_empty());
+        assert!(book.try_claim(&azure, "s2").is_ok() && book.try_claim(&azure, "s3").is_ok());
+    }
+
+    /// (5.0) A local seat frees by its own ticket: a guard whose seat was
+    /// already re-taken under the same session id never frees the new holder.
+    #[test]
+    fn a_local_guard_frees_only_its_own_claim() {
+        let book = Arc::new(SeatBook::new());
+        let a = book.try_claim(&local("m"), "s1").unwrap();
+        // Simulate the seat being re-taken under the same session id.
+        let ghost = {
+            let mut b = book.book.lock().unwrap();
+            b.local.remove("m");
+            book.take(&mut b, &local("m"), "s1")
+        };
+        drop(a);
+        assert_eq!(book.running(), vec!["s1".to_string()], "the old guard must not free the new claim");
+        drop(ghost);
+        assert!(book.running().is_empty());
+    }
+
+    /// (5.0) A refusal for an inline endpoint names its label, never its URL.
+    #[test]
+    fn the_busy_text_names_the_label_not_the_endpoint_key() {
+        let book = Arc::new(SeatBook::new());
+        let seat = WorkSeat::Unmanaged {
+            endpoint: "https://user:hunter2@api.example.com/v1?key=sekret".into(),
+            label: "an inline endpoint".into(),
+            model: "gpt-x".into(),
+            concurrent_calls: None,
+        };
+        let _a = book.try_claim(&seat, "h1").unwrap();
+        let busy = book.try_claim(&seat, "h2").err().unwrap();
+        assert!(busy.what.contains("an inline endpoint"), "{busy:?}");
+        for leak in ["hunter2", "sekret", "example.com", "https"] {
+            assert!(!busy.what.contains(leak), "{leak} leaked: {busy:?}");
+        }
     }
 }

@@ -61,13 +61,12 @@ pub fn build_work_job(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Dispatch routing (#463 cycle-break)
+// Dispatch routing
 //
-// The local-vs-remote routing decision moved here from `crew::dispatch` so
-// `crew` no longer depends on `fleet`. `crew::dispatch::dispatch` is purely
-// local; `dispatch_routed` is the front door for user-facing dispatch
-// callers. The receiving machine runs a submitted job through
-// `runner::execute_job`, which never re-routes.
+// `dispatch_routed` is the front door for user-facing dispatch callers: it
+// decides local vs remote. `crew::dispatch::dispatch` is purely local. The
+// receiving machine runs a submitted job through `runner::execute_job`,
+// which never re-routes.
 // ─────────────────────────────────────────────────────────────────────────
 
 use crate::job::{Boundary, SingleShotJob};

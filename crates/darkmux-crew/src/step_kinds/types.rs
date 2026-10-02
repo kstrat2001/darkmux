@@ -443,24 +443,32 @@ pub struct StepOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointSlot {
     key: String,
+    label: String,
     concurrent_calls: Option<u32>,
 }
 
 impl EndpointSlot {
     /// A slot for the endpoint `key` with the declared `concurrent_calls`.
     pub fn new(key: impl Into<String>, concurrent_calls: Option<u32>) -> Self {
-        Self { key: key.into(), concurrent_calls }
+        let key = key.into();
+        Self { label: key.clone(), key, concurrent_calls }
     }
 
     /// The slot `ep` claims: keyed by its `endpoints` id (an inline endpoint,
     /// which has none, by its URL), carrying its declared `concurrent_calls`.
+    /// Its [`label`](Self::label) is the id, or a fixed phrase for an inline
+    /// endpoint: a URL can carry userinfo or a key, so it is never shown.
     pub fn of(ep: &darkmux_types::ModelEndpoint) -> Self {
-        let key = ep
-            .named_id()
-            .map(str::to_string)
-            .or_else(|| ep.url.clone())
-            .unwrap_or_else(|| "(unnamed endpoint)".to_string());
-        Self::new(key, ep.known_limits().and_then(|l| l.concurrent_calls))
+        let named = ep.named_id().map(str::to_string);
+        let key = named.clone().or_else(|| ep.url.clone()).unwrap_or_else(|| "(unnamed endpoint)".to_string());
+        let label = named.unwrap_or_else(|| "an inline endpoint".to_string());
+        Self { key, label, concurrent_calls: ep.known_limits().and_then(|l| l.concurrent_calls) }
+    }
+
+    /// The name that may be shown to a person or a peer: the endpoint's id,
+    /// never its URL.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// The slot of a step whose endpoint could not be resolved: `run` refuses
@@ -899,5 +907,27 @@ pub trait StepKind: Send + Sync {
     /// ambient working directory must override this and say so.
     fn cwd_policy(&self) -> CwdPolicy {
         CwdPolicy::NoAmbientDependency
+    }
+}
+
+#[cfg(test)]
+mod endpoint_slot_tests {
+    use super::*;
+
+    /// (5.0) An inline endpoint's slot stays keyed by its URL (two inline
+    /// endpoints are two seats), but the name that may be shown never
+    /// carries any part of it: a URL can hold userinfo or a key.
+    #[test]
+    fn an_inline_endpoints_label_carries_no_part_of_its_url() {
+        let ep = darkmux_types::ModelEndpoint {
+            url: Some("https://user:hunter2@api.example.com/v1?key=sekret".into()),
+            ..Default::default()
+        };
+        let slot = EndpointSlot::of(&ep);
+        assert!(slot.key().contains("api.example.com"), "the key stays unique per URL");
+        for leak in ["hunter2", "sekret", "example.com", "https"] {
+            assert!(!slot.label().contains(leak), "{leak} leaked into the label {:?}", slot.label());
+        }
+        assert!(slot.is_endpoint());
     }
 }

@@ -433,7 +433,7 @@ pub(crate) fn persist_pin(snapshot: &MachineEntry, target: &PeerTarget) -> Resul
 /// its learned name (a card under another name teaches nothing, so a
 /// mis-pointed first contact is not adopted). A uid or name that is not well
 /// formed on the wire is ignored, and a name another entry (`others`, the
-/// other ids in the roster) already carries is not taken as this entry's
+/// other entries' ids and learned names) already carries is not taken as this entry's
 /// current name, so a peer's self-chosen name cannot make another entry's
 /// address ambiguous.
 fn taught_by_card(e: &MachineEntry, uid: Option<&str>, name: Option<&str>, others: &[&str]) -> Option<MachineEntry> {
@@ -478,7 +478,14 @@ pub fn learn_identity(
         return Ok(snapshot.clone());
     }
     crate::mutate_roster(|r| {
-        let others: Vec<String> = r.machines.keys().filter(|k| **k != snapshot.id).cloned().collect();
+        // Every name another entry answers to: its key and its learned name.
+        let others: Vec<String> = r
+            .machines
+            .iter()
+            .filter(|(k, _)| **k != snapshot.id)
+            .flat_map(|(k, e)| [Some(k.clone()), e.current_name.clone()])
+            .flatten()
+            .collect();
         let others: Vec<&str> = others.iter().map(String::as_str).collect();
         let saved = r.machines.get_mut(&snapshot.id);
         check_saved_entry(saved.as_deref(), snapshot, node, true)?;
@@ -1088,4 +1095,30 @@ mod tests {
         assert_eq!(saved.1.current_name, None, "nothing was written");
     }
 
+    /// (5.0) A name another entry already holds as its LEARNED name is not
+    /// taken either; a genuinely new name still is.
+    #[test]
+    #[serial_test::serial]
+    fn a_name_another_entry_has_learned_is_not_learned_but_a_new_name_is() {
+        let known = MachineEntry { machine_uid: Some("UID-S".into()), ..pinned_entry() };
+        let p = provider();
+        let dir = tempfile::tempdir().unwrap();
+        let learn = |name: &str| {
+            with_roster_file(&dir.path().join("fleet.json"), || {
+                crate::mutate_roster(|r| {
+                    r.machines.insert("studio".into(), known.clone());
+                    r.machines.insert(
+                        "m2".into(),
+                        MachineEntry { id: "m2".into(), current_name: Some("mini".into()), ..entry("100.64.0.3", None) },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                let target = SettledTarget::new(first_contact(&p));
+                learn_identity(&known, &target, Some("UID-S"), Some(name)).unwrap().current_name
+            })
+        };
+        assert_eq!(learn("mini"), None, "`mini` is m2's learned name");
+        assert_eq!(learn("studio-now").as_deref(), Some("studio-now"), "a new name is learned");
+    }
 }

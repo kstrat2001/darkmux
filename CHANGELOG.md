@@ -62,6 +62,10 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
+  check no longer treats a flow record without a `machine_uid` as a known name
+  (a record with no uid names no machine), and the retired Redis-queue
+  and mixed-version narration is gone from the fleet code and docs.
 - **Informational stderr lines stay out of an interactive terminal** (5.0).
   `[darkmux-liveness]` markers, the `flow: ... sink enabled` banners, and the
   dispatch progress headers print only when stderr is not a terminal (CI logs,
@@ -1468,6 +1472,18 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A fleet seat frees only the claim that took it** (5.0). A retried or
+  repeated sender session shares one receiver session id; dropping one of two
+  claims under it used to free both, so a cap of 2 could run 3. Each claim now
+  holds its own ticket.
+- **A peer cannot make another entry's learned name ambiguous** (5.0). A card
+  stating a name another roster entry already holds as its learned name is no
+  longer taken.
+- **A job that names a hardware uid never falls back to the name** (5.0). A
+  receiver that cannot read its own uid refuses it as misaddressed (421) with a
+  reason, instead of matching on the machine name.
+- **Busy and queued replies never carry an endpoint URL** (5.0). An inline
+  endpoint is named "an inline endpoint" to a peer; a named one by its id.
 - **Selecting text on a card or row never clicks it.** A drag that selects
   text, or a double-click that selects a word, no longer drills the fleet
   machine card, a run row, an event row, or a mission step; a plain click

@@ -777,8 +777,7 @@ impl Worker {
             });
         }
         (state.config_preflight)().map_err(|detail| Refusal::BadConfig { detail })?;
-        let resolution = (state.resolve_profile)(&self.job.role_id, self.job.profile.as_deref());
-        let now = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), &admitted, &self.job, resolution)?;
+        let now = scope_job(state, &admitted, &self.job)?;
         if now.seat != self.scoped.seat {
             return Err(Refusal::SeatChanged { profile: now.profile });
         }
@@ -921,14 +920,19 @@ async fn scope_submission(
     body: &[u8],
 ) -> Result<(WorkSubmission, ScopedJob), Refusal> {
     let sub = WorkSubmission::parse(body)?;
-    let resolve = state.resolve_profile.clone();
-    let (role, requested) = (sub.job.role_id.clone(), sub.job.profile.clone());
-    let resolution = match tokio::task::spawn_blocking(move || resolve(&role, requested.as_deref())).await {
-        Ok(r) => r,
-        Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
-    };
-    let scoped = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, &sub.job, resolution)?;
+    let (st, adm, job) = (state.clone(), admitted.clone(), sub.job.clone());
+    let scoped = tokio::task::spawn_blocking(move || scope_job(&st, &adm, &job))
+        .await
+        .unwrap_or_else(|e| Err(Refusal::BadConfig { detail: format!("profile resolution did not finish: {e}") }))?;
     Ok((sub, scoped))
+}
+
+/// The ONE owner of the scoped-job rule: resolve the job's profile as this
+/// machine does now, then check it against `admitted`'s scope and the
+/// boundary. A new submission and a queued job's recheck both go through it.
+fn scope_job(state: &FleetListenerState, admitted: &Admitted, job: &WorkJob) -> Result<ScopedJob, Refusal> {
+    let resolution = (state.resolve_profile)(&job.role_id, job.profile.as_deref());
+    darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, job, resolution)
 }
 
 /// `POST` a job or a check: refuses a caller the allow-list does not list,
@@ -1518,7 +1522,7 @@ mod tests {
     /// endpoint, `small` a second local model, anything else the local `big`.
     /// The test receiver's one unmanaged endpoint, declaring `concurrent_calls`.
     fn cloud_seat(concurrent_calls: Option<u32>) -> darkmux_fleet::WorkSeat {
-        darkmux_fleet::WorkSeat::Unmanaged { endpoint: "cloud-endpoint".into(), model: "gpt-x".into(), concurrent_calls }
+        darkmux_fleet::WorkSeat::Unmanaged { endpoint: "cloud-endpoint".into(), label: "cloud-endpoint".into(), model: "gpt-x".into(), concurrent_calls }
     }
 
     fn test_resolution(requested: Option<&str>) -> ProfileResolution {
@@ -2036,6 +2040,19 @@ mod tests {
         assert!(reason.contains("limits.concurrent_calls") && reason.contains("cloud-endpoint"), "{reason}");
         // A local job is not held up by endpoint jobs.
         assert_eq!(post(&h, TOKEN, job("l1", None), false).0, 202);
+    }
+
+    /// (5.0) The receiver's session id is derived from the sender's, with no
+    /// dedup, so a retry or a repeated sender session is two jobs under ONE
+    /// id. Both hold a seat, and the cap still bounds them.
+    #[test]
+    fn a_repeated_sender_session_takes_two_seats_and_the_cap_holds() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Refuse, Some(2), WIDE);
+        allow_profiles(&h, &["host", "small", "cloud"]);
+        assert_eq!(post(&h, TOKEN, job("dup", Some("cloud")), false).0, 202);
+        assert_eq!(post(&h, TOKEN, job("dup", Some("cloud")), false).0, 202, "same session id, second seat");
+        assert_eq!(h.seats.running().len(), 2, "two claims, one session id");
+        assert_eq!(post(&h, TOKEN, job("other", Some("cloud")), true).0, 503, "the cap of 2 holds");
     }
 
     /// (#2916 stage 2) `queue`: a waited-on job hears it is queued at once,
