@@ -3405,8 +3405,95 @@ static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// error-shape corpus.
 #[derive(Debug)]
 pub(crate) enum HostedCallError {
+    /// 429 / RESOURCE_EXHAUSTED: the endpoint rejected the call, retryable.
     RateLimited(String),
+    /// 503 / UNAVAILABLE / "high demand": the endpoint shed load, retryable.
+    /// Kept apart from `RateLimited` because it is a 5xx, which may have been
+    /// processed ([`call_may_have_spent`]), where a 429 never was.
+    ServerShed(String),
     Other(anyhow::Error),
+}
+
+/// How a failed hosted call failed, as far as the budget cares: whether the
+/// endpoint may have processed it. Carried inside the error as a
+/// [`HostedFailureError`]; read back by [`call_may_have_spent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedFailure {
+    /// Failed before the request was sent (config, spawn, DNS, connect, TLS).
+    NotSent,
+    /// Sent, and the answer never came whole: a timeout, a dropped or empty
+    /// reply, an unreadable body.
+    Unanswered,
+    /// The endpoint refused it: 4xx (400, 401, 403, ...), never processed.
+    Rejected,
+    /// 429: rejected for rate, never processed.
+    RateLimited,
+    /// 5xx: the endpoint failed after taking the call.
+    ServerError,
+}
+
+/// A hosted-call error tagged with its [`HostedFailure`] class.
+#[derive(Debug)]
+pub(crate) struct HostedFailureError {
+    kind: HostedFailure,
+    message: String,
+}
+
+impl std::fmt::Display for HostedFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostedFailureError {}
+
+/// [`failure`] for another module's tests, which classify an error without a
+/// live endpoint.
+#[cfg(test)]
+pub(crate) fn failure_for_test(kind: HostedFailure, message: &str) -> anyhow::Error {
+    failure(kind, message)
+}
+
+/// An error carrying its [`HostedFailure`] class, with `message` as its text.
+fn failure(kind: HostedFailure, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(HostedFailureError { kind, message: message.into() })
+}
+
+/// (5.0) THE one policy for a hosted call that failed: did the endpoint
+/// possibly process it, so that it may have been billed? A timeout or dropped
+/// reply after the request was sent, and a 5xx, may have been; a failure
+/// before sending, a 4xx (400, 401, 403, ...) and a 429 never were. An error
+/// with no class (anything not raised by the hosted call itself) is not
+/// charged: a false budget wait costs more than one missed call. Every hosted
+/// path (`dispatch_unmanaged`, the `dispatch.single_shot` and `dispatch.map`
+/// steps) charges through [`unanswered_hosted_spend`], which asks this.
+pub(crate) fn call_may_have_spent(err: &anyhow::Error) -> bool {
+    let kind = err.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|e| e.kind);
+    matches!(kind, Some(HostedFailure::Unanswered | HostedFailure::ServerError))
+}
+
+/// What a failed hosted call charges: the conservative charge of a reply with
+/// no usage ([`crate::budget::conservative_hosted_spend`]) when the endpoint
+/// may have processed it, else nothing.
+pub(crate) fn unanswered_hosted_spend(err: &anyhow::Error, granted_max_tokens: u32, request: &serde_json::Value) -> u64 {
+    if call_may_have_spent(err) {
+        crate::budget::conservative_hosted_spend(None, granted_max_tokens, request)
+    } else {
+        0
+    }
+}
+
+/// curl exit codes that mean the request went out and no whole answer came
+/// back: 18 partial file, 28 timeout, 52 empty reply, 55 send failure, 56
+/// receive failure. Every other nonzero exit (DNS 6, connect 7, TLS 35/60, a
+/// bad URL 3, ...) failed before the endpoint could have processed anything.
+/// A 28 can also be a connect timeout, which curl does not distinguish here;
+/// it is charged, the conservative side.
+fn curl_failure_kind(exit: i32) -> HostedFailure {
+    match exit {
+        18 | 28 | 52 | 55 | 56 => HostedFailure::Unanswered,
+        _ => HostedFailure::NotSent,
+    }
 }
 
 /// Backoff ladder for endpoint rate limits (free tiers especially: Gemini's
@@ -3426,6 +3513,7 @@ pub(crate) fn remote_chat_completion(
 ) -> Result<serde_json::Value> {
     let attempts = RATE_LIMIT_BACKOFF_SECONDS.len() + 1;
     let mut last = String::new();
+    let mut last_shed = false;
     for (i, delay) in std::iter::once(0u64)
         .chain(RATE_LIMIT_BACKOFF_SECONDS.iter().copied())
         .enumerate()
@@ -3439,11 +3527,13 @@ pub(crate) fn remote_chat_completion(
         }
         match remote_chat_attempt(url, auth_header, body, timeout_seconds) {
             Ok(v) => return Ok(v),
-            Err(HostedCallError::RateLimited(msg)) => last = msg,
+            Err(HostedCallError::RateLimited(msg)) => (last, last_shed) = (msg, false),
+            Err(HostedCallError::ServerShed(msg)) => (last, last_shed) = (msg, true),
             Err(HostedCallError::Other(e)) => return Err(e),
         }
     }
-    bail!("hosted endpoint rate-limited (429) after {attempts} attempts: {last}")
+    let kind = if last_shed { HostedFailure::ServerError } else { HostedFailure::RateLimited };
+    Err(failure(kind, format!("hosted endpoint rate-limited (429) after {attempts} attempts: {last}")))
 }
 
 fn remote_chat_attempt(
@@ -3481,13 +3571,13 @@ fn remote_chat_attempt(
                 .create_new(true)
                 .mode(0o600)
                 .open(&cfg_path)
-                .context("creating curl config for hosted dispatch")?
+                .map_err(|e| failure(HostedFailure::NotSent, format!("creating curl config for hosted dispatch: {e}")))?
         };
         #[cfg(not(unix))]
-        let mut f =
-            std::fs::File::create(&cfg_path).context("creating curl config for hosted dispatch")?;
+        let mut f = std::fs::File::create(&cfg_path)
+            .map_err(|e| failure(HostedFailure::NotSent, format!("creating curl config for hosted dispatch: {e}")))?;
         f.write_all(cfg.as_bytes())
-            .context("writing curl config body")?;
+            .map_err(|e| failure(HostedFailure::NotSent, format!("writing curl config body: {e}")))?;
         drop(f);
         let child = Command::new("curl")
             .args([
@@ -3500,7 +3590,7 @@ fn remote_chat_attempt(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("spawning curl for hosted dispatch")?;
+            .map_err(|e| failure(HostedFailure::NotSent, format!("spawning curl for hosted dispatch: {e}")))?;
         // (#2124) Registered the moment the child exists — BEFORE the
         // blocking wait below — so a signal-interrupted launcher (any of
         // the three `mission launch` launchers share this guard as of
@@ -3516,7 +3606,9 @@ fn remote_chat_attempt(
         // delivery to the launcher in a real invocation shape).
         let child_pid = child.id();
         darkmux_types::child_registry::register(child_pid);
-        let wait_result = child.wait_with_output().context("running curl for hosted dispatch");
+        let wait_result = child.wait_with_output().map_err(|e| {
+            failure(HostedFailure::Unanswered, format!("running curl for hosted dispatch: {e}"))
+        });
         darkmux_types::child_registry::deregister(child_pid);
         wait_result
     };
@@ -3548,11 +3640,11 @@ fn remote_chat_attempt(
         )));
     }
     if !out.status.success() {
-        return Err(HostedCallError::Other(anyhow!(describe_curl_failure(
-            url,
-            out.status.code().unwrap_or(-1),
-            &String::from_utf8_lossy(&out.stderr)
-        ))));
+        let exit = out.status.code().unwrap_or(-1);
+        return Err(HostedCallError::Other(failure(
+            curl_failure_kind(exit),
+            describe_curl_failure(url, exit, &String::from_utf8_lossy(&out.stderr)),
+        )));
     }
     parse_hosted_response(&out.stdout)
 }
@@ -3581,9 +3673,9 @@ pub(crate) fn parse_hosted_response(
             .collect::<String>()
     };
     let resp: serde_json::Value = serde_json::from_slice(stdout).map_err(|e| {
-        HostedCallError::Other(anyhow!(
-            "parsing hosted endpoint response as JSON: {e} (first 200 bytes: {:?})",
-            head()
+        HostedCallError::Other(failure(
+            HostedFailure::Unanswered,
+            format!("parsing hosted endpoint response as JSON: {e} (first 200 bytes: {:?})", head()),
         ))
     })?;
     let err_obj = resp.get("error").or_else(|| {
@@ -3604,17 +3696,14 @@ pub(crate) fn parse_hosted_response(
         // load with that message in a 200-status body, observed live
         // 2026-07-05 on the paid tier; it killed whole bench runs that a
         // 30s wait survives).
-        let transient = code == Some(429)
-            || code == Some(503)
-            || status == "RESOURCE_EXHAUSTED"
-            || status == "UNAVAILABLE"
-            || (msg.contains("high demand") && msg.contains("try again"));
-        if transient {
+        if code == Some(429) || status == "RESOURCE_EXHAUSTED" {
             return Err(HostedCallError::RateLimited(msg.to_string()));
         }
-        return Err(HostedCallError::Other(anyhow!(
-            "hosted endpoint returned an error: {msg}"
-        )));
+        if code == Some(503) || status == "UNAVAILABLE" || (msg.contains("high demand") && msg.contains("try again")) {
+            return Err(HostedCallError::ServerShed(msg.to_string()));
+        }
+        let kind = if code.is_some_and(|c| c >= 500) { HostedFailure::ServerError } else { HostedFailure::Rejected };
+        return Err(HostedCallError::Other(failure(kind, format!("hosted endpoint returned an error: {msg}"))));
     }
     // Require the MESSAGE object, not the content field (#1222 packet 2):
     // some OpenAI-compat reasoning backends omit `content` entirely on
@@ -3900,7 +3989,9 @@ fn dispatch_unmanaged(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            charge_unanswered_hosted_call(opts, execution, target, &label, &req_body, &dispatch_bucket, &budget_caller);
+            if call_may_have_spent(&e) {
+                charge_unanswered_hosted_call(opts, execution, target, &label, &req_body, &dispatch_bucket, &budget_caller);
+            }
             // (#2344) The one HTTP call is over — stop the beat before the
             // terminal record, so the live view drops the session instead of
             // waiting out the TTL. Same ordering as the container path's own

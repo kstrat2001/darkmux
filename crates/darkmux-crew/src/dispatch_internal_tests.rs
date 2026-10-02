@@ -807,19 +807,19 @@
         // 503 code, UNAVAILABLE status, and Google's "high demand" message
         // inside an HTTP-200 body (observed live 2026-07-05).
         match parse_hosted_response(br#"{"error":{"code":503,"message":"overloaded"}}"#) {
-            Err(HostedCallError::RateLimited(_)) => {}
+            Err(HostedCallError::ServerShed(_)) => {}
             _ => panic!("503 must classify retryable"),
         }
         match parse_hosted_response(
             br#"[{"error":{"status":"UNAVAILABLE","message":"The service is currently unavailable."}}]"#,
         ) {
-            Err(HostedCallError::RateLimited(_)) => {}
+            Err(HostedCallError::ServerShed(_)) => {}
             _ => panic!("UNAVAILABLE must classify retryable"),
         }
         match parse_hosted_response(
             br#"{"error":{"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later."}}"#,
         ) {
-            Err(HostedCallError::RateLimited(m)) => assert!(m.contains("high demand")),
+            Err(HostedCallError::ServerShed(m)) => assert!(m.contains("high demand")),
             _ => panic!("high-demand shedding must classify retryable"),
         }
         match parse_hosted_response(br#"{"id":"x"}"#) {
@@ -3165,6 +3165,83 @@
              once scoped to their own mission — without scope_to_run both dispatches would collide \
              on the SAME session_id while now carrying DIFFERENT mission_ids"
         );
+    }
+
+    /// The error `parse_hosted_response` raises for `body`, as `anyhow`.
+    fn parsed_hosted_error(body: &str) -> anyhow::Error {
+        match parse_hosted_response(body.as_bytes()) {
+            Err(HostedCallError::Other(e)) => e,
+            Err(HostedCallError::RateLimited(m)) => failure(HostedFailure::RateLimited, m),
+            Err(HostedCallError::ServerShed(m)) => failure(HostedFailure::ServerError, m),
+            Ok(_) => panic!("{body} must be an error"),
+        }
+    }
+
+    /// (5.0) The one charging policy, class by class: charged are a timeout
+    /// or dropped reply after sending, an unreadable body, and a 5xx; not
+    /// charged are a failure before sending, every 4xx and a 429.
+    #[test]
+    fn call_may_have_spent_charges_only_calls_the_endpoint_may_have_processed() {
+        // Charged.
+        for exit in [28, 52, 56, 55, 18] {
+            let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
+            assert!(call_may_have_spent(&e), "curl exit {exit} came after the request went out");
+        }
+        assert!(call_may_have_spent(&parsed_hosted_error("<html>502 Bad Gateway</html>")), "unreadable body");
+        assert!(call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":500,"message":"boom"}}"#)), "500");
+        assert!(call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":503,"message":"overloaded"}}"#)), "503");
+        // Not charged.
+        for exit in [6, 7, 35, 60, 3] {
+            let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
+            assert!(!call_may_have_spent(&e), "curl exit {exit} failed before the request went out");
+        }
+        for code in [400, 401, 403, 404] {
+            let body = format!(r#"{{"error":{{"code":{code},"message":"no"}}}}"#);
+            assert!(!call_may_have_spent(&parsed_hosted_error(&body)), "{code} was rejected, not processed");
+        }
+        assert!(!call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":429,"message":"slow down"}}"#)), "429");
+        assert!(!call_may_have_spent(&anyhow!("an error from nowhere near the hosted call")), "unclassed");
+        assert!(!call_may_have_spent(&failure(HostedFailure::NotSent, "x").context("wrapped")), "context keeps the class");
+        assert!(call_may_have_spent(&failure(HostedFailure::Unanswered, "x").context("wrapped")), "context keeps the class");
+    }
+
+    /// The charge is the conservative no-usage charge for a possibly
+    /// processed call, and exactly 0 for one that was not.
+    #[test]
+    fn unanswered_hosted_spend_is_conservative_or_zero() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let charged = unanswered_hosted_spend(&failure(HostedFailure::Unanswered, "x"), 4096, &body);
+        assert_eq!(charged, crate::budget::conservative_hosted_spend(None, 4096, &body));
+        assert!(charged >= 4096);
+        assert_eq!(unanswered_hosted_spend(&failure(HostedFailure::Rejected, "x"), 4096, &body), 0);
+        assert_eq!(unanswered_hosted_spend(&failure(HostedFailure::NotSent, "x"), 4096, &body), 0);
+    }
+
+    use crate::budget::tests::status_http_mock;
+
+    /// End to end through the real curl path: a 500 charges, a 401 does not,
+    /// and a refused connection (nothing listening) does not.
+    #[test]
+    #[serial]
+    fn dispatch_unmanaged_charges_a_5xx_and_not_a_4xx_or_an_unsent_call() {
+        let url = status_http_mock("500 Internal Server Error", r#"{"error":{"code":500,"message":"boom"}}"#);
+        let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&url);
+        assert!(result.is_err());
+        assert_eq!(charged, Some(unreported), "a 500 may have been processed");
+        assert_eq!(sources, vec!["absent"]);
+
+        let url = status_http_mock("401 Unauthorized", r#"{"error":{"code":401,"message":"bad key"}}"#);
+        let (result, charged, _, sources) = run_capped_hosted_dispatch(&url);
+        assert!(result.is_err());
+        assert_eq!((charged, sources.len()), (None, 0), "a 401 was rejected, not processed");
+
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/v1/chat/completions", l.local_addr().unwrap().port())
+        };
+        let (result, charged, _, sources) = run_capped_hosted_dispatch(&dead);
+        assert!(result.is_err());
+        assert_eq!((charged, sources.len()), (None, 0), "a refused connection never sent anything");
     }
 
     /// A loopback server that takes the request and never answers: the
