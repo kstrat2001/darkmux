@@ -16,10 +16,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           per event. Every action is a `FlowAction` variant (`action.rs`),
 //           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three
-//           dot-separated segments. Dotted only on write; a spaced or
-//           otherwise retired spelling in an archive is upgraded on read by
-//           `darkmux_flow::reader` (the table is `legacy.rs`), and an
-//           archive is never rewritten. Renamed: `dispatch start` /
+//           dot-separated segments. Dotted only on write. Nothing in the
+//           build reads a retired spelling (5.0, #3036): a spaced or
+//           otherwise retired spelling in an archive reads as
+//           `FlowAction::Other` like any action this build does not know,
+//           kept verbatim, and an archive is never rewritten. Renamed:
+//           `dispatch start` /
 //           `complete` / `error` / `route` -> `dispatch.*`; `step start` /
 //           `complete` / `error` / `result` / `timing` -> `step.*`,
 //           `step seat unresolved` -> `step.seat_unresolved`; `phase start`
@@ -31,18 +33,24 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           code-reviewer` -> `phase.review.dispatch`, `dispatch failed`
 //           -> `phase.review.failed`, `verdict: <v>` ->
 //           `phase.review.verdict` with the verdict in `payload.verdict`;
-//           `mission start` / `close` / `abort` / `pause` / `resume` ->
-//           `mission.*`; `note` -> `operator.note`, `catch` ->
+//           `mission start` / `close` / `abort` -> `mission.*`; `note` -> `operator.note`, `catch` ->
 //           `operator.catch`, `tier-decision` -> `tier.decision`. An action
 //           darkmux retired with no current equivalent (`telemetry.process`,
 //           `funnel.*`, the old `mission.run.*` / `mission.compile.*` /
-//           `mission reopen`, the literal launcher's `crawl.*`) reads as
-//           `FlowAction::Retired`: known, never written, not counted as
-//           unknown. An action this build does not know reads as
-//           `FlowAction::Other`, is never written, and `darkmux doctor`
-//           names it. A consumer outside
-//           darkmux reads the dotted spellings; darkmux's own readers
-//           upgrade old archives.
+//           `mission reopen`, `phase.added`, the literal launcher's
+//           `crawl.*`, `mission.pause` / `mission.resume`) is not written.
+//           An action this build does not know, a retired one included,
+//           reads as `FlowAction::Other`, is never written, and `darkmux
+//           doctor` names it. A consumer outside darkmux reads the dotted
+//           spellings, and neither it nor darkmux upgrades an old archive.
+//
+//           RETIRED FOREVER (5.0, #2954, #2996): `mission.pause`,
+//           `mission.resume`, and with them the mission fields `paused` and
+//           `paused_ts`. The verbs only flipped a status label, and an
+//           archive holds their no-op records; reusing any of the four
+//           names for a real pause would resurrect those records as one.
+//           A future operator pause is a separate mission field (`hold`)
+//           with new actions (`mission.hold` / `mission.release`).
 //
 //           Also (4.0, 5.0 dogfood): `step.error` carries a typed payload
 //           `{cause}`: why the step errored, on one line, control and
@@ -88,10 +96,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           means one role execution and nothing else. The run pair was
 //           written as `dispatch.*` with `source: "mission"` and
 //           `payload.runtime` (`mission` / `ephemeral`) before; neither is
-//           written now. A reader of a pre-4.0 archive reads a
-//           `dispatch.*` bookend whose `source` is `mission`, or `review`
-//           (the retired review launcher's), as `run.*`
-//           (`darkmux_flow::legacy::run_grain_of`); no file is rewritten.
+//           written now. A pre-4.0 archive's whole-run pair is not read as
+//           `run.*` (5.0, #3036): it reads as the `dispatch.*` it was
+//           spelled as; no file is rewritten.
 //
 //           Also (4.0, CLAUDE.md contract 8): every record of a role
 //           execution names it. `execution_id` (`darkmux_types::
@@ -105,13 +112,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           execution's id (recorded in its out-dir's `resume_origin.json`);
 //           a specialist change is a new execution. A `dispatch.map` step no
 //           longer writes a `dispatch.*` pair around the whole step: each
-//           item writes its own, with `payload.item_index`. A reader of a
-//           pre-4.0 archive gives a record of an execution that names none
-//           `legacy:<session>:<mission>` (or, with no session, `legacy::
-//           <mission>:<ts>:<handle>:<machine_uid>`), `darkmux_flow::legacy::execution_of`;
-//           no file is rewritten. Findings are filed under it too:
-//           `<execution_id>/<emit_seq>` (a pre-4.0 record's address is
-//           unchanged).
+//           item writes its own, with `payload.item_index`. A record of a
+//           pre-4.0 archive names no execution and none is given to it
+//           (5.0, #3036); no file is rewritten. Findings are filed under it
+//           too: `<execution_id>/<emit_seq>` (a finding already stored under
+//           a pre-4.0 address stays there).
 //
 //           Also removed (4.0, one token truth): `dispatch.complete`'s
 //           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
@@ -139,10 +144,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `sampler_ms` / `forward_ms`, `machine.battery_health`'s
 //           `total_operating_time_hours` / `time_at_soc_hours` are
 //           `total_operating_ms` / `time_at_soc_ms`. A reader of an archive
-//           maps every old spelling and key
-//           (`darkmux_flow::legacy::{OLD_SOURCES, OLD_TIERS,
-//           OLD_PAYLOAD_KEYS}`); no file is rewritten. A hook rule naming a
-//           retired action spelling is refused, not read as the current one.
+//           maps none of them (5.0, #3036): an old `source` or `tier` reads
+//           as unknown and an old payload key stays under its old name; no
+//           file is rewritten. A hook rule naming a retired action spelling
+//           matches no action, so it delivers nothing, warns at load and is
+//           flagged by `darkmux doctor`.
 //
 //           Also (4.0): a usage record whose provider sent no prompt count
 //           (and no total) carries no `total_tokens`: its full spend is
@@ -2181,7 +2187,6 @@ pub enum Tier {
 /// The component that wrote a record: one spelling each, `snake_case`. The
 /// set is closed; a spelling this build does not know reads as
 /// [`FlowSource::Unknown`] (see [`Level::Unknown`]) and is never written.
-/// Pre-4.0 spellings map on read (`crate::legacy::OLD_SOURCES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -2288,12 +2293,7 @@ pub struct FlowRecord {
     pub stage: Stage,
     pub action: crate::FlowAction,
     pub handle: String,
-    /// Sprint→Phase rename read-compat: historical flow records on disk
-    /// (append-only JSONL, never rewritten) carry this under the pre-
-    /// rename wire key `sprint_id`. `alias` lets readers accept either
-    /// key so historical records don't silently lose the field; every
-    /// newly-written record emits the canonical `phase_id` key.
-    #[serde(skip_serializing_if = "Option::is_none", alias = "sprint_id")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub phase_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2303,7 +2303,7 @@ pub struct FlowRecord {
     /// action is execution-grain (`FlowAction::grain`), never on any other.
     /// A session names the run; this names which execution inside it (a
     /// task session holds one per `dispatch.map` item). Schema 2.0 addition.
-    /// A pre-4.0 record carries none; `crate::reader` synthesizes one.
+    /// A pre-4.0 record carries none, and the reader gives it none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "string", optional))]
     pub execution_id: Option<darkmux_types::execution_id::ExecutionId>,

@@ -989,7 +989,9 @@ fn unknown_flow_actions_check(tally: &darkmux_flow::reader::UnknownActions) -> C
         ),
         hint: Some(
             "They read as-is and nothing acts on them. A newer darkmux on this machine or a peer \
-             writes actions this build does not know; upgrading this binary names them."
+             writes actions this build does not know; upgrading this binary names them. A record \
+             from a 3.x archive, or of an action a release retired, is unknown here for good: \
+             nothing maps an old spelling."
                 .into(),
         ),
     }
@@ -10094,8 +10096,8 @@ mod tests {
         }
     }
 
-    /// Unknown actions in the archive warn with their count and names; none
-    /// passes.
+    /// Unknown actions in the archive warn with their count and names, a
+    /// spelling 4.0 retired among them; none passes.
     #[test]
     fn unknown_flow_actions_warn_with_count_and_names_and_none_pass() {
         let mut tally = darkmux_flow::reader::UnknownActions::default();
@@ -10106,8 +10108,8 @@ mod tests {
         }
         let check = unknown_flow_actions_check(&tally);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.starts_with("3 record(s)"), "{}", check.message);
-        assert!(check.message.contains("future.thing (2), other.x (1)"), "{}", check.message);
+        assert!(check.message.starts_with("4 record(s)"), "{}", check.message);
+        assert!(check.message.contains("dispatch start (1), future.thing (2), other.x (1)"), "{}", check.message);
     }
 
     #[test]

@@ -9410,7 +9410,6 @@ impl TailerState {
             | E::StaleContextTokens(_)
             | E::PreSendBound(_)
             | E::ReasoningBoundNotApplied(_)
-            | E::Legacy(_)
             | E::Unknown => {}
         }
     }
@@ -10389,7 +10388,6 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         | E::Checkpoint(_)
         | E::ReasoningBoundNotApplied(_)
         | E::FeedbackInjected(_)
-        | E::Legacy(_)
         | E::Unknown => None,
     }
 }

@@ -57,9 +57,10 @@ export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
  * not-reported where the old count coerced it truthy — hardening, since no
  * producer writes one.
  *
- * Keyed on the execution (`executionOf`: the record's `execution_id`, which
- * for a pre-4.0 record is its session and mission, since a deterministic
- * session id recurs across unrelated runs, #2709). Per execution:
+ * Keyed on the execution (`executionOf`: the record's `execution_id`; a
+ * pre-4.0 record names none and is keyed by its session and mission, since a
+ * deterministic session id recurs across unrelated runs, #2709). Per
+ * execution:
  *
  *   - every token-bearing `dispatch complete` is one run (#2659: a re-launch
  *     under the same deterministic id closes with its own completion);

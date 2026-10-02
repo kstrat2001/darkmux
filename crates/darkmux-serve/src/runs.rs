@@ -5966,14 +5966,14 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The pre-4.0 whole-run bookend: `handle` = the launched config
+                // The whole-run bookend: `handle` = the launched config
                 // id, `session_id` = `mission_id`, `source: "mission"`, no
                 // `model`. `machine_id` present, as it would be in production
                 // (`darkmux_flow::record` auto-stamps it on every record whose
                 // caller left it unset).
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch.start",
+                    "action": "run.start",
                     "session_id": "bookend-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-1",
@@ -6416,11 +6416,10 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // A pre-4.0 whole-run bookend (read as `run.start`), the
-                // row's `representative`.
+                // The whole-run bookend, the row's `representative`.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch.start",
+                    "action": "run.start",
                     "session_id": "bookend-mission-2",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-2",
@@ -8028,32 +8027,5 @@ mod tests {
         assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.started_ts, None, "no record, no claim");
-    }
-
-    /// (4.0) `/runs` over a pre-4.0 day file (spaced bookends) indexes the
-    /// same completed session as its dotted twin: the fold reads through
-    /// `darkmux_flow::reader`, so no consumer sees the old spelling.
-    #[test]
-    fn a_spaced_archive_indexes_like_its_dotted_twin() {
-        let day = |start: &str, complete: &str| {
-            format!(
-                "{{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"{start}\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}}\n\
-                 {{\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"{complete}\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}}\n"
-            )
-        };
-        let window = ScanWindow { cutoff_date: "2026-05-01".to_string(), since_iso: None };
-        let index = |start: &str, complete: &str| {
-            let tmp = tempfile::TempDir::new().unwrap();
-            std::fs::write(tmp.path().join("2026-05-14.jsonl"), day(start, complete)).unwrap();
-            let idx = build_flow_session_index_in(tmp.path(), &[], &window, None);
-            let s1 = idx.get("S1").expect("S1 indexed");
-            (s1.has_start, s1.terminal_status, s1.start_ts.clone(), s1.terminal_ts.clone())
-        };
-        // flow-action-guard:allow-start — an old spelling is this test's input
-        let spaced = index("dispatch start", "dispatch complete");
-        // flow-action-guard:allow-end
-        assert_eq!(spaced, index("dispatch.start", "dispatch.complete"));
-        assert_eq!(spaced.1, Some(RunStatus::Complete));
-        assert!(spaced.0, "the spaced start opens the session");
     }
 }

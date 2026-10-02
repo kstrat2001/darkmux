@@ -168,7 +168,6 @@ fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch) -> Vec<RuleFlag> {
         receiver_rejected_flag(s),
         observer_flag(rule_match),
         cannot_match_flag(rule_match),
-        retired_spelling_flag(rule_match),
         transform_failed_flag(s),
     ]
     .into_iter()
@@ -321,31 +320,16 @@ fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
 /// deliver, however quiet it looks. Decided from the vocabulary
 /// ([`darkmux_flow::hooks::action_pattern_can_match`], the same test
 /// `HookSink::new` warns with), never from what today's records happen to
-/// carry. A retired spelling is [`retired_spelling_flag`]'s, not this.
+/// carry.  A spelling a release retired is not
+/// vocabulary either, so a rule written in one warns the same way.
 fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
     let configured = rule_match.action.as_deref()?;
-    if darkmux_flow::hooks::action_pattern_can_match(configured)
-        || darkmux_flow::hooks::retired_spelling_of(configured).is_some()
-    {
+    if darkmux_flow::hooks::action_pattern_can_match(configured) {
         return None;
     }
     Some(RuleFlag::warn(format!(
         "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
          (actions are spelled `<scope>.<event>`)"
-    )))
-}
-
-/// A rule written against a pre-4.0 spelling is refused: `HookSink::new`
-/// does not load the sink (the run continues without hooks). Hook rules
-/// are the operator's file, so it is named here to be fixed, not read as
-/// the current spelling.
-fn retired_spelling_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
-    let configured = rule_match.action.as_deref()?;
-    let retired = darkmux_flow::hooks::RetiredRuleAction::of(0, configured)?;
-    let note = retired.widening_note().map(|n| format!("; {n}")).unwrap_or_default();
-    Some(RuleFlag::fail(format!(
-        "RETIRED SPELLING — action=\"{configured}\" is a spelling darkmux retired in 4.0; write \"{}\"{note}",
-        retired.current
     )))
 }
 
@@ -787,38 +771,31 @@ mod tests {
         named(&checks, "hooks.rule.0").clone()
     }
 
-    /// (4.0) A rule written against a retired spelling FAILS the row and names
-    /// the spelling to write, an exact old spelling and a spaced glob alike;
-    /// it is not also reported as merely unable to match.
+    /// (#3036) A rule written in a spelling 4.0 retired is no special case:
+    /// it matches no action darkmux writes, so the row warns CANNOT MATCH,
+    /// an exact old spelling and a spaced glob alike.
     #[test]
-    fn hooks_check_fails_a_rule_written_against_a_retired_spelling() {
+    fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
         // flow-action-guard:allow-start — an old spelling is this test's input
-        let cases = [("dispatch complete", FlowAction::DispatchComplete.as_str()), ("dispatch *", "dispatch.*"), ("sprint *", "phase.*")];
-        // flow-action-guard:allow-end
-        for (old, current) in cases {
+        for old in ["dispatch complete", "dispatch *", "sprint *"] {
+            // flow-action-guard:allow-end
             let rule = rule_row(old);
-            assert_eq!(rule.status, Status::Fail, "{old}: {}", rule.message);
-            assert!(rule.message.contains("RETIRED SPELLING"), "{old}: {}", rule.message);
-            assert!(rule.message.contains(&format!("write \"{current}\"")), "names the current one: {}", rule.message);
-            assert!(!rule.message.contains("CANNOT MATCH"), "{old}: {}", rule.message);
-            assert_eq!(rule.message.contains("`dispatch.turn`"), old == "dispatch *", "{old}: {}", rule.message);
+            assert_eq!(rule.status, Status::Warn, "{old}: {}", rule.message);
+            assert!(rule.message.contains("CANNOT MATCH"), "{old}: {}", rule.message);
         }
     }
 
     /// A glob that matches no action at all (a typo, an invented scope, a
     /// retired action) warns too, without a suggestion it does not have.
-    /// The retired case is deliberate: `crawl.*` names only
-    /// [`darkmux_flow::legacy::RetiredAction`]s, which the reader knows and
-    /// no writer emits, so a rule for them can never deliver.
+    /// The retired case is deliberate: `crawl.*` names only actions no writer
+    /// emits any more, so a rule for them can never deliver.
     #[test]
     fn hooks_check_warns_on_a_glob_that_matches_no_action() {
-        let retired = darkmux_flow::legacy::RetiredAction::CrawlFinding.as_str();
-        let retired_glob = format!("{}.*", retired.split('.').next().unwrap());
-        for pattern in ["dispatchh.*", retired, retired_glob.as_str()] {
+        // flow-action-guard:allow — a retired action is this test's input
+        for pattern in ["dispatchh.*", "crawl.finding", "crawl.*"] {
             let rule = rule_row(pattern);
             assert_eq!(rule.status, Status::Warn, "{pattern}: {}", rule.message);
             assert!(rule.message.contains("CANNOT MATCH"), "{pattern}: {}", rule.message);
-            assert!(!rule.message.contains("RETIRED SPELLING"), "{pattern}: {}", rule.message);
         }
     }
 

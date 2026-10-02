@@ -13,15 +13,11 @@
 //! a run or an execution" has one answer. The typed payload per action is
 //! declared in the `flow_payloads!` list in `payload/mod.rs`, not here.
 //!
-//! [`FlowAction::Retired`] is an action darkmux once wrote and retired with
-//! no current equivalent (`telemetry.process`, the pre-graph `funnel.*` and
-//! `crawl.*` records, ...): known, readable, never written.
-//!
 //! [`FlowAction::Other`] exists only for READING: an archive may hold an
-//! action this binary does not know (a newer writer's record, or an
-//! old spelling [`crate::legacy`] has no mapping for). Its field is private,
-//! so no code outside this crate can build one, and no writer can emit a
-//! string that is not in the list.
+//! action this binary does not know (a newer writer's record, or an action
+//! darkmux retired, spelled however it was then). Its field is private, so no
+//! code outside this crate can build one, and no writer can emit a string
+//! that is not in the list.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -164,10 +160,6 @@ macro_rules! flow_actions {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum FlowAction {
             $( $(#[$meta])* $variant, )*
-            /// An action darkmux once wrote and no longer does, read from an
-            /// archive. Known, never written (see
-            /// [`crate::legacy::RetiredAction`]).
-            Retired(crate::legacy::RetiredAction),
             /// An action read from a record this binary has no variant for.
             Other(UnknownAction),
         }
@@ -186,7 +178,6 @@ macro_rules! flow_actions {
             pub fn as_str(&self) -> &str {
                 match self {
                     $( FlowAction::$variant => $wire, )*
-                    FlowAction::Retired(r) => r.as_str(),
                     FlowAction::Other(u) => u.as_str(),
                 }
             }
@@ -197,7 +188,7 @@ macro_rules! flow_actions {
             pub fn bookend(&self) -> Option<Bookend> {
                 match self {
                     $( FlowAction::$variant => flow_bookend!($($grain $($edge)?)?), )*
-                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
+                    FlowAction::Other(_) => None,
                 }
             }
 
@@ -209,7 +200,7 @@ macro_rules! flow_actions {
             pub fn grain(&self) -> Option<Grain> {
                 match self {
                     $( FlowAction::$variant => flow_grain!($($grain)?), )*
-                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
+                    FlowAction::Other(_) => None,
                 }
             }
 
@@ -217,7 +208,7 @@ macro_rules! flow_actions {
             pub fn scope(&self) -> Option<FlowScope> {
                 match self {
                     $( FlowAction::$variant => Some(FlowScope::$scope), )*
-                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
+                    FlowAction::Other(_) => None,
                 }
             }
 
@@ -227,9 +218,8 @@ macro_rules! flow_actions {
                 FlowAction::Other(UnknownAction(String::new()))
             }
 
-            /// Parse a CURRENT wire string. An unknown string becomes
-            /// [`FlowAction::Other`]; a retired spelling is
-            /// [`crate::legacy::read_action`]'s job, not this one's.
+            /// Parse a CURRENT wire string. An unknown string, a retired
+            /// spelling included, becomes [`FlowAction::Other`].
             pub(crate) fn from_wire(s: &str) -> FlowAction {
                 match s {
                     $( $wire => FlowAction::$variant, )*
@@ -353,14 +343,12 @@ impl Serialize for FlowAction {
 
 impl<'de> Deserialize<'de> for FlowAction {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Strict: a current spelling, or an old spelling of a current
-        // action. An unknown or retired action is REFUSED here, so no code
-        // outside this crate can mint one through serde; the lenient
-        // archive read is `crate::reader`'s, and it is crate-private.
+        // Strict: a current spelling only. An unknown action (a retired one
+        // included) is REFUSED here, so no code outside this crate can mint
+        // one through serde; the lenient archive read is `crate::reader`'s.
         let s = String::deserialize(d)?;
-        match crate::legacy::read_action(&s) {
+        match FlowAction::from_wire(&s) {
             FlowAction::Other(_) => Err(serde::de::Error::custom(format!("unknown flow action `{s}`"))),
-            FlowAction::Retired(_) => Err(serde::de::Error::custom(format!("retired flow action `{s}`"))),
             known => Ok(known),
         }
     }
@@ -371,7 +359,6 @@ impl<'de> Deserialize<'de> for FlowAction {
 #[cfg(feature = "ts-export")]
 mod ts {
     use super::{FlowAction, FlowScope};
-    use crate::legacy::RetiredAction;
     use std::path::Path;
 
     fn union(wires: &[&str]) -> String {
@@ -414,12 +401,6 @@ mod ts {
         FlowScope,
         "FlowScope.ts",
         "/**\n * The first segment of a flow action: the subject the action is about.\n */\n"
-    );
-
-    ts_union!(
-        RetiredAction,
-        "RetiredAction.ts",
-        "/**\n * An action darkmux wrote before 4.0 and retired with no current\n * equivalent. An archive may still hold it; nothing writes it.\n */\n"
     );
 
     /// The actions that are records OF a role execution, exported so the
@@ -472,11 +453,6 @@ mod ts {
     #[test]
     fn export_bindings_executiongrainaction() {
         <ExecutionGrainAction as ts_rs::TS>::export_all().expect("could not export ExecutionGrainAction");
-    }
-
-    #[test]
-    fn export_bindings_retiredaction() {
-        <RetiredAction as ts_rs::TS>::export_all().expect("could not export RetiredAction");
     }
 
     #[test]
@@ -550,19 +526,22 @@ mod tests {
 
     #[test]
     fn an_unknown_string_reads_as_other_and_writes_back_verbatim() {
-        let a = crate::legacy::read_action("future.thing");
+        let a = FlowAction::from_wire("future.thing");
         assert!(matches!(a, FlowAction::Other(_)));
         assert_eq!(a.scope(), None);
         assert_eq!(serde_json::to_string(&a).unwrap(), "\"future.thing\"");
     }
 
-    /// The public deserializer is strict: an unknown or retired action is
-    /// refused, a current or old spelling of a current action reads.
+    /// The public deserializer is strict: an unknown action, a retired
+    /// spelling included, is refused; a current one reads.
     #[test]
     fn serde_refuses_unknown_and_retired_actions() {
         assert!(serde_json::from_str::<FlowAction>("\"future.thing\"").is_err());
-        assert!(serde_json::from_str::<FlowAction>("\"telemetry.process\"").is_err());
-        assert_eq!(serde_json::from_str::<FlowAction>("\"dispatch start\"").unwrap(), FlowAction::DispatchStart);
+        // flow-action-guard:allow — retired spellings are this test's input
+        for retired in ["telemetry.process", "dispatch start"] {
+            assert!(serde_json::from_str::<FlowAction>(&format!("\"{retired}\"")).is_err(), "{retired}");
+        }
+        assert_eq!(serde_json::from_str::<FlowAction>("\"dispatch.start\"").unwrap(), FlowAction::DispatchStart);
     }
 
     /// Every bookend a row declares is the inverse of `Bookend::action`, and

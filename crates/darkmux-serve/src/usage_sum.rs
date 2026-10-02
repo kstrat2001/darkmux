@@ -18,8 +18,8 @@
 //! `dispatch complete` once. An execution with any usage record, even a
 //! count-less `token_source: "absent"` one, never reads its complete. The
 //! execution is the record's own `execution_id`; a record from before 4.0
-//! names none, and `darkmux_flow::legacy::execution_of` reads it as its
-//! session and mission.
+//! names none, and is keyed by its session and mission (#3036: no identity is
+//! invented for it).
 //!
 //! What this module reports is what darkmux INVOKED: the endpoint string
 //! the record carries, the model darkmux requested, the model the reply
@@ -96,14 +96,18 @@ impl UsageSum {
 pub use darkmux_crew::usage::{is_usage_record, usage_contribution, usage_purpose, UsageAmount, MAX_COUNT};
 use darkmux_crew::usage::{amount_of, has_any_token_counts, payload_of};
 
-/// The identity of the EXECUTION a record is of: the twin of `executionKey`.
-/// A record from before 4.0 names none, and reads as the execution
-/// `darkmux_flow::legacy::execution_of` gives it: its session and mission (a
-/// bare session id is not an identity in a pre-4.0 archive: a task session
-/// named only its task, so the same id recurs across unrelated runs,
-/// #2690/#2709).
+/// The key a record is grouped under: the twin of `executionKey`. The
+/// execution it names; a record from before 4.0 names none and none is
+/// invented for it (#3036), so it is keyed by its session and mission (a bare
+/// session id recurs across unrelated runs in such an archive, #2690/#2709),
+/// or, with no session, by the record itself (its time, handle and machine).
 fn execution_key(v: &serde_json::Value) -> String {
-    darkmux_flow::legacy::execution_of(v).to_string()
+    let text = |key: &str| v.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
+    match (text("execution_id"), text("session_id")) {
+        ("", "") => format!("unnamed::{}:{}:{}:{}", text("mission_id"), text("ts"), text("handle"), text("machine_uid")),
+        ("", session) => format!("unnamed:{session}:{}", text("mission_id")),
+        (execution, _) => execution.to_string(),
+    }
 }
 
 /// The records the legacy fallback counts (the twin of
@@ -538,8 +542,8 @@ mod tests {
         assert_eq!(idx.tokens_for(Some("m"), ["m.task.t"]), Some(17), "and both are the one run's tokens");
     }
 
-    /// Records of a pre-4.0 archive name no execution: the reader's synthesized
-    /// one is the session and mission, so the fallback reads as it always did.
+    /// A record naming no execution (written before 4.0) is keyed by its
+    /// session and mission: the fallback reads as it always did.
     #[test]
     fn a_pre_4_0_run_still_keys_on_its_session_and_mission() {
         let usage = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","mission_id":"m","payload":{"total_tokens":10,"token_source":"provider"}});
@@ -716,12 +720,12 @@ mod tests {
     /// no mission at all, never the other mission's.
     #[test]
     fn tokens_for_a_mission_never_reads_another_missions_share_of_a_common_session() {
-        let usage = |mid: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","mission_id":mid,"payload":{"token_source":"provider","total_tokens":total}});
+        let usage = |mid: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","mission_id":mid,"execution_id":format!("exec-{mid}"),"payload":{"token_source":"provider","total_tokens":total}});
         let records = vec![
             usage("M-A", 100),
             usage("M-B", 1000),
             // A record on the same session naming no mission: reachable by either.
-            serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","payload":{"token_source":"provider","total_tokens":7}}),
+            serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","execution_id":"exec-none","payload":{"token_source":"provider","total_tokens":7}}),
         ];
         let idx = fold_all(&records, None);
         assert_eq!(idx.tokens_for(Some("M-A"), ["task-t1"]), Some(107));
@@ -840,21 +844,5 @@ mod tests {
             let err = parse_since(bad, NOW).unwrap_err();
             assert!(err.contains("24h") && err.contains("YYYY-MM-DD"), "{bad:?}: {err}");
         }
-    }
-
-    /// (4.0) The pre-4.0 archive golden sums exactly as its upgraded twin:
-    /// its one usage record counts once (its spaced `dispatch complete` is not
-    /// counted again), and a spaced legacy complete with no usage record for
-    /// its run counts by its own totals.
-    #[test]
-    fn the_archive_golden_sums_like_its_upgraded_twin() {
-        let read = |name: &str| -> Vec<serde_json::Value> {
-            let path = format!("{}/../../tests/flow-archive-golden/{name}", env!("CARGO_MANIFEST_DIR"));
-            std::fs::read_to_string(&path).unwrap().lines().filter_map(darkmux_flow::reader::parse_value).collect()
-        };
-        let archive = sum_usage(&read("2026-08-20.jsonl"));
-        let twin = sum_usage(&read("2026-08-20.upgraded.jsonl"));
-        assert_eq!(archive, twin);
-        assert_eq!(archive.total, 1_500, "1200 from the usage record + 300 from the legacy complete: {archive:?}");
     }
 }

@@ -2,9 +2,11 @@
 # flow-action-guard.py (4.0): no flow action outside the one vocabulary.
 #
 # Every flow action is a `darkmux_flow::FlowAction` variant, and its wire
-# string lives in exactly one place: `crates/darkmux-flow/src/action.rs` (old
-# spellings and retired actions in `legacy.rs`, beside it). The guard READS
-# the vocabulary from those two files, so it cannot drift from them.
+# string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. The
+# guard READS the vocabulary from that file, so it cannot drift from it.
+# Nothing in the build knows a retired spelling any more (#3036: a record
+# carrying one reads as an unknown action), so the spellings the guard still
+# refuses to see outside a marked line are listed here, in RETIRED_SPELLINGS.
 #
 # Two tiers, by where a string lives:
 #
@@ -68,21 +70,41 @@ from rust_source import is_rust_test_file, test_lines
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ACTION_RS = "crates/darkmux-flow/src/action.rs"
-LEGACY_RS = "crates/darkmux-flow/src/legacy.rs"
 TRAJECTORY_EVENTS_RS = "crates/darkmux-trajectory/src/event.rs"
 CONFIG_KEYS_RS = "src/config_cmd.rs"
 STAGE_TS = "ui/src/types/generated/Stage.ts"
 CLI_RS = "src/cli.rs"
 STEP_CONFIG_RS = "crates/darkmux-crew/src/step_config/mod.rs"
 ACTIVITY_TS = "ui/src/lib/eventFilters.ts"
-VOCAB_SOURCES = (ACTION_RS, LEGACY_RS, TRAJECTORY_EVENTS_RS)
+VOCAB_SOURCES = (ACTION_RS, TRAJECTORY_EVENTS_RS)
+# Every multiword spelling darkmux wrote before 4.0 and no longer does: the
+# old spellings of current actions and the actions retired outright. The
+# one-word ones (`note`, `catch`) are left out: as literals they are ordinary
+# words far more often than actions. A string is "outside the vocabulary" when
+# it is neither current nor one of these, so a retired spelling gets the same
+# verdict whether or not it is listed once it looks like an action; this list
+# is what catches the spaced ones, which share no grammar with an action.
+RETIRED_SPELLINGS = frozenset({
+    "ambiguous-phase-id", "crawl.finding", "crawl.mission.completed", "crawl.mission.started",
+    "crawl.unit.completed", "crawl.unit.started", "dispatch code-reviewer", "dispatch complete",
+    "dispatch error", "dispatch failed", "dispatch route", "dispatch start", "funnel.ruling",
+    "funnel.step", "funnel.task", "mission abort", "mission close", "mission pause",
+    "mission reopen", "mission resume", "mission start", "mission.compile.complete",
+    "mission.compile.error", "mission.compile.start", "mission.pause", "mission.resume",
+    "mission.run.blocked", "mission.run.error", "mission.run.gate", "mission.run.qa-unavailable",
+    "mission.run.ship", "mission.run.ship.held", "mission.run.ship.merged", "mission.run.start",
+    "mission.run.verification", "phase abandon", "phase added", "phase complete",
+    "phase review aborted", "phase review begin", "phase start", "phase.added", "sprint abandon",
+    "sprint added", "sprint complete", "sprint review begin", "sprint start", "step complete",
+    "step error", "step result", "step seat unresolved", "step start", "step timing",
+    "telemetry.process", "tier-decision",
+})
 GENERATED_TS = "ui/src/types/generated/"
 ARCHIVES = (
     "docs/demo/",
     "tests/parity/corpus/",
     "tests/parity/goldens/",
     "scripts/demo-env/sessions/",
-    "tests/flow-archive-golden/",
     "crates/darkmux-lab/tests/fixtures/legacy-runs/",
     "CHANGELOG.md",
 )
@@ -143,20 +165,20 @@ def read(root, rel):
 
 
 def vocabulary(root):
-    act, leg = read(root, ACTION_RS), read(root, LEGACY_RS)
+    act = read(root, ACTION_RS)
     # A row is `Variant => Scope, "wire";`, or with the grain of the unit it
     # is a record of after the wire (`, Execution;`), and a bookend's edge
     # after that (`, Execution Start;`).
     current = set(re.findall(r'^\s+\w+ => \w+, "([^"]+)"(?:, \w+(?: \w+)?)?;', act, re.M))
     scopes = set(re.findall(r'^\s+\w+ => "([a-z]+)";', act, re.M))
-    old = set(re.findall(r'^\s+\("([^"]+)", FlowAction::\w+\),', leg, re.M))
-    retired = set(re.findall(r'^\s+\w+ => "([^"]+)";', leg, re.M))
-    if len(current) < 20 or len(scopes) < 10 or len(old) < 20 or len(retired) < 5:
-        sys.exit(f"flow-action-guard: vocabulary parse is broken ({len(current)}/{len(scopes)}/{len(old)}/{len(retired)})")
-    # The one-word old spellings (`note`, `catch`) are left out: as literals
-    # they are ordinary words far more often than actions.
-    multiword = {w for w in old | retired if re.search(r"[ .\-]", w)}
-    return Vocab(current, multiword, scopes, other_vocabularies(root), mission_verbs(root), activity_labels(root))
+    if len(current) < 20 or len(scopes) < 10:
+        sys.exit(f"flow-action-guard: vocabulary parse is broken ({len(current)}/{len(scopes)})")
+    if len(RETIRED_SPELLINGS) < 55 or "dispatch start" not in RETIRED_SPELLINGS:
+        sys.exit(f"flow-action-guard: RETIRED_SPELLINGS shrank to {len(RETIRED_SPELLINGS)} (floor 55)")
+    stale = RETIRED_SPELLINGS & current
+    if stale:
+        sys.exit(f"flow-action-guard: RETIRED_SPELLINGS names current actions: {sorted(stale)}")
+    return Vocab(current, RETIRED_SPELLINGS, scopes, other_vocabularies(root), mission_verbs(root), activity_labels(root))
 
 
 def activity_labels(root):
@@ -490,6 +512,9 @@ FIXTURE_CASES = [
 
 
 def self_test():
+    assert len(RETIRED_SPELLINGS) >= 55 and "dispatch start" in RETIRED_SPELLINGS, "RETIRED_SPELLINGS is hollowed out"
+    real = Vocab({"dispatch.start"}, RETIRED_SPELLINGS, {"dispatch"}, set())
+    assert rust_violations('let a = "dispatch start";', real), "a real retired spelling must fail in production Rust"
     v = SELF_TEST_VOCAB
     suites = [
         (RUST_CASES, lambda s: rust_violations(s, v)),
@@ -504,7 +529,7 @@ def self_test():
     assert rust_violations('let a = "dispatch start";', v, all_test=True), "a test file still flags an old spelling"
     assert not rust_violations('let a = "dispatch.start";', v, all_test=True), "a test file may name a current action"
     for rel, want in [("docs/demo/x.jsonl", None), ("tests/parity/corpus/a.jsonl", None),
-                      ("crates/darkmux-flow/src/legacy.rs", None), ("ui/src/types/generated/FlowAction.ts", None),
+                      ("ui/src/types/generated/FlowAction.ts", None),
                       ("tests/fixtures/a.jsonl", fixture_violations), ("ui/src/lib/flow.ts", ts_violations),
                       ("skills/x/SKILL.md", doc_violations), ("docs/guide/a.html", doc_violations),
                       ("ui/verify/a.spec.ts", ts_violations), ("ui/scripts/a.mjs", ts_violations),

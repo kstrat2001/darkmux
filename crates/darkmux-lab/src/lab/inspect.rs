@@ -42,14 +42,6 @@ fn legacy_sandbox(run_dir: &Path) -> Option<PathBuf> {
         .and_then(|m| m.get("sandbox").and_then(Value::as_str).map(PathBuf::from))
 }
 
-/// The distinct compaction summaries a run's trajectory recorded (the
-/// retired openclaw runtime wrote its compactions only as summary messages
-/// inside the thread; see `darkmux_trajectory::legacy`). Empty for a run
-/// with no trajectory, or none of that shape.
-pub fn read_compaction_summaries(run_dir: &Path) -> Vec<darkmux_trajectory::legacy::LegacyCompaction> {
-    run_trajectory(run_dir).legacy.compactions
-}
-
 pub fn resolve_run_path(run_path: &str) -> PathBuf {
     resolve_run_dir(run_path)
 }
@@ -270,34 +262,6 @@ mod tests {
         assert!(err.to_string().contains("no run manifest"));
     }
 
-    #[test]
-    fn read_compaction_summaries_empty_when_no_trajectory() {
-        let tmp = TempDir::new().unwrap();
-        let summaries = read_compaction_summaries(tmp.path());
-        assert!(summaries.is_empty());
-    }
-
-    #[test]
-    fn read_compaction_summaries_extracts_unique_summaries() {
-        let tmp = TempDir::new().unwrap();
-        // Two prompt.submitted events; the second has a compactionSummary.
-        // The third repeats the same summary and should be deduped.
-        let traj = r#"{"type":"prompt.submitted","data":{"messages":[]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"alpha summary content here","tokensBefore":48000}]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"alpha summary content here","tokensBefore":52000}]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"beta summary newer","tokensBefore":60000}]}}
-"#;
-        std::fs::write(tmp.path().join("trajectory.jsonl"), traj).unwrap();
-        let summaries = read_compaction_summaries(tmp.path());
-        // Two unique summaries (alpha + beta), even though alpha repeats
-        assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].tokens_before, 48000);
-        assert_eq!(summaries[1].tokens_before, 60000);
-        assert!(summaries[0].summary.contains("alpha"));
-        assert!(summaries[1].summary.contains("beta"));
-        assert_eq!((summaries[0].turn, summaries[1].turn), (2, 4), "the turn that first carried each");
-    }
-
     /// The one legacy location: a run recorded before its trajectory was
     /// copied into the run directory (#364) is read from the sandbox its
     /// manifest names. The run's own copy wins when both exist. A
@@ -340,13 +304,4 @@ mod tests {
         assert_eq!(run_trajectory(run.path()).turns(), 0, "the symlinked host file was folded");
     }
 
-    #[test]
-    fn read_compaction_summaries_skips_empty_summaries() {
-        let tmp = TempDir::new().unwrap();
-        let traj = r#"{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"","tokensBefore":1000}]}}
-"#;
-        std::fs::write(tmp.path().join("trajectory.jsonl"), traj).unwrap();
-        let summaries = read_compaction_summaries(tmp.path());
-        assert!(summaries.is_empty());
-    }
 }

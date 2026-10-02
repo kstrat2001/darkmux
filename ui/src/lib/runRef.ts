@@ -70,8 +70,8 @@ export interface RunRecords {
 
 /** What kind of unit a group is (contract 8's grains):
  *  - `run`: a run's own session, opened by `run.start` (a pre-4.0 archive's
- *    whole-run `dispatch.start` reaches the viewer as `run.start`: the
- *    daemon's reader upgrades it);
+ *    whole-run `dispatch.start` is no longer reclassified: it reads as the
+ *    execution bookend it was spelled as, #3036);
  *  - `execution`: model work (a dispatch, a budget-held call, or a turn,
  *    heartbeat, tool call or rest);
  *  - `lifecycle`: bookkeeping only (a mission's own lifecycle session, a

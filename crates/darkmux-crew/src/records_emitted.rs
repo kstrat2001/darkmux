@@ -386,7 +386,7 @@ mod tests {
         machine_uid: Option<&str>,
     ) -> FlowRecord {
         let execution_id = (action.grain() == Some(darkmux_flow::Grain::Execution))
-            .then(|| darkmux_types::execution_id::ExecutionId::legacy(session_id, mission_id, ts, "role", ""));
+            .then(|| darkmux_types::execution_id::ExecutionId::parse(&format!("exec-test-{}", session_id.unwrap_or("none"))).unwrap());
         FlowRecord {
             ts: ts.to_string(),
             level: darkmux_flow::Level::Info,
@@ -397,7 +397,6 @@ mod tests {
             handle: "role".to_string(),
             phase_id: None,
             session_id: session_id.map(String::from),
-            // What the reader gives a record of an execution that names none.
             execution_id,
             source: None,
             model: None,
@@ -522,9 +521,9 @@ mod tests {
         assert_eq!(got.total_records, 2, "still real records of this mission");
     }
 
-    /// A pre-4.0 archive's whole-run bookend (`dispatch start` sourced
-    /// `mission`) is read the way the disk path reads every line, through
-    /// `darkmux_flow::reader`, and never pairs.
+    /// (#3036) A pre-4.0 archive's whole-run bookend (`dispatch start` sourced
+    /// `mission`) reads as an unknown action, through `darkmux_flow::reader`
+    /// like every line on the disk path, and never pairs.
     #[test]
     fn a_pre_4_0_whole_run_bookend_read_from_an_archive_never_pairs() {
         let archived = |ts: &str, action: &str| {
@@ -538,7 +537,7 @@ mod tests {
         // flow-action-guard:allow-end
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!((got.dispatch_pairs, got.open_dispatches), (0, 0));
-        assert_eq!(got.by_action.get("run.start"), Some(&1));
+        assert_eq!(got.by_action.get("run.start"), None, "no run grain is synthesized");
     }
 
     #[test]

@@ -31,9 +31,7 @@ pub enum LmsEvent {
 pub enum LmsRole {
     /// The dispatch's own model.
     Primary,
-    /// The machine's utility model. Archives from before the utility seat was named spell it
-    /// `compactor`.
-    #[serde(alias = "compactor")]
+    /// The machine's utility model.
     Utility,
     /// A model the dispatch did not declare: a leftover, or the operator's own use.
     Resident,

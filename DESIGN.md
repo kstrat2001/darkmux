@@ -16,7 +16,7 @@ This document is the **why**: how darkmux is built, the decisions behind the sha
 - [Work units: the ladder and its words](#work-units-the-ladder-and-its-words)
 - [Identities: runs, sessions and executions](#identities-runs-sessions-and-executions)
 - [The flow vocabulary: one closed list, one spelling per event](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)
-- [One reader, and the legacy mapping](#one-reader-and-the-legacy-mapping)
+- [One reader, and what an old archive reads as](#one-reader-and-what-an-old-archive-reads-as)
 - [Typed flow payloads](#typed-flow-payloads)
 - [Two logs: the flow stream and the trajectory](#two-logs-the-flow-stream-and-the-trajectory)
 - [One token truth](#one-token-truth)
@@ -273,9 +273,9 @@ Two types have a run-kind role. `darkmux_types::session_id::RunIdKind` (mission,
 
 **Which step a record belongs to is stamped, not reconstructed.** A record of a step's session carries `payload.step_id`, set by the producer through the `Attribution` trait (`step_slot`) when the crew builds the record, and the viewer's `ingest.ts` has one cross-action read of it. A record with no `step_id` falls back to its step-scoped session (`SessionKind::Step`), and `mission_id` is the outer scope a reader filters by first. What no consumer may do is key a registry on a step's `kind` to infer a record's shape: that is the snowflake this design deleted, and attribution has to be inferable from the records alone.
 
-**Archives get a synthesized identity, never a rewrite.** A record of an execution written before executions were named carries none, and the reader gives it `legacy:<session>:<mission>` (`ExecutionId::legacy`, applied by `darkmux_flow::legacy::execution_of` and mirrored by the viewer's `ingest.ts`). That is the only place the old `(session, mission)` grouping survives.
+**Archives get no identity, and no rewrite.** A record of an execution written before executions were named carries none, and none is invented for it (5.0, #3036): the reader and the viewer's `ingest.ts` stamp nothing. Only the token and run counts key such a record, by `(session, mission)` (`usage_sum::execution_key` and `executionOf`); that grouping is the one place the old shape survives.
 
-Known gap: the legacy identity is as coarse as the old grouping was. Two executions that shared a session and a mission before the change read as one.
+Known gap: that grouping is as coarse as the old one was. Two executions that shared a session and a mission before the change read as one in the counts.
 
 ## The flow vocabulary: one closed list, one spelling per event
 
@@ -285,23 +285,21 @@ The flow stream is the record of what darkmux did, and every consumer (the daemo
 
 **Bookends and grains are declared on the row.** A row that opens or closes a unit says so, and `FlowAction::bookend` and `FlowAction::grain` read that back, so "which actions bracket a run, and which bracket a role execution" and "which records must name an execution" each have one answer. `run.start`, `run.complete` and `run.error` bracket a whole run; `dispatch.start`, `dispatch.complete` and `dispatch.error` bracket one role execution. The two grains never share a spelling, which is what lets `dispatch` mean one grain. The run pair is written by a guard that closes it on every exit path, so a panic or an early return still writes `run.error`. The viewer's `bookendOf` mirrors the table, and the rules that read bookends (liveness, the lifecycle below) key on `Bookend` and never on a string.
 
-**Writing is refused, not normalized.** Every sink write goes through `FlowSinkWrite::write`, which builds the `CheckedRecord` a sink accepts. It refuses an action darkmux does not write today (`FlowAction::Other`, one this build does not know, and `FlowAction::Retired`, one darkmux retired with no current equivalent), an execution-grain record with no `execution_id`, and a payload that is not its action's type. `darkmux flow record --action` accepts only known actions.
+**Writing is refused, not normalized.** Every sink write goes through `FlowSinkWrite::write`, which builds the `CheckedRecord` a sink accepts. It refuses an action darkmux does not write today (`FlowAction::Other`: one this build does not know, a retired spelling included), an execution-grain record with no `execution_id`, and a payload that is not its action's type. `darkmux flow record --action` accepts only known actions.
 
 **Utility jobs sit outside the bookends.** A utility job (compaction, radio routing) writes `utility.start` and its usage record, and `utility.error` when a routing call fails, and nothing else: no session of its own, no bookends, no run. See [The utility model](#the-utility-model-and-lean-utility-jobs).
 
-**A guard keeps it closed.** `scripts/flow-action-guard.py` runs in CI, reads its list from `action.rs` and `legacy.rs` so it cannot drift from them, and self-tests before it scans. In production Rust it forbids writing an action by hand in any shape it lists (a literal, a format string that builds one, a prefix test, `concat!`, JSON inside a string). In test code, the viewer, docs, skills, templates and fixtures, it forbids any string that looks like an action and is not a current one. Recorded archives are exempt, and a comment may name a spelling. It reads source text, so an action assembled at run time in a shape it does not list is not seen.
+**A guard keeps it closed.** `scripts/flow-action-guard.py` runs in CI, reads its list from `action.rs` so it cannot drift from it (the retired spellings it refuses to see are listed in the script, since nothing in the build knows them), and self-tests before it scans. In production Rust it forbids writing an action by hand in any shape it lists (a literal, a format string that builds one, a prefix test, `concat!`, JSON inside a string). In test code, the viewer, docs, skills, templates and fixtures, it forbids any string that looks like an action and is not a current one. Recorded archives are exempt, and a comment may name a spelling. It reads source text, so an action assembled at run time in a shape it does not list is not seen.
 
-**A fleet upgrades together.** A reader from before the closed vocabulary does not know the dotted spellings, so an old hub misreads a new peer's records: its missions never end and its step results are not folded. Current readers upgrade an old peer's records (next section), but nothing upgrades an old reader.
+**A fleet upgrades together.** A reader from before the closed vocabulary does not know the dotted spellings, so an old hub misreads a new peer's records: its missions never end and its step results are not folded. A current reader does not upgrade an old peer's records either: a record spelled the pre-4.0 way reads as an unknown action (next section), and nothing upgrades an old reader.
 
-## One reader, and the legacy mapping
+## One reader, and what an old archive reads as
 
-Every consumer that reads records back goes through `darkmux_flow::reader`: the day files, the Redis stream, a peer's records, the audit chain's JSON bodies. `parse_record` returns a typed `FlowRecord`; `parse_value` and `upgrade` serve the daemon, which passes records on to the viewer as JSON with every field intact.
+Every consumer that reads records back goes through `darkmux_flow::reader`: the day files, the Redis stream, a peer's records, the audit chain's JSON bodies. `parse_record` returns a typed `FlowRecord`; `parse_value` serves the daemon, which passes records on to the viewer as JSON with every field intact.
 
-`darkmux_flow::legacy` is the one place the older shapes live, and the reader is the one place that applies it: a retired action spelling maps to its current variant (`read_action`, `upgrade_action`), retired `source` and `tier` spellings and payload keys and units map to current ones, a pre-run-bookend whole-run pair reads as `run.*` (`run_grain_of`), and a record of an execution that names none gets its synthesized id (`stamp_execution`). Nothing else sniffs a prefix. A read returns one of five outcomes (`ActionRead`): `Current`, `Upgraded`, `Retired` (known, never counted), `Unknown` (kept verbatim) and `Absent` (a schema header line or a foreign line). `UnknownActions` counts the unknown ones by name, so `darkmux doctor` and the viewer (`· N unknown` beside the event count) can say so instead of dropping them.
+The reader maps nothing (5.0, #3036). A record's action is a current spelling or it is `FlowAction::Other`, kept verbatim: the pre-4.0 spellings, the actions retired with no current equivalent and a newer writer's actions all read the same way. A retired `source` reads as `FlowSource::Unknown`, a retired payload key stays under its old name, a pre-run-bookend whole-run pair reads as the execution bookends it was spelled as, and a record of an execution that names none gets none. `UnknownActions` counts the unknown ones by name, so `darkmux doctor` and the viewer (`· N unknown` beside the event count) can say so instead of dropping them. A 3.x archive therefore still loads and still lists, but most of its records are unknown actions and the views built on actions show little of it.
 
-The reader is lenient because an archive outlives the binary that wrote it, and rewriting one would destroy the evidence it is. This is the one place the user-file gate's strictness deliberately does not apply. A golden archive pair under `tests/flow-archive-golden/` (a day file as an older darkmux wrote it, and its upgraded form) is read by the flow crate, the daemon's usage sum and the viewer's ingest test, so the three readers cannot drift apart.
-
-Known gap: the mapping exists twice, in Rust (`legacy`) and in TypeScript (`ingest.ts`), and the golden is what holds the two together.
+The reader is lenient because an archive outlives the binary that wrote it, and rewriting one would destroy the evidence it is. This is the one place the user-file gate's strictness deliberately does not apply.
 
 ## Typed flow payloads
 
@@ -311,7 +309,7 @@ A record's payload is one Rust type per action. `Payload` (`crates/darkmux-flow/
 - **One vocabulary on the wire.** Durations are `*_ms` and instants are `*_at_ms` (epoch milliseconds). An optional key with no value is omitted rather than written as `null`; `telemetry.tokens` keeps `null` for "not reported", and a hook rule that matches `payload.<key>: null` matches both a `null` and an absent key. Key order follows the type's field order. `FlowRecord.source` is a closed `snake_case` set, and `tier` says who acted (`operator`, `frontier`, `darkmux`), never where a model ran.
 - **Reading an archive is tolerant.** A payload that does not parse as its action's type is kept as `UnreadPayload`: its JSON is preserved and re-serializes byte for byte, a typed reader treats it as absent, and it is never written. A field an older version never wrote reads as absent, never as zero, and a word in a closed set this build does not name (a result class, a detector kind, a seat class) reads as `unknown` instead of dropping the record.
 
-Known gap: the types are the contract for new records, but a renamed field is a wire break for every archive already written. Only the mapping in `legacy` keeps old archives readable, and each rename has to add to it.
+Known gap: the types are the contract for new records, but a renamed field is a wire break for every archive already written. Nothing maps an old archive's spellings any more, so a renamed field reads as absent in a record written before the rename.
 
 ## Two logs: the flow stream and the trajectory
 
@@ -388,7 +386,7 @@ A rename is not read as its old name. Each surface that can be misspelled has it
 - **Mission state files** in a retired spelling (a `sprint_ids` key, a `sprints/` directory) are refused by `darkmux_crew::retired_state`, naming the rewrite, and doctor fails each one.
 - **Hook rules** that name a retired action spelling are refused: the hook sink does not load, and doctor fails the rule, naming the spelling to write.
 
-The one place a rename is read leniently is a flow archive, which is never rewritten ([One reader](#one-reader-and-the-legacy-mapping)).
+The one place a rename is read leniently is a flow archive, which is never rewritten and now maps nothing ([One reader](#one-reader-and-what-an-old-archive-reads-as)).
 
 ## Endpoints: what darkmux does there, not where they are
 
@@ -1158,7 +1156,7 @@ A hook is not a feature bolted onto the crawler or the review pipeline. It is a 
 
 Two consequences fall out of that placement, and both are the reason it was placed there. Every record kind is hookable with **zero producer-side awareness**: thermal transitions, tool calls, and mission bookends all became deliverable without one line of change at the site that emits them. And delivery is **at-least-once, durable across restarts**: the queue is a file, the cursor moves after the 2xx, and a receiver that is down is an outage to wait out rather than data lost.
 
-**Rules match the closed vocabulary.** A rule's `match.action` is checked against the flow vocabulary ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)): a rule that names a retired spelling, an exact one or a spaced glob, is refused. The hook sink does not load (the run itself continues without hooks, like any other bad hook rule) and `darkmux doctor` fails the rule, naming the spelling to write. A dotted glob can match more than its old spelling did (`dispatch.*` also matches every turn and tool record), and the refusal says so. A rule's outbox is keyed by a hash of its `match`, so a rewritten rule starts a new outbox, and records still pending under the old spelling are not delivered; the key is not derived to survive the rewrite, because that would mean hashing the retired spelling forever. Only the outbox, an archive of records already written, is still read leniently.
+**Rules match the closed vocabulary.** A rule's `match.action` is checked against the flow vocabulary ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)): a rule that names a retired spelling, an exact one or a spaced glob, matches no action darkmux writes, so it delivers nothing. The hook sink warns at load and `darkmux doctor` warns `CANNOT MATCH`, the same as for a typo. A rule's outbox is keyed by a hash of its `match`, so a rewritten rule starts a new outbox, and records still pending under the old spelling are not delivered; the key is not derived to survive the rewrite, because that would mean hashing the retired spelling forever.
 
 **The receiver cannot always be adapted, which decides where transforms live.** When darkmux owns the receiver (the local crawl tracker), the honest shape is a thin adapter in the receiver: darkmux ships one wire contract (the flow record verbatim, schema-versioned, lenient on read) and the receiver projects it into whatever it stores. That stops being available the moment the destination is somebody else's SaaS. You get an API; you cannot put code inside Jira. So for anything not your own, the transform has to live on the **sending** side.
 

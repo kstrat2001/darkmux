@@ -71,10 +71,6 @@ fn the_wire_names_are_fixed() {
         let written = serde_json::to_value(&e).unwrap();
         assert_eq!(written["type"], name, "{name} is written under another name");
     }
-    // The retired format is read, never written.
-    let legacy = parse_line(r#"{"type":"prompt.submitted"}"#).expect("a legacy turn parses");
-    assert!(matches!(legacy, TrajectoryEvent::Legacy(crate::legacy::LegacyEvent::PromptSubmitted(_))));
-    assert!(serde_json::to_value(&legacy).is_err(), "nothing current writes the openclaw format");
 }
 
 #[test]
@@ -250,42 +246,26 @@ fn detector_firings_are_counted_and_promotions_summed() {
     assert_eq!(f.compactions(), 1);
 }
 
-/// An openclaw-era run (retired in #1405): its turns are `prompt.submitted`
-/// events, its compactions are distinct summaries inside the thread, and
-/// its tokens are its own `model.completed` lines' `data.usage`
-/// (input/output/total). Every line of that format names its
-/// `traceSchema`, and the turn count comes from its prompts alone: a
-/// completion of that format never adds a turn, whatever type its clock is.
+/// (#3036) The openclaw trajectory reader is gone: a run of that retired
+/// runtime (#1405) still loads, without a panic, and reads as zero turns,
+/// zero compactions and zero tokens. Its `prompt.submitted` turns are an
+/// unknown event, and its own `model.completed` lines (string clock,
+/// `data.usage`) neither add a turn nor carry tokens.
 #[test]
-fn an_openclaw_run_counts_its_prompts_summaries_and_tokens() {
-    let summary = |s: &str, before: u64| {
-        format!(r#"{{"traceSchema":"openclaw-trajectory","type":"prompt.submitted","ts":"2026-05-18T13:43:11.589Z","seq":4,"data":{{"messages":[{{"role":"user","summary":null}},{{"role":"compactionSummary","summary":"{s}","tokensBefore":{before}}}]}}}}"#)
-    };
+fn an_openclaw_run_reads_as_zero_turns() {
     let raw = [
-        summary("first summary", 900),
-        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-05-18T13:43:11.589Z","seq":5,"data":{"usage":{"input":294041,"output":5684,"total":299725}}}"#.to_string(),
-        summary("first summary", 900),
-        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":1779111791000,"seq":5,"data":{"usage":{"input":100,"output":10}}}"#.to_string(),
-        summary("second summary", 1200),
-        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-05-18T13:47:27.009Z","seq":5,"data":{"usage":null}}"#.to_string(),
+        r#"{"traceSchema":"openclaw-trajectory","type":"session.started","ts":"2026-05-18T13:43:00.000Z","seq":1}"#,
+        r#"{"traceSchema":"openclaw-trajectory","type":"prompt.submitted","ts":"2026-05-18T13:43:11.589Z","seq":4,"data":{"messages":[{"role":"user","summary":null},{"role":"compactionSummary","summary":"s","tokensBefore":900}]}}"#,
+        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-05-18T13:43:11.589Z","seq":5,"data":{"usage":{"input":294041,"output":5684,"total":299725}}}"#,
+        // A numeric clock reads as a current `model.completed` unless the schema tag is honored.
+        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":1779111791000,"seq":6,"data":{"usage":{"input":100,"output":10}}}"#,
     ]
     .join("\n");
     let f = TrajectoryFold::from_lines(&raw);
-    assert_eq!(f.turns(), 3, "three prompts; no completion adds a turn, numeric clock or not");
-    assert_eq!(f.compactions(), 2);
-    assert_eq!(f.legacy.compactions.iter().map(|c| c.tokens_before).collect::<Vec<_>>(), vec![900, 1200]);
-    assert_eq!(f.legacy.compactions.iter().map(|c| c.turn).collect::<Vec<_>>(), vec![1, 3], "the turn that first carried each");
-    assert_eq!(f.legacy.compactions[0].summary, "first summary");
-    assert_eq!(
-        (f.tokens.prompt, f.tokens.completion, f.tokens.total),
-        (294_141, 5_694, 299_835),
-        "the provider's total, else a complete split; a null usage adds nothing"
-    );
-    assert_eq!(f.model_calls, 0, "openclaw's own completions are not calls of this format");
-    // One source even for a line that slipped past the routing (no
-    // `traceSchema`, a numeric clock): an openclaw run's turns are its prompts.
-    let mixed = [summary("a", 1), r#"{"type":"model.completed","ts":1,"seq":5}"#.to_string()].join("\n");
-    assert_eq!(TrajectoryFold::from_lines(&mixed).turns(), 1);
+    assert_eq!((f.turns(), f.compactions()), (0, 0));
+    assert_eq!((f.tokens.prompt, f.tokens.completion, f.tokens.total), (0, 0, 0));
+    assert_eq!(f.model_calls, 0);
+    assert_eq!(parse_line(r#"{"type":"prompt.submitted"}"#), Some(TrajectoryEvent::Unknown));
 }
 
 /// (#1959) A run that decayed and recovered must not read healthier than a

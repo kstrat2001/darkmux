@@ -1210,8 +1210,8 @@
         fs::write(
             tmp.path().join("2026-05-14.jsonl"),
             "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
-             {\"action\":\"dispatch.start\",\"handle\":\"coder\",\"session_id\":\"S1\",\"mission_id\":\"demo\"}\n\
-             {\"action\":\"dispatch.turn\",\"handle\":\"coder\",\"session_id\":\"S1\",\"mission_id\":\"demo\"}\n",
+             {\"action\":\"dispatch.start\",\"handle\":\"coder\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"demo\"}\n\
+             {\"action\":\"dispatch.turn\",\"handle\":\"coder\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"demo\"}\n",
         )
         .unwrap();
         fs::write(
@@ -1276,14 +1276,14 @@
         fs::write(
             tmp.path().join("2026-05-12.jsonl"),
             "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
-             {\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
-             {\"action\":\"dispatch.turn\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:01:00Z\"}\n",
+             {\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
+             {\"action\":\"dispatch.turn\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:01:00Z\"}\n",
         ).unwrap();
         fs::write(
             tmp.path().join("2026-05-14.jsonl"),
-            "{\"action\":\"dispatch.start\",\"session_id\":\"S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
-             {\"action\":\"dispatch.turn\",\"session_id\":\"S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:01:00Z\"}\n\
-             {\"action\":\"dispatch.start\",\"session_id\":\"S3\",\"mission_id\":\"m2\",\"machine_id\":\"studio\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
+            "{\"action\":\"dispatch.start\",\"session_id\":\"S2\",\"execution_id\":\"exec-S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
+             {\"action\":\"dispatch.turn\",\"session_id\":\"S2\",\"execution_id\":\"exec-S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:01:00Z\"}\n\
+             {\"action\":\"dispatch.start\",\"session_id\":\"S3\",\"execution_id\":\"exec-S3\",\"mission_id\":\"m2\",\"machine_id\":\"studio\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
         ).unwrap();
 
         let app = build_router_local(tmp.path().to_path_buf());
@@ -1338,11 +1338,10 @@
     #[test]
     fn scan_flow_missions_counts_a_record_in_both_sinks_exactly_once() {
         let tmp = TempDir::new().unwrap();
-        // The day file holds the pre-4.0 spelling; the stream copy was read
-        // through the same upgrade, so the two are one record.
         let record = serde_json::json!({
             "action": "dispatch.start",
             "session_id": "S-mine",
+            "execution_id": "exec-mine",
             "mission_id": "m-mine",
             "machine_id": "MacBook-Pro",
             "machine_uid": "MY-UID",
@@ -1350,12 +1349,9 @@
         });
         // The SAME record on disk and in the stream — exactly what a Tee sink
         // produces for local work.
-        let mut on_disk = record.clone();
-        // flow-action-guard:allow — an old spelling is this test's input
-        on_disk["action"] = serde_json::json!("dispatch start");
         fs::write(
             tmp.path().join("2026-05-14.jsonl"),
-            format!("{}\n", serde_json::to_string(&on_disk).unwrap()),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
         )
         .unwrap();
         let missions = super::scan_flow_missions(tmp.path(), std::slice::from_ref(&record));
@@ -2920,22 +2916,17 @@
         assert_eq!(got.as_deref(), Some(written), "expected appended line verbatim");
     }
 
-    // ─── (4.0) every route that serves records serves the current spelling ──
+    // ─── routes that serve records serve them as written ────────────────────
     //
-    // The viewer reads ONE spelling per event and relies on the daemon to
-    // upgrade what a pre-4.0 archive holds. One test per route that returns
-    // records (or counts them), each over a day file written with the
-    // retired spaced bookends. `/lab/run/events` is pinned by
-    // `lab_run_events_handler_backfills_then_deltas_across_two_polls` (its
-    // appended record is a spaced `step result`) and `/worktree-summary` by
-    // `resolve_session_finds_matching_record` (same).
+    // Nothing is upgraded on read (#3036): a record carries the spelling it
+    // was written with, and one a release retired reads as an unknown action.
 
-    const SPACED_DAY: &str = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"mac\"}\n\
-         {\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"mac\"}\n";
+    const DAY: &str = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"execution_id\":\"exec-1\",\"machine_id\":\"mac\"}\n\
+         {\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"execution_id\":\"exec-1\",\"machine_id\":\"mac\"}\n";
 
-    fn spaced_archive() -> TempDir {
+    fn archive() -> TempDir {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("2026-05-14.jsonl"), SPACED_DAY).unwrap();
+        fs::write(tmp.path().join("2026-05-14.jsonl"), DAY).unwrap();
         tmp
     }
 
@@ -2953,87 +2944,51 @@
     }
 
     #[tokio::test]
-    async fn flow_date_route_serves_a_spaced_archive_dotted() {
-        let flows = spaced_archive();
+    async fn flow_date_route_serves_the_day_as_written() {
+        let flows = archive();
         let json = get_json(&flows, "/flow/2026-05-14").await;
         assert_eq!(actions_of(&json), vec!["dispatch.start", "dispatch.complete"]);
         let since = get_json(&flows, "/flow/2026-05-14?since=2026-05-14T09:00:05Z").await;
         assert_eq!(actions_of(&since), vec!["dispatch.complete"]);
     }
 
+    /// (#3036) A pre-5.0 day file is served with its retired spelling and no
+    /// synthesized execution: nothing is rewritten on the way out.
     #[tokio::test]
-    async fn flow_mission_route_serves_a_spaced_archive_dotted() {
-        let json = get_json(&spaced_archive(), "/flow-mission/m1").await;
+    async fn flow_date_route_serves_a_retired_spelling_as_written() {
+        let tmp = TempDir::new().unwrap();
+        // flow-action-guard:allow-start — a retired spelling is this test's input
+        let old = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}\n";
+        fs::write(tmp.path().join("2026-05-14.jsonl"), old).unwrap();
+        let json = get_json(&tmp, "/flow/2026-05-14").await;
+        assert_eq!(json[0]["action"], "dispatch start");
+        // flow-action-guard:allow-end
+        assert!(json[0].get("execution_id").is_none(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn flow_mission_route_serves_the_mission_as_written() {
+        let json = get_json(&archive(), "/flow-mission/m1").await;
         assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
     }
 
     #[tokio::test]
-    async fn flow_dispatch_route_serves_a_spaced_archive_dotted() {
-        let json = get_json(&spaced_archive(), "/flow-dispatch/S1").await;
+    async fn flow_dispatch_route_serves_the_session_as_written() {
+        let json = get_json(&archive(), "/flow-dispatch/S1").await;
         assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
     }
 
     #[tokio::test]
-    async fn flow_days_route_counts_a_spaced_dispatch_start() {
-        let json = get_json(&spaced_archive(), "/flow-days").await;
+    async fn flow_days_route_counts_a_dispatch_start() {
+        let json = get_json(&archive(), "/flow-days").await;
         assert_eq!(json["days"][0]["dispatches"], 1, "{json}");
     }
 
     #[tokio::test]
-    async fn flow_missions_route_counts_a_spaced_dispatch_start() {
-        let json = get_json(&spaced_archive(), "/flow-missions").await;
+    async fn flow_missions_route_counts_a_dispatch_start() {
+        let json = get_json(&archive(), "/flow-missions").await;
         let m1 = json["missions"].as_array().unwrap().iter().find(|m| m["mission_id"] == "m1").expect("m1");
         assert_eq!(m1["dispatches"], 1, "{json}");
-    }
-
-    /// `/flow/:date/stream` falls back to tailing the day file when Redis is
-    /// off; a spaced line appended to it goes out dotted.
-    #[tokio::test]
-    async fn flow_stream_file_tail_forwards_a_spaced_record_dotted() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("test.jsonl");
-        std::fs::File::create(&path).unwrap();
-        let stream = tail_lines(path.clone(), 0);
-        tokio::pin!(stream);
-        std::fs::write(&path, "{\"action\":\"step.result\",\"handle\":\"h\"}\n").unwrap();
-        let got = next_line(&mut stream, Duration::from_millis(1500)).await.expect("a line");
-        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
-        assert_eq!(v["action"], "step.result");
-        assert_eq!(v["handle"], "h");
-    }
-
-    /// `/flow/:date`'s Redis backfill (`read_flow_records_from_redis`) reads
-    /// each `XREVRANGE` entry through the flow reader.
-    #[test]
-    fn redis_backfill_serves_a_spaced_record_dotted() {
-        let entry = |id: &str, json: &str| {
-            redis::Value::Array(vec![
-                redis::Value::BulkString(id.as_bytes().to_vec()),
-                redis::Value::Array(vec![
-                    redis::Value::BulkString(b"record".to_vec()),
-                    redis::Value::BulkString(json.as_bytes().to_vec()),
-                ]),
-            ])
-        };
-        let raw = redis::Value::Array(vec![
-            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#),
-            entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
-        ]);
-        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap();
-        assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
-    }
-
-    /// The Redis half of the same stream (`xread_block_once`) forwards each
-    /// record through `forwarded_line`: verbatim when current, upgraded when
-    /// retired.
-    #[test]
-    fn forwarded_line_upgrades_a_retired_spelling_and_leaves_a_current_one_verbatim() {
-        let current = r#"{"z":1,"action":"dispatch.start","execution_id":"exec-1"}"#.to_string();
-        assert_eq!(forwarded_line(current.clone()), current);
-        // flow-action-guard:allow — an old spelling is this test's input
-        let v: serde_json::Value = serde_json::from_str(&forwarded_line(r#"{"action":"mission close"}"#.to_string())).unwrap();
-        assert_eq!(v["action"], "mission.close");
-        assert_eq!(forwarded_line("not json".to_string()), "not json");
     }
 
     #[tokio::test]
@@ -3862,39 +3817,6 @@
                     "telemetry ring must stay in file (chronological) order"
                 );
             }
-        }
-
-        /// (#2409) A pre-4.0 SPACED bookend (`dispatch start`) is kept above
-        /// the cap exactly like the dotted form: the reader upgrades it to
-        /// the same action.
-        #[tokio::test]
-        async fn flow_file_read_keeps_legacy_spaced_dispatch_start_above_the_cap() {
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let telemetry_count = MAX_FLOW_FILE_RECORDS;
-            let mut buf = String::new();
-            buf.push_str(&format!(
-                // flow-action-guard:allow — an old spelling is this test's input
-                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch start","session_id":"s1"}}"#
-            ));
-            buf.push('\n');
-            for i in 0..telemetry_count {
-                buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
-                ));
-                buf.push('\n');
-            }
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
-
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
-
-            assert_eq!(records.len(), telemetry_count + 1);
-            assert_eq!(
-                records.first().unwrap()["action"].as_str(),
-                Some("dispatch.start"),
-                "the legacy-spelled start bookend must survive the cap: {:?}",
-                records.first()
-            );
         }
 
         /// (#2409) A file under the cap is unaffected — no regression to the
@@ -7173,11 +7095,11 @@ fn join_host_samples_pulls_in_window_machine_telemetry_and_drops_out_of_window()
     assert_eq!(stats.days_scanned, 1, "the run's whole window sits in one day file");
 }
 
-// (#2413 follow-up, found live 2026-09-06) The crew and the CLI emit the SPACED
-// `dispatch start`/`dispatch complete`; the join used to match only the dotted
-// spelling, so `start_ms` was never found and no real run ever got a sample.
+// (#2413 follow-up) A session's host samples are joined between its
+// `dispatch.start` and `dispatch.complete` bookends: when `start_ms` was never
+// found, no real run ever got a sample.
 #[test]
-fn join_host_samples_joins_when_the_bookends_use_the_spaced_spelling_production_emits() {
+fn join_host_samples_joins_between_a_sessions_dispatch_bookends() {
     let tmp = TempDir::new().unwrap();
     let day = "2026-01-01";
     let in_window = serde_json::json!({
@@ -7204,15 +7126,13 @@ fn join_host_samples_joins_when_the_bookends_use_the_spaced_spelling_production_
     let mut records = vec![
         serde_json::json!({
             "ts": "2026-01-01T00:00:00Z",
-            // flow-action-guard:allow — an old spelling is this test's input
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "session_id": "s-1",
             "machine_uid": "m-1",
         }),
         serde_json::json!({
             "ts": "2026-01-01T00:00:10Z",
-            // flow-action-guard:allow — an old spelling is this test's input
-            "action": "dispatch complete",
+            "action": "dispatch.complete",
             "session_id": "s-1",
             "machine_uid": "m-1",
         }),

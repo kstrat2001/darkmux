@@ -81,7 +81,7 @@ impl Folded {
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
-            execution: action.filter(|a| a.grain() == Some(Grain::Execution)).map(|_| darkmux_flow::legacy::execution_of(v)),
+            execution: action.filter(|a| a.grain() == Some(Grain::Execution)).and_then(|_| darkmux_flow::reader::execution_id_of(v)),
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason,

@@ -283,6 +283,13 @@ pub enum MissionStatus {
     /// the scheduler never honored it, so a `mission.json` an older binary
     /// left at `"status":"paused"` is simply an open mission. It is written
     /// back as `active` the next time the mission is saved.
+    ///
+    /// RETIRED FOREVER (5.0, #2954, #2996): `paused`, `paused_ts`,
+    /// `mission.pause` and `mission.resume` are never to be reused. An
+    /// archive holds the no-op pauses those names recorded, and reusing a
+    /// name for a real pause would resurrect them as one. A future operator
+    /// pause is a separate mission field (`hold`) with new flow actions
+    /// (`mission.hold` / `mission.release`).
     #[default]
     #[serde(alias = "paused")]
     Active,

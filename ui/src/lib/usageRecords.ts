@@ -17,7 +17,7 @@
  * `dispatch complete` once. An execution with any usage record, even a
  * count-less `token_source: "absent"` one, never reads its complete. The
  * execution is the record's own `execution_id` (`ingest.ts`'s `executionOf`;
- * a pre-4.0 record reads as its session and mission).
+ * a pre-4.0 record names none and reads as its session and mission).
  *
  * `purpose` and `call_kind` values come from the Rust enums
  * (`darkmux_crew::usage::{UsagePurpose, CallKind}`) through their generated

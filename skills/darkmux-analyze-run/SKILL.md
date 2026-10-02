@@ -31,7 +31,6 @@ workload:    <workload-id>
 wall:        <seconds>s
 turns:       N
 compactions: M
-tokensBefore: <list>
 mode:        fast | slow
 notes:
   - turns=...

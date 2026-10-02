@@ -1994,25 +1994,6 @@ mod tests {
         assert!(!out.contains_key("someone-else"));
     }
 
-    /// (#1445 gate should-fix) A step result may carry `payload.tokens`
-    /// rather than `total_tokens` — the fold reads the fallback so those
-    /// rows backfill. The `step_id` is the JOIN KEY the fold matches on
-    /// (#2310 P4d: the kind moved off the retired review vocabulary; the
-    /// id must keep matching `step_ids`, which is what this pins).
-    #[test]
-    fn fold_finals_review_vocabulary_tokens_payload_folds() {
-        let step_ids = ids(&["example-judge-step"]);
-        let rec = serde_json::json!({
-            "action": "step.result",
-            "payload": { "step_id": "example-judge-step", "kind": "dispatch.map", "tokens": 4200 }
-        });
-        // Records reach the fold through the flow reader, which reads the
-        // retired `tokens` spelling as `total_tokens`.
-        let rec = darkmux_flow::reader::parse_value(&rec.to_string()).expect("a record");
-        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert_eq!(out["example-judge-step"].tokens, Some(4200), "a `tokens` payload folds");
-    }
-
     /// (#1445 gate should-fix) `total_tokens` wins when both keys are
     /// present — the same precedence the JS fold applies.
     #[test]
@@ -2162,24 +2143,6 @@ mod tests {
         // The production cap folds all three.
         let out_full = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(out_full["s1"].tokens, Some(1950), "100 + 900 + 950: one term per execution");
-    }
-
-    /// (4.0) `/mission/:id/graph.json` over a pre-4.0 day file folds the
-    /// same finals as its dotted twin.
-    #[test]
-    fn a_spaced_archive_folds_like_its_dotted_twin() {
-        let step_ids = ids(&["s1"]);
-        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
-        let fold = |action: &str| {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "kind": "k", "total_tokens": 4200 } });
-            write_day_file(tmp.path(), "2026-07-17", &[rec]);
-            backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts)["s1"].tokens
-        };
-        // flow-action-guard:allow-start — an old spelling is this test's input
-        assert_eq!(fold("dispatch complete"), Some(4200));
-        assert_eq!(fold("dispatch complete"), fold("dispatch.complete"));
-        // flow-action-guard:allow-end
     }
 
     #[test]

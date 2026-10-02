@@ -1515,7 +1515,7 @@ mod tests {
             &serde_json::json!({
                 "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
                 "tier": "local", "stage": "dispatch", "action": "dispatch.start",
-                "handle": "coder", "mission_id": "m9", "session_id": "s1",
+                "handle": "coder", "mission_id": "m9", "session_id": "s1", "execution_id": "exec-s1",
                 "machine_uid": "mac-1"
             }),
         );
@@ -1524,7 +1524,7 @@ mod tests {
             &serde_json::json!({
                 "ts": "2023-11-14T10:00:05Z", "level": "info", "category": "work",
                 "tier": "local", "stage": "dispatch", "action": "dispatch.complete",
-                "handle": "coder", "mission_id": "m9", "session_id": "s1"
+                "handle": "coder", "mission_id": "m9", "session_id": "s1", "execution_id": "exec-s1"
             }),
         );
         // A sibling mission's record in the SAME day file — must not leak in.
@@ -1533,7 +1533,7 @@ mod tests {
             &serde_json::json!({
                 "ts": "2023-11-14T10:00:02Z", "level": "info", "category": "work",
                 "tier": "local", "stage": "dispatch", "action": "dispatch.start",
-                "handle": "coder", "mission_id": "sibling-mission", "session_id": "sX"
+                "handle": "coder", "mission_id": "sibling-mission", "session_id": "sX", "execution_id": "exec-sX"
             }),
         );
         // A machine-scoped host sample (#2413) inside the window, same machine.

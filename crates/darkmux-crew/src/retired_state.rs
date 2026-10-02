@@ -6,8 +6,9 @@
 //! if the field were absent: serde ignores an unknown key, so a `sprint_ids`
 //! list would otherwise come back as a mission with no phases. `darkmux
 //! doctor` reports the same files ([`scan`]), and the loaders refuse them
-//! ([`parse_state`]). Only a flow record's `phase_id` keeps a `sprint_id`
-//! reader: flow archives are append-only (`darkmux_flow::legacy`).
+//! ([`parse_state`]). A flow record's `sprint_id` is not read either (#3036):
+//! flow archives are append-only and are never rewritten, so such a record
+//! reads without a `phase_id`.
 
 use std::path::{Path, PathBuf};
 

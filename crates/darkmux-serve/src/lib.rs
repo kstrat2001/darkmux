@@ -3341,7 +3341,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<wire::FlowDay> {
             }
             // A dispatch = a dispatch.start edge.
             if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-                dispatches.insert(darkmux_flow::legacy::execution_of(&v).to_string());
+                dispatches.extend(darkmux_flow::reader::execution_id_of(&v).map(|id| id.to_string()));
             }
         }
         days.push(wire::FlowDay {
@@ -3603,7 +3603,7 @@ fn scan_flow_missions(
             e.last_date = date.to_string();
         }
         if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            e.dispatches.insert(darkmux_flow::legacy::execution_of(v).to_string());
+            e.dispatches.extend(darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string()));
         }
         if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
             if !mach.is_empty() {
@@ -4509,8 +4509,8 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 /// snapshot path wasn't).
 ///
 /// (#2409) The cap applies to the supplementary-vocabulary ring only. The
-/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as its
-/// current action through `darkmux_flow::reader`), are ALWAYS kept
+/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as an
+/// unknown action, so it is not one), are ALWAYS kept
 /// regardless of this count: cross-system contract 2 (liveness) requires
 /// that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`
@@ -4760,7 +4760,7 @@ fn tail_lines(
                 let line: String = s.2.drain(..nl).collect();
                 s.2.drain(..1);
                 if !line.is_empty() {
-                    s.3.push_back(forwarded_line(line));
+                    s.3.push_back(line);
                 }
             }
             // s.2 now holds the incomplete trailing chunk (if any).
@@ -5246,21 +5246,11 @@ fn xread_block_once(
                 continue;
             };
             if record_ts_matches_date(record_json, date_filter) {
-                records.push(forwarded_line(record_json.to_string()));
+                records.push(record_json.to_string());
             }
         }
     }
     Ok((records, new_last_id))
-}
-
-/// One raw record line as the live stream sends it: through the flow
-/// reader, so a pre-4.0 spelling goes out current. A line that is not a
-/// JSON object goes out as it came.
-fn forwarded_line(line: String) -> String {
-    match darkmux_flow::reader::upgrade_line(&line) {
-        Some(std::borrow::Cow::Owned(upgraded)) => upgraded,
-        Some(std::borrow::Cow::Borrowed(_)) | None => line,
-    }
 }
 
 /// Extract the `record` field's string value from an XADD/XREAD/XRANGE

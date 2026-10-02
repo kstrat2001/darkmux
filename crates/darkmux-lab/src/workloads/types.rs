@@ -299,9 +299,6 @@ pub struct InspectionReport {
     /// (#2094) Sum of the internal runtime's inter-turn rests for this run,
     /// from its trajectory. `0` when the run took no rests.
     pub rest_ms: u64,
-    /// The prompt-token count each compaction of an openclaw-era run was
-    /// triggered at (empty for every current run).
-    pub tokens_before: Vec<u64>,
     pub mode: Option<RunMode>,
     /// (#2494) The workload's own verify outcome, read back from the run
     /// manifest. `None` is a THIRD state, distinct from pass and fail: the

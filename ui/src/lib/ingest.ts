@@ -40,7 +40,6 @@ import type { DispatchEndPayload } from "../types/generated/DispatchEndPayload";
 import type { FlowPayloads } from "../types/generated/FlowPayloads";
 import type { FlowSource } from "../types/generated/FlowSource";
 import type { Level } from "../types/generated/Level";
-import type { RetiredAction } from "../types/generated/RetiredAction";
 import type { Stage } from "../types/generated/Stage";
 import type { Tier } from "../types/generated/Tier";
 import { isPlainObject } from "./guards";
@@ -322,52 +321,13 @@ export type EveryVariantNamed = [
   Assert<Covers<FlowSource, typeof SOURCE_WIRE>>,
 ];
 
-/** Every action darkmux retired with no current equivalent
- *  (`darkmux_flow`'s `RetiredAction`): an archive may still hold one and the
- *  daemon serves it as written. Keyed by the generated union, so a retired
- *  spelling ts-rs adds without an entry here is a type error. */
-const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
-  // flow-action-guard:allow-start — the retired spellings, keyed by the generated union
-  "telemetry.process": true,
-  "funnel.step": true,
-  "funnel.ruling": true,
-  "funnel.task": true,
-  "mission.run.start": true,
-  "mission.run.gate": true,
-  "mission.run.error": true,
-  "mission.run.verification": true,
-  "mission.run.blocked": true,
-  "mission.run.ship": true,
-  "mission.run.ship.merged": true,
-  "mission.run.ship.held": true,
-  "mission.run.qa-unavailable": true,
-  "mission.compile.start": true,
-  "mission.compile.complete": true,
-  "mission.compile.error": true,
-  "mission reopen": true,
-  "mission.pause": true,
-  "mission pause": true,
-  "mission.resume": true,
-  "mission resume": true,
-  "phase.added": true,
-  "phase added": true,
-  "sprint added": true,
-  "crawl.finding": true,
-  "crawl.mission.started": true,
-  "crawl.mission.completed": true,
-  "crawl.unit.started": true,
-  "crawl.unit.completed": true,
-  // flow-action-guard:allow-end
-};
+const KNOWN_ACTIONS: ReadonlySet<string> = new Set(Object.values(ACTION_WIRE));
 
-const KNOWN_ACTIONS: ReadonlySet<string> = new Set([...Object.values(ACTION_WIRE), ...Object.keys(RETIRED_WIRE)]);
-
-/** Whether an action is one this build knows: current (`ACTION`) or retired
- *  (`RETIRED_WIRE`). The one test of it; the vocabulary-skew tripwire counts
- *  the records that fail it. A retired action is known, not skew: its
- *  records match nothing in `ACTION`, and a surface that still reads one
- *  does so by its other fields (`telemetry.process` host samples, by
- *  `category` and `source`). */
+/** Whether an action is one this build knows (`ACTION`). The one test of it;
+ *  the vocabulary-skew tripwire counts the records that fail it. An action a
+ *  release retired is not known: an archive's record of one reads as skew
+ *  (#3036), and a surface that still reads one does so by its other fields
+ *  (`telemetry.process` host samples, by `category` and `source`). */
 export function isKnownAction(a: NormAction | undefined): boolean {
   return a !== undefined && KNOWN_ACTIONS.has(tagText(a));
 }
@@ -412,7 +372,6 @@ export function ingestRecord(raw: unknown): NormRecord | null {
   for (const key of TAGGED_FIELDS) assignTyped(out, key, parseTag(raw[key]));
   const action = out.action as NormAction | undefined;
   if (action !== undefined && !isKnownAction(action)) warnUnknownAction(tagText(action));
-  if (isExecutionAction(action) && typeof out.execution_id !== "string") out.execution_id = legacyExecutionId(raw);
   return out as unknown as NormRecord;
 }
 
@@ -499,31 +458,22 @@ const EXECUTION_GRAIN_WIRE: { readonly [W in ExecutionGrainAction]: true } = {
 /** Whether an action is a record of a role execution. */
 export const isExecutionAction = (a: NormAction | undefined): boolean => a !== undefined && Object.hasOwn(EXECUTION_GRAIN_WIRE, tagText(a));
 
-/** THE legacy path: the execution a record that names none is of, as
- *  `darkmux_flow::legacy::execution_of` reads it: its session and mission
- *  (a bare session id is not an identity in a pre-4.0 archive: a task
- *  session named only its task, so the same id recurs across unrelated runs,
- *  #2690/#2709), or, with no session, the record itself (its time, handle and machine). */
-const LEGACY_EXECUTION_PREFIX = "legacy:";
-
-function legacyExecutionId(raw: { session_id?: unknown; mission_id?: unknown; ts?: unknown; handle?: unknown; machine_uid?: unknown }): string {
+/** The key the token and run counts group a record under: the execution it
+ *  names. A record written before 4.0 names none, and none is invented for
+ *  it (#3036: ingest stamps nothing); the counts key it by its session and
+ *  mission instead (a bare session id is not an identity in a pre-4.0
+ *  archive: a task session named only its task, so the same id recurs across
+ *  unrelated runs, #2690/#2709), or, with no session, by the record itself
+ *  (its time, handle and machine). The same fallback as the Rust usage fold's
+ *  `usage_sum::execution_key`. */
+export function executionOf(r: NormRecord): string {
+  if (r.execution_id !== undefined) return r.execution_id;
   const text = (v: unknown): string => (typeof v === "string" ? v : "");
-  const mission = text(raw.mission_id);
-  const session = text(raw.session_id);
+  const [session, mission] = [text(r.session_id), text(r.mission_id)];
   return session === ""
-    ? `${LEGACY_EXECUTION_PREFIX}:${mission}:${text(raw.ts)}:${text(raw.handle)}:${text(raw.machine_uid)}`
-    : `${LEGACY_EXECUTION_PREFIX}${session}:${mission}`;
+    ? `unnamed::${mission}:${text(r.ts)}:${text(r.handle)}:${text(r.machine_uid)}`
+    : `unnamed:${session}:${mission}`;
 }
-
-/** Whether an execution id was synthesized for a pre-4.0 record
- *  (`legacyExecutionId`) rather than minted for one execution. A legacy id
- *  is a session and mission, so one session's records may carry several. */
-export const isLegacyExecution = (id: string): boolean => id.startsWith(LEGACY_EXECUTION_PREFIX);
-
-/** The execution a record is of: the one it names, else the legacy one
- *  (`legacyExecutionId`). Meaningful for a record of an execution-grain
- *  action (`isExecutionAction`); `ingestRecord` stamps it on those. */
-export const executionOf = (r: NormRecord): string => r.execution_id ?? legacyExecutionId(r);
 
 /** A liveness bookend: the unit it brackets (contract 8's grains: a whole
  *  `run`, or one role `execution`) and its edge. The viewer's copy of
