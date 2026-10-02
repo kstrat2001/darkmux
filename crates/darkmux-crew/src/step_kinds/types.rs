@@ -573,7 +573,7 @@ pub enum CwdPolicy {
     /// registry (a real enumeration, not a source scan) for every Tier 1
     /// builtin; it cannot see Tier 2/3 kinds registered by an individual
     /// mission (`mods.gate`, the crawl planners `crawl.plan`/`plan.sites`,
-    /// the crawl unit kinds `crawl.unit`/`crawl.summary`, `mission.worktree`/
+    /// the crawl unit kinds `dispatch.unit`/`dispatch.summary`, `mission.worktree`/
     /// `mission.coder`/`mission.verify`, `deliver.github_review`,
     /// `records.gather` — ten kinds total, see that test's own comment)
     /// since those live in separate crates with their own registration
@@ -820,6 +820,14 @@ pub trait StepKind: Send + Sync {
     /// graph — see [`Port`]'s doc on why typing here is by-convention, not
     /// schema-checked. Defaults to `&[]`, same rationale as `provides`.
     fn requires(&self) -> &'static [Port] {
+        &[]
+    }
+
+    /// (#2312) For a required data port, the `config` key whose literal value
+    /// can supply it in place of a producer task: `(port name, config key)`.
+    /// The wiring check skips a requirement when the step's own `config` sets
+    /// that key (a path or inline value an operator wrote). Defaults to none.
+    fn config_supplies(&self) -> &'static [(&'static str, &'static str)] {
         &[]
     }
 

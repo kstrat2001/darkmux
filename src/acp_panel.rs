@@ -764,10 +764,8 @@ pub fn run_ephemeral(
     // anything else), and the reserved `PANEL_ARGS_TASK_ID` reads/depends_on
     // carve-out in `validate` means the just-injected args task never
     // trips a false dangling-reference finding here.
-    let known_ids = StepKindRegistry::with_builtins().ids();
-    let known_kinds: Vec<&str> = known_ids.iter().map(String::as_str).collect();
     let errors: Vec<_> = config
-        .validate(&known_kinds)
+        .validate_with(&crate::mission_launch::kind_catalog()?)
         .into_iter()
         .filter(|f| f.severity == mission_config::FindingSeverity::Error)
         .collect();

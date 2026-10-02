@@ -626,6 +626,19 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
         &maintainer_only,
     ));
 
+    // (#2312, #2430) The mission-config check needs the kinds' declared ports,
+    // which only the root crate can assemble: the coder-phase kinds live here.
+    // The catalog is the one `mission launch` validates against.
+    match mission_launch::kind_catalog() {
+        Ok(catalog) => report.checks.push(doctor::check_mission_config_registry(&catalog)),
+        Err(e) => report.checks.push(doctor::Check {
+            name: "mission config registry".into(),
+            status: doctor::Status::Fail,
+            message: format!("could not build the step-kind registry: {e:#}"),
+            hint: None,
+        }),
+    }
+
     // (#2924) Fleet-roster rows: a loopback address no peer can use, and an
     // entry not named by its machine's machine_id. Appended here because they
     // read the roster (darkmux-fleet), which the doctor crate does not depend

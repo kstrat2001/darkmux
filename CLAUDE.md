@@ -355,7 +355,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      layer exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
      `dispatch.single_shot` contain one; `dispatch.map` contains one per collection item
      (with per-item error isolation — its own doc contrasts it with "a single-dispatch
-     step"), and a `crawl.unit` step contains one per draw. Do NOT
+     step"), and a `dispatch.unit` step contains one per draw. Do NOT
      insert a further noun between step and role execution to name the N: a 1:1 wrapper earns nothing, and
      the N already has three domain names that are not synonyms — `dispatch.map`'s **items**
      (what the work is done to), review's **seats** (which staffed model does it), and
@@ -441,7 +441,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `crew={names} models={summary}` — so those seat executions had no dispatch identity at
      all. That launcher (`src/mission_launch_review.rs`) was deleted in #2310 P4d; the
      shipped `review` mission config's seats now go through the generic building blocks
-     (`crawl.unit` → `darkmux_crew::dispatch::dispatch`, bookended, for `reviewer`;
+     (`dispatch.unit` → `darkmux_crew::dispatch::dispatch`, bookended, for `reviewer`;
      `dispatch.internal` for the optional `coder` seat), so the bypass this bullet describes
      no longer exists. The surviving `single_shot_chat` call site is the generic Tier-1
      `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs`, its hosted
@@ -686,7 +686,7 @@ crates/
   darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review envelope (lab/review.rs — data types + outcome mapping only; the executable pipeline these types used to describe was deleted in #2310 P4d, see darkmux-crew's step_kinds above and crawl/ below for what runs `review` now)
     src/crawl/                    The agentic bug crawler's mechanical planning half (#1959) — `plan.rs` (Materialized + [Rule] -> a token-estimated work-unit Plan; `manifest.rs`/`sources.rs` retired, superseded by `darkmux-crew`'s `workspace_spec`)
     src/crawl/plan_sites_step.rs  `plan.sites` (#2310 P4c) — the generic diff/tree plan step; the `review` config's `plan-<rule>` tasks use this with `source: "diff"` to plan over a diff's hunks rather than a whole-tree walk
-    src/crawl/unit_step.rs        `crawl.unit` + `crawl.summary` (#2301) — the crawl's dispatch half as step kinds; `review`'s `unit-<rule>` tasks grow one `crawl.unit` dispatch per planned site with `role_id: "reviewer"`
+    src/crawl/unit_step.rs        `dispatch.unit` + `dispatch.summary` (#2301) — the crawl's dispatch half as step kinds; `review`'s `unit-<rule>` tasks grow one `dispatch.unit` dispatch per planned site with `role_id: "reviewer"`
   darkmux-fleet/              Roster + cross-machine routing
   darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
   darkmux-serve/              HTTP daemon + the bundled viewer (assets/next.html, built from ui/src)

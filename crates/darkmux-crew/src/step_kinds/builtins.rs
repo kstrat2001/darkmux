@@ -16,9 +16,10 @@
 //! doc for the full three-tier picture.
 
 use super::types::{
-    CwdPolicy, MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx,
+    CwdPolicy, MapDispatchOverride, OverrideDispatchCall, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx,
 };
 use crate::remote_budget::RemoteBudget;
+use crate::step_output::labels;
 use crate::step_config::{
     load, load_checked, ConfigKind, DispatchInternalConfig, MapConfig, ModelCallConfig, NoopConfig,
     MapSource, ShellConfig, SingleShotConfig,
@@ -485,6 +486,13 @@ pub(crate) fn dispatch_opts_for(
 }
 
 impl StepKind for DispatchInternalStepKind {
+    /// (#2312) An untyped producer: its output is text, not a wrapped body,
+    /// so it satisfies only a consumer that asks for [`labels::TEXT`].
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data(labels::TEXT)];
+        &PORTS
+    }
+
     fn id(&self) -> &'static str {
         ConfigKind::DispatchInternal.id()
     }
@@ -2115,7 +2123,7 @@ impl MapCall {
 /// records, `ui/src/lib/usageRecords.ts`.) The other live producer, the container path's per-turn tailer
 /// (`dispatch_internal.rs`'s `emit_telemetry`), runs under
 /// `session_id::step(&step.id)` (`dispatch_opts_for`, this file) — unique per
-/// step — and `crawl.unit` mints `crawl-<mission>-<rule>-<unit>` plus a
+/// step — and `dispatch.unit` mints `crawl-<mission>-<rule>-<unit>` plus a
 /// per-draw suffix. Neither can share a key with another seat. So this one
 /// emitter is the whole live population.
 fn map_call_token_payload(
@@ -2729,6 +2737,13 @@ fn validated_shell_cwd(step: &Step, source: &str, raw: &std::path::Path) -> Resu
 }
 
 impl StepKind for ProceduralShellStepKind {
+    /// (#2312) An untyped producer: its output is text, not a wrapped body,
+    /// so it satisfies only a consumer that asks for [`labels::TEXT`].
+    fn provides(&self) -> &'static [Port] {
+        const PORTS: [Port; 1] = [Port::data(labels::TEXT)];
+        &PORTS
+    }
+
     /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied shell command and
     /// speaks to no model at all. Before this hook it said nothing, and
     /// silence classified it as a hosted-endpoint dispatch: a wave of these
@@ -7247,7 +7262,7 @@ mod tests {
     // production graph runs, is what would catch a future packet
     // accidentally giving one of these a port it shouldn't have.
     #[test]
-    fn tier1_kinds_declare_no_ports_by_default() {
+    fn tier1_kinds_declare_no_ports_beyond_the_untyped_text_producers() {
         let kinds: Vec<Arc<dyn StepKind>> = vec![
             Arc::new(DispatchInternalStepKind),
             Arc::new(DispatchSingleShotStepKind),
@@ -7256,9 +7271,13 @@ mod tests {
             Arc::new(ProceduralNoopStepKind),
         ];
         for kind in kinds {
-            assert!(
-                kind.provides().is_empty(),
-                "`{}` should declare no `provides` ports (Tier 1 backward-compat)",
+            // (#2312) The untyped producers provide "text" and nothing else.
+            let untyped = matches!(kind.id(), "dispatch.internal" | "procedural.shell");
+            let provided: Vec<&str> = kind.provides().iter().map(|p| p.name).collect();
+            assert_eq!(
+                provided,
+                if untyped { vec!["text"] } else { vec![] },
+                "`{}` declares the wrong `provides` ports",
                 kind.id()
             );
             assert!(

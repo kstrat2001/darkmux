@@ -1474,7 +1474,7 @@ fn diff_touched_lines(diff_text: &str) -> BTreeMap<String, BTreeSet<u32>> {
 /// graph ports (#2301's `Output<T>` envelope convention) for the ORIGINAL
 /// three fields — no producer for "findings as one bulk typed value"
 /// existed when this module was written (a finding is read from the
-/// finding STORE by key, per `crawl.summary`'s own "the same one read of
+/// finding STORE by key, per `dispatch.summary`'s own "the same one read of
 /// the dispatch's findings.jsonl" pattern, DESIGN.md's record table) —
 /// inventing four speculative port kinds nothing would ever produce was
 /// worse than the config-embedded shape. #2310 P4c-2b is the future caller

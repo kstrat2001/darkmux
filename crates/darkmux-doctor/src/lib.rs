@@ -139,7 +139,6 @@ pub fn run() -> DoctorReport {
         check_profile_registry(),
         // (#2707) Read-only: counts what darkmux left in the temp root.
         check_temp_residue(),
-        check_mission_config_registry(),
         check_lms_binary(),
         check_docker_runtime(),
         check_models_loaded(),
@@ -6359,6 +6358,17 @@ fn schema_drift_notes(older_major: &[(String, u32)], minor_drift: &[(String, Str
     notes
 }
 
+/// A user-tier file is the one the operator edits, so a finding about it names
+/// the path; a built-in has no file to point at.
+fn naming_user_file(message: String, loaded: &darkmux_crew::mission_config::LoadedMissionConfig) -> String {
+    match loaded.source {
+        darkmux_crew::mission_config::MissionConfigSource::User => {
+            format!("{message} (file: {})", loaded.manifest_path.display())
+        }
+        _ => message,
+    }
+}
+
 /// (#1284 Packet 1) Registered mission configs — enumerates every
 /// discoverable mission-config document (`darkmux_crew::mission_config::
 /// list_ids()`, unioned user → on-disk → embedded), loads + `validate()`s
@@ -6371,30 +6381,20 @@ fn schema_drift_notes(older_major: &[(String, u32)], minor_drift: &[(String, Str
 ///   (`FindingSeverity::Warning` on the `schema_version` path) are real,
 ///   actionable problems — either one flips this check to `Warn` and names
 ///   the offending document(s).
-/// - **Unrecognized step-kind references** are checked ONLY against
-///   `StepKindRegistry::with_builtins()`'s five Tier 1 ids
-///   (`dispatch.internal`, `dispatch.map`, `dispatch.single_shot`,
-///   `procedural.noop`, `procedural.shell`) and are deliberately treated
-///   as INFORMATIONAL, never blocking: everything else registers into its
-///   OWN per-mission registry at COMPOSITION time
-///   (`src/mission_launch.rs::all_step_kinds`, which layers the coder-phase
-///   `mission.*` kinds, the crawl kinds, and `review.json`'s
-///   `records.gather`/`deliver.github_review`/`mods.gate` on top of the
-///   Tier 1 set), which this document-level check has no way to see. The
-///   three shipped configs mint a mix: `coder-phase.json` is pure `mission.*`;
-///   `crawl.json` mints `crawl.plan`/`crawl.summary`/`crawl.unit` alongside
-///   Tier 1 `dispatch.internal`; `review.json` mints `plan.sites`,
-///   `crawl.unit`, `crawl.summary`, `mods.gate`, `records.gather`, and
-///   `deliver.github_review` alongside Tier 1 `procedural.shell` and
-///   `dispatch.internal`. So an "unknown kind" hit on the non-Tier-1 ones
-///   is the EXPECTED steady state, not a sign anything is broken —
-///   surfaced in the message for visibility, but never flips the check's
-///   status on its own (a permanent Warn for an expected,
-///   unfixable-by-design condition would just teach operators to ignore
-///   this check).
-fn check_mission_config_registry() -> Check {
+/// - **Step kinds and their wiring** are checked against the `catalog` the
+///   caller supplies (#2312). `main.rs` passes the registry `mission launch`
+///   itself resolves against (`src/mission_launch.rs::all_step_kinds`: Tier 1
+///   plus the coder-phase, crawl and review kinds), which this crate cannot
+///   build (the coder-phase kinds live in the root crate), so this check is
+///   appended after `run()` like the skills freshness check. That catalog
+///   also carries each kind's declared ports, so a config wiring a task to a
+///   producer of the wrong kind is an `Error` finding here, and a retired
+///   kind id (#2430) is one too. A kind the catalog does not know stays
+///   INFORMATIONAL, never blocking: a caller holding only the Tier 1 set sees
+///   Tier 3 ids as unknown, and a permanent Warn for that would teach
+///   operators to ignore this check.
+pub fn check_mission_config_registry(catalog: &darkmux_crew::mission_config::KindCatalog) -> Check {
     use darkmux_crew::mission_config::{self, FindingSeverity};
-    use darkmux_crew::step_kinds::StepKindRegistry;
 
     let ids = mission_config::list_ids();
     if ids.is_empty() {
@@ -6406,8 +6406,6 @@ fn check_mission_config_registry() -> Check {
         };
     }
 
-    let known_kinds = StepKindRegistry::with_builtins().ids();
-    let known_kind_refs: Vec<&str> = known_kinds.iter().map(String::as_str).collect();
 
     let mut summary_lines: Vec<String> = Vec::new();
     // (#2003) (id, explanation) pairs, so identical explanations can be
@@ -6426,7 +6424,7 @@ fn check_mission_config_registry() -> Check {
     for id in &ids {
         match mission_config::load(id) {
             Ok(loaded) => {
-                let findings = loaded.config.validate(&known_kind_refs);
+                let findings = loaded.config.validate_with(catalog);
                 let errors: Vec<_> =
                     findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
                 // (#3035) A schema NEWER than this binary reads is refused by the
@@ -6452,7 +6450,7 @@ fn check_mission_config_registry() -> Check {
 
                 if !errors.is_empty() {
                     let joined = errors.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
-                    blocking.push((id.clone(), joined));
+                    blocking.push((id.clone(), naming_user_file(joined, &loaded)));
                 }
                 if !version_drift.is_empty() {
                     let joined =
@@ -11973,10 +11971,11 @@ mod tests {
         //
         // (fleet route check) 70: `check_fleet_routes` joined beside it.
         //
-        // (5.0, #3036) 69: `check_machine_rollup` left with the `machine_rollup`
-        // block.
+        // (5.0, #3036) `check_machine_rollup` left with the `machine_rollup`
+        // block, and (#2312) `check_mission_config_registry` moved out of
+        // `run()`: the root crate appends it with the full step-kind catalog.
         let expected =
-            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14677,6 +14676,11 @@ mod tests {
 
     // ─── #1284 Packet 1: check_mission_config_registry ───────────────
 
+    /// The Tier 1 kinds only: what a caller with no wider registry has.
+    fn tier1_catalog() -> darkmux_crew::mission_config::KindCatalog {
+        darkmux_crew::step_kinds::StepKindRegistry::with_builtins().catalog()
+    }
+
     #[serial_test::serial]
     #[test]
     fn check_mission_config_registry_passes_on_embedded_builtins_only() {
@@ -14685,7 +14689,7 @@ mod tests {
         // kinds, so the check must still PASS (unknown-kind warnings are
         // informational, never blocking — see the check's own doc).
         let _guard = CrewRootGuard::new();
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("review"), "{}", check.message);
         assert!(check.message.contains("coder-phase"), "{}", check.message);
@@ -14716,11 +14720,49 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("broken-deps"), "{}", check.message);
         assert!(check.message.contains("ghost-task"), "{}", check.message);
         assert!(check.hint.is_some());
+    }
+
+    /// (#2312, #2430) The wiring and retired-id findings reach the doctor row
+    /// when the caller supplies a catalog that knows the kinds' ports.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_flags_a_miswired_task_and_a_retired_kind_id() {
+        use darkmux_crew::mission_config::{KindCatalog, KindPorts};
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("miswired.json"),
+            r#"{"id": "miswired", "name": "Miswired", "phases": [{"id": "p1", "tasks": [
+                {"id": "producer", "steps": [{"id": "ps", "kind": "procedural.shell"}]},
+                {"id": "consumer", "depends_on": ["producer"], "steps": [{"id": "cs", "kind": "dispatch.unit"}]},
+                {"id": "old", "steps": [{"id": "os", "kind": "crawl.unit"}]}
+            ]}]}"#,
+        )
+        .unwrap();
+        let mut catalog = tier1_catalog();
+        catalog.insert(
+            "dispatch.unit",
+            KindPorts { requires: vec!["plan.sites".into()], ..KindPorts::default() },
+        );
+        let check = check_mission_config_registry(&catalog);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("miswired"), "{}", check.message);
+        assert!(check.message.contains("plan.sites"), "the wiring miss is named: {}", check.message);
+        assert!(check.message.contains("renamed to"), "the retired id is named: {}", check.message);
+        assert!(check.message.contains("miswired.json"), "the file to edit is named: {}", check.message);
+        assert!(
+            check.message.contains("rename `crawl.unit` to `dispatch.unit` and `crawl.summary` to `dispatch.summary`"),
+            "both replacements are named: {}",
+            check.message
+        );
+        // The same document against an ids-only catalog sees no wiring miss.
+        let blind = check_mission_config_registry(&KindCatalog::from_ids(&["procedural.shell", "dispatch.unit"]));
+        assert!(!blind.message.contains("plan.sites"), "{}", blind.message);
     }
 
     #[serial_test::serial]
@@ -14730,7 +14772,7 @@ mod tests {
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
         std::fs::write(guard.path().join("mission-configs").join("busted.json"), "{not valid json").unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("busted"), "{}", check.message);
         assert!(check.message.contains("failed to parse"), "{}", check.message);
@@ -14752,7 +14794,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("\"bad\""), "{}", check.message);
     }
@@ -14787,7 +14829,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("schema_version \"1.0\" (major 1)"), "{}", check.message);
         // (#1684) Asserted against the CONSTANT rather than a hardcoded
@@ -14829,7 +14871,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert!(check.message.contains("mine-older.json"), "{}", check.message);
         assert!(
             check.message.contains("schema major (3) is older than this darkmux's (4)"),
@@ -14853,7 +14895,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert!(!check.message.contains("is older than this darkmux's"), "{}", check.message);
     }
 
@@ -14895,7 +14937,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(
             check.status,
             Status::Pass,
@@ -14960,7 +15002,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
 
         if bin_minor == 0 {
             assert_eq!(
@@ -15028,7 +15070,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("delete it"),
@@ -15056,7 +15098,7 @@ mod tests {
             )
             .unwrap();
 
-            let registry = check_mission_config_registry();
+            let registry = check_mission_config_registry(&tier1_catalog());
             let text = format!("{} {}", registry.message, registry.hint.clone().unwrap_or_default());
             for claim in ["swallowed", "complete green", "parses cleanly", "lands in `extras`"] {
                 assert!(!text.contains(claim), "{ahead}: the registry check contradicts the refusal ({claim}): {text}");
@@ -15129,7 +15171,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             check.message.contains("nameless"),
@@ -15166,7 +15208,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check_mission_config_registry();
+        let check = check_mission_config_registry(&tier1_catalog());
         assert!(
             !check.message.contains("declares schema"),
             "a current-schema user copy must not trip any drift warning: {}",

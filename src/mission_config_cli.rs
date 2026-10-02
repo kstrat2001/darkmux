@@ -970,9 +970,7 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
     // items, and validate's own `Warning`-severity findings (schema-version
     // drift, an unrecognized step kind) are routine noise this command
     // doesn't otherwise surface — an `Error` finding is not.
-    let known_kind_ids = registry.ids();
-    let known_kinds: Vec<&str> = known_kind_ids.iter().map(String::as_str).collect();
-    for f in loaded.config.validate(&known_kinds).into_iter().filter(|f| f.severity == FindingSeverity::Error) {
+    for f in loaded.config.validate_with(&registry.catalog()).into_iter().filter(|f| f.severity == FindingSeverity::Error) {
         warnings.push(format!("config validation: {f}"));
     }
 
@@ -1845,8 +1843,8 @@ mod tests {
         );
         assert_eq!(show.id, "crawl");
         // (#2298 + #2301 + #2302) Four phases: one `crawl.plan` task per
-        // built-in rule, one `crawl.unit` GROW template per rule, one
-        // `crawl.summary`, and one `dispatch.internal` create-mod template.
+        // built-in rule, one `dispatch.unit` GROW template per rule, one
+        // `dispatch.summary`, and one `dispatch.internal` create-mod template.
         // Every step constructible by the launcher's own registry — a crawl
         // kind that failed to register would leave a config that cannot
         // execute, and that holds for create-mods too even though it
@@ -1858,8 +1856,8 @@ mod tests {
             show.phases[i].tasks.iter().flat_map(|t| t.steps.iter()).map(|s| s.kind.as_str()).collect()
         };
         assert_eq!(kinds_of(0), vec!["crawl.plan"; 4]);
-        assert_eq!(kinds_of(1), vec!["crawl.unit"; 4]);
-        assert_eq!(kinds_of(2), vec!["crawl.summary"]);
+        assert_eq!(kinds_of(1), vec!["dispatch.unit"; 4]);
+        assert_eq!(kinds_of(2), vec!["dispatch.summary"]);
         assert_eq!(kinds_of(3), vec!["dispatch.internal"]);
         for phase in &show.phases {
             for step in phase.tasks.iter().flat_map(|t| t.steps.iter()) {

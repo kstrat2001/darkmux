@@ -7241,6 +7241,89 @@ fn write_workspace_spec(path: &std::path::Path, root: &std::path::Path, app: &st
     fs::write(path, spec.to_string()).unwrap();
 }
 
+/// (#2430) A config naming a retired step kind id is refused before anything
+/// is minted, and the refusal names the id that replaced it. Not aliased:
+/// the same config with the new id launches.
+#[test]
+fn a_config_naming_a_retired_step_kind_is_refused_naming_the_new_one() {
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = |kind: &str| {
+        serde_json::json!({
+            "id": "retired-kind-test", "name": "retired kind", "schema_version": "4.0",
+            "phases": [{"id": "p", "tasks": [{"id": "t", "steps": [{"id": "s", "kind": kind}]}]}]
+        })
+        .to_string()
+    };
+    std::fs::write(config_dir.join("retired-kind-test.json"), config("crawl.unit")).unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "launch", "retired-kind-test", "--dry-run"])
+        .output()
+        .expect("mission launch runs");
+    assert!(!out.status.success(), "a retired kind id must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("crawl.unit") && stderr.contains("dispatch.unit") && stderr.contains("renamed"),
+        "the refusal names the old id and the new one: {stderr}"
+    );
+    // The upgrade path is explicit: the file to edit, and BOTH replacements.
+    assert!(stderr.contains("retired-kind-test.json"), "names the file: {stderr}");
+    assert!(
+        stderr.contains("rename `crawl.unit` to `dispatch.unit` and `crawl.summary` to `dispatch.summary`"),
+        "names both replacements: {stderr}"
+    );
+    assert!(!home.path().join("missions").exists(), "a refused launch mints nothing");
+}
+
+/// (#2312) A config wiring a task to a producer that provides the wrong kind
+/// of output is refused by `mission launch` before anything is minted, and
+/// `mission config show` reports the same finding.
+#[test]
+fn a_task_wired_to_a_producer_of_the_wrong_kind_is_refused_before_minting() {
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("wiring-test.json"),
+        serde_json::json!({
+            "id": "wiring-test", "name": "wiring", "schema_version": "4.0",
+            "phases": [
+                {"id": "p1", "tasks": [
+                    {"id": "producer", "steps": [{"id": "ps", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}
+                ]},
+                {"id": "p2", "tasks": [
+                    {"id": "consumer", "grow": {"from": "producer", "items": "units", "id": "{{item.id}}",
+                        "config": {"plan": "{{from.output}}", "unit": "{{item.id}}"}},
+                     "steps": [{"id": "cs", "kind": "dispatch.unit", "config": {}}]}
+                ]}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let launch = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "launch", "wiring-test", "--dry-run"])
+        .output()
+        .expect("mission launch runs");
+    assert!(!launch.status.success(), "a mis-wired config must be refused");
+    let stderr = String::from_utf8_lossy(&launch.stderr);
+    for part in ["consumer", "dispatch.unit", "plan.sites", "producer", "procedural.shell", "text"] {
+        assert!(stderr.contains(part), "the refusal names `{part}`: {stderr}");
+    }
+    assert!(!home.path().join("missions").exists(), "a refused launch mints nothing");
+
+    let show = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .args(["mission", "config", "show", "wiring-test", "--json"])
+        .output()
+        .expect("mission config show runs");
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("config validation") && shown.contains("plan.sites"), "show reports the finding: {shown}");
+}
+
 /// (#2301) `mission launch crawl --dry-run` on the REAL built-in config.
 ///
 /// The retired launcher's own dry run planned in-process and printed a plan
@@ -7281,7 +7364,7 @@ fn crawl_dry_run_prints_the_graph_the_launch_would_mint() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The document IS the crawl now: its three phases and its per-rule
     // tracks are what a dry run shows.
-    for want in ["Plan", "Crawl", "Summarize", "crawl.plan", "crawl.unit", "crawl.summary"] {
+    for want in ["Plan", "Crawl", "Summarize", "crawl.plan", "dispatch.unit", "dispatch.summary"] {
         assert!(stdout.contains(want), "dry run never mentioned `{want}`:\n{stdout}");
     }
     // (#2302) The create-mods phase ships OFF, so it is PRUNED at mint and
@@ -7291,7 +7374,7 @@ fn crawl_dry_run_prints_the_graph_the_launch_would_mint() {
         "the create-mod task is `enabled: false`, so its phase is pruned:\n{stdout}"
     );
     assert!(
-        stdout.trim_end().ends_with("[crawl.summary]"),
+        stdout.trim_end().ends_with("[dispatch.summary]"),
         "and the default graph still ENDS at the summary, whose output is the close payload:\n{stdout}"
     );
     // Nothing was minted, and nothing was planned.
@@ -7770,7 +7853,7 @@ fn review_real_launch_leaves_no_literal_braces_in_any_minted_step_config() {
                     "an unset optional input's placeholder key must be OMITTED, not an empty string: {step}"
                 );
             }
-            if step["kind"] == serde_json::json!("crawl.unit") && step["config"].get("grown_from").is_some() {
+            if step["kind"] == serde_json::json!("dispatch.unit") && step["config"].get("grown_from").is_some() {
                 saw_grown_unit_step = true;
                 assert_eq!(
                     step["config"]["intent_file"],
@@ -8260,7 +8343,7 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
     let plan_path = mission_dir.join("plan").join("swallowed-error.json");
     let plan: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&plan_path).expect("the plan was written")).unwrap();
-    assert_eq!(plan["kind"], serde_json::json!("crawl.plan"), "the plan is a typed output envelope");
+    assert_eq!(plan["kind"], serde_json::json!("plan.sites"), "the plan is a typed output envelope");
     assert!(!plan["hash"].as_str().unwrap_or("").is_empty(), "and carries its body's digest");
     let units = plan["body"]["units"].as_array().expect("the body holds the units");
     assert!(!units.is_empty(), "the fixture's swallowed catch was planned: {plan}");
@@ -8344,7 +8427,7 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
     let flows = TempDir::new().unwrap();
     let findings = TempDir::new().unwrap();
 
-    // The producer's output: the SAME envelope `crawl.summary` writes — a
+    // The producer's output: the SAME envelope `dispatch.summary` writes — a
     // wrapped body whose top-level `finding_refs` is the array to map over.
     let summary_body = serde_json::json!({
         "findings": 2,
@@ -8357,7 +8440,7 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
     });
     let summary_output = serde_json::json!({
         "schema_version": "1.0",
-        "kind": "crawl.summary",
+        "kind": "dispatch.summary",
         "producer": {"mission": "m", "task": "summary", "step": "summary-step", "machine_id": "t"},
         "produced_at": "2026-09-04T00:00:00Z",
         "body": summary_body,

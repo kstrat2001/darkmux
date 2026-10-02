@@ -299,6 +299,9 @@ export function isAiKind(kind: string | undefined): boolean {
   // token/turn meter it never earned, having placed zero dispatches of its
   // own).
   if (kind.endsWith("-render") || kind.endsWith("-collect")) return false;
+  // (#2430) `dispatch.summary` folds the unit outcomes already on disk; it
+  // dispatches no model, though its id shares the `dispatch.` prefix.
+  if (kind === "dispatch.summary") return false;
   if (kind.indexOf("dispatch.") === 0) return true;
   if (kind === "mission.coder" || kind === "mission.verify") return true;
   // (#2310 P4d; #2404 P4d round 3) The `review.probe`/`review.judge`/

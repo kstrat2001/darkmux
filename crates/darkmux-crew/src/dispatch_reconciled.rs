@@ -58,7 +58,7 @@
 //!   `MissionVerifyStepKind::run()` (`src/coder_phase.rs`) — the standalone
 //!   `phase` CLI verb that used to call it directly was retired in #1463.
 //!   `MissionVerifyStepKind::seat()` already calls `resolve_local_seat`.
-//! - `crates/darkmux-lab/src/crawl/unit_step.rs`'s `CrawlUnitStepKind` is
+//! - `crates/darkmux-lab/src/crawl/unit_step.rs`'s `DispatchUnitStepKind` is
 //!   itself a `StepKind` whose own `seat()` already calls
 //!   `resolve_local_seat` — its raw `dispatch()` call is the SAME
 //!   post-wave no-op pattern `DispatchInternalStepKind` uses, not a

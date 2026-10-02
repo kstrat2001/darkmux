@@ -22,9 +22,9 @@ pub fn sample(kind: ConfigKind) -> Value {
         ConfigKind::DeliverGithubReview => json!({"emit": "-", "head_sha": "s", "findings": [], "mods": [], "diff": "", "scope": {}}),
         ConfigKind::CrawlPlan => json!({"rule": "r", "workspace": "w", "sizing": {"max_sites_per_unit": "{{n}}"}, "no_fetch": "{{f}}"}),
         ConfigKind::PlanSites => json!({"rule": "r", "source": "diff", "diff_file": "d", "github": "o/r", "head_sha": "s"}),
-        ConfigKind::CrawlUnit => json!({"plan": "p", "unit": "u", "draws": "2", "timeout_seconds": ""}),
+        ConfigKind::DispatchUnit => json!({"plan": "p", "unit": "u", "draws": "2", "timeout_seconds": ""}),
         ConfigKind::MissionCoder => json!({"timeout_seconds": 5, "image": null, "injected_budget_chars": 100}),
-        ConfigKind::CrawlSummary | ConfigKind::MissionWorktree | ConfigKind::MissionVerify => json!({}),
+        ConfigKind::DispatchSummary | ConfigKind::MissionWorktree | ConfigKind::MissionVerify => json!({}),
     }
 }
 

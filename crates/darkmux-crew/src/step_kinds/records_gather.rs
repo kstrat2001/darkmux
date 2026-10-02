@@ -24,7 +24,7 @@
 //! flow of its own.
 //!
 //! **Scope summary, honestly bounded.** (#2361 item 2) `rules_run` and
-//! `hunks_covered` count only what a COMPLETED `crawl.unit` step
+//! `hunks_covered` count only what a COMPLETED `dispatch.unit` step
 //! reviewed — a plan is an intention, and a run whose units errored
 //! covered nothing. Before that fix, four errored units out of five still
 //! reported "5 rule(s), 5/5 hunks covered", which is a false claim of
@@ -37,7 +37,7 @@
 //! rules used to double-count the same hunk once per rule that planned
 //! it). `hunks_total` comes from parsing the diff itself with the shared
 //! `crate::diff::parse_diff`. `refused` is the RUNTIME-BOUNDARY rejection
-//! count (#2310 P4c-2b PR #2357 review CONSIDER F) — `crawl.unit`'s own
+//! count (#2310 P4c-2b PR #2357 review CONSIDER F) — `dispatch.unit`'s own
 //! `findings_rejected`, summed off this mission's Step records
 //! (`scan_unit_and_plan_steps`, read as loose JSON — never `darkmux-lab`'s
 //! typed `UnitOutcome`, same crate-boundary reason) — NEVER a gate-failed
@@ -62,23 +62,23 @@ use std::sync::Arc;
 pub const RECORDS_GATHER_KIND: &str = ConfigKind::RecordsGather.id();
 
 /// Content id both the step's own `provides()` port and the envelope's
-/// `kind` use — same one-name-for-both-roles convention `crawl.summary`
-/// establishes (`CRAWL_SUMMARY_KIND == CRAWL_SUMMARY_OUTPUT_KIND`).
+/// `kind` use — the one-name-for-both-roles convention `dispatch.summary`
+/// follows (`step_output::labels::SUMMARY`).
 pub const RECORDS_GATHER_OUTPUT_KIND: &str = "records.gather";
 
 pub const GATHER_OUTPUT_SCHEMA_VERSION: &str = "1.0";
 
-/// `darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND`, from the same
+/// `darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND`, from the same
 /// [`ConfigKind`] id. `darkmux-crew` cannot depend on `darkmux-lab` (see
 /// `scan_unit_and_plan_steps`'s own doc); a conformance test in
 /// `src/mission_launch.rs` asserts each resolves against `all_step_kinds`'s
 /// real registry.
-pub const SCANNED_CRAWL_UNIT_KIND: &str = ConfigKind::CrawlUnit.id();
+pub const SCANNED_DISPATCH_UNIT_KIND: &str = ConfigKind::DispatchUnit.id();
 /// `darkmux_lab::crawl::plan_sites_step::PLAN_SITES_KIND`, from the same
-/// [`ConfigKind`] id. See [`SCANNED_CRAWL_UNIT_KIND`].
+/// [`ConfigKind`] id. See [`SCANNED_DISPATCH_UNIT_KIND`].
 pub const SCANNED_PLAN_SITES_KIND: &str = ConfigKind::PlanSites.id();
 /// `darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND`, from the same
-/// [`ConfigKind`] id. See [`SCANNED_CRAWL_UNIT_KIND`].
+/// [`ConfigKind`] id. See [`SCANNED_DISPATCH_UNIT_KIND`].
 pub const SCANNED_CRAWL_PLAN_KIND: &str = ConfigKind::CrawlPlan.id();
 
 /// What [`RecordsGatherStepKind`] produces — everything
@@ -93,7 +93,7 @@ pub struct GatherOutput {
     pub scope: DeliverScope,
     /// (silent-miss audit, 2026-09-06) What [`scan_unit_and_plan_steps`]
     /// could not read while building `scope` — a failed `load_phases`,
-    /// a failed `load_steps_for_phase` for one phase, or a `crawl.unit`
+    /// a failed `load_steps_for_phase` for one phase, or a `dispatch.unit`
     /// step whose own output failed to parse. Each of these previously
     /// vanished into a default/skip/zero with no trace; see
     /// [`StepScan::unreadable`]. Deliberately NOT a field on
@@ -207,7 +207,7 @@ impl StepKind for RecordsGatherStepKind {
         let hunks_total: usize = crate::diff::parse_diff(&diff).iter().map(|(_, hunks)| hunks.len()).sum();
 
         // (#2310 P4c-2b PR #2357 review CONSIDER F, MUST FIX C/D) `refused`
-        // is the RUNTIME-BOUNDARY rejection count (`crawl.unit`'s own
+        // is the RUNTIME-BOUNDARY rejection count (`dispatch.unit`'s own
         // `findings_rejected` — a `create_finding` call the runtime itself
         // rejected, before a finding ever became a stored record), never
         // a gate-failed mod (that is a DOUBLE-CHECK thread ,
@@ -230,7 +230,7 @@ impl StepKind for RecordsGatherStepKind {
         // not rule-bearing TASKS. `declared` is keyed by task id, and a
         // config routinely declares more than one task for one rule —
         // `crawl.json`'s own shape is a `crawl.plan` task per rule AND a
-        // `crawl.unit` grow template per rule — so `declared.len()` made M
+        // `dispatch.unit` grow template per rule — so `declared.len()` made M
         // the task count and rendered a single-rule run as "0 of 2 rules
         // reviewed". The numerator (`rules_run`, off the `plan/<rule>.json`
         // file set) was already per-rule, so the two halves of the same
@@ -317,7 +317,7 @@ fn declared_rules(mission_id: &str) -> std::collections::BTreeMap<String, String
     let Ok(Some(config)) = crate::lifecycle::load_config_snapshot(mission_id) else { return out };
     for phase in &config.phases {
         for task in &phase.tasks {
-            if let Some(rule) = task.steps.iter().find_map(|s| crawl_identity(&s.kind, &s.config).rule) {
+            if let Some(rule) = task.steps.iter().find_map(|s| crawl_identity(crate::step_config::current_kind_id(&s.kind), &s.config).rule) {
                 out.insert(task.id.clone(), rule);
             }
         }
@@ -420,13 +420,13 @@ fn plan_totals(
 }
 
 /// What [`scan_unit_and_plan_steps`] found, scanning this mission's own
-/// `Task`/`Step` records — the same records `crawl.summary` reads for its
+/// `Task`/`Step` records — the same records `dispatch.summary` reads for its
 /// OWN totals (`darkmux-lab`'s `summarize_mission`), duplicated in
 /// miniature here because `darkmux-crew` cannot depend on `darkmux-lab`
 /// (this module's own doc).
 #[derive(Debug, Clone, Default)]
 struct StepScan {
-    /// Sum of every `crawl.unit` step's own `findings_rejected` — a
+    /// Sum of every `dispatch.unit` step's own `findings_rejected` — a
     /// runtime-boundary rejection (`create_finding` refused before it
     /// ever became a stored finding), read generically off the step's
     /// `UnitOutcome`-shaped JSON output (never the typed struct itself —
@@ -435,10 +435,10 @@ struct StepScan {
     /// Rule ids whose `plan.sites`/`crawl.plan` step did NOT reach
     /// `Complete` — never even attempted.
     not_attempted: Vec<String>,
-    /// Human-readable names of `crawl.unit`/`plan.sites`/`crawl.plan`
+    /// Human-readable names of `dispatch.unit`/`plan.sites`/`crawl.plan`
     /// steps that ended `Error`/`Abandoned` this run.
     errored: Vec<String>,
-    /// (#2361 item 2) `(rule, unit id)` for every `crawl.unit` step that
+    /// (#2361 item 2) `(rule, unit id)` for every `dispatch.unit` step that
     /// reached `Complete` — the ONLY units whose planned windows count as
     /// covered. Both halves come off the step's own config, which the
     /// grown task stamps (`rule`/`unit` in `review.json`'s and
@@ -449,7 +449,7 @@ struct StepScan {
     /// default/skip/clean outcome: `load_phases()` failing (the whole scan
     /// returns empty — no rule, unit, or rejection is ever named), a
     /// per-phase `load_steps_for_phase` failing (that phase's steps are
-    /// invisible to every count above), and a `crawl.unit` step's own
+    /// invisible to every count above), and a `dispatch.unit` step's own
     /// output failing to parse (`findings_rejected` reads as `0` — a
     /// parse failure and a genuinely clean unit are indistinguishable
     /// without this). Each entry names what was unreadable and why, so a
@@ -471,7 +471,7 @@ pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
 /// (#2310 P4c-2b PR #2357 review MUST FIX C/D, CONSIDER F) Scan every
 /// `Task`/`Step` this mission recorded (across every phase — the same
 /// per-phase `lifecycle::load_steps_for_phase` walk `crawl::unit_step::
-/// summarize_mission` uses) for `crawl.unit` steps (to total
+/// summarize_mission` uses) for `dispatch.unit` steps (to total
 /// `findings_rejected`, and to name any that never converged) and
 /// `plan.sites`/`crawl.plan` steps (to name any rule that never finished
 /// planning). An unreadable phase/step list no longer vanishes into a
@@ -481,7 +481,7 @@ pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
 /// mission with nothing wrong.
 ///
 /// **The scan keys on kind ids held as constants**
-/// ([`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
+/// ([`SCANNED_DISPATCH_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
 /// [`SCANNED_CRAWL_PLAN_KIND`], #2310 swarm F). This is a closed list,
 /// matched by string, and there is no generic property ("this kind
 /// declares residency") behind it — so a THIRD config that reviews work
@@ -510,9 +510,9 @@ pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
 /// findings_rejected accounting must be added to this match at the same
 /// time it is written** — a step of any other kind that merely fails is
 /// now caught by the fallthrough, but its rule/unit specifics are not.
-/// [`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
+/// [`SCANNED_DISPATCH_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
 /// [`SCANNED_CRAWL_PLAN_KIND`] come from the same [`ConfigKind`] ids as
-/// `darkmux_lab::crawl::{unit_step::CRAWL_UNIT_KIND, plan_sites_step::
+/// `darkmux_lab::crawl::{unit_step::DISPATCH_UNIT_KIND, plan_sites_step::
 /// PLAN_SITES_KIND, plan_step::CRAWL_PLAN_KIND}` (this crate cannot depend
 /// on `darkmux-lab` — this module's own doc); a conformance test in
 /// `src/mission_launch.rs` checks them against the full `StepKindRegistry`.
@@ -557,8 +557,8 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
             if step.task_id == exclude_task_id {
                 continue;
             }
-            match step.kind.as_str() {
-                SCANNED_CRAWL_UNIT_KIND => {
+            match step.kind_id() {
+                SCANNED_DISPATCH_UNIT_KIND => {
                     if step.status != crate::types::NodeStatus::Complete {
                         scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
                         continue;
@@ -590,7 +590,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     // plan named were actually reviewed —
                     // (#2454) UNLESS it completed without ever dispatching.
                     // A `Complete` status stopped being sufficient evidence
-                    // the moment `crawl.unit` gained a path that returns
+                    // the moment `dispatch.unit` gained a path that returns
                     // `Ok` having done NO work: the thermal breaker's
                     // between-units gate. Such a unit read nothing, so
                     // counting its planned windows as covered would make the
@@ -607,14 +607,14 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                         .and_then(|v| v.as_str())
                         .is_some_and(|r| r == UNIT_RESULT_THERMAL_STOP);
                     // NOT pushed to `errored` either: nothing failed. The
-                    // run's own `crawl.summary` is where a thermally
+                    // run's own `dispatch.summary` is where a thermally
                     // shortened run is NAMED (`stopped_by: "thermal"`, the
                     // unit's own `thermal_stop` result); giving the posted
                     // review its own "skipped" line means a new
                     // `DeliverScope` field, its render and its goldens —
                     // worth doing, deliberately not folded into this fix.
                     if !never_dispatched {
-                        let identity = crawl_identity(&step.kind, &step.config);
+                        let identity = crawl_identity(step.kind_id(), &step.config);
                         if let (Some(rule), Some(unit)) = (identity.rule, identity.unit) {
                             scan.completed_units.insert((rule, unit));
                         }
@@ -632,7 +632,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     if step.status == crate::types::NodeStatus::Complete {
                         continue;
                     }
-                    let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
+                    let rule = crawl_identity(step.kind_id(), &step.config).rule.unwrap_or_else(|| step.id.clone());
                     scan.not_attempted.push(rule);
                     scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
                 }
@@ -886,7 +886,7 @@ mod tests {
 
     /// (F2, from #2374's review) M counts DISTINCT RULES, not
     /// rule-bearing tasks. `crawl.json` declares two tasks per rule — a
-    /// `crawl.plan` and a `crawl.unit` grow template — so the
+    /// `crawl.plan` and a `dispatch.unit` grow template — so the
     /// `task id -> rule` map holds two entries for one rule and
     /// `declared.len()` rendered a single-rule run as "0 of 2 rules
     /// reviewed", a denominator no rule count can ever reach.
@@ -909,7 +909,7 @@ mod tests {
                       "steps": [{"id": "s-plan", "kind": "plan.sites",
                                  "config": {"rule": "intent-vs-diff"}}] },
                     { "id": "unit-intent-vs-diff",
-                      "steps": [{"id": "s-unit", "kind": "crawl.unit",
+                      "steps": [{"id": "s-unit", "kind": "dispatch.unit",
                                  "config": {"rule": "intent-vs-diff"}}] },
                 ],
             }],
@@ -1000,7 +1000,7 @@ mod tests {
         // gate-failed mod is a DOUBLE-CHECK thread (`render_github_review`
         // already renders it that way), never counted as "refused" —
         // that field is now the runtime-boundary rejection count only
-        // (`crawl.unit`'s own `findings_rejected`, asserted below), so a
+        // (`dispatch.unit`'s own `findings_rejected`, asserted below), so a
         // mission with zero unit steps at all reads `refused: 0` even
         // with a gate-failed mod present.
         assert_eq!(wrapped.body.scope.refused, 0, "a gate-failed mod is a double-check thread, not a refusal: {:?}", wrapped.body.scope);
@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     /// (#2310 P4c-2b PR #2357 review CONSIDER F, proven) `refused` reads
-    /// off `crawl.unit`'s own `findings_rejected` — this mission's Step
+    /// off `dispatch.unit`'s own `findings_rejected` — this mission's Step
     /// records, generically as JSON (never `darkmux-lab`'s typed
     /// `UnitOutcome`).
     #[test]
@@ -1020,7 +1020,7 @@ mod tests {
         let _tmp = IsolatedState::new();
         save_phase();
         let unit_output = crate::step_output::Output::wrap(
-            "crawl.unit-outcome",
+            "dispatch.unit",
             json!({ "schema_version": "1.1", "unit": "u-1", "result": "stop", "findings": 1, "findings_rejected": 3 }),
             crate::step_output::Producer::of(MISSION, "unit-task", "unit-step-1"),
         )
@@ -1032,7 +1032,7 @@ mod tests {
             &Step {
                 id: "unit-step-1".into(),
                 task_id: "unit-task".into(),
-                kind: "crawl.unit".into(),
+                kind: "dispatch.unit".into(),
                 gate: None,
                 status: NodeStatus::Complete,
                 config: json!({}),
@@ -1048,7 +1048,7 @@ mod tests {
             &Step {
                 id: "unit-step-2".into(),
                 task_id: "unit-task-2".into(),
-                kind: "crawl.unit".into(),
+                kind: "dispatch.unit".into(),
                 gate: None,
                 status: NodeStatus::Error,
                 config: json!({}),
@@ -1070,7 +1070,7 @@ mod tests {
         );
     }
 
-    /// Save one `crawl.unit` step for `rule`/`unit` at `status`.
+    /// Save one `dispatch.unit` step for `rule`/`unit` at `status`.
     fn save_unit_step(id: &str, rule: &str, unit: &str, status: NodeStatus) {
         save_unit_step_with_result(id, rule, unit, status, "stop");
     }
@@ -1081,7 +1081,7 @@ mod tests {
     fn save_unit_step_with_result(id: &str, rule: &str, unit: &str, status: NodeStatus, result: &str) {
         let output = (status == NodeStatus::Complete).then(|| {
             crate::step_output::Output::wrap(
-                "crawl.unit-outcome",
+                "dispatch.unit",
                 json!({ "schema_version": "1.1", "unit": unit, "result": result, "findings": 1, "findings_rejected": 0 }),
                 crate::step_output::Producer::of(MISSION, "unit-task", id),
             )
@@ -1094,7 +1094,7 @@ mod tests {
             &Step {
                 id: id.into(),
                 task_id: format!("unit-{rule}"),
-                kind: "crawl.unit".into(),
+                kind: "dispatch.unit".into(),
                 gate: None,
                 status,
                 config: json!({ "rule": rule, "unit": unit }),
@@ -1237,7 +1237,7 @@ mod tests {
             .collect();
         std::fs::write(
             plan_dir.join(format!("{rule}.json")),
-            serde_json::to_string(&json!({ "kind": "crawl.plan", "body": { "units": units } })).unwrap(),
+            serde_json::to_string(&json!({ "kind": "plan.sites", "body": { "units": units } })).unwrap(),
         )
         .unwrap();
     }
@@ -1400,7 +1400,7 @@ mod tests {
         std::fs::write(
             plan_dir.join("existing-solution.json"),
             serde_json::to_string(&json!({
-                "kind": "crawl.plan",
+                "kind": "plan.sites",
                 "schema_version": "1",
                 "body": {
                     "schema_version": "1.1",
@@ -1476,9 +1476,9 @@ mod tests {
     }
 
     /// (silent-miss audit, 2026-09-06) Before this fix, `_ => {}` meant a
-    /// step of any kind OTHER than `crawl.unit`/`plan.sites`/`crawl.plan`
+    /// step of any kind OTHER than `dispatch.unit`/`plan.sites`/`crawl.plan`
     /// that ended `Error` was invisible to the scope entirely — a
-    /// `crawl.json` config that grows a `crawl.summary`/`finding`/
+    /// `crawl.json` config that grows a `dispatch.summary`/`finding`/
     /// `dispatch.internal` step which then errors produced a scope
     /// identical to one where that step never ran into trouble. Red-proved
     /// by reverting the `other =>` arm to `_ => {}`: this test then fails
@@ -1494,7 +1494,7 @@ mod tests {
             &Step {
                 id: "weird-step-1".into(),
                 task_id: "weird-task".into(),
-                kind: "crawl.summary".into(),
+                kind: "dispatch.summary".into(),
                 gate: None,
                 status: NodeStatus::Error,
                 config: json!({}),
@@ -1509,7 +1509,7 @@ mod tests {
         let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
-            wrapped.body.scope.errored.iter().any(|e| e.contains("crawl.summary") && e.contains("weird-step-1")),
+            wrapped.body.scope.errored.iter().any(|e| e.contains("dispatch.summary") && e.contains("weird-step-1")),
             "an unrecognized kind that errored must still be named: {:?}",
             wrapped.body.scope
         );
@@ -1534,7 +1534,7 @@ mod tests {
             &Step {
                 id: "weird-step-2".into(),
                 task_id: "weird-task-2".into(),
-                kind: "crawl.summary".into(),
+                kind: "dispatch.summary".into(),
                 gate: None,
                 status: NodeStatus::Complete,
                 config: json!({}),
@@ -1725,7 +1725,7 @@ mod tests {
         );
     }
 
-    /// (silent-miss audit, 2026-09-06) A `crawl.unit` step's own output
+    /// (silent-miss audit, 2026-09-06) A `dispatch.unit` step's own output
     /// that fails to parse used to be swallowed by `let Ok((doc, _)) = ...
     /// else { continue }` — `findings_rejected` for that unit silently
     /// read as `0`, indistinguishable from a genuinely clean unit. Now
@@ -1743,7 +1743,7 @@ mod tests {
             &Step {
                 id: "unit-step-bad".into(),
                 task_id: "unit-task-bad".into(),
-                kind: "crawl.unit".into(),
+                kind: "dispatch.unit".into(),
                 gate: None,
                 status: NodeStatus::Complete,
                 config: json!({}),
@@ -1774,7 +1774,7 @@ mod tests {
     /// phase (a `.json` file that fails to parse as a `Step`) used to be
     /// swallowed by `load_steps_for_phase`'s `Err` being skipped via
     /// `let Ok(steps) = ... else { continue }` — that phase's steps
-    /// (including any `crawl.unit`/`plan.sites` records) became entirely
+    /// (including any `dispatch.unit`/`plan.sites` records) became entirely
     /// invisible to the scan, no different from a phase with nothing to
     /// report. Now named on `GatherOutput::unreadable`.
     #[test]

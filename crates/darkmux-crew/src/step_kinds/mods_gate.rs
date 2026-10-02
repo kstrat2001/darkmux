@@ -130,7 +130,7 @@ pub const MODS_GATE_KIND: &str = ConfigKind::ModsGate.id();
 
 /// What one `mods.gate` step reports as its own output — a small summary,
 /// never the gated mods themselves (a reader wanting those reads the mod
-/// store, the same discipline `crawl.summary` uses for findings).
+/// store, the same discipline `dispatch.summary` uses for findings).
 #[derive(Debug, Clone, Serialize)]
 struct GateSummary {
     for_key: String,

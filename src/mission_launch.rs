@@ -176,6 +176,14 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     Ok(registry)
 }
 
+/// What every config-validating surface checks a document against: the ids and
+/// declared ports of [`all_step_kinds`]. `mission launch`, `mission config show`,
+/// `darkmux doctor` and the panel runner all build it here, so none can
+/// validate against a narrower kind set than launch resolves (#2312).
+pub(crate) fn kind_catalog() -> Result<darkmux_crew::mission_config::KindCatalog> {
+    Ok(all_step_kinds()?.catalog())
+}
+
 /// `darkmux mission launch <config-id>` entry point. Returns the process
 /// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
 /// map exactly (#1284 review round 1, must-fix 1):
@@ -459,7 +467,7 @@ pub fn launch(
     let registry = all_step_kinds()?;
     let known_ids = registry.ids();
     let known_kinds: Vec<&str> = known_ids.iter().map(String::as_str).collect();
-    let findings = config.validate(&known_kinds);
+    let findings = config.validate_with(&registry.catalog());
     let errors: Vec<_> = findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
     if !errors.is_empty() {
         let msg = errors.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("\n");
@@ -902,7 +910,7 @@ pub fn launch(
     for w in &interpret_warnings {
         eprintln!("{}", style::dim(&format!("mission launch: {w}")));
     }
-    // (#2595 review round 2, CONSIDER 5) A statically-declared `crawl.unit`
+    // (#2595 review round 2, CONSIDER 5) A statically-declared `dispatch.unit`
     // step (a hand-authored config naming the kind directly, with no
     // `grow`) reaches THIS map, never `grow_phase`'s own stamp — see
     // `stamp_unit_timeout`'s own doc. Stamped here, before the mint-time
@@ -1909,7 +1917,7 @@ type GrowthBatch = (
 
 /// (#2595 review round 2, MUST FIX 1+2) `--timeout`'s RAW flag value —
 /// `None` when the operator omitted it, `Some(n)` when they typed
-/// `--timeout n` — stamped onto every grown `crawl.unit` step's own
+/// `--timeout n` — stamped onto every grown `dispatch.unit` step's own
 /// `config`. This is deliberately the un-collapsed `Option`, not `launch`'s
 /// local `.unwrap_or(600)` value: `config.timeout_seconds` routes straight
 /// into `DispatchOpts::timeout_override_seconds` (see `unit_step.rs`'s own
@@ -1959,7 +1967,7 @@ fn stamp_unit_timeout(steps: &mut BTreeMap<String, crew::types::Step>, timeout_s
         return;
     };
     for step in steps.values_mut() {
-        if step.kind != darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND {
+        if step.kind_id() != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
             continue;
         }
         // An explicit --timeout wins OUTRIGHT — overwrite even a
@@ -1975,7 +1983,7 @@ fn stamp_unit_timeout(steps: &mut BTreeMap<String, crew::types::Step>, timeout_s
             }
             // (#2595 review round 2, CONSIDER 7) `Step.config` is untyped
             // — a string/number/array/bool can reach here (nothing
-            // upstream guarantees a crawl.unit step's config is an object
+            // upstream guarantees a dispatch.unit step's config is an object
             // or null). Leave it completely untouched rather than
             // clobbering whatever it held with `{"timeout_seconds": n}`:
             // the step's own parse (`UnitStepConfig::from_step`) fails
@@ -6149,7 +6157,7 @@ mod tests {
         ],
         "phases": [
             {"id": "p1", "tasks": [{"id": "t1", "steps": [
-                {"id": "unit", "kind": "crawl.unit", "config": {"plan": "p", "unit": "u", "draws": "{{draws}}"}}
+                {"id": "unit", "kind": "dispatch.unit", "config": {"plan": "p", "unit": "u", "draws": "{{draws}}"}}
             ]}]}
         ]
     }"#;
@@ -6171,7 +6179,7 @@ mod tests {
                 }
                 let err = launch("draws-param-test-mission", None, &params, None).expect_err("the rule must refuse the launch");
                 let msg = format!("{err:#}");
-                assert!(msg.contains("step `unit` (`crawl.unit`)") && msg.contains(rule), "{param} dry={dry}: {msg}");
+                assert!(msg.contains("step `unit` (`dispatch.unit`)") && msg.contains(rule), "{param} dry={dry}: {msg}");
                 assert!(all_mission_ids().is_empty(), "a refused launch must mint nothing");
             }
         }
@@ -7064,7 +7072,11 @@ mod tests {
                 "phases": [{
                     "id": "build",
                     "tasks": [{
+                        "id": "build-worktree",
+                        "steps": [{"id": "build-worktree-step", "kind": "mission.worktree", "config": null}]
+                    }, {
                         "id": "build-coder",
+                        "depends_on": ["build-worktree"],
                         "steps": [{"id": "build-coder-step", "kind": "mission.coder", "config": null}]
                     }]
                 }]
@@ -7319,7 +7331,7 @@ mod tests {
         assert_eq!(registered, typed);
     }
 
-    /// `darkmux-crew`'s `records_gather` scan reads a `crawl.unit` outcome's
+    /// `darkmux-crew`'s `records_gather` scan reads a `dispatch.unit` outcome's
     /// `result` to tell a unit that REVIEWED its windows from one the thermal
     /// breaker skipped before it ever dispatched (#2454). It cannot depend on
     /// `darkmux-lab`, so it keeps its own copy of the skip marker
@@ -7389,6 +7401,78 @@ mod tests {
         assert!(registry.get("dispatch.internal").is_ok(), "dispatch.internal must resolve");
         assert!(registry.get("mission.coder").is_ok(), "mission.coder must resolve");
         assert!(registry.get("plan.sites").is_ok(), "plan.sites must resolve");
+    }
+
+    /// Every embedded built-in config, parsed from its template file, so a
+    /// config added later cannot escape the wiring check.
+    fn builtin_configs() -> Vec<(String, serde_json::Value)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs");
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(out.len() >= 4, "the built-in configs were found");
+        out
+    }
+
+    fn wiring_errors(value: &serde_json::Value) -> Vec<String> {
+        let cfg: MissionConfig = serde_json::from_value(value.clone()).unwrap();
+        let catalog = all_step_kinds().unwrap().catalog();
+        cfg.validate_with(&catalog)
+            .into_iter()
+            .filter(|f| f.severity == FindingSeverity::Error)
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    /// (#2312) Every built-in is wired consistently with its kinds' declared ports.
+    #[test]
+    fn every_builtin_config_validates_clean_against_the_kinds_ports() {
+        for (id, value) in builtin_configs() {
+            let errors = wiring_errors(&value);
+            assert!(errors.is_empty(), "built-in `{id}` must validate clean: {errors:?}");
+        }
+    }
+
+    /// (#2312) The static shape: a `dispatch.unit` whose own `config.plan` names
+    /// the plan has no producer task and validates clean; with no `config.plan`
+    /// and no producer it is refused.
+    #[test]
+    fn a_unit_with_a_literal_plan_needs_no_producer_task() {
+        let cfg = |config: serde_json::Value| {
+            serde_json::json!({"id": "static-unit", "name": "static", "schema_version": "4.0", "phases": [{"id": "p", "tasks": [
+                {"id": "t", "steps": [{"id": "s", "kind": "dispatch.unit", "config": config}]}
+            ]}]})
+        };
+        assert!(wiring_errors(&cfg(serde_json::json!({"plan": "/p.json", "unit": "u1"}))).is_empty());
+        let errors = wiring_errors(&cfg(serde_json::json!({"unit": "u1"})));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("dispatch.unit") && errors[0].contains("plan.sites"), "{}", errors[0]);
+    }
+
+    /// (#2312) Rewire `crawl`'s growth to a `procedural.shell` producer: the
+    /// unit's plan would be shell text, so the config is refused naming both
+    /// tasks and both kinds. (Probed on main first: such a config mints, then
+    /// every unit fails reading its plan, "missing field `kind`".)
+    #[test]
+    fn a_unit_growing_from_a_shell_producer_is_refused_naming_both_kinds() {
+        let (_, mut crawl) = builtin_configs().into_iter().find(|(id, _)| id == "crawl").unwrap();
+        crawl["phases"][0]["tasks"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "shell-plan",
+            "steps": [{"id": "shell-plan-step", "kind": "procedural.shell", "config": {"command": "echo {}"}}]
+        }));
+        let unit = crawl["phases"][1]["tasks"][0].as_object_mut().unwrap();
+        unit["grow"]["from"] = serde_json::json!("shell-plan");
+        unit["depends_on"] = serde_json::json!(["shell-plan"]);
+        let unit_id = unit["id"].as_str().unwrap().to_string();
+        let errors = wiring_errors(&crawl);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        for part in [unit_id.as_str(), "dispatch.unit", "plan.sites", "shell-plan", "procedural.shell", "text"] {
+            assert!(errors[0].contains(part), "the error names `{part}`: {}", errors[0]);
+        }
     }
 
     /// (#1549) The overrides must reach a coder-phase-shaped graph even when
@@ -9316,7 +9400,7 @@ mod tests {
     // crawl's (and review's) per-unit dispatch timeout, alongside
     // coder-phase. `register_coder_phase_kinds` stamps the resolved value
     // onto the coder step's `Step.config`; nothing ever did the same for a
-    // `crawl.unit` step, because a unit `Step` doesn't exist statically —
+    // `dispatch.unit` step, because a unit `Step` doesn't exist statically —
     // it's grown from a plan at the phase boundary (#2300). A first pass at
     // this fix collapsed the flag to a `u32` (`.unwrap_or(600)`) BEFORE
     // reaching `stamp_unit_timeout`, so an omitted `--timeout` looked
@@ -9335,7 +9419,7 @@ mod tests {
             id: id.to_string(),
             task_id: format!("{id}-task"),
             gate: None,
-            kind: darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND.to_string(),
+            kind: darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND.to_string(),
             status: NodeStatus::Planned,
             config,
             started_ts: None,
@@ -9402,7 +9486,7 @@ mod tests {
     #[test]
     fn stamp_unit_timeout_omitted_flag_handles_a_null_config() {
         // `procedural.noop`'s own `Default` shape — exercised here because
-        // nothing guarantees a `crawl.unit` step's config is already an
+        // nothing guarantees a `dispatch.unit` step's config is already an
         // object before this stamp runs.
         let mut steps = BTreeMap::new();
         steps.insert("u1".to_string(), crawl_unit_step("u1", serde_json::Value::Null));
@@ -9495,13 +9579,13 @@ mod tests {
     #[test]
     fn stamp_unit_timeout_ignores_every_other_step_kind() {
         // (#2595 review round 2, MUST FIX 4, vacuity mutation 1) A prior
-        // round of this test declared only ONE non-`crawl.unit` step
+        // round of this test declared only ONE non-`dispatch.unit` step
         // (`mission.coder`) — which is ALSO separately excluded by
         // `uses_coder_phase_kinds` upstream, so a mutant that replaced the
         // kind gate with "stamp every kind except the coder" left this
         // test green. A second, genuinely DISPATCHING non-unit kind
         // (`dispatch.internal`, whose own default is 3600s, not 600/900)
-        // closes that gap: this is scoped to `crawl.unit` ONLY, never to
+        // closes that gap: this is scoped to `dispatch.unit` ONLY, never to
         // `mission.coder` (which has its own stamping in
         // `register_coder_phase_kinds`) nor to any other dispatching kind
         // that has nothing to do with #2595.
@@ -9526,7 +9610,7 @@ mod tests {
         for id in ["s1", "s2"] {
             assert!(
                 steps[id].config.get("timeout_seconds").is_none(),
-                "a non-crawl.unit step (`{id}`, kind `{}`) must be untouched by this stamp; got {:?}",
+                "a non-dispatch.unit step (`{id}`, kind `{}`) must be untouched by this stamp; got {:?}",
                 steps[id].kind,
                 steps[id].config
             );
@@ -9606,7 +9690,7 @@ mod tests {
                         "id": "{{item.id}}",
                         "config": { "plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "rule-a" }
                     },
-                    "steps": [{"id": "unit-rule-a-step", "kind": "crawl.unit", "config": {}}]
+                    "steps": [{"id": "unit-rule-a-step", "kind": "dispatch.unit", "config": {}}]
                 },
                 {
                     "id": "unit-rule-b",
@@ -9617,7 +9701,7 @@ mod tests {
                         "id": "{{item.id}}",
                         "config": { "plan": "{{from.output}}", "unit": "{{item.id}}", "rule": "rule-b" }
                     },
-                    "steps": [{"id": "unit-rule-b-step", "kind": "crawl.unit", "config": {}}]
+                    "steps": [{"id": "unit-rule-b-step", "kind": "dispatch.unit", "config": {}}]
                 }
             ]
         }))
@@ -9634,7 +9718,7 @@ mod tests {
     /// legal value grows.
     #[test]
     fn grow_phase_refuses_a_grown_copy_whose_config_breaks_its_kinds_rule() {
-        let all_known = &[darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND];
+        let all_known = &[darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND];
         let declared_inputs = std::collections::BTreeSet::new();
         let collected = BTreeMap::new();
         for (draws, refused) in [(0, true), (2, false)] {
@@ -9656,7 +9740,7 @@ mod tests {
     #[test]
     fn grow_phase_explicit_flag_stamps_every_grown_crawl_unit_step_across_two_templates() {
         let (phase, real_task_ids, tasks_by_id, steps) = two_template_crawl_phase_fixture();
-        let all_known = &[darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND];
+        let all_known = &[darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND];
         let declared_inputs = std::collections::BTreeSet::new();
         let collected = BTreeMap::new();
 
@@ -9679,12 +9763,12 @@ mod tests {
             assert_eq!(grown_tasks.len(), 1, "the plan named exactly one unit per template");
             let grown_step = grown_steps
                 .values()
-                .find(|s| s.kind == darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND)
-                .unwrap_or_else(|| panic!("template `{}` must grow a crawl.unit step", event.task_template));
+                .find(|s| s.kind == darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND)
+                .unwrap_or_else(|| panic!("template `{}` must grow a dispatch.unit step", event.task_template));
             assert_eq!(
                 grown_step.config.get("timeout_seconds").and_then(|v| v.as_u64()),
                 Some(900),
-                "grow_phase must stamp an explicit --timeout onto EVERY grown crawl.unit step, \
+                "grow_phase must stamp an explicit --timeout onto EVERY grown dispatch.unit step, \
                  not just the first template's batch (template `{}`); got config {:?}",
                 event.task_template,
                 grown_step.config
@@ -9699,7 +9783,7 @@ mod tests {
         // grown units with no `config.timeout_seconds` at all, so the
         // standing env/config/600 resolution governs each one downstream.
         let (phase, real_task_ids, tasks_by_id, steps) = two_template_crawl_phase_fixture();
-        let all_known = &[darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND];
+        let all_known = &[darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND];
         let declared_inputs = std::collections::BTreeSet::new();
         let collected = BTreeMap::new();
 
@@ -9722,11 +9806,11 @@ mod tests {
             assert_eq!(grown_tasks.len(), 1, "the plan named exactly one unit per template");
             let grown_step = grown_steps
                 .values()
-                .find(|s| s.kind == darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND)
-                .unwrap_or_else(|| panic!("template `{}` must grow a crawl.unit step", event.task_template));
+                .find(|s| s.kind == darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND)
+                .unwrap_or_else(|| panic!("template `{}` must grow a dispatch.unit step", event.task_template));
             assert!(
                 grown_step.config.get("timeout_seconds").is_none(),
-                "grow_phase must NOT stamp anything onto a grown crawl.unit step when --timeout \
+                "grow_phase must NOT stamp anything onto a grown dispatch.unit step when --timeout \
                  was omitted (template `{}`) — the standing env/config/600 tier must decide; got \
                  config {:?}",
                 event.task_template,
@@ -9762,7 +9846,7 @@ mod tests {
     }
 
     // (#2595 review round 2, CONSIDER 5) A hand-authored config can declare
-    // a `crawl.unit` step STATICALLY — no `grow` — and that step reaches
+    // a `dispatch.unit` step STATICALLY — no `grow` — and that step reaches
     // `mission_config::interpret`'s own returned map, never `grow_phase`'s.
     // These tests pin the exact composition `launch()` now runs at its own
     // call site (`interpret` -> `stamp_unit_timeout` on `all_steps`, before
@@ -9772,22 +9856,22 @@ mod tests {
         let cfg: mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
             "id": "m", "name": "M", "schema_version": "3.2", "inputs": [],
             "phases": [{"id": "p", "tasks": [{"id": "t", "role_id": "crawler", "steps": [
-                {"id": "s", "kind": "crawl.unit", "config": {"plan": "/p.json", "unit": "u1"}}
+                {"id": "s", "kind": "dispatch.unit", "config": {"plan": "/p.json", "unit": "u1"}}
             ]}]}]
         }))
         .expect("config parses");
         let (_tasks, mut all_steps, _warnings) =
             mission_config::interpret(&cfg, &mission_config::LaunchParams::default())
-                .expect("a static crawl.unit step interprets cleanly");
+                .expect("a static dispatch.unit step interprets cleanly");
         stamp_unit_timeout(&mut all_steps, Some(900));
         let step = all_steps
             .values()
-            .find(|s| s.kind == darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND)
-            .expect("the static crawl.unit step must survive interpret");
+            .find(|s| s.kind == darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND)
+            .expect("the static dispatch.unit step must survive interpret");
         assert_eq!(
             step.config.get("timeout_seconds").and_then(|v| v.as_u64()),
             Some(900),
-            "a statically-declared crawl.unit step must be stamped the SAME way a grown one is — \
+            "a statically-declared dispatch.unit step must be stamped the SAME way a grown one is — \
              got config {:?}",
             step.config
         );
@@ -9798,21 +9882,21 @@ mod tests {
         let cfg: mission_config::MissionConfig = serde_json::from_value(serde_json::json!({
             "id": "m", "name": "M", "schema_version": "3.2", "inputs": [],
             "phases": [{"id": "p", "tasks": [{"id": "t", "role_id": "crawler", "steps": [
-                {"id": "s", "kind": "crawl.unit", "config": {"plan": "/p.json", "unit": "u1"}}
+                {"id": "s", "kind": "dispatch.unit", "config": {"plan": "/p.json", "unit": "u1"}}
             ]}]}]
         }))
         .expect("config parses");
         let (_tasks, mut all_steps, _warnings) =
             mission_config::interpret(&cfg, &mission_config::LaunchParams::default())
-                .expect("a static crawl.unit step interprets cleanly");
+                .expect("a static dispatch.unit step interprets cleanly");
         stamp_unit_timeout(&mut all_steps, None);
         let step = all_steps
             .values()
-            .find(|s| s.kind == darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND)
-            .expect("the static crawl.unit step must survive interpret");
+            .find(|s| s.kind == darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND)
+            .expect("the static dispatch.unit step must survive interpret");
         assert!(
             step.config.get("timeout_seconds").is_none(),
-            "an omitted --timeout must leave a statically-declared crawl.unit step's config \
+            "an omitted --timeout must leave a statically-declared dispatch.unit step's config \
              untouched too — got {:?}",
             step.config
         );

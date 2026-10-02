@@ -61,7 +61,7 @@
   "crates/darkmux-flow/src/status.rs::format_status_human": 37,
   "crates/darkmux-lab/src/crawl/plan.rs::plan_with_params": 28,
   "crates/darkmux-lab/src/crawl/semver.rs::token_admits": 19,
-  "crates/darkmux-lab/src/crawl/unit_step.rs::StepKind for CrawlUnitStepKind::run": 33,
+  "crates/darkmux-lab/src/crawl/unit_step.rs::StepKind for DispatchUnitStepKind::run": 33,
   "crates/darkmux-lab/src/crawl/unit_step.rs::summarize_mission": 16,
   "crates/darkmux-lab/src/lab/bundle/facts.rs::call_facts_for": 18,
   "crates/darkmux-lab/src/lab/bundle/mod.rs::build_bundles": 46,

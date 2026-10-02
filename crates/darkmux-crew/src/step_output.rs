@@ -9,8 +9,8 @@
 //! string protocol between kinds.
 //!
 //! This module adds the thin part around the body: WHO produced it, WHEN,
-//! and WHAT it is. `kind` is a content id (`"crawl.plan"`,
-//! `"crawl.unit-outcome"`, `"crawl.summary"`) the reader checks against the
+//! and WHAT it is. `kind` is a content id (`"plan.sites"`,
+//! `"dispatch.unit"`, `"dispatch.summary"`; see [`labels`]) the reader checks against the
 //! value it expects BEFORE deserializing `body` — a mismatch is a refusal
 //! naming both, which is what turns a mis-wired graph into an error message
 //! rather than a confusing parse failure deep inside a body struct.
@@ -52,6 +52,36 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// The content ids (`Output::kind`) the shared dispatch kinds' outputs carry
+/// (#2430). The label names WHAT a body is, so it follows the procedure and
+/// not the mission that first used it: a plan of sites, one unit's outcome,
+/// the fold over unit outcomes. A port's name IS its label (#2312).
+pub mod labels {
+    /// What an untyped producer (`procedural.shell`, `dispatch.internal`)
+    /// hands off: text, with no wrapped body behind it.
+    pub const TEXT: &str = "text";
+    /// A plan of sites; written by `plan.sites` and `crawl.plan`, read by
+    /// `dispatch.unit`.
+    pub const PLAN: &str = "plan.sites";
+    /// One `dispatch.unit` step's outcome; read by `dispatch.summary`.
+    pub const UNIT_OUTCOME: &str = "dispatch.unit";
+    /// `dispatch.summary`'s body.
+    pub const SUMMARY: &str = "dispatch.summary";
+
+    /// The current label for one an archive may still carry (written before
+    /// the #2430 rename). The ONLY place the old spellings exist: a read
+    /// maps through it and nothing writes them back. Any other label is
+    /// returned unchanged.
+    pub fn current(label: &str) -> &str {
+        match label {
+            "crawl.plan" => PLAN,
+            "crawl.unit-outcome" => UNIT_OUTCOME,
+            "crawl.summary" => SUMMARY,
+            other => other,
+        }
+    }
+}
 
 /// [`Output`]'s own schema version — the ENVELOPE's, never the body's. A
 /// body carries its own `schema_version` and versions independently.
@@ -264,7 +294,7 @@ impl<T: DeserializeOwned> Output<T> {
             });
         }
         let found = doc.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-        if found != expected_kind {
+        if labels::current(found) != expected_kind {
             bail!(
                 "step output: {whence} is a `{found}` output, but a `{expected_kind}` was \
                  expected — the graph wires this step to the wrong producer"
@@ -286,8 +316,10 @@ impl<T: DeserializeOwned> Output<T> {
                 );
             }
         }
-        serde_json::from_value(doc)
-            .with_context(|| format!("step output: reading {whence} as a `{expected_kind}` envelope"))
+        let mut out: Self = serde_json::from_value(doc)
+            .with_context(|| format!("step output: reading {whence} as a `{expected_kind}` envelope"))?;
+        out.kind = expected_kind.to_string();
+        Ok(out)
     }
 }
 
@@ -364,11 +396,11 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn an_envelope_round_trips_through_its_own_output_string() {
-        let out = Output::wrap("crawl.unit-outcome", body(), Producer::of("m-1", "t-1", "s-1"));
+        let out = Output::wrap("dispatch.unit", body(), Producer::of("m-1", "t-1", "s-1"));
         let text = out.to_output_string().unwrap();
-        let back: Output<Body> = Output::read(&text, "crawl.unit-outcome").unwrap();
+        let back: Output<Body> = Output::read(&text, "dispatch.unit").unwrap();
         assert_eq!(back.body, body());
-        assert_eq!(back.kind, "crawl.unit-outcome");
+        assert_eq!(back.kind, "dispatch.unit");
         assert_eq!(back.schema_version, OUTPUT_SCHEMA_VERSION);
         assert_eq!(back.producer.mission, "m-1");
         assert_eq!(back.producer.step, "s-1");
@@ -377,19 +409,35 @@ mod tests {
 
     #[test]
     fn the_wrong_kind_is_refused_naming_both() {
-        let text = Output::wrap("crawl.plan", body(), Producer::default()).to_output_string().unwrap();
-        let err = Output::<Body>::read(&text, "crawl.summary").unwrap_err().to_string();
-        assert!(err.contains("crawl.plan") && err.contains("crawl.summary"), "{err}");
+        let text = Output::wrap(labels::PLAN, body(), Producer::default()).to_output_string().unwrap();
+        let err = Output::<Body>::read(&text, "dispatch.summary").unwrap_err().to_string();
+        assert!(err.contains(labels::PLAN) && err.contains("dispatch.summary"), "{err}");
+    }
+
+    /// (#2430) An archived output carries the pre-rename label. It reads, and
+    /// reads AS the current label, so nothing downstream sees the old one.
+    #[test]
+    fn an_archived_output_with_a_pre_rename_label_still_reads_as_the_current_one() {
+        for (old, current) in [
+            ("crawl.plan", labels::PLAN),
+            ("crawl.unit-outcome", labels::UNIT_OUTCOME),
+            ("crawl.summary", labels::SUMMARY),
+        ] {
+            let text = Output::wrap(old, body(), Producer::default()).to_output_string().unwrap();
+            let back = Output::<Body>::read(&text, current).unwrap_or_else(|e| panic!("{old}: {e:#}"));
+            assert_eq!(back.kind, current, "{old} reads as {current}");
+            assert_eq!(back.body, body());
+        }
     }
 
     #[test]
     fn a_body_that_does_not_match_fails_by_field_name() {
         let text = serde_json::json!({
-            "schema_version": "1.0", "kind": "crawl.summary", "producer": {},
+            "schema_version": "1.0", "kind": "dispatch.summary", "producer": {},
             "produced_at": "", "body": {"schema_version": "1.0", "note": "no n"}
         })
         .to_string();
-        let err = format!("{:#}", Output::<Body>::read(&text, "crawl.summary").unwrap_err());
+        let err = format!("{:#}", Output::<Body>::read(&text, "dispatch.summary").unwrap_err());
         assert!(err.contains('n'), "{err}");
     }
 
@@ -399,45 +447,45 @@ mod tests {
         let p = dir.path().join("plan.json");
         std::fs::write(&p, serde_json::to_string(&body()).unwrap()).unwrap();
         // An UNWRAPPED body at a path — the crawl plan's shape today.
-        let back: Output<Body> = Output::read(&p.display().to_string(), "crawl.plan").unwrap();
+        let back: Output<Body> = Output::read(&p.display().to_string(), labels::PLAN).unwrap();
         assert_eq!(back.body, body());
-        assert_eq!(back.kind, "crawl.plan", "an unwrapped body takes the expected kind");
+        assert_eq!(back.kind, labels::PLAN, "an unwrapped body takes the expected kind");
     }
 
     #[test]
     fn a_ref_pointer_reads_the_wrapped_envelope_it_names_and_still_kind_checks() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("out.json");
-        std::fs::write(&p, Output::wrap("crawl.plan", body(), Producer::default()).to_output_string().unwrap())
+        std::fs::write(&p, Output::wrap(labels::PLAN, body(), Producer::default()).to_output_string().unwrap())
             .unwrap();
         let pointer = ref_output_string(&p);
-        assert_eq!(Output::<Body>::read(&pointer, "crawl.plan").unwrap().body, body());
-        let err = Output::<Body>::read(&pointer, "crawl.unit-outcome").unwrap_err().to_string();
-        assert!(err.contains("crawl.plan") && err.contains("crawl.unit-outcome"), "{err}");
+        assert_eq!(Output::<Body>::read(&pointer, labels::PLAN).unwrap().body, body());
+        let err = Output::<Body>::read(&pointer, "dispatch.unit").unwrap_err().to_string();
+        assert!(err.contains(labels::PLAN) && err.contains("dispatch.unit"), "{err}");
     }
 
     #[test]
     fn an_empty_or_missing_output_names_what_was_wanted() {
-        let err = Output::<Body>::read("   ", "crawl.summary").unwrap_err().to_string();
-        assert!(err.contains("crawl.summary") && err.contains("empty"), "{err}");
-        assert!(missing_output("task `t`", "crawl.plan").to_string().contains("crawl.plan"));
+        let err = Output::<Body>::read("   ", "dispatch.summary").unwrap_err().to_string();
+        assert!(err.contains("dispatch.summary") && err.contains("empty"), "{err}");
+        assert!(missing_output("task `t`", labels::PLAN).to_string().contains(labels::PLAN));
     }
 
     #[test]
     fn a_byte_flipped_in_a_written_body_is_refused_by_hash() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("plan.json");
-        let text = Output::wrap("crawl.plan", body(), Producer::default()).to_output_string().unwrap();
-        assert!(Output::<Body>::read_path(&p, "crawl.plan").is_err(), "nothing written yet");
+        let text = Output::wrap(labels::PLAN, body(), Producer::default()).to_output_string().unwrap();
+        assert!(Output::<Body>::read_path(&p, labels::PLAN).is_err(), "nothing written yet");
         std::fs::write(&p, &text).unwrap();
-        assert_eq!(Output::<Body>::read_path(&p, "crawl.plan").unwrap().body, body());
+        assert_eq!(Output::<Body>::read_path(&p, labels::PLAN).unwrap().body, body());
 
         // Flip one byte INSIDE the body — still valid JSON, still the right
         // kind, still every required field: only the hash catches it.
         std::fs::write(&p, text.replace("\"n\":7", "\"n\":8")).unwrap();
-        let err = Output::<Body>::read_path(&p, "crawl.plan").unwrap_err().to_string();
+        let err = Output::<Body>::read_path(&p, labels::PLAN).unwrap_err().to_string();
         assert!(err.contains("does not match its own hash"), "{err}");
-        assert!(err.contains("crawl.plan"), "the refusal names the kind: {err}");
+        assert!(err.contains(labels::PLAN), "the refusal names the kind: {err}");
     }
 
     #[test]

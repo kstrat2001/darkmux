@@ -1942,7 +1942,7 @@ mod tests {
             id: id.to_string(),
             task_id: "t-1".to_string(),
             gate: None,
-            kind: "crawl.unit".to_string(),
+            kind: "dispatch.unit".to_string(),
             status: NodeStatus::Planned,
             config: json!(null),
             started_ts: None,

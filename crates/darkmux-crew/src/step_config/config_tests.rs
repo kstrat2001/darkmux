@@ -54,7 +54,7 @@ fn a_misspelled_key_is_refused_naming_the_file_path_and_the_closest_key() {
 
 #[test]
 fn a_kind_that_reads_no_config_refuses_every_key() {
-    for kind in [ConfigKind::CrawlSummary, ConfigKind::MissionWorktree, ConfigKind::MissionVerify] {
+    for kind in [ConfigKind::DispatchSummary, ConfigKind::MissionWorktree, ConfigKind::MissionVerify] {
         let issues = kind.issues(&json!({"role_id": "x"}), "config");
         assert_eq!(rendered(&issues).len(), 1, "{}: {:?}", kind.id(), rendered(&issues));
         assert!(kind.issues(&Value::Null, "config").is_empty(), "a null config is an empty one");
@@ -94,7 +94,7 @@ fn a_wrong_type_is_refused_before_anything_runs() {
         (ConfigKind::ProceduralShell, "command", json!(["true"])),
         (ConfigKind::PlanSites, "source", json!("both")),
         (ConfigKind::CrawlPlan, "no_fetch", json!("sometimes")),
-        (ConfigKind::CrawlUnit, "draws", json!("many")),
+        (ConfigKind::DispatchUnit, "draws", json!("many")),
         (ConfigKind::MissionCoder, "injected_budget_chars", json!(true)),
     ];
     for (kind, key, bad) in cases {
@@ -146,7 +146,7 @@ fn an_unknown_step_kind_is_refused_naming_the_kinds_darkmux_ships() {
 fn grown(step_config: Value, grow_config: Value) -> Value {
     json!({"id": "d", "name": "d", "phases": [{"id": "p", "tasks": [{"id": "t",
         "grow": {"from": "x", "items": "i", "id": "{{item.id}}", "config": grow_config},
-        "steps": [{"id": "s", "kind": "crawl.unit", "config": step_config}]}]}]})
+        "steps": [{"id": "s", "kind": "dispatch.unit", "config": step_config}]}]}]})
 }
 
 #[test]
@@ -227,11 +227,11 @@ fn rule_cases() -> Vec<(ConfigKind, Value, &'static str)> {
         doc
     };
     vec![
-        (ConfigKind::CrawlUnit, unit(json!({"draws": 0})), "config.draws must be >= 1, got 0"),
-        (ConfigKind::CrawlUnit, unit(json!({"draws": 9})), "config.draws is 9, above the cap of 8"),
-        (ConfigKind::CrawlUnit, unit(json!({"draws": "9"})), "above the cap of 8"),
-        (ConfigKind::CrawlUnit, unit(json!({"timeout_seconds": 0})), "config.timeout_seconds must be >= 1"),
-        (ConfigKind::CrawlUnit, unit(json!({"plan": " "})), "config.plan must not be blank"),
+        (ConfigKind::DispatchUnit, unit(json!({"draws": 0})), "config.draws must be >= 1, got 0"),
+        (ConfigKind::DispatchUnit, unit(json!({"draws": 9})), "config.draws is 9, above the cap of 8"),
+        (ConfigKind::DispatchUnit, unit(json!({"draws": "9"})), "above the cap of 8"),
+        (ConfigKind::DispatchUnit, unit(json!({"timeout_seconds": 0})), "config.timeout_seconds must be >= 1"),
+        (ConfigKind::DispatchUnit, unit(json!({"plan": " "})), "config.plan must not be blank"),
         (ConfigKind::PlanSites, json!({"rule": "r", "source": "diff", "workspace": "w"}), "config.diff_file is required"),
         (ConfigKind::PlanSites, json!({"rule": "r", "source": "diff", "diff_file": "d"}), "config.workspace is required, or set both config.github and config.head_sha"),
         (ConfigKind::PlanSites, json!({"rule": "r", "source": "diff", "diff_file": "d", "github": "o/r"}), "config.workspace is required, or set both config.github and config.head_sha"),
@@ -243,8 +243,8 @@ fn rule_cases() -> Vec<(ConfigKind, Value, &'static str)> {
         (ConfigKind::PlanSites, json!({"rule": "../x", "workspace": "w"}), "config.rule `../x` is not a safe path component"),
         (ConfigKind::CrawlPlan, json!({"rule": "a/b", "workspace": "w"}), "config.rule `a/b` is not a safe path component"),
         (ConfigKind::CrawlPlan, json!({"rule": ".hidden", "workspace": "w"}), "config.rule `.hidden` is not a safe path component"),
-        (ConfigKind::CrawlUnit, unit(json!({"rule": "../x"})), "config.rule `../x` is not a safe path component"),
-        (ConfigKind::CrawlUnit, unit(json!({"rule": "ok+a/b"})), "config.rule `a/b` is not a safe path component"),
+        (ConfigKind::DispatchUnit, unit(json!({"rule": "../x"})), "config.rule `../x` is not a safe path component"),
+        (ConfigKind::DispatchUnit, unit(json!({"rule": "ok+a/b"})), "config.rule `a/b` is not a safe path component"),
         (ConfigKind::PlanSites, json!({"rule": " ", "workspace": "w"}), "config.rule must not be blank"),
         (ConfigKind::PlanSites, json!({"rule": "r", "workspace": "w", "sizing": {"max_est_tokens_per_unit": 0}}), "config.sizing.max_est_tokens_per_unit must be a positive integer"),
         (ConfigKind::CrawlPlan, json!({"rule": "", "workspace": "w"}), "config.rule must not be blank"),
@@ -272,14 +272,14 @@ fn a_config_the_kinds_own_reader_refuses_by_value_is_refused_by_the_gate_naming_
 
 #[test]
 fn a_placeholder_valued_config_is_left_to_the_launch_check_after_substitution() {
-    let doc = doc_with_step("crawl.unit", json!({"plan": "{{plan}}", "unit": "{{unit}}", "draws": "{{draws}}"}));
+    let doc = doc_with_step("dispatch.unit", json!({"plan": "{{plan}}", "unit": "{{unit}}", "draws": "{{draws}}"}));
     assert_eq!(rendered(&step_config_issues(&doc)), Vec::<String>::new());
 }
 
 #[test]
 fn a_config_that_is_not_an_object_is_refused_not_read_as_empty() {
     for bad in [json!("oops"), json!(5), json!(["hello"]), json!(true)] {
-        for kind in [ConfigKind::ProceduralNoop, ConfigKind::CrawlSummary, ConfigKind::CrawlUnit] {
+        for kind in [ConfigKind::ProceduralNoop, ConfigKind::DispatchSummary, ConfigKind::DispatchUnit] {
             let text = rendered(&step_config_issues(&doc_with_step(kind.id(), bad.clone()))).join("\n");
             assert!(text.contains("`phases[0].tasks[0].steps[0].config` must be an object"), "{} {bad}: {text}", kind.id());
             assert!(kind.loads(&bad).is_err(), "{} {bad}: the load refuses it too", kind.id());
@@ -325,7 +325,7 @@ fn values_the_typed_load_now_refuses_or_reads_as_unset() {
         (ConfigKind::DeliverGithubReview, json!({"emit": 5})),
         (ConfigKind::DeliverGithubReview, json!({"attribution": 5})),
         (ConfigKind::DeliverGithubReview, json!({"diff": 5})),
-        (ConfigKind::CrawlUnit, json!({"plan": "p", "unit": "u", "rule": 5})),
+        (ConfigKind::DispatchUnit, json!({"plan": "p", "unit": "u", "rule": 5})),
     ];
     for (kind, config) in refused {
         assert!(kind.loads(&config).is_err(), "{} {config}", kind.id());
@@ -333,7 +333,7 @@ fn values_the_typed_load_now_refuses_or_reads_as_unset() {
     }
     let unset = [
         (ConfigKind::CrawlPlan, json!({"rule": "r", "workspace": "w", "sizing": {"max_sites_per_unit": null}})),
-        (ConfigKind::CrawlUnit, json!({"plan": "p", "unit": "u", "no_progress_turns": null})),
+        (ConfigKind::DispatchUnit, json!({"plan": "p", "unit": "u", "no_progress_turns": null})),
         (ConfigKind::DeliverGithubReview, json!({"findings": null})),
     ];
     for (kind, config) in unset {
@@ -351,7 +351,7 @@ fn the_safe_spellings_of_github_and_rule_pass_the_gate() {
         assert_eq!(rendered(&ConfigKind::PlanSites.problems(&doc, "config")), Vec::<String>::new(), "{github}");
     }
     let unit = json!({"plan": "p", "unit": "u", "rule": "unnamed-predicate+swallowed-error"});
-    assert_eq!(rendered(&ConfigKind::CrawlUnit.problems(&unit, "config")), Vec::<String>::new());
+    assert_eq!(rendered(&ConfigKind::DispatchUnit.problems(&unit, "config")), Vec::<String>::new());
     let derived_tree = json!({"rule": "r", "source": "diff", "diff_file": "d", "github": "{{github}}", "head_sha": "{{head_sha}}"});
     assert_eq!(rendered(&ConfigKind::PlanSites.problems(&derived_tree, "config")), Vec::<String>::new());
 }
@@ -361,9 +361,9 @@ fn the_safe_spellings_of_github_and_rule_pass_the_gate() {
 #[test]
 fn an_embedded_reference_in_a_rule_is_left_to_the_launch_check() {
     let doc = json!({"plan": "p", "unit": "u", "rule": "pre-{{tag}}"});
-    assert_eq!(rendered(&ConfigKind::CrawlUnit.problems(&doc, "config")), Vec::<String>::new());
+    assert_eq!(rendered(&ConfigKind::DispatchUnit.problems(&doc, "config")), Vec::<String>::new());
     let resolved = json!({"plan": "p", "unit": "u", "rule": "pre-../x"});
-    assert!(!ConfigKind::CrawlUnit.problems(&resolved, "config").is_empty());
+    assert!(!ConfigKind::DispatchUnit.problems(&resolved, "config").is_empty());
 }
 
 /// After a launch substitutes its params, every refusal names the step and its
@@ -372,7 +372,7 @@ fn an_embedded_reference_in_a_rule_is_left_to_the_launch_check() {
 fn a_resolved_step_refusal_names_the_step_and_kind_for_every_problem() {
     let cases = [
         ("mods.gate", json!({}), "step `s1` (`mods.gate`): missing required key `config.for_key`"),
-        ("crawl.unit", json!({"plan": "p", "unit": "u", "draws": "many"}), "step `s1` (`crawl.unit`): `config.draws` must be"),
+        ("dispatch.unit", json!({"plan": "p", "unit": "u", "draws": "many"}), "step `s1` (`dispatch.unit`): `config.draws` must be"),
         ("mods.gate", json!({"for_key": " "}), "step `s1` (`mods.gate`): `config.for_key`: config.for_key must not be blank"),
         ("procedural.shell", json!({"command": "true", "comand": 1}), "step `s1` (`procedural.shell`): unknown key `config.comand`"),
     ];

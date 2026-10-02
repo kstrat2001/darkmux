@@ -15,7 +15,7 @@ label: string,
  * (#1403) The RAW step kind id (`"dispatch.internal"`, `"dispatch.map"`,
  * `"mission.coder"`, `"procedural.shell"`, …) — distinct from the
  * human `label`. The page gates the live token/turn meter on this: an
- * AI-DISPATCHING kind (`dispatch.*`, `crawl.unit`,
+ * AI-DISPATCHING kind (`dispatch.*` except `dispatch.summary`,
  * `mission.coder/verify`) shows a meter; a procedural kind
  * (`procedural.*`, `records.gather`, `mission.worktree`) shows
  * none. Empty string when the kind is genuinely unknown (a synthesized

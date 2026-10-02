@@ -3,7 +3,7 @@
 //! rules) into a deterministic `Plan` of work units with token estimates.
 //! NO model dispatch happens here; this is the mechanical, free-to-compute
 //! half of the crawler (prefilters, globs, the npm range check) that the
-//! `crawl.unit` step kind (`unit_step.rs`) consumes, one unit per step.
+//! `dispatch.unit` step kind (`unit_step.rs`) consumes, one unit per step.
 
 use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
 use darkmux_crew::rules::{Rule, RuleKind};
@@ -315,7 +315,7 @@ pub struct Plan {
     /// and `plan.sites`'s own `"source": "tree"` both still call), so a
     /// reader cannot distinguish "planned by the tree strategy" from "this
     /// plan predates the field" — which is fine, because nothing needs to
-    /// today: `crawl.unit` reads a `Plan` the same way regardless of what
+    /// today: `dispatch.unit` reads a `Plan` the same way regardless of what
     /// planned it. A future consumer that DOES need to tell tree from
     /// pre-field-tree apart is the moment this earns its own real minor
     /// bump, together with a deliberate golden update.
@@ -2913,7 +2913,7 @@ line two
     /// with_params` WRITE; it says nothing about whether the exact same
     /// committed golden still DESERIALIZES — which is the half that broke.
     /// `crawl.plan` (`plan_step.rs`) writes `plan.json` to
-    /// `<darkmux root>/missions/<id>/plan/<rule>.json`; `crawl.unit`
+    /// `<darkmux root>/missions/<id>/plan/<rule>.json`; `dispatch.unit`
     /// (`unit_step.rs`) reads it back. This is that reader, standing in
     /// for the real one.
     ///
@@ -3686,7 +3686,7 @@ line two
             // writes for a real launch (`<missions_dir>/<mission>/plan/
             // <rule>.json`) — `records.gather`'s own `plan_totals` reads
             // this to compute `scope.rules_run`/`hunks_covered`.
-            // (#2361 item 2) One COMPLETED `crawl.unit` step per planned
+            // (#2361 item 2) One COMPLETED `dispatch.unit` step per planned
             // unit, in the shape the grown task writes it (`rule` + `unit`
             // in the step's own config) — `records.gather` counts coverage
             // from these now, not from the plans alone, because a plan is
@@ -3694,7 +3694,7 @@ line two
             // fixture that skipped them would claim coverage no unit did.
             let unit_ids: Vec<String> = plan.units.iter().map(|u| u.id().to_string()).collect();
             let wrapped = darkmux_crew::step_output::Output::wrap(
-                crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND,
+                darkmux_crew::step_output::labels::PLAN,
                 plan,
                 darkmux_crew::step_output::Producer::of(MISSION, "plan-task", "plan-step"),
             );
@@ -3708,7 +3708,7 @@ line two
                     &darkmux_crew::types::Step {
                         id: format!("unit-{rule_id}-{unit_id}-step"),
                         task_id: format!("unit-{rule_id}-{unit_id}"),
-                        kind: "crawl.unit".into(),
+                        kind: "dispatch.unit".into(),
                         gate: None,
                         status: darkmux_crew::types::NodeStatus::Complete,
                         config: serde_json::json!({ "rule": rule_id, "unit": unit_id }),

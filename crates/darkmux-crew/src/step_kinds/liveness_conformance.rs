@@ -36,7 +36,7 @@
 //! they are not the same gap (corrected #2344 review, CONSIDER 6 — an
 //! earlier version of this paragraph conflated them):
 //!
-//!   1. Genuine Tier 3 kinds in OTHER crates (`darkmux-lab`'s `crawl.unit`,
+//!   1. Genuine Tier 3 kinds in OTHER crates (`darkmux-lab`'s `dispatch.unit`,
 //!      the binary's `mission.coder`) — this crate structurally cannot see
 //!      them at all. Every one of them performs its model work by calling
 //!      `darkmux_crew::dispatch::dispatch` (see `crawl::unit_step::

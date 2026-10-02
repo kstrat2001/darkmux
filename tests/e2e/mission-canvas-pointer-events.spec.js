@@ -65,7 +65,7 @@ function graphSnapshot() {
   for (let i = 0; i < 5; i++) {
     nodes.push({
       id: `task-${i}`, kind: 'task', label: `CRAWL.UNIT-${i}`, parentId: 'phase-a', status: 'running', depth: i,
-      steps: [{ id: `step-${i}`, kind: 'crawl.unit', label: `Unit ${i}`, status: 'running', startedTs: 0, model: 'darkmux:qwen3.6-35b-a3b' }],
+      steps: [{ id: `step-${i}`, kind: 'dispatch.unit', label: `Unit ${i}`, status: 'running', startedTs: 0, model: 'darkmux:qwen3.6-35b-a3b' }],
     });
     edges.push({ id: `contains-${i}`, source: 'phase-a', target: `task-${i}`, kind: 'contains' });
     if (i > 0) edges.push({ id: `dep-${i}`, source: `task-${i - 1}`, target: `task-${i}`, kind: 'depends_on' });

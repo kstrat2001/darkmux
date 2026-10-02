@@ -723,6 +723,159 @@ impl std::fmt::Display for ValidationFinding {
     }
 }
 
+/// The data ports one step kind declares (#2312): the labels of the outputs it
+/// `requires` from upstream and `provides` downstream. A label is the wrapper
+/// `kind` the output carries (`step_output::labels`), so no rename table sits
+/// between a producer and its consumer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KindPorts {
+    pub requires: Vec<String>,
+    pub provides: Vec<String>,
+    /// `(required label, config key)`: a literal at that key in the step's own
+    /// `config` meets the requirement without a producer task.
+    pub config_supplies: Vec<(String, String)>,
+}
+
+/// What [`MissionConfig::validate_with`] knows about the registered kinds: their
+/// ids, and the data ports each declares. Built from a registry
+/// (`StepKindRegistry::catalog`); [`MissionConfig::validate`] builds one with
+/// ids only, which skips the wiring check because no ports are known.
+#[derive(Debug, Clone, Default)]
+pub struct KindCatalog {
+    kinds: BTreeMap<String, KindPorts>,
+}
+
+impl KindCatalog {
+    pub fn from_ids(ids: &[&str]) -> Self {
+        Self { kinds: ids.iter().map(|id| (id.to_string(), KindPorts::default())).collect() }
+    }
+
+    pub fn insert(&mut self, id: &str, ports: KindPorts) {
+        self.kinds.insert(id.to_string(), ports);
+    }
+
+    pub fn ids(&self) -> Vec<&str> {
+        self.kinds.keys().map(String::as_str).collect()
+    }
+
+    fn ports(&self, id: &str) -> Option<&KindPorts> {
+        self.kinds.get(id)
+    }
+}
+
+impl MissionConfig {
+    /// [`Self::validate`] plus the checks that need the registered kinds' ports
+    /// (#2430, #2312). This is what `mission launch`, `mission config show`
+    /// and `darkmux doctor` run.
+    ///
+    /// - A step naming a RETIRED kind id is an Error naming its replacement.
+    ///   It is refused, not aliased: a retired id never reaches the registry.
+    /// - **Wiring.** For every task, the FIRST step's `requires` must each be
+    ///   `provides`d by the LAST step of at least one task named in the
+    ///   task's `depends_on` or `reads`, or by its `grow.from` producer. A miss
+    ///   is an Error naming both tasks and both kinds. A kind that requires
+    ///   nothing passes, and so does a kind the catalog does not know (an
+    ///   unknown kind is already a warning). The run-time `Output::read` check
+    ///   stays: this one only refuses, before anything is minted, a config the
+    ///   read would fail anyway.
+    pub fn validate_with(&self, catalog: &KindCatalog) -> Vec<ValidationFinding> {
+        let mut findings = self.validate(&catalog.ids());
+        findings.extend(self.retired_kind_findings());
+        findings.extend(self.wiring_findings(catalog));
+        findings
+    }
+
+    fn retired_kind_findings(&self) -> Vec<ValidationFinding> {
+        let steps = self.phases.iter().flat_map(|p| &p.tasks).flat_map(|t| t.steps.iter().map(move |s| (t, s)));
+        steps
+            .filter_map(|(task, step)| {
+                let new = crate::step_config::ConfigKind::replacing(&step.kind)?;
+                Some(ValidationFinding {
+                    severity: FindingSeverity::Error,
+                    path: format!("tasks[{}].steps[{}].kind", task.id, step.id),
+                    message: format!(
+                        "step \"{}\" names step kind \"{}\", which was renamed to \"{}\" (#2430) \
+                         and is not accepted under its old name; in this file {}",
+                        step.id,
+                        step.kind,
+                        new.id(),
+                        crate::step_config::ConfigKind::retired_fix()
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    fn wiring_findings(&self, catalog: &KindCatalog) -> Vec<ValidationFinding> {
+        let tasks: BTreeMap<&str, &TaskConfig> =
+            self.phases.iter().flat_map(|p| &p.tasks).map(|t| (t.id.as_str(), t)).collect();
+        let mut findings = Vec::new();
+        for task in tasks.values() {
+            let Some(first) = task.steps.first() else { continue };
+            let Some(wanted) = catalog.ports(&first.kind).map(|p| &p.requires) else { continue };
+            let wired: BTreeSet<&String> =
+                task.depends_on.iter().chain(&task.reads).chain(task.grow.iter().map(|g| &g.from)).collect();
+            let producers: Vec<&TaskConfig> =
+                wired.into_iter().filter_map(|id| tasks.get(id.as_str()).copied()).collect();
+            for label in wanted.iter().filter(|l| !config_supplies(catalog, first, l)) {
+                if let Some(f) = unmet_requirement(task, first, label, &producers, catalog) {
+                    findings.push(f);
+                }
+            }
+        }
+        findings
+    }
+}
+
+/// Whether the step's own `config` carries a literal at the key its kind says
+/// can supply `label` (a blank string or null is not a value).
+fn config_supplies(catalog: &KindCatalog, step: &StepConfig, label: &str) -> bool {
+    let Some(ports) = catalog.ports(&step.kind) else { return false };
+    ports.config_supplies.iter().filter(|(l, _)| l == label).any(|(_, key)| {
+        match step.config.get(key) {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+            Some(_) => true,
+        }
+    })
+}
+
+/// The finding for `label` if no producer's LAST step provides it; `None` when
+/// one does.
+fn unmet_requirement(
+    task: &TaskConfig,
+    first: &StepConfig,
+    label: &str,
+    producers: &[&TaskConfig],
+    catalog: &KindCatalog,
+) -> Option<ValidationFinding> {
+    let provides = |p: &&TaskConfig| {
+        p.steps.last().and_then(|s| catalog.ports(&s.kind)).is_some_and(|k| k.provides.iter().any(|l| l == label))
+    };
+    if producers.iter().any(provides) {
+        return None;
+    }
+    let offered: Vec<String> = producers
+        .iter()
+        .map(|p| {
+            let last = p.steps.last().map_or("(no steps)", |s| s.kind.as_str());
+            let labels = p.steps.last().and_then(|s| catalog.ports(&s.kind)).map(|k| k.provides.join(", "));
+            format!("task \"{}\" ({last}) provides {}", p.id, labels.filter(|l| !l.is_empty()).unwrap_or_else(|| "nothing".into()))
+        })
+        .collect();
+    Some(ValidationFinding {
+        severity: FindingSeverity::Error,
+        path: format!("tasks[{}].steps[{}].kind", task.id, first.id),
+        message: format!(
+            "task \"{}\" starts with \"{}\", which requires a \"{label}\" output, but no task it \
+             depends_on, reads or grows from provides one: {}",
+            task.id,
+            first.kind,
+            if offered.is_empty() { "it names none".to_string() } else { offered.join("; ") }
+        ),
+    })
+}
+
 impl MissionConfig {
     /// One error per retired top-level key the document still carries (it
     /// parses into `extras` and would otherwise be silently inert).
@@ -2335,6 +2488,151 @@ mod tests {
         crate::step_kinds::StepKindRegistry::with_builtins().ids()
     }
 
+    // ── (#2430, #2312) retired kind ids + port wiring ─────────────
+
+    fn task_of(id: &str, kind: &str) -> TaskConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "steps": [{"id": format!("{id}-step"), "kind": kind}]
+        }))
+        .unwrap()
+    }
+
+    fn phase_of(id: &str, tasks: Vec<TaskConfig>) -> PhaseConfig {
+        serde_json::from_value(serde_json::json!({ "id": id, "tasks": tasks })).unwrap()
+    }
+
+    /// A catalog where `needs` requires "plan", `makes` provides it, and
+    /// `other` provides "text".
+    fn wiring_catalog() -> KindCatalog {
+        let ports = |requires: &[&str], provides: &[&str]| KindPorts {
+            requires: requires.iter().map(|s| s.to_string()).collect(),
+            provides: provides.iter().map(|s| s.to_string()).collect(),
+            ..KindPorts::default()
+        };
+        let mut c = KindCatalog::default();
+        c.insert("needs", ports(&["plan"], &[]));
+        c.insert("makes", ports(&[], &["plan"]));
+        c.insert("other", ports(&[], &["text"]));
+        c.insert("free", ports(&[], &[]));
+        let mut literal = ports(&["plan"], &[]);
+        literal.config_supplies = vec![("plan".into(), "plan_file".into())];
+        c.insert("needs-or-literal", literal);
+        c
+    }
+
+    fn errors_of(cfg: &MissionConfig, catalog: &KindCatalog) -> Vec<String> {
+        cfg.validate_with(catalog)
+            .into_iter()
+            .filter(|f| f.severity == FindingSeverity::Error)
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_retired_step_kind_id_is_an_error_naming_its_replacement() {
+        for (old, new) in [("crawl.unit", "dispatch.unit"), ("crawl.summary", "dispatch.summary")] {
+            let cfg = doc(vec![phase_of("p", vec![task_of("t", old)])]);
+            // Refused even when the caller knows no kinds at all.
+            let errors = errors_of(&cfg, &KindCatalog::default());
+            assert!(
+                errors.iter().any(|e| e.contains(old) && e.contains(new)),
+                "{old} must be refused naming {new}: {errors:?}"
+            );
+        }
+        let ok = doc(vec![phase_of("p", vec![task_of("t", "dispatch.unit")])]);
+        assert!(errors_of(&ok, &KindCatalog::default()).is_empty());
+    }
+
+    #[test]
+    fn a_required_port_must_be_provided_by_a_task_the_config_wires_in() {
+        let catalog = wiring_catalog();
+        let mut consumer = task_of("consumer", "needs");
+        consumer.depends_on = vec!["producer".into()];
+
+        // depends_on, reads and grow.from each satisfy it.
+        let cfg = doc(vec![phase_of("a", vec![task_of("producer", "makes")]), phase_of("b", vec![consumer.clone()])]);
+        assert!(errors_of(&cfg, &catalog).is_empty(), "{:?}", errors_of(&cfg, &catalog));
+        let mut by_reads = consumer.clone();
+        by_reads.depends_on.clear();
+        by_reads.reads = vec!["producer".into()];
+        let cfg = doc(vec![phase_of("a", vec![task_of("producer", "makes")]), phase_of("b", vec![by_reads])]);
+        assert!(errors_of(&cfg, &catalog).is_empty());
+        let mut by_grow = consumer.clone();
+        by_grow.depends_on.clear();
+        by_grow.grow = Some(
+            serde_json::from_value(serde_json::json!({"from": "producer", "items": "units", "id": "{{item.id}}"})).unwrap(),
+        );
+        let cfg = doc(vec![phase_of("a", vec![task_of("producer", "makes")]), phase_of("b", vec![by_grow])]);
+        assert!(errors_of(&cfg, &catalog).is_empty(), "{:?}", errors_of(&cfg, &catalog));
+
+        // A producer of the wrong type: Error naming both tasks and both kinds.
+        let cfg = doc(vec![phase_of("a", vec![task_of("producer", "other")]), phase_of("b", vec![consumer.clone()])]);
+        let errors = errors_of(&cfg, &catalog);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        for part in ["consumer", "needs", "plan", "producer", "other", "text"] {
+            assert!(errors[0].contains(part), "the error names `{part}`: {}", errors[0]);
+        }
+
+        // No producer wired at all.
+        let mut alone = consumer.clone();
+        alone.depends_on.clear();
+        let cfg = doc(vec![phase_of("a", vec![task_of("producer", "makes")]), phase_of("b", vec![alone])]);
+        assert_eq!(errors_of(&cfg, &catalog).len(), 1);
+
+        // A kind that requires nothing passes with no producers.
+        let cfg = doc(vec![phase_of("a", vec![task_of("loner", "free")])]);
+        assert!(errors_of(&cfg, &catalog).is_empty());
+    }
+
+    /// (#2312) A literal at the config key a kind names meets its requirement
+    /// without a producer task; an absent, null or blank value does not.
+    #[test]
+    fn a_literal_config_value_meets_a_requirement_without_a_producer() {
+        let catalog = wiring_catalog();
+        let with_config = |config: serde_json::Value| {
+            let mut t = task_of("consumer", "needs-or-literal");
+            t.steps[0].config = config;
+            doc(vec![phase_of("a", vec![t])])
+        };
+        assert!(errors_of(&with_config(serde_json::json!({"plan_file": "/p.json"})), &catalog).is_empty());
+        for unset in [serde_json::json!({}), serde_json::json!({"plan_file": null}), serde_json::json!({"plan_file": " "})] {
+            assert_eq!(errors_of(&with_config(unset.clone()), &catalog).len(), 1, "{unset} supplies nothing");
+        }
+        // A key the kind does not name supplies nothing.
+        assert_eq!(errors_of(&with_config(serde_json::json!({"other": "x"})), &catalog).len(), 1);
+    }
+
+    /// A task's input is read by its FIRST step, so only that step's
+    /// requirements are checked; a later step's are not.
+    #[test]
+    fn only_the_consumers_first_step_requirements_are_checked() {
+        let catalog = wiring_catalog();
+        let two_steps = |first: &str, last: &str| {
+            let mut t = task_of("consumer", first);
+            t.steps.push(serde_json::from_value(serde_json::json!({"id": "tail", "kind": last})).unwrap());
+            t
+        };
+        let cfg = doc(vec![phase_of("a", vec![two_steps("free", "needs")])]);
+        assert!(errors_of(&cfg, &catalog).is_empty(), "a later step's requirement is not wired");
+        let cfg = doc(vec![phase_of("a", vec![two_steps("needs", "free")])]);
+        assert_eq!(errors_of(&cfg, &catalog).len(), 1, "the first step's requirement is");
+    }
+
+    /// The producer's LAST step is what a downstream task reads, so a
+    /// providing FIRST step does not count.
+    #[test]
+    fn only_the_producers_last_step_counts_as_providing() {
+        let catalog = wiring_catalog();
+        let mut producer = task_of("producer", "makes");
+        producer.steps.push(
+            serde_json::from_value(serde_json::json!({"id": "tail", "kind": "free"})).unwrap(),
+        );
+        let mut consumer = task_of("consumer", "needs");
+        consumer.depends_on = vec!["producer".into()];
+        let cfg = doc(vec![phase_of("a", vec![producer]), phase_of("b", vec![consumer])]);
+        assert_eq!(errors_of(&cfg, &catalog).len(), 1);
+    }
+
     fn known_kinds_refs(known: &[String]) -> Vec<&str> {
         known.iter().map(String::as_str).collect()
     }
@@ -2643,8 +2941,8 @@ mod tests {
         let cfg = embedded_config("crawl");
         assert_eq!(cfg.id, "crawl");
         // (#2298 + #2301) Three phases: a `crawl.plan` task per built-in
-        // rule, a `crawl.unit` GROW template per rule growing from that
-        // rule's own plan task, and one `crawl.summary`.
+        // rule, a `dispatch.unit` GROW template per rule growing from that
+        // rule's own plan task, and one `dispatch.summary`.
         let phase_ids: Vec<&str> = cfg.phases.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(phase_ids, vec!["plan", "crawl", "summarize", "create-mods"], "{phase_ids:?}");
         const RULES: [&str; 4] =
@@ -2672,12 +2970,12 @@ mod tests {
             assert_eq!(grow.config["plan"], serde_json::json!("{{from.output}}"));
             assert_eq!(grow.config["unit"], serde_json::json!("{{item.id}}"));
             assert_eq!(grow.config["rule"], serde_json::json!(rule));
-            assert_eq!(task.steps[0].kind, "crawl.unit");
+            assert_eq!(task.steps[0].kind, "dispatch.unit");
         }
 
         let summarize = &cfg.phases[2];
         assert_eq!(summarize.tasks.len(), 1);
-        assert_eq!(summarize.tasks[0].steps[0].kind, "crawl.summary");
+        assert_eq!(summarize.tasks[0].steps[0].kind, "dispatch.summary");
 
         // (#2302) The create-mods phase: ONE grow template, OFF, growing a
         // `coder` dispatch per finding the summary named. `enabled: false`

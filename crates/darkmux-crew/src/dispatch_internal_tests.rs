@@ -16934,7 +16934,7 @@ fn slash_bearing_resident_is_recognized() {
         "qwen/qwen3.8-27b",
         None
     ));
-    // The slash-free id the same mission's seven `crawl.unit` steps used.
+    // The slash-free id the same mission's seven `dispatch.unit` steps used.
     assert!(crate::dispatch_internal::is_reloadable_target(
         "qwen3.6-35b-a3b-turboquant-mlx",
         "darkmux:qwen3.6-35b-a3b-turboquant-mlx",

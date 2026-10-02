@@ -4,7 +4,7 @@ import type { PlanSourceRef } from "./PlanSourceRef";
 import type { UnitOutcome } from "./UnitOutcome";
 
 /**
- * (#2301) The typed crawl run summary — `crawl.summary`'s body, and the
+ * (#2301) The typed crawl run summary — `dispatch.summary`'s body, and the
  * mission's `mission close` payload.
  *
  * Every key the retired launcher's close payload carried is here under the

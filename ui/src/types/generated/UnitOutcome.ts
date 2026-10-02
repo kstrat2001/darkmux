@@ -2,8 +2,8 @@
 import type { FindingRef } from "./FindingRef";
 
 /**
- * (#2301) What ONE `crawl.unit` step produces, and the ONLY thing
- * `crawl.summary` reads. A typed struct, not a JSON blob: the consumer
+ * (#2301) What ONE `dispatch.unit` step produces, and the ONLY thing
+ * `dispatch.summary` reads. A typed struct, not a JSON blob: the consumer
  * deserializes through it, so a producer that drifts fails at the read
  * naming the field rather than summarizing zeros.
  */

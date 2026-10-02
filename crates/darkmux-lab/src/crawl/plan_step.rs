@@ -25,7 +25,7 @@
 //! retires) once the crawl side of the consolidation is decided. Until
 //! then, `crawl.plan` is the kind `crawl.json` names; `plan.sites` is the
 //! kind `review.json` names; both produce the same `Plan` content
-//! (`CRAWL_PLAN_OUTPUT_KIND`), so `crawl.unit` reads either without
+//! (`darkmux_crew::step_output::labels::PLAN`), so `dispatch.unit` reads either without
 //! modification.
 //!
 //! Step config:
@@ -64,12 +64,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const CRAWL_PLAN_KIND: &str = ConfigKind::CrawlPlan.id();
-
-/// (#2301) The CONTENT id of what this kind produces — the value a
-/// consumer checks before deserializing the body as a [`Plan`]. Same
-/// string as the step kind here because the kind produces exactly one
-/// thing; they are separate concepts and are allowed to diverge.
-pub const CRAWL_PLAN_OUTPUT_KIND: &str = "crawl.plan";
 
 pub struct CrawlPlanStepKind;
 
@@ -126,11 +120,12 @@ impl StepKind for CrawlPlanStepKind {
     }
 
     /// (#2301) A data port's LABEL is the same string as the wrapper
-    /// `kind` the output carries, so a graph validator can compare a
+    /// `kind` the output carries, so the wiring check (#2312) can compare a
     /// producer's `provides` against a consumer's `requires` without a
-    /// rename table in between.
+    /// rename table in between. The label is the plan's, shared with
+    /// `plan.sites` (`step_output::labels::PLAN`), not this kind's id.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(CRAWL_PLAN_OUTPUT_KIND)];
+        const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::PLAN)];
         &PORTS
     }
 
@@ -147,7 +142,7 @@ impl StepKind for CrawlPlanStepKind {
         // `ref` to that file rather than the file's bytes — a plan is
         // large, and every consumer wants the path anyway.
         let wrapped = darkmux_crew::step_output::Output::wrap(
-            CRAWL_PLAN_OUTPUT_KIND,
+            darkmux_crew::step_output::labels::PLAN,
             the_plan,
             darkmux_crew::step_output::Producer::of(&mission_id_of(task), &task.id, &step.id),
         );
@@ -279,7 +274,7 @@ pub(crate) fn write_plan(path: &Path, the_plan: &darkmux_crew::step_output::Outp
 
 /// Register the crawl's step kinds. Called from the launcher's registry
 /// builder beside the review and coder-phase kinds. (#2301) The dispatch
-/// half — `crawl.unit` + `crawl.summary` — registers here too, so one call
+/// half — `dispatch.unit` + `dispatch.summary` — registers here too, so one call
 /// still gives a launcher every kind `crawl.json` declares.
 pub fn register_crawl_kinds(registry: &StepKindRegistry) -> Result<()> {
     registry.register(Arc::new(CrawlPlanStepKind)).context("registering crawl.plan")?;
@@ -393,9 +388,9 @@ mod tests {
             darkmux_crew::step_output::ref_output_string(&out),
             "(#2301) the output is a `ref` NAMING the plan file, not the file's bytes"
         );
-        let envelope = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, CRAWL_PLAN_OUTPUT_KIND)
+        let envelope = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, darkmux_crew::step_output::labels::PLAN)
             .expect("the ref resolves and the content id checks out");
-        assert_eq!(envelope.kind, CRAWL_PLAN_OUTPUT_KIND);
+        assert_eq!(envelope.kind, darkmux_crew::step_output::labels::PLAN);
         let written: Plan = envelope.body;
         assert_eq!(written.rules, vec!["unnamed-predicate".to_string()]);
         assert_eq!(written.params.unwrap().max_sites_per_unit, 7, "the sizing knob the plan was cut with");
@@ -417,10 +412,10 @@ mod tests {
             "rule": "unnamed-predicate", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
         }));
         let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
-        let err = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, "crawl.unit-outcome")
+        let err = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, "dispatch.unit")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("crawl.plan") && err.contains("crawl.unit-outcome"), "{err}");
+        assert!(err.contains(darkmux_crew::step_output::labels::PLAN) && err.contains("dispatch.unit"), "{err}");
     }
 
     #[test]
