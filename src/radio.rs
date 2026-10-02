@@ -1253,6 +1253,7 @@ mod tests {
         let index = crate::radio_index::render_verb_index(&crate::radio_index::build_verb_index(&<crate::cli::Cli as clap::CommandFactory>::command()));
         let surface = format!("{}\n{index}", build_router_message("x", &catalog));
         let retired = crate::retired_verbs::retired_spellings();
+        // drift-guard:allow lab eval — asserts the retired table names it
         assert!(retired.iter().any(|s| s == "darkmux lab eval"), "the table must include lab eval: {retired:?}");
         for spelling in retired {
             assert!(!surface.contains(&spelling), "`{spelling}` is retired but the model-facing surface offers it");
