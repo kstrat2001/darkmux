@@ -3378,7 +3378,8 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
 
 // A machine's card position is stable across loading, refetch and source
 // changes, and the same whichever machine serves the page: every card is
-// ordered by its own name, this machine's included.
+// ordered by its machine's uid (not its display name, which changes as sources
+// load), this machine's included.
 describe("FleetLens: card order is stable", () => {
   const cardNames = () => [...document.querySelectorAll(".mach-name")].map((n) => n.textContent);
   const flowRecords = () => {
@@ -3393,14 +3394,35 @@ describe("FleetLens: card order is stable", () => {
   };
   const selfSpecs = { machine_uid: "UUID-M", machine_id: "Mac-Self", cpu_brand: "Apple M5" };
 
-  it("flow-only cards order by name, not by flow order or uid", async () => {
+  it("flow-only cards order by uid, not by flow order or name", async () => {
     mockFleetFetch({ flowToday: flowRecords() });
     renderFleetLens();
     await waitFor(() => expect(cardNames()).toHaveLength(2));
-    expect(cardNames()).toEqual(["Apple", "Zebra"]);
+    expect(cardNames()).toEqual(["Zebra", "Apple"]);
   });
 
-  it("this machine sits among the others by name, and the fleet reads the same whichever machine serves it", async () => {
+  it("the order holds when the view answers after first paint, whatever names it brings", async () => {
+    const view = gate();
+    const row = (uid: string, name: string, id: string) => viewRow({ machine_uid: uid, machine_id: name }, { entry: { id, address: "100.64.1.2:8765", added_unix_ms: 1 } });
+    mockFleetFetch({
+      flowToday: flowRecords(),
+      hold: { "/fleet/view": view.promise },
+      view: [row("UUID-Z", "Studio-Z", "roster-z"), row("UUID-A", "Mac-A", "roster-a")],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(2));
+    expect(cardNames()).toEqual(["Zebra", "Apple"]);
+    await act(async () => {
+      view.open();
+    });
+    // The view names both machines differently ("Mac-A" sorts before "Zebra"
+    // and "Studio-Z" after "Apple"): by name the order would flip; by uid it holds.
+    await waitFor(() => expect(fleetOrderOf()).toBe("final"));
+    expect(cardNames()).toHaveLength(2);
+    expect(cardUids()).toEqual(["UUID-A", "UUID-Z"]);
+  });
+
+  it("this machine sits among the others by uid, and the fleet reads the same whichever machine serves it", async () => {
     mockFleetFetch({
       flowToday: flowRecords(),
       specs: selfSpecs,
@@ -3408,7 +3430,7 @@ describe("FleetLens: card order is stable", () => {
     });
     renderFleetLens();
     await waitFor(() => expect(cardNames()).toHaveLength(3));
-    expect(cardNames()).toEqual(["Apple", "Mac-Self", "Zebra"]);
+    expect(cardNames()).toEqual(["Zebra", "Mac-Self", "Apple"]);
     // The activity lanes follow the same order.
     expect([...document.querySelectorAll(".lname")].map((n) => n.textContent)).toEqual(cardNames());
   });
@@ -3420,7 +3442,7 @@ describe("FleetLens: card order is stable", () => {
     renderFleetLens({}, queryClient);
     await waitFor(() => expect(cardNames()).toHaveLength(3));
     const before = cardNames();
-    expect(before).toEqual(["Apple", "Mac-Self", "Zebra"]);
+    expect(before).toEqual(["Zebra", "Mac-Self", "Apple"]);
     mockFleetFetch({ ...args, fail: { "/fleet/view": 500 } });
     await act(async () => {
       await queryClient.refetchQueries({ queryKey: queryKeys.fleetView("/fleet/view") });
@@ -3434,6 +3456,8 @@ describe("FleetLens: card order is stable", () => {
   });
 
   const fleetOrder = () => document.querySelector(".fleet")?.getAttribute("data-order");
+  const fleetOrderOf = fleetOrder;
+  const cardUids = () => [...document.querySelectorAll(".mach")].map((c) => c.getAttribute("data-flip-key")?.toUpperCase());
 
   it("with the view pending the cards are not laid out yet, and the order is final when it lands", async () => {
     const view = gate();
@@ -3446,7 +3470,7 @@ describe("FleetLens: card order is stable", () => {
     });
     await waitFor(() => expect(cardNames()).toHaveLength(3));
     expect(fleetOrder()).toBe("final");
-    expect(cardNames()).toEqual(["Apple", "Mac-Self", "Zebra"]);
+    expect(cardNames()).toEqual(["Zebra", "Mac-Self", "Apple"]);
   });
 
   it("a view slower than the bounded wait no longer holds the cards back", async () => {
@@ -3466,7 +3490,7 @@ describe("FleetLens: card order is stable", () => {
     mockFleetFetch({ flowToday: flowRecords(), view });
     renderFleetLens();
     await waitFor(() => expect(cardNames()).toHaveLength(2));
-    expect(cardNames()).toEqual(["Apple", "Zebra"]);
+    expect(cardNames()).toEqual(["Zebra", "Apple"]);
   });
 
   it("every card and lane carries its machine as the motion key", async () => {

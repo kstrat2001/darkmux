@@ -39,8 +39,18 @@
    "word": "no ending"
   },
   {
+   "status": "abandoned",
+   "abandoned_reason": "unknown",
+   "word": "no ending"
+  },
+  {
    "status": "unparseable",
    "word": "unparseable"
+  },
+  {
+   "status": "running",
+   "not_reporting": true,
+   "word": "not reporting"
   }
  ],
  "relay": {

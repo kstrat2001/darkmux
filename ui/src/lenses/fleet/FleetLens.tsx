@@ -778,8 +778,9 @@ export function FleetLens({
   // touching only the running sessions, so a live sample never rescans the
   // window. A replay keys the base on the playhead itself.
   const baseCards = useMemo(() => {
-    const viewBases = viewCards.map(({ facts }) =>
-      buildFleetCardBase(
+    const viewBases = viewCards.map(({ row, facts }) => ({
+      order: { uid: row.machine_uid ?? null, fallback: row.entry?.id ?? facts.uid },
+      base: buildFleetCardBase(
         flowWindow.data,
         liveMachines,
         specs,
@@ -795,9 +796,10 @@ export function FleetLens({
         roster,
         policy,
       ),
-    );
-    const flowBases = flowOnlyUids.map((m) =>
-      buildFleetCardBase(
+    }));
+    const flowBases = flowOnlyUids.map((m) => ({
+      order: { uid: m, fallback: m },
+      base: buildFleetCardBase(
         flowWindow.data,
         liveMachines,
         specs,
@@ -810,11 +812,11 @@ export function FleetLens({
         roster,
         policy,
       ),
-    );
+    }));
     // The ONE place the card order is decided (`cardOrder.ts`): neither the
     // view's order nor the flow window's, so which source answered first
     // never moves a card.
-    return orderCards([...viewBases, ...flowBases], (b) => ({ name: b.name, uid: b.uid }));
+    return orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
   }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy]);
   const cards = useMemo(
@@ -839,6 +841,11 @@ export function FleetLens({
 
   // The activity lanes follow the cards' order (`cardOrder.ts`), not the flow
   // window's, so the two lists cannot disagree or reshuffle as records land.
+  // Runs the daemon marks `not_reporting`: their bars say so (one owner, on the row).
+  const notReportingIds = useMemo(
+    () => new Set(runs.filter((r) => r.not_reporting === true).flatMap((r) => [r.id, ...(r.dispatch_id ? [r.dispatch_id] : [])])),
+    [runs],
+  );
   const laneUids = useMemo(() => {
     const place = new Map(baseCards.map((c, i) => [c.uid, i]));
     return [...uids].sort((a, b) => (place.get(a) ?? Infinity) - (place.get(b) ?? Infinity));
@@ -863,9 +870,10 @@ export function FleetLens({
         specs,
         roster,
         policy,
+        notReportingIds,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, laneUids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
+    [flowWindow.data, liveMachines, laneUids, notReportingIds, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
   // (5.0 R3) Names, not a count: the hero's tooltip says WHICH machines its

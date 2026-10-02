@@ -57,6 +57,7 @@
  */
 
 import { runStatusWord } from "../../lib/runStatusWord";
+import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { displayNameOf } from "../../lib/machineIdentity";
 import type { RosterName, SelfIdentity } from "../../lib/machineIdentity";
 import { clkhm } from "../../lib/format";
@@ -133,12 +134,16 @@ function labelWidthPx(uids: string[], data: NormRecord[], liveMachines: Map<stri
   return Math.round(Math.min(170, Math.max(54, maxLen * 7.4 + 10)));
 }
 
+const NO_IDS: ReadonlySet<string> = new Set();
+
 interface BarWindow {
   tlMin: number;
   pct: (t: number) => number;
   playheadT: number;
   policy: LifecyclePolicy;
   presence: Presence;
+  /** Ids (session or mission) of runs the daemon marks `not_reporting`. */
+  notReporting: ReadonlySet<string>;
 }
 
 /** One run's bar, or `null` when it draws none: bookkeeping-only sessions
@@ -160,8 +165,10 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const leftPct = Math.max(0, Math.min(w.pct(cst), 100 - widthPct)); // never spill past the right edge
   const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
   const state = toRunState(l);
+  const silent = state.status === "running" && (w.notReporting.has(g.sessionId) || (g.missionId !== null && w.notReporting.has(g.missionId)));
+  const word = silent ? runStatusWord(NOT_REPORTING_STATUS) : runStatusWord(state.status, state.abandonReason);
   const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
-  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${runStatusWord(state.status, state.abandonReason)}` };
+  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${word}` };
 }
 
 export function buildActivityTimeline(
@@ -219,6 +226,9 @@ export function buildActivityTimeline(
   roster: readonly RosterName[] = [],
   /** The daemon's lifecycle policy (`/runs.policy`). */
   policy: LifecyclePolicy = DEFAULT_POLICY,
+  /** Ids of runs the daemon marks `not_reporting` (`Run.not_reporting`): their
+   *  bar titles say so, as the board does. */
+  notReporting: ReadonlySet<string> = NO_IDS,
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
   const tlMax = fixedRange ? fixedRange[1] : playheadT;
@@ -226,7 +236,7 @@ export function buildActivityTimeline(
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
-  const window: BarWindow = { tlMin, pct, playheadT, policy, presence };
+  const window: BarWindow = { tlMin, pct, playheadT, policy, presence, notReporting };
   const lanes: TimelineLane[] = uids.map((m) => {
     // (#2125) One bar per RUN, a `(session, mission)` pair (`runRef.ts`),
     // not per bare session id: a review mission's step session id is reused

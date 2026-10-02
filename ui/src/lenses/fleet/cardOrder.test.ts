@@ -1,32 +1,32 @@
 import { describe, it, expect } from "vitest";
 import { compareCardOrder, orderCards, type CardOrder } from "./cardOrder";
 
-const item = (name: string, uid = name): CardOrder => ({ name, uid });
+const item = (uid: string | null, fallback = uid ?? "?"): CardOrder => ({ uid, fallback });
 
 describe("orderCards", () => {
-  it("orders by name whatever the input order, so every serving machine lays the fleet out alike", () => {
-    const a = [item("studio"), item("MacBook-Pro"), item("darkbook")];
-    const b = [item("darkbook"), item("studio"), item("MacBook-Pro")];
-    const want = ["darkbook", "MacBook-Pro", "studio"];
-    expect(orderCards(a, (x) => x).map((x) => x.name)).toEqual(want);
-    expect(orderCards(b, (x) => x).map((x) => x.name)).toEqual(want);
+  it("orders by uid whatever the input order, so every serving machine lays the fleet out alike", () => {
+    const a = [item("UUID-C"), item("UUID-A"), item("UUID-B")];
+    const b = [item("UUID-B"), item("UUID-C"), item("UUID-A")];
+    expect(orderCards(a, (x) => x).map((x) => x.uid)).toEqual(["UUID-A", "UUID-B", "UUID-C"]);
+    expect(orderCards(b, (x) => x).map((x) => x.uid)).toEqual(["UUID-A", "UUID-B", "UUID-C"]);
   });
 
-  it("ignores case in the name", () => {
-    expect(orderCards([item("beta"), item("Alpha")], (x) => x).map((x) => x.name)).toEqual(["Alpha", "beta"]);
+  it("ignores the case of a uid", () => {
+    expect(orderCards([item("b-2"), item("A-1")], (x) => x).map((x) => x.uid)).toEqual(["A-1", "b-2"]);
   });
 
-  it("settles two machines that share a name by uid, in either case", () => {
-    expect(orderCards([item("Mac", "UUID-B"), item("Mac", "uuid-a")], (x) => x).map((x) => x.uid)).toEqual(["uuid-a", "UUID-B"]);
+  it("puts a card whose uid is unknown after every known one, in a stable order by its fallback", () => {
+    const cards = [item(null, "studio"), item("UUID-Z"), item(null, "mini"), item("UUID-A")];
+    expect(orderCards(cards, (x) => x).map((x) => x.uid ?? x.fallback)).toEqual(["UUID-A", "UUID-Z", "mini", "studio"]);
   });
 
   it("does not mutate its input", () => {
     const input = [item("b"), item("a")];
     orderCards(input, (x) => x);
-    expect(input.map((x) => x.name)).toEqual(["b", "a"]);
+    expect(input.map((x) => x.uid)).toEqual(["b", "a"]);
   });
 
-  it("treats the same name and uid as equal", () => {
-    expect(compareCardOrder(item("a"), item("a"))).toBe(0);
+  it("treats the same uid as equal", () => {
+    expect(compareCardOrder(item("a"), item("A"))).toBe(0);
   });
 });

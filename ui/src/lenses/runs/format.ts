@@ -49,16 +49,17 @@ export function runsAgo(r: Run, now: number = Date.now()): string {
 
 /** The status BADGE's display text: `runStatusWord`, the one status-to-word map
  * (#1907 split `abandoned` on `Run.abandoned_reason`, which it reads). */
-export function runStatusLabel(r: Run, notReporting = false): string {
-  return runStatusWord(runBadgeStatus(r, notReporting), r.abandoned_reason);
+export function runStatusLabel(r: Run): string {
+  return runStatusWord(runBadgeStatus(r), r.abandoned_reason);
 }
 
 /** (5.0 R3) The status a row's badge keys its color and pulse on. It is the
  * run's own, except that a run recorded as running on a machine that is not
- * reporting (held as down by the fleet view, with no live session beat, so no
- * terminal record can arrive) is `not_reporting` (`NOT_REPORTING_STATUS`). */
-export function runBadgeStatus(r: Run, notReporting: boolean): RunBadgeStatus {
-  return notReporting && r.status === "running" ? NOT_REPORTING_STATUS : r.status;
+ * reporting (`Run.not_reporting`, decided once by the daemon: the fleet view
+ * holds its machine as down and no live session beat names it, so no terminal
+ * record can arrive) is `not_reporting` (`NOT_REPORTING_STATUS`). */
+export function runBadgeStatus(r: Run): RunBadgeStatus {
+  return r.not_reporting === true && r.status === "running" ? NOT_REPORTING_STATUS : r.status;
 }
 
 /** A lab row's verify outcome, in three states (#2494): what the workload's

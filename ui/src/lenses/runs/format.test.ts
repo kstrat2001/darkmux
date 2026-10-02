@@ -154,15 +154,15 @@ describe("runStatusLabel", () => {
   // evidence behind it, so it reads "not reporting", a word of its own that is
   // not the `unparseable` run status. Nothing else changes.
   it("reads a running run on a machine that is not reporting as 'not reporting'", () => {
-    const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true });
-    expect(runStatusLabel(r, true)).toBe("not reporting");
-    expect(runBadgeStatus(r, true)).toBe("not_reporting");
-    expect(runStatusLabel(r, false)).toBe("running");
+    const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true, not_reporting: true });
+    expect(runStatusLabel(r)).toBe("not reporting");
+    expect(runBadgeStatus(r)).toBe("not_reporting");
+    expect(runStatusLabel({ ...r, not_reporting: false })).toBe("running");
   });
   it("leaves a finished run's status alone even when its machine is not reporting", () => {
-    const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true });
-    expect(runStatusLabel(r, true)).toBe("complete");
-    expect(runBadgeStatus(r, true)).toBe("complete");
+    const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, not_reporting: true });
+    expect(runStatusLabel(r)).toBe("complete");
+    expect(runBadgeStatus(r)).toBe("complete");
   });
   it("leaves every other status unchanged", () => {
     for (const status of ["planned", "running", "complete", "degraded", "error", "unparseable"] as const) {

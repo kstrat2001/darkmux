@@ -1343,11 +1343,17 @@ describe("the count line with several executions (W3)", () => {
  * must give the answer this card gives for the same row. */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** The input Rust reads (`a_model_is_working` in `src/card_status.rs`): a card the
+ * view read, with a loaded model in a busy LM Studio status. */
+const BUSY = ["processingPrompt", "generating", "computingEmbedding"];
+function aModelIsWorking(row: FleetMachine): boolean {
+  return row.card.state === "available" && row.card.card.specs.loaded_models.some((m) => BUSY.some((b) => b.toLowerCase() === m.status.toLowerCase()));
+}
+
 describe("the card's status, for the rows the Rust twin also answers", () => {
   interface SharedCase {
     name: string;
     row: FleetMachine;
-    active: boolean;
     expect: { status: string; word: string; second_line: string | null; reason: string | null };
   }
   const cases = JSON.parse(
@@ -1362,7 +1368,7 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
     // The view-only stand-in for "records reach this viewer": a live beat, or this machine.
     const seen = c.row.is_this_machine || c.row.liveness === "live";
     const card = {
-      active: c.active,
+      active: aModelIsWorking(c.row),
       runsCount: 0,
       standing,
       availability: machineAvailability({ self: c.row.is_this_machine, seen, standing }),

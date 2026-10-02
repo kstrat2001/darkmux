@@ -411,6 +411,51 @@ pub struct Run {
     /// an executor's `ts`. The board sorts on this field alone.
     #[cfg_attr(test, ts(type = "number"))]
     pub receive_key: u64,
+    /// (5.0) A run recorded as running on a machine the fleet view holds as
+    /// down, with no live session beat: nothing says it is still running and
+    /// nothing says it stopped. Set by [`mark_not_reporting`], the ONE owner,
+    /// so every surface (board, filter, run page, timeline, `run list`) words
+    /// it alike (`not reporting`). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub not_reporting: bool,
+}
+
+/// Mark every running run whose machine the view holds as down and whose
+/// session (or mission) has no live beat in `live` (session and mission ids
+/// of the beats now alive). A machine the view does not hold, this machine,
+/// and a machine whose card was read claim nothing: the run's own records
+/// stand. `no_beat` only says no daemon beat was found, so a peer running a
+/// bare dispatch still counts through its session beat.
+pub fn mark_not_reporting(runs: &mut [Run], view: &crate::fleet_view::FleetView, live: &HashSet<String>) {
+    use crate::fleet_view::{CardOutcome, Liveness};
+    for run in runs.iter_mut().filter(|r| r.status == RunStatus::Running) {
+        if live.contains(&run.id) || run.dispatch_id.as_ref().is_some_and(|d| live.contains(d)) {
+            continue;
+        }
+        let Some(row) = view.machines.iter().find(|m| row_runs_machine(view, m, run)) else { continue };
+        let down = !row.is_this_machine && !matches!(row.card, CardOutcome::Available { .. }) && row.liveness == Liveness::NoBeat;
+        run.not_reporting = down;
+    }
+}
+
+/// Whether a view row is the machine a run was recorded on: by hardware uid
+/// when both name one, else by a name the run may carry (the row's card name
+/// or roster id).
+fn row_runs_machine(view: &crate::fleet_view::FleetView, row: &crate::fleet_view::FleetMachine, run: &Run) -> bool {
+    if let (Some(a), Some(b)) = (&row.machine_uid, &run.machine_uid) {
+        return a.eq_ignore_ascii_case(b);
+    }
+    let Some(name) = &run.machine else { return false };
+    let card_name = match &row.card {
+        crate::fleet_view::CardOutcome::Available { card, .. } => card.specs.machine_id.clone(),
+        _ => None,
+    };
+    [card_name, row.entry.as_ref().map(|e| e.id.clone())]
+        .into_iter()
+        .flatten()
+        .chain(row.entry.is_none().then(|| view.row_name(row)))
+        .any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// (#2902 step 2b) The run union plus the usage breakdown over the same
@@ -531,6 +576,12 @@ fn build_runs_in(
         let mut run = mission_to_run(mission, kind, shape.as_ref(), &mission_id_index, &flow_index, now_ms);
         // (#2902 step 2b) Its records carry its `mission_id`.
         run.tokens = usage.tokens_for(Some(&mission.id), std::iter::empty());
+        // The same key a peer builds for this mission (`flow_mission_to_run`):
+        // its newest record's receive key, so a mission sorts alike whichever
+        // machine serves it. Local time only when no record names it.
+        if let Some(key) = flow_missions.get(&mission.id).and_then(|a| a.last_key) {
+            run.receive_key = key;
+        }
         runs.push(run);
     }
 
@@ -940,6 +991,7 @@ fn flow_mission_to_run(
         verify_passed: None,
         relay: None,
         receive_key: agg.last_key.unwrap_or(0),
+        not_reporting: false,
     }
 }
 
@@ -1293,6 +1345,7 @@ fn mission_to_run(
         verify_passed: None,
         relay: None,
         receive_key: local_receive_key(completed_ts.or(started_ts).unwrap_or(mission.created_ts)),
+        not_reporting: false,
     }
 }
 
@@ -1792,6 +1845,7 @@ fn lab_summary_to_run(
         verify_passed: summary.verify_passed,
         relay: None,
         receive_key: local_receive_key(summary.mtime_ms / 1000),
+        not_reporting: false,
     }
 }
 
@@ -2628,6 +2682,7 @@ fn ghost_runs(
             verify_passed: None,
             relay: run_relay(session_id),
             receive_key: agg.last_key.unwrap_or(0),
+            not_reporting: false,
         });
     }
     out
@@ -7506,6 +7561,56 @@ mod tests {
         })
     }
 
+    /// 5.0: one owner decides "not reporting": a running run on a peer the view
+    /// holds as down, with no live beat. This machine, a live session and a
+    /// peer that is up claim nothing.
+    #[test]
+    fn mark_not_reporting_is_decided_once_from_the_view_and_the_live_beats() {
+        use crate::fleet_view::{gather_view, tests as fv, FLEET_VIEW_CACHE_TTL};
+        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
+        let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+        // A rostered peer nothing could read and no beat was found for.
+        let mut studio = view.machines[0].clone();
+        studio.is_this_machine = false;
+        studio.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("studio")));
+        studio.liveness = crate::fleet_view::Liveness::NoBeat;
+        studio.card = crate::fleet_view::CardOutcome::Unknown;
+        view.machines.push(studio);
+        let row = |id: &str, machine: &str, status: RunStatus| Run {
+            id: id.to_string(),
+            kind: RunKind::Dispatch,
+            status,
+            machine: Some(machine.to_string()),
+            machine_uid: None,
+            route: None,
+            role: None,
+            model: None,
+            started_ts: None,
+            completed_ts: None,
+            updated_ts: None,
+            tracked: false,
+            dispatch_id: Some(format!("d-{id}")),
+            abandoned_reason: None,
+            tokens: None,
+            workload: None,
+            verify_passed: None,
+            relay: None,
+            receive_key: 0,
+            not_reporting: false,
+        };
+        let mut runs = vec![
+            row("down", "studio", RunStatus::Running),
+            row("beating", "studio", RunStatus::Running),
+            row("done", "studio", RunStatus::Complete),
+            row("here", "laptop", RunStatus::Running),
+            row("unknown-machine", "elsewhere", RunStatus::Running),
+        ];
+        let live: HashSet<String> = ["d-beating".to_string()].into();
+        mark_not_reporting(&mut runs, &view, &live);
+        let flags: Vec<(&str, bool)> = runs.iter().map(|r| (r.id.as_str(), r.not_reporting)).collect();
+        assert_eq!(flags, [("down", true), ("beating", false), ("done", false), ("here", false), ("unknown-machine", false)]);
+    }
+
     #[test]
     fn hub_key_reads_the_stream_id_as_ms_times_1024_plus_seq() {
         assert_eq!(hub_key("1700000000000-3"), Some(1_700_000_000_000 * 1024 + 3));
@@ -7538,6 +7643,34 @@ mod tests {
         assert!(key("skewed-mission") < key("honest-mission"));
         let skewed = runs.iter().find(|r| r.id == "skewed-mission").unwrap();
         assert!(skewed.updated_ts > Some(3_900_000_000), "the executor's clock still says 2096; only the key ignores it");
+    }
+
+    /// 5.0 (#3017): a mission sorts alike whichever machine serves it. The
+    /// machine that owns it (a durable record on disk) and a peer that sees it
+    /// only through the fleet stream both key it on its newest hub record.
+    #[test]
+    #[serial_test::serial]
+    fn a_mission_gets_the_same_receive_key_built_locally_and_as_a_peer() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mut start = peer_record("dispatch.start", "2096-01-01T00:00:00Z");
+        start["hub_id"] = serde_json::json!("1700000000000-0");
+        let mut done = peer_record("dispatch.complete", "2096-01-01T00:00:05Z");
+        done["hub_id"] = serde_json::json!("1700000007000-2");
+        let fleet = vec![start, done];
+        let peer_key = build_runs(flows.path(), None, &fleet)
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("peer row")
+            .receive_key;
+        assert_eq!(peer_key, 1_700_000_007_000 * 1024 + 2);
+
+        // The owning machine: the same mission, durable on disk.
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("review-on-the-hub", vec![], None)).unwrap();
+        let local = build_runs(flows.path(), None, &fleet);
+        let row = local.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert!(row.tracked, "built from the durable record");
+        assert_eq!(row.receive_key, peer_key);
     }
 
     #[test]

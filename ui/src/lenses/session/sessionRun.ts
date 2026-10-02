@@ -67,7 +67,7 @@ import { toolOutcome } from "../../lib/recordDetail";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
 import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
-import { sameMachine, sameUid, type MachineRef } from "../../lib/machineIdentity";
+import { sameMachine, sameUid } from "../../lib/machineIdentity";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 
 /** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
@@ -761,24 +761,13 @@ function ranOn(d: NormRecord | null, first: NormRecord | null | undefined): { na
  *  word, so the page states its status in one voice. */
 function pillOf(
   state: RunState,
-  on: { name: string; uid: string },
-  notReporting: ((on: MachineRef) => boolean) | undefined,
+  notReporting: boolean | undefined,
 ): { status: SessionHeader["status"]; label: string; open: string } {
-  if (state.status === "running" && notReporting?.(machineRefOf(on))) {
+  if (state.status === "running" && notReporting) {
     const word = runStatusWord(NOT_REPORTING_STATUS);
     return { status: NOT_REPORTING_STATUS, label: word, open: word };
   }
   return { status: state.status, label: runStatusWord(state.status, state.abandonReason), open: "running" };
-}
-
-const machineRefOf = (on: { name: string; uid: string }): MachineRef => ({ uid: on.uid || null, name: on.name || null });
-
-/** The machine a session's run executed on, as a reference to match against
- *  the fleet (`ranOn`'s rule, over the raw records): `{}` when its records
- *  name none. */
-export function sessionMachine(data: readonly NormRecord[], sid: string): MachineRef {
-  const own = data.filter((r) => r.session_id === sid);
-  return machineRefOf(ranOn(own.find((r) => r.action === ACTION.DispatchStart) ?? null, own[0]));
 }
 
 /** Whether the run executed on the machine showing it. `viewerUid` is the page's
@@ -1602,7 +1591,7 @@ export function runRegions(
   viewerUid: string | null = null,
   /** (5.0 R3) Whether the machine a run executed on is not reporting. A run
    *  that reads running there has no live evidence, so its status is unknown. */
-  notReporting?: (on: MachineRef) => boolean,
+  notReporting?: boolean,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
@@ -1630,7 +1619,7 @@ export function runRegions(
 
   const role = roleOf(d ?? firstSessRec);
   const on = ranOn(d, firstSessRec);
-  const pill = pillOf(state, on, notReporting);
+  const pill = pillOf(state, notReporting);
 
   const sp: DispatchStartPayload = payloadOf(d, ACTION.DispatchStart) ?? {};
   const remoteEp = sp.endpoint || endPayloadOf(c)?.endpoint;

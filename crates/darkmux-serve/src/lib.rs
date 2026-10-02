@@ -60,7 +60,7 @@ mod runs;
 mod run_lifecycle;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
-    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
+    AbandonReason, DispatchSessionEvidence, mark_not_reporting, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
 /// The daemon's response bodies: one Rust type per JSON route, and the source
@@ -1055,6 +1055,16 @@ where
     }
 }
 
+/// The session and mission ids with a live beat right now (a mission's own
+/// session never beats, so any beat naming its mission counts). Empty when
+/// presence is off or unreadable: [`runs::mark_not_reporting`] then claims
+/// nothing about a run on a machine the view holds as up.
+pub fn live_session_ids() -> std::collections::HashSet<String> {
+    let Some(url) = darkmux_flow::redis_url() else { return Default::default() };
+    let (beats, _) = read_presence_beats(&url, "sessions", darkmux_flow::session_presence::read_live_sessions);
+    beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect()
+}
+
 /// GET /fleet/dispatches/live — the dispatches with a live heartbeat right now
 /// (#638). Each running dispatch refreshes a short-TTL
 /// `darkmux:session-presence:<sid>` Redis key; this returns every unexpired
@@ -1846,9 +1856,14 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let lab_dir = state.lab_dir.clone();
     // (#1705) One blocking task: read the fleet stream, then build every
     // row against local + fleet together.
+    let view = fleet_view::cached_view(&state).await.ok();
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
-        (runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records), fleet.state)
+        let mut rows = runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records);
+        if let Some(view) = &view {
+            runs::mark_not_reporting(&mut rows, view, &live_session_ids());
+        }
+        (rows, fleet.state)
     })
     .await;
     let (runs, fleet_state) = result.unwrap_or_else(|e| {

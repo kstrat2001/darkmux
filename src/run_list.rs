@@ -43,7 +43,9 @@ pub(crate) fn run(
     // /runs` — `fleet_records_for_runs()` degrades to an empty vec on a
     // standalone install (no `DARKMUX_REDIS_URL`), same as the handler.
     let fleet = darkmux_serve::fleet_records_for_runs();
-    let built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
+    let mut built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
+    // The same overlay the daemon's `/runs` applies: one owner for "not reporting".
+    darkmux_serve::mark_not_reporting(&mut built.runs, &crate::machine_list::local_fleet_view(), &darkmux_serve::live_session_ids());
     let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
     let report = usage.then(|| UsageReport {
         since: built.since.clone(),
@@ -127,11 +129,8 @@ fn filter_by_kind(rows: Vec<Run>, kind: RunKindArg) -> Vec<Run> {
     }
 }
 
-/// `updated_ts || completed_ts || started_ts || 0` — ported verbatim from
-/// `ui/src/lenses/runs/format.ts::runActivity`, the RUNS lens's own recency
-/// key (see `Run::updated_ts`'s own doc: "the one field the runs lens can
-/// always order by, across all three sources"). Drives both the ordering
-/// within each half of [`select_rows`] and the JSON default order.
+/// `updated_ts || completed_ts || started_ts || 0`: the row's own time, for the
+/// `--since` bound only. Ordering is by `Run::receive_key`.
 fn run_activity(r: &Run) -> u64 {
     r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(0)
 }
@@ -161,12 +160,12 @@ struct Selection {
 ///    in-flight run", and a cap that could hide live work reintroduces
 ///    that bug in a new place. A shorter table is the better failure.
 ///
-/// Both halves are ordered newest-activity-first via [`run_activity`].
+/// Both halves are ordered newest-first by the hub's receive order (`Run::receive_key`).
 /// `all` lifts the cap, and `limit == 0` is treated as unlimited too — the
 /// SAME convention `mission status --limit` documents ("0 = no cap"), kept
 /// consistent here rather than reinventing a second meaning for zero.
 fn select_rows(mut rows: Vec<Run>, limit: usize, all: bool) -> Selection {
-    rows.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.receive_key));
     let (running, terminal): (Vec<Run>, Vec<Run>) =
         rows.into_iter().partition(|r| r.status == RunStatus::Running);
     let total_terminal = terminal.len();
@@ -241,6 +240,7 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
 /// word, so the column needs no second line for it.
 pub(crate) fn status_label(r: &Run) -> &'static str {
     match r.status {
+        RunStatus::Running if r.not_reporting => "not reporting",
         RunStatus::Abandoned if r.abandoned_reason == Some(AbandonReason::Aborted) => "aborted",
         RunStatus::Abandoned => "no ending",
         status => status.as_str(),
@@ -466,7 +466,7 @@ const VERIFY_FAIL_LABEL: &str = "verify FAIL";
 /// over budget, since `{:<10}` is a minimum and never truncates.
 const INDENT_COLS: usize = 2;
 const KIND_COLS: usize = 8; // "dispatch"
-const STATUS_COLS: usize = 11; // "unparseable"
+const STATUS_COLS: usize = 13; // "not reporting"
 const STARTED_COLS: usize = 10;
 const DURATION_COLS: usize = 10;
 /// (#2902) `999.99k` is the widest [`tokens_cell`] below a billion tokens.
@@ -750,7 +750,7 @@ fn json_payload<'a>(
     usage: Option<&'a UsageReport>,
 ) -> RunListOutput<'a> {
     let mut sorted: Vec<&Run> = rows.iter().collect();
-    sorted.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.receive_key));
     RunListOutput { kind, total: sorted.len(), runs: sorted, fleet, since, usage }
 }
 
@@ -964,7 +964,8 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
-            receive_key: 0,
+            receive_key: updated_ts * 1000 * 1024,
+            not_reporting: false,
         }
     }
 
@@ -1320,6 +1321,8 @@ mod tests {
         status: RunStatus,
         #[serde(default)]
         abandoned_reason: Option<AbandonReason>,
+        #[serde(default)]
+        not_reporting: bool,
         word: String,
     }
     #[derive(serde::Deserialize)]
@@ -1344,8 +1347,25 @@ mod tests {
         for c in words().statuses {
             let mut r = mk_run("r", RunKind::Mission, c.status, 1);
             r.abandoned_reason = c.abandoned_reason;
+            r.not_reporting = c.not_reporting;
             assert_eq!(status_label(&r), c.word, "{:?} {:?}", c.status, c.abandoned_reason);
         }
+    }
+
+    /// 5.0 (#3017): `run list` orders by the hub's receive order like the board,
+    /// never by an executor's clock.
+    #[test]
+    fn rows_order_by_receive_key_not_by_the_executors_clock() {
+        let mut skewed = mk_run("skewed", RunKind::Mission, RunStatus::Complete, 4_000_000_000);
+        skewed.receive_key = 1_700_000_000_000 * 1024;
+        let mut honest = mk_run("honest", RunKind::Dispatch, RunStatus::Complete, 1_700_000_100);
+        honest.receive_key = 1_700_000_100_000 * 1024;
+        let sel = select_rows(vec![skewed.clone(), honest.clone()], 10, false);
+        let ids: Vec<&str> = sel.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["honest", "skewed"]);
+        let rows = [skewed, honest];
+        let payload = json_payload(&rows, RunKindArg::All, &darkmux_serve::source_state::SourceState::Ok, None, None);
+        assert_eq!(payload.runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["honest", "skewed"]);
     }
 
     /// A relayed run says "from <machine>", in the subtitle (and in the narrow
@@ -1422,10 +1442,10 @@ mod tests {
         let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
         r.role = Some("a-role-name-far-too-long-to-fit-in-this-narrow-pane".to_string());
         let rows = vec![r];
-        let id_w = id_width(&rows, Some(60));
-        let line = format_row(2, &rows[0], id_w, Some(60), show_machine_column(Some(60)));
+        let id_w = id_width(&rows, Some(64));
+        let line = format_row(2, &rows[0], id_w, Some(64), show_machine_column(Some(64)));
         assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
-        assert!(line.chars().count() <= 60);
+        assert!(line.chars().count() <= 64);
         assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
     }
 

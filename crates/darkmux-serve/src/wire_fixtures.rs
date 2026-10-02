@@ -188,6 +188,7 @@ mod tests {
             verify_passed: None,
             relay: None,
             receive_key: 1_785_401_200 * 1000 * 1024,
+            not_reporting: false,
         };
         golden("runs-row.json", &run);
     }

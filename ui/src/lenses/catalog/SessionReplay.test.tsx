@@ -789,41 +789,30 @@ describe("SessionReplay", () => {
   // evidence and no terminal record can arrive: the pill says UNKNOWN, in the
   // place the page already states its status, instead of RUNNING.
   describe("a run on a machine that is not reporting", () => {
-    const peerRow = (liveness: "no_beat" | "live") => ({
-      entry: { id: "studio", address: "a:1", added_unix_ms: 1 },
-      is_this_machine: false,
-      machine_uid: "u-studio",
-      liveness,
-      card: { state: "unreachable", reason: "listener_off", detail: null },
-    });
-    const mount = async (liveness: "no_beat" | "live", ended = false, liveSession = false) => {
+    // The daemon marks the row (`Run.not_reporting`, `mark_not_reporting` in
+    // Rust, which owns the live-beat exception); the page reads it from the
+    // runs board's answer and derives nothing of its own.
+    const mount = async (notReporting: boolean, ended = false) => {
       const at = (ms: number) => new Date(Date.now() - ms).toISOString();
       const records = [
         { ts: at(30_000), action: "dispatch.start", session_id: "s-peer", machine_id: "studio", machine_uid: "u-studio", payload: { role: "coder" } },
         ...(ended ? [{ ts: at(10_000), action: "dispatch.complete", session_id: "s-peer", machine_id: "studio", machine_uid: "u-studio", payload: { wall_ms: 20_000 } }] : []),
       ];
+      const runs = [{ id: "s-peer", kind: "dispatch", status: ended ? "complete" : "running", tracked: false, dispatch_id: "s-peer", machine: "studio", machine_uid: "u-studio", ...(notReporting ? { not_reporting: true } : {}) }];
       vi.stubGlobal(
         "fetch",
-        vi.fn((url: string) => {
-          if (url === "/fleet/dispatches/live") {
-            const dispatches = liveSession ? [{ session_id: "s-peer", machine_id: "studio" }] : [];
-            return Promise.resolve(new Response(JSON.stringify({ dispatches, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
-          }
-          if (url === "/fleet/view") return Promise.resolve(new Response(JSON.stringify({ machines: [peerRow(liveness)] }), { status: 200 }));
-          return Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }));
-        }),
+        vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
       );
       renderReplay("s-peer");
       await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
-      // Both reads the verdict depends on have been asked and answered.
-      const asked = (u: string) => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => c[0] === u);
-      await waitFor(() => expect(asked("/fleet/view") && asked("/fleet/dispatches/live")).toBe(true));
+      const asked = (u: string) => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => String(c[0]).includes(u));
+      await waitFor(() => expect(asked("/runs")).toBe(true));
       await new Promise((r) => setTimeout(r, 0));
       return () => document.querySelector(".session-run__header .pill");
     };
 
     it("reads NOT REPORTING and does not pulse", async () => {
-      const pill = await mount("no_beat");
+      const pill = await mount(true);
       await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       expect(pill()?.getAttribute("data-live")).toBeNull();
       expect(pill()?.getAttribute("title")).toMatch(/not reporting/i);
@@ -834,7 +823,7 @@ describe("SessionReplay", () => {
     });
 
     it("does not count a clock up toward now for a run nobody is reporting on", async () => {
-      const pill = await mount("no_beat");
+      const pill = await mount(true);
       await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       const readout = () => document.querySelector(".metrics")?.textContent;
       const before = readout();
@@ -843,22 +832,13 @@ describe("SessionReplay", () => {
     });
 
     it("leaves a run that recorded its end alone: it finished, whoever is reporting now", async () => {
-      const pill = await mount("no_beat", true);
+      const pill = await mount(true, true);
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("complete"));
     });
 
-    it("keeps reading RUNNING while the machine is reporting", async () => {
-      const pill = await mount("live");
+    it("keeps reading RUNNING when the row is not marked", async () => {
+      const pill = await mount(false);
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("running"));
-    });
-
-    // `no_beat` is "no daemon beat found", not "down": a peer running a bare
-    // dispatch still beats its session, and a live session is never unknown.
-    it("a run whose session is live is never unknown, even when its machine's row reads down", async () => {
-      const pill = await mount("no_beat", false, true);
-      await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("running"));
-      await new Promise((r) => setTimeout(r, 100));
-      expect(pill()?.textContent?.toLowerCase()).toBe("running");
       expect(pill()?.getAttribute("data-live")).not.toBeNull();
     });
   });

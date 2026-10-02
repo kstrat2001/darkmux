@@ -172,4 +172,12 @@ relay?: RunRelay,
  * own work) carries this machine's receive time on the same scale, never
  * an executor's `ts`. The board sorts on this field alone.
  */
-receive_key: number, };
+receive_key: number, 
+/**
+ * (5.0) A run recorded as running on a machine the fleet view holds as
+ * down, with no live session beat: nothing says it is still running and
+ * nothing says it stopped. Set by [`mark_not_reporting`], the ONE owner,
+ * so every surface (board, filter, run page, timeline, `run list`) words
+ * it alike (`not reporting`). Absent when false.
+ */
+not_reporting?: boolean, };

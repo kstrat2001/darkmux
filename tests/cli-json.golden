@@ -936,6 +936,7 @@ Run
   verify_passed?: boolean | null
   relay?: RunRelay | null
   receive_key: uint64
+  not_reporting?: boolean
 RunChecks
   telemetry_covers_run: boolean
   policy_consistent: boolean | null

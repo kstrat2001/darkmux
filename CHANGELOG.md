@@ -86,17 +86,19 @@ darkmux release.
   runs board, its Status filter and the fleet timeline share one map: `error`
   (no more `errored` or `killed` on the page), `unparseable`, `aborted` or `no
   ending` for an abandoned run, and `not reporting` for a run recorded as running
-  on a machine that is not reporting (it used to read `unknown`, the same word
-  as a status that is not one). `darkmux run list`'s STATUS column reads the same
-  words, from one shared fixture, and its subtitle no longer leads with the
-  abandon reason (the status word says it).
+  on a machine the fleet view holds as down with no live session beat (it used to
+  read `unknown`, the same word as a status that is not one). The daemon decides
+  that once, on the row (`GET /runs` rows gain an additive `not_reporting`), so
+  the board, its filter, the run page, the fleet timeline and `darkmux run list`
+  agree. `run list`'s STATUS column (now 13 wide) reads the same words from one
+  shared fixture, and its subtitle no longer leads with the abandon reason.
 - **`darkmux machine list` words a machine's status as its card does** (5.0).
   Under each row: `status: idle`, `dispatch in flight`, `online` (with `not
   streaming` on the next line), `not streaming` or `offline`, then `why:` and the
   card tooltip's reason. A card nothing could read now names the typed reason
   (`not streaming: not listening`) instead of a fixed sentence.
 - **Fleet cards read the same from any serving machine** (5.0). Cards are ordered
-  by name, no longer this machine first, and show only their own machine's
+  by machine uid, no longer this machine first, and show only their own machine's
   facts. A card of unknown standing that nothing has read holds the no-reading
   line `—` instead of a confident `0 running`.
 - **The panel accepts this machine's own name for `profile list --machine`**
@@ -105,8 +107,9 @@ darkmux release.
 - **The runs board orders by the hub's receive order** (5.0). `GET /runs` rows
   gain `receive_key` (the newest record's hub stream id as `ms * 1024 + seq`; a
   row with no hub record carries this machine's own receive time on the same
-  scale), and the board sorts on it alone, so a peer whose clock runs ahead
-  cannot sit above work the hub received later.
+  scale), and the board and `darkmux run list` sort on it alone, so a peer whose
+  clock runs ahead cannot sit above work the hub received later, and a mission
+  sorts alike on the machine that ran it and on a peer.
 - **A relayed run reads `from <machine>` everywhere** (5.0): the board subtitle,
   the run page header (it said `asked on`) and `darkmux run list`'s subtitle.
 
