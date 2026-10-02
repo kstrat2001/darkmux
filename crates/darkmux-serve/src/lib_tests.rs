@@ -5258,6 +5258,7 @@
     /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
     struct CrewDirGuard {
         prev: Option<String>,
+        prev_home: Option<String>,
         // Held only to keep the temp dir alive for the guard's lifetime
         // (RAII) — never read after construction, hence the underscore.
         _tmp: TempDir,
@@ -5266,10 +5267,14 @@
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
             let prev = std::env::var("DARKMUX_HOME").ok();
+            let prev_home = std::env::var("HOME").ok();
+            // HOME too, not just the darkmux root: a path resolved from the
+            // home directory must not reach the operator's own state.
             unsafe {
                 std::env::set_var("DARKMUX_HOME", tmp.path());
+                std::env::set_var("HOME", tmp.path());
             }
-            Self { prev, _tmp: tmp }
+            Self { prev, prev_home, _tmp: tmp }
         }
     }
     impl Drop for CrewDirGuard {
@@ -5278,6 +5283,10 @@
                 match &self.prev {
                     Some(v) => std::env::set_var("DARKMUX_HOME", v),
                     None => std::env::remove_var("DARKMUX_HOME"),
+                }
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
                 }
             }
         }
@@ -5373,7 +5382,9 @@
     /// `/runs` publishes the lifecycle policy its rows were judged by, the
     /// numbers the viewer judges flow sessions by (`ui/src/lib/lifecycle.ts`).
     #[tokio::test]
+    #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_publishes_its_lifecycle_policy() {
+        let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
@@ -5385,7 +5396,9 @@
     }
 
     #[tokio::test]
+    #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_includes_lab_runs_with_kind_lab() {
+        let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
