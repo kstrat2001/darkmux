@@ -67,7 +67,7 @@ fn no_rules_check(provenance: &str, outbox_dir: &Path, config_path: &Path) -> Ch
     Check {
         name: "hooks".into(),
         status: Status::Warn,
-        message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
+        message: format!("enabled ({provenance}) but no rules configured: outbox_dir={}", outbox_dir.display()),
         hint: Some(format!(
             "Add a rule to {}'s `hooks.rules`, e.g. `darkmux config set hooks.rules \
              '[{{\"match\":{{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
@@ -87,7 +87,7 @@ fn overview_check(provenance: &str, outbox_dir: &Path, summaries: &[HookRuleSumm
         name: "hooks".into(),
         status: worst,
         message: format!(
-            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
+            "enabled ({provenance}): {} rule(s), outbox_dir={}\n{}",
             summaries.len(),
             outbox_dir.display(),
             lines.join("\n")
@@ -176,7 +176,7 @@ fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch) -> Vec<RuleFlag> {
 }
 
 fn empty_match_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
-    s.is_empty_match.then(|| RuleFlag::warn("EMPTY MATCH — matches nothing"))
+    s.is_empty_match.then(|| RuleFlag::warn("EMPTY MATCH: matches nothing"))
 }
 
 /// A refused rule is refused at load. A rule with both or neither of
@@ -185,9 +185,9 @@ fn empty_match_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
 /// tailnet policy (#2135 option 2) — a valid tailnet rule is not this case.
 fn refusal_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     if let Some(problem) = s.destination_problem {
-        return Some(RuleFlag::fail(format!("DESTINATION REFUSED — {}; refused at load", problem.describe())));
+        return Some(RuleFlag::fail(format!("DESTINATION REFUSED: {}; refused at load", problem.describe())));
     }
-    s.is_refused.then(|| RuleFlag::fail("URL REFUSED — neither loopback nor a Tailscale address; refused at load"))
+    s.is_refused.then(|| RuleFlag::fail("URL REFUSED: neither loopback nor a Tailscale address; refused at load"))
 }
 
 /// (#2135 option 2) An unsigned TAILNET target is fine inside the tailnet
@@ -196,7 +196,7 @@ fn refusal_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
 fn tailnet_unsigned_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     (s.is_tailnet && !s.signed).then(|| {
         RuleFlag::warn(
-            "TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it",
+            "TAILNET TARGET, UNSIGNED: attribution is unsigned; fine inside the tailnet, required beyond it",
         )
     })
 }
@@ -218,7 +218,7 @@ fn dropped_writes_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
 fn stalled_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     s.stalled.then(|| {
         RuleFlag::warn(format!(
-            "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
+            "STALLED: {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
              deliveries for this rule until its cursor file becomes writable again",
             s.cursor_write_failures
         ))
@@ -230,7 +230,7 @@ fn stalled_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
 /// redelivered.
 fn quarantined_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     (s.quarantined_lines > 0)
-        .then(|| RuleFlag::warn(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines)).delivery())
+        .then(|| RuleFlag::warn(format!("{} line(s) quarantined (invalid JSON: never redelivered)", s.quarantined_lines)).delivery())
 }
 
 /// (#2273) The receiver accepted a delivery's HTTP request (2xx) but its
@@ -252,7 +252,7 @@ fn receiver_rejected_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     }
     let last_clause = match s.last_receiver_rejected {
         Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
-            format!("; {n} on the last delivery — the receiver's reason(s) below")
+            format!("; {n} on the last delivery: the receiver's reason(s) below")
         }
         Some(n) => format!("; {n} on the last delivery"),
         None => String::new(),
@@ -260,7 +260,7 @@ fn receiver_rejected_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     Some(
         RuleFlag::warn(format!(
             "{} record(s) reported rejected by the receiver so far (request accepted, content \
-             rejected — consumed, not retried){last_clause}",
+             rejected: consumed, not retried){last_clause}",
             s.receiver_rejected_total
         ))
         .delivery(),
@@ -299,7 +299,7 @@ fn receiver_reason_lines(s: &HookRuleSummary) -> Vec<String> {
 /// `Location`), and `message` reaches flush-left rows — see
 /// [`receiver_reason_lines`].
 fn giving_up_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
-    s.last_error.as_ref().map(|_| RuleFlag::warn("deliveries are giving up — the last error is below").delivery())
+    s.last_error.as_ref().map(|_| RuleFlag::warn("deliveries are giving up: the last error is below").delivery())
 }
 
 /// The last give-up's error as sanitized, width-bounded hint lines, under
@@ -313,7 +313,7 @@ fn last_error_lines(s: &HookRuleSummary) -> Vec<String> {
 
 fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
     hooks_match_risks_observing_the_observer(rule_match)
-        .then(|| RuleFlag::warn("matches telemetry / a bare `*` action — the observer must not join the observed"))
+        .then(|| RuleFlag::warn("matches telemetry / a bare `*` action: the observer must not join the observed"))
 }
 
 /// A rule whose `action` pattern matches no action darkmux writes can never
@@ -328,7 +328,7 @@ fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
         return None;
     }
     Some(RuleFlag::warn(format!(
-        "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
+        "CANNOT MATCH: action=\"{configured}\" matches no action darkmux writes \
          (actions are spelled `<scope>.<event>`)"
     )))
 }
@@ -338,7 +338,7 @@ fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
 /// fails this row without the whole sink reading as broken.
 fn transform_failed_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     match (&s.transform_name, &s.transform_status) {
-        (Some(name), Some(Err(reason))) => Some(RuleFlag::fail(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"))),
+        (Some(name), Some(Err(reason))) => Some(RuleFlag::fail(format!("TRANSFORM `{name}` FAILED TO LOAD: {reason}"))),
         _ => None,
     }
 }
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
 
         let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
-        assert_eq!(overview.status, Status::Fail, "worst of the three rules — a non-loopback rule is a hard block");
+        assert_eq!(overview.status, Status::Fail, "worst of the three rules: a non-loopback rule is a hard block");
 
         let healthy = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(healthy.status, Status::Pass, "{}", healthy.message);
@@ -845,10 +845,10 @@ mod tests {
     /// The forgery payloads: the verbatim vocabulary of doctor's three
     /// flush-left row shapes, each sized to a plausible whole row.
     const DOCTOR_FORGERY_PAYLOADS: &[&str] = &[
-        "33 pass, 2 warn — workable but worth a look",
-        "● needs attention — everything looks fine here",
-        "● ok — every check passed",
-        "darkmux doctor — 35 checks",
+        "33 pass, 2 warn: workable but worth a look",
+        "● needs attention: everything looks fine here",
+        "● ok: every check passed",
+        "darkmux doctor: 35 checks",
         "all 35 checks passed",
     ];
 
@@ -985,7 +985,7 @@ mod tests {
 
         assert!(
             !proven.is_empty(),
-            "the precondition found no forgeable (payload, width, filler) at all — this test would prove nothing"
+            "the precondition found no forgeable (payload, width, filler) at all: this test would prove nothing"
         );
         println!("doctor inline forgeries proven (payload, terminal width, filler): {proven:#?}");
 
@@ -1214,7 +1214,7 @@ mod tests {
         assert!(rule.message.contains("400 record(s) reported rejected by the receiver"), "{}", rule.message);
         assert!(
             !rule.message.contains("on the last delivery"),
-            "the last delivery was clean — the message must not claim otherwise: {}",
+            "the last delivery was clean: the message must not claim otherwise: {}",
             rule.message
         );
     }
@@ -1357,7 +1357,7 @@ mod tests {
         assert_eq!(checks[0].status, Status::Warn);
         assert_eq!(
             checks[0].message,
-            format!("enabled (config.json) but no rules configured — outbox_dir={}", tmp.path().display())
+            format!("enabled (config.json) but no rules configured: outbox_dir={}", tmp.path().display())
         );
         let hint = checks[0].hint.as_deref().unwrap();
         assert!(hint.starts_with("Add a rule to /darkmux-root/config.json's `hooks.rules`"), "{hint}");
@@ -1378,7 +1378,7 @@ mod tests {
         assert_eq!(
             overview.message,
             format!(
-                "enabled (config.json) — 1 rule(s), outbox_dir={}\n  #0: {}",
+                "enabled (config.json): 1 rule(s), outbox_dir={}\n  #0: {}",
                 tmp.path().display(),
                 row.message
             )
@@ -1417,7 +1417,7 @@ mod tests {
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Warn);
-        assert!(row.message.contains("[STALLED — 3 consecutive cursor-write failure(s);"), "{}", row.message);
+        assert!(row.message.contains("[STALLED: 3 consecutive cursor-write failure(s);"), "{}", row.message);
     }
 
     #[test]
@@ -1428,7 +1428,7 @@ mod tests {
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Warn);
-        assert!(row.message.contains("[2 line(s) quarantined (invalid JSON — never redelivered)]"), "{}", row.message);
+        assert!(row.message.contains("[2 line(s) quarantined (invalid JSON: never redelivered)]"), "{}", row.message);
     }
 
     #[test]
@@ -1515,7 +1515,7 @@ mod tests {
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Fail);
         assert!(row.message.contains(", transform: no-such-adapter-for-this-test.jq [FAILED]"), "{}", row.message);
-        assert!(row.message.contains("[TRANSFORM `no-such-adapter-for-this-test.jq` FAILED TO LOAD — "), "{}", row.message);
+        assert!(row.message.contains("[TRANSFORM `no-such-adapter-for-this-test.jq` FAILED TO LOAD: "), "{}", row.message);
         assert_eq!(named(&checks, "hooks.rule.1").status, Status::Pass);
         assert_eq!(named(&checks, "hooks").status, Status::Fail);
     }
@@ -1553,7 +1553,7 @@ mod tests {
         let checks = checks_for(&[hook_rule(None, Some("http://10.0.0.5/x"))], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Fail);
-        assert!(row.message.contains("[EMPTY MATCH — matches nothing; URL REFUSED —"), "{}", row.message);
+        assert!(row.message.contains("[EMPTY MATCH: matches nothing; URL REFUSED:"), "{}", row.message);
         assert!(row.message.contains("[refused, unsigned]"), "{}", row.message);
     }
 
@@ -1568,8 +1568,8 @@ mod tests {
         assert_eq!(
             row.message,
             format!(
-                "action={} -> {LOOPBACK} [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — names \
-                 BOTH `http` and `file` — a rule needs exactly one destination; refused at load]",
+                "action={} -> {LOOPBACK} [refused, n/a] (undelivered: 0) [DESTINATION REFUSED: names \
+                 BOTH `http` and `file`: a rule needs exactly one destination; refused at load]",
                 live_action()
             ),
             "the URL itself is fine; what is refused is naming two destinations"
@@ -1589,8 +1589,8 @@ mod tests {
         assert_eq!(
             row.message,
             format!(
-                "action={} -> http://100.64.1.2:8790/e [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — \
-                 names BOTH `http` and `file` — a rule needs exactly one destination; refused at load]",
+                "action={} -> http://100.64.1.2:8790/e [refused, n/a] (undelivered: 0) [DESTINATION REFUSED: \
+                 names BOTH `http` and `file`: a rule needs exactly one destination; refused at load]",
                 live_action()
             )
         );
@@ -1605,8 +1605,8 @@ mod tests {
         assert_eq!(
             row.message,
             format!(
-                "action={} -> (no destination) [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — has no \
-                 destination — set exactly one of `http` or `file`; refused at load]",
+                "action={} -> (no destination) [refused, n/a] (undelivered: 0) [DESTINATION REFUSED: has no \
+                 destination: set exactly one of `http` or `file`; refused at load]",
                 live_action()
             ),
             "there is no URL to refuse; what is missing is a destination"
@@ -1669,7 +1669,7 @@ mod tests {
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Warn, "{}", row.message);
-        assert!(row.message.ends_with("[deliveries are giving up — the last error is below]"), "{}", row.message);
+        assert!(row.message.ends_with("[deliveries are giving up: the last error is below]"), "{}", row.message);
         assert!(!row.message.contains("connection refused"), "{}", row.message);
         let hint = row.hint.clone().unwrap();
         let lines: Vec<&str> = hint.lines().collect();
@@ -1685,7 +1685,7 @@ mod tests {
     fn a_give_up_error_renders_indented_and_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
-        let err = format!("redirect refused\n● ok — every check passed {}", "q".repeat(300));
+        let err = format!("redirect refused\n● ok: every check passed {}", "q".repeat(300));
         std::fs::write(
             tmp.path().join(format!("{}.last", key_of(&rule))),
             serde_json::json!({"ts": "2026-01-01T00:00:00Z", "ok": false, "error": err}).to_string(),

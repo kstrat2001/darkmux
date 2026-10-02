@@ -342,7 +342,7 @@ fn lessons_list(json: bool) -> Result<i32> {
             println!(
                 "{}",
                 darkmux_types::style::dim(
-                    "no lessons recorded yet — darkmux memory lesson add --title <t> --body <b>"
+                    "no lessons recorded yet: darkmux memory lesson add --title <t> --body <b>"
                 )
             );
             return Ok(0);
@@ -373,7 +373,7 @@ fn lessons_edit(
             eprintln!(
                 "{}",
                 darkmux_types::style::error(
-                    "nothing to edit — pass at least one of --title / --body / --file / --clear-file"
+                    "nothing to edit: pass at least one of --title / --body / --file / --clear-file"
                 )
             );
             return Ok(2);
@@ -397,7 +397,7 @@ fn lessons_edit(
             eprintln!(
                 "{}",
                 darkmux_types::style::error(&format!(
-                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    "no lesson #{id} in the {tier} store (ids are per-tier: try --global?)"
                 ))
             );
             Ok(1)
@@ -418,7 +418,7 @@ fn lessons_remove(id: i64, global: bool) -> Result<i32> {
             eprintln!(
                 "{}",
                 darkmux_types::style::error(&format!(
-                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    "no lesson #{id} in the {tier} store (ids are per-tier: try --global?)"
                 ))
             );
             Ok(1)
@@ -561,7 +561,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                     "{}",
                     darkmux_types::style::dim(&format!(
                         "no adjudication corrections recorded{scoped} in the last {days} day(s) \
-                         — your reviewer records them with darkmux flow note --execution <id> \
+                        : your reviewer records them with darkmux flow note --execution <id> \
                          --text \"<verdict · what you overrode · why>\" --source adjudication"
                     ))
                 );
@@ -1419,7 +1419,7 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
         } else {
             eprintln!(
                 "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
-                 failed there) — residents UNKNOWN, not empty. Check LMStudio + the \
+                 failed there): residents UNKNOWN, not empty. Check LMStudio + the \
                  `lms` CLI on `{id}`."
             );
         }

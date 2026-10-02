@@ -256,7 +256,7 @@ fn ab_context(args: &LabLoopArgs) -> Result<String> {
             ),
         };
         anyhow::bail!(
-            "--ab: nothing to inject — no authored lessons for this repo{no_cautions}. \
+            "--ab: nothing to inject: no authored lessons for this repo{no_cautions}. \
              Record a lesson (`darkmux memory lesson add`){remedy}, then retry."
         );
     }

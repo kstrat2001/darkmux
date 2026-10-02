@@ -1079,8 +1079,8 @@ impl DestinationProblem {
     /// The predicate that completes "hook rule #N …".
     pub fn describe(self) -> &'static str {
         match self {
-            Self::BothHttpAndFile => "names BOTH `http` and `file` — a rule needs exactly one destination",
-            Self::NoDestination => "has no destination — set exactly one of `http` or `file`",
+            Self::BothHttpAndFile => "names BOTH `http` and `file`: a rule needs exactly one destination",
+            Self::NoDestination => "has no destination: set exactly one of `http` or `file`",
         }
     }
 }
@@ -1143,9 +1143,9 @@ mod destination_tests {
         let both = rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"));
         let neither = rule(None, None);
         let err = resolve_one_rule(0, &both, tmp.path()).err().unwrap().to_string();
-        assert_eq!(err, "hook rule #0 names BOTH `http` and `file` — a rule needs exactly one destination");
+        assert_eq!(err, "hook rule #0 names BOTH `http` and `file`: a rule needs exactly one destination");
         let err = resolve_one_rule(0, &neither, tmp.path()).err().unwrap().to_string();
-        assert_eq!(err, "hook rule #0 has no destination — set exactly one of `http` or `file`");
+        assert_eq!(err, "hook rule #0 has no destination: set exactly one of `http` or `file`");
         let s = summarize_configured_rules(&[both, neither], tmp.path());
         assert_eq!(s[0].destination_problem, Some(DestinationProblem::BothHttpAndFile));
         assert_eq!(s[1].destination_problem, Some(DestinationProblem::NoDestination));
@@ -1320,7 +1320,7 @@ pub struct HookRuleSummary {
 
 fn describe_match(m: &HookMatch) -> String {
     if m.is_empty() {
-        return "(empty — matches nothing)".to_string();
+        return "(empty: matches nothing)".to_string();
     }
     let mut parts = Vec::new();
     if let Some(v) = &m.action {

@@ -125,7 +125,7 @@ pub fn provider_for(value: &str, bin: Option<&str>) -> Result<Box<dyn IdentityPr
             Ok(Box::new(WhoisCli::new("tailscale", &bin)))
         }
         other => bail!(
-            "unknown identity provider `{other}` (fleet.identity.provider) — valid: {}",
+            "unknown identity provider `{other}` (fleet.identity.provider): valid: {}",
             KNOWN_IDENTITY_PROVIDERS.join(", ")
         ),
     }

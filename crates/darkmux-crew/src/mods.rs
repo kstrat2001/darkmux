@@ -593,11 +593,11 @@ pub const MOD_TERM: &str =
 /// mounts do not use.
 pub fn dispatch_mod_flag_help() -> String {
     format!(
-        "Append a stored mod's record to the brief — repeatable. The mod is the HOW (a change \
+        "Append a stored mod's record to the brief: repeatable. The mod is the HOW (a change \
          someone already proposed); this hands the role the kit BYTE-EXACT and unparsed, plus \
          its attached files, which are bind-mounted read-only at {CONTAINER_MODS_BASE}/<key>/\
          attachments/ and named by that path in the block. A key with no stored mod is refused \
-         loudly rather than dispatched with a silently missing brief — `darkmux mod list` shows \
+         loudly rather than dispatched with a silently missing brief: `darkmux mod list` shows \
          what is stored. When both flags are given, the finding blocks come first, then the mod \
          blocks, each in the order given."
     )

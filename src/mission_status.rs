@@ -552,12 +552,12 @@ fn fleet_scope_note(state: &SourceState) -> Option<String> {
     match state {
         SourceState::Ok | SourceState::Off => None,
         SourceState::Stale { age_ms, .. } => Some(format!(
-            "fleet: could not reach the shared stream; showing a peer-mission snapshot {} old — \
+            "fleet: could not reach the shared stream; showing a peer-mission snapshot {} old: \
              this board's fleet view may be missing recent work",
             format_age_span(*age_ms / 1000)
         )),
         SourceState::Unavailable { .. } => Some(
-            "fleet: could not reach the shared stream and nothing was cached — this board covers \
+            "fleet: could not reach the shared stream and nothing was cached: this board covers \
              this machine's own missions only"
                 .to_string(),
         ),
@@ -590,7 +590,7 @@ fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<Strin
     }
     out.push(String::new());
     let header = format!(
-        "OBSERVED ON THE FLEET ({}) — seen via the shared flow stream, not owned by this machine",
+        "OBSERVED ON THE FLEET ({}): seen via the shared flow stream, not owned by this machine",
         peer.len()
     );
     for line in wrap_indented(&header, 0, width) {
@@ -683,7 +683,7 @@ fn detect_drift(
     if m.status == MissionStatus::Active && all_terminal && complete > 0 {
         out.push(Drift {
             kind: DriftKind::DoneNotFinalized,
-            detail: "all phases are terminal — the mission looks done but is still open"
+            detail: "all phases are terminal: the mission looks done but is still open"
                 .to_string(),
             suggest: vec![format!("darkmux mission finalize {}", m.id)],
         });
@@ -764,7 +764,7 @@ fn nothing_complete_not_closed_drift(
     Some(Drift {
         kind: DriftKind::AllPhasesTerminalNoneComplete,
         detail: format!(
-            "every phase is terminal and none completed ({abandoned} of {} abandoned) — the \
+            "every phase is terminal and none completed ({abandoned} of {} abandoned): the \
              mission is still open with nothing left to run",
             phases.len()
         ),
@@ -1290,13 +1290,13 @@ fn running_phase_session_drift(
         // session ending — a fact, not an absence.
         Some(DispatchSessionEvidence::RecordedEnd) => (
             "darkmux recorded this mission's dispatch session ENDING (a crash/kill/timeout \
-             close-edge, not a clean finish) — matching the Abandoned verdict `darkmux run list` \
+             close-edge, not a clean finish): matching the Abandoned verdict `darkmux run list` \
              reports for this mission"
                 .to_string(),
             vec![cross_check, debrief, abort],
         ),
         Some(DispatchSessionEvidence::StaleNoTerminal) => (
-            "this mission's dispatch session shows no evidence of life — no terminal record seen \
+            "this mission's dispatch session shows no evidence of life: no terminal record seen \
              (the same staleness rule `darkmux run list` reports this mission Abandoned under)"
                 .to_string(),
             vec![cross_check, debrief, abort],
@@ -1352,7 +1352,7 @@ fn planned_phase_nothing_advances_drift(
     Some(Drift {
         kind: DriftKind::PlannedPhaseNothingAdvances,
         detail: format!(
-            "phase(s) {} still read Planned, but this mission's dispatch session has ended — \
+            "phase(s) {} still read Planned, but this mission's dispatch session has ended: \
              nothing is left to advance them",
             planned.join(", ")
         ),
@@ -1603,7 +1603,7 @@ fn render_empty_board(fleet_state: &SourceState, width: Option<usize>) -> Vec<St
     // suggestions follow, for the same reason — this is the one command a
     // brand-new operator will copy, and it is the worst possible one to
     // break across a line with an indent injected into the middle.
-    for line in wrap_indented("no missions yet — launch one from a config with:", 2, width) {
+    for line in wrap_indented("no missions yet: launch one from a config with:", 2, width) {
         out.push(style::dim(&line));
     }
     out.push(format!("  {} darkmux mission config list", style::dim("→")));
@@ -1628,7 +1628,7 @@ fn render_board(b: &Board) -> Vec<String> {
     // useless at once.
     let (visible, hidden) = board_partition(b.views, b.named_only);
     let mut out = vec![style::header(&format!(
-        "mission status — {} mission{}",
+        "mission status: {} mission{}",
         visible.len(),
         if visible.len() == 1 { "" } else { "s" }
     ))];
@@ -1819,7 +1819,7 @@ fn overflow_lines(section: &Section, b: &Board, link_still_unshown: bool) -> Ove
     let more = format!(
         "… {} more ({shown} of {total} shown){}",
         total - shown,
-        if in_panel { "" } else { " — `--all` for every mission" }
+        if in_panel { "" } else { ": `--all` for every mission" }
     );
     let mut lines: Vec<String> = wrap_indented(&more, 2, b.width).iter().map(|l| style::dim(l)).collect();
     if hidden_drift > 0 {
@@ -1828,7 +1828,7 @@ fn overflow_lines(section: &Section, b: &Board, link_still_unshown: bool) -> Ove
             "⚠ {hidden_drift} hidden mission{} need{} attention{}",
             if hidden_drift == 1 { "" } else { "s" },
             if hidden_drift == 1 { "s" } else { "" },
-            if in_panel { "" } else { " — run with `--all`" }
+            if in_panel { "" } else { ": run with `--all`" }
         );
         lines.extend(wrap_indented(&warn, 2, b.width).iter().map(|l| style::warn(l)));
     }
@@ -1928,13 +1928,13 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
     // rather than `--all` (which would also un-paginate).
     if hidden_attention == 0 {
         return Some(format!(
-            "+{hidden_len} run instance{plural} filtered out — drop `--named` to include them, \
+            "+{hidden_len} run instance{plural} filtered out: drop `--named` to include them, \
              or see the runs lens"
         ));
     }
     let verb = if hidden_attention == 1 { "needs" } else { "need" };
     Some(format!(
-        "+{hidden_len} run instance{plural} filtered out, {hidden_attention} {verb} attention — \
+        "+{hidden_len} run instance{plural} filtered out, {hidden_attention} {verb} attention: \
          drop `--named` to include them, or see the runs lens"
     ))
 }
@@ -1987,9 +1987,9 @@ fn attention_rollup(
     // `fleet_scope_note` line above it (which a narrow terminal or a script
     // grepping just this line could miss).
     let fleet_tail =
-        if fleet_complete { "" } else { " — the fleet-wide read did not complete; peer missions may be missing" };
+        if fleet_complete { "" } else { ": the fleet-wide read did not complete; peer missions may be missing" };
     match (visible_attention, hidden_attention) {
-        (0, 0) if fleet_complete => (true, "✓ board is clean — every mission's phases are reconciled".to_string()),
+        (0, 0) if fleet_complete => (true, "✓ board is clean: every mission's phases are reconciled".to_string()),
         // Never the green checkmark here: this machine's own missions are
         // reconciled, but the line says "board", and the board includes the
         // fleet.
@@ -2007,7 +2007,7 @@ fn attention_rollup(
 fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
     let one = hidden == 1;
     format!(
-        "{hidden} filtered-out run instance{s} {verb} attention — drop `--named` to see {it} and {its} \
+        "{hidden} filtered-out run instance{s} {verb} attention: drop `--named` to see {it} and {its} \
          reconcile command{s}{fleet_tail}",
         s = if one { "" } else { "s" },
         verb = if one { "needs" } else { "need" },
@@ -2023,14 +2023,14 @@ fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
 fn visible_attention_line(visible: usize, hidden_by: Option<HiddenBy>, all_link_present: bool, fleet_tail: &str) -> String {
     let tail = match (hidden_by, all_link_present) {
         (None, _) => "",
-        (Some(HiddenBy::Paginated), true) => " (some are hidden — open the full board above)",
-        (Some(HiddenBy::Paginated), false) => " (some are hidden — `--all` to see them)",
-        (Some(HiddenBy::Filtered), _) => " (some are hidden — drop `--named` to see them)",
-        (Some(HiddenBy::Both), true) => " (some are hidden — drop `--named` and open the full board above)",
-        (Some(HiddenBy::Both), false) => " (some are hidden — drop `--named` and add `--all`)",
+        (Some(HiddenBy::Paginated), true) => " (some are hidden: open the full board above)",
+        (Some(HiddenBy::Paginated), false) => " (some are hidden: `--all` to see them)",
+        (Some(HiddenBy::Filtered), _) => " (some are hidden: drop `--named` to see them)",
+        (Some(HiddenBy::Both), true) => " (some are hidden: drop `--named` and open the full board above)",
+        (Some(HiddenBy::Both), false) => " (some are hidden: drop `--named` and add `--all`)",
     };
     format!(
-        "{visible} mission{s} {verb} attention — run the suggested commands above to reconcile{tail}{fleet_tail}",
+        "{visible} mission{s} {verb} attention: run the suggested commands above to reconcile{tail}{fleet_tail}",
         s = if visible == 1 { "" } else { "s" },
         verb = if visible == 1 { "needs" } else { "need" },
     )
@@ -2613,7 +2613,7 @@ mod tests {
         assert_eq!(
             std::env::var_os("DARKMUX_HOME"),
             ambient,
-            "and this test must leave the ambient environment exactly as it found it — the \
+            "and this test must leave the ambient environment exactly as it found it: the \
              restore that went unasserted in #2698"
         );
     }
@@ -2978,8 +2978,8 @@ mod tests {
         m.description = "dispatch: code-reviewer".into();
         assert_eq!(display_label(&m), "code-reviewer");
 
-        m.description = "PR review — kstrat2001/darkmux@38031a5".into();
-        assert_eq!(display_label(&m), "PR review — kstrat2001/darkmux@38031a5");
+        m.description = "PR review: kstrat2001/darkmux@38031a5".into();
+        assert_eq!(display_label(&m), "PR review: kstrat2001/darkmux@38031a5");
 
         // No description at all: an id is a poor label, never a wrong one.
         m.description = "   ".into();
@@ -3012,7 +3012,7 @@ mod tests {
 
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
         m.description = "(#2310 P4d) The code review, built on the shared mission building \
-             blocks rather than a pipeline of its own — and, since P4d, the ONLY `review`: \
+             blocks rather than a pipeline of its own: and, since P4d, the ONLY `review`: \
              the bespoke funnel launcher and its ten Tier-3 step kinds are deleted."
             .into();
         m.spec = Some(crate::crew::types::MissionSpec {
@@ -3605,7 +3605,7 @@ mod tests {
         assert_eq!(
             kinds,
             vec![DriftKind::DoneNotFinalized],
-            "a mission that produced SOMETHING stays with the rule whose sentence fits it — the \
+            "a mission that produced SOMETHING stays with the rule whose sentence fits it: the \
              two kinds must never both fire: {kinds:?}"
         );
         let closed = mission("m1", MissionStatus::Finalized);
@@ -3987,13 +3987,13 @@ mod tests {
                 assert_eq!(
                     kinds,
                     vec![DriftKind::StaleActive],
-                    "the day-scale rule covers the zero-complete sibling — if this arm ever \
+                    "the day-scale rule covers the zero-complete sibling: if this arm ever \
                      goes empty too, the narrowing below stopped being narrow"
                 );
             } else {
                 assert!(
                     kinds.is_empty(),
-                    "documented as UNCOVERED in running_phase_session_drift's scope doc — if a \
+                    "documented as UNCOVERED in running_phase_session_drift's scope doc: if a \
                      rule starts firing here, update that doc rather than this assertion: \
                      {kinds:?}"
                 );
@@ -4299,7 +4299,7 @@ mod tests {
         // ── Predicate 1: one rule's coverage (NOT the headline) ──────────
         assert_eq!(
             raw_rule_silent, 53,
-            "naive count changed — see this test's doc on the Aborted split: {detail:?}"
+            "naive count changed: see this test's doc on the Aborted split: {detail:?}"
         );
         assert_eq!(real_rule_silent, 28, "the documented disagreement count moved: {detail:?}");
         assert_eq!(
@@ -4318,7 +4318,7 @@ mod tests {
         assert_eq!(
             real_board_silent, 10,
             "(#2682 round 4) 29 before this round, 12 after; (#2954) 10 once a Planned phase with a dead session is drawn. Every remaining row is named, with \
-             its reasoning, in `running_phase_session_drift`'s scope doc — if this number moves, \
+             its reasoning, in `running_phase_session_drift`'s scope doc: if this number moves, \
              update that doc rather than this assertion: {board_detail:?}"
         );
         assert_eq!(
@@ -4329,7 +4329,7 @@ mod tests {
         assert_eq!(
             board_per_status.get("Finalized").copied(),
             Some(5),
-            "Finalized board-silent breakdown moved — only the all-terminal-phases rows should \
+            "Finalized board-silent breakdown moved: only the all-terminal-phases rows should \
              remain; a Finalized mission holding a Planned/Running phase now draws \
              `mission-terminal-open-phase`: {board_detail:?}"
         );
@@ -4443,7 +4443,7 @@ mod tests {
             local_evidence,
             Some(darkmux_serve::DispatchSessionEvidence::StaleNoTerminal),
             "a session with a start but no terminal, past the staleness budget, must read \
-             StaleNoTerminal — got {local_evidence:?}"
+             StaleNoTerminal: got {local_evidence:?}"
         );
 
         // What the board's OWN drift check does when handed that SAME value.
@@ -4674,11 +4674,11 @@ mod tests {
 
         assert!(
             d.iter().any(|dr| dr.kind == DriftKind::StaleActive),
-            "doom-loop-m4 has sat at 0/4 phases for weeks — must still flag stale-active: {d:?}"
+            "doom-loop-m4 has sat at 0/4 phases for weeks: must still flag stale-active: {d:?}"
         );
         assert!(
             !d.iter().any(suggests_aborting_a_phase),
-            "the phase-order rule is retired (#2406) — no phase in this fixture should be \
+            "the phase-order rule is retired (#2406): no phase in this fixture should be \
              flagged unreachable any more: {d:?}"
         );
         assert_eq!(d.len(), 1, "only stale-active should fire now: {d:?}");
@@ -4802,11 +4802,11 @@ mod tests {
     fn hidden_run_summary_names_the_count_and_pluralizes() {
         assert_eq!(
             hidden_run_summary(1, 0).unwrap(),
-            "+1 run instance filtered out — drop `--named` to include them, or see the runs lens"
+            "+1 run instance filtered out: drop `--named` to include them, or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(32, 0).unwrap(),
-            "+32 run instances filtered out — drop `--named` to include them, or see the runs lens"
+            "+32 run instances filtered out: drop `--named` to include them, or see the runs lens"
         );
     }
 
@@ -4817,12 +4817,12 @@ mod tests {
         // collapsed out of the section it would have rendered in.
         assert_eq!(
             hidden_run_summary(32, 2).unwrap(),
-            "+32 run instances filtered out, 2 need attention — drop `--named` to include them, \
+            "+32 run instances filtered out, 2 need attention: drop `--named` to include them, \
              or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(3, 1).unwrap(),
-            "+3 run instances filtered out, 1 needs attention — drop `--named` to include them, \
+            "+3 run instances filtered out, 1 needs attention: drop `--named` to include them, \
              or see the runs lens"
         );
     }
@@ -4831,7 +4831,7 @@ mod tests {
     fn attention_rollup_is_clean_only_when_both_counts_are_zero() {
         let (clean, msg) = attention_rollup(0, 0, None, false, true);
         assert!(clean);
-        assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
+        assert_eq!(msg, "✓ board is clean: every mission's phases are reconciled");
     }
 
     #[test]
@@ -4855,19 +4855,19 @@ mod tests {
     fn attention_rollup_uses_the_existing_wording_when_visible_missions_need_attention() {
         let (clean, msg) = attention_rollup(3, 0, None, false, true);
         assert!(!clean);
-        assert_eq!(msg, "3 missions need attention — run the suggested commands above to reconcile");
+        assert_eq!(msg, "3 missions need attention: run the suggested commands above to reconcile");
 
         let (_, msg) = attention_rollup(1, 0, None, false, true);
-        assert_eq!(msg, "1 mission needs attention — run the suggested commands above to reconcile");
+        assert_eq!(msg, "1 mission needs attention: run the suggested commands above to reconcile");
     }
 
     #[test]
     fn attention_rollup_tail_reflects_hidden_drift_and_panel_presence() {
         let (_, msg) = attention_rollup(3, 0, Some(HiddenBy::Paginated), false, true);
-        assert!(msg.ends_with("(some are hidden — `--all` to see them)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden: `--all` to see them)"), "{msg}");
 
         let (_, msg) = attention_rollup(3, 0, Some(HiddenBy::Paginated), true, true);
-        assert!(msg.ends_with("(some are hidden — open the full board above)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden: open the full board above)"), "{msg}");
 
         let (_, msg) = attention_rollup(3, 0, None, false, true);
         assert!(!msg.contains("hidden"), "{msg}");
@@ -4879,12 +4879,12 @@ mod tests {
     fn attention_rollup_tail_names_the_cure_for_filtered_rows() {
         for panel in [false, true] {
             let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Filtered), panel, true);
-            assert!(msg.ends_with("(some are hidden — drop `--named` to see them)"), "{msg}");
+            assert!(msg.ends_with("(some are hidden: drop `--named` to see them)"), "{msg}");
         }
         let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), false, true);
-        assert!(msg.ends_with("(some are hidden — drop `--named` and add `--all`)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden: drop `--named` and add `--all`)"), "{msg}");
         let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), true, true);
-        assert!(msg.ends_with("(some are hidden — drop `--named` and open the full board above)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden: drop `--named` and open the full board above)"), "{msg}");
     }
 
     #[test]
@@ -4920,7 +4920,7 @@ mod tests {
         // install must see the EXACT pre-#1711 wording, unchanged.
         let (clean, msg) = attention_rollup(0, 0, None, false, true);
         assert!(clean);
-        assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
+        assert_eq!(msg, "✓ board is clean: every mission's phases are reconciled");
     }
 
     #[test]
@@ -5208,7 +5208,7 @@ mod tests {
         assert_eq!(
             peer_status_word(RunStatus::Abandoned, Some(AbandonReason::NoTerminal)),
             "silent (no terminal record seen)",
-            "no terminal record and not live must NOT be worded as a verdict — darkmux describes, \
+            "no terminal record and not live must NOT be worded as a verdict: darkmux describes, \
              never adjudicates"
         );
         assert_eq!(
@@ -5403,7 +5403,7 @@ mod tests {
         let vs = views_of(&ms);
         assert_eq!(
             text(render_board(&board(&vs))),
-            "mission status — 3 missions\n\
+            "mission status: 3 missions\n\
              \n\
              ACTIVE (3)\n  \
              ◆ alpha-1   2h    1/2  ▓▓░░  1 complete · 1 running\n      \
@@ -5415,7 +5415,7 @@ mod tests {
              ◆ alpha-0   1h    1/2  ▓▓░░  1 complete · 1 running\n  \
              ◆ alpha-2   3h    1/2  ▓▓░░  1 complete · 1 running\n\
              \n\
-             1 mission needs attention — run the suggested commands above to reconcile"
+             1 mission needs attention: run the suggested commands above to reconcile"
         );
     }
 
@@ -5424,7 +5424,7 @@ mod tests {
         let ms = three_active();
         let vs: Vec<MissionView> = ms.iter().map(|m| view(m, 2, 0)).collect();
         let out = text(render_board(&board(&vs)));
-        assert!(out.ends_with("\n\n✓ board is clean — every mission's phases are reconciled"), "{out}");
+        assert!(out.ends_with("\n\n✓ board is clean: every mission's phases are reconciled"), "{out}");
     }
 
     #[test]
@@ -5436,14 +5436,14 @@ mod tests {
         b.limit = Some(1);
         assert_eq!(
             text(render_board(&b)),
-            "mission status — 3 missions\n\
+            "mission status: 3 missions\n\
              \n\
              ACTIVE (3)\n  \
              ◆ alpha-2   3h    1/2  ▓▓░░  1 complete · 1 running\n  \
-             … 2 more (1 of 3 shown) — `--all` for every mission\n  \
-             ⚠ 1 hidden mission needs attention — run with `--all`\n\
+             … 2 more (1 of 3 shown): `--all` for every mission\n  \
+             ⚠ 1 hidden mission needs attention: run with `--all`\n\
              \n\
-             1 mission needs attention — run the suggested commands above to reconcile (some are hidden — `--all`\n\
+             1 mission needs attention: run the suggested commands above to reconcile (some are hidden: `--all`\n\
              to see them)"
         );
     }
@@ -5462,7 +5462,7 @@ mod tests {
         assert!(out.contains("  … 1 more (1 of 2 shown)\n"), "{out}");
         assert_eq!(out.matches("→ show every mission").count(), 1, "one link for the whole board: {out}");
         assert!(!out.contains("--all"), "{out}");
-        assert!(out.ends_with("(some are hidden — open\nthe full board above)"), "{out}");
+        assert!(out.ends_with("(some are hidden: open the\nfull board above)"), "{out}");
     }
 
     #[test]
@@ -5502,7 +5502,7 @@ mod tests {
         vs[1].drifts.push(drift("stale", &[]));
 
         let out = text(render_board(&board(&vs)));
-        assert!(out.contains("mission status — 2 missions"), "{out}");
+        assert!(out.contains("mission status: 2 missions"), "{out}");
         assert!(out.contains("→ `--named` for named missions only"), "{out}");
 
         let mut b = board(&vs);
@@ -5512,13 +5512,13 @@ mod tests {
         let mut b = board(&vs);
         b.named_only = true;
         let out = text(render_board(&b));
-        assert!(out.contains("mission status — 1 mission\n"), "{out}");
+        assert!(out.contains("mission status: 1 mission\n"), "{out}");
         assert!(
-            out.contains("+1 run instance filtered out, 1 needs attention — drop `--named` to include them"),
+            out.contains("+1 run instance filtered out, 1 needs attention: drop `--named` to include them"),
             "{out}"
         );
         assert!(
-            out.ends_with("\n\n1 filtered-out run instance needs attention — drop `--named` to see it and its reconcile command"),
+            out.ends_with("\n\n1 filtered-out run instance needs attention: drop `--named` to see it and its reconcile command"),
             "{out}"
         );
     }
@@ -5539,7 +5539,7 @@ mod tests {
         let out = text(render_board(&b));
         let rollup = out.rsplit("\n\n").next().unwrap().replace('\n', " ");
         assert!(rollup.starts_with("1 mission needs attention"), "{rollup}");
-        assert!(rollup.ends_with("(some are hidden — drop `--named` to see them)"), "{rollup}");
+        assert!(rollup.ends_with("(some are hidden: drop `--named` to see them)"), "{rollup}");
     }
 
     #[test]
@@ -5582,17 +5582,17 @@ mod tests {
     fn an_empty_board_points_at_the_launch_commands() {
         assert_eq!(
             text(render_empty_board(&SourceState::Off, Some(100))),
-            "  no missions yet — launch one from a config with:\n  \
+            "  no missions yet: launch one from a config with:\n  \
              → darkmux mission config list\n  \
              → darkmux mission launch <config-id>"
         );
         assert_eq!(
             text(render_empty_board(&SourceState::Unavailable { detail: "x" }, Some(100))),
-            "  no missions yet — launch one from a config with:\n  \
+            "  no missions yet: launch one from a config with:\n  \
              → darkmux mission config list\n  \
              → darkmux mission launch <config-id>\n\
              \n\
-             fleet: could not reach the shared stream and nothing was cached — this board covers this machine's\n\
+             fleet: could not reach the shared stream and nothing was cached: this board covers this machine's\n\
              own missions only"
         );
     }
@@ -5614,15 +5614,15 @@ mod tests {
         b.fleet_state = &SourceState::Stale { age_ms: 90_000, detail: "x" };
         assert_eq!(
             text(render_board(&b)),
-            "mission status — 0 missions\n\
+            "mission status: 0 missions\n\
              \n\
-             fleet: could not reach the shared stream; showing a peer-mission snapshot 1m old — this board's\n\
-             fleet view may be missing recent work\n\
+             fleet: could not reach the shared stream; showing a peer-mission snapshot 1m old: this board's fleet\n\
+             view may be missing recent work\n\
              \n\
-             OBSERVED ON THE FLEET (1) — seen via the shared flow stream, not owned by this machine\n  \
+             OBSERVED ON THE FLEET (1): seen via the shared flow stream, not owned by this machine\n  \
              ◇ review-peer-1  peer-a   2m  running\n\
              \n\
-             this machine's missions are reconciled — the fleet-wide read did not complete; peer missions may be\n\
+             this machine's missions are reconciled: the fleet-wide read did not complete; peer missions may be\n\
              missing (see note above)"
         );
     }

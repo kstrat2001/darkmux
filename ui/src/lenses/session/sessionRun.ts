@@ -1,8 +1,7 @@
 /**
  * Pure logic for the session drill-in ("run detail" for a `#dispatch=<id>`
- * route) — a TypeScript port of `viewer.html`'s `runRegions()`
- * (viewer.html:2064-2285), the derivation behind `renderSubsystem()`
- * (viewer.html:2292-2309). This is the "whole separate render surface"
+ * route): `runRegions()`, the derivation behind the run page's regions.
+ * This is the "whole separate render surface"
  * `SessionReplay.tsx`'s pre-drill-in doc named as out of scope; this packet
  * is the one that builds it.
  *
@@ -22,7 +21,7 @@
  * 1. Every other region this module DOES emit (header, brief kv rows,
  *    metrics tiles, model track, detections) is genuinely golden-verified,
  *    not just "read from source and hoped right".
- * 2. The two SVG visualizations (viewer.html's `loadRow`/`ctxChart` —
+ * 2. The two SVG visualizations (the retired viewer's `loadRow`/`ctxChart` —
  *    per-sample CPU/RAM/GPU bars and a context-window step chart) are
  *    DELIBERATELY NOT ported here. Both are PURE re-renderings of numbers
  *    this module already surfaces as text (the CPU/RAM/GPU % samples have
@@ -74,7 +73,7 @@ import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 /** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
  *  section's ACTIVE TIME has its own, below: it shows wall minus rest). */
 const WALL_HINT_TITLE =
-  "run time — the runtime's own measure of this execution, INCLUDING any rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
+  "run time: the runtime's own measure of this execution, INCLUDING any rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
 
 /** The MODEL section's ACTIVE TIME hover text: wall clock minus every rest, the
  *  figure `darkmux run stats` prints as active. The brief's timing line beside it
@@ -1184,7 +1183,7 @@ const SKEW_SIGNAL: Signal = {
   kind: "clock-skew",
   severity: "warn",
   detail:
-    "this run's terminal record is timestamped BEFORE its own start — the outcome is read from it anyway, but elapsed time and signal offsets on this page are unreliable.",
+    "this run's terminal record is timestamped BEFORE its own start: the outcome is read from it anyway, but elapsed time and signal offsets on this page are unreliable.",
   fix: "check the clocks on the machines that produced these records.",
   atMs: null,
   offsetLabel: "",
@@ -1223,7 +1222,7 @@ function untaggedTrackSignal(distinct: string[]): Signal | null {
   return {
     kind: "model-track-unclassified",
     severity: "info",
-    detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}), but these records carry no seat tag — a real mid-run swap and a correct primary+compactor staffing look identical here, so this run is not judged either way.`,
+    detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}), but these records carry no seat tag: a real mid-run swap and a correct primary+compactor staffing look identical here, so this run is not judged either way.`,
     fix: "runs recorded at flow schema 1.45.0 or later tag each load with its seat; the swap reading returns for those.",
     atMs: null,
     offsetLabel: "",
@@ -1263,10 +1262,10 @@ function taggedSwapSignal(lms: NormRecord[], loads: NormRecord[]): Signal | null
 
 function swapDetail(specialistModels: string[], unloaded: string[], loadedMidRun: string[]): string | null {
   if (specialistModels.length > 1) {
-    return `${specialistModels.length} models loaded in one run (${specialistModels.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`;
+    return `${specialistModels.length} models loaded in one run (${specialistModels.join(" → ")}): mid-run swap stalls the dispatch while the new model loads.`;
   }
-  if (unloaded.length > 0) return `${unloaded.join(", ")} was unloaded mid-run — the seat's reload stalls the dispatch while the model loads.`;
-  if (loadedMidRun.length > 0) return `${loadedMidRun.join(", ")} loaded mid-run rather than before it — the dispatch stalls while the model loads.`;
+  if (unloaded.length > 0) return `${unloaded.join(", ")} was unloaded mid-run: the seat's reload stalls the dispatch while the model loads.`;
+  if (loadedMidRun.length > 0) return `${loadedMidRun.join(", ")} loaded mid-run rather than before it: the dispatch stalls while the model loads.`;
   return null;
 }
 
@@ -1426,8 +1425,8 @@ function repetitionDetail(acc: TurnFlag, policy: string | null): string {
   const ratio = acc.ratio ? ` (tail_ratio=${acc.ratio})` : "";
   const citation = acc.sawGate ? "#2836" : "#1221";
   if (acc.acted) return `turn ${acc.turnSeq}: judged repeating${ratio} and ended it${acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : ""} (${citation})`;
-  if (policy === "record" || policy === "observe") return `turn ${acc.turnSeq}: judged repeating${ratio} — recorded, not concluded (#2846)`;
-  if (policy === "warn") return `turn ${acc.turnSeq}: judged repeating${ratio} — warned, not concluded (#2947)`;
+  if (policy === "record" || policy === "observe") return `turn ${acc.turnSeq}: judged repeating${ratio}: recorded, not concluded (#2846)`;
+  if (policy === "warn") return `turn ${acc.turnSeq}: judged repeating${ratio}: warned, not concluded (#2947)`;
   return `turn ${acc.turnSeq}: judged repeating${ratio} (${citation})`;
 }
 
@@ -1531,7 +1530,7 @@ function errorOutcome(edge: CloseEdge | undefined): string | undefined {
   return `errored${edge.exitCode != null ? ` (exit ${edge.exitCode})` : ""}`;
 }
 
-/** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
+/** `runRegions()`, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
  * session (the `/flow-dispatch/<id>` response, through `flowToRenderModel`
  * — see that function's own doc) — `sid` further scopes every derivation

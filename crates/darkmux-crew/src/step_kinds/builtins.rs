@@ -1534,7 +1534,7 @@ impl DispatchMapStepKind {
     /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
     /// graph/parity consumer reads a map's per-item records the same way it
     /// reads a single-shot's.
-    fn item_record(session: &SessionId, execution: &ExecutionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+    fn item_record(session: &SessionId, execution: &ExecutionId, step: &Step, model: &str, unmanaged: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
@@ -1547,7 +1547,7 @@ impl DispatchMapStepKind {
                 darkmux_flow::Payload::StepResult(StepResultPayload {
                     index: Some(res.index as u64),
                     ok: Some(res.ok),
-                    remote: Some(remote),
+                    unmanaged: Some(unmanaged),
                     total_tokens: res.total_tokens,
                     // (#1442) Per-item telemetry: the endpoint-reported served
                     // model (HOSTED only; absent for a local item, by
@@ -1565,7 +1565,7 @@ impl DispatchMapStepKind {
 
     /// The terminal of one item's execution (see [`ExecutionBookends`]):
     /// `dispatch.complete` for an item that produced a reply, `dispatch.error`
-    /// for one that did not. `remote_tokens` is stamped only for a hosted
+    /// for one that did not. `unmanaged_tokens` is stamped only for a hosted
     /// item, and only what it spent, the figure its item record reports.
     fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         let tokens = crate::dispatch_envelope::DirectTokens {
@@ -1587,7 +1587,7 @@ impl DispatchMapStepKind {
             error: res.error.clone(),
             // A hosted item's spend, only what it spent: the figure its item
             // record reports.
-            remote_tokens: records.endpoint_label.map(|_| res.total_tokens.unwrap_or(0)),
+            unmanaged_tokens: records.endpoint_label.map(|_| res.total_tokens.unwrap_or(0)),
             ..records.stamp(base)
         };
         if res.ok {
@@ -1598,7 +1598,7 @@ impl DispatchMapStepKind {
     }
 
     /// (#1442 gate C1) The ONE step-level aggregate record emitted after the
-    /// whole loop: items_in, ok_count, failed_count, remote, and SUMMED
+    /// whole loop: items_in, ok_count, failed_count, unmanaged, and SUMMED
     /// total_tokens across every item. See the emission site in `run` for
     /// why the sum (not the per-item values) is what the mission graph's
     /// max-fold token meter must see.
@@ -1606,7 +1606,7 @@ impl DispatchMapStepKind {
         session: &SessionId,
         step: &Step,
         model: &str,
-        remote: bool,
+        unmanaged: bool,
         results: &[MapItemResult],
     ) -> darkmux_flow::FlowRecord {
         let ok_count = results.iter().filter(|r| r.ok).count();
@@ -1629,7 +1629,7 @@ impl DispatchMapStepKind {
                     items_in: Some(results.len() as u64),
                     ok_count: Some(ok_count as u64),
                     failed_count: Some(failed_count as u64),
-                    remote: Some(remote),
+                    unmanaged: Some(unmanaged),
                     total_tokens: Some(total_tokens),
                     total_wall_ms: Some(total_wall_ms),
                     ..StepResultPayload::new(&step.id, "dispatch.map")
@@ -1653,7 +1653,7 @@ impl DispatchMapStepKind {
                 darkmux_flow::Payload::StepResult(StepResultPayload {
                     items_in: Some(0),
                     items_out: Some(0),
-                    short_circuit: Some("empty collection — dispatch.map skipped before any model load".to_string()),
+                    short_circuit: Some("empty collection: dispatch.map skipped before any model load".to_string()),
                     ..StepResultPayload::new(&step.id, "dispatch.map")
                 }),
                 step.id.clone(),
@@ -2148,7 +2148,7 @@ impl MapCall {
 /// Without it, a split the item genuinely had would be dropped entirely —
 /// the exact class of loss this function exists to close.
 ///
-/// (#2690, FLOW_SCHEMA_VERSION 1.49.0) `remote` and `index` are the SEAT's
+/// (#2690, FLOW_SCHEMA_VERSION 1.49.0) `unmanaged` and `index` are the SEAT's
 /// own identity, and they are here because the viewer could not otherwise
 /// recover it. `session_id` on this record is the step's task session
 /// (`SessionId::task(run, &step.task_id)`), which sibling seats fanned out within ONE task SHARE
@@ -2161,7 +2161,7 @@ impl MapCall {
 /// measured at three arities (`ui/src/lenses/fleet/savings.test.ts`).
 ///
 /// This record now carries the answer instead of the consumer guessing it.
-/// `remote` is the step's own hosted-or-local verdict — the SAME
+/// `unmanaged` is the step's own unmanaged-or-managed verdict — the SAME
 /// `endpoint.is_some()` this kind already stamps on its `step result`
 /// (`Self::item_record`) and aggregate records, so a seat's telemetry and a
 /// seat's per-item record cannot disagree. It is uniform across a step's
@@ -2175,7 +2175,7 @@ impl MapCall {
 /// legitimately report identical ones.
 ///
 /// WHY THE PRODUCER AND NOT THE VIEWER. `Self::item_record` already emits a
-/// literal per-seat `remote` for the same item, pushed from the same
+/// literal per-seat `unmanaged` for the same item, pushed from the same
 /// `MapItemResult` in the same loop iteration — so a consumer COULD join the
 /// two. Measured on the committed parity corpora, that join is
 /// `(session_id, ts, total_tokens)`, it pairs 180 of 364 telemetry records,
@@ -2201,7 +2201,7 @@ impl MapCall {
 fn map_call_token_payload(
     call: &MapCall,
     index: usize,
-    remote: bool,
+    unmanaged: bool,
     requested_model: &str,
     endpoint: &str,
     endpoint_id: Option<&str>,
@@ -2219,12 +2219,12 @@ fn map_call_token_payload(
     );
     // Unconditional, unlike every count: these two are facts about THIS
     // emitter's own call, never something a provider did or did not report.
-    // A consumer can therefore treat an ABSENT `remote` as "not this
+    // A consumer can therefore treat an ABSENT `unmanaged` as "not this
     // producer", which is what lets the viewer keep its pre-#2690 fallback
     // for every other `telemetry.tokens` lineage without a version check.
     // `index` is the ITEM's position; an item that retried emits one record
     // per attempt, all carrying the same index.
-    payload.remote = Some(remote);
+    payload.unmanaged = Some(unmanaged);
     payload.index = Some(index as u64);
     payload
 }
@@ -2235,7 +2235,7 @@ fn map_call_token_payload(
 #[cfg(test)]
 fn map_item_token_payload(
     res: &MapItemResult,
-    remote: bool,
+    unmanaged: bool,
     requested_model: &str,
     endpoint: &str,
 ) -> Option<crate::usage::UsagePayload> {
@@ -2249,7 +2249,7 @@ fn map_item_token_payload(
         },
         reported_model: res.served_model.clone(),
     };
-    Some(map_call_token_payload(&call, res.index, remote, requested_model, endpoint, None))
+    Some(map_call_token_payload(&call, res.index, unmanaged, requested_model, endpoint, None))
 }
 
 /// (#1605) The bounded transient-error retry's backoff — short on purpose
@@ -3156,7 +3156,7 @@ mod tests {
     /// no HTTP mock needed, since a correct refusal never dials it.
     #[test]
     #[serial_test::serial]
-    fn dispatch_internal_resume_precheck_names_the_remote_single_shot_path_not_the_checkpoint() {
+    fn dispatch_internal_resume_precheck_names_the_unmanaged_single_shot_path_not_the_checkpoint() {
         // (#2718) Every darkmux write destination, pinned for this test.
         // Measured before this line existed: a full `-p darkmux-crew --lib`
         // run with all twelve state variables exported to a fresh root still
@@ -3205,8 +3205,8 @@ mod tests {
         let err = result.expect_err("a bare-hosted role with --resume-from must refuse");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("not supported on the remote single-shot dispatch path"),
-            "must name the remote single-shot path as the reason: {msg}"
+            msg.contains("not supported on the unmanaged-endpoint single-shot dispatch path"),
+            "must name the unmanaged-endpoint single-shot path as the reason: {msg}"
         );
         assert!(
             !msg.contains("RESUME CHECKPOINT NOT FOUND"),
@@ -5193,7 +5193,7 @@ mod tests {
         let recs = as_values(&out.flow_records);
         let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "map item (named)");
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
-        assert_eq!(rec["payload"]["remote"], true);
+        assert_eq!(rec["payload"]["unmanaged"], true);
     }
 
     #[test]
@@ -5342,7 +5342,7 @@ mod tests {
     /// Unconditional, unlike every token field beside them: they describe
     /// this emitter's own call, not something a provider reported, so the
     /// omit-never-zero rule does not apply. That is what lets a consumer
-    /// read an ABSENT `remote` as "a different `telemetry.tokens` lineage"
+    /// read an ABSENT `unmanaged` as "a different `telemetry.tokens` lineage"
     /// rather than "this producer had nothing to say".
     #[test]
     fn map_item_token_telemetry_carries_the_seat_tier_and_index() {
@@ -5361,15 +5361,15 @@ mod tests {
             retried: 0,
         };
         let payload = serde_json::to_value(map_item_token_payload(&local, false, "m", "ep").expect("emits")).unwrap();
-        assert_eq!(payload["remote"], false, "a local seat's own tier, on its own token record");
+        assert_eq!(payload["unmanaged"], false, "a local seat's own tier, on its own token record");
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
 
         let hosted = serde_json::to_value(map_item_token_payload(&local, true, "m", "ep").expect("emits")).unwrap();
-        assert_eq!(hosted["remote"], true);
+        assert_eq!(hosted["unmanaged"], true);
         assert_eq!(hosted["index"], 3);
     }
 
-    /// (#2690) `remote: false` is a REPORTED FALSE, not an absent key — the
+    /// (#2690) `unmanaged: false` is a REPORTED FALSE, not an absent key — the
     /// distinction the viewer's fallback branch depends on. A serializer (or
     /// a future `skip_serializing_if`) that dropped the `false` case would
     /// leave a local seat indistinguishable from a pre-1.49.0 record and
@@ -5392,8 +5392,8 @@ mod tests {
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("emits")).unwrap();
         let obj = payload.as_object().expect("object");
-        assert!(obj.contains_key("remote"), "the key is present even when the seat is local");
-        assert_eq!(obj["remote"], serde_json::Value::Bool(false));
+        assert!(obj.contains_key("unmanaged"), "the key is present even when the seat is local");
+        assert_eq!(obj["unmanaged"], serde_json::Value::Bool(false));
         assert!(obj.contains_key("index"), "and so is the index, at index 0");
         assert_eq!(obj["index"], 0);
     }
@@ -5446,11 +5446,11 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        for remote in [false, true] {
-            let tok = serde_json::to_value(map_item_token_payload(&res, remote, "m", "ep").expect("emits")).unwrap();
-            let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", remote, &res);
+        for unmanaged in [false, true] {
+            let tok = serde_json::to_value(map_item_token_payload(&res, unmanaged, "m", "ep").expect("emits")).unwrap();
+            let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", unmanaged, &res);
             let item_payload = item.payload_json();
-            assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
+            assert_eq!(tok["unmanaged"], item_payload["unmanaged"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
         }
     }
@@ -5641,7 +5641,7 @@ mod tests {
     #[test]
     fn dispatch_map_aggregate_record_sums_tokens_and_counts_outcomes() {
         // (#1442 gate C1) The one step-level aggregate: items_in, ok_count,
-        // failed_count, remote, and SUMMED total_tokens — the record the
+        // failed_count, unmanaged, and SUMMED total_tokens — the record the
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
@@ -5656,7 +5656,7 @@ mod tests {
         assert_eq!(p["items_in"], 3);
         assert_eq!(p["ok_count"], 2);
         assert_eq!(p["failed_count"], 1);
-        assert_eq!(p["remote"], true);
+        assert_eq!(p["unmanaged"], true);
         assert_eq!(p["total_tokens"], 350, "summed across items, absent usage counted as 0 here");
         assert!(
             matches!(rec.level, darkmux_flow::Level::Warn),
@@ -5666,7 +5666,7 @@ mod tests {
         let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
-        assert_eq!(rec.payload_json()["remote"], false);
+        assert_eq!(rec.payload_json()["unmanaged"], false);
     }
 
     fn map_item(index: usize, ok: bool) -> MapItemResult {
@@ -6201,7 +6201,7 @@ mod tests {
 
     /// (#2690) THE WIRING test for the seat fields, and the reason it is an
     /// end-to-end run rather than another `map_item_token_payload` unit
-    /// test: the payload function takes `remote` as an ARGUMENT, so its own
+    /// test: the payload function takes `unmanaged` as an ARGUMENT, so its own
     /// tests prove only that it copies what it is handed. What decides the
     /// answer is the ONE call site
     /// (`map_item_token_payload(&res, endpoint.is_some())`), and a
@@ -6213,7 +6213,7 @@ mod tests {
     /// realistic slip and one arm alone cannot see it.
     #[test]
     #[serial_test::serial] // mutates the remote-budget env var
-    fn dispatch_map_hosted_telemetry_reports_its_seat_as_remote() {
+    fn dispatch_map_unmanaged_telemetry_reports_its_seat_as_unmanaged() {
         clear_hosted_override();
         install_hosted_delayed(0, None, Some(42));
         let s = map_step(json!({
@@ -6232,9 +6232,9 @@ mod tests {
         for (i, rec) in telemetry.iter().enumerate() {
             let payload = rec.payload_json();
             assert_eq!(
-                payload["remote"],
+                payload["unmanaged"],
                 serde_json::Value::Bool(true),
-                "a HOSTED map seat must report itself remote: {rec:?}"
+                "a HOSTED map seat must report itself unmanaged: {rec:?}"
             );
             assert_eq!(payload["index"], i, "and its own position in the fan-out: {rec:?}");
         }
@@ -6244,7 +6244,7 @@ mod tests {
     /// for why the call site needs its own coverage.
     #[test]
     #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
-    fn dispatch_map_local_telemetry_reports_its_seat_as_not_remote() {
+    fn dispatch_map_local_telemetry_reports_its_seat_as_not_unmanaged() {
         use httpmock::prelude::*;
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -6288,9 +6288,9 @@ mod tests {
         for (i, rec) in telemetry.iter().enumerate() {
             let payload = rec.payload_json();
             assert_eq!(
-                payload["remote"],
+                payload["unmanaged"],
                 serde_json::Value::Bool(false),
-                "a LOCAL map seat must report itself NOT remote — an absent or `true` value                  here is how the savings hero credits the operator's own hardware to a                  hosted endpoint: {rec:?}"
+                "a LOCAL map seat must report itself NOT unmanaged: an absent or `true` value                  here is how the savings hero credits the operator's own hardware to a                  hosted endpoint: {rec:?}"
             );
             assert_eq!(payload["index"], i, "and its own position in the fan-out: {rec:?}");
         }
@@ -6376,13 +6376,13 @@ mod tests {
                 payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
                 "the terminal names WHERE the seat ran, in the one format the viewer parses"
             );
-            assert_eq!(payload["remote_tokens"].as_u64(), Some(42), "remote spend is the item's own");
+            assert_eq!(payload["unmanaged_tokens"].as_u64(), Some(42), "unmanaged spend is the item's own");
             assert_eq!(payload["total_turns"].as_u64(), Some(1), "an item that produced a reply is one turn");
             assert!(payload["wall_ms"].is_u64(), "and carries its own wall clock: {payload}");
             assert_eq!(
                 terminal.session_id.as_deref(),
                 Some(darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire().as_str()),
-                "SAME session as the seat's token records — that join is the whole point"
+                "SAME session as the seat's token records: that join is the whole point"
             );
         }
         // Each item's usage record names the same execution its bookends do.
@@ -7580,7 +7580,7 @@ mod tests {
         assert_eq!(p["reported_model"], "served-by-mock");
         assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
         assert_eq!(p["total_tokens"], 12);
-        assert_eq!(p["remote"], false, "#2690's seat field is kept");
+        assert_eq!(p["unmanaged"], false, "#2690's seat field is kept");
         assert_eq!(p["index"], 0);
     }
 
@@ -7704,7 +7704,7 @@ mod tests {
         assert_eq!(p["reported_model"], "served-by-mock");
         let ep: darkmux_types::ModelEndpoint = serde_json::from_value(ep_json).unwrap();
         assert_eq!(p["endpoint"], crate::target::endpoint_route_label(&ep, "gpt-5.1"));
-        assert_eq!(p["remote"], true);
+        assert_eq!(p["unmanaged"], true);
     }
 
     #[test]

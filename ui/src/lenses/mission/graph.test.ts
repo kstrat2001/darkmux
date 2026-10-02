@@ -650,7 +650,7 @@ describe("seedMetricsFromGraph", () => {
 });
 
 describe("hasNoMetricsData", () => {
-  it("returns true for exactly one of the 16 falsy/truthy combinations — all four falsy", () => {
+  it("returns true for exactly one of the 16 falsy/truthy combinations: all four falsy", () => {
     // Bit i selects the truthy sample for field i; the expression
     // `!tf && !nf && !cf && !st` is true only when every operand is falsy.
     const TRUTHY = { tokensFinal: 123, turnsFinal: 7, toolsFinal: 3, startedMs: 1_700_000_000_000 };

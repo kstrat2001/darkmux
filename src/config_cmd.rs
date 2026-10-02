@@ -24,12 +24,12 @@ pub enum ConfigCmd {
     /// `darkmux config set redis.host 100.64.0.2`,
     /// `darkmux config set fleet.mode hub`, or
     /// `darkmux config set role_profiles.code-reviewer qwen35b` (bind a role to
-    /// a profile — #1475). The role id must be a real one (`darkmux role
-    /// list`) — a typo'd or invented role id is settable but resolves nothing
-    /// (#1547; `darkmux doctor` flags it).
+    /// a profile). The role id must be a real one (`darkmux role
+    /// list`): a typo'd or invented role id is settable but resolves nothing
+    /// (`darkmux doctor` flags it).
     ///
     /// With no VALUE, prints what the key accepts: for an enum-valued key,
-    /// every valid value with its meaning (#2947).
+    /// every valid value with its meaning.
     #[command(after_long_help = config_enum::help_block())]
     Set {
         /// Dotted config key (e.g. `redis.host`, `fleet.mode`,
@@ -670,11 +670,11 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 // (#2947) A retired spelling names its replacement first.
                 if let Some(new) = setting.renamed(raw) {
                     bail!(
-                        "`{raw}` was renamed to `{new}` in 4.0: `darkmux config set {} {new}` — valid values:\n{list}",
+                        "`{raw}` was renamed to `{new}` in 4.0: `darkmux config set {} {new}`: valid values:\n{list}",
                         setting.key
                     )
                 }
-                bail!("`{raw}` is not a valid {} — valid values:\n{list}", setting.kind)
+                bail!("`{raw}` is not a valid {}: valid values:\n{list}", setting.kind)
             }
         },
         Ty::StrList => Value::Array(
@@ -719,8 +719,8 @@ fn get_path<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
 fn suggestion(key: &str) -> String {
     let keys = all_keys();
     match darkmux_types::user_files::closest(key, keys.iter().map(|(k, _)| *k)) {
-        Some(near) => format!(" — did you mean `{near}`? (`darkmux config list` shows every settable key)"),
-        None => " — run `darkmux config list` to see the settable keys".to_string(),
+        Some(near) => format!(": did you mean `{near}`? (`darkmux config list` shows every settable key)"),
+        None => ": run `darkmux config list` to see the settable keys".to_string(),
     }
 }
 

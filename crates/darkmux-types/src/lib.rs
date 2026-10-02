@@ -792,7 +792,7 @@ impl ProfileRegistry {
                 }
                 if m.missing_managed_n_ctx() {
                     out.push(format!(
-                        "profile \"{pname}\" model \"{}\" is local (no endpoint) but declares no n_ctx — \
+                        "profile \"{pname}\" model \"{}\" is local (no endpoint) but declares no n_ctx: \
                          swap/dispatch on it will fail at resolution",
                         m.id
                     ));

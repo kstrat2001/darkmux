@@ -215,7 +215,7 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
   });
 });
 
-describe("SessionReplay — presence is a fact about now, not about a scrubbed instant", () => {
+describe("SessionReplay: presence is a fact about now, not about a scrubbed instant", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();

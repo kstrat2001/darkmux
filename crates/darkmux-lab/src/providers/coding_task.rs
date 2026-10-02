@@ -782,7 +782,7 @@ impl Drop for TrajectoryPreserver {
         let preserved = preserve_runtime_artifacts(&self.out_dir, &self.run_dir, &["trajectory.jsonl", "findings.jsonl"]);
         if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
             if let Err(e) = darkmux_trajectory::close_if_unterminated(&self.run_dir.join("trajectory.jsonl")) {
-                eprintln!("darkmux: warn — could not mark the preserved trajectory interrupted: {e}");
+                eprintln!("darkmux: warn: could not mark the preserved trajectory interrupted: {e}");
             }
         }
     }
@@ -1300,14 +1300,14 @@ pub(crate) fn preserve_runtime_artifacts(
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux: runtime {name} NOT copied into the run dir — {reason}; \
+                        "darkmux: runtime {name} NOT copied into the run dir: {reason}; \
                          recorded as refused_artifacts in the run manifest"
                     ))
                 );
                 out.refused.push(RefusedArtifact { file: (*name).to_string(), reason });
             }
             Err(ContainedFileError::Io(e)) => {
-                eprintln!("darkmux: warn — failed copying runtime {name} into run dir: {e}");
+                eprintln!("darkmux: warn: failed copying runtime {name} into run dir: {e}");
             }
         }
     }

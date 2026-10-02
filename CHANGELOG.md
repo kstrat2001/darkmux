@@ -1037,6 +1037,17 @@ darkmux release.
     an envelope's `remote_budgets` is `dispatch_budgets` (the old key still
     reads, never written); `machine list` says `unmanaged N`; doctor's
     `remote endpoint credentials` row is `unmanaged endpoint credentials`.
+  - **The last `remote` wire names follow** (same unreleased versions, nothing
+    bumped): a `telemetry.tokens` or `step result` payload's `remote` flag is
+    `unmanaged`, a `dispatch.complete`'s `remote_tokens` is `unmanaged_tokens`,
+    a run record seat's `remote` is `unmanaged`, `--json` models report
+    `unmanaged` (not `remote`), and a role's `residency` of `remote` is
+    `unmanaged`. The flag means "the endpoint is not one darkmux manages",
+    decided from the endpoint's kind, so an unmanaged server on this machine
+    reads as unmanaged. An archived record or envelope's old key still reads,
+    and nothing writes it.
+  - A flow record read off the hub carries `hub_id`, now listed in the FLOW
+    history (it is never written to a flow file).
 
 - **`darkmux machine list --deep` is retired.** The card is the default content
   of `machine list`, so there is nothing to ask for; the flag is refused, naming

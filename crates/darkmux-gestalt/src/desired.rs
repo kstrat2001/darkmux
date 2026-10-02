@@ -1,7 +1,7 @@
 //! Desired-state ingestion — the lenient layer between operator config and
 //! the planner (#1282 direction).
 //!
-//! [`ingest`] NEVER fails the batch: structurally unusable or remote entries
+//! [`ingest`] NEVER fails the batch: structurally unusable or unmanaged entries
 //! come back quarantined with a named reason; valid local entries become
 //! [`Placement`]s the planner reasons about.
 //!
@@ -12,7 +12,7 @@
 //! [`DesiredEntry::n_ctx`] flows straight through from `ProfileModel`: a
 //! local entry that lacks `n_ctx` reaches THIS layer and [`ingest`]
 //! quarantines it with a named reason ([`QuarantineReason::MissingNCtx`])
-//! unless the entry is remote.
+//! unless the entry is unmanaged.
 
 use crate::ownership::namespaced_identifier;
 use serde::{Deserialize, Serialize};
@@ -23,15 +23,15 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredEntry {
     pub model_key: String,
-    /// n_ctx-as-MINIMUM (#600). `None` ⇒ quarantine unless remote.
+    /// n_ctx-as-MINIMUM (#600). `None` ⇒ quarantine unless unmanaged.
     pub n_ctx: Option<u32>,
     /// Explicit identifier alias (the namespace opt-out — see
     /// [`crate::ownership::namespaced_identifier`]).
     pub identifier: Option<String>,
-    /// Endpoint-bearing ⇒ no local residency concept (#1177): remote seats
+    /// Endpoint-bearing ⇒ no local residency concept (#1177): unmanaged seats
     /// consume zero local pool (#1260) and never reach a
     /// [`crate::ports::ModelHost`].
-    pub remote: bool,
+    pub unmanaged: bool,
     /// Provenance label ("primary", "utility", "probe:security", …). Never
     /// decision-bearing (#1280: no seat is exempt from the residency path);
     /// feeds reasons + the #1279 refcount report.
@@ -43,7 +43,7 @@ impl DesiredEntry {
     /// registry schema itself is lenient — `ProfileModel.n_ctx` is
     /// `Option<u32>` (endpoint-bearing models declare none) — so the Option
     /// flows straight through; [`ingest`] quarantines a LOCAL entry that
-    /// lacks one. `remote` is `!ProfileModel::is_managed()` (#2902: the one
+    /// lacks one. `unmanaged` is `!ProfileModel::is_managed()` (#2902: the one
     /// endpoint classification the dispatch path routes on), so gestalt and
     /// dispatch can never disagree about which models darkmux loads. An
     /// endpoint named by an undefined id is not managed, so it is never
@@ -53,7 +53,7 @@ impl DesiredEntry {
             model_key: pm.id.clone(),
             n_ctx: pm.n_ctx,
             identifier: pm.identifier.clone(),
-            remote: !pm.is_managed(),
+            unmanaged: !pm.is_managed(),
             seat: seat.to_string(),
         }
     }
@@ -82,12 +82,12 @@ pub enum QuarantineReason {
     /// Structurally unusable locally (#1282 direction) — named, batch
     /// survives.
     MissingNCtx,
-    /// Deliberate: remote placements never reach a ModelHost (#1177/#1260);
+    /// Deliberate: unmanaged placements never reach a ModelHost (#1177/#1260);
     /// quarantine here beats a meaningless no-op adapter.
     RemoteEndpoint,
 }
 
-/// Lenient ingestion: NEVER fails the batch. Remote / structurally unusable
+/// Lenient ingestion: NEVER fails the batch. Unmanaged / structurally unusable
 /// entries come back quarantined with a named reason; valid local entries
 /// become [`Placement`]s, identifiers resolved here, once.
 ///
@@ -107,7 +107,7 @@ pub fn ingest(entries: &[DesiredEntry]) -> (Vec<Placement>, Vec<Quarantined>) {
     let mut quarantined: Vec<Quarantined> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for e in entries {
-        if e.remote {
+        if e.unmanaged {
             quarantined.push(Quarantined {
                 entry: e.clone(),
                 reason: QuarantineReason::RemoteEndpoint,
@@ -144,7 +144,7 @@ mod tests {
             model_key: model_key.to_string(),
             n_ctx,
             identifier: identifier.map(str::to_string),
-            remote: false,
+            unmanaged: false,
             seat: seat.to_string(),
         }
     }
@@ -209,13 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn ingest_quarantines_remote_endpoint() {
+    fn ingest_quarantines_unmanaged_endpoint() {
         // (#1177/#1260) Endpoint-bearing entries never become placements —
         // zero local pool consumption, and plan_acquire never sees them.
-        // Remote takes precedence over the missing-n_ctx check: a remote
+        // Unmanaged takes precedence over the missing-n_ctx check: an unmanaged
         // seat legitimately has no local load context.
         let mut e = entry("gpt-4o", None, None, "judge");
-        e.remote = true;
+        e.unmanaged = true;
         let (placements, quarantined) = ingest(&[e.clone()]);
         assert!(placements.is_empty());
         assert_eq!(
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(e.model_key, "qwen3.6-35b-a3b");
         assert_eq!(e.n_ctx, Some(100_000));
         assert_eq!(e.identifier.as_deref(), Some("my-alias"));
-        assert!(!e.remote);
+        assert!(!e.unmanaged);
         assert_eq!(e.seat, "primary");
     }
 
@@ -257,7 +257,7 @@ mod tests {
         };
         let e = DesiredEntry::from_profile_model(&pm, "primary");
         assert_eq!(e.n_ctx, None);
-        assert!(!e.remote);
+        assert!(!e.unmanaged);
         let (placements, quarantined) = ingest(&[e]);
         assert!(placements.is_empty());
         assert_eq!(quarantined.len(), 1);
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn from_profile_model_detects_remote_endpoint() {
+    fn from_profile_model_detects_unmanaged_endpoint() {
         let pm = darkmux_types::ProfileModel {
             id: "gpt-4o".into(),
             n_ctx: Some(128_000),
@@ -277,12 +277,12 @@ mod tests {
             }),
             extras: Default::default(),
         };
-        assert!(DesiredEntry::from_profile_model(&pm, "judge").remote);
-        // The managed LM Studio endpoint is local — not remote.
+        assert!(DesiredEntry::from_profile_model(&pm, "judge").unmanaged);
+        // The managed LM Studio endpoint is local, not unmanaged.
         let pm_local = darkmux_types::ProfileModel {
             endpoint: Some(darkmux_types::ModelEndpoint::managed_lmstudio()),
             ..pm
         };
-        assert!(!DesiredEntry::from_profile_model(&pm_local, "judge").remote);
+        assert!(!DesiredEntry::from_profile_model(&pm_local, "judge").unmanaged);
     }
 }

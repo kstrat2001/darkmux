@@ -288,7 +288,7 @@ pub fn active_detached_thread_count() -> usize {
 /// index-addressable after it's been partitioned into the three tracks.
 ///
 /// (#2394) `seat` was a two-variant `Residency` (`Local(Placement)` |
-/// `Remote`) whose `Remote` arm was reached both by a genuine hosted
+/// `Unmanaged`) whose `Unmanaged` arm was reached both by a genuine unmanaged
 /// endpoint AND by every job that consumes no model at all, so a wave of
 /// `procedural.shell` steps queued behind a cap meant for hosted endpoints.
 /// It is now [`crate::step_kinds::SeatClaim`], the same exhaustive type the
@@ -362,7 +362,7 @@ pub fn run_bounded<T: Send + 'static>(
     // (#3035) One batch per unmanaged endpoint, keyed by the endpoint.
     let mut endpoint_jobs: BTreeMap<String, EndpointBatch<T>> = BTreeMap::new();
     // (#2394) The dispatch-free track. Its own vec, its own cap, its own
-    // sibling thread — never merged into `remote_jobs`.
+    // sibling thread — never merged into `endpoint_jobs`.
     let mut dispatch_free_jobs: Vec<(usize, DispatchJob<T>)> = Vec::new();
 
     // (#1452) Every queued index, captured BEFORE `jobs` is partitioned and
@@ -419,7 +419,7 @@ pub fn run_bounded<T: Send + 'static>(
                 spawn_scoped_named(scope, move || run_capped_batches(batch.jobs, width, results))
             })
             .collect();
-        // (#2394) The third sibling. Same batching mechanism as the remote
+        // (#2394) The third sibling. Same batching mechanism as the unmanaged-endpoint
         // track, a DIFFERENT cap — and running on its own thread means a
         // long dispatch-free wait never occupies a hosted-endpoint slot.
         let dispatch_free_track = (!dispatch_free_jobs.is_empty()).then(|| {
@@ -1085,7 +1085,7 @@ pub(crate) fn ensure_wave_loaded(
 }
 
 /// The batching mechanism BOTH cap-bounded tracks use (#2394 — this was
-/// `run_remote_batches` when the remote track was the only one): chunk
+/// `run_remote_batches` when the unmanaged-endpoint track was the only one): chunk
 /// `jobs` into `cap`-sized batches (in input order — no wave-style
 /// co-residency arithmetic applies to a seat with no local placement, so a
 /// simple fixed-size batch is the whole mechanism) and run each batch
@@ -1155,11 +1155,11 @@ fn note_serial_endpoint_in(
 }
 
 fn run_capped_batches<T: Send + 'static>(
-    mut remote_jobs: Vec<(usize, DispatchJob<T>)>,
+    mut capped_jobs: Vec<(usize, DispatchJob<T>)>,
     cap: usize,
     results: &ResultsSink<T>,
 ) {
-    for batch in remote_jobs.chunks_mut(darkmux_types::config_access::jobs_at_once(cap)) {
+    for batch in capped_jobs.chunks_mut(darkmux_types::config_access::jobs_at_once(cap)) {
         // A batch whose job panicked re-panics at the end of its scope. That
         // must not end the track: the jobs queued behind it (one at a time on
         // an endpoint with no declared concurrency, #3035) still run. The
@@ -3470,13 +3470,13 @@ mod tests {
     /// ~800ms.
     ///
     /// **Red before the fix**: there was no third track. Every dispatch-free
-    /// job was a `Residency::Remote` job, so this ran in four sequential
+    /// job was an unmanaged-endpoint job, so this ran in four sequential
     /// 200ms batches. The scheduler-level twin of this
     /// (`dispatch_free_siblings_do_not_serialize_behind_a_serial_endpoint`)
     /// measured 12.16s against a 3s expectation on the real
     /// `procedural.shell` kind.
     #[test]
-    fn dispatch_free_jobs_are_bounded_by_their_own_cap_not_the_remote_one() {
+    fn dispatch_free_jobs_are_bounded_by_their_own_cap_not_the_endpoint_one() {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let marker = Arc::new(AtomicU32::new(0));
@@ -3503,7 +3503,7 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(600),
             "four dispatch-free jobs at 200ms each must overlap under their OWN cap, never \
-             serialize behind a serial endpoint — got {elapsed:?}"
+             serialize behind a serial endpoint: got {elapsed:?}"
         );
     }
 
@@ -3654,7 +3654,7 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(300),
             "an unresolved LOCAL seat must run one at a time (~360ms), never fall through to \
-             the dispatch-free track — got {elapsed:?}"
+             the dispatch-free track: got {elapsed:?}"
         );
     }
 
@@ -3722,7 +3722,7 @@ mod tests {
     /// index is reconciled into a terminal `Err`, and a sibling job in the
     /// same batch still completes.
     #[test]
-    fn run_bounded_reconciles_a_panicking_remote_job_to_a_terminal_error() {
+    fn run_bounded_reconciles_a_panicking_endpoint_job_to_a_terminal_error() {
         let est = FixedEstimator::default();
         let facts = Facts::default();
         let jobs: Vec<QueuedJob<()>> = vec![

@@ -184,7 +184,7 @@ pub fn dispatch_routed_single_shot(
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
                          `{}` (role `{}`): a submitted dispatch runs on the \
-                         OTHER machine, which has no access to this machine's checkpoint — it \
+                         OTHER machine, which has no access to this machine's checkpoint: it \
                          would start fresh and report success regardless. darkmux never silently \
                          starts a dispatch fresh under a name that looked like a resume: resume \
                          on THIS machine (name a profile here, without `@{target}`) or start \
@@ -199,7 +199,7 @@ pub fn dispatch_routed_single_shot(
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux dispatch: WARNING — this machine's machine_id is unresolvable. \
+                        "darkmux dispatch: WARNING: this machine's machine_id is unresolvable. \
                          `{}` is submitted to {target} regardless. \
                          Set DARKMUX_MACHINE_ID (or `darkmux config set machine_id`) so the \
                          local-vs-remote decision is deterministic.",
@@ -221,7 +221,7 @@ pub fn dispatch_routed_single_shot(
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
                          `{}` (role `{}`): a submitted dispatch runs on the \
-                         OTHER machine, which has no access to this machine's checkpoint — it \
+                         OTHER machine, which has no access to this machine's checkpoint: it \
                          would start fresh and report success regardless. darkmux never silently \
                          starts a dispatch fresh under a name that looked like a resume: resume \
                          on THIS machine (name a profile here, without `@{target}`) or start \
@@ -2048,9 +2048,9 @@ mod tests {
         // regression loud without turning an honest refactor into one.
         assert!(
             functions.len() > 3,
-            "found only {} top-level fns in routing.rs (expected more — this file \
+            "found only {} top-level fns in routing.rs (expected more: this file \
              currently declares 5, after #2916 removed the Redis wait path). Two different things produce this: (a) the extractor \
-             regressed on a shape it should recognize (`fn_decl_prefix_len` — plain `fn`, \
+             regressed on a shape it should recognize (`fn_decl_prefix_len`: plain `fn`, \
              `pub fn`, or a restricted-visibility `pub(...) fn`), or (b) a function that used \
              to live at top-level in this file was genuinely moved or deleted, which means \
              this whole conformance scan's premise (everything relevant lives in THIS file) \
@@ -2070,7 +2070,7 @@ mod tests {
         let line_prefix = src[..def_at].rsplit('\n').next().unwrap_or("");
         assert_eq!(
             line_prefix, "",
-            "`dispatch_via_submission` must stay module-PRIVATE for this scan's premise to hold — \
+            "`dispatch_via_submission` must stay module-PRIVATE for this scan's premise to hold: \
              found `{line_prefix}fn dispatch_via_submission(`, which reads as widened visibility. \
              If it genuinely needs wider visibility, this scan's premise is gone and it needs a \
              real redesign (a crate-or-workspace-wide scan), not a bigger pin."
@@ -2083,14 +2083,14 @@ mod tests {
             mod_decls,
             vec!["mod tests {".to_string()],
             "this scan's premise requires this file to declare NO descendant module other than \
-             its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
+             its own `#[cfg(test)] mod tests`: found: {mod_decls:?}. A new `mod` here is a \
              place a call to `dispatch_via_submission(` could live that this scan cannot see."
         );
 
         let call_offsets = find_calls(&src, "dispatch_via_submission");
         assert!(
             !call_offsets.is_empty(),
-            "found zero calls to `dispatch_via_submission(` — either the extractor regressed or the \
+            "found zero calls to `dispatch_via_submission(`: either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
         );
         // (#2584 review — Also-fix 2) This is a bare count assertion, and
@@ -2110,9 +2110,9 @@ mod tests {
             call_offsets.len(),
             2,
             "expected exactly the two known call sites (both Remote arms of \
-             `dispatch_routed_via`'s match) — found {}. If this went UP: a new call site needs \
+             `dispatch_routed_via`'s match): found {}. If this went UP: a new call site needs \
              the same guard this test enforces on the existing two before you bump this \
-             constant. If this went DOWN: do not just lower the constant — find out where the \
+             constant. If this went DOWN: do not just lower the constant: find out where the \
              missing call went first (a function-pointer alias is the known way a real call to \
              `dispatch_via_submission` can go invisible to this text scan).",
             call_offsets.len()
@@ -2125,7 +2125,7 @@ mod tests {
                 .unwrap_or_else(|| {
                     panic!(
                         "a `dispatch_via_submission(` call at byte offset {call_at} is not inside any \
-                         top-level (column-0 `fn`/`pub fn`) function this scan indexes — extend \
+                         top-level (column-0 `fn`/`pub fn`) function this scan indexes: extend \
                          `top_level_function_spans` before this test can vouch for it."
                     )
                 });
@@ -2163,18 +2163,18 @@ mod tests {
             assert!(
                 resume_from_guard_precedes(scoped_body, call_at_in_scoped, &excluded_in_scoped),
                 "`{fn_name}` calls `dispatch_via_submission(` at file offset {call_at} without a \
-                 `resume_from`-conditioned guard preceding it IN ITS OWN ENCLOSING SCOPE — the \
+                 `resume_from`-conditioned guard preceding it IN ITS OWN ENCLOSING SCOPE: the \
                  same match arm when the call sits in one, its own enclosing block otherwise. \
                  This is the #2561/#2580/#2584 bypass class: a caller can silently spend real \
                  tokens on a PEER machine under a --resume-from flag that was never honored. The \
                  guard must sit inside an `if` whose condition mentions `resume_from`, closes \
                  before the call, and contains both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
-                 bail!/return Err/panic! — all within that scope, not a sibling arm's or an \
+                 bail!/return Err/panic!: all within that scope, not a sibling arm's or an \
                  unrelated block's. If this assertion is RED but the runtime tests \
                  (`dispatch_routed_via_refuses_resume_from_before_anything_is_sent` and \
                  `resume_from_local_unknown_arm.rs`) are GREEN: the runtime tests are ground \
                  truth (they run the real function against a real fake peer), this scan is a \
-                 cheap proxy for them — investigate before assuming this scan is wrong, but a \
+                 cheap proxy for them: investigate before assuming this scan is wrong, but a \
                  disagreement does not by itself mean this finding is a false positive."
             );
         }

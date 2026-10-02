@@ -25,7 +25,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
 //           field is `dispatch`; `step start` `seat_class` `remote_endpoint`
 //           is `unmanaged_endpoint`; `step result` `remote_max_tokens_per_execution`
-//           is `tokens_per_dispatch`)
+//           is `tokens_per_dispatch`; the `remote` flag on a `telemetry.tokens`
+//           or `step result` payload is `unmanaged` and a `dispatch.complete`
+//           `remote_tokens` is `unmanaged_tokens`, the old keys read from an
+//           archive and are never written; `hub_id`, the Redis stream id the
+//           daemon adds to a record it reads off the fleet hub, is not a
+//           stored field: no flow file holds it)
 //           per event. Every action is a `FlowAction` variant (`action.rs`),
 //           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three
 //           dot-separated segments. Dotted only on write. Nothing in the
@@ -2174,9 +2179,9 @@ pub enum Category {
     Machinery,
     Audit,
     Review,
-    /// Telemetry as a first-class flow-event family (#557): per-dispatch
-    /// instrument samples — context-fill, detector firings, compaction, lms
-    /// load/unload, container CPU — emitted into the one stream, always-on.
+    /// Telemetry as a first-class flow-event family: per-dispatch
+    /// instrument samples (context-fill, detector firings, compaction, lms
+    /// load/unload, container CPU), emitted into the one stream, always-on.
     /// Replaces the retired instruments.jsonl sidecar.
     Telemetry,
     /// See [`Level::Unknown`] — same lenient-on-read contract.
@@ -2286,13 +2291,13 @@ pub enum Stage {
     /// (delivery, dry run, dropped, busy). No work-lifecycle record carries
     /// it.
     Ship,
-    /// Post-mission review stage (#999, NASA vocabulary — Mission · Crew ·
-    /// Debrief · Lessons). The mission debrief ceremony (#1000) distills the
+    /// Post-mission review stage (Mission · Crew · Debrief · Lessons). The
+    /// mission debrief ceremony distills the
     /// mission's cautions + corrections into durable lessons; records of that
     /// review carry this stage. Serialized as `"debrief"`. Renamed from the
     /// unemitted `Retrospect` placeholder in FLOW_SCHEMA 1.14.0.
     Debrief,
-    /// Tier-decision record (#136): the frontier orchestrator's reasoning
+    /// Tier-decision record: the frontier orchestrator's reasoning
     /// for routing this piece of work to local vs. holding in frontier.
     /// Emitted via `darkmux flow tier-decision`. Category typically
     /// `audit`; the `reasoning` field carries the operator-visible

@@ -247,13 +247,13 @@ fn conventions_branch(
         Some(b) if crate::conventions::valid_branch(&b) => b,
         Some(b) => {
             eprintln!(
-                "darkmux: warning — conventions branch_template expanded to an invalid git ref ({b:?}); using `{default}`"
+                "darkmux: warning: conventions branch_template expanded to an invalid git ref ({b:?}); using `{default}`"
             );
             default
         }
         None => {
             eprintln!(
-                "darkmux: warning — conventions branch_template references {{ticket}} but mission `{}` has no ticket (set one: a `ticket` key on the mission config); using `{default}`",
+                "darkmux: warning: conventions branch_template references {{ticket}} but mission `{}` has no ticket (set one: a `ticket` key on the mission config); using `{default}`",
                 mission.id
             );
             default
@@ -293,7 +293,7 @@ fn select_phase(
             );
         }
         if matches!(s.status, PhaseStatus::Complete) {
-            bail!("phase `{id}` is already Complete (terminal) — nothing to run");
+            bail!("phase `{id}` is already Complete (terminal): nothing to run");
         }
         return Ok(s.clone());
     }
@@ -324,8 +324,8 @@ fn select_phase(
         many => {
             let ids: Vec<&str> = many.iter().map(|s| s.id.as_str()).collect();
             bail!(
-                "mission `{mission_id}` has {} ready phases ({}) — unexpected for a strictly \
-                 linear mission (hand-edited JSON?). This resolves one phase at a time — \
+                "mission `{mission_id}` has {} ready phases ({}): unexpected for a strictly \
+                 linear mission (hand-edited JSON?). This resolves one phase at a time: \
                  pass `--phase <id>` to choose.",
                 many.len(),
                 ids.join(", ")
@@ -343,7 +343,7 @@ fn select_phase(
 fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> Result<()> {
     if wt_path.exists() {
         bail!(
-            "worktree already exists at {} — a previous `mission launch coder-phase` for this \
+            "worktree already exists at {}: a previous `mission launch coder-phase` for this \
              phase hasn't been finalized or torn down. Inspect it, run \
              `darkmux mission finalize <mission>` once its work is merged (tears the worktree \
              down), `darkmux mission abort <mission>` to discard the mission, or \
@@ -891,7 +891,7 @@ impl StepKind for MissionCoderStepKind {
             eprintln!(
                 "{}",
                 style::error(&format!(
-                    "✗ coder dispatch exited {exit_code} — see stderr above. The phase stays \
+                    "✗ coder dispatch exited {exit_code}: see stderr above. The phase stays \
                      Running and the worktree is left at {} for inspection. Re-launching \
                      `darkmux mission launch coder-phase` will refuse until you tear it down: \
                      `darkmux mission abort {} --phase {}`.",
@@ -1068,7 +1068,7 @@ impl StepKind for MissionVerifyStepKind {
             .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
         println!(
             "\n{}",
-            style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
+            style::header("▶ local QA: dispatching `code-reviewer` against the worktree diff…")
         );
 
         match crate::phase_cli::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
@@ -1087,7 +1087,7 @@ impl StepKind for MissionVerifyStepKind {
                 eprintln!(
                     "{}",
                     style::warn(&format!(
-                        "⚠ QA could not run ({msg}). The coder's work is in the worktree — review \
+                        "⚠ QA could not run ({msg}). The coder's work is in the worktree: review \
                          the diff manually before shipping."
                     ))
                 );
@@ -1296,7 +1296,7 @@ fn teardown_and_terminate_phase(
             eprintln!(
                 "{}",
                 style::warn(&format!(
-                    "worktree {} has uncommitted or unpushed work — SKIPPING its git teardown so \
+                    "worktree {} has uncommitted or unpushed work: SKIPPING its git teardown so \
                      nothing is lost. Push/merge it, then remove it by hand: `git worktree remove \
                      {}` + `git branch -D {}`. The phase still completes and the mission still \
                      closes.",
@@ -1322,7 +1322,7 @@ fn teardown_and_terminate_phase(
                     Ok(o) => eprintln!(
                         "{}",
                         style::warn(&format!(
-                            "git worktree remove failed: {} — you may need `git worktree prune`.",
+                            "git worktree remove failed: {}: you may need `git worktree prune`.",
                             String::from_utf8_lossy(&o.stderr).trim()
                         ))
                     ),
@@ -1350,14 +1350,14 @@ fn teardown_and_terminate_phase(
                     }
                     _ => println!(
                         "{}",
-                        style::dim(&format!("branch {b} not deleted — likely already gone"))
+                        style::dim(&format!("branch {b} not deleted: likely already gone"))
                     ),
                 }
             } else {
                 println!(
                     "{}",
                     style::dim(&format!(
-                        "branch {b} not deleted — never had a worktree (derived name), left untouched"
+                        "branch {b} not deleted: never had a worktree (derived name), left untouched"
                     ))
                 );
             }
@@ -1392,7 +1392,7 @@ fn teardown_and_terminate_phase(
         Err(e) => eprintln!(
             "{}",
             style::warn(&format!(
-                "phase {} → {} failed: {e:#} — reconcile with `mission {}` / `mission status`.",
+                "phase {} → {} failed: {e:#}: reconcile with `mission {}` / `mission status`.",
                 phase.id,
                 kind.phase_status_label(),
                 kind.verb()
@@ -1484,7 +1484,7 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
 
     println!(
         "{}",
-        style::header(&format!("▶ mission {} — {}", kind.verb(), mission_id))
+        style::header(&format!("▶ mission {}: {}", kind.verb(), mission_id))
     );
 
     // A pure-planning mission (no worktrees) can be finalized/aborted from a
@@ -1503,7 +1503,7 @@ fn terminate_mission(mission_id: &str, kind: MissionTerminal, reasoning: Option<
         cleaned += 1;
     }
     if cleaned == 0 && !mine.is_empty() {
-        println!("{}", style::dim("all phases already terminal — nothing to tear down"));
+        println!("{}", style::dim("all phases already terminal: nothing to tear down"));
     }
 
     // Close the mission. Best-effort against an already-terminal mission (a
@@ -1610,7 +1610,7 @@ pub fn abort(mission_id: &str, phase_id: Option<&str>) -> Result<i32> {
 
     println!(
         "{}",
-        style::header(&format!("▶ mission abort — {} · phase {}", mission_id, phase.id))
+        style::header(&format!("▶ mission abort: {} · phase {}", mission_id, phase.id))
     );
     teardown_and_terminate_phase(Some(&root), mission, &phase, conv.as_ref(), MissionTerminal::Abort);
 
@@ -1702,7 +1702,7 @@ fn append_injected_blocks(
             .join("\n");
         out = format!(
             "{out}\n\n<lessons>\nThe user recorded these conventions and decisions for this \
-             codebase — the rules the team actually follows and the reasoning behind them. Treat \
+             codebase: the rules the team actually follows and the reasoning behind them. Treat \
              them as authoritative: follow them, and prefer them over a generic default when they \
              conflict. If one is clearly stale against the current code, say so in your final \
              message rather than silently ignoring it:\n\n\
@@ -1774,10 +1774,10 @@ fn append_injected_blocks(
             .join("\n");
         out = format!(
             "{out}\n\n<detected-cautions>\ndarkmux's loop detectors flagged these patterns in \
-             earlier dispatches in this mission — repeated tool calls, looping reasoning, \
+             earlier dispatches in this mission: repeated tool calls, looping reasoning, \
              tool-failure cascades. They are signals from earlier contexts, not facts about \
              your current workspace: a pattern that fired earlier may be irrelevant now. Use \
-             them to avoid walking back into a known dead end — if you notice yourself about to \
+             them to avoid walking back into a known dead end: if you notice yourself about to \
              repeat one, stop and change your approach. None of these is a required action:\n\n\
              {listed}\n</detected-cautions>"
         );
@@ -2625,7 +2625,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
 
     println!(
         "{}",
-        style::header(&format!("debrief — mission `{}`", report.mission.id))
+        style::header(&format!("debrief: mission `{}`", report.mission.id))
     );
     let desc = report.mission.description.lines().next().unwrap_or("").trim();
     if !desc.is_empty() {
@@ -2656,21 +2656,21 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
 
     println!(
         "{}",
-        style::header("detected cautions — the loop pathologies the runs got flagged doing")
+        style::header("detected cautions: the loop pathologies the runs got flagged doing")
     );
     print_bullets_or_none(&report.cautions);
     println!();
 
     println!(
         "{}",
-        style::header("adjudication corrections — what the reviewer recorded")
+        style::header("adjudication corrections: what the reviewer recorded")
     );
     print_bullets_or_none(&report.corrections);
     println!();
 
     println!(
         "{}",
-        style::header("records emitted — this mission's own flow-stream cost")
+        style::header("records emitted: this mission's own flow-stream cost")
     );
     print_records_emitted(&report.records_emitted);
     println!();
@@ -2705,10 +2705,10 @@ fn print_records_emitted(records_emitted: &Option<crew::records_emitted::Records
 /// assertions in tests aren't fighting ANSI escapes.
 fn format_records_emitted_lines(records_emitted: &Option<crew::records_emitted::RecordsEmitted>) -> Vec<String> {
     let Some(re) = records_emitted else {
-        return vec!["(not available — no envelope.json yet, or it predates #2421)".to_string()];
+        return vec!["(not available: no envelope.json yet, or it predates #2421)".to_string()];
     };
     if re.total_records == 0 {
-        return vec!["(no flow records found for this mission — see the envelope's warnings)".to_string()];
+        return vec!["(no flow records found for this mission: see the envelope's warnings)".to_string()];
     }
     let mut top_actions: Vec<(&String, &u64)> = re.by_action.iter().collect();
     top_actions.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -2723,7 +2723,7 @@ fn format_records_emitted_lines(records_emitted: &Option<crew::records_emitted::
     ));
     lines.push(match &re.machine_uid {
         Some(mu) => format!("{} host samples in window (machine `{mu}`)", re.host_samples_in_window),
-        None => "no machine_uid on this mission's records — host samples not joined".to_string(),
+        None => "no machine_uid on this mission's records: host samples not joined".to_string(),
     });
     lines
 }
@@ -2756,7 +2756,7 @@ pub fn nudge_mission_debrief(mission_id: &str) {
     println!(
         "{}",
         style::dim(&format!(
-            "  mission closed — bank its lessons before the next crew:  \
+            "  mission closed: bank its lessons before the next crew:  \
              darkmux mission debrief {mission_id}"
         ))
     );
@@ -2794,7 +2794,7 @@ pub(crate) fn print_unverified_banner(failed: &[FailedExec]) {
     println!(
         "\n{}",
         style::warn(&format!(
-            "⚠ verification unproven — {} verifier command(s) FAILED TO RUN (never executed, so \
+            "⚠ verification unproven: {} verifier command(s) FAILED TO RUN (never executed, so \
              they verified nothing). A SIGNOFF claiming these passed is contradicted by the \
              runtime's own record:",
             failed.len()
@@ -2810,10 +2810,10 @@ pub(crate) fn print_unverified_banner(failed: &[FailedExec]) {
     println!(
         "  {}",
         style::dim(
-            "CONFIRM verification independently before you merge — re-run once the toolchain is \
+            "CONFIRM verification independently before you merge: re-run once the toolchain is \
              fixed, or verify by hand. Nothing downstream holds on this: `mission ship` retired \
              (#1463), and with it the automated verifier-fabrication hold (#799). The frontier \
-             orchestrator now does the merge itself — this banner is the only remaining backstop, \
+             orchestrator now does the merge itself: this banner is the only remaining backstop, \
              so treat an unproven SIGNOFF as unverified until you have checked it yourself."
         )
     );

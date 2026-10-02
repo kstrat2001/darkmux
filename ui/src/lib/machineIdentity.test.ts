@@ -40,7 +40,7 @@ import type { PresenceBeat } from "../types/generated/PresenceBeat";
  * The multi-alias case is the point of these tests; the single-alias cases are
  * here so a fix that simply returned the first uid every time would fail.
  */
-describe("machineNames / localMachineUid — identity is the uid, not the label", () => {
+describe("machineNames / localMachineUid: identity is the uid, not the label", () => {
   const rec = (uid: string, name: string, ts = "2026-08-13T10:00:00Z") =>
     norm({ ts, machine_uid: uid, machine_id: name });
   const beat = (uid: string, display: string): [string, never] =>
@@ -121,7 +121,7 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
     expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro");
   });
 
-  it("(#2814) displayNameOf is a FLOOR — an observed name still outranks the specs name", () => {
+  it("(#2814) displayNameOf is a FLOOR: an observed name still outranks the specs name", () => {
     const data = [rec(UID, "MacBook-Pro.local")];
     expect(displayNameOf(data, new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro.local");
   });

@@ -121,12 +121,13 @@ pub struct MemberRecord {
     pub draws: u32,
     pub wall_ms: u64,
     pub total_tokens: u64,
-    /// (#1260/#1186) `true` when this seat dispatched to a remote endpoint —
-    /// its `total_tokens` are CLOUD tokens, which downstream savings
-    /// surfaces must exclude (remote work is never "off the meter").
-    /// Skipped when `false` so local-only envelopes serialize unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub remote: bool,
+    /// (#1260/#1186) `true` when this seat dispatched to an unmanaged
+    /// endpoint: its `total_tokens` are not darkmux's own hardware's, which
+    /// downstream savings surfaces must exclude (unmanaged work is never
+    /// "off the meter"). Skipped when `false` so local-only envelopes
+    /// serialize unchanged. An archived envelope spells it `remote`.
+    #[serde(default, alias = "remote", skip_serializing_if = "std::ops::Not::not")]
+    pub unmanaged: bool,
     /// (#1260) Endpoint HOST only (e.g. `myorg.cognitiveservices.azure.com`)
     /// — never credentials, never the full deployment path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,7 +161,7 @@ pub use darkmux_flow::payload::StepTimingPayload as StepRecord;
 /// darkmux-namespaced LMStudio identifier (`ownership::namespaced_identifier`);
 /// REMOTE seats keep the profile's bare model id — nothing is loaded into
 /// LMStudio, so no `darkmux:` namespace entry is ever minted for them (the
-/// namespace marks darkmux-owned LOCAL residency, and a remote seat has
+/// namespace marks darkmux-owned LOCAL residency, and an unmanaged seat has
 /// none).
 pub fn seat_identifier(pm: &ProfileModel) -> String {
     if pm.is_managed() {
@@ -170,7 +171,7 @@ pub fn seat_identifier(pm: &ProfileModel) -> String {
     }
 }
 
-/// (#1260) The remote endpoint HOST for provenance records — host only,
+/// (#1260) The unmanaged endpoint HOST for provenance records — host only,
 /// NEVER credentials and never the full deployment path (an Azure
 /// deployment URL embeds the deployment name; the host is the boundary
 /// operators reason about). `None` for local seats.
@@ -185,7 +186,7 @@ pub fn seat_endpoint_host(pm: &ProfileModel) -> Option<String> {
 }
 
 /// (#1260) The endpoint a seat's chat calls should route through — `Some`
-/// only when the staffing's resolved model declares a remote endpoint.
+/// only when the staffing's resolved model declares an unmanaged endpoint.
 pub fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
     pm.endpoint.as_ref().filter(|e| e.kind().is_ok_and(|k| !k.is_managed()))
 }
@@ -212,10 +213,11 @@ pub struct SeatStaffingSnapshot {
     /// profile's bare model id for a REMOTE one — the same form
     /// [`MemberRecord::model`] records, so the two line up at a glance.
     pub model: String,
-    /// (#1260) `true` when the staffing's model declares a remote endpoint.
-    /// Skipped when `false` so pre-#1260 snapshots round-trip unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub remote: bool,
+    /// (#1260) `true` when the staffing's model declares an unmanaged
+    /// endpoint. Skipped when `false` so pre-#1260 snapshots round-trip
+    /// unchanged. An archived snapshot spells it `remote`.
+    #[serde(default, alias = "remote", skip_serializing_if = "std::ops::Not::not")]
+    pub unmanaged: bool,
     /// (#1260) Endpoint HOST only — never credentials, never the full
     /// deployment path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,7 +307,7 @@ pub fn staffing_snapshot(
             // snapshot records role → profile → model, not just profile+model.
             role_id: s.role_id.clone(),
             model: seat_identifier(&s.pm),
-            remote: !s.pm.is_managed(),
+            unmanaged: !s.pm.is_managed(),
             endpoint: seat_endpoint_host(&s.pm),
             k: s.k,
             passes: s.passes,
@@ -349,13 +351,13 @@ mod tests {
     use darkmux_types::ProfileModel;
 
     /// Golden JSON for [`MemberRecord`] — pins both the emitted fields AND
-    /// the `skip_serializing_if` behavior (`remote`/`endpoint`/
+    /// the `skip_serializing_if` behavior (`unmanaged`/`endpoint`/
     /// `served_model` never appear when they're the "nothing to say"
     /// default) exactly as `darkmux_lab::lab::review`'s own copy serialized
     /// before this type moved. **Proved failing first**: commenting out
     /// `#[serde(default, skip_serializing_if = "std::ops::Not::not")]` on
-    /// `remote` (leaving the field un-skippable) made this test fail with
-    /// an unexpected `"remote":false` key in the local-seat case — restored
+    /// `unmanaged` (leaving the field un-skippable) made this test fail with
+    /// an unexpected `"unmanaged":false` key in the local-seat case — restored
     /// before committing.
     #[test]
     fn member_record_serializes_with_the_pre_move_shape() {
@@ -376,26 +378,26 @@ mod tests {
                 "wall_ms": 1500,
                 "total_tokens": 4200
             }),
-            "a local (non-remote, no served_model) seat must not serialize remote/endpoint/served_model at all"
+            "a local (managed, no served_model) seat must not serialize unmanaged/endpoint/served_model at all"
         );
 
-        let remote = MemberRecord {
+        let unmanaged = MemberRecord {
             model: "gpt-4o".into(),
             seat: "example-judge".into(),
-            remote: true,
+            unmanaged: true,
             endpoint: Some("myorg.cognitiveservices.azure.com".into()),
             served_model: Some("gpt-4o-2024-08-06".into()),
             ..Default::default()
         };
         assert_eq!(
-            serde_json::to_value(&remote).unwrap(),
+            serde_json::to_value(&unmanaged).unwrap(),
             serde_json::json!({
                 "model": "gpt-4o",
                 "seat": "example-judge",
                 "draws": 0,
                 "wall_ms": 0,
                 "total_tokens": 0,
-                "remote": true,
+                "unmanaged": true,
                 "endpoint": "myorg.cognitiveservices.azure.com",
                 "served_model": "gpt-4o-2024-08-06"
             })
@@ -519,9 +521,9 @@ mod tests {
         }
     }
 
-    /// A remote `ProfileModel` whose declared endpoint URL is `url` —
+    /// An unmanaged `ProfileModel` whose declared endpoint URL is `url` —
     /// used by the #1887 credential-strip tests below.
-    fn remote_pm(url: &str) -> ProfileModel {
+    fn unmanaged_pm(url: &str) -> ProfileModel {
         ProfileModel {
             id: "endpoint-model".to_string(),
             endpoint: Some(ModelEndpoint { url: Some(url.to_string()), ..Default::default() }),
@@ -529,13 +531,13 @@ mod tests {
         }
     }
 
-    /// Same as [`staffing`] but staffed on a remote seat whose endpoint URL
+    /// Same as [`staffing`] but staffed on an unmanaged seat whose endpoint URL
     /// carries userinfo — used by the #1887 snapshot-level test.
-    fn staffing_remote(name: &str, url: &str) -> ResolvedSeatStaffing {
+    fn staffing_unmanaged(name: &str, url: &str) -> ResolvedSeatStaffing {
         ResolvedSeatStaffing {
             name: name.to_string(),
             role_id: Some(format!("review-{name}")),
-            pm: remote_pm(url),
+            pm: unmanaged_pm(url),
             k: 1,
             passes: 2,
             max_tokens: None,
@@ -559,8 +561,8 @@ mod tests {
     /// committing.
     #[test]
     fn seat_endpoint_host_strips_token_userinfo_form() {
-        let pm = remote_pm("https://tok@proxy.example.com/v1");
-        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        let pm = unmanaged_pm("https://tok@proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("an unmanaged pm always yields a host");
         assert_eq!(host, "proxy.example.com");
         assert!(!host.contains('@'), "no userinfo delimiter may survive: {host:?}");
         assert!(!host.contains("tok"), "the token itself must not survive: {host:?}");
@@ -571,8 +573,8 @@ mod tests {
     /// token-only case above.
     #[test]
     fn seat_endpoint_host_strips_user_pass_userinfo_form() {
-        let pm = remote_pm("https://user:pass@proxy.example.com/v1");
-        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        let pm = unmanaged_pm("https://user:pass@proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("an unmanaged pm always yields a host");
         assert_eq!(host, "proxy.example.com");
         assert!(!host.contains('@'), "no userinfo delimiter may survive: {host:?}");
         assert!(!host.contains("user"), "the username must not survive: {host:?}");
@@ -585,8 +587,8 @@ mod tests {
     /// no-`@` fast path stays proven alongside the two stripping cases.
     #[test]
     fn seat_endpoint_host_bare_host_is_unchanged() {
-        let pm = remote_pm("https://proxy.example.com/v1");
-        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        let pm = unmanaged_pm("https://proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("an unmanaged pm always yields a host");
         assert_eq!(host, "proxy.example.com");
     }
 
@@ -602,14 +604,14 @@ mod tests {
     /// needs its own full case matrix.
     #[test]
     fn staffing_snapshot_strips_endpoint_userinfo_too() {
-        let judge = staffing_remote("example-judge", "https://tok@proxy.example.com/v1");
+        let judge = staffing_unmanaged("example-judge", "https://tok@proxy.example.com/v1");
 
         let snap = staffing_snapshot(&[], &judge, None, false);
 
         let value = serde_json::to_value(&snap).unwrap();
         let endpoint = value["judge"]["endpoint"]
             .as_str()
-            .expect("a remote judge seat's snapshot must carry an endpoint host");
+            .expect("an unmanaged judge seat's snapshot must carry an endpoint host");
         assert_eq!(endpoint, "proxy.example.com");
         assert!(!endpoint.contains('@'), "no userinfo delimiter may survive: {endpoint:?}");
         assert!(!endpoint.contains("tok"), "the token itself must not survive: {endpoint:?}");
@@ -674,7 +676,7 @@ mod tests {
     /// (#2540) The READ-side twin every WRITE-side golden above is missing.
     /// `member_record_serializes_with_the_pre_move_shape` and
     /// `staffing_snapshot_serializes_with_the_pre_move_shape` both pin that
-    /// `MemberRecord::remote` / `SeatStaffingSnapshot::remote` /
+    /// `MemberRecord::unmanaged` / `SeatStaffingSnapshot::unmanaged` /
     /// `StaffingSnapshot::request_changes` are OMITTED at their default —
     /// but neither, nor anything else in this module, ever deserializes a
     /// document that omits them. All three pair `#[serde(default)]` with
@@ -686,7 +688,7 @@ mod tests {
     /// fields on the common path — failed to deserialize.
     ///
     /// **Proved failing first** (2026-09-09, this packet): commenting out
-    /// `default` on `MemberRecord::remote`, `SeatStaffingSnapshot::remote`,
+    /// `default` on `MemberRecord::unmanaged`, `SeatStaffingSnapshot::unmanaged`,
     /// and `StaffingSnapshot::request_changes` in turn, rebuilding
     /// (`cargo build -p darkmux-crew --tests`, confirmed exit 0 each time),
     /// and running `cargo test -p darkmux-crew --lib` left **every other
@@ -696,6 +698,20 @@ mod tests {
     /// `lab::review` recorded-envelope tests — happened to catch all three
     /// accidentally, which is what makes it easy to miss that the owning
     /// crate has none.) Restored before writing this test.
+    /// (#3035) An envelope archived before 5.0 spells the flag `remote`; it
+    /// still reads as `unmanaged`, and the new spelling is what gets written.
+    #[test]
+    fn an_archived_remote_seat_flag_reads_as_unmanaged() {
+        let member: MemberRecord = serde_json::from_value(serde_json::json!({
+            "model": "m", "seat": "s", "draws": 1, "wall_ms": 1, "total_tokens": 1, "remote": true
+        }))
+        .unwrap();
+        assert!(member.unmanaged);
+        let written = serde_json::to_value(&member).unwrap();
+        assert_eq!(written["unmanaged"], true);
+        assert!(written.get("remote").is_none(), "{written}");
+    }
+
     #[test]
     fn member_record_and_staffing_snapshot_round_trip_through_every_omitted_default() {
         let local_member = MemberRecord {
@@ -708,11 +724,11 @@ mod tests {
         };
         let member_value = serde_json::to_value(&local_member).unwrap();
         assert!(
-            member_value.get("remote").is_none(),
-            "std::ops::Not::not should have skipped MemberRecord::remote"
+            member_value.get("unmanaged").is_none(),
+            "std::ops::Not::not should have skipped MemberRecord::unmanaged"
         );
         let member_back: MemberRecord = serde_json::from_value(member_value)
-            .unwrap_or_else(|e| panic!("a MemberRecord with remote omitted must still deserialize: {e}"));
+            .unwrap_or_else(|e| panic!("a MemberRecord with unmanaged omitted must still deserialize: {e}"));
         assert_eq!(local_member, member_back);
 
         // A local judge, no verify seat, no request_changes — the common
@@ -725,12 +741,12 @@ mod tests {
 
         let snap_value = serde_json::to_value(&snap).unwrap();
         assert!(
-            snap_value["probes"][0].get("remote").is_none(),
-            "std::ops::Not::not should have skipped SeatStaffingSnapshot::remote on the probe"
+            snap_value["probes"][0].get("unmanaged").is_none(),
+            "std::ops::Not::not should have skipped SeatStaffingSnapshot::unmanaged on the probe"
         );
         assert!(
-            snap_value["judge"].get("remote").is_none(),
-            "std::ops::Not::not should have skipped SeatStaffingSnapshot::remote on the judge"
+            snap_value["judge"].get("unmanaged").is_none(),
+            "std::ops::Not::not should have skipped SeatStaffingSnapshot::unmanaged on the judge"
         );
         assert!(
             snap_value.get("request_changes").is_none(),
@@ -739,7 +755,7 @@ mod tests {
 
         // The mutation-sensitive step: this is exactly what breaks with
         // "missing field" if `#[serde(default)]` is dropped from
-        // `remote` on either seat type, or from `request_changes`, while
+        // `unmanaged` on either seat type, or from `request_changes`, while
         // `skip_serializing_if` stays.
         let snap_back: StaffingSnapshot = serde_json::from_value(snap_value)
             .unwrap_or_else(|e| panic!("a StaffingSnapshot with every default omitted must still deserialize: {e}"));

@@ -2121,7 +2121,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
 // (5.0 R2) The Machine info panel describes ONE machine: the one whose
 // readings it shows. A relayed dispatch ran elsewhere, so the panel names
 // that machine and never fills its rows from this daemon.
-describe("MachineDrawer — a relayed dispatch describes the machine that ran it (5.0 R2)", () => {
+describe("MachineDrawer: a relayed dispatch describes the machine that ran it (5.0 R2)", () => {
   const T = "2026-01-01T00:10:00Z";
   const MBP = { machine_uid: "UID-MBP", machine_id: "MacBook-Pro" };
   const DARK = { machine_uid: "UID-DARK", machine_id: "darkbook" };

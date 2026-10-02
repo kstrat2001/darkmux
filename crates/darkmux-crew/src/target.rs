@@ -68,9 +68,9 @@ impl Target {
 
 /// The route label for an unmanaged endpoint and the model requested there:
 /// the host (never the path, never credentials) and the model id, through
-/// `darkmux_flow::remote_route_label`.
+/// `darkmux_flow::unmanaged_route_label`.
 pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
-    darkmux_flow::remote_route_label(ep.host().as_deref().unwrap_or("remote"), model_id)
+    darkmux_flow::unmanaged_route_label(ep.host().as_deref().unwrap_or("remote"), model_id)
 }
 
 /// What [`resolve_in`] found.

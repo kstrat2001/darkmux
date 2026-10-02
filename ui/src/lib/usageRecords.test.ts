@@ -183,11 +183,12 @@ describe("usageContribution is sumUsage's per-record half (one arithmetic)", () 
     expect(fold(usageOnly, PURPOSE.utility)).toEqual({ total: w.total, prompt: w.prompt, completion: w.completion, cached: w.cached, utility: 0 });
   });
 
-  it("the provider total wins; a split with no total falls back to prompt + completion, then remote_tokens", () => {
+  it("the provider total wins; a split with no total falls back to prompt + completion, then unmanaged_tokens (an archive's remote_tokens)", () => {
     clock = 0;
     const amount = (payload: Record<string, unknown>) => usageContribution(usage("s", "h", payload))!;
     expect(amount({ prompt_tokens: 7, completion_tokens: 3, total_tokens: 12 }).total).toBe(12);
     expect(amount({ prompt_tokens: 7, completion_tokens: 3 }).total).toBe(10);
+    expect(amount({ unmanaged_tokens: 5 }).total).toBe(5);
     expect(amount({ remote_tokens: 5 }).total).toBe(5);
   });
 
@@ -247,7 +248,11 @@ describe("the legacy fallback (a run with no usage records counts its complete)"
     expect(sumUsage([complete("a", { total_tokens: 10 })]).cached).toBeNull();
   });
 
-  it("a remote_tokens-only legacy complete still counts its total", () => {
+  it("an unmanaged_tokens-only complete counts its total", () => {
+    expect(sumUsage([complete("rv", { unmanaged_tokens: 40 })]).total).toBe(40);
+  });
+
+  it("a remote_tokens-only archived complete still counts its total", () => {
     expect(sumUsage([complete("rv", { remote_tokens: 40 })]).total).toBe(40);
   });
 });

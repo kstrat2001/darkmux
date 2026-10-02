@@ -106,7 +106,7 @@ export function ScopeLamps({
       ? finished
         ? "finished"
         : noSignal
-          ? "disconnected — page lost the daemon"
+          ? "disconnected: page lost the daemon"
           : "no model working"
       : reading.state === "generating"
         ? reading.thinking

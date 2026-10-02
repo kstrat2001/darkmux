@@ -43,7 +43,7 @@ describe("PANELS", () => {
   // (#1905 step 3) exactly eight pills — the operator's own rejection of a
   // ten-pill render ("can't allow main to have this") is the reason a
   // ninth/tenth client-only entry can never come back silently.
-  it("is exactly ten pills (machine-list is the tenth), matching panel.rs's own doctrine cap — no client-only entries", () => {
+  it("is exactly ten pills (machine-list is the tenth), matching panel.rs's own doctrine cap: no client-only entries", () => {
     expect(PANELS).toHaveLength(10);
     expect(PANEL_IDS).toHaveLength(10);
   });

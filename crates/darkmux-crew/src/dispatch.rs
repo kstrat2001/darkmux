@@ -638,7 +638,7 @@ pub struct DispatchResult {
     /// Host path where the internal runtime's `.darkmux-runtime/`
     /// bookkeeping landed (the dir mounted into the container at
     /// `/darkmux-out`). `None` when the dispatch path doesn't produce
-    /// out-of-band bookkeeping (e.g. the remote single-shot path).
+    /// out-of-band bookkeeping (e.g. the unmanaged-endpoint single-shot path).
     pub out_dir: Option<PathBuf>,
     /// This dispatch's trajectory, as the live tailer folded it while the
     /// container ran: the dispatch's one reading of its trajectory. Callers

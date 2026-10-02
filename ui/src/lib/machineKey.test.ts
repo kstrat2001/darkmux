@@ -31,7 +31,7 @@ function ctx(data: NormRecord[], extra: Partial<MachineKeyContext> = {}): Machin
 const h = (uid: string) => machineKeyHash(uid).slice(0, 6);
 const NOT_FOUND = { uid: null, key: null, stale: false };
 
-describe("(#2929) machine keys — what the URL hash carries instead of the hardware uid", () => {
+describe("(#2929) machine keys: what the URL hash carries instead of the hardware uid", () => {
   it("UID_SHAPED matches a uuid in either case, and not a key", () => {
     expect(UID_SHAPED.test(UID_A)).toBe(true);
     expect(UID_SHAPED.test(UID_A.toLowerCase())).toBe(true);
@@ -75,12 +75,12 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
       expect(new Set(keys).size, keys.join(" ")).toBe(uids.length);
       uids.forEach((u, i) => expect(decodeMachineKey(c, keys[i]).uid, keys[i]).toBe(u));
     }
-    it("a machine literally named like another's unnamed key — either order", () => {
+    it("a machine literally named like another's unnamed key: either order", () => {
       const fake = `unnamed-${h(UID_B)}`;
       assertBijective(ctx([rec(UID_A, "2026-09-27T01:00:00Z", fake), rec(UID_B, "2026-09-27T02:00:00Z")]), [UID_A, UID_B]);
       assertBijective(ctx([rec(UID_B, "2026-09-27T01:00:00Z"), rec(UID_A, "2026-09-27T02:00:00Z", fake)]), [UID_A, UID_B]);
     });
-    for (const sep of ["_", "~"]) it(`a machine literally named like another's disambiguated key ("${sep}") — either order`, () => {
+    for (const sep of ["_", "~"]) it(`a machine literally named like another's disambiguated key ("${sep}"): either order`, () => {
       const fake = `mac${sep}${h(UID_B)}`;
       const three = (fakeFirst: boolean) =>
         ctx(
@@ -103,7 +103,7 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
     });
   });
 
-  describe("C2: a saved key opens the SAME machine or not-found — never another", () => {
+  describe("C2: a saved key opens the SAME machine or not-found: never another", () => {
     it("the machine gained a name since the key was minted", () => {
       const before = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")]);
       const key = encodeMachineKey(before, UID_B);
@@ -206,7 +206,7 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
     expect(decodeMachineKey(c, MACHINE_NOT_FOUND_KEY)).toEqual(NOT_FOUND);
   });
 
-  it("never encodes a uid — every machine in a mixed window, and one outside it", () => {
+  it("never encodes a uid: every machine in a mixed window, and one outside it", () => {
     const beats = new Map<string, PresenceBeat>([[UID_C, { machine_uid: UID_C } as PresenceBeat]]);
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z", "b")], { liveMachines: beats });
     const keys = [UID_A, UID_B, UID_C, UID_D].map((u) => encodeMachineKey(c, u));

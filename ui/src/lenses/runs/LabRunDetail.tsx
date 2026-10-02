@@ -17,27 +17,23 @@ import type { LabRunEventsResponse } from "../../types/generated/LabRunEventsRes
 import { ingest, type NormRecord } from "../../lib/ingest";
 
 /**
- * Lab-run detail — `renderLabRun()` (viewer.html:4848-4869), reached by
+ * Lab-run detail, reached by
  * clicking a `kind==="lab"` row in the runs board (`data-act="labrun"`,
- * `ACTIONS.labrun` → `drillLabRun(dir)`). Previously `RunsBoard`'s row
- * click surfaced `NOT_PORTED_NOTICE` for every interactive row — this
- * component is the real destination for the lab half of that gap (the
- * mission/dispatch half routes to `/mission/<id>/graph`, see
+ * `drillLabRun(dir)`). This component is the destination for the lab
+ * half (the mission/dispatch half routes to `/mission/<id>/graph`, see
  * `RunsBoard.tsx`'s own doc for that half).
  *
- * Two fetches, matching `drillLabRun`'s own two loads:
- * - `GET /lab/run/detail?dir=` (react-query, one-shot — legacy's
- *   `loadLabRunDetail`) for the envelope(s)/scores that drive the pipeline
+ * Two fetches:
+ * - `GET /lab/run/detail?dir=` (react-query, one-shot) for the envelope(s)/scores that drive the pipeline
  *   synthesis stage + the CLI hint.
  * - `GET /lab/run/events?dir=&offset=` (a self-rescheduling poll, NOT
  *   react-query's `refetchInterval` — the offset/accumulation state is
- *   genuinely sequential, matching legacy's `pollLabEvents`: each tick
+ *   genuinely sequential: each tick
  *   fetches from the LAST `next_offset`, appends new lines, and either
  *   backs off to the steady cadence or speeds up to drain a backlog. A
  *   plain `refetchInterval` re-fetch has no way to carry that offset
  *   forward between polls, so this stays a manual `useEffect` + timer,
- *   mirroring the legacy control flow rather than fighting react-query's
- *   shape to force it in).
+ *   rather than fighting react-query's shape to force it in).
  *
  *   The poll goes through `fetchJson` (the same discriminated-result
  *   contract every other data path in this app uses), not a raw `fetch` —
@@ -55,15 +51,12 @@ import { ingest, type NormRecord } from "../../lib/ingest";
  *   `/lab/run/events` every tick behind an error page nothing will ever
  *   resolve.
  *
- * (drill-in packet) `onUnresolvable` — the port of legacy's `drillLabRun`
- * fallback (`viewer.html:4101-4126`): `if(!LAB_DETAIL){ ...state.level="runs";
- * state.labRunDir=null; render(); ... }`. A stale/mistyped `run=` deep link,
- * a dir deleted since the list was fetched, or (on a daemon-less static
- * build) the genuine absence of `/lab/run/detail` all land here the same
- * way legacy's does — fired once, from an effect keyed on the detail
- * query's own settled `!ok` state, mirroring legacy's `await
- * loadLabRunDetail(dir); if(!LAB_DETAIL)`. This component does NOT choose
- * the fallback MESSAGE (the daemon-vs-static split legacy's own
+ * (drill-in packet) `onUnresolvable` — the fallback back to the runs
+ * list. A stale/mistyped `run=` deep link, a dir deleted since the list
+ * was fetched, or (on a daemon-less static build) the genuine absence of
+ * `/lab/run/detail` all land here the same way: fired once, from an
+ * effect keyed on the detail query's own settled `!ok` state. This
+ * component does NOT choose the fallback MESSAGE (the daemon-vs-static split
  * `missionGraphReachable()` check makes) — that judgment stays in
  * `RunsBoard.tsx`, right beside `MISSION_GRAPH_UNREACHABLE_NOTICE`, the
  * other daemon-reachability notice this board already owns; this component
@@ -99,8 +92,7 @@ export function LabRunDetail({
   // `useRef` for the offset (not state) — a poll reads/advances it between
   // renders without itself triggering one; only `setEvents`/`setFinished`/
   // `setPollUnreachable` (real content/status changes) do, matching
-  // legacy's `renderLabRun()` firing only when `gotLines` is truthy
-  // (viewer.html:4064).
+  // a re-render firing only when lines arrived.
   const offsetRef = useRef(0);
   const failCountRef = useRef(0);
 
@@ -127,10 +119,9 @@ export function LabRunDetail({
   }, [detailErrored, dir]);
 
   useEffect(() => {
-    // Fresh entry into a (possibly different) run dir: legacy resets
-    // `LAB_EVENTS=[]; LAB_EVENTS_OFFSET=0` on every `drillLabRun` call
-    // (viewer.html:4103) — this effect's own dependency array (`[dir]`)
-    // reruns it exactly then, so the reset lives here rather than at the
+    // Fresh entry into a (possibly different) run dir: the events and
+    // offset reset on every entry. This effect's own dependency array
+    // (`[dir]`) reruns it exactly then, so the reset lives here rather than at the
     // component's mount-only initial state.
     offsetRef.current = 0;
     setEvents([]);
@@ -225,10 +216,10 @@ export function LabRunDetail({
   const scores = detail.scores;
   const pipe = computeLabPipeline(events);
   // (#1434) No task-finished record exists anymore; a run is "finished"
-  // when its completed envelope or scores artifact is present — OR the
+  // when its completed envelope or scores artifact is present: OR the
   // events poll itself observed `finished` (the `scores.json`-exists check
-  // the server makes on every poll, viewer.html:2218/`renderLabRun`'s own
-  // `!!env || (scores!=null)` check, folded with the poll's own signal so a
+  // the server makes on every poll) plus the `!!env || (scores!=null)`
+  // check, folded with the poll's own signal so a
   // run that just completed doesn't wait for a full remount to say so).
   const isFinished = !!env || scores != null || finished;
   const pipelineLines = labPipelineLines(pipe, env);

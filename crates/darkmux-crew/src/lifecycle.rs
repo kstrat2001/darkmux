@@ -789,12 +789,12 @@ fn reconcile_phase_warning(mission_id: &str, phase: &Phase, refused: Option<&any
     match refused {
         None => format!(
             "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
-             Finalized — reconciled to Abandoned (#1504 defensive backstop)",
+             Finalized: reconciled to Abandoned (#1504 defensive backstop)",
             phase.id, phase.status
         ),
         Some(e) => format!(
             "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
-             Finalized — NOT reconciled, left as it is: {e:#}",
+             Finalized: NOT reconciled, left as it is: {e:#}",
             phase.id, phase.status
         ),
     }

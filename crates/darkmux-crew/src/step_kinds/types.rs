@@ -36,7 +36,7 @@ pub struct OverrideDispatchCall<'a> {
 /// `ReviewStepContext::chat_override` (an `Arc<dyn Fn + Send + Sync>`
 /// field, `None` at every production call site). A thread-local seam
 /// cannot serve here: the scheduler executes steps on spawned scoped
-/// threads (`concurrent_dispatch::run_remote_batches` /
+/// threads (`concurrent_dispatch::run_capped_batches` /
 /// `run_local_waves`), where a test thread's thread-local is invisible.
 /// When present, `dispatch.map` routes every item's call through it INSTEAD
 /// of the real `single_shot_chat`/`single_shot_chat_hosted` transport —

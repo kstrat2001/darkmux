@@ -864,7 +864,7 @@ fn chain_depths_strict(value: Option<&serde_json::Value>) -> Result<Vec<u32>> {
             ensure!(
                 arr.len() <= MAX_CHAIN_LADDER_LEN,
                 "workload `chainDepths` has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
-                 — this cap counts raw array entries (before de-duplication), because after \
+                : this cap counts raw array entries (before de-duplication), because after \
                  de-duplication each distinct depth becomes its own chaining task with up to \
                  `depth` hop files, so a long array is refused as a conservative bound on how many \
                  chaining tasks it could generate, even if repeated values would collapse to fewer \
@@ -895,14 +895,14 @@ fn chain_depths_strict(value: Option<&serde_json::Value>) -> Result<Vec<u32>> {
                 ensure!(
                     n >= 1,
                     "workload `chainDepths` contains {n}, but every depth must be a positive \
-                     integer — `0` would be silently raised to the chaining minimum (2) by \
+                     integer: `0` would be silently raised to the chaining minimum (2) by \
                      generate_tasks rather than used as written. Use a real depth (>= 1), or omit \
                      chainDepths for the default ladder."
                 );
                 ensure!(
                     n <= MAX_CHAIN_DEPTH as u64,
                     "workload `chainDepths` contains {n}, above the cap of {MAX_CHAIN_DEPTH} \
-                     — every unit of depth is another hop file the sandbox has to generate and \
+                    : every unit of depth is another hop file the sandbox has to generate and \
                      another required tool call in the task, so a value this large turns one \
                      manifest key into an effectively unbounded loop. Lower the value."
                 );
@@ -1045,7 +1045,7 @@ impl WorkloadProvider for ToolBenchProvider {
             // `<= 3600` ceiling that is unique to this key (see above).
             ensure!(
                 n >= 1,
-                "workload `taskTimeoutSeconds` must be >= 1 — `0` resolves to an \
+                "workload `taskTimeoutSeconds` must be >= 1: `0` resolves to an \
                  already-expired inactivity deadline (an instant kill) on the container path, \
                  not 'unbounded' or 'shortest allowed'. Omit taskTimeoutSeconds for the standing \
                  env/config/600 default, or set a real positive bound."
@@ -1055,7 +1055,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 "workload `taskTimeoutSeconds` is {n}, outside the allowed range \
                  {MIN_TASK_TIMEOUT_SECONDS}-{MAX_TASK_TIMEOUT_SECONDS} seconds. This value \
                  outranks your own env/config inactivity setting when present, so it is refused \
-                 rather than silently clamped to a bound you didn't type — pick a value inside \
+                 rather than silently clamped to a bound you didn't type: pick a value inside \
                  the range, or omit the key for the standing env/config/600 default. This range \
                  is narrower than `darkmux dispatch --timeout`'s on purpose: it bounds one quick \
                  tool-bench axis probe, not an open-ended dispatch."

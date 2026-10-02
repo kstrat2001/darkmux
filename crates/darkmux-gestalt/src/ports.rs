@@ -66,7 +66,7 @@ impl std::fmt::Display for HostError {
                 write!(f, "host refused: insufficient resources ({detail})")
             }
             HostError::NotResident { identifier } => {
-                write!(f, "\"{identifier}\" is not resident — nothing to unload")
+                write!(f, "\"{identifier}\" is not resident: nothing to unload")
             }
             HostError::CommandFailed { detail } => write!(f, "host command failed: {detail}"),
         }
@@ -142,7 +142,7 @@ mod tests {
             ),
             (
                 HostError::NotResident { identifier: "darkmux:m".into() },
-                "\"darkmux:m\" is not resident — nothing to unload",
+                "\"darkmux:m\" is not resident: nothing to unload",
             ),
             (HostError::CommandFailed { detail: "exit 1".into() }, "host command failed: exit 1"),
         ];

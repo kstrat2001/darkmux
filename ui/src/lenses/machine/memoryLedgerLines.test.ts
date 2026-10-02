@@ -176,12 +176,12 @@ describe("overPriceHint", () => {
 describe("notLocalMessage", () => {
   it("a named machine: go to its own machine page", () => {
     expect(notLocalMessage("studio")).toBe(
-      "residency / RAM not reported from here — local-probe only. View the machine page on studio directly for live figures.",
+      "residency / RAM not reported from here: local-probe only. View the machine page on studio directly for live figures.",
     );
   });
   it.each(["unnamed machine", "unnamed machine 2"])("%s: says how to name it, not where to go", (name) => {
     const msg = notLocalMessage(name);
-    expect(msg).toContain("residency / RAM not reported from here — local-probe only.");
+    expect(msg).toContain("residency / RAM not reported from here: local-probe only.");
     expect(msg).toContain("darkmux config set machine_id <name>");
     expect(msg).not.toContain(`on ${name} directly`);
   });

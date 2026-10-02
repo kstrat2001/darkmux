@@ -4411,7 +4411,7 @@
                 "probes": [
                     {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
                 ],
-                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "remote": true, "endpoint": "provider.example", "passes": 2}
+                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "unmanaged": true, "endpoint": "provider.example", "passes": 2}
             }
         }]);
         fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
@@ -6255,7 +6255,7 @@
             .expect("STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject");
         let (body, _) = after
             .split_once("]);")
-            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts — the pin lost its subject");
+            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts: the pin lost its subject");
         body
     }
 
@@ -6310,7 +6310,7 @@
             assert!(
                 map.contains(&format!("[{key},")),
                 "ui/src/lenses/mission/graph.ts lost the {key} entry from its \
-                 STATUS_ACTIONS map — the SSE delta layer silently stops animating that transition"
+                 STATUS_ACTIONS map: the SSE delta layer silently stops animating that transition"
             );
         }
     }
@@ -6341,7 +6341,7 @@
             assert!(
                 map.contains(&format!("[{key},")),
                 "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
-                 STEP_LIFECYCLE_ACTIONS entry {key} — the graph lens would silently \
+                 STEP_LIFECYCLE_ACTIONS entry {key}: the graph lens would silently \
                  stop animating that step transition"
             );
         }

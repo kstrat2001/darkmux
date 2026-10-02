@@ -1070,7 +1070,7 @@ pub struct RuntimeBehaviorConfig {
     /// one completed turn and the next model-facing turn does. This keeps
     /// the knob's cost proportional to actual GPU inference bursts rather
     /// than to how finely one burst happens to get checkpointed. Local
-    /// dispatches only. The remote single-shot path never forwards this at
+    /// dispatches only. The unmanaged-endpoint single-shot path never forwards this at
     /// all (it never builds a `DockerRunConfig`). An agentic-REMOTE
     /// dispatch (a tool-granting role on an endpoint profile, which DOES
     /// run the same container/`loop_runner.rs` local dispatches use) is
