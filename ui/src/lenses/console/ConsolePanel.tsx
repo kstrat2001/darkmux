@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ComponentProps, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, rosterOptName, rosterIsPositional, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
+import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, variantKey, rosterOptName, rosterIsPositional, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
 import { useFleetView } from "../../hooks/useFleetView";
 import { fetchPanel } from "./fetchPanel";
 import { fetchJson } from "../../lib/fetcher";
@@ -94,8 +94,12 @@ import { onIntentClick } from "../../lib/clickIntent";
 export function ConsolePanel({
   initialPanelId,
   initialOpts,
+  droppedNote,
 }: {
   initialPanelId: PanelId | "";
+  /** What `parseRoute` dropped from the deep link and why (`route.dropped`),
+   * shown as one line until the operator picks a panel or option. */
+  droppedNote?: readonly string[];
   /** (#1911) The panel's own opt selections carried in on a deep link
    * (`route.opts` — `lib/route.ts`), already sanitized against that
    * panel's own table by `parseRoute`. Seeds this component's per-pill
@@ -111,6 +115,14 @@ export function ConsolePanel({
   // deciding what `""` renders as." A real `PanelId` means the operator
   // (or a deep link) explicitly picked that tab.
   const [panelId, setPanelId] = useState<PanelId>(initialPanelId || DEFAULT_PANEL_ID);
+  // The deep link's dropped-opts note. The operator's own pick supersedes the
+  // link, so a selection clears it; a new link brings its own.
+  const [dropped, setDropped] = useState<readonly string[]>(droppedNote ?? []);
+  // Only a NON-empty note replaces it: the address bar is rewritten to the
+  // canonical hash right after load, and that re-parse carries nothing dropped.
+  useEffect(() => {
+    if (droppedNote && droppedNote.length > 0) setDropped(droppedNote);
+  }, [droppedNote]);
 
   // (#1911) Per-pill opt selection memory — a `Map` beside `panelId`,
   // deliberately NOT `localStorage` (see the module doc below for why: a
@@ -147,6 +159,7 @@ export function ConsolePanel({
 
   const activeSelection: Readonly<Record<string, string>> = selections.get(panelId) ?? {};
   const setOpt = (name: string, value: string) => {
+    setDropped([]);
     const next = reconcileOpts(panelId, activeSelection, name, value);
     setSelections((prev) => {
       const m = new Map(prev);
@@ -190,6 +203,7 @@ export function ConsolePanel({
   // that panel's selection: the link names one variant, not "whatever was
   // picked last".
   const selectPanel = (next: PanelId, linkOpts?: Readonly<Record<string, string>>) => {
+    setDropped([]);
     const opts = linkOpts && Object.keys(linkOpts).length > 0 ? { ...linkOpts } : (selections.get(next) ?? {});
     if (linkOpts && Object.keys(linkOpts).length > 0) {
       setSelections((prev) => new Map(prev).set(next, opts));
@@ -208,7 +222,7 @@ export function ConsolePanel({
       {/* `key={panelId}` — see the module doc's `placeholderData` paragraph
           for why this is load-bearing, not decorative: it is what keeps
           `keepPreviousData` scoped to selection changes WITHIN one panel. */}
-      <CliPanelView key={panelId} id={panelId} opts={activeSelection} onOptChange={setOpt} onPanelSwitch={selectPanel} />
+      <CliPanelView key={panelId} id={panelId} opts={activeSelection} dropped={dropped} onOptChange={setOpt} onPanelSwitch={selectPanel} />
     </>
   );
 }
@@ -235,30 +249,27 @@ function PanelTab({ id, label, active, onSelect }: { id: PanelId; label: string;
   );
 }
 
-/** The CLI-panel fetch/chrome/body machinery, extracted from `ConsolePanel`'s
- * own return for readability. (#1905 step 3) This is now the ONLY render
- * branch `ConsolePanel` ever mounts. */
-function CliPanelView({
-  id,
-  opts,
-  onOptChange,
-  onPanelSwitch,
-}: {
-  id: PanelId;
-  /** (#1911) The panel's current opt selections — the RAW per-pill map
-   * from `ConsolePanel`'s own state, which may include an explicitly
-   * re-picked default. `queryKeys.panel`/`fetchPanel` both canonicalize
-   * (drop defaults, sort) before this reaches a cache key or the wire, so
-   * "picked the default" and "never touched it" land in the SAME query. */
-  opts: Readonly<Record<string, string>>;
-  onOptChange: (name: string, value: string) => void;
-  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
-}) {
-  const manual = isManualPanel(id);
-  const wireOpts = Object.fromEntries(canonicalOptPairs(id, opts));
+/** The panel's query, plus the body to show: the fresh one, or, when a refresh
+ * failed, the last body that arrived intact for THIS selection. */
+function usePanelOutcome(
+  id: PanelId,
+  opts: Readonly<Record<string, string>>,
+  wireOpts: Readonly<Record<string, string>>,
+  manual: boolean,
+) {
+  // The last body that arrived intact for THIS selection. A 429, a 504 or a
+  // network blip comes back from `fetchPanel` as `{ok:false}` data, which
+  // replaces the query's data; without this the output the operator was
+  // reading would be erased by the very failure that makes it matter.
+  const selectionKey = variantKey(id, opts);
+  const lastGood = useRef<{ key: string; body: PanelResponse } | null>(null);
   const query = useQuery({
     queryKey: queryKeys.panel(id, opts),
-    queryFn: () => fetchPanel(id, panelCols(document.querySelector(".panelout")), wireOpts),
+    queryFn: async () => {
+      const outcome = await fetchPanel(id, panelCols(document.querySelector(".panelout")), wireOpts);
+      if (outcome.ok) lastGood.current = { key: selectionKey, body: outcome.data };
+      return outcome;
+    },
     enabled: !manual,
     staleTime: PANEL_CACHE_MS,
     refetchOnWindowFocus: !manual,
@@ -271,8 +282,37 @@ function CliPanelView({
     placeholderData: keepPreviousData,
   });
 
-  const loadedBody = query.data?.ok === true ? query.data.data : null;
   const errorMessage = query.data?.ok === false ? query.data.message : null;
+  const keptBody = lastGood.current?.key === selectionKey ? lastGood.current.body : null;
+  const loadedBody = query.data?.ok === true ? query.data.data : errorMessage !== null && !query.isPlaceholderData ? keptBody : null;
+  return { query, loadedBody, errorMessage };
+}
+
+/** The CLI-panel fetch/chrome/body machinery, extracted from `ConsolePanel`'s
+ * own return for readability. (#1905 step 3) This is now the ONLY render
+ * branch `ConsolePanel` ever mounts. */
+function CliPanelView({
+  id,
+  opts,
+  dropped,
+  onOptChange,
+  onPanelSwitch,
+}: {
+  id: PanelId;
+  /** (#1911) The panel's current opt selections — the RAW per-pill map
+   * from `ConsolePanel`'s own state, which may include an explicitly
+   * re-picked default. `queryKeys.panel`/`fetchPanel` both canonicalize
+   * (drop defaults, sort) before this reaches a cache key or the wire, so
+   * "picked the default" and "never touched it" land in the SAME query. */
+  opts: Readonly<Record<string, string>>;
+  /** What the deep link carried that was not used; shown in the chrome row. */
+  dropped: readonly string[];
+  onOptChange: (name: string, value: string) => void;
+  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
+}) {
+  const manual = isManualPanel(id);
+  const wireOpts = Object.fromEntries(canonicalOptPairs(id, opts));
+  const { query, loadedBody, errorMessage } = usePanelOutcome(id, opts, wireOpts, manual);
   // `isPlaceholderData`: true exactly while `loadedBody`/`errorMessage`
   // describe a PREVIOUS selection (the query key changed and the new
   // key's own fetch hasn't landed yet) — see `ChromeCommandLine`'s doc for
@@ -358,7 +398,12 @@ function CliPanelView({
   return (
     <div className="panelwrap" ref={wrapRef}>
       <div className="panelchrome">
-        <ChromeCommandLine id={id} opts={opts} onOptChange={onOptChange} loadedBody={loadedBody} stale={stale} manual={manual} fetchedAt={query.dataUpdatedAt} />
+        <ChromeCommandLine id={id} opts={opts} onOptChange={onOptChange} loadedBody={loadedBody} stale={stale} manual={manual} fetchedAt={query.dataUpdatedAt} failure={loadedBody ? errorMessage : null} />
+        {dropped.length > 0 && (
+          <span className="pc-dropped" title={`Not used from this link: ${dropped.join("; ")}.`}>
+            · {dropped.length} unused
+          </span>
+        )}
         <span className="pc-spacer"></span>
         {/* (byte-identical-to-today pin) The old `LoadedChrome`/
             `NotLoadedChrome` split had one asymmetry worth preserving
@@ -395,6 +440,7 @@ function CliPanelView({
         loading={query.isFetching && !stale}
         stale={stale}
         errorMessage={errorMessage}
+        keptOutput={errorMessage !== null && loadedBody !== null}
         ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
         exitCode={loadedBody ? loadedBody.exit_code : null}
         stderrTail={loadedBody ? loadedBody.stderr_tail || "" : ""}
@@ -481,6 +527,7 @@ function ChromeCommandLine({
   stale,
   manual,
   fetchedAt,
+  failure,
 }: {
   id: PanelId;
   opts: Readonly<Record<string, string>>;
@@ -491,6 +538,9 @@ function ChromeCommandLine({
    * for why passing `Date.now()` here silently killed the age-based note. */
   fetchedAt: number;
   manual: boolean;
+  /** The daemon's message when the latest refresh failed while `loadedBody`
+   * (the last good output) is still shown; stated in the meta slot. */
+  failure: string | null;
 }) {
   const groups = panelOptGroups(id);
   const pendingArgv = composeArgv(id, opts);
@@ -504,7 +554,7 @@ function ChromeCommandLine({
         <span className="pc-drift" title="the composed request did not match what the server actually ran">
           ⚠ argv mismatch — showing what actually ran
         </span>
-        <CapturedInfo body={loadedBody!} stale={false} fetchedAt={fetchedAt} />
+        <CapturedInfo body={loadedBody!} stale={false} fetchedAt={fetchedAt} failure={failure} />
         {loadedBody!.auto_refresh === false && <span className="pc-manual">· manual-run only</span>}
         <span>· {loadedBody!.gather_ms}ms</span>
       </>
@@ -529,9 +579,9 @@ function ChromeCommandLine({
       </span>
       {loadedBody && (
         <>
-          <CapturedInfo body={loadedBody} stale={stale} fetchedAt={fetchedAt} />
+          <CapturedInfo body={loadedBody} stale={stale} fetchedAt={fetchedAt} failure={failure} />
           {loadedBody.auto_refresh === false && <span className="pc-manual">· manual-run only</span>}
-          <span>· {loadedBody.gather_ms}ms</span>
+          {failure === null && <span>· {loadedBody.gather_ms}ms</span>}
         </>
       )}
     </>
@@ -596,9 +646,12 @@ function CapturedInfo({
   body,
   stale,
   fetchedAt,
+  failure,
 }: {
   body: PanelResponse;
   stale: boolean;
+  /** The failed refresh's message, when the body shown is the last good one. */
+  failure: string | null;
   /** (#1922 review) `query.dataUpdatedAt`, NOT `Date.now()`. Passing now
    * made `panelAgeLabel`'s `age` identically zero, so the age-based
    * `· stale (Ns)` note could never render — dead code that `format.ts`'s
@@ -607,6 +660,16 @@ function CapturedInfo({
   fetchedAt: number;
 }) {
   const a = panelAgeLabel(body, fetchedAt);
+  if (failure !== null) {
+    // As short as "captured hh:mm:ss" so the header does not wrap on a phone;
+    // the daemon's whole sentence is the tooltip.
+    const why = /\bslow\b/.test(failure) ? "slow" : "error";
+    return (
+      <span className="pc-refresh-failed" title={`Refresh failed, showing the output from ${a.hhmmss}. ${failure.trim()}`}>
+        failed: {why} · {a.hhmmss}
+      </span>
+    );
+  }
   return (
     <>
       <span>
@@ -837,6 +900,19 @@ function BooleanToken({
   );
 }
 
+/** `PanelBodyBase`, plus the one case it cannot express: the request failed
+ * but the last good output is still on hand (`keptOutput`). That output stays,
+ * dimmed as older than the failure, with the failure itself stated in the header's meta slot (`CapturedInfo`). */
+function PanelBody(props: ComponentProps<typeof PanelBodyBase> & { keptOutput: boolean }) {
+  const { keptOutput, ...base } = props;
+  if (!(base.errorMessage && keptOutput) || base.loading) return <PanelBodyBase {...base} />;
+  return (
+    <>
+      <PanelBodyBase {...base} stale={true} errorMessage={null} />
+    </>
+  );
+}
+
 /** Legacy `renderConsole()`'s body switch (`.panelout`/`.panelerr`,
  * loading > error > loaded > not-yet-run precedence). The loaded branch is
  * the ONLY one using a real `<pre>` element — see `styles.css`'s module doc
@@ -894,7 +970,7 @@ function BooleanToken({
  * screen predates the current selection. A genuine first-ever fetch (no
  * prior data to keep) still shows "running…", unchanged — `stale` can
  * only be true when there IS prior data to show instead. */
-function PanelBody({
+function PanelBodyBase({
   loading,
   stale,
   errorMessage,

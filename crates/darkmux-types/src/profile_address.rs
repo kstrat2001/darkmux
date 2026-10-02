@@ -68,7 +68,9 @@ impl std::fmt::Display for ProfileAddress {
 }
 
 /// Why `value` is not a machine name, or `None` when it is one:
-/// `[A-Za-z0-9_-]`, 1..=[`MAX_MACHINE_NAME_LEN`]. The fleet wire adds one
+/// `[A-Za-z0-9_-]`, 1..=[`MAX_MACHINE_NAME_LEN`], not starting with `-` (a name
+/// is handed to other commands as an argument, where a leading dash reads as a
+/// flag). The fleet wire adds one
 /// more rule of its own (no `-from-`), checked where a job is built.
 pub fn machine_name_problem(value: &str) -> Option<String> {
     if value.is_empty() {
@@ -76,6 +78,9 @@ pub fn machine_name_problem(value: &str) -> Option<String> {
     }
     if value.len() > MAX_MACHINE_NAME_LEN {
         return Some(format!("the machine name is longer than {MAX_MACHINE_NAME_LEN} characters"));
+    }
+    if value.starts_with('-') {
+        return Some(format!("the machine name `{value}` starts with `-`, which reads as a flag"));
     }
     if let Some(c) = value.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_')) {
         return Some(format!(
@@ -104,6 +109,14 @@ pub fn local_only_refusal(profile: &str, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_name_cannot_start_with_a_dash() {
+        for bad in ["-x", "--all", "-"] {
+            assert!(machine_name_problem(bad).is_some(), "{bad}");
+        }
+        assert!(machine_name_problem("a-b_c").is_none());
+    }
 
     fn ok(raw: &str) -> ProfileAddress {
         ProfileAddress::parse(raw).unwrap_or_else(|e| panic!("{raw}: {e}"))

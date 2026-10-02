@@ -36,7 +36,7 @@
 
 import { injectedPlaybackDate } from "./injectedMeta";
 import { getSource } from "./source";
-import { sanitizeOptParams } from "../lenses/console/panels";
+import { sanitizeOptParams, describeDroppedOpts } from "../lenses/console/panels";
 import { FILTER_DIMS, parseFilterSel, type FilterSel } from "./runsFilterQuery";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
@@ -151,8 +151,13 @@ export type Route =
    * entries `sanitizeOptParams` recognized for THIS panel ever land here —
    * see that function's own doc. Always present (never optional) so every
    * consumer (`ConsolePanel`, `hashSync.canonicalHash`) can read it
-   * unconditionally rather than defaulting to `{}` at every call site. */
-  | { kind: "console"; panelId: PanelId | ""; opts: Readonly<Record<string, string>> }
+   * unconditionally rather than defaulting to `{}` at every call site.
+   *
+   * `dropped` — present only when the link carried something this build did
+   * not honor (an unknown panel, an unknown option or value, a machine with
+   * `remote`, a repeated key): one short phrase each, naming what and why, for
+   * the console's one-line note. */
+  | { kind: "console"; panelId: PanelId | ""; opts: Readonly<Record<string, string>>; dropped?: readonly string[] }
   /** `#dispatch=<id>` — the detail view for ONE dispatch: one role's one
    * model execution (`CLAUDE.md` contract 8, the work-unit vocabulary).
    * Named for the `RunKind` it opens, which is that contract's conformance
@@ -384,6 +389,58 @@ function parseRunsRoute(get: (name: string) => string, search: URLSearchParams, 
   return { kind: "runs", runsKind, lab: lab === null ? null : lab.trim(), machine, ...(beyondPin ? { filters } : {}) };
 }
 
+/** What a console deep link carried that was not honored, as short phrases:
+ * a `panel=` that is not a panel, `opt.*` params the panel's table does not
+ * accept, and any `panel`/`opt.*` key repeated within one source (`search` or
+ * `hash`), whose value the parse then resolves to the last one given. */
+function droppedFromConsoleLink(
+  rawPanel: string,
+  panelId: PanelId | "",
+  rawOpts: Readonly<Record<string, string>>,
+  sources: readonly URLSearchParams[],
+): string[] {
+  const out: string[] = [];
+  if (rawPanel && !panelId) out.push(`panel=${rawPanel.slice(0, 40)} (not a panel)`);
+  if (panelId) out.push(...describeDroppedOpts(panelId, rawOpts));
+  for (const src of sources) {
+    const repeated = new Set([...src.keys()].filter((k) => (k === "panel" || k.startsWith("opt.")) && src.getAll(k).length > 1));
+    for (const k of repeated) out.push(`${k.slice(0, 40)} (given more than once)`);
+  }
+  return out;
+}
+
+/** The `lens=console` route: the panel, its `opt.*` selections, and what the
+ * link carried that was not used. */
+function parseConsoleRoute(get: (name: string) => string, search: URLSearchParams, hash: URLSearchParams): Route {
+  const rawPanel = get("panel");
+  const panelId: PanelId | "" = (PANEL_IDS as readonly string[]).includes(rawPanel) ? (rawPanel as PanelId) : "";
+  // (#1911) `opt.<name>` — read from BOTH the hash and the query string,
+  // same dual-source posture `get()` already gives every other param;
+  // hash wins on a name present in both. Validated against `panelId`'s
+  // OWN table (an id this build doesn't recognize has no table to
+  // validate against, so it gets no opts at all — matching "an
+  // unrecognized `panel` parses the same as absent").
+  // (#1920) Hash first, then search fills only what the hash did not
+  // set — so a non-empty SEARCH value wins, matching `get()` above
+  // (`search.get(name) || hash.get(name)`) and therefore every other
+  // NAMED param: `lens`, `panel`, `machine`, `mission`,
+  // `dispatch`. The first draft appended hash last and let it overwrite
+  // unconditionally, so `opt.kind=` and `panel=` on one page obeyed
+  // opposite rules.
+  //
+  // Note this repo does have a deliberate hash-wins case, pinned by
+  // "an in-hash date wins over a co-present ?date= query param" — but
+  // that is the BARE `#<date>` form, a positional hash shape rather
+  // than a named param, so it is a different rule for a different
+  // thing, not a precedent for this one.
+  const rawOpts: Record<string, string> = {};
+  for (const [k, v] of hash.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
+  for (const [k, v] of search.entries()) if (k.startsWith("opt.") && v !== "") rawOpts[k.slice(4)] = v;
+  const opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
+  const dropped = droppedFromConsoleLink(rawPanel, panelId, rawOpts, [search, hash]);
+  return { kind: "console", panelId, opts, ...(dropped.length ? { dropped } : {}) };
+}
+
 /** Parse the CURRENT `location.hash` into a [[Route]]. Pure function of
  * `location.hash` (and, matching the legacy grammar, `location.search` as a
  * fallback source for the same param names) — call it fresh on every
@@ -428,34 +485,7 @@ export function parseRoute(): Route {
     return { kind: "machine", machine: machine ? machine : null };
   }
 
-  if (lens === "console") {
-    const rawPanel = get("panel");
-    const panelId: PanelId | "" = (PANEL_IDS as readonly string[]).includes(rawPanel) ? (rawPanel as PanelId) : "";
-    // (#1911) `opt.<name>` — read from BOTH the hash and the query string,
-    // same dual-source posture `get()` already gives every other param;
-    // hash wins on a name present in both. Validated against `panelId`'s
-    // OWN table (an id this build doesn't recognize has no table to
-    // validate against, so it gets no opts at all — matching "an
-    // unrecognized `panel` parses the same as absent").
-    // (#1920) Hash first, then search fills only what the hash did not
-    // set — so a non-empty SEARCH value wins, matching `get()` above
-    // (`search.get(name) || hash.get(name)`) and therefore every other
-    // NAMED param: `lens`, `panel`, `machine`, `mission`,
-    // `dispatch`. The first draft appended hash last and let it overwrite
-    // unconditionally, so `opt.kind=` and `panel=` on one page obeyed
-    // opposite rules.
-    //
-    // Note this repo does have a deliberate hash-wins case, pinned by
-    // "an in-hash date wins over a co-present ?date= query param" — but
-    // that is the BARE `#<date>` form, a positional hash shape rather
-    // than a named param, so it is a different rule for a different
-    // thing, not a precedent for this one.
-    const rawOpts: Record<string, string> = {};
-    for (const [k, v] of hash.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
-    for (const [k, v] of search.entries()) if (k.startsWith("opt.") && v !== "") rawOpts[k.slice(4)] = v;
-    const opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
-    return { kind: "console", panelId, opts };
-  }
+  if (lens === "console") return parseConsoleRoute(get, search, hash);
 
   const mission = get("mission");
   if (mission) {

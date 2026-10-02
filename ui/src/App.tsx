@@ -1056,7 +1056,7 @@ function renderRoute(
       // table by `parseRoute` (or forced by `PANEL_ALIASES`) — seeds the
       // console's per-pill selection memory so a shared link reproduces
       // panel AND variant.
-      return <ConsolePanel initialPanelId={route.panelId} initialOpts={route.opts} />;
+      return <ConsolePanel initialPanelId={route.panelId} initialOpts={route.opts} droppedNote={route.dropped} />;
     case "dispatch":
       // Packet 4: a real fetch to /flow-dispatch/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported

@@ -126,6 +126,11 @@ const PROFILE_LIST_REMOTE_OPT: PanelOpt = {
  * `ROSTER_MACHINE_FLAG`, pinned by `panels.test.ts`. */
 const ROSTER_MACHINE_FLAG = "--machine";
 
+/** Ends option parsing before a positional roster id (`machine status -- <id>`),
+ * so no roster id can read as a flag: the twin of `panel.rs`'s
+ * `POSITIONAL_SEPARATOR`. */
+const POSITIONAL_SEPARATOR = "--";
+
 /** The roster opt's default value: this machine's own list, no flag. A
  * label rather than a name, so it cannot be mistaken for a roster id. */
 export const LOCAL_MACHINE = "(this machine)";
@@ -186,7 +191,7 @@ function isMachineNameShape(v: string): boolean {
  * `with_roster_choice`. */
 function rosterArgv(id: PanelId, machine: string): string[] {
   const flag = PANEL_OPTS[id].rosterFlag;
-  return flag === undefined ? [machine] : [flag, machine];
+  return flag === undefined ? [POSITIONAL_SEPARATOR, machine] : [flag, machine];
 }
 
 /** The roster opt as a [[PanelOpt]] for the menu: this machine first (the
@@ -303,6 +308,36 @@ export function sanitizeOptParams(id: PanelId, raw: Readonly<Record<string, stri
     delete out.remote;
   }
   return out;
+}
+
+/** One short phrase per piece of a deep link's `opt.*` params that
+ * [[sanitizeOptParams]] would drop, naming what and why; empty when nothing is
+ * dropped. `raw` is the link's params with the `opt.` prefix stripped. */
+export function describeDroppedOpts(id: PanelId, raw: Readonly<Record<string, string>>): string[] {
+  const out: string[] = [];
+  const kept = sanitizeOptParams(id, raw);
+  const rosterName = rosterOptName(id);
+  const known = new Map(panelOptGroups(id).map((o) => [o.name, o] as const));
+  for (const [name, value] of Object.entries(raw)) {
+    const opt = known.get(name);
+    if (name === rosterName) {
+      if (!isMachineNameShape(value)) out.push(`opt.${name}=${clip(value)} (not a machine name)`);
+    } else if (opt === undefined) {
+      out.push(`opt.${name} (${id} has no such option)`);
+    } else if (!opt.values.some((v) => v.value === value)) {
+      out.push(`opt.${name}=${clip(value)} (not one of ${opt.values.map((v) => v.value).join(", ")})`);
+    }
+  }
+  if (rosterName !== null && raw.remote !== undefined && kept.remote === undefined && kept[rosterName] !== undefined && raw.remote !== "off") {
+    out.push(`opt.remote=${clip(raw.remote)} (cannot be combined with opt.${rosterName}; kept the machine)`);
+  }
+  return out;
+}
+
+/** A link value, shortened so a hostile or accidental megabyte hash cannot
+ * fill the note. */
+function clip(v: string): string {
+  return v.length > 40 ? `${v.slice(0, 40)}…` : v;
 }
 
 /** The canonical cache-key string — the client twin of `panel.rs`'s

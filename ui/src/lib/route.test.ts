@@ -86,7 +86,30 @@ describe("parseRoute", () => {
 
   it("falls back to the default panel for an unrecognized panel id (matching legacy consoleQuery, not a blank page)", () => {
     setHash("#lens=console&panel=rm-rf-everything");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {}, dropped: ["panel=rm-rf-everything (not a panel)"] });
+  });
+
+  // ── what a console link carried that was not used ──────────────────
+  it("names a machine and remote together, keeping the machine", () => {
+    setHash("#lens=console&panel=profile-list&opt.machine=studio&opt.remote=on");
+    expect(parseRoute()).toEqual({
+      kind: "console",
+      panelId: "profile-list",
+      opts: { machine: "studio" },
+      dropped: ["opt.remote=on (cannot be combined with opt.machine; kept the machine)"],
+    });
+  });
+
+  it("names a repeated key rather than silently taking one of the two", () => {
+    setHash("#lens=console&panel=run-list&opt.kind=lab&opt.kind=mission");
+    const r = parseRoute();
+    expect(r).toMatchObject({ kind: "console", opts: { kind: "mission" } });
+    expect((r as { dropped?: string[] }).dropped).toEqual(["opt.kind (given more than once)"]);
+  });
+
+  it("a clean link carries no dropped field at all", () => {
+    setHash("#lens=console&panel=run-list&opt.kind=lab");
+    expect("dropped" in parseRoute()).toBe(false);
   });
 
   // ── #1911: opts on the console route ──────────────────────────────
@@ -103,30 +126,35 @@ describe("parseRoute", () => {
 
   it("an unknown opt VALUE for a known name drops silently — never a blank page, never a passthrough", () => {
     setHash("#lens=console&panel=run-list&opt.kind=bogus");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
+    expect(parseRoute()).toEqual({
+      kind: "console",
+      panelId: "run-list",
+      opts: {},
+      dropped: ["opt.kind=bogus (not one of all, mission, dispatch, lab)"],
+    });
   });
 
   it("an unknown opt NAME for the panel drops silently", () => {
     setHash("#lens=console&panel=run-list&opt.machine=studio");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {}, dropped: ["opt.machine (run-list has no such option)"] });
   });
 
   it("an opt legal on a DIFFERENT panel is irrelevant here and drops", () => {
     // `kind` is a real opt name — just not one `mission-status` declares.
     setHash("#lens=console&panel=mission-status&opt.kind=lab");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: {} });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: {}, dropped: ["opt.kind (mission-status has no such option)"] });
   });
 
   it("a panel with no declared opts ignores any opt.* param entirely", () => {
     setHash("#lens=console&panel=doctor&opt.all=all");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "doctor", opts: {} });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "doctor", opts: {}, dropped: ["opt.all (doctor has no such option)"] });
   });
 
   // ── #1911: the mission-status-all alias is retired ────────────────
 
   it("panel=mission-status-all is no panel: the console shows its activity view, never mission-status", () => {
     setHash("#lens=console&panel=mission-status-all");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {}, dropped: ["panel=mission-status-all (not a panel)"] });
   });
 
   it("the unlimited board is mission-status with opt.all=all", () => {

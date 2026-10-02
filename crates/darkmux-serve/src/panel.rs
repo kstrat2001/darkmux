@@ -46,19 +46,21 @@
 //! The struct shape IS the legality proof (see [`PanelOpt`]/
 //! [`PanelOptValue`]): there is no field that could hold a placeholder, a
 //! format string, or a client-echoed value, so a machine id cannot be
-//! written down in a table at all (the one exception is the roster-valued opt
-//! below). Only a `(name, value)` LOOKUP KEY crosses the wire;
+//! written down in a table at all (the exception is the roster-valued opt
+//! below, one on `profile-list` and one on `machine-status`). Only a `(name, value)` LOOKUP KEY crosses the wire;
 //! the server owns every literal argv fragment it could ever resolve to.
 //! This is the SAME trust mechanism the panel id itself already used, one
 //! level down. An unknown name or an unknown value for a known name is a
 //! 400 naming the legal set — never a pass-through, never silently ignored
 //! (see [`resolve_opts`]).
 //!
-//! ### The one roster-valued opt (`profile-list`'s `machine`)
+//! ### The roster-valued opt (`profile-list` and `machine-status`)
 //!
-//! `profile-list` also declares [`PanelSpec::roster_opt`]: `opt.machine=<name>`
-//! drives `--machine <name>`. This is the single exception to "no client string
-//! reaches argv", and it is still a closed set: the legal values are the names
+//! `profile-list` and `machine-status` declare [`PanelSpec::roster_opt`]:
+//! `opt.machine=<name>` drives `--machine <name>` on the first and the
+//! positional id (after a `--`, so no id can read as a flag) on the second.
+//! This is the exception to "no client string reaches argv", and it is still
+//! a closed set: the legal values are the names
 //! the fleet view lists (`FleetView::selector_names`: every roster id and this
 //! machine's own name, the set the CLI's `--machine` accepts), and the value is
 //! accepted only by exact (case-insensitive) membership. The argv gets the
@@ -69,6 +71,22 @@
 //!
 //! There is no `mission-status-all`: the unlimited board is `mission-status`
 //! with `opt.all=all`, and a request for the old id is an unknown panel (404).
+//!
+//! ## What a remote caller is shown
+//!
+//! A panel's output can name this machine's paths and its roster peers'
+//! addresses (a resolver error, a registry path, an environment warning). So
+//! every response to a caller that is neither this machine nor a token holder
+//! passes ONE filter, [`redact_for_remote`], whatever the panel: `stderr_tail`
+//! is replaced by a short note, every roster address (and its host part) in
+//! stdout reads "(address hidden)", and the daemon user's home prefix reads
+//! `~` (a `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`). Matches are whole
+//! tokens only (stdout is split into escape sequences and text runs first, each
+//! run is redacted on its own, and an OSC 8 link to a hidden target loses its
+//! target), and a machine id or name is never hidden, only the address
+//! behind it. The address set is read from the roster and the directories from
+//! the environment when the request is served; nothing is listed by hand. Local
+//! callers and token holders see the output unchanged.
 //!
 //! ## Response shape
 //!
@@ -132,12 +150,37 @@ use crate::{current_millis, AppState};
 /// bound a polling client, not to make data old.
 pub(crate) const PANEL_CACHE_TTL: Duration = Duration::from_millis(3_000);
 
-/// Hard wall-clock bound on one panel spawn. These are fast read-only CLI
-/// verbs (disk + local probes); anything hitting this bound is wedged, and a
-/// wedged child must never wedge the daemon route (#1570/#1573's class —
-/// the same week this module was written, the crate sweep found two more
-/// instances of unbounded external calls; this one is born bounded).
+/// TTL for the panels that read the fleet stream (`run-list`,
+/// `mission-status`). Their cold spawn measures about 5s (the fleet read plus,
+/// before the link base went root-relative, a `tailscale` probe), so a 3s TTL
+/// expired before one spawn finished and every poll spawned again. The TTL is
+/// kept above one cold spawn instead of serving stale while refreshing: one
+/// rule, no second code path, and the body's `age_ms` still says how old it is.
+pub(crate) const FLEET_PANEL_CACHE_TTL: Duration = Duration::from_millis(8_000);
+
+/// Wall-clock bound on one panel spawn, for the fast read-only verbs (disk +
+/// local probes). Hitting it means the verb was slow, and a slow child must
+/// never wedge the daemon route (#1570/#1573's class: this is born bounded).
+/// The bound is per panel ([`PanelSpec::spawn_timeout`]): `doctor` probes
+/// every peer and needs more.
 const PANEL_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `doctor`'s spawn bound. Measured on this machine (release build, 2026-10-02):
+/// 5.6s with no peers, 7.1s with three black-holed peers in the roster. The
+/// bound is over three times the slower figure so a run that is merely slow
+/// finishes instead of timing out into a 504. It is kept BELOW
+/// [`MANUAL_MIN_INTERVAL`] on purpose: at or above it the floor would already
+/// be open when the timeout fires and [`release_manual_run`] would do nothing
+/// (pinned by `doctor_times_out_inside_the_manual_floor`).
+const DOCTOR_SPAWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Stderr lines kept in `stderr_tail` (see [`stderr_tail`]).
+const STDERR_TAIL_LINES: usize = 8;
+
+/// Hard cap on the stdout a panel returns. A verb printing more is cut at a
+/// line boundary and the response says so in its own text; the cap keeps one
+/// runaway verb from becoming a multi-megabyte JSON body per poll.
+const PANEL_STDOUT_CAP_BYTES: usize = 512 * 1024;
 
 /// Required on every `/panel/*` request. Its ONLY job is to be a
 /// non-simple header, which forces the browser to send a CORS **preflight**
@@ -191,7 +234,7 @@ pub(crate) struct PanelOptValue {
 /// `run-list` (#1911). The struct shape IS the legality proof: it has no
 /// field that could hold a placeholder, a format string, or a
 /// client-echoed value, so a machine id cannot be written down here at
-/// all (the one roster-valued opt is [`PanelSpec::roster_opt`], validated
+/// all (the roster-valued opts are [`PanelSpec::roster_opt`], validated
 /// against the roster, not a table). A client transmits a `(name, value)` pair used ONLY as a lookup key
 /// into this table; the argv tokens appended are the table's OWN literals.
 pub(crate) struct PanelOpt {
@@ -257,11 +300,17 @@ const RUN_LIST_OPTS: &[PanelOpt] = &[RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_
 
 /// Who may run a panel. Every panel's output is a read of this machine, so
 /// `Read` panels follow the daemon's read posture (`serve.read_auth`). A
+/// `Read` panel's output still passes [`redact_for_remote`] for a caller that
+/// is not this machine or a token holder: its `stderr_tail` is withheld, its
+/// roster addresses read "(address hidden)" and the daemon user's home reads
+/// `~`; the panels below that need more than that are `LocalOrToken`. A
 /// panel whose output DESCRIBES THE EXECUTION SURFACE (the fleet listener's
 /// overlay address, port, busy policy, and the allow-list's node names and
-/// roles) is a map for the caller with the token, so `/health` withholds
-/// the same facts from a non-local caller; those panels hold the same line
-/// even with read auth off.
+/// roles) or NAMES THIS MACHINE'S OWN NETWORK AND PATHS (the flow sinks'
+/// directories, hook target URLs, the Redis URL, a tailnet hostname) is a
+/// map for the caller with the token, so `/health` withholds the same facts
+/// from a non-local caller; those panels hold the same line even with read
+/// auth off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PanelAudience {
     /// Served under the read posture: open with read auth off, local or
@@ -286,8 +335,8 @@ fn admit_audience(
         PanelAudience::LocalOrToken => Err((
             StatusCode::UNAUTHORIZED,
             format!(
-                "panel \"{}\" describes this machine's fleet execution surface; it is served to this machine \
-                 or a caller presenting the serve token (Authorization: Bearer <token>)\n",
+                "panel \"{}\" describes this machine's own paths, endpoints or fleet execution surface; it is \
+                 served to this machine or a caller presenting the serve token (Authorization: Bearer <token>)\n",
                 spec.id
             ),
         )),
@@ -308,6 +357,8 @@ pub(crate) struct PanelSpec {
     pub(crate) argv: &'static [&'static str],
     pub(crate) auto_refresh: bool,
     pub(crate) cache_ttl: Duration,
+    /// Wall-clock bound on this panel's spawn; see [`PANEL_SPAWN_TIMEOUT`].
+    pub(crate) spawn_timeout: Duration,
     /// Declared option space (#1911) — empty for verbs with no legal
     /// variants. See the module doc, "Opts: a declared option space, not
     /// an open one".
@@ -332,7 +383,7 @@ pub(crate) struct PanelSpec {
 
 /// A panel's roster-valued opt: the query name, and how the chosen machine
 /// reaches argv. `profile list` takes it as a flag; `machine status` takes it
-/// as its positional id.
+/// as its positional id (after `--`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RosterOpt {
     pub(crate) name: &'static str,
@@ -356,10 +407,12 @@ const PROFILE_LIST_OPTS: &[PanelOpt] = &[PROFILE_LIST_REMOTE_OPT];
 /// The roster-valued opt's query name, shared by every panel that has one.
 const ROSTER_MACHINE_OPT: &str = "machine";
 const ROSTER_MACHINE_FLAG: &str = "--machine";
+/// Ends option parsing before a positional roster id.
+const POSITIONAL_SEPARATOR: &str = "--";
 
 /// `profile list --machine <name>`.
 const ROSTER_AS_FLAG: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: Some(ROSTER_MACHINE_FLAG) };
-/// `machine status <name>`.
+/// `machine status -- <name>`.
 const ROSTER_AS_POSITIONAL: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: None };
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
@@ -399,7 +452,7 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     ) = match id {
         // Read: mission and run state, the same facts `/runs` serves.
         "mission-status" => {
-            ("mission-status", &["mission", "status"], true, PANEL_CACHE_TTL, MISSION_STATUS_OPTS, Read)
+            ("mission-status", &["mission", "status"], true, FLEET_PANEL_CACHE_TTL, MISSION_STATUS_OPTS, Read)
         }
         // Read: the role manifests the crew loads; no machine or fleet state.
         "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[], Read),
@@ -415,16 +468,17 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         // listener's port and enablement and the `fleet.accept_work`
         // allow-list (node names, roles, profiles, images).
         "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[], LocalOrToken),
-        // Read: the flow sinks' state, which `/health` and the flow routes
-        // already show; no listener or allow-list state.
-        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[], Read),
+        // LocalOrToken: prints the flows and outbox directories, each hook's
+        // target URL and the Redis URL (an overlay address). `/health` and the
+        // flow routes show counts, not these.
+        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[], LocalOrToken),
         // Read: registered lab fixtures; no machine or fleet state.
         "lab-fixture-list" => {
             ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[], Read)
         }
         // (#1911) The CLI twin of the RUNS lens's union — see
         // `src/run_list.rs`'s own module doc. Read: the same rows as `/runs`.
-        "run-list" => ("run-list", &["run", "list"], true, PANEL_CACHE_TTL, RUN_LIST_OPTS, Read),
+        "run-list" => ("run-list", &["run", "list"], true, FLEET_PANEL_CACHE_TTL, RUN_LIST_OPTS, Read),
         // Read: the profiles THIS machine's own grants let it use (its own
         // registry, or a roster peer's card), the same facts `machine list`
         // prints; it reveals only this machine's own allow-list entry on
@@ -456,7 +510,17 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         "machine-status" => Some(ROSTER_AS_POSITIONAL),
         _ => None,
     };
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience, roster_opt })
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, spawn_timeout: spawn_timeout_for(id), opts, needs_fleet_snapshot, audience, roster_opt })
+}
+
+/// The spawn bound for panel `id`: `doctor` probes every peer and gets the long
+/// one, every other verb is a fast local read.
+fn spawn_timeout_for(id: &str) -> Duration {
+    if id == "doctor" {
+        DOCTOR_SPAWN_TIMEOUT
+    } else {
+        PANEL_SPAWN_TIMEOUT
+    }
 }
 
 /// One resolved `(name, value)` opt selection, in [`PanelSpec::opts`]'
@@ -581,6 +645,15 @@ fn resolve_roster_opt(
             if roster_ids.is_empty() { "(the roster is empty)".to_string() } else { roster_ids.join(", ") }
         ));
     };
+    // (5.0 console review) A roster id reaches argv, so it must be a machine
+    // name even when the roster holds an older, looser spelling (a hand-edited
+    // `--all`): the one rule `machine add` enforces, applied again here.
+    if let Some(problem) = darkmux_types::profile_address::machine_name_problem(id) {
+        return Err(format!(
+            "roster id {id:?} is not a legal machine name and is not offered on panel \"{}\": {problem}\n",
+            spec.id
+        ));
+    }
     if remote_on {
         return Err(format!(
             "options \"{name}\" and \"remote\" cannot be combined on panel \"{}\": pick one machine or every peer\n",
@@ -602,11 +675,49 @@ fn with_roster_choice(
 ) -> (Vec<String>, String, std::collections::BTreeMap<String, String>) {
     let mut argv: Vec<String> = argv.into_iter().map(String::from).collect();
     let (Some(id), Some(roster)) = (machine, spec.roster_opt) else { return (argv, key, echo) };
-    argv.extend(roster.flag.map(str::to_string));
+    match roster.flag {
+        Some(flag) => argv.push(flag.to_string()),
+        // A positional id follows `--`, so nothing in the roster can be read
+        // as a flag (5.0 console review).
+        None => argv.push(POSITIONAL_SEPARATOR.to_string()),
+    }
     argv.push(id.to_string());
     let joiner = if key.contains('?') { '&' } else { '?' };
     echo.insert(ROSTER_MACHINE_OPT.to_string(), id.to_string());
     (argv, format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"), echo)
+}
+
+/// The first key that appears twice in a raw query string, percent-decoded
+/// (`opt%2Ekind` and `opt.kind` are the same key), or `None`.
+fn duplicate_query_key(raw: &str) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split('&').filter(|pair| !pair.is_empty()).map(|pair| decode_query_component(pair.split('=').next().unwrap_or(""))).find(|key| !seen.insert(key.clone()))
+}
+
+/// `application/x-www-form-urlencoded` decoding of one component: `+` is a
+/// space and `%XX` is a byte; a malformed escape stays literal. Lossy UTF-8,
+/// which is enough for comparing keys.
+fn decode_query_component(raw: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = match (bytes[i], bytes.get(i + 1).and_then(|b| hex(*b)), bytes.get(i + 2).and_then(|b| hex(*b))) {
+            (b'%', Some(hi), Some(lo)) => Some(hi * 16 + lo),
+            _ => None,
+        };
+        match (bytes[i], escaped) {
+            (_, Some(byte)) => {
+                out.push(byte);
+                i += 2;
+            }
+            (b'+', None) => out.push(b' '),
+            (b, None) => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The `cols` param, lenient on read (#1911) — see the call site's comment
@@ -676,6 +787,10 @@ type FlightLock = Arc<tokio::sync::Mutex<()>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct PanelState {
+    /// Test-only: run this program instead of the daemon's own binary, so a
+    /// test can drive the real spawn path with a child whose output it knows.
+    #[cfg(test)]
+    child_exe: Option<std::path::PathBuf>,
     cache: Arc<tokio::sync::Mutex<HashMap<String, CacheEntry>>>,
     flights: Arc<tokio::sync::Mutex<HashMap<String, FlightLock>>>,
     /// Last ADMITTED run of each MANUAL-ONLY panel — the floor's clock.
@@ -723,6 +838,11 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// `MANUAL_MIN_INTERVAL` by construction, not by convention. `doctor`
 /// declares no options today, so no live manual panel exercises the
 /// distinction yet — the signature itself is the guarantee.
+/// One admitted manual run's claim on the floor: the timestamps stored in
+/// [`PanelState::last_manual`]. A timed-out run hands it back to
+/// [`release_manual_run`], which gives back only a claim that is still its own.
+type ManualClaim = (SystemTime, Instant);
+
 /// Admit one manual run, or refuse it — checking the floor and claiming it
 /// in ONE lock acquisition (#1919).
 ///
@@ -744,12 +864,13 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 ///   ~2.2s and touches the Keychain, and the alternative — releasing on
 ///   the error arms — is a real option if that proves annoying.
 /// - Completion-to-completion spacing is therefore as low as
-///   `MANUAL_MIN_INTERVAL` minus `PANEL_SPAWN_TIMEOUT` (20s worst case)
-///   rather than a flat 30s. Still far above doctor's own cost.
+///   `MANUAL_MIN_INTERVAL` minus the panel's spawn bound rather than a flat
+///   30s. A spawn that TIMES OUT gives the window back
+///   ([`release_manual_run`]): it produced nothing to wait out.
 ///
 /// There is no `.await` between the read and the insert, so a racer
 /// either observes the timestamp or genuinely arrived after the window.
-async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<(), (StatusCode, String)> {
+async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<ManualClaim, (StatusCode, String)> {
     admit_manual_run_at(panels, id, SystemTime::now()).await
 }
 
@@ -782,7 +903,7 @@ async fn admit_manual_run_at(
     panels: &PanelState,
     id: &'static str,
     now: SystemTime,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<ManualClaim, (StatusCode, String)> {
     // (#2479 audit CONSIDER 6) The monotonic companion anchor is always
     // the REAL clock, never injected — see [`manual_floor_wait`]'s doc for
     // why only the wall-clock side needs to be test-injectable. A fresh
@@ -810,8 +931,9 @@ async fn admit_manual_run_at(
         }
     }
     // Claim the window under the SAME guard that just cleared it.
-    last.insert(id, (now, now_instant));
-    Ok(())
+    let claim = (now, now_instant);
+    last.insert(id, claim);
+    Ok(claim)
 }
 
 /// Pure floor math for [`admit_manual_run`] (#2479): given the wall-clock
@@ -931,21 +1053,299 @@ async fn resolve_selection(
     Ok(with_roster_choice(spec, compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
 }
 
+/// What a caller that is neither this machine nor a token holder is shown
+/// instead of the daemon's diagnostics (see [`redact_for_remote`]).
+const REMOTE_DIAGNOSTICS_NOTE: &str = "diagnostics are shown on this machine only";
+/// Stands in for a roster address in a remote caller's output.
+const ADDRESS_HIDDEN: &str = "(address hidden)";
+
+/// What a non-local caller must not read in a panel's output, derived from
+/// the daemon's own state when the request is served: every roster ADDRESS
+/// (and its host part) that is not itself a public machine name, and the
+/// daemon user's home and `DARKMUX_HOME` directories. Machine ids and names are
+/// public (a 400 for a bad opt lists them): only the address behind one is
+/// private.
+struct Redaction {
+    /// Longest first, so an address is replaced whole before its host part.
+    addresses: Vec<String>,
+    /// Directory prefixes and what each reads as, longest first.
+    dirs: Vec<(String, &'static str)>,
+}
+
+impl Redaction {
+    /// The roster is read from disk and the directories from the environment
+    /// per call; there is no list to maintain. An unreadable roster hides
+    /// nothing it cannot name, and the caller still gets no `stderr_tail`.
+    fn derive() -> Self {
+        let roster = darkmux_fleet::load_roster().ok();
+        let machines: Vec<(&str, &str)> =
+            roster.iter().flat_map(|r| r.machines.values().map(|m| (m.id.as_str(), m.address.as_str()))).collect();
+        let mut public: Vec<String> = Vec::new();
+        for m in roster.iter().flat_map(|r| r.machines.values()) {
+            public.extend(m.current_name.clone());
+        }
+        public.extend(darkmux_flow::resolve_machine_id());
+        let home = std::env::var("HOME").ok();
+        let darkmux_home = std::env::var("DARKMUX_HOME").ok();
+        Self::from_parts(&machines, &public, home, darkmux_home)
+    }
+
+    /// `machines` is `(id, address)`; `public` are further machine names.
+    fn from_parts(
+        machines: &[(&str, &str)],
+        public: &[String],
+        home: Option<String>,
+        darkmux_home: Option<String>,
+    ) -> Self {
+        let is_public = |s: &str| {
+            machines.iter().any(|(id, _)| id.eq_ignore_ascii_case(s)) || public.iter().any(|p| p.eq_ignore_ascii_case(s))
+        };
+        let mut all: Vec<String> = Vec::new();
+        for addr in machines.iter().map(|(_, a)| a.trim()).filter(|a| !a.is_empty()) {
+            if !is_public(addr) {
+                all.push(addr.to_string());
+            }
+            if let Some(host) = address_host(addr).filter(|h| !is_public(h)) {
+                all.push(host.to_string());
+            }
+        }
+        all.sort_by_key(|a| std::cmp::Reverse(a.len()));
+        all.dedup();
+        // A directory as given and as the filesystem resolves it (`/tmp` is
+        // `/private/tmp` on macOS): a verb may print either.
+        let forms = |d: Option<String>| -> Vec<String> {
+            let given = d.map(|d| d.trim_end_matches('/').to_string()).filter(|d| d.len() > 1);
+            let canon = given
+                .as_deref()
+                .and_then(|g| std::fs::canonicalize(g).ok())
+                .map(|c| c.to_string_lossy().trim_end_matches('/').to_string())
+                .filter(|c| c.len() > 1);
+            let mut all: Vec<String> = given.into_iter().chain(canon).collect();
+            all.dedup();
+            all
+        };
+        let homes = forms(home);
+        let mut dirs: Vec<(String, &'static str)> = homes.iter().cloned().map(|h| (h, "~")).collect();
+        // A DARKMUX_HOME inside HOME (at a path boundary: `/Users/kainx/dm` is
+        // not inside `/Users/kain`) is covered by the HOME rewrite.
+        for dh in forms(darkmux_home) {
+            let inside = homes.iter().any(|h| dh == *h || dh.starts_with(&format!("{h}/")));
+            if !inside {
+                dirs.push((dh, "$DARKMUX_HOME"));
+            }
+        }
+        dirs.sort_by_key(|(d, _)| std::cmp::Reverse(d.len()));
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|(d, _)| seen.insert(d.clone()));
+        Self { addresses: all, dirs }
+    }
+}
+
+/// The host of a roster address (`name:8765`, `[::1]:8765`, a bare IP or name).
+fn address_host(addr: &str) -> Option<&str> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => Some(host),
+        _ => None,
+    }
+}
+
+/// A character that continues a host name or a path component: a match
+/// touching one is part of a longer word (`mac` in `macos`, `studio` in
+/// `lmstudio-community`, `/Users/kain` in `/Users/kainx`), never the needle.
+fn word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Whether the text beginning with `rest` continues a word: a word character,
+/// or a `.` that is followed by one (`.net` in `host.net`). A `.` that ends the
+/// text or is followed by anything else is punctuation, a boundary.
+fn continues_forward(rest: &str) -> bool {
+    let mut it = rest.chars();
+    match it.next() {
+        Some('.') => it.next().is_some_and(word_char),
+        Some(c) => word_char(c),
+        None => false,
+    }
+}
+
+/// The mirror of [`continues_forward`] for the text ending with `before`.
+fn continues_backward(before: &str) -> bool {
+    let mut it = before.chars().rev();
+    match it.next() {
+        Some('.') => it.next().is_some_and(word_char),
+        Some(c) => word_char(c),
+        None => false,
+    }
+}
+
+/// Replace each ASCII-case-insensitive occurrence of `needle` in `text` that
+/// is a whole token: neither side may continue a word.
+fn replace_token(text: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return text.to_string();
+    }
+    let (hay, pat) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(&pat) {
+        let (start, end) = (from + rel, from + rel + pat.len());
+        if !continues_backward(&text[..start]) && !continues_forward(&text[end..]) {
+            out.push_str(&text[last..start]);
+            out.push_str(with);
+            last = end;
+        }
+        from = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Redact one run of plain text: roster addresses, then the directories.
+fn redact_text(text: &str, r: &Redaction) -> String {
+    let mut out = text.to_string();
+    for addr in &r.addresses {
+        out = replace_token(&out, addr, ADDRESS_HIDDEN);
+    }
+    for (dir, reads_as) in &r.dirs {
+        out = replace_token(&out, dir, reads_as);
+    }
+    out
+}
+
+/// How many bytes of `rest` (which starts with an ESC or a C1 CSI, U+009B)
+/// the escape at its start covers, and what of it is sent on. Only two forms
+/// survive for a remote caller: SGR (`CSI digits;colons m`, rebuilt from its
+/// parameters) and OSC 8 hyperlinks (rebuilt with no parameters, an ST
+/// terminator and the target only when it names nothing private). Every other
+/// escape is dropped whole; one that is malformed or unterminated loses only
+/// its introducer, so what follows is ordinary text and gets redacted as such
+/// (`\x1b[/Users/kain` must not be eaten as the sequence `\x1b[/U`).
+fn classify_escape(rest: &str, r: &Redaction) -> (usize, String) {
+    let bytes = rest.as_bytes();
+    if rest.starts_with('\u{9b}') {
+        return csi(rest, 2);
+    }
+    match bytes.get(1) {
+        Some(b'[') => csi(rest, 2),
+        Some(b']') => osc(rest, r),
+        // A charset designation (`ESC ( B`) is three bytes.
+        Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => (3, String::new()),
+        _ => (1, String::new()),
+    }
+}
+
+/// A CSI whose introducer is `intro` bytes long: kept only as SGR.
+fn csi(rest: &str, intro: usize) -> (usize, String) {
+    let body = &rest.as_bytes()[intro..];
+    let params = body.iter().take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':').count();
+    match body.get(params) {
+        Some(b'm') => (intro + params + 1, format!("\x1b[{}m", &rest[intro..intro + params])),
+        Some(b) if (0x40..=0x7e).contains(b) => (intro + params + 1, String::new()),
+        _ => (intro, String::new()),
+    }
+}
+
+/// An OSC: kept only as an OSC 8 hyperlink, rebuilt without its parameters.
+fn osc(rest: &str, r: &Redaction) -> (usize, String) {
+    let body = &rest[2..];
+    let bel = body.find('\x07').map(|p| (p, 1));
+    let st = body.find("\x1b\\").map(|p| (p, 2));
+    let Some((end, term_len)) = [bel, st].into_iter().flatten().min_by_key(|(p, _)| *p) else {
+        return (2, String::new());
+    };
+    let consumed = 2 + end + term_len;
+    let Some((_params, target)) = body[..end].strip_prefix("8;").and_then(|l| l.split_once(';')) else {
+        return (consumed, String::new());
+    };
+    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target;
+    (consumed, format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }))
+}
+
+/// A panel's stdout for a remote caller. The text is split into escape
+/// sequences and plain runs FIRST, and each run is redacted on its own, so an
+/// escape boundary is always a token boundary: panel children are forced to
+/// color, and `\x1b[2m/Users/kain` must read as a path, not as a path glued to
+/// the `m` that ends the escape. See [`classify_escape`] for which escapes
+/// survive.
+fn redact_stdout(text: &str, r: &Redaction) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run_start = 0;
+    let mut i = 0;
+    while i < text.len() {
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        if ch != '\x1b' && ch != '\u{9b}' {
+            i += ch.len_utf8();
+            continue;
+        }
+        out.push_str(&redact_text(&text[run_start..i], r));
+        let (consumed, kept) = classify_escape(&text[i..], r);
+        out.push_str(&kept);
+        i += consumed;
+        run_start = i;
+    }
+    out.push_str(&redact_text(&text[run_start..], r));
+    out
+}
+
+/// The ONE output filter for a caller that is not this machine or a token
+/// holder, applied to every panel's response whatever the panel: `stderr_tail`
+/// is withheld (it carries the daemon's environment warnings and resolver
+/// errors), roster addresses in stdout read "(address hidden)", and the daemon
+/// user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
+/// `$DARKMUX_HOME`). Matches are whole tokens only, and a machine id or name is
+/// never hidden. The sets come from [`Redaction::derive`].
+fn redact_for_remote(body: &mut PanelResponse, r: &Redaction) {
+    if !body.stderr_tail.is_empty() {
+        body.stderr_tail = REMOTE_DIAGNOSTICS_NOTE.to_string();
+    }
+    body.ansi_text = redact_stdout(&body.ansi_text, r);
+}
+
 pub(crate) async fn panel_handler(
     Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    raw_query: axum::extract::RawQuery,
+    params: Query<HashMap<String, String>>,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
 ) -> Result<axum::Json<PanelResponse>, (StatusCode, String)> {
-    let spec = admit_panel_request(&id, peer.map(|c| c.0), &headers)?;
+    let peer = peer.map(|c| c.0);
+    let full_view = crate::caller_is_local_or_holds_token(peer, &headers);
+    let mut body = run_panel(&id, raw_query.0, params.0, peer, &headers, &state).await?;
+    if !full_view {
+        redact_for_remote(&mut body, &Redaction::derive());
+    }
+    Ok(axum::Json(body))
+}
+
+async fn run_panel(
+    id: &str,
+    raw_query: Option<String>,
+    params: HashMap<String, String>,
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<PanelResponse, (StatusCode, String)> {
+    let spec = admit_panel_request(id, peer, headers)?;
+    // A repeated query key is ambiguous (the map below would keep one of the
+    // two), so it is refused rather than resolved last-wins.
+    if let Some(key) = raw_query.as_deref().and_then(duplicate_query_key) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("query key \"{key}\" appears more than once on panel \"{}\": send each key once\n", spec.id),
+        ));
+    }
     // Canonical &'static id straight off the spec — one table, no second
     // lookup that could drift out from under it.
     let id: &'static str = spec.id;
 
     // `opt.<name>` query params. An unknown name or value is a 400, never
     // silently ignored.
-    let (final_argv, key, opts_echo) = resolve_selection(&state, &spec, &params).await?;
+    let (final_argv, key, opts_echo) = resolve_selection(state, &spec, &params).await?;
 
     // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
     // `u16`) resolves to the default width rather than failing the whole
@@ -961,13 +1361,11 @@ pub(crate) async fn panel_handler(
     // Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
     // — see `admit_manual_run`'s own doc for why that must never be the
     // variant key.
-    if !spec.auto_refresh {
-        admit_manual_run(&state.panels, id).await?;
-    }
+    let claim = if spec.auto_refresh { None } else { Some(admit_manual_run(&state.panels, id).await?) };
 
     // Serve fresh-enough cache without spawning.
     if let Some(body) = cached_if_fresh(&state.panels, &key, spec.cache_ttl).await {
-        return Ok(axum::Json(body));
+        return Ok(body);
     }
 
     // Single-flight: collapse concurrent misses for the same VARIANT into
@@ -980,7 +1378,7 @@ pub(crate) async fn panel_handler(
     // Re-check under the flight lock — a concurrent request may have filled
     // the cache while this one waited.
     if let Some(body) = cached_if_fresh(&state.panels, &key, spec.cache_ttl).await {
-        return Ok(axum::Json(body));
+        return Ok(body);
     }
 
     // (#1914) When this panel reads the fleet stream, hand the spawned
@@ -995,32 +1393,10 @@ pub(crate) async fn panel_handler(
     // failure) just skips the env var below, and the child falls back to
     // its own live read (`fleet_records_for_runs`'s own doc) — a snapshot
     // that couldn't be prepared is never a reason to fail the panel.
-    let fleet_snapshot = if spec.needs_fleet_snapshot {
-        match tokio::task::spawn_blocking(crate::fleet_flow_records).await {
-            Ok(read) => match crate::write_fleet_snapshot_file(&read) {
-                Ok(file) => Some(file),
-                Err(e) => {
-                    eprintln!(
-                        "darkmux serve: panel \"{id}\": could not write the fleet snapshot \
-                         ({e}); the child will read Redis directly"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "darkmux serve: panel \"{id}\": fleet read task failed ({e}); the child \
-                     will read Redis directly"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let fleet_snapshot = if spec.needs_fleet_snapshot { prepare_fleet_snapshot(id).await } else { None };
 
     let started = Instant::now();
-    let exe = std::env::current_exe().map_err(|e| {
+    let exe = child_exe(&state.panels).map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("resolving current_exe: {e}\n"))
     })?;
     let mut cmd = tokio::process::Command::new(exe);
@@ -1054,31 +1430,11 @@ pub(crate) async fn panel_handler(
         cmd.env(crate::FLEET_SNAPSHOT_ENV_VAR, file.path());
     }
 
-    let output = tokio::time::timeout(PANEL_SPAWN_TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                format!(
-                    "panel \"{id}\" timed out after {}s: the CLI verb is wedged; \
-                     the daemon killed it (kill_on_drop)\n",
-                    PANEL_SPAWN_TIMEOUT.as_secs()
-                ),
-            )
-        })?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawning panel \"{id}\": {e}\n")))?;
+    let output = run_child(&state.panels, &spec, claim, cmd).await?;
 
     let gather_ms = started.elapsed().as_millis() as u64;
-    let ansi_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr_tail: String = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .rev()
-        .take(5)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let ansi_text = capped_stdout(&String::from_utf8_lossy(&output.stdout));
+    let stderr_tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
 
     let body = PanelResponse {
         panel: id.to_string(),
@@ -1108,7 +1464,127 @@ pub(crate) async fn panel_handler(
         let mut cache = state.panels.cache.lock().await;
         cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
     }
-    Ok(axum::Json(body))
+    Ok(body)
+}
+
+/// The program a panel spawns: the daemon's own binary (a test may substitute
+/// one, see [`PanelState::child_exe`]).
+fn child_exe(panels: &PanelState) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(exe) = &panels.child_exe {
+        return Ok(exe.clone());
+    }
+    let _ = panels;
+    std::env::current_exe()
+}
+
+/// The fleet-snapshot handoff file for a panel that reads the fleet stream, or
+/// `None` when it could not be prepared (the child then reads Redis itself).
+async fn prepare_fleet_snapshot(id: &str) -> Option<tempfile::NamedTempFile> {
+    match tokio::task::spawn_blocking(crate::fleet_flow_records).await {
+        Ok(read) => match crate::write_fleet_snapshot_file(&read) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!(
+                    "darkmux serve: panel \"{id}\": could not write the fleet snapshot \
+                     ({e}); the child will read Redis directly"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "darkmux serve: panel \"{id}\": fleet read task failed ({e}); the child \
+                 will read Redis directly"
+            );
+            None
+        }
+    }
+}
+
+/// Run the panel's child under the spec's own spawn bound. A child that does
+/// not finish in time is stopped (`kill_on_drop`) and answered as a 504 that
+/// says the verb was slow; for a manual-run panel the floor is released too,
+/// because the operator got no result and a retry is not a loop.
+async fn run_child(
+    panels: &PanelState,
+    spec: &PanelSpec,
+    claim: Option<ManualClaim>,
+    mut cmd: tokio::process::Command,
+) -> Result<std::process::Output, (StatusCode, String)> {
+    let id = spec.id;
+    match tokio::time::timeout(spec.spawn_timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("spawning panel \"{id}\": {e}\n"))),
+        Err(_) => {
+            if let Some(claim) = claim {
+                release_manual_run(panels, id, claim).await;
+            }
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "panel \"{id}\" is slow: it did not finish within {}s; try again{}\n",
+                    spec.spawn_timeout.as_secs(),
+                    if spec.auto_refresh { "" } else { "; this timeout did not use up the manual-run wait" }
+                ),
+            ))
+        }
+    }
+}
+
+/// Give back the manual-run floor claimed for `id`, so an immediate retry is
+/// admitted. Only a timed-out spawn calls this: a run that produced no result
+/// must not make the operator wait out the floor. It removes the entry only
+/// while it is still `claim`, this run's own: a later run admitted after the
+/// window opened holds its own claim, and this one must not erase it.
+async fn release_manual_run(panels: &PanelState, id: &'static str, claim: ManualClaim) {
+    let mut last = panels.last_manual.lock().await;
+    if last.get(id) == Some(&claim) {
+        last.remove(id);
+    }
+}
+
+/// The stderr kept in a response. Known diagnostics (`[darkmux-liveness]`
+/// traces, #1311) are dropped: they are written on success too and used to
+/// push the real error out of a five-line tail. Of what remains, lines that
+/// read as errors are kept first, then the most recent others, up to
+/// [`STDERR_TAIL_LINES`], in their original order.
+fn stderr_tail(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.starts_with("[darkmux-liveness]")).collect();
+    let is_error = |l: &str| {
+        let l = l.trim_start().to_ascii_lowercase();
+        // Rust prints `thread 'main' panicked at ...`, so the word is not a prefix.
+        l.starts_with("error") || l.starts_with("fatal") || l.contains(" panicked at ")
+    };
+    let mut keep = vec![false; lines.len()];
+    let mut budget = STDERR_TAIL_LINES;
+    for (i, _) in lines.iter().enumerate().rev().filter(|(_, l)| is_error(l)).take(budget) {
+        keep[i] = true;
+        budget -= 1;
+    }
+    for i in (0..lines.len()).rev().filter(|i| !keep[*i]).take(budget).collect::<Vec<_>>() {
+        keep[i] = true;
+    }
+    lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| *l).collect::<Vec<_>>().join("\n")
+}
+
+/// `stdout`, cut at a line boundary under [`PANEL_STDOUT_CAP_BYTES`] with a
+/// visible note when it was cut.
+fn capped_stdout(stdout: &str) -> String {
+    if stdout.len() <= PANEL_STDOUT_CAP_BYTES {
+        return stdout.to_string();
+    }
+    let mut end = PANEL_STDOUT_CAP_BYTES;
+    while !stdout.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = stdout[..end].rfind('\n').map_or(end, |i| i + 1);
+    format!(
+        "{}[output truncated: {} of {} bytes shown]\n",
+        &stdout[..cut],
+        cut,
+        stdout.len()
+    )
 }
 
 /// Serve the cached body if it is within `ttl`, with `age_ms` restamped so
@@ -1148,7 +1624,7 @@ mod tests {
     /// table's own comments.
     #[test]
     fn every_panel_has_a_stated_audience() {
-        let execution_surface = ["doctor", "config-list"];
+        let execution_surface = ["doctor", "config-list", "flow-status"];
         for id in PANEL_IDS {
             let want = if execution_surface.contains(id) { PanelAudience::LocalOrToken } else { PanelAudience::Read };
             assert_eq!(panel_spec(id).unwrap().audience, want, "{id}");
@@ -1167,7 +1643,7 @@ mod tests {
         // 8 as of `run-list` (#1911), 9 with `profile-list`, 10 with `machine-list` (5.0). Bumping this number is the doctrine
         // decision: an entry is legal only if it neither dispatches a model
         // (#1286) nor mutates, so the worst case of a bug here stays a wrong
-        // READING. This now counts 8 BASE VERBS, not 8 id/argv combinations
+        // READING. This now counts 10 BASE VERBS, not 10 id/argv combinations
         // (#1911) — a verb's VARIANTS (its declared `opts`) grow the option
         // space, not this list; see `variant_cross_product_stays_bounded`
         // for that guard instead. If growth ever comes from wanting
@@ -1227,7 +1703,8 @@ mod tests {
         {
             let s = panel_spec(id).unwrap();
             assert!(s.auto_refresh, "{id}");
-            assert_eq!(s.cache_ttl, PANEL_CACHE_TTL, "{id}");
+            let want = if s.needs_fleet_snapshot { FLEET_PANEL_CACHE_TTL } else { PANEL_CACHE_TTL };
+            assert_eq!(s.cache_ttl, want, "{id}");
         }
     }
 
@@ -2237,7 +2714,7 @@ mod tests {
             opts_map(&resolved),
             machine.as_deref(),
         );
-        assert_eq!(argv, vec!["machine", "status", "studio"]);
+        assert_eq!(argv, vec!["machine", "status", "--", "studio"]);
         assert_eq!(key, "machine-status?machine=studio");
         assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
         let err = resolve_roster_opt(&spec, &mut req(&[("machine", "nowhere")]), &roster(), false).unwrap_err();
@@ -2249,5 +2726,649 @@ mod tests {
         let (status, body) = panel_get("/panel/machine-status?opt.machine=no-such-machine-in-any-roster", true).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("unknown value") && body.contains("legal values"), "{body}");
+    }
+
+    // ── console review fixes (5.0) ────────────────────────────────────
+
+    /// The fleet-reading panels' cold spawn is about 5s, so their TTL must
+    /// outlast one spawn; every other panel keeps the short TTL.
+    #[test]
+    fn fleet_reading_panels_cache_longer_than_one_cold_spawn() {
+        assert!(FLEET_PANEL_CACHE_TTL > Duration::from_secs(5), "TTL under one cold spawn re-spawns on every poll");
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap();
+            if spec.needs_fleet_snapshot {
+                assert_eq!(spec.cache_ttl, FLEET_PANEL_CACHE_TTL, "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_gets_more_spawn_time_than_the_fast_verbs() {
+        assert_eq!(panel_spec("doctor").unwrap().spawn_timeout, DOCTOR_SPAWN_TIMEOUT);
+        assert!(DOCTOR_SPAWN_TIMEOUT >= Duration::from_secs(21), "doctor measures 7s with black-holed peers");
+        for id in PANEL_IDS.iter().filter(|id| **id != "doctor") {
+            assert_eq!(panel_spec(id).unwrap().spawn_timeout, PANEL_SPAWN_TIMEOUT, "{id}");
+        }
+    }
+
+    fn sleeping_child() -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        cmd
+    }
+
+    /// A timed-out manual spawn is worded "slow", is a 504, and does NOT
+    /// consume the manual-run floor: an immediate retry is admitted.
+    #[tokio::test]
+    async fn a_timed_out_manual_spawn_is_slow_not_wedged_and_releases_the_floor() {
+        let panels = PanelState::default();
+        let mut spec = panel_spec("doctor").unwrap();
+        spec.spawn_timeout = Duration::from_millis(50);
+        let claim = admit_manual_run(&panels, spec.id).await.unwrap();
+        let (status, body) = run_child(&panels, &spec, Some(claim), sleeping_child()).await.unwrap_err();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(body.contains("slow"), "{body}");
+        assert!(!body.contains("wedged"), "{body}");
+        admit_manual_run(&panels, spec.id).await.expect("the timeout must give the manual-run window back");
+    }
+
+    /// An auto-refresh panel's timeout has no floor to release, and its
+    /// message does not promise one.
+    #[tokio::test]
+    async fn a_timed_out_auto_panel_is_slow_too() {
+        let panels = PanelState::default();
+        let mut spec = panel_spec("role-list").unwrap();
+        spec.spawn_timeout = Duration::from_millis(50);
+        let (status, body) = run_child(&panels, &spec, None, sleeping_child()).await.unwrap_err();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(body.contains("slow") && !body.contains("manual-run wait"), "{body}");
+    }
+
+    /// A child that finishes keeps its floor claim: only a timeout releases.
+    #[tokio::test]
+    async fn a_finished_manual_spawn_still_holds_the_floor() {
+        let panels = PanelState::default();
+        let spec = panel_spec("doctor").unwrap();
+        let claim = admit_manual_run(&panels, spec.id).await.unwrap();
+        let mut ok = tokio::process::Command::new("true");
+        ok.kill_on_drop(true);
+        run_child(&panels, &spec, Some(claim), ok).await.unwrap();
+        assert_eq!(admit_manual_run(&panels, spec.id).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn a_repeated_query_key_is_found_even_when_encoded_differently() {
+        assert_eq!(duplicate_query_key("cols=80&opt.kind=lab&opt.kind=all"), Some("opt.kind".into()));
+        assert_eq!(duplicate_query_key("opt.all=all&opt%2Eall=recent"), Some("opt.all".into()));
+        assert_eq!(duplicate_query_key("cols=80&opt.kind=lab&opt.all=all"), None);
+        assert_eq!(duplicate_query_key(""), None);
+        // The same VALUE twice is still a repeated key.
+        assert_eq!(duplicate_query_key("cols=80&cols=80"), Some("cols".into()));
+    }
+
+    #[tokio::test]
+    async fn handler_refuses_a_repeated_query_key_naming_it() {
+        let (status, body) = panel_get("/panel/run-list?opt.kind=lab&opt.kind=all", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("\"opt.kind\"") && body.contains("more than once"), "{body}");
+    }
+
+    #[test]
+    fn stderr_tail_drops_liveness_lines_and_keeps_the_real_error() {
+        let mut raw = String::from("error: the roster is unreadable\n");
+        for i in 0..20 {
+            raw.push_str(&format!("[darkmux-liveness] T +{i}ms phase pid=1 case=c\n"));
+        }
+        let tail = stderr_tail(&raw);
+        assert_eq!(tail, "error: the roster is unreadable");
+    }
+
+    #[test]
+    fn stderr_tail_prefers_error_lines_over_later_noise() {
+        let mut raw = String::from("error: first\n");
+        for i in 0..30 {
+            raw.push_str(&format!("note {i}\n"));
+        }
+        let tail = stderr_tail(&raw);
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), STDERR_TAIL_LINES);
+        assert_eq!(lines[0], "error: first", "the error survives and keeps its place: {tail}");
+        assert_eq!(*lines.last().unwrap(), "note 29");
+    }
+
+    #[test]
+    fn stdout_is_capped_at_a_line_with_a_visible_note() {
+        let line = "x".repeat(99) + "\n";
+        let big = line.repeat(PANEL_STDOUT_CAP_BYTES / 100 + 50);
+        let out = capped_stdout(&big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("[output truncated:"), "{}", &out[out.len().saturating_sub(80)..]);
+        assert!(out.starts_with(&line));
+        assert_eq!(capped_stdout("small\n"), "small\n");
+    }
+
+    /// A flag-shaped roster id never reaches argv: refused by the machine-name
+    /// rule even when the roster itself lists it.
+    #[test]
+    fn a_flag_shaped_roster_id_is_refused() {
+        for spec_id in ["profile-list", "machine-status"] {
+            let spec = panel_spec(spec_id).unwrap();
+            let err = resolve_roster_opt(&spec, &mut req(&[("machine", "--all")]), &["--all".to_string()], false).unwrap_err();
+            assert!(err.contains("not a legal machine name"), "{spec_id}: {err}");
+        }
+    }
+
+    /// Both roster shapes, as argv: a flag value, or `--` then the id.
+    #[test]
+    fn a_positional_roster_id_follows_a_separator_and_a_flag_id_follows_its_flag() {
+        let argv_of = |id: &str| {
+            let spec = panel_spec(id).unwrap();
+            let mut requested = req(&[("machine", "studio")]);
+            let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
+            let resolved = resolve_opts(&spec, &requested).unwrap();
+            with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()).0
+        };
+        assert_eq!(argv_of("machine-status"), ["machine", "status", "--", "studio"]);
+        assert_eq!(argv_of("profile-list"), ["profile", "list", "--machine", "studio"]);
+    }
+
+    /// The panel table as JSON, for the console's own test to read. Written
+    /// by `DARKMUX_REGENERATE_FIXTURES=1`, compared otherwise, so the console
+    /// cannot drift from this table without a red test on one side.
+    /// The tokens `with_roster_choice` puts before a chosen id: asked of that
+    /// function itself, so the rule has one owner.
+    fn argv_before_id(spec: &PanelSpec) -> Vec<String> {
+        let (argv, _, _) = with_roster_choice(spec, spec.argv.to_vec(), spec.id.to_string(), Default::default(), Some("ID"));
+        argv[spec.argv.len()..argv.len() - 1].to_vec()
+    }
+
+    #[test]
+    fn panel_table_matches_the_generated_fixture() {
+        let table: Vec<serde_json::Value> = PANEL_IDS
+            .iter()
+            .map(|id| {
+                let s = panel_spec(id).unwrap();
+                serde_json::json!({
+                    "id": s.id,
+                    "argv": s.argv,
+                    "auto_refresh": s.auto_refresh,
+                    "audience": match s.audience { PanelAudience::Read => "read", PanelAudience::LocalOrToken => "local_or_token" },
+                    "opts": s.opts.iter().map(|o| serde_json::json!({
+                        "name": o.name,
+                        "values": o.values.iter().map(|v| serde_json::json!({"value": v.value, "argv": v.argv})).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "roster_opt": s.roster_opt.map(|r| serde_json::json!({
+                        "name": r.name,
+                        "flag": r.flag,
+                        // The argv tokens that precede the chosen machine's id.
+                        "argv_before_id": argv_before_id(&s),
+                    })),
+                })
+            })
+            .collect();
+        let rendered = serde_json::to_string_pretty(&table).unwrap() + "\n";
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/lenses/console/panel-table.generated.json");
+        if std::env::var_os("DARKMUX_REGENERATE_FIXTURES").is_some() {
+            std::fs::write(&path, &rendered).expect("writing the panel table fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .expect("panel-table.generated.json is missing: regenerate with DARKMUX_REGENERATE_FIXTURES=1");
+        assert_eq!(
+            rendered, on_disk,
+            "the panel table changed: regenerate with `DARKMUX_REGENERATE_FIXTURES=1 cargo nextest run -p \
+             darkmux-serve panel_table`, then update ui/src/lenses/console/panels.ts to match"
+        );
+    }
+
+    // ── the remote-caller output filter (5.0 console review) ───────────
+
+    fn probe_body() -> PanelResponse {
+        PanelResponse {
+            panel: "machine-status".into(),
+            argv: vec!["machine".into(), "status".into()],
+            opts: Default::default(),
+            captured_ts_ms: 0,
+            gather_ms: 1,
+            exit_code: Some(1),
+            ansi_text: "\x1b[2mregistry:\x1b[0m \x1b[2m/Users/tester/.darkmux/fleet.json\x1b[0m\nfixture: \x1b[2m/Users/tester/fx/a\x1b[0m\n\x1b[1mpeerone\x1b[0m at \x1b[2mpeerone.tailnet.example:8765\x1b[0m\n".into(),
+            stderr_tail: "the roster address for peerone (`peerone.tailnet.example:8765`) does not resolve\nwarning: env var X (/Users/tester/notebook) is ignored".into(),
+            cols: 100,
+            cache_ttl_ms: 3000,
+            age_ms: 0,
+            auto_refresh: true,
+        }
+    }
+
+    fn redaction() -> Redaction {
+        Redaction::from_parts(
+            &[("peerone", "peerone.tailnet.example:8765"), ("ten", "10.1.2.3")],
+            &[],
+            Some("/Users/tester".into()),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_remote_caller_sees_no_roster_address_no_home_path_and_no_stderr() {
+        let mut body = probe_body();
+        redact_for_remote(&mut body, &redaction());
+        let all = format!("{}{}", body.ansi_text, body.stderr_tail);
+        assert!(!all.contains("tailnet.example"), "{all}");
+        assert!(!all.contains("/Users/"), "{all}");
+        assert!(body.ansi_text.contains("at \x1b[2m(address hidden)\x1b[0m"), "{}", body.ansi_text);
+        assert!(body.ansi_text.contains("\x1b[2m~/.darkmux/fleet.json\x1b[0m"), "{}", body.ansi_text);
+        assert_eq!(body.stderr_tail, REMOTE_DIAGNOSTICS_NOTE);
+    }
+
+    #[test]
+    fn a_clean_stderr_stays_empty_for_a_remote_caller() {
+        let mut body = probe_body();
+        body.stderr_tail.clear();
+        redact_for_remote(&mut body, &redaction());
+        assert_eq!(body.stderr_tail, "");
+    }
+
+    #[test]
+    fn the_redaction_set_is_derived_from_the_roster_addresses_and_their_hosts() {
+        let r = Redaction::from_parts(
+            &[("a", "Peer.Example:8765"), ("b", "[fd7a::1]:8765"), ("c", "10.0.0.4"), ("d", "")],
+            &[],
+            Some("/".into()),
+            None,
+        );
+        for want in ["Peer.Example:8765", "Peer.Example", "[fd7a::1]:8765", "fd7a::1", "10.0.0.4"] {
+            assert!(r.addresses.iter().any(|a| a == want), "{want} in {:?}", r.addresses);
+        }
+        assert!(r.addresses.windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
+        assert!(r.dirs.is_empty(), "a bare / is not a home to rewrite");
+    }
+
+    fn body_with(text: &str) -> PanelResponse {
+        let mut b = probe_body();
+        b.ansi_text = text.to_string();
+        b.stderr_tail.clear();
+        b
+    }
+
+    fn filtered(r: &Redaction, text: &str) -> String {
+        let mut b = body_with(text);
+        redact_for_remote(&mut b, r);
+        b.ansi_text
+    }
+
+    /// Bare MagicDNS names as roster addresses (the form the roster doc
+    /// suggests): they are ids too, so ordinary words and ids stay intact.
+    #[test]
+    fn short_hostnames_do_not_corrupt_ordinary_output() {
+        let r = Redaction::from_parts(
+            &[("mac", "mac"), ("ana", "ana"), ("mini", "mini"), ("studio", "studio")],
+            &[],
+            Some("/Users/kain".into()),
+            None,
+        );
+        let text = "darkmux machine list\nmacos aarch64\nanalyst bail-with-explanation\nmini studio ana mac\n";
+        assert_eq!(filtered(&r, text), text);
+    }
+
+    /// The same short names when the id differs from the address: only whole
+    /// tokens go, never a substring of a word.
+    #[test]
+    fn a_short_address_is_hidden_only_as_a_whole_token() {
+        let r = Redaction::from_parts(&[("peerone", "mac"), ("peertwo", "ana")], &[], None, None);
+        assert_eq!(
+            filtered(&r, "mac is up; macos aarch64; analyst; lmstudio-community/mac-x ana, (mac)"),
+            "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac-x (address hidden), ((address hidden))"
+        );
+    }
+
+    /// A host part that equals a roster id is public, so it is not hidden; the
+    /// address with its port still is.
+    #[test]
+    fn a_host_that_equals_a_roster_id_is_public_but_its_port_form_is_not() {
+        let r = Redaction::from_parts(&[("studio", "studio:8765")], &[], None, None);
+        assert_eq!(filtered(&r, "studio at studio:8765"), "studio at (address hidden)");
+        // A name the roster learned from the machine's own card counts too.
+        let r = Redaction::from_parts(&[("peerone", "boxa.tailnet.example:8765")], &["boxa.tailnet.example".to_string()], None, None);
+        assert_eq!(filtered(&r, "boxa.tailnet.example"), "boxa.tailnet.example");
+    }
+
+    #[test]
+    fn a_model_key_that_contains_a_host_as_a_substring_survives() {
+        let r = Redaction::from_parts(&[("peerone", "studio")], &[], None, None);
+        assert_eq!(
+            filtered(&r, "lmstudio-community/qwen3-4b studio"),
+            "lmstudio-community/qwen3-4b (address hidden)"
+        );
+    }
+
+    #[test]
+    fn the_home_rewrite_respects_path_boundaries_and_covers_darkmux_home() {
+        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Volumes/x/dm".into()));
+        assert_eq!(
+            filtered(&r, "/Users/kain/a /Users/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
+            "~/a /Users/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
+        );
+        // A DARKMUX_HOME inside HOME is covered by the HOME rewrite.
+        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Users/kain/.darkmux".into()));
+        assert_eq!(filtered(&r, "/Users/kain/.darkmux/x"), "~/.darkmux/x");
+    }
+
+    fn app_state() -> AppState {
+        AppState {
+            flows_dir: std::path::PathBuf::new(),
+            sse_open: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            lab_dir: None,
+            panels: PanelState::default(),
+            fleet: crate::fleet_view::FleetContext::hermetic(),
+            live_ingest: None,
+        }
+    }
+
+    /// Serve `role-list` from a pre-seeded cache (no spawn) to `peer`, with
+    /// the roster and HOME the filter derives from set for the call.
+    async fn served_to(peer: &str, host: &str) -> PanelResponse {
+        let dir = tempfile::tempdir().unwrap();
+        let roster = dir.path().join("fleet.json");
+        std::fs::write(
+            &roster,
+            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"peerone.tailnet.example:8765","added_unix_ms":1}}}"#,
+        )
+        .unwrap();
+        let (prev_fleet, prev_home) = (std::env::var("DARKMUX_FLEET_FILE").ok(), std::env::var("HOME").ok());
+        std::env::set_var("DARKMUX_FLEET_FILE", &roster);
+        std::env::set_var("HOME", "/Users/tester");
+        let state = app_state();
+        state.panels.cache.lock().await.insert(
+            "role-list".to_string(),
+            CacheEntry { body: probe_body(), captured: SystemTime::now() },
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(PANEL_HEADER, "1".parse().unwrap());
+        headers.insert("host", host.parse().unwrap());
+        let out = panel_handler(
+            Path("role-list".to_string()),
+            axum::extract::RawQuery(None),
+            Query(HashMap::new()),
+            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            headers,
+            State(state),
+        )
+        .await;
+        for (k, v) in [("DARKMUX_FLEET_FILE", prev_fleet), ("HOME", prev_home)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out.unwrap().0
+    }
+
+    /// The reviewer's probe through the real handler: a remote caller reads
+    /// no DNS name and no home path from a Read panel; this machine reads it
+    /// unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_handler_filters_a_remote_caller_and_leaves_this_machine_alone() {
+        let remote = served_to("100.64.1.2:50000", "localhost:8765").await;
+        let all = format!("{}{}", remote.ansi_text, remote.stderr_tail);
+        assert!(!all.contains("tailnet.example") && !all.contains("/Users/"), "{all}");
+        assert_eq!(remote.stderr_tail, REMOTE_DIAGNOSTICS_NOTE);
+
+        let local = served_to("127.0.0.1:50000", "localhost:8765").await;
+        let want = probe_body();
+        assert_eq!(local.ansi_text, want.ansi_text);
+        assert_eq!(local.stderr_tail, want.stderr_tail);
+    }
+
+    #[test]
+    fn stderr_tail_keeps_a_rust_panic_line() {
+        let mut raw = String::from("thread 'main' panicked at src/x.rs:1:1:\nboom\n");
+        for i in 0..30 {
+            raw.push_str(&format!("note {i}\n"));
+        }
+        let tail = stderr_tail(&raw);
+        assert!(tail.lines().next().unwrap().contains("panicked at"), "{tail}");
+    }
+
+    /// The release is only worth having while a timed-out run still sits
+    /// inside the floor: the doctor bound must be shorter than the floor.
+    #[test]
+    fn doctor_times_out_inside_the_manual_floor() {
+        assert!(DOCTOR_SPAWN_TIMEOUT < MANUAL_MIN_INTERVAL);
+    }
+
+    /// A timed-out run gives back only ITS claim: a later run admitted after
+    /// the window opened keeps its own.
+    #[tokio::test]
+    async fn a_timeout_does_not_erase_a_later_runs_claim() {
+        let panels = PanelState::default();
+        let mut spec = panel_spec("doctor").unwrap();
+        spec.spawn_timeout = Duration::from_millis(50);
+        let first = admit_manual_run_at(&panels, "doctor", SystemTime::now() - Duration::from_secs(120)).await.unwrap();
+        // A second run is admitted (the first's window long open) and claims the floor.
+        let second = admit_manual_run(&panels, "doctor").await.unwrap();
+        assert_ne!(first, second);
+        // The first run now times out: it must not release the second's claim.
+        run_child(&panels, &spec, Some(first), sleeping_child()).await.unwrap_err();
+        assert_eq!(admit_manual_run(&panels, "doctor").await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// ONE state: a remote caller is served through the spawn path, then this
+    /// machine. The cache holds the unfiltered body, so this machine still
+    /// reads it unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn one_state_serves_a_remote_caller_then_this_machine_unredacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let roster = dir.path().join("fleet.json");
+        // `echo role list` prints `role list`; "role" is the roster address.
+        std::fs::write(
+            &roster,
+            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"role","added_unix_ms":1}}}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        std::env::set_var("DARKMUX_FLEET_FILE", &roster);
+        let mut state = app_state();
+        state.panels.child_exe = Some(std::path::PathBuf::from("/bin/echo"));
+        let serve = |peer: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(PANEL_HEADER, "1".parse().unwrap());
+            headers.insert("host", "localhost:8765".parse().unwrap());
+            panel_handler(
+                Path("role-list".to_string()),
+                axum::extract::RawQuery(None),
+                Query(HashMap::new()),
+                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                headers,
+                State(state.clone()),
+            )
+        };
+        let remote = serve("100.64.1.2:50000").await.unwrap().0;
+        let local = serve("127.0.0.1:50000").await.unwrap().0;
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+            None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+        }
+        assert_eq!(remote.ansi_text.trim(), "(address hidden) list");
+        assert_eq!(local.ansi_text.trim(), "role list", "the cache must hold the unfiltered body");
+    }
+
+    // ── real panel output: colored, punctuated, linked ─────────────────
+
+    fn real_redaction() -> Redaction {
+        Redaction::from_parts(
+            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac")],
+            &[],
+            Some("/Users/kain".into()),
+            Some("/Users/kainx/dm".into()),
+        )
+    }
+
+    /// Every SGR form a panel child emits (the sequence ends in `m`, which is
+    /// a word letter: the escape must be a token boundary).
+    #[test]
+    fn an_address_or_path_next_to_a_color_code_is_still_redacted() {
+        let r = real_redaction();
+        for (input, want) in [
+            ("roster: \x1b[2m/Users/kain/.darkmux/fleet.json", "roster: \x1b[2m~/.darkmux/fleet.json"),
+            ("\x1b[2mstudio.tailnet.example\x1b[0m", "\x1b[2m(address hidden)\x1b[0m"),
+            ("\x1b[0mstudio.tailnet.example:8765", "\x1b[0m(address hidden)"),
+            ("\x1b[2m100.64.1.2", "\x1b[2m(address hidden)"),
+            ("\x1b[1mmac", "\x1b[1m(address hidden)"),
+            ("\x1b[38;5;208m/Users/kain\x1b[39m", "\x1b[38;5;208m~\x1b[39m"),
+        ] {
+            assert_eq!(filtered(&r, input), want, "{input:?}");
+        }
+    }
+
+    /// Punctuation after a token is a boundary: end of a sentence, a trailing dot.
+    #[test]
+    fn a_trailing_dot_does_not_protect_an_address_or_a_path() {
+        let r = real_redaction();
+        for (input, want) in [
+            ("is studio.tailnet.example.", "is (address hidden)."),
+            ("at 100.64.1.2.", "at (address hidden)."),
+            ("in /Users/kain.", "in ~."),
+            ("(100.64.1.2), mac.\n", "((address hidden)), (address hidden).\n"),
+        ] {
+            assert_eq!(filtered(&r, input), want, "{input:?}");
+        }
+        // A dot followed by a word character still continues the name.
+        assert_eq!(filtered(&r, "100.64.1.2.5 mac.example"), "100.64.1.2.5 mac.example");
+    }
+
+    #[test]
+    fn an_osc8_link_to_a_hidden_target_loses_its_target_and_keeps_its_label() {
+        let r = real_redaction();
+        let file = "\x1b]8;;file:///Users/kain/.darkmux/fleet.json\x1b\\fleet.json\x1b]8;;\x1b\\";
+        assert_eq!(filtered(&r, file), "\x1b]8;;\x1b\\fleet.json\x1b]8;;\x1b\\");
+        let url = "\x1b]8;id=1;http://studio.tailnet.example:8765/#lens=runs\x07label\x1b]8;;\x07";
+        assert_eq!(filtered(&r, url), "\x1b]8;;\x1b\\label\x1b]8;;\x1b\\");
+        // A link that names nothing private is left alone (the board's own links).
+        let own = "\x1b]8;;/#mission=m-1\x1b\\m-1\x1b]8;;\x1b\\";
+        assert_eq!(filtered(&r, own), own);
+        // A hidden address in the LABEL is redacted as plain text.
+        assert_eq!(
+            filtered(&r, "\x1b]8;;/x\x1b\\studio.tailnet.example\x1b]8;;\x1b\\"),
+            "\x1b]8;;/x\x1b\\(address hidden)\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn darkmux_home_is_trimmed_and_nested_at_a_path_boundary() {
+        // `/Users/kainx/dm` is not inside `/Users/kain`, so it is its own rewrite.
+        let r = real_redaction();
+        assert_eq!(filtered(&r, "/Users/kainx/dm/cfg /Users/kain/a"), "$DARKMUX_HOME/cfg ~/a");
+        // A trailing slash on either directory does not stop the match.
+        let r = Redaction::from_parts(&[], &[], Some("/Users/kain/".into()), Some("/Volumes/x/dm/".into()));
+        assert_eq!(filtered(&r, "/Users/kain/a /Volumes/x/dm/b"), "~/a $DARKMUX_HOME/b");
+        // Inside HOME at a boundary: covered by the HOME rewrite.
+        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Users/kain/dm/".into()));
+        assert_eq!(filtered(&r, "/Users/kain/dm/x"), "~/dm/x");
+    }
+
+    #[test]
+    fn the_earlier_over_redaction_fixtures_still_hold_with_colors() {
+        let r = Redaction::from_parts(&[("peerone", "mac"), ("peertwo", "studio")], &[], Some("/Users/kain".into()), None);
+        let text = "\x1b[1mdarkmux machine list\x1b[0m\nmacos aarch64 analyst lmstudio-community/x\n";
+        assert_eq!(filtered(&r, text), text);
+    }
+
+    // ── canonical forms of the directories ─────────────────────────────
+
+    /// A directory given through a symlink (`/tmp` on macOS is `/private/tmp`)
+    /// is printed by some verbs in its resolved form: both must be rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_redacted_in_its_canonical_form_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        std::fs::create_dir_all(real.join("fx")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (link, real) = (link.to_string_lossy().to_string(), real.to_string_lossy().to_string());
+        assert_ne!(link, real);
+        // As DARKMUX_HOME (outside HOME) ...
+        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some(link.clone()));
+        assert_eq!(filtered(&r, &format!("{link}/a {real}/fx")), "$DARKMUX_HOME/a $DARKMUX_HOME/fx");
+        // ... and as HOME.
+        let r = Redaction::from_parts(&[], &[], Some(format!("{link}/")), None);
+        assert_eq!(filtered(&r, &format!("{link}/a {real}/fx")), "~/a ~/fx");
+    }
+
+    /// A DARKMUX_HOME whose canonical form lies inside HOME's canonical form is
+    /// covered by the HOME rewrite, at a path boundary.
+    #[cfg(unix)]
+    #[test]
+    fn a_canonical_darkmux_home_inside_home_is_not_listed_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(home.join("dm")).unwrap();
+        let (h, dm) = (home.to_string_lossy().to_string(), home.join("dm").to_string_lossy().to_string());
+        let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(dm.clone()));
+        assert_eq!(filtered(&r, &format!("{dm}/x")), "~/dm/x");
+        assert!(r.dirs.iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs);
+        // A sibling that merely shares the prefix is not inside it.
+        std::fs::create_dir_all(format!("{h}x/dm")).ok();
+        let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(format!("{h}x/dm")));
+        assert_eq!(filtered(&r, &format!("{h}x/dm/y")), "$DARKMUX_HOME/y");
+        std::fs::remove_dir_all(format!("{h}x")).ok();
+    }
+
+    // ── escapes a remote caller is sent ────────────────────────────────
+
+    #[test]
+    fn only_sgr_and_osc8_survive_for_a_remote_caller() {
+        let r = real_redaction();
+        for (input, want) in [
+            // Non-8 OSC (window title, cwd report), BEL and ST terminated: dropped whole.
+            ("a\x1b]0;/Users/kain/x\x07b", "ab"),
+            ("a\x1b]7;file:///Users/kain\x1b\\b", "ab"),
+            // Non-SGR CSI dropped; SGR kept, rebuilt from its parameters.
+            ("a\x1b[2Jb\x1b[1;31mc\x1b[0m", "ab\x1b[1;31mc\x1b[0m"),
+            ("\x1b[mx", "\x1b[mx"),
+            // A charset designation is dropped.
+            ("a\x1b(Bb", "ab"),
+            // OSC 8: params stripped, target kept, terminator normalized to ST.
+            ("\x1b]8;id=7;/#mission=m-1\x07m-1\x1b]8;;\x07", "\x1b]8;;/#mission=m-1\x1b\\m-1\x1b]8;;\x1b\\"),
+        ] {
+            assert_eq!(filtered(&r, input), want, "{input:?}");
+        }
+    }
+
+    /// An escape that is malformed or never terminated loses only its
+    /// introducer: the rest is text, and is redacted as text.
+    #[test]
+    fn an_unterminated_or_malformed_escape_is_text_that_is_redacted() {
+        let r = real_redaction();
+        for (input, want) in [
+            ("\x1b[/Users/kain/.darkmux", "~/.darkmux"),
+            ("x \x1b]0;/Users/kain no terminator", "x 0;~ no terminator"),
+            ("x \x1b]8;;http://studio.tailnet.example:8765/", "x 8;;http://(address hidden)/"),
+            ("tail \x1b[", "tail "),
+            ("tail \x1b", "tail "),
+        ] {
+            assert_eq!(filtered(&r, input), want, "{input:?}");
+        }
+    }
+
+    /// U+009B is a one-character CSI: the same rules as `ESC [`.
+    #[test]
+    fn a_c1_csi_is_treated_as_an_escape() {
+        let r = real_redaction();
+        assert_eq!(filtered(&r, "a\u{9b}2Jb"), "ab");
+        assert_eq!(filtered(&r, "\u{9b}1mbold"), "\x1b[1mbold");
+        let got = filtered(&r, "\u{9b}/Users/kain/x");
+        assert!(!got.contains("kain") && !got.contains('\u{9b}'), "{got:?}");
+    }
+
+    /// An OSC 8 target carrying control characters is not passed on.
+    #[test]
+    fn an_osc8_target_with_a_control_character_is_dropped() {
+        let r = real_redaction();
+        assert_eq!(filtered(&r, "\x1b]8;;a\x01b\x1b\\L"), "\x1b]8;;\x1b\\L");
     }
 }

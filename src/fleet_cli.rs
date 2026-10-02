@@ -27,13 +27,23 @@ use crate::flow;
 /// address reaches whichever machine reads it, never the one the entry
 /// describes. `--allow-loopback` exists for several daemons on one host (a
 /// same-host test fleet), where loopback really does reach the peer.
+/// Why `machine add` refuses before touching anything, or `None`. The id must
+/// be a machine name first (5.0 console review: it reaches argv from the
+/// console panel), then the loopback rule.
+fn add_refusal(id: &str, address: &str, allow_loopback: bool) -> Option<String> {
+    if let Some(problem) = darkmux_types::profile_address::machine_name_problem(id) {
+        return Some(format!("machine: `{id}` is not a legal machine id: {problem}"));
+    }
+    loopback_refusal(id, address, allow_loopback)
+}
+
 pub(crate) fn cmd_machine_add(
     id: &str,
     address: &str,
     description: Option<&str>,
     allow_loopback: bool,
 ) -> Result<i32> {
-    if let Some(msg) = loopback_refusal(id, address, allow_loopback) {
+    if let Some(msg) = add_refusal(id, address, allow_loopback) {
         eprintln!("{msg}");
         return Ok(2);
     }
@@ -321,10 +331,12 @@ pub(crate) fn peer_resources_view(id: &str, body: serde_json::Value, json: bool)
 pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value> {
     let roster = fleet::load_roster()?;
     let entry = fleet::find_machine(&roster, id)?.cloned().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <dns-name>`, \
-             or omit the id to read this host"
-        )
+        // Never suggest adding an id `machine add` would refuse.
+        let add = match darkmux_types::profile_address::machine_name_problem(id) {
+            None => format!("add it with `darkmux machine add {id} --address <dns-name>`, "),
+            Some(_) => format!("`{id}` is not a legal machine id, so it cannot be added; "),
+        };
+        anyhow::anyhow!("no machine `{id}` in roster — {add}or omit the id to read this host")
     })?;
     let local_id = flow::resolve_machine_id();
     let dialed = dial_address(&entry, local_id.as_deref(), &darkmux_types::config_access::serve_client_addr());
@@ -994,6 +1006,35 @@ pub(crate) fn cmd_machine_untrust(name: &str) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    /// (5.0 console review) A flag-shaped id is refused before any state is
+    /// read or written: it reaches argv from the console panel.
+    #[serial_test::serial]
+    #[test]
+    fn machine_add_refuses_a_flag_shaped_id() {
+        // A regression must never reach the real roster: point it at an empty one.
+        let tmp = tempfile::tempdir().unwrap();
+        let roster = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster) };
+        let flag = cmd_machine_add("--all", "studio.tailnet.example", None, false).unwrap();
+        let space = cmd_machine_add("a b", "studio.tailnet.example", None, false).unwrap();
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        assert_eq!((flag, space), (2, 2));
+        assert!(!roster.exists(), "a refused id must not write a roster");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn a_missing_flag_shaped_peer_is_not_suggested_for_adding() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", tmp.path().join("fleet.json")) };
+        let flag = fetch_peer_json("--all", "/health").unwrap_err().to_string();
+        let name = fetch_peer_json("studio", "/health").unwrap_err().to_string();
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        assert!(!flag.contains("machine add --all"), "{flag}");
+        assert!(flag.contains("not a legal machine id"), "{flag}");
+        assert!(name.contains("machine add studio --address"), "{name}");
+    }
+
     use super::*;
 
     // ── machine add: loopback refusal + self by machine_id (#2924) ──────

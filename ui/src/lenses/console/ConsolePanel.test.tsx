@@ -4,11 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConsolePanel } from "./ConsolePanel";
 import type { PanelId } from "../../lib/route";
 
-function renderPanel(initialPanelId: PanelId | "" = "", initialOpts?: Readonly<Record<string, string>>) {
+function renderPanel(initialPanelId: PanelId | "" = "", initialOpts?: Readonly<Record<string, string>>, droppedNote?: readonly string[]) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <ConsolePanel initialPanelId={initialPanelId} initialOpts={initialOpts} />
+      <ConsolePanel initialPanelId={initialPanelId} initialOpts={initialOpts} droppedNote={droppedNote} />
     </QueryClientProvider>,
   );
 }
@@ -104,7 +104,7 @@ describe("ConsolePanel", () => {
     const body = {
       ...MISSION_STATUS_BODY,
       panel: "machine-status",
-      argv: ["machine", "status", "studio"],
+      argv: ["machine", "status", "--", "studio"],
       opts: { machine: "studio" },
       ansi_text: "machine `studio` (remote):",
     };
@@ -210,6 +210,103 @@ describe("ConsolePanel", () => {
     );
     renderPanel("mission-status");
     await waitFor(() => expect(screen.getByText('panel "mission-status" timed out')).toBeInTheDocument());
+  });
+
+  // A 429, a 504 or a network blip must not erase the output the operator was
+  // reading: the last good body stays, the daemon's own words appear beside it.
+  it("a failed refresh keeps the last good output and shows the error beside it", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (!url.startsWith("/panel/mission-status")) return Promise.resolve(jsonResponse({}, 404));
+        calls += 1;
+        return Promise.resolve(
+          calls === 1
+            ? jsonResponse(MISSION_STATUS_BODY)
+            : new Response('panel "mission-status" is slow: it did not finish within 10s; try again\n', { status: 504 }),
+        );
+      }),
+    );
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/mission status — 0 missions/)).toBeInTheDocument());
+    fireEvent.click(screen.getByText("re-run"));
+    await waitFor(() => expect(document.querySelector(".pc-refresh-failed")).not.toBeNull());
+    expect(screen.getByText(/mission status — 0 missions/)).toBeInTheDocument();
+    // The failure sits in the header's meta slot, in full as its tooltip; no
+    // block is added to the body and the output stays, dimmed.
+    const meta = document.querySelector(".pc-refresh-failed")!;
+    expect(meta.textContent).toMatch(/^failed: slow · \d\d:\d\d:\d\d$/);
+    expect(meta.getAttribute("title")).toContain("did not finish within 10s; try again");
+    expect(document.querySelector(".panelerr")).toBeNull();
+    expect(document.querySelector(".panelout")).toHaveClass("pc-body-stale");
+    // The chrome still reads as loaded: the command line and its re-run button.
+    expect(screen.getByText("re-run")).toBeInTheDocument();
+  });
+
+  // The kept body belongs to ONE selection. When A loads and B (another
+  // selection of the same panel) fails, B shows no body, and A's output never
+  // appears under B's command line.
+  it("a failure on a different selection shows no body, never the other selection's output", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (!url.startsWith("/panel/run-list")) return Promise.resolve(jsonResponse({}, 404));
+        return Promise.resolve(
+          url.includes("opt.kind=lab")
+            ? new Response('panel "run-list" is slow: it did not finish within 10s; try again\n', { status: 504 })
+            : jsonResponse(RUN_LIST_DEFAULT_BODY),
+        );
+      }),
+    );
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/KIND STATUS/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+    await waitFor(() => expect(screen.getByText(/is slow: it did not finish/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "--kind lab ▾" })).toBeInTheDocument();
+    expect(screen.queryByText(/KIND STATUS/)).toBeNull();
+    expect(document.querySelector(".panelout")).toBeNull();
+    expect(document.querySelector(".pc-refresh-failed")).toBeNull();
+  });
+
+  it("an error with nothing ever loaded still shows the error alone", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("panel refused\n", { status: 429 }))));
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText("panel refused")).toBeInTheDocument());
+    expect(document.querySelector(".panelout")).toBeNull();
+  });
+
+  it("a deep link's dropped opts are named in one line, and the operator's own pick clears it", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY))));
+    renderPanel("run-list", {}, ["opt.kind=nope (not one of all, mission, dispatch, lab)"]);
+    const note = await screen.findByText(/1 unused/);
+    expect(note.getAttribute("title")).toBe("Not used from this link: opt.kind=nope (not one of all, mission, dispatch, lab).");
+    fireEvent.click(screen.getByText("mission status", { selector: ".runchip" }));
+    await waitFor(() => expect(screen.queryByText(/1 unused/)).toBeNull());
+  });
+
+  // The address bar is rewritten to the canonical hash right after load, which
+  // re-parses to a route with nothing dropped: the note must outlive that.
+  it("the dropped-opts note survives the re-parse of the cleaned-up hash", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ui = (note?: readonly string[]) => (
+      <QueryClientProvider client={queryClient}>
+        <ConsolePanel initialPanelId="run-list" initialOpts={{}} droppedNote={note} />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(ui(["opt.bogus (run-list has no such option)"]));
+    await screen.findByText(/1 unused/);
+    rerender(ui(undefined));
+    expect(screen.getByText(/1 unused/).getAttribute("title")).toContain("opt.bogus");
+  });
+
+  it("no dropped opts, no note row: a normal console has no extra line", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY))));
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/KIND STATUS/)).toBeInTheDocument());
+    expect(document.querySelector(".pc-dropped")).toBeNull();
   });
 
   it("re-visiting an already-loaded CLI panel reuses the cache (no second fetch)", async () => {

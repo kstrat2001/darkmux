@@ -2365,7 +2365,9 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn an_execution_surface_panel_refuses_a_remote_caller_with_read_auth_off() {
-        for id in ["doctor", "config-list"] {
+        // `flow-status` prints the sinks' paths, hook target URLs and the Redis
+        // URL: a non-local caller without the token gets a 401 there too.
+        for id in ["doctor", "config-list", "flow-status"] {
             for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
                 let s = panel_status(auth, remote_peer(), id, &[]).await;
                 assert_eq!(s, StatusCode::UNAUTHORIZED, "{id} under {auth:?}");
@@ -2380,7 +2382,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn an_execution_surface_panel_serves_this_machine_and_the_token() {
-        for id in ["doctor", "config-list"] {
+        for id in ["doctor", "config-list", "flow-status"] {
             let local = panel_status(AuthEnv::Off, loopback_peer(), id, &[]).await;
             assert_eq!(local, StatusCode::BAD_REQUEST, "{id}: this machine passes the gate");
             let token = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[("Authorization", BEARER)]).await;
@@ -2395,7 +2397,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn a_read_panel_follows_the_read_posture() {
-        for id in ["mission-status", "role-list", "machine-status", "flow-status", "lab-fixture-list", "run-list", "profile-list", "machine-list"] {
+        for id in ["mission-status", "role-list", "machine-status", "lab-fixture-list", "run-list", "profile-list", "machine-list"] {
             let s = panel_status(AuthEnv::Off, remote_peer(), id, &[]).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{id} with read auth off");
             let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;

@@ -163,7 +163,12 @@ test.describe("next-parity: console lens (Packet 6)", () => {
 
     await page.goto("/index.html#lens=console&panel=rm-rf-everything");
     await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
-    expect(await extractStageOnlyText(page)).toBe(goldenStageText("console"));
+    // The default panel, plus the header's one-token note that the link's
+    // panel was not used (full text in its tooltip); nothing else differs.
+    const text = await extractStageOnlyText(page);
+    expect(text).toContain("· 1 unused");
+    expect(text.replace("\n· 1 unused", "")).toBe(goldenStageText("console"));
+    await expect(page.locator(".pc-dropped")).toHaveAttribute("title", /panel=rm-rf-everything \(not a panel\)/);
   });
 
   for (const [panelId, panelHash] of AUTO_PANELS) {

@@ -1,0 +1,217 @@
+[
+  {
+    "id": "mission-status",
+    "argv": [
+      "mission",
+      "status"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [
+      {
+        "name": "all",
+        "values": [
+          {
+            "value": "recent",
+            "argv": []
+          },
+          {
+            "value": "all",
+            "argv": [
+              "--all"
+            ]
+          }
+        ]
+      }
+    ],
+    "roster_opt": null
+  },
+  {
+    "id": "role-list",
+    "argv": [
+      "role",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [],
+    "roster_opt": null
+  },
+  {
+    "id": "machine-status",
+    "argv": [
+      "machine",
+      "status"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [],
+    "roster_opt": {
+      "name": "machine",
+      "flag": null,
+      "argv_before_id": [
+        "--"
+      ]
+    }
+  },
+  {
+    "id": "machine-list",
+    "argv": [
+      "machine",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [],
+    "roster_opt": null
+  },
+  {
+    "id": "config-list",
+    "argv": [
+      "config",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "local_or_token",
+    "opts": [],
+    "roster_opt": null
+  },
+  {
+    "id": "flow-status",
+    "argv": [
+      "flow",
+      "status"
+    ],
+    "auto_refresh": true,
+    "audience": "local_or_token",
+    "opts": [],
+    "roster_opt": null
+  },
+  {
+    "id": "lab-fixture-list",
+    "argv": [
+      "lab",
+      "fixture",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [],
+    "roster_opt": null
+  },
+  {
+    "id": "run-list",
+    "argv": [
+      "run",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [
+      {
+        "name": "kind",
+        "values": [
+          {
+            "value": "all",
+            "argv": []
+          },
+          {
+            "value": "mission",
+            "argv": [
+              "--kind",
+              "mission"
+            ]
+          },
+          {
+            "value": "dispatch",
+            "argv": [
+              "--kind",
+              "dispatch"
+            ]
+          },
+          {
+            "value": "lab",
+            "argv": [
+              "--kind",
+              "lab"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "all",
+        "values": [
+          {
+            "value": "recent",
+            "argv": []
+          },
+          {
+            "value": "all",
+            "argv": [
+              "--all"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "usage",
+        "values": [
+          {
+            "value": "off",
+            "argv": []
+          },
+          {
+            "value": "on",
+            "argv": [
+              "--usage"
+            ]
+          }
+        ]
+      }
+    ],
+    "roster_opt": null
+  },
+  {
+    "id": "profile-list",
+    "argv": [
+      "profile",
+      "list"
+    ],
+    "auto_refresh": true,
+    "audience": "read",
+    "opts": [
+      {
+        "name": "remote",
+        "values": [
+          {
+            "value": "off",
+            "argv": []
+          },
+          {
+            "value": "on",
+            "argv": [
+              "--remote"
+            ]
+          }
+        ]
+      }
+    ],
+    "roster_opt": {
+      "name": "machine",
+      "flag": "--machine",
+      "argv_before_id": [
+        "--machine"
+      ]
+    }
+  },
+  {
+    "id": "doctor",
+    "argv": [
+      "doctor"
+    ],
+    "auto_refresh": false,
+    "audience": "local_or_token",
+    "opts": [],
+    "roster_opt": null
+  }
+]
