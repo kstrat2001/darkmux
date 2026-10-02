@@ -2619,6 +2619,21 @@ fn check_openai_base_url_conflict() -> Check {
     }
 }
 
+/// The hub's two streams with the retention cap each resolves to (`0` is
+/// unbounded), so an operator sees where work records and machine samples
+/// go and how many each keeps. (#2101)
+fn redis_streams_summary() -> String {
+    use darkmux_types::config_access as c;
+    let cap = |n: usize| if n == 0 { "unbounded".to_string() } else { n.to_string() };
+    format!(
+        "work `{}` (maxlen {}), telemetry `{}` (maxlen {})",
+        c::redis_stream(),
+        cap(c::redis_maxlen()),
+        c::redis_telemetry_stream(),
+        cap(c::redis_telemetry_maxlen()),
+    )
+}
+
 /// Surface a config-assembled Redis that would connect WITHOUT a password —
 /// `config.redis.enabled` is set but neither the Keychain item `darkmux-redis`
 /// nor `DARKMUX_REDIS_URL` supplies credentials. Password-less is fine for a
@@ -2632,7 +2647,12 @@ fn check_redis_config() -> Check {
         .filter(|s| !s.trim().is_empty())
         .is_some();
     if env_url {
-        return Check { name: name.into(), status: Status::Pass, message: "Redis via DARKMUX_REDIS_URL".into(), hint: None };
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("Redis via DARKMUX_REDIS_URL · {}", redis_streams_summary()),
+            hint: None,
+        };
     }
     if !darkmux_types::config_access::redis_enabled() {
         return Check { name: name.into(), status: Status::Pass, message: "config Redis disabled".into(), hint: None };
@@ -2648,7 +2668,7 @@ fn check_redis_config() -> Check {
         Some(host) if darkmux_flow::redis_keychain_password_present() => Check {
             name: name.into(),
             status: Status::Pass,
-            message: format!("config Redis enabled → {host} (password from Keychain)"),
+            message: format!("config Redis enabled → {host} (password from Keychain) · {}", redis_streams_summary()),
             hint: None,
         },
         Some(host) => Check {
@@ -12129,6 +12149,27 @@ mod tests {
         let expected =
             69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    /// (#2101) `doctor` shows where work records and machine samples go and how
+    /// many each stream keeps; `0` reads as unbounded, never as "none".
+    #[serial_test::serial]
+    #[test]
+    fn the_redis_check_names_both_streams_and_both_caps() {
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1");
+            std::env::set_var("DARKMUX_REDIS_STREAM", "t:flow");
+            std::env::set_var("DARKMUX_REDIS_MAXLEN", "7");
+            std::env::set_var("DARKMUX_REDIS_TELEMETRY_MAXLEN", "0");
+        }
+        let message = check_redis_config().message;
+        for var in ["DARKMUX_REDIS_URL", "DARKMUX_REDIS_STREAM", "DARKMUX_REDIS_MAXLEN", "DARKMUX_REDIS_TELEMETRY_MAXLEN"] {
+            unsafe { std::env::remove_var(var) };
+        }
+        assert!(
+            message.contains("work `t:flow` (maxlen 7), telemetry `t:flow:telemetry` (maxlen unbounded)"),
+            "{message}"
+        );
     }
 
     // ─── #934 doctor L1 ───────────────────────────────────────────────

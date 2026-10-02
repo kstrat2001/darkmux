@@ -165,7 +165,7 @@ redis-cli CONFIG SET maxmemory 4gb
 redis-cli CONFIG SET maxmemory-policy noeviction
 redis-cli CONFIG REWRITE
 redis-cli BGREWRITEAOF</code></pre>
-    <p>The <code>maxmemory 4gb</code> + <code>noeviction</code> pair is deliberate: the flow stream is already <code>XADD MAXLEN</code>-bounded by darkmux (default 10,000 entries via <code>DARKMUX_REDIS_MAXLEN</code>), so Redis never needs to evict. You do NOT want it to, either, because eviction policies that touch streams can drop records silently. <code>noeviction</code> means "if you'd hit the cap, reject the write and surface an error," the right posture for a record-keeping substrate.</p>
+    <p>The <code>maxmemory 4gb</code> + <code>noeviction</code> pair is deliberate: the flow streams are already <code>XADD MAXLEN</code>-bounded by darkmux (default 10,000 entries each: <code>DARKMUX_REDIS_MAXLEN</code> for work records, <code>DARKMUX_REDIS_TELEMETRY_MAXLEN</code> for the machine samples that ride their own <code>darkmux:flow:telemetry</code> stream), so Redis never needs to evict. You do NOT want it to, either, because eviction policies that touch streams can drop records silently. <code>noeviction</code> means "if you'd hit the cap, reject the write and surface an error," the right posture for a record-keeping substrate.</p>
     <p>Verify:</p>
     <pre><code>redis-cli CONFIG GET appendonly                     <span class="comment"># "yes"</span>
 redis-cli CONFIG GET appendfsync                    <span class="comment"># "everysec"</span>

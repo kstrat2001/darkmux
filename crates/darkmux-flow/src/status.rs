@@ -89,6 +89,11 @@ pub struct RedisStatus {
     pub stream: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_len: Option<usize>,
+    /// (#2101) The machine-telemetry stream, kept apart from `stream` so its
+    /// samples never evict work records, with its own cap.
+    pub telemetry_stream: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_max_len: Option<usize>,
     pub reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reachability_error: Option<String>,
@@ -283,6 +288,8 @@ pub(crate) struct RedisCfg {
     pub(crate) url: RawRedisUrl,
     pub(crate) stream: String,
     pub(crate) max_len: Option<usize>,
+    pub(crate) telemetry_stream: String,
+    pub(crate) telemetry_max_len: Option<usize>,
 }
 
 pub(crate) fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
@@ -298,6 +305,11 @@ pub(crate) fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
             max_len: info
                 .config
                 .get("max_len")
+                .and_then(|s| s.parse::<usize>().ok()),
+            telemetry_stream: info.config.get("telemetry_stream").cloned().unwrap_or_default(),
+            telemetry_max_len: info
+                .config
+                .get("telemetry_max_len")
                 .and_then(|s| s.parse::<usize>().ok()),
         });
     }
@@ -381,6 +393,8 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
                     url: cfg.url.to_string(),
                     stream: cfg.stream.clone(),
                     max_len: cfg.max_len,
+                    telemetry_stream: cfg.telemetry_stream.clone(),
+                    telemetry_max_len: cfg.telemetry_max_len,
                     reachable: false,
                     reachability_error: Some(format!("client open: {e}")),
                     xlen: None,
@@ -407,6 +421,8 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
                     url: cfg.url.to_string(),
                     stream: cfg.stream.clone(),
                     max_len: cfg.max_len,
+                    telemetry_stream: cfg.telemetry_stream.clone(),
+                    telemetry_max_len: cfg.telemetry_max_len,
                     reachable: false,
                     reachability_error: Some(format!("connect: {e}")),
                     xlen: None,
@@ -478,6 +494,8 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
             url: cfg.url.to_string(),
             stream: cfg.stream.clone(),
             max_len: cfg.max_len,
+            telemetry_stream: cfg.telemetry_stream.clone(),
+            telemetry_max_len: cfg.telemetry_max_len,
             reachable: true,
             reachability_error: None,
             xlen,
@@ -586,6 +604,12 @@ pub fn format_status_human(status: &FlowStatus) -> String {
             out,
             "  max_len:      {}",
             r.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
+        );
+        let _ = writeln!(out, "  telemetry:    {}", r.telemetry_stream);
+        let _ = writeln!(
+            out,
+            "  telemetry_max_len: {}",
+            r.telemetry_max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
         );
         let _ = writeln!(out, "  reachable:    {}", r.reachable);
         if let Some(err) = r.reachability_error.as_ref() {
@@ -1084,6 +1108,8 @@ mod redis_probe_tests {
             url: RawRedisUrl::new(format!("redis://127.0.0.1:{port}")),
             stream: "darkmux:flow".to_string(),
             max_len: Some(10000),
+            telemetry_stream: "darkmux:flow:telemetry".to_string(),
+            telemetry_max_len: Some(10000),
         };
 
         let start = std::time::Instant::now();

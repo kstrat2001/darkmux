@@ -107,6 +107,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("redis.db", Ty::Uint),
     ("redis.stream", Ty::Str),
     ("redis.maxlen", Ty::Uint),
+    ("redis.telemetry_maxlen", Ty::Uint),
     ("audit.enabled", Ty::Bool),
     ("audit.dir", Ty::Str),
     ("runtime.inactivity_timeout_seconds", Ty::Uint),

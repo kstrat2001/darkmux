@@ -62,6 +62,25 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **Machine telemetry has its own hub stream, so work records keep their window** (#2101).
+  `machine.telemetry` was 87% of the hub's records, so the one capped stream held
+  about 41 hours and a relayed run's usage was trimmed away before its sender could
+  be asked (12 of 30 relayed runs on one day). Samples now go to
+  `<redis.stream>:telemetry` under their own cap, `redis.telemetry_maxlen`
+  (env `DARKMUX_REDIS_TELEMETRY_MAXLEN`, default 10000, `0` unbounded; `init`
+  writes it, `config set` validates it, `doctor` and `flow status` show it).
+  `GET /flow/<date>`, `/runs`, `/flow-missions` and the live tail read both streams
+  and merge them in hub order; the outage backfill never re-sends a sample (the
+  next one supersedes it). `flow status --json` gains `telemetry_stream`
+  and `telemetry_max_len` (`tests/cli-json.golden` regenerated).
+  **Upgraders:** the old samples stay on the work stream until they age out; no
+  action needed.
+- **Hub outage watermark hardening** (#3062 follow-ups). The watermark's generation
+  never restarts at 1 when its file is lost (it starts at the clock's nanoseconds),
+  its temp file is fsynced before the rename, a torn-tail sidecar's directory is
+  fsynced so its name survives a power cut, and the sink's disable warning names
+  what failed last (`write` or `backfill`) instead of counting both as writes.
+
 - **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
   check no longer treats a flow record without a `machine_uid` as a known name
   (a record with no uid names no machine), and the retired Redis-queue

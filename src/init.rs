@@ -767,6 +767,7 @@ mod tests {
         // scalar defaults are written (not left to invisible code-defaults).
         assert_eq!(cfg.redis.as_ref().and_then(|r| r.enabled), Some(false));
         assert_eq!(cfg.redis.as_ref().and_then(|r| r.maxlen), Some(10_000));
+        assert_eq!(cfg.redis.as_ref().and_then(|r| r.telemetry_maxlen), Some(10_000));
         assert_eq!(cfg.audit.as_ref().and_then(|a| a.enabled), Some(false));
         assert_eq!(
             cfg.runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds),

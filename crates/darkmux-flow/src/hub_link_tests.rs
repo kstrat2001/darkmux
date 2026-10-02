@@ -22,8 +22,14 @@ use tempfile::TempDir;
 
 const STREAM: &str = "darkmux:flow";
 
-/// One `XADD` the hub accepted: its `record` field, and whether it carried `late`.
-type Stored = (String, bool);
+/// One `XADD` the hub accepted: the stream it went to, its `MAXLEN ~` cap if
+/// it carried one, its `record` field, and whether it carried `late`.
+struct Stored {
+    stream: String,
+    maxlen: Option<usize>,
+    record: String,
+    late: bool,
+}
 
 struct Hub {
     port: u16,
@@ -110,14 +116,25 @@ impl Hub {
         }
     }
 
-    /// Every entry on the stream, oldest first: `(record json, late marker)`.
+    /// Every entry on the work stream, oldest first: `(record json, late marker)`.
     fn entries(&self) -> Vec<(serde_json::Value, bool)> {
+        self.entries_on(STREAM)
+    }
+
+    /// Every entry on `stream`, oldest first.
+    fn entries_on(&self, stream: &str) -> Vec<(serde_json::Value, bool)> {
         self.stored
             .lock()
             .unwrap()
             .iter()
-            .map(|(record, late)| (serde_json::from_str(record).unwrap(), *late))
+            .filter(|e| e.stream == stream)
+            .map(|e| (serde_json::from_str(&e.record).unwrap(), e.late))
             .collect()
+    }
+
+    /// The `MAXLEN ~` cap each `XADD` to `stream` carried.
+    fn maxlens_on(&self, stream: &str) -> Vec<Option<usize>> {
+        self.stored.lock().unwrap().iter().filter(|e| e.stream == stream).map(|e| e.maxlen).collect()
     }
 }
 
@@ -148,14 +165,16 @@ fn read_command(r: &mut impl BufRead) -> Option<Vec<String>> {
 }
 
 /// `XADD key [MAXLEN ~ n] * field value ...`: keep the `record` field and
-/// whether `late` was set. The MAXLEN cap is parsed past, not applied.
+/// whether `late` was set. The MAXLEN cap is recorded, not applied.
 fn xadd_fields(args: &[String]) -> Option<Stored> {
     let mut i = 2;
+    let mut maxlen = None;
     if args.get(i)?.eq_ignore_ascii_case("MAXLEN") {
         i += 1;
         if matches!(args.get(i)?.as_str(), "~" | "=") {
             i += 1;
         }
+        maxlen = args.get(i)?.parse().ok();
         i += 1; // the count
     }
     i += 1; // the id (`*`)
@@ -167,7 +186,7 @@ fn xadd_fields(args: &[String]) -> Option<Stored> {
             _ => {}
         }
     }
-    Some((record?, late))
+    Some(Stored { stream: args.get(1)?.clone(), maxlen, record: record?, late })
 }
 
 fn serve_connection(stream: TcpStream, stored: &Mutex<Vec<Stored>>, reject_xadd: &AtomicBool) {
@@ -625,4 +644,62 @@ fn a_stale_clear_after_a_clear_and_a_new_record_keeps_the_newer_outage() {
     w.clear_if(tick_read.seq).unwrap();
     let kept = w.load().expect("the newer outage must survive the stale clear");
     assert_eq!(kept.since, "2026-01-01T00:05:00Z");
+}
+
+const TELEMETRY_STREAM: &str = "darkmux:flow:telemetry";
+
+fn telemetry_rec(handle: &str, secs_ago: i64) -> FlowRecord {
+    let mut r = rec(handle, secs_ago);
+    r.action = crate::FlowAction::MachineTelemetry;
+    r
+}
+
+/// (#2101) `machine.telemetry` is most of the hub's records by volume, so it
+/// rides its own stream with its own cap; every other record stays on the
+/// work stream under that stream's cap.
+#[test]
+fn machine_telemetry_rides_its_own_stream_with_its_own_cap() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::LongLived).with_telemetry(TELEMETRY_STREAM, Some(500));
+    write(&s, &dir, &rec("work", 5));
+    write(&s, &dir, &telemetry_rec("sample", 4));
+    assert_eq!(handles(&hub.entries_on(STREAM)), ["work"], "telemetry must not touch the work stream");
+    assert_eq!(handles(&hub.entries_on(TELEMETRY_STREAM)), ["sample"]);
+    assert_eq!(hub.maxlens_on(STREAM), [Some(10_000)]);
+    assert_eq!(hub.maxlens_on(TELEMETRY_STREAM), [Some(500)]);
+}
+
+/// Telemetry is live state, so a backfill after an outage does not re-send it
+/// to either stream: the next sample supersedes the missed ones.
+#[test]
+fn the_backfill_never_resends_telemetry() {
+    let dir = TempDir::new().unwrap();
+    let mut hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::LongLived);
+    let during = [rec("g1", 40), telemetry_rec("t1", 35), rec("g2", 30), rec("g3", 25)];
+    outage(&mut hub, &dir, &s, &rec("b1", 50), &during);
+    hub.up();
+    write(&s, &dir, &rec("after", 1));
+    assert_eq!(handles(&hub.entries_on(STREAM)), ["g1", "g2", "g3", "after"]);
+    assert!(hub.entries_on(TELEMETRY_STREAM).is_empty(), "a missed sample is not backfilled");
+}
+
+/// The generation must not restart at 1 when the state file is gone or
+/// unreadable: a backfill that read generation N must never see a newer
+/// outage reuse N.
+#[test]
+fn a_lost_state_file_does_not_restart_the_generation() {
+    let dir = TempDir::new().unwrap();
+    let w = hub_link::OutageWatermark::new(watermark_file(&dir));
+    w.record("2026-01-01T00:00:10Z").unwrap();
+    let first = w.load().unwrap().seq;
+    std::fs::remove_file(watermark_file(&dir)).unwrap();
+    w.record("2026-01-01T00:00:20Z").unwrap();
+    let after_missing = w.load().unwrap().seq;
+    assert!(after_missing > first, "generation {after_missing} after a missing file must be past {first}");
+    std::fs::write(watermark_file(&dir), "{ not json").unwrap();
+    w.record("2026-01-01T00:00:30Z").unwrap();
+    let after_corrupt = w.load().unwrap().seq;
+    assert!(after_corrupt > after_missing, "generation {after_corrupt} after a corrupt file must be past {after_missing}");
 }

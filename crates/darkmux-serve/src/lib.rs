@@ -3170,9 +3170,9 @@ fn read_cpu_brand() -> Option<String> {
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
 ///
 /// When `DARKMUX_REDIS_URL` is set + reachable at request time, the
-/// stream comes from `XREAD BLOCK darkmux:flow $` — the **fleet-wide**
-/// tail of new records from every machine writing to the shared
-/// stream. When Redis is unset OR unreachable at probe time, falls
+/// stream comes from `XREAD BLOCK darkmux:flow $` (and the machine-telemetry
+/// stream beside it) — the **fleet-wide** tail of new records from every
+/// machine writing to the shared streams. When Redis is unset OR unreachable at probe time, falls
 /// back to file-tailing `<flows_dir>/<date>.jsonl` (today's
 /// per-machine behavior). #270 PR-B.
 ///
@@ -3230,13 +3230,18 @@ async fn flow_stream_handler(
     let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
         if redis_reachable {
             let url = redis_url.expect("redis_reachable implies url");
-            let stream_name = darkmux_types::config_access::redis_stream(); // (#875)
+            // (#875, #2101) Both hub streams: work records and the machine
+            // samples ride separate streams, and the live view needs both.
+            let stream_names = vec![
+                darkmux_types::config_access::redis_stream(),
+                darkmux_types::config_access::redis_telemetry_stream(),
+            ];
             Box::pin(
                 // expose_for_probe(): redis_tail_lines + resolve_current_last_id
                 // use the URL only for Client::open and never log it (they
                 // pre-date the RawRedisUrl wrapper and handle the raw string
                 // safely), so the secret stays unlogged. (#661 Slice 5)
-                redis_tail_lines(url.expose_for_probe().to_string(), stream_name, date_owned)
+                redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned)
                     .map(|line| Ok(Event::default().data(line))),
             )
         } else {
@@ -4027,7 +4032,9 @@ fn join_host_samples_into_session_records(
 ///    (newest-first — #809: cap-saturation must cut the oldest entries, never
 ///    the newest), parse each entry's `record` field, filter by
 ///    `record.ts.starts_with(date)`, reverse back to chronological.
-///    `darkmux:flow` stream override honored via `DARKMUX_REDIS_STREAM`.
+///    `darkmux:flow` stream override honored via `DARKMUX_REDIS_STREAM`. The
+///    machine-telemetry stream (`<stream>:telemetry`, #2101) is read in the
+///    same round trip and merged in hub order.
 /// 2. Redis configured but unreachable → log the fallback once and read
 ///    the local file. Daemon stays serving rather than 500-ing.
 /// 3. `DARKMUX_REDIS_URL` unset → read the local file directly.
@@ -4518,6 +4525,7 @@ fn read_flow_records_from_redis(
     // is the exact read that took 30s and 408'd the viewer.
     bound_redis_response(&conn);
     let stream = darkmux_types::config_access::redis_stream(); // (#875)
+    let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
     // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
     // the fleet has been busy long enough (XLEN floats a little above the
     // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
@@ -4542,7 +4550,11 @@ fn read_flow_records_from_redis(
     // Redis-configured path still gets the file path's bookend guarantee
     // for records durable on THIS machine; only the Redis-only view of a
     // remote peer's history is still exposed to this cap).
-    let raw: redis::Value = redis::cmd("XREVRANGE")
+    // (#2101) Both hub streams in ONE round trip (a tailnet read of this size
+    // costs ~344ms): the work records and the machine samples, which ride
+    // separate streams so samples cannot evict work records.
+    let (raw, raw_telemetry): (redis::Value, redis::Value) = redis::pipe()
+        .cmd("XREVRANGE")
         .arg(&stream)
         .arg("+")
         .arg("-")
@@ -4551,9 +4563,41 @@ fn read_flow_records_from_redis(
         // `MAX_FLOW_FILE_RECORDS` const defined below in this file —
         // matched by convention, not enforced. Single-sourced now.
         .arg(MAX_FLOW_FILE_RECORDS)
+        .cmd("XREVRANGE")
+        .arg(&telemetry_stream)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(MAX_FLOW_FILE_RECORDS)
         .query(&mut conn)
-        .with_context(|| format!("XREVRANGE on {stream}"))?;
-    records_from_xrevrange(raw, date, darkmux_types::config_access::redis_maxlen())
+        .with_context(|| format!("XREVRANGE on {stream} and {telemetry_stream}"))?;
+    let work = records_from_xrevrange(raw, date, darkmux_types::config_access::redis_maxlen())?;
+    let telemetry =
+        records_from_xrevrange(raw_telemetry, date, darkmux_types::config_access::redis_telemetry_maxlen())?;
+    // `cut` is the work stream's alone: the telemetry stream is a live-state
+    // window by design, so its trimming never means a day's work is missing.
+    Ok(SourceRead { records: merge_by_hub_id(work.records, telemetry.records), cut: work.cut })
+}
+
+/// A record's hub id (`<ms>-<seq>`, #3017) as a sort key.
+fn hub_id_key(record: &serde_json::Value) -> Option<(u64, u64)> {
+    let (ms, seq) = record.get("hub_id")?.as_str()?.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// Merge two chronological runs of hub records into one, in hub order. The hub
+/// assigns ids, so they order records across the two streams even where the
+/// writers' clocks disagree. Stable: on equal keys `a` comes first.
+fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    while let (Some(x), Some(y)) = (a.peek(), b.peek()) {
+        let take_a = hub_id_key(x) <= hub_id_key(y);
+        out.extend(if take_a { a.next() } else { b.next() });
+    }
+    out.extend(a);
+    out.extend(b);
+    out
 }
 
 /// The records an `XREVRANGE` reply holds, read through the flow reader
@@ -4983,7 +5027,7 @@ fn build_tail_stream(
 ///    + the channel closes. (#293)
 fn redis_tail_lines(
     url: String,
-    stream_name: String,
+    stream_names: Vec<String>,
     date_filter: String,
 ) -> impl Stream<Item = String> {
     // Bounded channel — hyper's TCP backpressure only reaches as far
@@ -4999,7 +5043,12 @@ fn redis_tail_lines(
     // with operator-visible log. (#294)
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(SSE_MPSC_CAPACITY);
 
-    tokio::spawn(redis_tail_task(tx, url, stream_name, date_filter));
+    // (#2101) One task per hub stream, all feeding the one channel, so the
+    // work stream and the telemetry stream each keep their own cursor and
+    // their own failure budget.
+    for stream_name in stream_names {
+        tokio::spawn(redis_tail_task(tx.clone(), url.clone(), stream_name, date_filter.clone()));
+    }
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }

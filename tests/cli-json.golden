@@ -862,6 +862,8 @@ RedisStatus
   url: string
   stream: string
   max_len?: uint | null
+  telemetry_stream: string
+  telemetry_max_len?: uint | null
   reachable: boolean
   reachability_error?: string | null
   xlen?: uint64 | null

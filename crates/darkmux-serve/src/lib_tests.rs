@@ -3049,6 +3049,19 @@
         assert_eq!(ids, vec!["1000-0", "2000-0"]);
     }
 
+    /// (#2101) Work records and machine samples are read from two streams and
+    /// come back as one run in hub order, whichever stream each came from.
+    #[test]
+    fn work_and_telemetry_reads_merge_in_hub_order() {
+        let r = |id: &str, action: &str| serde_json::json!({"hub_id": id, "action": action});
+        let work = vec![r("1000-0", "dispatch.start"), r("3000-0", "dispatch.complete")];
+        let telemetry = vec![r("2000-0", "machine.telemetry"), r("2000-1", "machine.telemetry"), r("4000-0", "machine.telemetry")];
+        let merged = super::merge_by_hub_id(work, telemetry);
+        let ids: Vec<_> = merged.iter().map(|m| m["hub_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1000-0", "2000-0", "2000-1", "3000-0", "4000-0"]);
+        assert!(super::merge_by_hub_id(Vec::new(), Vec::new()).is_empty());
+    }
+
     #[test]
     fn a_live_tail_line_carries_its_hub_id() {
         let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, Some("1000-3"));
@@ -3533,6 +3546,114 @@
         fn today_utc_date() -> String {
             darkmux_flow::day_utc_now()
         }
+
+        const WORK_STREAM: &str = "darkmux:flow";
+        const TELEMETRY_STREAM: &str = "darkmux:flow:telemetry";
+
+        fn xlen(url: &str, stream: &str) -> u64 {
+            let client = redis::Client::open(url).expect("redis client");
+            let mut conn = client.get_connection().expect("conn");
+            redis::cmd("XLEN").arg(stream).query(&mut conn).expect("XLEN")
+        }
+
+        /// A sink writing through the production path (`RedisSink`), the two
+        /// streams capped at 100 entries each.
+        fn capped_sink(url: &str) -> darkmux_flow::RedisSink {
+            darkmux_flow::RedisSink::new(url, WORK_STREAM, Some(100))
+                .unwrap()
+                .with_telemetry(TELEMETRY_STREAM, Some(100))
+        }
+
+        fn flow_record(
+            action: darkmux_flow::FlowAction,
+            handle: &str,
+            execution: Option<&darkmux_types::execution_id::ExecutionId>,
+        ) -> darkmux_flow::FlowRecord {
+            use darkmux_types::session_id::{RunId, SessionId};
+            let session = SessionId::adhoc(RunId::mission("telemetry-split").unwrap(), "coder", "sess-2101");
+            let mut r = darkmux_flow::FlowRecord::for_session(
+                &session,
+                darkmux_flow::Level::Info,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                action,
+                handle,
+            );
+            r.execution_id = execution.cloned();
+            r
+        }
+
+        /// (#2101) THE regression: machine samples are most of the hub's
+        /// records by volume, and on one capped stream they flushed a relayed
+        /// run's usage out of the hub within two days. A flood of samples
+        /// must trim only the telemetry stream, and the day read must still
+        /// hand back the usage record, merged in hub order with the samples.
+        #[test]
+        #[serial]
+        fn a_telemetry_flood_does_not_evict_a_usage_record() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use darkmux_flow::FlowSinkWrite as _;
+            let redis = spawn_redis();
+            let sink = capped_sink(&redis.url);
+            let execution = darkmux_types::execution_id::ExecutionId::mint();
+
+            sink.write(&flow_record(darkmux_flow::FlowAction::TelemetryTokens, "usage-first", Some(&execution))).unwrap();
+            for i in 0..1_000 {
+                sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, &format!("sample-{i}"), None)).unwrap();
+            }
+
+            assert_eq!(xlen(&redis.url, WORK_STREAM), 1, "the usage record stays on the work stream");
+            let sampled = xlen(&redis.url, TELEMETRY_STREAM);
+            assert!(sampled < 1_000, "the telemetry stream must be the one that is trimmed, holds {sampled}");
+
+            let read = super::read_flow_records_from_redis(&redis.url, None).unwrap();
+            let actions: Vec<&str> = read.records.iter().filter_map(|r| r["action"].as_str()).collect();
+            assert_eq!(actions.first(), Some(&"telemetry.tokens"), "the usage record is read, first in hub order");
+            assert_eq!(
+                actions.iter().filter(|a| **a == "machine.telemetry").count() as u64,
+                sampled,
+                "every sample the telemetry stream still holds is read back too"
+            );
+        }
+
+        /// (#2101) The live tail follows BOTH hub streams: the machine samples
+        /// that feed the fleet's live readings arrive beside the work records.
+        #[tokio::test]
+        #[serial]
+        async fn the_live_tail_carries_work_records_and_machine_samples() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use darkmux_flow::FlowSinkWrite as _;
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            let stream = redis_tail_lines(
+                redis.url.clone(),
+                vec![WORK_STREAM.to_string(), TELEMETRY_STREAM.to_string()],
+                today,
+            );
+            tokio::pin!(stream);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let sink = capped_sink(&redis.url);
+            sink.write(&flow_record(darkmux_flow::FlowAction::OperatorNote, "work-note", None)).unwrap();
+            sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, "sample", None)).unwrap();
+
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                match next_line(&mut stream, Duration::from_millis(3000)).await {
+                    Some(line) => seen.push(line),
+                    None => break,
+                }
+            }
+            assert!(seen.iter().any(|l| l.contains("work-note")), "work record missing from the tail: {seen:?}");
+            assert!(seen.iter().any(|l| l.contains("machine.telemetry")), "machine sample missing from the tail: {seen:?}");
+        }
+
 
         async fn body_as_array(
             response: axum::response::Response,
@@ -4057,7 +4178,7 @@
 
             let stream = redis_tail_lines(
                 redis.url.clone(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 today.clone(),
             );
             tokio::pin!(stream);
@@ -4130,7 +4251,7 @@
 
             let stream = redis_tail_lines(
                 redis.url.clone(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 today.clone(),
             );
             tokio::pin!(stream);
@@ -4190,7 +4311,7 @@
             // ≈ 5s before the synthetic record + exit.
             let stream = redis_tail_lines(
                 "redis://127.0.0.1:1".to_string(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 "2026-05-23".to_string(),
             );
             tokio::pin!(stream);
