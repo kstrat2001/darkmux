@@ -3,6 +3,7 @@
 use crate::lab::artifact_dirs;
 use crate::lab::cow_clone::cow_clone_dir_excluding;
 use crate::lab::lifecycle;
+use crate::lab::manifest::{ManifestFixture, RunManifest, MANIFEST_FILE};
 use darkmux_types::session_id::{RunId, SessionId};
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
@@ -544,14 +545,11 @@ fn enrich_manifest_with_fixture_info(
     baseline_hash: Option<&str>,
     source_sandbox_dir: &Path,
 ) -> Result<()> {
-    let manifest_path = run_dir.join("manifest.json");
+    let manifest_path = run_dir.join(MANIFEST_FILE);
     if !manifest_path.exists() {
         return Err(anyhow!("manifest.json not present at {}", manifest_path.display()));
     }
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {} as JSON", manifest_path.display()))?;
+    let mut manifest = RunManifest::read(run_dir)?;
 
     // The fixture object names what the model started from. Phase 3
     // will add `name` + `satisfies` + `manifest_version` once the
@@ -563,41 +561,28 @@ fn enrich_manifest_with_fixture_info(
     //     runs; the rare canonicalize failure on an existing dir, e.g.
     //     a permissions quirk, falls back to the raw path).
     //   - source does NOT exist (self-contained workload populated by
-    //     the provider's setup()) → JSON `null`, an explicit "no
+    //     the provider's setup()) → `null`, an explicit "no
     //     source" signal rather than a non-canonical raw path that
     //     would spuriously mismatch a canonicalized run.
-    let source_path = if source_sandbox_dir.exists() {
-        let p = source_sandbox_dir
+    let source_path = source_sandbox_dir.exists().then(|| {
+        source_sandbox_dir
             .canonicalize()
-            .unwrap_or_else(|_| source_sandbox_dir.to_path_buf());
-        serde_json::Value::String(p.display().to_string())
-    } else {
-        serde_json::Value::Null
-    };
-    let fixture = serde_json::json!({
-        "source_path": source_path,
-        "baseline_hash": baseline_hash,
+            .unwrap_or_else(|_| source_sandbox_dir.to_path_buf())
+            .display()
+            .to_string()
     });
-
-    if let Some(obj) = manifest.as_object_mut() {
-        obj.insert("fixture".to_string(), fixture);
-        // (#2494) RAISE to 4, never lower. This enricher mints v4 to mean
-        // "has a `fixture` block", but it runs AFTER the provider, which
-        // may already have written a HIGHER version for a field of its own
-        // (v5 = "has `verify`"). An unconditional insert here silently
-        // downgraded that, stamping v4 onto a manifest that really is v5.
-        let bumped = obj
-            .get("schema_version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            .max(4);
-        obj.insert("schema_version".to_string(), serde_json::json!(bumped));
-    } else {
-        return Err(anyhow!("manifest is not a JSON object"));
-    }
-
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
-        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    manifest.fixture = Some(ManifestFixture {
+        source_path,
+        baseline_hash: baseline_hash.map(str::to_string),
+        extras: Default::default(),
+    });
+    // (#2494) RAISE to 4, never lower. This enricher mints v4 to mean
+    // "has a `fixture` block", but it runs AFTER the provider, which
+    // may already have written a HIGHER version for a field of its own
+    // (v5 = "has `verify`"). An unconditional insert here silently
+    // downgraded that, stamping v4 onto a manifest that really is v5.
+    manifest.raise_schema_version(4);
+    manifest.write(run_dir)?;
     Ok(())
 }
 

@@ -746,20 +746,19 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
         let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
         v.get(key).cloned()
     };
+    let manifest = crate::lab::manifest::RunManifest::read_lenient(run_dir);
     let session_id = side("lifecycle.json", "session_id")
-        .or_else(|| side("manifest.json", "session_id"))
-        .and_then(|v| v.as_str().map(|s| s.to_string()));
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .or_else(|| manifest.as_ref().and_then(|m| m.session_id.clone()));
     // The manifest records verify as `{passed, details}`; older runs wrote a
     // bare string. Normalized to one word here so a caller comparing runs
     // across that change is not comparing two shapes.
-    let verify = side("manifest.json", "verify").and_then(|v| match &v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        _ => v
-            .get("passed")
-            .and_then(|p| p.as_bool())
-            .map(|p| if p { "pass" } else { "fail" }.to_string()),
+    let verify = manifest.as_ref().and_then(|m| match m.verify.as_ref()?.as_ref()? {
+        crate::lab::manifest::ManifestVerify::Legacy(word) => Some(word.clone()),
+        crate::lab::manifest::ManifestVerify::Report(r) => Some(if r.passed { "pass" } else { "fail" }.to_string()),
+        crate::lab::manifest::ManifestVerify::Unrecognized(_) => None,
     });
-    let ok = side("manifest.json", "ok").and_then(|v| v.as_bool());
+    let ok = manifest.as_ref().and_then(|m| m.ok);
 
     // (#2833) A run's verify came from BEFORE the write-the-tests work gate
     // existed iff: verify was recorded at all, the manifest's schema
@@ -769,10 +768,8 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     // declares a `baseline.test_count` — i.e. the gate WOULD have applied
     // had it existed yet. Best-effort: if the fixture path is gone or
     // unreadable, this stays `false` rather than guessing.
-    let schema_version = side("manifest.json", "schema_version").and_then(|v| v.as_u64());
-    let fixture_source_path = side("manifest.json", "fixture")
-        .and_then(|f| f.get("source_path").cloned())
-        .and_then(|v| v.as_str().map(str::to_string));
+    let schema_version = manifest.as_ref().and_then(|m| m.schema_version);
+    let fixture_source_path = manifest.as_ref().and_then(|m| m.fixture.as_ref()?.source_path.clone());
     let verify_ungated = verify.is_some()
         && schema_version.unwrap_or(0) < 6
         && fixture_source_path

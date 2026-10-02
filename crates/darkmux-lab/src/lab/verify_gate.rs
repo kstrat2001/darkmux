@@ -45,9 +45,9 @@
 //! closed for that case too.
 
 use crate::lab::fixture::FixtureManifest;
-use anyhow::{anyhow, Context, Result};
-use serde_json::json;
+use anyhow::{anyhow, Result};
 use crate::lab::dispatch_end::DispatchEnd;
+use crate::lab::manifest::{ManifestVerify, ManifestVerifyReport, RunManifest, WorkGate, WorkGateEvidence};
 use std::fs;
 use std::path::Path;
 
@@ -470,18 +470,15 @@ fn detect_command_tampering(fixture_dir: &Path, sandbox_dir: &Path) -> Option<St
     }
 }
 
-fn read_manifest(run_dir: &Path) -> Result<serde_json::Value> {
-    let manifest_path = run_dir.join("manifest.json");
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {} as JSON", manifest_path.display()))
-}
-
-fn write_manifest(run_dir: &Path, manifest: &serde_json::Value) -> Result<()> {
-    let manifest_path = run_dir.join("manifest.json");
-    fs::write(&manifest_path, serde_json::to_string_pretty(manifest)?)
-        .with_context(|| format!("writing {}", manifest_path.display()))
+/// The report a gate rewrites, or `None` when the run's `verify` is null or absent (the
+/// workload declares none: there is no verdict to gate). A `verify` that is present but is
+/// not the `{passed, details}` object is an error: nothing here can write a verdict into it.
+fn verify_to_gate(manifest: &mut RunManifest) -> Result<Option<&mut ManifestVerifyReport>> {
+    match manifest.verify.as_mut() {
+        Some(Some(ManifestVerify::Report(report))) => Ok(Some(report.as_mut())),
+        Some(Some(_)) => Err(anyhow!("manifest `verify` is not a JSON object")),
+        _ => Ok(None),
+    }
 }
 
 /// Force `verify.passed = false` with `reason` into the manifest's `verify`
@@ -491,31 +488,15 @@ fn write_manifest(run_dir: &Path, manifest: &serde_json::Value) -> Result<()> {
 /// declared (valid or malformed) but something else about applying the gate
 /// went wrong, so the raw exit-0 verdict can never stand unexamined.
 fn gate_with_forced_failure(run_dir: &Path, reason: &str) -> Result<Option<WorkGateResult>> {
-    let mut manifest = read_manifest(run_dir)?;
-    let verify_is_null = manifest.get("verify").map(|v| v.is_null()).unwrap_or(true);
-    if verify_is_null {
+    let mut manifest = RunManifest::read(run_dir)?;
+    let Some(report) = verify_to_gate(&mut manifest)? else {
         return Ok(None);
-    }
-    let obj = manifest
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("manifest is not a JSON object"))?;
-    let verify_obj = obj
-        .get_mut("verify")
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| anyhow!("manifest `verify` is not a JSON object"))?;
-    verify_obj.insert("passed".to_string(), json!(false));
-    verify_obj.insert("details".to_string(), json!(reason));
-    verify_obj.insert(
-        "work_gate".to_string(),
-        json!({ "forced_failure_reason": reason }),
-    );
-    let bumped = obj
-        .get("schema_version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .max(6);
-    obj.insert("schema_version".to_string(), json!(bumped));
-    write_manifest(run_dir, &manifest)?;
+    };
+    report.passed = false;
+    report.details = reason.to_string();
+    report.work_gate = Some(WorkGate::Forced { forced_failure_reason: reason.to_string() });
+    manifest.raise_schema_version(6);
+    manifest.write(run_dir)?;
     Ok(Some(WorkGateResult {
         passed: false,
         details: reason.to_string(),
@@ -537,35 +518,25 @@ fn warn_coverage_declared_without_baseline(
     let Some(min) = coverage_min_pct else {
         return Ok(None); // no coverage threshold declared — fully untouched, today's behavior.
     };
-    let mut manifest = read_manifest(run_dir)?;
+    let mut manifest = RunManifest::read(run_dir)?;
     let note = format!(
         "note: workload declares coverage_min_pct={min:.1}% but this run's fixture declares no \
          baseline.test_count, so the write-the-tests work gate does not apply here — coverage \
          was NOT graded"
     );
     eprintln!("[lab] warn: {note}");
-    let Some(obj) = manifest.as_object_mut() else {
-        return Ok(None);
+    let report = match manifest.verify.as_mut() {
+        Some(Some(ManifestVerify::Report(report))) => report,
+        _ => return Ok(None), // verify null/absent, or not a report: nothing to annotate.
     };
-    let Some(verify_obj) = obj.get_mut("verify").and_then(|v| v.as_object_mut()) else {
-        return Ok(None); // verify null/absent — nothing to annotate.
-    };
-    let existing = verify_obj
-        .get("details")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let updated = if existing.is_empty() {
+    let updated = if report.details.is_empty() {
         note
     } else {
-        format!("{existing}; {note}")
+        format!("{}; {note}", report.details)
     };
-    let passed = verify_obj
-        .get("passed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    verify_obj.insert("details".to_string(), json!(updated));
-    write_manifest(run_dir, &manifest)?;
+    let passed = report.passed;
+    report.details = updated.clone();
+    manifest.write(run_dir)?;
     Ok(Some(WorkGateResult {
         passed,
         details: updated,
@@ -585,38 +556,25 @@ fn run_full_gate(
     baseline_test_count: u64,
     coverage_min_pct: Option<f32>,
 ) -> Result<Option<WorkGateResult>> {
-    let mut manifest = read_manifest(run_dir)?;
+    let mut manifest = RunManifest::read(run_dir)?;
 
     // A workload whose fixture HAS a baseline but which itself declares no
     // verify command at all is an odd combination, but not this module's to
     // adjudicate — leave `verify: null` exactly as the provider wrote it.
-    let verify_is_null = manifest.get("verify").map(|v| v.is_null()).unwrap_or(true);
-    if verify_is_null {
+    let Some(report) = verify_to_gate(&mut manifest)? else {
         return Ok(None);
-    }
+    };
+    // #2833 review finding 7a: a missing/non-bool `passed` reads as FAILED, never
+    // passed (`ManifestVerifyReport::passed` is false unless it is a JSON `true`;
+    // see `apply_treats_missing_command_passed_as_failed`).
+    let verify_command_passed = report.passed;
 
-    let final_hash = manifest
-        .get("final_hash")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let baseline_hash = manifest
-        .get("fixture")
-        .and_then(|f| f.get("baseline_hash"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let final_hash = manifest.final_hash_value().map(str::to_string);
+    let baseline_hash = manifest.baseline_hash().map(str::to_string);
     let sandbox_changed = match (&final_hash, &baseline_hash) {
         (Some(f), Some(b)) => Some(f != b),
         _ => None,
     };
-
-    // #2833 review finding 7a: missing/non-bool `passed` must read as
-    // FAILED, never passed — `.unwrap_or(false)` is load-bearing, not
-    // decorative (see `apply_treats_missing_command_passed_as_failed`).
-    let verify_command_passed = manifest
-        .get("verify")
-        .and_then(|v| v.get("passed"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     let verify_output = fs::read_to_string(run_dir.join("verify-output.txt")).unwrap_or_default();
     let summary = parse_node_test_summary(&verify_output);
@@ -643,47 +601,36 @@ fn run_full_gate(
     };
     let gate_result = evaluate(&input);
 
-    let obj = manifest
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("manifest is not a JSON object"))?;
-    let verify_obj = obj
-        .get_mut("verify")
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| anyhow!("manifest `verify` is not a JSON object"))?;
-    verify_obj.insert("passed".to_string(), json!(gate_result.passed));
-    verify_obj.insert("details".to_string(), json!(gate_result.details));
-    verify_obj.insert(
-        "work_gate".to_string(),
-        json!({
-            "baseline_test_count": baseline_test_count,
-            "tests_total": summary.map(|s| s.tests),
-            "tests_passed": summary.map(|s| s.pass),
-            "tests_added": gate_result.tests_added,
-            "tests_failed": summary.map(|s| s.fail),
-            "tests_skipped": summary.map(|s| s.skipped),
-            "tests_todo": summary.map(|s| s.todo),
-            "sandbox_changed": sandbox_changed,
-            "coverage_min_pct": coverage_min_pct,
-            "coverage_pct": coverage_pct,
-            "command_tampered": command_tampered,
-            // The raw "did the verify command exit 0" signal, preserved
-            // distinctly from the gated `passed` above it — #2833's finding
-            // was precisely that this signal alone is vacuous for a
-            // write-the-tests workload, not that it's wrong to record.
-            "command_passed": verify_command_passed,
-        }),
-    );
+    let Some(report) = verify_to_gate(&mut manifest)? else {
+        return Ok(None);
+    };
+    report.passed = gate_result.passed;
+    report.details = gate_result.details.clone();
+    report.work_gate = Some(WorkGate::Evidence(Box::new(WorkGateEvidence {
+        baseline_test_count: Some(baseline_test_count),
+        tests_total: summary.map(|s| s.tests),
+        tests_passed: summary.map(|s| s.pass),
+        tests_added: gate_result.tests_added,
+        tests_failed: summary.map(|s| s.fail),
+        tests_skipped: summary.map(|s| s.skipped),
+        tests_todo: summary.map(|s| s.todo),
+        sandbox_changed,
+        coverage_min_pct,
+        coverage_pct,
+        command_tampered,
+        // The raw "did the verify command exit 0" signal, preserved
+        // distinctly from the gated `passed` above it — #2833's finding
+        // was precisely that this signal alone is vacuous for a
+        // write-the-tests workload, not that it's wrong to record.
+        command_passed: Some(verify_command_passed),
+        extras: Default::default(),
+    })));
 
     // RAISE-never-lower, same discipline as `enrich_manifest_with_fixture_info`
     // two callers up the same file.
-    let bumped = obj
-        .get("schema_version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .max(6);
-    obj.insert("schema_version".to_string(), json!(bumped));
+    manifest.raise_schema_version(6);
 
-    write_manifest(run_dir, &manifest)?;
+    manifest.write(run_dir)?;
     Ok(Some(gate_result))
 }
 

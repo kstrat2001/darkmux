@@ -74,7 +74,7 @@
   "crates/darkmux-lab/src/lab/stats_render.rs::sets_text": 21,
   "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::run": 17,
   "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::setup": 24,
-  "crates/darkmux-lab/src/providers/tool_bench.rs::WorkloadProvider for ToolBenchProvider::run": 29,
+  "crates/darkmux-lab/src/providers/tool_bench.rs::WorkloadProvider for ToolBenchProvider::run": 28,
   "crates/darkmux-lab/src/providers/workspace_delta.rs::walk_dir": 18,
   "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs::parse_gguf_header_from_reader": 40,
   "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs::read_gguf_scalar": 24,
