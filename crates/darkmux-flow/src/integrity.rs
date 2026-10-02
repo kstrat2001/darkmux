@@ -355,12 +355,19 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
     Ok(())
 }
 
-/// Write `bytes` to a new file at `path` and fsync it.
+/// Write `bytes` to a new file at `path` and fsync it, then its directory, so
+/// the new name survives a power cut as well as the bytes.
 fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(bytes)?;
-    f.sync_all()
+    f.sync_all()?;
+    #[cfg(unix)]
+    {
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Sidecars of torn tails set aside next to `path` (see
