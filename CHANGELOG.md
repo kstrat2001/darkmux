@@ -1517,13 +1517,14 @@ darkmux release.
   origin record (opened without following symlinks, and only if this user owns
   it), and `doctor`'s orphan count covers it. Because a lock dies with the
   darkmux process, a resume also asks docker and is refused while the origin's
-  recorded container is still running. If a phase stop's `docker kill` fails, the
+  recorded container is still running (including the container of an earlier
+  resume, which is recorded on the origin too). If a phase stop's `docker kill` fails, the
   watchdog's retried kill takes over at once.
 - **A hosted call the endpoint may have processed is charged, once, one way** (5.0).
   A timeout or dropped reply after the request was sent, an unreadable reply,
   and a 5xx write an `absent` usage record (the endpoint's window counts it as
   a call) and charge the per-dispatch cap what a reply with no usage is charged:
-  the granted cap plus the estimated prompt. A failure before sending, a 4xx
+  the granted cap plus the estimated prompt. A failure before sending, a redirect (3xx), a 4xx
   (400, 401, 403) and a 429 charge nothing. `dispatch`, `dispatch.single_shot`
   and `dispatch.map` share the rule; the last two used to charge nothing on any
   error.

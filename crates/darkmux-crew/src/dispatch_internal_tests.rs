@@ -784,7 +784,7 @@
         let script = format!(
             "#!/bin/sh\n[ \"$1\" = warm-up ] && exit 0\necho \"$@\" >> {rec}\n\
              if [ \"$1\" = kill ]; then\n  n=$(cat {cnt} 2>/dev/null || echo 0)\n  echo $((n+1)) > {cnt}\n  [ \"$n\" = 0 ] && exit 1\nfi\n\
-             if [ \"$1\" = ps ] && [ -e {run} ]; then echo abc123; fi\nexit 0\n",
+             if [ \"$1\" = ps ] && [ -e {run} ]; then case \"$*\" in *\"$(cat {run})\"*) echo abc123;; esac; fi\nexit 0\n",
             rec = record.display(),
             cnt = dir.path().join("kills").display(),
             run = dir.path().join("running").display(),
@@ -850,7 +850,7 @@
     #[serial]
     fn a_resume_is_refused_while_the_origins_container_is_still_running() {
         let (_ws, prior, _) = origin_dir();
-        record_origin_container(prior.path(), "darkmux-dispatch-orphan");
+        record_origin_container(prior.path(), "darkmux-dispatch-orphan", None);
         let dir = TempDir::new().unwrap();
         let (record, prev_path) = install_scripted_docker(&dir);
         std::fs::write(dir.path().join("running"), "").unwrap();
@@ -863,6 +863,71 @@
         assert!(allowed, "allowed once the container is gone");
         let ps = std::fs::read_to_string(&record).unwrap();
         assert!(ps.contains("name=^darkmux-dispatch-orphan$"), "asked docker about the recorded name: {ps}");
+    }
+
+    /// `record_origin_container` writes the dispatch's own container into its
+    /// origin record (the name a later resume asks docker about), and, for a
+    /// resume, appends it to the origin it resumed.
+    #[test]
+    fn the_containers_are_recorded_on_the_origin_record() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, resume, _) = origin_dir();
+        record_origin_container(origin.path(), "darkmux-dispatch-c0", None);
+        assert_eq!(origin_containers(origin.path()), vec!["darkmux-dispatch-c0"]);
+        record_origin_container(resume.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        record_origin_container(resume.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        assert_eq!(origin_containers(resume.path()), vec!["darkmux-dispatch-c1"], "its own record");
+        assert_eq!(
+            origin_containers(origin.path()),
+            vec!["darkmux-dispatch-c0", "darkmux-dispatch-c1"],
+            "the origin names the resume's container too, once"
+        );
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").unwrap()];
+        assert_eq!(
+            src.matches("record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());").count(),
+            1,
+            "dispatch() records its container, and on the origin when it resumes"
+        );
+    }
+
+    /// The exact sequence: resume R1 of O runs container C1, R1's darkmux is
+    /// SIGKILLed (its lock is gone, C1 runs on), and `--resume-from O` finds O's
+    /// lock free and its own container C0 stopped. It must still be refused,
+    /// because O's record names C1.
+    #[test]
+    #[serial]
+    fn a_resume_is_refused_while_a_previous_resumes_container_still_runs() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, r1, _) = origin_dir();
+        record_origin_container(origin.path(), "darkmux-dispatch-c0", None);
+        record_origin_container(r1.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        let dir = TempDir::new().unwrap();
+        let (_record, prev_path) = install_scripted_docker(&dir);
+        std::fs::write(dir.path().join("running"), "darkmux-dispatch-c1").unwrap();
+        let refused = claim_resume_origin(origin.path()).err().map(|e| e.to_string());
+        std::fs::remove_file(dir.path().join("running")).unwrap();
+        let allowed = claim_resume_origin(origin.path()).is_ok();
+        restore_path(prev_path);
+        let msg = refused.expect("refused while C1 runs");
+        assert!(msg.contains("darkmux-dispatch-c1") && !msg.contains("darkmux-dispatch-c0"), "{msg}");
+        assert!(allowed, "allowed once C1 is gone");
+    }
+
+    /// A redirect means the endpoint processed nothing (curl does not follow
+    /// it): not charged, and the error says what to check. A non-JSON 2xx
+    /// stays charged, since the work may have happened.
+    #[test]
+    fn a_redirect_is_not_charged_but_a_non_json_success_is() {
+        for status in [301, 302, 307, 308] {
+            let e = classified_hosted_error(Some(status), "<html>moved</html>");
+            assert!(!call_may_have_spent(&e), "{status}");
+            assert!(e.to_string().contains("redirected") && e.to_string().contains("base URL"), "{e}");
+        }
+        let odd = classified_hosted_error(Some(100), "");
+        assert!(!call_may_have_spent(&odd) && odd.to_string().contains("unexpected HTTP status 100"), "{odd}");
+        assert!(call_may_have_spent(&classified_hosted_error(Some(200), "<html>ok?</html>")), "a non-JSON 200");
+        assert!(call_may_have_spent(&classified_hosted_error(Some(204), "")), "an empty 204");
     }
 
     /// A dispatch that has stamped its identity holds its out-dir's lock:

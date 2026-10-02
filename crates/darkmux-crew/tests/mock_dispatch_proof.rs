@@ -558,6 +558,13 @@ fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume(
         flow_actions(flows_dir.path(), &session_id).iter().any(|a| a == "dispatch.rest")
     });
     let live_containers = docker_names("darkmux-dispatch-");
+    // The origin record names the container docker is actually running, which
+    // is what a resume after a SIGKILL of darkmux asks docker about.
+    let origin_record: Value = serde_json::from_str(
+        &std::fs::read_to_string(darkmux_types::paths::resume_origin_record_path(&out_dir).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let recorded_container = origin_record.get("container").and_then(Value::as_str).unwrap_or_default().to_string();
     // A resume of the running dispatch is refused while its lock is held.
     let resume_err = dispatch(opts(
         darkmux_types::session_id::SessionId::adhoc(
@@ -584,6 +591,10 @@ fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume(
     let stop_err = format!("{:#}", handle.join().unwrap().map(|_| ()).unwrap_err());
 
     assert!(!live_containers.is_empty(), "a real container was running when the stop landed");
+    assert!(
+        live_containers.contains(&recorded_container),
+        "the origin record's `container` ({recorded_container:?}) must be the running docker container, not one of {live_containers:?}"
+    );
     assert!(format!("{resume_err:#}").contains("still running"), "{resume_err:#}");
     assert!(lock_held_during, "the running dispatch held its execution lock");
     assert!(stop_err.contains("was stopped") && stop_err.contains("phase `p1`"), "{stop_err}");

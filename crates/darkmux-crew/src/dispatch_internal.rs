@@ -1287,8 +1287,22 @@ fn stamp_own_execution(
 /// Record the container this dispatch runs in, in its resume-origin record, so
 /// a later resume can tell the container is still up after the darkmux
 /// process that started it (and held the lock) was killed. Best effort.
-fn record_origin_container(host_out: &Path, container_name: &str) {
+fn record_origin_container(host_out: &Path, container_name: &str, resume_from: Option<&Path>) {
     update_origin_field(host_out, "container", serde_json::Value::String(container_name.to_string()));
+    // A resume's container is also recorded on the origin it resumed, which a
+    // later `--resume-from` that origin reads: otherwise a resume whose darkmux
+    // process was killed leaves its container invisible to the next claim.
+    if let Some(origin) = resume_from {
+        let mut names = origin_resume_containers(origin);
+        if !names.iter().any(|n| n == container_name) {
+            names.push(container_name.to_string());
+        }
+        update_origin_field(
+            origin,
+            "containers",
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
 }
 
 /// Set one key in `out_dir`'s host-only origin record, keeping the rest.
@@ -1345,7 +1359,7 @@ pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
     };
     // The lock lives only as long as the darkmux process: after a SIGKILL of
     // it the container keeps running with no lock held. Ask docker too.
-    if let Some(name) = origin_container(resume_from) {
+    for name in origin_containers(resume_from) {
         if probe_container_liveness(&name) == Liveness::Running {
             bail_resume!(
                 "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its container `{name}` \
@@ -1396,11 +1410,30 @@ fn complete_execution_on_success(exit_code: i32, host_out: &Path, resume_from: O
     }
 }
 
-/// The container name `out_dir`'s dispatch recorded, when it recorded one.
-fn origin_container(out_dir: &Path) -> Option<String> {
-    let raw = read_resume_origin(out_dir).ok()?;
-    let origin: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    origin.get("container")?.as_str().map(str::to_string)
+/// The containers of the resumes that continued `out_dir`'s dispatch, as its
+/// origin record names them (`containers`).
+fn origin_resume_containers(out_dir: &Path) -> Vec<String> {
+    let Some(origin) = read_resume_origin(out_dir).ok().and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+    else {
+        return Vec::new();
+    };
+    origin
+        .get("containers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Every container recorded in `out_dir`'s origin record: its own dispatch's
+/// (`container`) and those of the resumes that continued it.
+fn origin_containers(out_dir: &Path) -> Vec<String> {
+    let own = read_resume_origin(out_dir)
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|o| o.get("container").and_then(|v| v.as_str()).map(str::to_string));
+    own.into_iter().chain(origin_resume_containers(out_dir)).collect()
 }
 
 fn resume_origin_completed(out_dir: &Path) -> bool {
@@ -3759,9 +3792,25 @@ pub(crate) fn classify_hosted_response(
     status: Option<u16>,
     body: &[u8],
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
-    let Some(status) = status.filter(|s| matches!(s, 400..=599)) else {
-        return parse_hosted_response(body);
+    let status = match status {
+        // A 2xx, or no usable status: the body's own shape decides. A
+        // non-JSON 2xx stays charged (the work may have happened).
+        None | Some(200..=299) => return parse_hosted_response(body),
+        Some(s) => s,
     };
+    if (300..=399).contains(&status) {
+        // curl does not follow redirects: nothing was processed.
+        return Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("the endpoint redirected (HTTP {status}); check the base URL"),
+        )));
+    }
+    if !(400..=599).contains(&status) {
+        return Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("the endpoint answered with an unexpected HTTP status {status}; check the base URL"),
+        )));
+    }
     let message = || {
         let text = String::from_utf8_lossy(body);
         let from_body = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| {
@@ -6394,7 +6443,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             })
             .collect::<String>()
     );
-    record_origin_container(&host_out, &container_name);
+    record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());
 
     // Build the complete docker-run argv via the pure function (#842).
     // All inputs are resolved above; this is a single deterministic call.
