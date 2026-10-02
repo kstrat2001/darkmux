@@ -73,6 +73,8 @@ A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #
 
 ## Step 3: `config.json`
 
+Leftovers at their old defaults (what `init` wrote) only warn and are safe to delete; a value the user set is refused until it is moved (#3057). Doctor shows the first as a warning and the second as a failure.
+
 `darkmux config` cannot delete a key, so these are hand edits (the Edit tool, or `jq` writing a `.new` file that you check with `jq -e .` before moving it into place). Delete each of these when present:
 
 | Key | Why (from doctor) |

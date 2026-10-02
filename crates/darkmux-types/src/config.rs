@@ -386,7 +386,8 @@ use std::path::Path;
 //           single-shot path) and the whole `machine_rollup{}` block (and its
 //           two env vars; the `machine.rollup` flow record is gone). Both are
 //           `RETIRED_SETTINGS` entries: an env var warns, a leftover config
-//           key is named by the unknown-key gate. Additive
+//           key is named by the unknown-key gate and judged by its value
+//           (`LeftoverValue`, #3057). Additive
 //           `fleet.accept_work.<name>.repos`, the names of repos in the
 //           receiver's future registry that the peer may hand work off
 //           against; absent or empty means none. Reserved for git workspace
@@ -403,7 +404,8 @@ use std::path::Path;
 //           (`endpoints.<id>.limits.tokens_per_dispatch`,
 //           `.concurrent_calls`, `.window`, `.policy`, `.warn_at`). Each is a
 //           `RETIRED_SETTINGS` entry naming its replacement: an env var
-//           warns, a leftover config key is named by the unknown-key gate.
+//           warns, a leftover config key is named by the unknown-key gate
+//           and judged by its value (`LeftoverValue`, #3057).
 //           Nothing is carried over: limits are off until set per endpoint.
 //           Folded into a minor bump like 2.2's removals.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
@@ -447,8 +449,70 @@ pub struct RetiredSetting {
     /// would quietly change behavior; `Warn` when nothing reads it and nothing
     /// is lost. Meaningless without an `env`.
     pub env_policy: LeftoverPolicy,
+    /// How a leftover `config.json` key's VALUE is judged (#3057): at the
+    /// default `darkmux init` once wrote (or any value, where ignoring it
+    /// changes nothing) it only warns; anything else is refused.
+    pub leftover: LeftoverValue,
     /// What replaced it, or that nothing did, and what to do.
     pub line: &'static str,
+}
+
+/// A value `darkmux init` once wrote for a retired key, or one a retired key
+/// held by default: ignoring it loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldDefault {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(&'static str),
+    EmptyArray,
+}
+
+impl OldDefault {
+    fn matches(self, value: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match (self, value) {
+            (OldDefault::Null, Value::Null) => true,
+            (OldDefault::Bool(want), Value::Bool(got)) => want == *got,
+            (OldDefault::Int(want), Value::Number(n)) => n.as_i64() == Some(want),
+            (OldDefault::Str(want), Value::String(got)) => want == got,
+            (OldDefault::EmptyArray, Value::Array(a)) => a.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+/// How a retired `config.json` key's leftover value is judged (#3057, 5.0):
+/// a value ignoring which changes nothing only WARNS and every command still
+/// starts; a value ignoring which would change something (a spend cap that
+/// was set, a feature that was turned on) is REFUSED until the operator
+/// moves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftoverValue {
+    /// No value is judged harmless: the key is refused, as before.
+    Refuse,
+    /// Any value is harmless: ignoring it only makes things slower or quieter.
+    Any,
+    /// Harmless only at one of these old defaults.
+    Default(&'static [OldDefault]),
+    /// A block: harmless when it is an object and every key inside it is
+    /// (judged by that key's own entry, `<block>.<key>`; a key with no entry
+    /// is not).
+    Block,
+}
+
+/// Whether a retired `config.json` key holding `value` is harmless to ignore
+/// ([`LeftoverValue`]). A key that is not retired is not.
+pub fn leftover_is_harmless(key: &str, value: &serde_json::Value) -> bool {
+    let Some(entry) = RETIRED_SETTINGS.iter().find(|r| r.key == key) else { return false };
+    match entry.leftover {
+        LeftoverValue::Refuse => false,
+        LeftoverValue::Any => true,
+        LeftoverValue::Default(defaults) => defaults.iter().any(|d| d.matches(value)),
+        LeftoverValue::Block => value
+            .as_object()
+            .is_some_and(|map| map.iter().all(|(k, v)| leftover_is_harmless(&format!("{key}.{k}"), v))),
+    }
 }
 
 /// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
@@ -457,6 +521,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Block,
         line: "removed in 5.0 (#3035): \"remote\" was the wrong axis (a local server on the same machine is an \
                endpoint too), so limits are declared per endpoint in profiles.json, under \
                `endpoints.<id>.limits`. Nothing is carried over: delete the block, then set the limits you want \
@@ -466,6 +531,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.max_tokens_per_step",
         env: Some("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"),
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Null]),
         line: "removed in 5.0 (#3035): the cap is per DISPATCH (one role execution) now, set per endpoint as \
                `endpoints.<id>.limits.tokens_per_dispatch` in profiles.json. A whole-run budget is that \
                endpoint's rolling `limits.window`. Nothing is carried over: limits are off until you set them",
@@ -474,6 +540,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.max_tokens_per_execution",
         env: Some("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"),
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Int(500_000)]),
         line: "removed in 5.0 (#3035; it was renamed `remote.max_tokens_per_step` in 4.0): set \
                `endpoints.<id>.limits.tokens_per_dispatch` on the endpoint in profiles.json instead. Nothing is \
                carried over: limits are off until you set them (500000 was darkmux's old default, not a \
@@ -483,6 +550,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.step_budget_policy",
         env: Some("DARKMUX_REMOTE_STEP_BUDGET_POLICY"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Str("warn")]),
         line: "removed in 5.0 (#3035): what reaching a limit does is `endpoints.<id>.limits.policy` (`off`, `warn` \
                or `wait`) in profiles.json, one policy for the endpoint's whole `limits`",
     },
@@ -490,6 +558,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.concurrent_cap",
         env: Some("DARKMUX_REMOTE_CONCURRENT_CAP"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3035): concurrency is per endpoint. On an endpoint darkmux does not manage, set \
                `endpoints.<id>.limits.concurrent_calls` in profiles.json (absent, its calls run one at a time); \
                on a managed endpoint the scheduler owns parallelism and the field is refused",
@@ -498,6 +567,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "dirs.ack",
         env: Some("DARKMUX_ACK_DIR"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3036): the licensed-adjacent acknowledgment gate and its roles retired, so \
                nothing writes or reads an acknowledgment file. Delete it",
     },
@@ -505,6 +575,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "runtime.log_level",
         env: Some("DARKMUX_LOG"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Default(&[OldDefault::Str("info")]),
         line: "removed in 5.0 (#3035): it only ever switched on one debug line on the tool-less hosted dispatch \
                path and nothing else read it. Delete it",
     },
@@ -512,6 +583,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "machine_rollup",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Block,
         line: "removed in 5.0 (#3036): the periodic `machine.rollup` flow record is gone; the machine lens reads \
                `GET /machine/resources`. Delete the block",
     },
@@ -519,18 +591,21 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "machine_rollup.enabled",
         env: Some("DARKMUX_MACHINE_ROLLUP_ENABLED"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
         line: "removed in 5.0 (#3036) with the rest of `machine_rollup`. Delete it",
     },
     RetiredSetting {
         key: "machine_rollup.period_seconds",
         env: Some("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3036) with the rest of `machine_rollup`. Delete it",
     },
     RetiredSetting {
         key: "dirs.notebook",
         env: Some("DARKMUX_NOTEBOOK_DIR"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Refuse,
         line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
@@ -539,6 +614,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "radio.router_profile",
         env: Some("DARKMUX_RADIO_ROUTER_PROFILE"),
         env_policy: LeftoverPolicy::Warn,
+        leftover: LeftoverValue::Refuse,
         line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
                profiles.json. Delete it",
     },
@@ -546,24 +622,28 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "dirs.openclaw_config",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Refuse,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "dirs.runtime_agents",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Refuse,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "gh",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Block,
         line: "renamed to `cmd` (#2003): move `gh.enabled` / `gh.allowed` to `cmd.enabled` / `cmd.allowed`",
     },
     RetiredSetting {
         key: "orchestrator",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Str("")]),
         line: "removed in #1766 (`init` wrote it from #663): flow records no longer carry an orchestrator. \
                Delete it",
     },
@@ -571,6 +651,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.stage_budget_policy",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Str("warn")]),
         line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), retired in 5.0 (#3035): the policy is \
                `endpoints.<id>.limits.policy` in profiles.json",
     },
@@ -578,6 +659,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "review",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Block,
         line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
                went with the funnel. Delete the block",
     },
@@ -585,6 +667,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "runtime.daemon_auth_enabled",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
         line: "replaced in 4.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
                fleet's execution credential) and `serve.read_auth` (whether reads from off this machine need \
                it, default off). Move your value to `serve.token_keychain`, and set `serve.read_auth true` if \
@@ -594,6 +677,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "runtime.telemetry_record_every_samples",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Int(5)]),
         line: "removed in #2413: one machine-scoped host sampler replaced the per-dispatch curve; its cadence is \
                `runtime.host_sampler_interval_ms`. Delete it",
     },
@@ -601,10 +685,41 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "dirs.crew",
         env: Some("DARKMUX_CREW_DIR"),
         env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Refuse,
         line: "removed in 4.0: \"crew\" is a retired concept. `DARKMUX_HOME` (or `~/.darkmux`) is the one root, and \
                roles, missions, phases, crews and skills live directly under it. Unset it, and to relocate \
                darkmux set `DARKMUX_HOME`; the autonomous-dispatch preamble override is \
                `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md`",
+    },
+    RetiredSetting {
+        key: "review.judge_concurrency",
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Int(1)]),
+        line: "removed with the review funnel (#2310): `review` runs as a mission config now. Delete the block",
+    },
+    RetiredSetting {
+        key: "review.judge_fail_on_any_skip",
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
+        line: "removed with the review funnel (#2310): `review` runs as a mission config now. Delete the block",
+    },
+    RetiredSetting {
+        // flow-action-guard:allow — a retired config key, refused by name
+        key: "gh.enabled",
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
+        line: "renamed to `cmd.enabled` (#2003)",
+    },
+    RetiredSetting {
+        // flow-action-guard:allow — a retired config key, refused by name
+        key: "gh.allowed",
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
+        leftover: LeftoverValue::Default(&[OldDefault::EmptyArray]),
+        line: "renamed to `cmd.allowed` (#2003)",
     },
 ];
 

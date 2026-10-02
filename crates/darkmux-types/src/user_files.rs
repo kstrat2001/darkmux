@@ -947,13 +947,23 @@ pub fn check_path_and<T: JsonSchema + 'static>(
     retired: RetiredLookup<'_>,
     extra: ExtraIssues<'_>,
 ) -> Option<FileProblem> {
+    match read_user_file(kind, path) {
+        Ok(Some(text)) => check_text_and::<T>(kind, path, &text, retired, extra),
+        Ok(None) => None,
+        Err(problem) => Some(problem),
+    }
+}
+
+/// The text of the user file at `path`: `None` when it is absent or is the
+/// operator's own state in a test build, the problem when it cannot be read.
+fn read_user_file(kind: UserFileKind, path: &Path) -> Result<Option<String>, FileProblem> {
     if is_operator_state(path) {
-        return None;
+        return Ok(None);
     }
     match read_bounded(path) {
-        Ok(text) => check_text_and::<T>(kind, path, &text, retired, extra),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()), note: None }),
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()), note: None }),
     }
 }
 
@@ -1015,28 +1025,103 @@ pub fn config_retired(path: &str) -> Option<String> {
         })
 }
 
-/// The config document at `path` checked against [`crate::config::DarkmuxConfig`].
-pub fn config_json_problem_at(path: &Path) -> Option<FileProblem> {
-    check_path::<crate::config::DarkmuxConfig>(UserFileKind::Config, path, &config_retired)
+/// A retired `config.json` key still holding a value ignoring which changes
+/// nothing (#3057): it never refuses anything, and is reported once per
+/// command (a `warning:` line) and in `darkmux doctor` (a Warn row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftoverWarning {
+    /// The dotted key (`remote`, `runtime.log_level`).
+    pub key: String,
+    /// What removed it and what to do: the key's [`config_retired`] line.
+    pub line: String,
 }
 
-/// The resolved `config.json` checked against its schema. A test build reads
-/// the in-process test config instead of the operator's file, the same
-/// isolation `config_access` gives every setting (#811).
-pub fn config_json_problems() -> Vec<FileProblem> {
+impl fmt::Display for LeftoverWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} in config.json is ignored: {}", escape_text(&self.key), self.line)
+    }
+}
+
+/// What the gate finds in a `config.json`: the problems that refuse, and the
+/// retired keys at a harmless value, which only warn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigCheck {
+    pub refusal: Option<FileProblem>,
+    pub warnings: Vec<LeftoverWarning>,
+}
+
+/// The value at the dotted `path` of `doc`.
+fn value_at<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(doc, |v, key| v.get(key))
+}
+
+/// [`check_text`] of a `config.json`, with every retired key at a harmless
+/// value ([`crate::config::leftover_is_harmless`]) moved from the refusal to
+/// the warnings.
+pub fn config_check_text(path: &Path, text: &str) -> ConfigCheck {
+    let Some(mut found) = check_text::<crate::config::DarkmuxConfig>(UserFileKind::Config, path, text, &config_retired) else {
+        return ConfigCheck::default();
+    };
+    let mut warnings = Vec::new();
+    if let (Problem::Keys(keys), Ok(doc)) = (&mut found.problem, serde_json::from_str::<Value>(text)) {
+        let harmless = |k: &KeyIssue| {
+            matches!(&k.issue, Issue::Retired(_)) && value_at(&doc, &k.path).is_some_and(|v| crate::config::leftover_is_harmless(&k.path, v))
+        };
+        let (quiet, loud): (Vec<KeyIssue>, Vec<KeyIssue>) = std::mem::take(keys).into_iter().partition(harmless);
+        warnings = quiet
+            .into_iter()
+            .filter_map(|k| match k.issue {
+                Issue::Retired(line) => Some(LeftoverWarning { key: k.path, line }),
+                _ => None,
+            })
+            .collect();
+        *keys = loud;
+    }
+    let refused = !matches!(&found.problem, Problem::Keys(keys) if keys.is_empty());
+    ConfigCheck { refusal: refused.then_some(found), warnings }
+}
+
+/// [`config_check_text`] of the file at `path`; an absent file is clean.
+pub fn config_check_at(path: &Path) -> ConfigCheck {
+    match read_user_file(UserFileKind::Config, path) {
+        Ok(Some(text)) => config_check_text(path, &text),
+        Ok(None) => ConfigCheck::default(),
+        Err(problem) => ConfigCheck { refusal: Some(problem), warnings: Vec::new() },
+    }
+}
+
+/// The config document at `path` checked against [`crate::config::DarkmuxConfig`],
+/// as the problem that refuses (a harmless leftover is not one).
+pub fn config_json_problem_at(path: &Path) -> Option<FileProblem> {
+    config_check_at(path).refusal
+}
+
+/// The resolved `config.json`, checked. A test build reads the in-process
+/// test config instead of the operator's file, the same isolation
+/// `config_access` gives every setting (#811).
+pub fn config_json_check() -> ConfigCheck {
     #[cfg(any(test, feature = "test-support"))]
     {
         let path = PathBuf::from("config.json");
         let doc = serde_json::to_string(crate::config_access::config()).unwrap_or_default();
-        check_text::<crate::config::DarkmuxConfig>(UserFileKind::Config, &path, &doc, &config_retired)
-            .into_iter()
-            .collect()
+        config_check_text(&path, &doc)
     }
     #[cfg(not(any(test, feature = "test-support")))]
     {
-        let path = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
-        config_json_problem_at(&path).into_iter().collect()
+        config_check_at(&crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config)
     }
+}
+
+/// The problems of the resolved `config.json` that refuse: every preflight's
+/// and `doctor`'s Fail rows.
+pub fn config_json_problems() -> Vec<FileProblem> {
+    config_json_check().refusal.into_iter().collect()
+}
+
+/// The resolved `config.json`'s retired keys at a harmless value: printed
+/// once per command, and `doctor`'s Warn rows.
+pub fn config_json_warnings() -> Vec<LeftoverWarning> {
+    config_json_check().warnings
 }
 
 #[cfg(test)]

@@ -62,6 +62,21 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **A retired `config.json` key at its old default warns; a value you set is
+  still refused** (#3057). The retired `remote` block, `machine_rollup` block,
+  `runtime.log_level`, `runtime.daemon_auth_enabled`, `runtime.telemetry_record_every_samples`,
+  `orchestrator`, `review`, `gh` and `dirs.ack` are judged by their VALUE.
+  A leftover holding what `darkmux init` wrote (`log_level: "info"`, the `remote`
+  block with `max_tokens_per_step: null` and `step_budget_policy: "warn"` and any
+  `concurrent_cap`, `machine_rollup.enabled: false`) prints one
+  `warning: <key> in config.json is ignored: removed in 5.0 ...; delete it` per
+  command and shows as a warning in `darkmux doctor`; every command still
+  starts, `serve` included. A value ignoring which would change something is
+  refused at preflight until you move it: a spend cap that was set
+  (`remote.max_tokens_per_step` or `max_tokens_per_execution` other than the old
+  500000 default), `machine_rollup.enabled: true`, `runtime.daemon_auth_enabled: true`.
+  `config set` on a retired key still refuses. **Upgraders:** a leftover at its old
+  default is safe to delete; a value you set is refused until you move it.
 - **Loose JSON fields are typed (#3035).** Typing, not a wire change: every value
   already written still reads, and a typed field writes back the JSON it was read from. A flow payload's `context` is a `RecordContext` (`workspace`, `source`,
   `sha`, `rule`, `rules`, `confirm`, `unit`, `model`, `locality`, `profile`, and on a
@@ -920,19 +935,18 @@ darkmux release.
   integration for your own project is unchanged.
 - **`runtime.log_level` and `DARKMUX_LOG` are gone** (CONFIG 2.2). The setting
   switched on one debug line on the tool-less hosted dispatch path and nothing
-  else read it. A leftover `runtime.log_level` in `config.json` makes every entry
-  point refuse at preflight until you delete it, and `darkmux doctor` fails it;
-  a leftover `DARKMUX_LOG` warns and is ignored. **Upgraders:** `darkmux init`
-  wrote `runtime.log_level` into every config before this release, so delete it.
+  else read it. A leftover `runtime.log_level: "info"` in `config.json` (what `darkmux init`
+  wrote) and a leftover `DARKMUX_LOG` warn and are ignored (#3057); any other
+  `log_level` value is refused at preflight. **Upgraders:** delete it.
 - **The `machine_rollup` block, its two env vars and the `machine.rollup` flow
   record are gone** (CONFIG 2.2, FLOW 2.0.0). Nothing replaced the periodic
   whole-machine heartbeat: the machine lens reads `GET /machine/resources`.
   `darkmux doctor` loses its `machine_rollup` row, and an archived
   `machine.rollup` record reads as an unknown action. A leftover `machine_rollup`
-  block makes every entry point refuse at preflight until you delete it, and
-  doctor fails it; the two `DARKMUX_MACHINE_ROLLUP_*` vars warn and are ignored.
-  **Upgraders:** `init` wrote the block into every config before this release,
-  so delete it (and `runtime.log_level`).
+  block with `enabled: false` (what `init` wrote) warns and is ignored, and so do
+  the two `DARKMUX_MACHINE_ROLLUP_*` vars (#3057); `enabled: true` is refused at
+  preflight, since ignoring it would drop a feature you turned on.
+  **Upgraders:** delete the block (and `runtime.log_level`).
 - **`fleet.accept_work.<name>.workspace` is a receiver path grant and nothing
   more** (CONFIG 2.2). It never authorizes a fetch, a checkout or a push; git
   handoff (#755) gets its own grant, and its checkouts live outside the
@@ -947,8 +961,9 @@ darkmux release.
   `remote.step_budget_policy` and `remote.concurrent_cap` are retired, with
   `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`, `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`,
   `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP`.
-  A leftover `remote` key in `config.json` is refused at preflight by every
-  consuming entry point until you delete it, and `darkmux doctor` fails it;
+  A leftover `remote` block at its old defaults warns and is ignored (#3057);
+  one that sets a spend cap is refused at preflight by every consuming entry
+  point until you move it, and `darkmux doctor` fails it;
   `config set` refuses the old keys. A leftover `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` or
   `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` is refused (ignoring a spend cap would
   remove it); `DARKMUX_REMOTE_CONCURRENT_CAP` and `DARKMUX_REMOTE_STEP_BUDGET_POLICY`
