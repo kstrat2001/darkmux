@@ -97,11 +97,11 @@ describe("resolveDrawerScope (#2107)", () => {
     expect(s.samples.map((p) => p.cpu)).toEqual([11]);
   });
 
-  it("with no known local uid, the rolling window does not filter by machine (best-effort default)", () => {
+  it("(5.0 R2) with no known local uid, the rolling window matches no machine's samples", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");
     const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine")];
     const s = resolveDrawerScope({ kind: "runs", runsKind: "all", lab: null, machine: null }, [], rolling, null, now);
-    expect(s.samples.map((p) => p.cpu)).toEqual([99]);
+    expect(s.samples).toEqual([]);
   });
 
   it("(5.0 R2) a relayed dispatch's scope names the machine that ran it and keeps only its samples", () => {
