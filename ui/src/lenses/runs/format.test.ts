@@ -4,7 +4,7 @@ import {
   runActivity,
   runsAgo,
   runSubtitle,
-  runStatusLabel,
+  runBadgeStatus, runStatusLabel,
   runsMultiMachine,
   runsFiltered,
   runsForMachine,
@@ -149,6 +149,19 @@ describe("runStatusLabel", () => {
   it("falls back to 'no ending recorded' when abandoned but the reason is absent (an older server)", () => {
     const r = run({ id: "a", kind: "dispatch", status: "abandoned", tracked: false });
     expect(runStatusLabel(r)).toBe("no ending recorded");
+  });
+  // (5.0 R3) A running run on a machine that is not reporting has no live
+  // evidence behind it, so it reads unknown. Nothing else changes.
+  it("reads a running run on a machine that is not reporting as 'unknown'", () => {
+    const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true });
+    expect(runStatusLabel(r, true)).toBe("unknown");
+    expect(runBadgeStatus(r, true)).toBe("unknown");
+    expect(runStatusLabel(r, false)).toBe("running");
+  });
+  it("leaves a finished run's status alone even when its machine is not reporting", () => {
+    const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true });
+    expect(runStatusLabel(r, true)).toBe("complete");
+    expect(runBadgeStatus(r, true)).toBe("complete");
   });
   it("leaves every other status unchanged", () => {
     for (const status of ["planned", "running", "complete", "degraded", "error", "unparseable"] as const) {

@@ -221,6 +221,40 @@ describe("MachineLens", () => {
     });
   });
 
+  // (5.0 R3) The header's hardware line is this machine's own, or "not reported".
+  describe("the hardware line", () => {
+    const peerRow = (specs: Record<string, unknown> | null) => ({
+      entry: null,
+      is_this_machine: false,
+      machine_uid: "u-mini",
+      liveness: "no_beat",
+      card: specs ? { state: "available", card: { specs: { machine_uid: "u-mini", ...specs }, fleet_mode: "peer" }, source: "listener" } : { state: "unreachable", reason: "listener_off", detail: null },
+    });
+    const hdr = () => document.querySelector(".machine-lens__hdr")?.textContent;
+
+    it("a peer with no beat reads its hardware off the card the view read", async () => {
+      mockMachineFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" }, fleetView: [peerRow({ cpu_brand: "M1 Max", ram_total_bytes: 34359738368 })] });
+      renderMachine("u-mini");
+      await waitFor(() => expect(hdr()).toBe("fleet › machine — M1 Max · 32 GB"));
+    });
+
+    it("the card read now outranks a presence beat's older hardware string", async () => {
+      mockMachineFetch({
+        specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+        liveMachines: [{ machine_uid: "u-mini", display_name: "mini", schema_version: "1", beat_ts_ms: 1, specs: "M1 · 16 GB" }],
+        fleetView: [peerRow({ cpu_brand: "M4 Pro", ram_total_bytes: 51539607552 })],
+      });
+      renderMachine("u-mini");
+      await waitFor(() => expect(hdr()).toBe("fleet › machine — M4 Pro · 48 GB"));
+    });
+
+    it("a peer nothing reported hardware for says so, never blank and never this machine's hardware", async () => {
+      mockMachineFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 }, fleetView: [peerRow(null)] });
+      renderMachine("u-mini");
+      await waitFor(() => expect(hdr()).toBe("fleet › machine — hardware not reported"));
+    });
+  });
+
   it("uid: null (nav-tab/deep-link) is always the local machine — resources loads with real figures", async () => {
     const resourcesCalled = mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
     renderMachine(null);

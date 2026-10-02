@@ -48,4 +48,15 @@ describe("ReadyHeadline", () => {
     const { container } = render(<ReadyHeadline n={2} ago="" />);
     expect(container.textContent).toBe("2 ");
   });
+
+  // (5.0 R3) The count says machines online and the dispatch time sits beside
+  // it, so it reads fleet-wide; it is the newest start among the machines
+  // whose records reach this viewer, and the line says so.
+  it("names what the last-dispatch clause covers", () => {
+    const { container } = render(<ReadyHeadline n={2} ago="10h ago" />);
+    const clause = container.querySelector("[data-scope]");
+    expect(clause?.textContent).toBe(" · last dispatch 10h ago");
+    expect(clause?.getAttribute("data-scope")).toBe("fleet");
+    expect(clause?.getAttribute("title")).toBe("The newest dispatch start in the loaded window, on any machine whose records reach this viewer, not only this machine.");
+  });
 });
