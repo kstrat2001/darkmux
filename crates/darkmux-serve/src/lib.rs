@@ -1296,7 +1296,6 @@ fn build_startup_banner(
     mission_count: usize,
     phase_count: usize,
     lab_dir: Option<&std::path::Path>,
-    pending_move: Option<&PendingMove>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
@@ -1386,13 +1385,6 @@ fn build_startup_banner(
             "  lab dir:        none (pass --lab-dir <path> to enable the lab observer lens)"
                 .to_string(),
         ),
-    }
-
-    if let Some(m) = pending_move {
-        lines.push(darkmux_types::style::warn(&format!(
-            "  ! lab runs in {} are not read (4.0 reads {}); move them: {}",
-            m.from, m.to, m.command
-        )));
     }
 
     lines.push(darkmux_types::style::success("  ready — Ctrl-C to stop"));
@@ -1558,7 +1550,6 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             mission_count,
             phase_count,
             lab_dir.as_deref(),
-            lab_dir.as_deref().and_then(pending_move_for).as_ref(),
         ) {
             println!("{line}");
         }
@@ -2156,35 +2147,6 @@ fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
     path_is_within(&candidate, lab_dir).then_some(candidate)
 }
 
-/// A lab dir whose pre-4.0 runs have not been moved: where they are, where
-/// 4.0 reads, and the command that settles it. `darkmux serve` never moves
-/// them and never refuses to start over it; it says so in the startup banner
-/// and on `GET /lab/runs`, where the lab lens would otherwise show no runs.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct PendingMove {
-    pub from: String,
-    pub to: String,
-    pub command: String,
-}
-
-/// The [`PendingMove`] for a served lab dir, or `None` when nothing waits to
-/// be moved.
-pub(crate) fn pending_move_for(lab_dir: &StdPath) -> Option<PendingMove> {
-    use darkmux_types::config_access::LabDirState;
-    let state = darkmux_types::config_access::lab_dir_state_for(lab_dir);
-    let command = state.command()?;
-    match state {
-        LabDirState::MovePending { from, to, .. } | LabDirState::Split { from, to } => Some(PendingMove {
-            from: from.display().to_string(),
-            to: to.display().to_string(),
-            command,
-        }),
-        LabDirState::Current => None,
-    }
-}
-
 /// One run cluster's summary row for `GET /lab/runs`.
 ///
 /// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
@@ -2363,19 +2325,12 @@ async fn lab_runs_handler(State(state): State<AppState>) -> axum::Json<wire::Lab
             dir: None,
             exists: false,
             runs: Vec::new(),
-            pending_move: None,
         });
     };
     let shown = lab_dir.display().to_string();
     let exists = lab_dir.is_dir();
-    let (runs, pending_move) = tokio::task::spawn_blocking(move || {
-        (scan_lab_runs(&lab_dir), pending_move_for(&lab_dir))
-    })
-    .await
-    .unwrap_or_default();
-    // `pending_move` is present only while pre-4.0 runs wait to be moved, so the
-    // lab lens can say why it is empty. Serving never refuses over it.
-    axum::Json(wire::LabRunsResponse { configured: true, dir: Some(shown), exists, runs, pending_move })
+    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir)).await.unwrap_or_default();
+    axum::Json(wire::LabRunsResponse { configured: true, dir: Some(shown), exists, runs })
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator

@@ -63,17 +63,6 @@ pub enum ConfigKind {
     MissionVerify,
 }
 
-/// A step kind id as this build spells it: a retired id (see
-/// [`ConfigKind::replacing`]) maps to its replacement, any other id is
-/// returned unchanged. Applied where a step record is READ from disk, so an
-/// archived mission still opens; nothing writes the old id back.
-pub fn current_kind_id(id: &str) -> &str {
-    match ConfigKind::replacing(id) {
-        Some(kind) => kind.id(),
-        None => id,
-    }
-}
-
 /// A value a step kind refuses although its type is right: the key (dotted,
 /// under `config`) and the rule it breaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,8 +175,7 @@ impl ConfigKind {
     /// `crawl.summary` became `dispatch.unit` and `dispatch.summary`), or
     /// `None` for an id that was never retired. The ONE place the old
     /// spellings live. A config naming one is refused, naming the new id
-    /// (`MissionConfig::validate_with`); a record an old run left on disk is
-    /// read through [`current_kind_id`] and never written back.
+    /// (`MissionConfig::validate_with`).
     pub fn replacing(retired_id: &str) -> Option<Self> {
         Self::RETIRED.iter().find(|(old, _)| *old == retired_id).map(|(_, new)| *new)
     }

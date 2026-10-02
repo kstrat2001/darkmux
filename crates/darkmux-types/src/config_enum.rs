@@ -1055,7 +1055,6 @@ mod tests {
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("DeclaredFleetMode", "`FleetMode` as a card, presence beat or record states it, with `Unknown` for a newer value; never a setting"),
-            ("LabDirState", "where the lab-run root stands relative to the pre-4.0 one (doctor and lab verbs), never a setting"),
             ("EndpointSource", "runtime-only provenance, never serialized"),
             ("CredentialSource", "runtime-only resolution result, never serialized"),
             (

@@ -143,7 +143,7 @@ pub mod power_policy;
 // (before 5.0: the per-step `remote.max_tokens_per_step` bucket, #1877).
 pub mod budget;
 pub mod dispatch_budget;
-pub mod retired_state;
+pub mod state_file;
 // (#2421) Mission-envelope records-emitted aggregation — see the module doc
 // for why this lives here rather than in `darkmux-serve`.
 pub mod records_emitted;

@@ -55,9 +55,6 @@ pub struct InitReport {
     pub skills_installed: Vec<String>,
     pub skills_overwritten: Vec<String>,
     pub skills_skipped: Vec<String>,
-    /// (#1449) Retired `darkmux-*` skills the install step pruned (or, in
-    /// dry-run, would prune).
-    pub skills_pruned: Vec<String>,
     /// (#1927) `darkmux-*` skills whose installed copy is locally modified
     /// (or has no recorded provenance) and so was NOT refreshed — the edit
     /// survives. Pass `--force` to overwrite one of these anyway.
@@ -155,7 +152,6 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.skills_installed = skills_report.installed;
     report.skills_overwritten = skills_report.overwritten;
     report.skills_skipped = skills_report.skipped;
-    report.skills_pruned = skills_report.pruned;
     report.skills_protected = skills_report.protected;
     report.skills_force_overwrote_modified = skills_report.force_overwrote_modified;
 

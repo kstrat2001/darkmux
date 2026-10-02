@@ -59,7 +59,7 @@
 //! is the explicit "this mission is now being worked on" transition.
 
 use crate::loader::load_phases;
-use crate::retired_state::{parse_state, StateKind};
+use crate::state_file::{parse_state, StateKind};
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, OpenPayload, Stage, Tier};
@@ -213,10 +213,7 @@ pub fn save_phase(phase: &Phase) -> Result<()> {
     save_state(StateKind::Phase, &phase_path(&phase.mission_id, &phase.id), phase)
 }
 
-/// Directory holding the mission's phase JSONs. Only `phases/` is read: a
-/// mission directory still holding the pre-rename `sprints/` is reported by
-/// `darkmux doctor` ([`crate::retired_state::retired_phases_dir`]), and its
-/// phases are not read.
+/// Directory holding the mission's phase JSONs.
 pub fn phases_dir(mission_id: &str) -> PathBuf {
     mission_dir(mission_id).join("phases")
 }
@@ -1542,26 +1539,6 @@ mod tests {
 
         let step = load_step("test-mission", "p-abandon", "mid-flight-step").unwrap();
         assert_eq!(step.status, crate::types::NodeStatus::Abandoned);
-    }
-
-    /// (#2430) Reconciling an archived step re-saves it, and the kind id it
-    /// was stored with is not rewritten: history keeps the spelling it was
-    /// written under, and only `Step::kind_id` answers to the new one.
-    #[serial_test::serial]
-    #[test]
-    fn reconciling_an_archived_step_keeps_its_retired_kind_id_on_disk() {
-        let _g = CrewGuard::new();
-        seed_phase("p-old", PhaseStatus::Running);
-        let mut s = seed_step("test-mission", "p-old", "old-step", crate::types::NodeStatus::Running);
-        s.kind = "crawl.unit".to_string();
-        save_step("test-mission", "p-old", &s).unwrap();
-
-        phase_abandon("p-old").unwrap();
-
-        let step = load_step("test-mission", "p-old", "old-step").unwrap();
-        assert_eq!(step.status, crate::types::NodeStatus::Abandoned, "the reconcile did re-save it");
-        assert_eq!(step.kind, "crawl.unit", "the stored kind is byte-identical");
-        assert_eq!(step.kind_id(), "dispatch.unit");
     }
 
     /// A step already terminal (Complete/Abandoned/Error) is left completely

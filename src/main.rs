@@ -68,7 +68,6 @@ mod config_cmd;
 mod conventions;
 mod mission_show;
 mod mission_status;
-mod retired_verbs;
 mod run_list;
 mod run_records;
 mod mission_config_cli;
@@ -142,11 +141,6 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 fn main() -> Result<()> {
     providers::register_builtins()?;
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let words: Vec<String> = argv.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    if let Some(refusal) = retired_verbs::refusal(&words) {
-        eprintln!("error: {refusal}");
-        std::process::exit(2);
-    }
     let cli = Cli::parse_from(argv);
     darkmux_types::diagnostics::set_verbose_flag(cli.verbose);
     refuse_retired_env(&cli.command)?;
@@ -632,15 +626,7 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
         })
         .collect();
     let skill_targets = skills::install_target_dirs().unwrap_or_default();
-    let maintainer_only: Vec<String> = skills::MAINTAINER_ONLY_SKILLS
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    report.checks.push(doctor::check_installed_skills_freshness(
-        &skill_targets,
-        &embedded_skills,
-        &maintainer_only,
-    ));
+    report.checks.push(doctor::check_installed_skills_freshness(&skill_targets, &embedded_skills));
 
     // (#2312, #2430) The mission-config check needs the kinds' declared ports,
     // which only the root crate can assemble: the coder-phase kinds live here.
@@ -1850,17 +1836,6 @@ fn cmd_init(
         );
         println!(
             "    stale one), so it could not tell an edit from a copy an older darkmux installed."
-        );
-    }
-    if !report.skills_pruned.is_empty() {
-        // (#1449) Retired darkmux-* skills removed from the install target so an
-        // upgraded machine stops teaching dead verbs.
-        let verb = if dry_run { "would prune" } else { "pruned" };
-        println!(
-            "  {} ({}): {}",
-            verb,
-            report.skills_pruned.len(),
-            report.skills_pruned.join(", ")
         );
     }
     if let Some(p) = report.hook_added {

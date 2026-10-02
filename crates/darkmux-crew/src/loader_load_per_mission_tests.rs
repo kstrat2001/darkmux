@@ -428,34 +428,6 @@
         assert!(!role.is_specialist());
     }
 
-    /// Legacy `"admin"` value (renamed to `"utility"` in the
-    /// admin→utility nomenclature transition) is treated as
-    /// specialist by `is_specialist()` itself — silent fallthrough
-    /// at the matcher layer. The loud-fail lives at the loader
-    /// boundary (`validate_role_family`) so the matcher stays
-    /// branch-free. See `validate_rejects_legacy_admin_role_family`.
-    #[test]
-    fn legacy_admin_value_is_silently_specialist_at_matcher_layer() {
-        let role = Role {
-            schema_version: None,
-            output_schema: None,
-            id: "test-role".into(),
-            description: "A test role".into(),
-            skills: vec![],
-            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
-            escalation_contract: EscalationContract::BailWithExplanation,
-            prompt_path: None,
-            bail_after_compactions: None,
-            role_family: Some("admin".into()),
-            feedback_templates: None,
-        };
-        // Matcher only recognizes "utility" — legacy "admin" falls
-        // through to specialist (preventive default). Production paths
-        // rely on the loader's validator catching this before the
-        // matcher ever sees it.
-        assert!(role.is_specialist());
-    }
-
     #[test]
     fn role_family_explicit_specialist_matches_default() {
         let role = Role {
@@ -510,64 +482,6 @@
                 assert!(r.is_specialist());
             }
         }
-    }
-
-    /// Loader rejects the legacy `"admin"` role_family value from a
-    /// user-authored manifest with an operator-actionable error
-    /// message that names the rename, points at the offending file
-    /// path, and tells the operator what to change. Pre-1.0 no-compat
-    /// doctrine — no silent rewrite, no env-var alias.
-    #[serial]
-    #[test]
-    fn validate_rejects_legacy_admin_role_family_user_source() {
-        let legacy_role = Role {
-            schema_version: None,
-            output_schema: None,
-            id: "legacy-role".into(),
-            description: "A role using the pre-rename admin value".into(),
-            skills: vec![],
-            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
-            escalation_contract: EscalationContract::BailWithExplanation,
-            prompt_path: None,
-            bail_after_compactions: None,
-            role_family: Some("admin".into()),
-            feedback_templates: None,
-        };
-        let err = super::validate_role_family(&legacy_role, super::RoleSource::User).expect_err(
-            "validator must reject the legacy `admin` value on user-authored roles"
-        );
-        let msg = format!("{err}");
-        assert!(msg.contains("legacy-role"), "msg names the offending role: {msg}");
-        assert!(msg.contains("\"admin\""), "msg names the legacy value: {msg}");
-        assert!(msg.contains("\"utility\""), "msg names the new value: {msg}");
-        // User-source message points at the editable file path.
-        assert!(msg.contains("legacy-role.json"), "msg points at the file to edit: {msg}");
-    }
-
-    /// Builtin-source rejection produces a different message — operator
-    /// can't edit embedded manifests, so the actionable repair is
-    /// "please file an issue" rather than "edit your manifest."
-    #[test]
-    fn validate_rejects_legacy_admin_role_family_builtin_source() {
-        let legacy_role = Role {
-            schema_version: None,
-            output_schema: None,
-            id: "broken-builtin".into(),
-            description: "Simulates a builtin manifest that drifted back to admin".into(),
-            skills: vec![],
-            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
-            escalation_contract: EscalationContract::BailWithExplanation,
-            prompt_path: None,
-            bail_after_compactions: None,
-            role_family: Some("admin".into()),
-            feedback_templates: None,
-        };
-        let err = super::validate_role_family(&legacy_role, super::RoleSource::Builtin)
-            .expect_err("validator must reject the legacy `admin` value on builtin roles");
-        let msg = format!("{err}");
-        assert!(msg.contains("broken-builtin"), "msg names the offending role: {msg}");
-        assert!(msg.contains("internal regression"), "msg flags this is not operator-actionable: {msg}");
-        assert!(msg.contains("file an issue"), "msg points to the right repair path: {msg}");
     }
 
     #[test]

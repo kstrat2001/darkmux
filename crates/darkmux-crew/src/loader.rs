@@ -2,7 +2,7 @@
 //!
 //! Search order: user dir → binary-embedded built-ins.
 
-use crate::retired_state::{self, parse_state, StateKind};
+use crate::state_file::{parse_state, StateKind};
 use crate::types::*;
 use darkmux_types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
@@ -444,7 +444,7 @@ pub fn load_roles() -> Result<Vec<Role>> {
             Ok(role) => {
                 // Defense-in-depth: builtin manifests get the same
                 // validation as user-authored ones. A future builtin
-                // drift back to `admin` would bail loudly here rather
+                // drift to an unknown family would bail loudly here rather
                 // than silently shipping the wrong family.
                 validate_role_family(&role, RoleSource::Builtin)?;
                 map.entry(id.to_string()).or_insert(role);
@@ -483,15 +483,10 @@ enum RoleSource {
 /// Validate a role's `role_family` field. The family is a validated
 /// **two-value axis** (#590): `"specialist"` (works the mission/phases)
 /// or `"utility"` (supports the runtime outside mission scope), or absent
-/// (defaults to specialist). Anything else loud-fails at the loader
-/// boundary:
-///
-/// - The legacy `"admin"` value (renamed to `"utility"` in the
-///   codebase-wide nomenclature transition; no pre-1.0 compat alias) gets
-///   a targeted migration message.
-/// - Any other unknown value (a typo like `"utilty"`) is rejected rather
-///   than silently treated as specialist — a silent misclassification is
-///   exactly the bug a validated axis prevents.
+/// (defaults to specialist). Any other value (a typo like `"utilty"`)
+/// loud-fails at the loader boundary rather than being silently treated as
+/// specialist: a silent misclassification is exactly the bug a validated
+/// axis prevents.
 ///
 /// Each error names the offending role, the value, and a repair path
 /// appropriate to where the manifest came from.
@@ -499,27 +494,6 @@ fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
     match role.role_family.as_deref() {
         // The two recognized families, or absent (defaults to specialist).
         None | Some("specialist") | Some("utility") => Ok(()),
-        // Legacy value renamed to "utility" — keep the targeted migration message.
-        Some("admin") => Err(match source {
-            RoleSource::User => anyhow::anyhow!(
-                "role `{}` has `role_family: \"admin\"`, which was renamed to \"utility\" \
-                 in the codebase-wide nomenclature transition. Pre-1.0 there's no \
-                 compat alias — update your role manifest at `{}/{}.json` to set \
-                 `\"role_family\": \"utility\"` (the canonical bounded-I/O family).",
-                role.id,
-                roles_dir().display(),
-                role.id
-            ),
-            RoleSource::Builtin => anyhow::anyhow!(
-                "internal regression: builtin role `{}` declares the legacy \
-                 `role_family: \"admin\"` value, which was renamed to \"utility\" \
-                 in the codebase-wide nomenclature transition. This is not an \
-                 operator-actionable error — please file an issue at \
-                 https://github.com/kstrat2001/darkmux/issues with the role id \
-                 (`{}`) and your darkmux version (`darkmux --version`).",
-                role.id, role.id
-            ),
-        }),
         // Any other value is a typo / unknown family — fail loud.
         Some(other) => Err(match source {
             RoleSource::User => anyhow::anyhow!(
@@ -628,8 +602,7 @@ fn say_once(warnings: &[String]) -> usize {
 ///
 /// Walks every `<root>/missions/<mission-id>/phases/*.json`.  The
 /// Phase JSON already carries `mission_id`, so no inference from the dir
-/// name is needed.  Legacy flat phase files under `<root>/phases/`
-/// are silently ignored — the migration verb is the bridge.
+/// name is needed.
 pub fn load_phases() -> Result<Vec<Phase>> {
     let mut warnings = Vec::new();
     let phases = read_phases(&mut warnings);
@@ -666,8 +639,8 @@ fn read_mission_phases(
     Ok(())
 }
 
-/// [`load_phases`] without the saying: a leftover `sprints/` directory and
-/// every phase it refused is a line in `warnings`.
+/// [`load_phases`] without the saying: every phase file it refused is a line
+/// in `warnings`.
 fn read_phases(warnings: &mut Vec<String>) -> Result<Vec<Phase>> {
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
@@ -688,9 +661,6 @@ fn read_phases(warnings: &mut Vec<String>) -> Result<Vec<Phase>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        if let Some(retired) = retired_state::retired_phases_dir(&path) {
-            warnings.push(format!("warning: {}: {}", retired.path.display(), retired.fix));
-        }
         read_mission_phases(&mission_id, &mut map, warnings)?;
     }
 

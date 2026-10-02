@@ -648,25 +648,6 @@ describe("RunsBoard", () => {
     expect(screen.queryByText(/no lab-run source wired/i)).toBeNull();
   });
 
-  // (4.0) Runs recorded before the lab dir moved sit in the old dir and the
-  // list is empty until the operator moves them: the empty state names the
-  // command instead of claiming there are no runs.
-  it("a pending lab-dir move names the command in the empty state", async () => {
-    mockFetch(
-      true,
-      true,
-      { pending_move: { from: "/h/runs", to: "/h/lab", command: "mv /h/runs /h/lab" }, dir: "/h/lab", exists: false },
-      NO_LAB_RUNS,
-    );
-    const { container } = renderBoard();
-    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
-    await waitFor(() => expect(screen.getByText(/mv \/h\/runs \/h\/lab/)).toBeInTheDocument());
-    expect(screen.getByText(/still in \/h\/runs/i)).toBeInTheDocument();
-    expect(screen.queryByText(/does not exist yet/i)).toBeNull();
-    expect(screen.queryByText(/no lab runs found/i)).toBeNull();
-  });
-
   // Keyboard-accessibility structure — the runs-lens `role="button"` chips
   // (RunsBar's kind filter) and the `.runmore` "show all"
   // row are click-only divs/spans with tabIndex but no key handler prior to

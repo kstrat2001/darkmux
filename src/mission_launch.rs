@@ -1960,7 +1960,7 @@ fn stamp_unit_timeout(steps: &mut BTreeMap<String, crew::types::Step>, timeout_s
         return;
     };
     for step in steps.values_mut() {
-        if step.kind_id() != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
+        if step.kind != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
             continue;
         }
         // An explicit --timeout wins OUTRIGHT — overwrite even a

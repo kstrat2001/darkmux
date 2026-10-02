@@ -470,10 +470,6 @@ pub struct LabRunsResponse {
     pub dir: Option<String>,
     pub exists: bool,
     pub runs: Vec<crate::LabRunSummary>,
-    /// Present while runs recorded before 4.0 still sit in the old lab dir.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub pending_move: Option<crate::PendingMove>,
 }
 
 /// One review envelope's headline, from a run's archived `funnels.json`.

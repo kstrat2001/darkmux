@@ -47,11 +47,9 @@ fn cmd_compare(run_a: &str, run_b: &str) -> Result<i32> {
     Ok(0)
 }
 
-/// The gate every verb here passes first: the lab dir is where 4.0 reads it
-/// (else the refusal names the `mv`), and no id names a mission or dispatch
+/// The gate every verb here passes first: no id names a mission or dispatch
 /// run.
 fn lab_records_only(verb: &str, ids: &[&str]) -> Result<()> {
-    darkmux_types::config_access::require_current_lab_dir()?;
     let missing: Vec<&str> = ids.iter().copied().filter(|id| !is_lab_record(id)).collect();
     if missing.is_empty() {
         return Ok(());

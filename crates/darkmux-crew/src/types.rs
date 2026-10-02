@@ -165,8 +165,8 @@ pub struct Role {
     /// preamble. Absent ⇒ treat as `"specialist"` (preventive safety: better
     /// an unneeded preamble than a missing one). Built-in roles all declare
     /// it explicitly. `validate_role_family` in `loader.rs` enforces the
-    /// two-value axis — the legacy `"admin"` value and any unknown value are
-    /// rejected with an operator-actionable message.
+    /// two-value axis — any other value is rejected with an
+    /// operator-actionable message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_family: Option<String>,
     /// (#457 Step 2) Per-role overrides for the runtime's feedback-
@@ -202,11 +202,7 @@ impl Role {
     /// (#425) True when this role drives a multi-turn agent loop and
     /// therefore needs the autonomous-dispatch preamble prepended to
     /// its system prompt. Default (field absent) = specialist =
-    /// needs preamble. Explicit `"utility"` opts out. The legacy
-    /// `"admin"` value was renamed to `"utility"` to match the
-    /// codebase's broader utility/specialist nomenclature; pre-1.0,
-    /// no compat alias — `validate_role_family` in `loader.rs` rejects
-    /// the legacy value with a clear migration message.
+    /// needs preamble. Explicit `"utility"` opts out.
     pub fn is_specialist(&self) -> bool {
         !matches!(self.role_family.as_deref(), Some("utility"))
     }
@@ -297,11 +293,7 @@ pub struct Crew {
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum MissionStatus {
-    /// A mission that is running or ready to run. `paused` is read as
-    /// `Active`: the retired `mission pause` verb only flipped this label and
-    /// the scheduler never honored it, so a `mission.json` an older binary
-    /// left at `"status":"paused"` is simply an open mission. It is written
-    /// back as `active` the next time the mission is saved.
+    /// A mission that is running or ready to run.
     ///
     /// RETIRED FOREVER (5.0, #2954, #2996): `paused`, `paused_ts`,
     /// `mission.pause` and `mission.resume` are never to be reused. An
@@ -310,11 +302,8 @@ pub enum MissionStatus {
     /// pause is a separate mission field (`hold`) with new flow actions
     /// (`mission.hold` / `mission.release`).
     #[default]
-    #[serde(alias = "paused")]
     Active,
-    /// Terminal (SUCCESS path). Named for the `mission finalize` verb. A
-    /// `mission.json` still saying `"status":"closed"` is refused by
-    /// [`crate::retired_state`], never read as this.
+    /// Terminal (SUCCESS path). Named for the `mission finalize` verb.
     Finalized,
     /// Terminal (FAILURE path). A mission the operator tore down with
     /// `mission abort`, or one reconciled after its process died.
@@ -347,9 +336,7 @@ pub struct Mission {
     pub description: String,
     #[serde(default)]
     pub status: MissionStatus,
-    /// The mission's phases. A `mission.json` still using the pre-rename key
-    /// `sprint_ids` is refused by [`crate::retired_state`], never read as an
-    /// empty list.
+    /// The mission's phases.
     #[serde(default)]
     pub phase_ids: Vec<String>,
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
@@ -361,8 +348,7 @@ pub struct Mission {
     pub started_ts: Option<u64>,
     /// When the mission transitioned to `Finalized`. Finalized is
     /// terminal — once set, lifecycle verbs can't move the mission
-    /// elsewhere. A `mission.json` still using the old key `closed_ts` is
-    /// refused by [`crate::retired_state`].
+    /// elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub finalized_ts: Option<u64>,
@@ -769,9 +755,6 @@ pub struct Step {
     pub task_id: String,
     /// step-kind registry id, e.g. `"dispatch.internal"` |
     /// `"dispatch.single_shot"` | `"procedural.shell"` | `"procedural.noop"`.
-    /// Kept exactly as stored: a record an older run wrote with a retired id
-    /// keeps that spelling when it is re-saved. Compare through
-    /// [`Step::kind_id`], never this field (#2430).
     pub kind: String,
     /// (#1684 Packet 2, mission-config schema 2.2) The operator sign-off
     /// gate — mirrors [`mission_config::StepConfig::gate`](
@@ -835,14 +818,6 @@ pub struct Step {
     pub output: Option<String>,
 }
 
-impl Step {
-    /// The kind id as this build spells it: a retired id an older run stored
-    /// maps to its replacement (#2430). The stored `kind` is never rewritten.
-    pub fn kind_id(&self) -> &str {
-        crate::step_config::current_kind_id(&self.kind)
-    }
-}
-
 /// (#2310 P4) The default `Task::run_on` / `mission_config::TaskConfig::run_on`
 /// value — a Task is ready only once every dependency reaches
 /// `NodeStatus::Complete`, the behavior every config predating this field
@@ -865,8 +840,7 @@ pub fn default_run_on() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
-    /// The phase this task belongs to. A task file still using the pre-rename
-    /// key `sprint_id` is refused by [`crate::retired_state`].
+    /// The phase this task belongs to.
     pub phase_id: String,
     pub description: String,
     /// (#1398) Operator-facing short label — same overload split as
@@ -971,23 +945,6 @@ pub struct Task {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// (#2430) A step record an older run left on disk names a retired kind
-    /// id. It reads as the id that replaced it, and a current id is untouched.
-    #[test]
-    fn an_archived_step_keeps_its_stored_kind_and_answers_to_the_current_id() {
-        let read = |kind: &str| -> Step {
-            serde_json::from_value(serde_json::json!({"id": "s", "task_id": "t", "kind": kind})).unwrap()
-        };
-        assert_eq!(read("crawl.unit").kind_id(), "dispatch.unit");
-        assert_eq!(read("crawl.summary").kind_id(), "dispatch.summary");
-        assert_eq!(read("crawl.plan").kind_id(), "crawl.plan", "crawl.plan is still a live kind");
-        assert_eq!(read("dispatch.unit").kind_id(), "dispatch.unit");
-        // The stored spelling survives a read and a re-save byte for byte.
-        let old = read("crawl.unit");
-        assert_eq!(old.kind, "crawl.unit");
-        assert_eq!(serde_json::to_value(&old).unwrap()["kind"], "crawl.unit");
-    }
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {

@@ -68,19 +68,6 @@ pub mod labels {
     pub const UNIT_OUTCOME: &str = "dispatch.unit";
     /// `dispatch.summary`'s body.
     pub const SUMMARY: &str = "dispatch.summary";
-
-    /// The current label for one an archive may still carry (written before
-    /// the #2430 rename). The ONLY place the old spellings exist: a read
-    /// maps through it and nothing writes them back. Any other label is
-    /// returned unchanged.
-    pub fn current(label: &str) -> &str {
-        match label {
-            "crawl.plan" => PLAN,
-            "crawl.unit-outcome" => UNIT_OUTCOME,
-            "crawl.summary" => SUMMARY,
-            other => other,
-        }
-    }
 }
 
 /// [`Output`]'s own schema version — the ENVELOPE's, never the body's. A
@@ -294,7 +281,7 @@ impl<T: DeserializeOwned> Output<T> {
             });
         }
         let found = doc.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-        if labels::current(found) != expected_kind {
+        if found != expected_kind {
             bail!(
                 "step output: {whence} is a `{found}` output, but a `{expected_kind}` was \
                  expected — the graph wires this step to the wrong producer"
@@ -412,22 +399,6 @@ mod tests {
         let text = Output::wrap(labels::PLAN, body(), Producer::default()).to_output_string().unwrap();
         let err = Output::<Body>::read(&text, "dispatch.summary").unwrap_err().to_string();
         assert!(err.contains(labels::PLAN) && err.contains("dispatch.summary"), "{err}");
-    }
-
-    /// (#2430) An archived output carries the pre-rename label. It reads, and
-    /// reads AS the current label, so nothing downstream sees the old one.
-    #[test]
-    fn an_archived_output_with_a_pre_rename_label_still_reads_as_the_current_one() {
-        for (old, current) in [
-            ("crawl.plan", labels::PLAN),
-            ("crawl.unit-outcome", labels::UNIT_OUTCOME),
-            ("crawl.summary", labels::SUMMARY),
-        ] {
-            let text = Output::wrap(old, body(), Producer::default()).to_output_string().unwrap();
-            let back = Output::<Body>::read(&text, current).unwrap_or_else(|e| panic!("{old}: {e:#}"));
-            assert_eq!(back.kind, current, "{old} reads as {current}");
-            assert_eq!(back.body, body());
-        }
     }
 
     #[test]
