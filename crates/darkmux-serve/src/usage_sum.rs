@@ -165,6 +165,21 @@ pub struct UsageSplit {
 }
 
 impl UsageSplit {
+    fn of_sum(s: &UsageSum) -> Self {
+        Self { calls: s.usage_records, total: s.total, input: s.prompt, cached: s.cached, generated: s.completion, unreported: s.usage_records - s.reported }
+    }
+
+    fn merge(&mut self, o: &UsageSplit) {
+        self.calls += o.calls;
+        self.total = self.total.saturating_add(o.total);
+        self.input = self.input.saturating_add(o.input);
+        self.generated = self.generated.saturating_add(o.generated);
+        self.unreported += o.unreported;
+        if let Some(c) = o.cached {
+            self.cached = Some(self.cached.unwrap_or(0).saturating_add(c));
+        }
+    }
+
     fn add(&mut self, a: &UsageAmount) {
         self.calls += 1;
         if !a.reported {
@@ -190,6 +205,12 @@ pub struct UsageBreakdown {
     /// a `doctor --probe`): in `overall`, on no run's TOKENS cell. The run rows
     /// plus this equal the overall.
     pub no_run: UsageSplit,
+    /// (#3067) The calls that name a session or a mission with no row in this
+    /// listing (a start record outside the window, a peer's trimmed by the
+    /// stream's length bound): in `overall`, on no row. Filled by the run
+    /// build, which knows the rows: the run rows' tokens plus `no_run` plus
+    /// this are the overall.
+    pub unlisted: UsageSplit,
 }
 
 /// What makes two usage records one line of the breakdown. The endpoint
@@ -369,8 +390,17 @@ impl UsageFold {
                 .then_with(|| a.requested_model.cmp(&b.requested_model))
                 .then_with(|| a.reported_model.cmp(&b.reported_model))
         });
+        // The entries naming no run are `no_run`'s: never a row's to claim.
+        let no_run_entries: HashSet<usize> =
+            self.runs.iter().enumerate().filter(|(_, e)| e.session_id.is_empty() && e.mission_id.is_empty()).map(|(i, _)| i).collect();
         let runs = self.runs.into_iter().map(|e| (e.mission_id, e.sum)).collect();
-        UsageIndex { runs, by_session, by_mission, breakdown: UsageBreakdown { overall, groups, no_run: self.no_run } }
+        UsageIndex {
+            runs,
+            by_session,
+            by_mission,
+            claimed: std::cell::RefCell::new(no_run_entries),
+            breakdown: UsageBreakdown { overall, groups, no_run: self.no_run, unlisted: UsageSplit::default() },
+        }
     }
 }
 
@@ -382,6 +412,9 @@ pub struct UsageIndex {
     runs: Vec<(String, UsageSum)>,
     by_session: HashMap<String, Vec<usize>>,
     by_mission: HashMap<String, Vec<usize>>,
+    /// The entries a run row has read (or that belong to no run): what
+    /// [`Self::unlisted`] leaves out.
+    claimed: std::cell::RefCell<HashSet<usize>>,
     pub breakdown: UsageBreakdown,
 }
 
@@ -406,7 +439,9 @@ impl UsageIndex {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut total = 0u64;
         let mut reported = 0u64;
+        let mut claimed = self.claimed.borrow_mut();
         let mut take = |i: usize, runs: &[(String, UsageSum)]| {
+            claimed.insert(i);
             if seen.insert(i) {
                 total = total.saturating_add(runs[i].1.total);
                 reported += runs[i].1.reported;
@@ -426,6 +461,20 @@ impl UsageIndex {
             }
         }
         (reported > 0).then_some(total)
+    }
+
+    /// (#3067) Everything no row has read through [`Self::tokens_for`]: the
+    /// entries naming a session or mission that has no row in the listing.
+    /// Call it after every row has read its tokens.
+    pub fn unlisted(&self) -> UsageSplit {
+        let claimed = self.claimed.borrow();
+        let mut out = UsageSplit::default();
+        for (i, (_, sum)) in self.runs.iter().enumerate() {
+            if !claimed.contains(&i) {
+                out.merge(&UsageSplit::of_sum(sum));
+            }
+        }
+        out
     }
 
     /// The run keyed on exactly one session (a ghost, a lab run).

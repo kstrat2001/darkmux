@@ -1880,25 +1880,27 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
         let built = runs::build_runs_with_usage(&flows_dir, lab_dir.as_deref(), &fleet.records, None);
-        let no_run = wire::NoRunUsage { calls: built.usage.no_run.calls, tokens: built.usage.no_run.total };
+        let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
+        let off_rows = (off(&built.usage.no_run), off(&built.usage.unlisted));
         let mut rows = built.runs;
         let live = live_session_ids();
         log_beat_read_once(live.is_none());
         apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
-        (rows, no_run, fleet.state)
+        (rows, off_rows, fleet.state)
     })
     .await;
-    let (runs, no_run, fleet_state) = result.unwrap_or_else(|e| {
+    let (runs, (no_run, unlisted), fleet_state) = result.unwrap_or_else(|e| {
         // A join failure means NOTHING was aggregated — the empty array below
         // is a total failure, not an idle fleet. Previously this was a bare
         // `unwrap_or_default()`: silent on stderr and indistinguishable on the
         // wire from "no runs".
         eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
-        (Vec::new(), wire::NoRunUsage::default(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
+        (Vec::new(), Default::default(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
     });
     axum::Json(wire::RunsResponse {
         runs,
         no_run,
+        unlisted,
         generated_at_ms: current_millis(),
         meta: source_state::coverage_meta(&fleet_state),
         policy: runs::runs_policy(),

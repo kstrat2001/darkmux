@@ -1185,3 +1185,12 @@ pub(crate) fn status_http_mock(status_line: &'static str, body: &'static str) ->
     });
     format!("http://127.0.0.1:{port}/v1/chat/completions")
 }
+
+/// (#3067) A call whose provider reported `total_tokens: 0` beside one half is
+/// settled at what the display shows, not at 0 (which would let it run off the meter).
+#[test]
+fn a_step_budget_settles_a_zero_total_at_the_displayed_amount() {
+    let counts = darkmux_trajectory::UsageCounts { prompt: Some(900), total: Some(0), ..Default::default() };
+    assert_eq!(super::conservative_spend(counts.total_tokens(), 4096, "p"), counts.floor_tokens());
+    assert_eq!(counts.floor_tokens(), 900);
+}

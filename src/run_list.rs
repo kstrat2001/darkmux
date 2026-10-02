@@ -844,6 +844,13 @@ fn no_run_note(split: &UsageSplit) -> String {
     format!("{} {calls} on no run ({} tokens): in the totals, on no run's TOKENS cell", grouped(split.calls), grouped(split.total))
 }
 
+/// (#3067) Calls that name a run with no row in this listing (its start record
+/// is outside the window): in the totals, on no row.
+fn unlisted_note(split: &UsageSplit) -> String {
+    let calls = if split.calls == 1 { "call" } else { "calls" };
+    format!("{} {calls} on a run with no row here ({} tokens): in the totals, on no row's TOKENS cell", grouped(split.calls), grouped(split.total))
+}
+
 /// The calls a provider answered without a usage block are counted as calls
 /// and add 0 tokens here, the same reading the endpoint window budget takes
 /// (the conservative charge applies only to a dispatch's own cap). Say so
@@ -947,6 +954,9 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     }
     if b.no_run.calls > 0 {
         lines.push(style::dim(&no_run_note(&b.no_run)));
+    }
+    if b.unlisted.calls > 0 {
+        lines.push(style::dim(&unlisted_note(&b.unlisted)));
     }
     if all.unreported > 0 {
         lines.push(style::dim(&unreported_note(all.unreported)));
@@ -1692,6 +1702,7 @@ mod tests {
                     reported: 9,
                 },
                 no_run: split(2, 110, 95, None, 15),
+                unlisted: split(0, 0, 0, None, 0),
                 groups: vec![
                     UsageGroup {
                         machine: Some("laptop".into()),
@@ -1784,6 +1795,16 @@ mod tests {
 
     /// (#3067) A call that reported no usage is named under the totals, so a
     /// short total is not read as a complete one.
+    /// (#3067) Calls on a run with no row print their own line, only when there are some.
+    #[test]
+    fn usage_lines_name_calls_on_a_run_with_no_row_only_when_there_are_some() {
+        let mut report = sample_report();
+        assert!(!usage_lines(&report, None).join("\n").contains("no row here"));
+        report.breakdown.unlisted = split(1, 50, 40, None, 10);
+        let text = usage_lines(&report, None).join("\n");
+        assert!(text.contains("1 call on a run with no row here (50 tokens)"), "{text}");
+    }
+
     #[test]
     fn usage_lines_name_calls_that_reported_no_usage() {
         let mut report = sample_report();

@@ -676,9 +676,13 @@ fn build_runs_in(
     }
     runs.extend(ghosts);
 
+    // (#3067) Whatever no listed row claimed: rows + no_run + unlisted are the
+    // overall, always.
+    let mut breakdown = usage.breakdown.clone();
+    breakdown.unlisted = usage.unlisted();
     RunsWithUsage {
         runs,
-        usage: usage.breakdown,
+        usage: breakdown,
         since: window.since_label(),
         default_window: window.since_iso.is_none(),
     }
@@ -7508,6 +7512,46 @@ mod tests {
         let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
         assert_eq!(built.usage.no_run.total, 9);
         assert_eq!(rows + built.usage.no_run.total, built.usage.overall.total, "rows plus no-run are the overall");
+    }
+
+    /// (#3067) The identity holds even for usage that names a run with no
+    /// row: a session whose start record is outside the window (no ghost row)
+    /// lands in `unlisted`, so rows + no_run + unlisted are the overall.
+    #[test]
+    #[serial_test::serial]
+    fn rows_plus_no_run_plus_unlisted_equal_the_total_even_for_a_session_with_no_row() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": total });
+        let sessionless = {
+            let mut r = usage_record(&now, "x", None, serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }));
+            r.as_object_mut().unwrap().remove("session_id");
+            r
+        };
+        let mission_only = {
+            let mut r = usage_record(&now, "x", Some("m-x"), provider(7));
+            r.as_object_mut().unwrap().remove("session_id");
+            r
+        };
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }),
+                usage_record(&now, "s-run", None, provider(100)),
+                // No start record: no row is built for this session.
+                usage_record(&now, "s-orphan", None, provider(50)),
+                mission_only,
+                sessionless,
+            ],
+        );
+        let built = build_runs_with_usage(flows.path(), None, &[], None);
+        let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+        let u = &built.usage;
+        assert_eq!((u.no_run.total, u.no_run.calls), (9, 1));
+        assert_eq!((u.unlisted.total, u.unlisted.calls), (50, 1), "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
+        assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total);
     }
 
     /// (#2902 step 2b) `build_runs_with_usage`'s breakdown is the same fold

@@ -151,7 +151,10 @@ impl UsageCounts {
         };
         match self.total {
             Some(t) if t > 0 => Some(t),
-            // A reported total of 0 beside non-zero halves is unreported (#3067).
+            // A reported total of 0 beside non-zero halves is unreported (#3067):
+            // the halves, or what one half reported, so the budget settles what
+            // the display shows.
+            Some(0) if self.prompt.is_some() || self.completion.is_some() => Some(self.prompt.unwrap_or(0).saturating_add(self.completion.unwrap_or(0))),
             reported => halves.or(reported),
         }
     }
@@ -235,6 +238,10 @@ mod tests {
         let zero_total = UsageCounts { prompt: Some(900), completion: Some(40), total: Some(0), ..Default::default() };
         assert_eq!(zero_total.floor_tokens(), 940, "a total of 0 beside halves is unreported (#3067)");
         assert_eq!(zero_total.total_tokens(), Some(940));
+        // One half beside a reported 0: the budget settle and the display agree.
+        let one_half = UsageCounts { prompt: Some(900), total: Some(0), ..Default::default() };
+        assert_eq!(one_half.total_tokens(), Some(900));
+        assert_eq!(one_half.floor_tokens(), 900);
     }
 
     #[test]

@@ -43,11 +43,22 @@ export interface TokensOffMeter {
    *  and no mission (radio routing, a probe). Every figure above counts them;
    *  no run's TOKENS cell does. The twin of `/runs`' `no_run`. */
   noRun: { calls: number; tokens: number };
+  /** (#3067) The part of `total` that names a run with no row in the listing
+   *  (a start record outside the window). Zero when no listing was given. */
+  unlisted: { calls: number; tokens: number };
 }
 
-export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
+export function tokensOffMeter(data: NormRecord[], runIds?: ReadonlySet<string>): TokensOffMeter {
   const s = sumUsage(data);
-  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data), noRun: noRunUsage(data) };
+  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data), noRun: noRunUsage(data), unlisted: unlistedUsage(data, runIds) };
+}
+
+/** The usage records that name a session or mission no row of `runIds` is,
+ *  the twin of the run build's `unlisted`. Nothing without a listing. */
+export function unlistedUsage(data: readonly NormRecord[], runIds?: ReadonlySet<string>): { calls: number; tokens: number } {
+  if (!runIds) return { calls: 0, tokens: 0 };
+  const s = sumUsage(data.filter((r) => (r.session_id || r.mission_id) && !runIds.has(r.session_id ?? "") && !runIds.has(r.mission_id ?? "")));
+  return { calls: s.usageRecords, tokens: s.total };
 }
 
 /** The usage records on no run: neither a session nor a mission named, the

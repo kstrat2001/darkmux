@@ -861,8 +861,11 @@ interface ModelFigures {
 /** (#3067) The hover text naming the utility part of the token tiles. */
 function tokenHintOf(f: Pick<ModelFigures, "tokIn" | "tokOut" | "tokTotal" | "tokUtility">): string | undefined {
   const parts: string[] = [];
-  if (f.tokTotal != null && f.tokTotal !== (f.tokIn ?? 0) + (f.tokOut ?? 0)) {
+  const split = (f.tokIn ?? 0) + (f.tokOut ?? 0);
+  if (f.tokTotal != null && f.tokTotal > split) {
     parts.push(`${fmtC(f.tokTotal)} tokens in total, the run row's figure (not all of it is split into input and generated)`);
+  } else if (f.tokTotal != null && f.tokTotal < split) {
+    parts.push(`${fmtC(f.tokTotal)} tokens in total, the run row's figure (the provider's total is below input + generated)`);
   }
   if (f.tokUtility) parts.push(`includes ${fmtC(f.tokUtility)} tokens of utility calls (compaction, radio routing)`);
   return parts.length > 0 ? parts.join("; ") : undefined;

@@ -5619,7 +5619,7 @@
             r.to_string()
         };
         let start = serde_json::json!({ "ts": ts, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }).to_string();
-        let lines = [start, usage(Some("s-run"), 100), usage(None, 9), usage(None, 4)].join("\n");
+        let lines = [start, usage(Some("s-run"), 100), usage(None, 9), usage(None, 4), usage(Some("s-orphan"), 50)].join("\n");
         fs::write(flows.path().join(format!("{}.jsonl", &ts[..10])), lines + "\n").unwrap();
         let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
@@ -5628,7 +5628,9 @@
         assert_eq!(json["no_run"]["tokens"], 13, "{json}");
         assert_eq!(json["no_run"]["calls"], 2);
         let rows: u64 = json["runs"].as_array().unwrap().iter().filter_map(|r| r["tokens"].as_u64()).sum();
-        assert_eq!(rows + json["no_run"]["tokens"].as_u64().unwrap(), 113, "rows plus no_run are the total");
+        assert_eq!((json["unlisted"]["tokens"].as_u64(), json["unlisted"]["calls"].as_u64()), (Some(50), Some(1)), "a session with no start record has no row");
+        let off = json["no_run"]["tokens"].as_u64().unwrap() + json["unlisted"]["tokens"].as_u64().unwrap();
+        assert_eq!(rows + off, 163, "rows plus no_run plus unlisted are the total");
     }
 
     /// 5.0: `/runs` applies the not-reporting overlay. A dispatch running on a

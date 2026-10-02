@@ -58,13 +58,16 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
   );
 }
 
+type OffRow = { calls: number; tokens: number };
+
 /** (#3067) The hover text under the total: what it leaves out (machines not
  *  streaming here) and what it includes that no run's row shows (calls with no
  *  session, radio routing). A tooltip, so the hero keeps its height. */
-export function totalHint(noRun: { calls: number; tokens: number }, notStreaming: readonly string[]): string | undefined {
+export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[]): string | undefined {
   const parts: string[] = [];
   if (notStreaming.length > 0) parts.push(`Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.`);
-  if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing).`);
+  if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing and probes).`);
+  if (unlisted.calls > 0) parts.push(`Includes ${fmtC(unlisted.tokens)} tokens on runs not listed here.`);
   return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
@@ -183,7 +186,7 @@ const SavingsHero = memo(function SavingsHero({
           <div className="savlblwrap">
             <div
               className="savlbl"
-              title={totalHint(t.noRun, notStreaming)}
+              title={totalHint(t.noRun, t.unlisted, notStreaming)}
             >
               {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
               {liveMode ? ` · last ${hours}h` : ""}
@@ -722,7 +725,8 @@ export function FleetLens({
     () => recordsAsOf(flowWindow.data, playhead ?? wallNow),
     [flowWindow.data, playhead, wallNow],
   );
-  const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
+  const runIds = useMemo(() => (runsQuery.data?.ok ? new Set(runs.map((r) => r.id)) : undefined), [runsQuery.data, runs]);
+  const tokens = useMemo(() => tokensOffMeter(scopedData, runIds), [scopedData, runIds]);
 
   // (#2928) The live channel's overlay: at the live edge of a live route
   // only (`livePolling` is false on a static build, `playhead` is set on a

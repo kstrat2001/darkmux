@@ -1025,7 +1025,7 @@ describe("tokensOffMeter", () => {
 
   it("returns all-zero on an empty window", () => {
     const t = tokensOffMeter([]);
-    expect(t).toEqual({ total: 0, input: 0, generated: 0, cached: null, utility: 0, runs: 0, noRun: { calls: 0, tokens: 0 } });
+    expect(t).toEqual({ total: 0, input: 0, generated: 0, cached: null, utility: 0, runs: 0, noRun: { calls: 0, tokens: 0 }, unlisted: { calls: 0, tokens: 0 } });
   });
 });
 

@@ -3617,9 +3617,13 @@ describe("fleet card: the utility robot from the card alone", () => {
 });
 
 describe("the hero total's hover text (#3067)", () => {
-  it("names the tokens with no run, and stays silent when there are none", () => {
-    expect(totalHint({ calls: 0, tokens: 0 }, [])).toBeUndefined();
-    expect(totalHint({ calls: 2, tokens: 1300 }, [])).toBe("Includes 1.30k tokens with no run (radio routing).");
-    expect(totalHint({ calls: 1, tokens: 9 }, ["studio"])).toBe("Counts only machines whose records reach this viewer. Not streaming here: studio. Includes 9 tokens with no run (radio routing).");
+  const none = { calls: 0, tokens: 0 };
+  it("names the tokens with no run and on unlisted runs, whichever are non-zero", () => {
+    expect(totalHint(none, none, [])).toBeUndefined();
+    expect(totalHint({ calls: 2, tokens: 1300 }, none, [])).toBe("Includes 1.30k tokens with no run (radio routing and probes).");
+    expect(totalHint(none, { calls: 1, tokens: 50 }, [])).toBe("Includes 50 tokens on runs not listed here.");
+    expect(totalHint({ calls: 1, tokens: 9 }, { calls: 1, tokens: 50 }, ["studio"])).toBe(
+      "Counts only machines whose records reach this viewer. Not streaming here: studio. Includes 9 tokens with no run (radio routing and probes). Includes 50 tokens on runs not listed here.",
+    );
   });
 });
