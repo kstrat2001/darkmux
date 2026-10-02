@@ -351,6 +351,10 @@ export interface StepMetrics {
    *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
    *  one execution's end (a map step holds one per item), not the step's. */
   stepBookended?: boolean;
+  /** (#3017) The hub receive order of the newest terminal folded, when it
+   *  carried one: what tells a retry (a start the hub received AFTER the step
+   *  ended) from a sibling start of the same attempt. */
+  endHub?: number | null;
 }
 
 const EMPTY_METRICS: StepMetrics = {
@@ -417,10 +421,16 @@ export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: strin
  *    not the most records: a looped-then-killed attempt emits hundreds of
  *    turn records while the successful retry emits a dozen, so frequency
  *    selects the failure; recency selects the attempt that represents the
- *    step's current state. Count breaks ts ties.
+ *    step's current state. Count breaks ties.
+ *
+ * "Latest" is the hub's receive order (#3017) when both sessions' records
+ * carry it, because a retry on another machine is stamped by THAT machine's
+ * clock, which can run minutes behind the first attempt's. A session with no
+ * hub-ordered record (a replay, a local-only line) is compared by its own
+ * time, and only against another such session.
  */
 export function stepDispatchSessions(records: NormRecord[], missionId: string): Record<string, string> {
-  type Tally = { n: number; lastTs: number; ours: boolean };
+  type Tally = { n: number; lastTs: number; lastHub: number | null; ours: boolean };
   const tally: Record<string, Record<string, Tally>> = {};
   for (const rec of records) {
     // (#2223) Evidence that a dispatch actually ran under this session, as
@@ -432,9 +442,10 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     if (!stepId || !sid) continue;
     if (rec.mission_id && rec.mission_id !== missionId) continue;
     const forStep = (tally[stepId] ||= {});
-    const t = (forStep[sid] ||= { n: 0, lastTs: 0, ours: false });
+    const t = (forStep[sid] ||= { n: 0, lastTs: 0, lastHub: null, ours: false });
     t.n += 1;
     t.lastTs = Math.max(t.lastTs, rec.tMs ?? 0);
+    if (rec.hub != null) t.lastHub = Math.max(t.lastHub ?? 0, rec.hub);
     if (rec.mission_id === missionId) t.ours = true;
   }
   const out: Record<string, string> = {};
@@ -451,8 +462,9 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
         if (t.ours) { best = sid; bestT = t; }
         continue;
       }
-      if (t.lastTs !== bestT.lastTs) {
-        if (t.lastTs > bestT.lastTs) { best = sid; bestT = t; }
+      const newer = attemptRecency(t, bestT);
+      if (newer !== 0) {
+        if (newer > 0) { best = sid; bestT = t; }
         continue;
       }
       if (t.n > bestT.n) { best = sid; bestT = t; }
@@ -460,6 +472,14 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     if (best) out[stepId] = best;
   }
   return out;
+}
+
+/** Positive when attempt `a` is more recent than `b`, negative when older, 0
+ *  when neither is (#3017): by the hub's receive order when both have one,
+ *  else by their own latest record time. */
+function attemptRecency(a: { lastTs: number; lastHub: number | null }, b: { lastTs: number; lastHub: number | null }): number {
+  if (a.lastHub !== null && b.lastHub !== null) return a.lastHub - b.lastHub;
+  return a.lastTs - b.lastTs;
 }
 
 /** Whether folding a record left the step's accumulator unchanged. */
@@ -476,6 +496,7 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
     a.toolFinal === b.toolFinal &&
     a.usageSeen === b.usageSeen &&
     a.startTs === b.startTs &&
+    (a.endHub ?? null) === (b.endHub ?? null) &&
     a.endTs === b.endTs &&
     a.stepBookended === b.stepBookended &&
     a.lastTs === b.lastTs
@@ -493,6 +514,34 @@ function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsS
     finalTok: count((end ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
     totalTurns: count(end?.total_turns),
   };
+}
+
+/** Fold a start or terminal into the step's span (start, end). Records must be
+ *  folded in the hub's receive order (`byReceiveOrder`), not by each writer's
+ *  clock (#3017): a start the hub received AFTER the step's last terminal is a
+ *  RETRY, so the span restarts at it and the step reads running. Without hub
+ *  ids the span is the earliest start to the latest terminal, as before. A
+ *  terminal with no usable time still ends the step, at the latest time the
+ *  step is known to have been alive (the bad-timestamp policy). */
+function foldSpan(
+  cur: StepMetrics,
+  next: StepMetrics,
+  ev: { isStart: boolean; isTerminal: boolean; recMs: number; hub: number | null },
+): void {
+  if (ev.isStart && ev.recMs) {
+    const retried = ev.hub !== null && cur.endHub != null && ev.hub > cur.endHub;
+    if (retried) {
+      next.startTs = ev.recMs;
+      next.endTs = 0;
+      next.endHub = null;
+    } else {
+      next.startTs = next.startTs ? Math.min(next.startTs, ev.recMs) : ev.recMs;
+    }
+  }
+  if (ev.isTerminal) {
+    next.endTs = Math.max(next.endTs, ev.recMs || next.lastTs || next.startTs);
+    if (ev.hub !== null) next.endHub = Math.max(next.endHub ?? 0, ev.hub);
+  }
 }
 
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
@@ -520,10 +569,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   if (stepBookended) next.stepBookended = true;
   const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
-  if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
-  // A terminal with no usable time still ends the step, at the latest time
-  // the step is known to have been alive (the bad-timestamp policy).
-  if (isTerminal) next.endTs = Math.max(next.endTs, recMs || next.lastTs || next.startTs);
+  foldSpan(cur, next, { isStart, isTerminal, recMs, hub: rec.hub ?? null });
 
   const fig = recordFigures(rec);
   const finalTok = fig.finalTok;

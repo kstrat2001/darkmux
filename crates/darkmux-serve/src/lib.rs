@@ -4557,15 +4557,42 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Sourc
                 continue;
             }
         }
-        let Some(parsed) = darkmux_flow::reader::parse_value(json) else {
+        let Some(mut parsed) = darkmux_flow::reader::parse_value(json) else {
             continue;
         };
+        if let Some(id) = redis_value_as_str(&pairs[0]) {
+            stamp_hub_id(&mut parsed, id);
+        }
         records.push(parsed);
     }
     // XREVRANGE yields newest-first; restore chronological order so the
     // response matches the local-file path's ordering (#809).
     records.reverse();
     Ok(SourceRead { records, cut })
+}
+
+/// (#3017) Stamp a record read off the hub with the hub's own stream id
+/// (`<ms>-<seq>`) as `hub_id`. The Redis stream id is assigned by the hub at
+/// receive and is monotonic, so it orders records from machines whose clocks
+/// disagree; a record's own `ts` is its writer's clock and cannot. Additive:
+/// a record that never passed through the hub (a local-only day-file line)
+/// carries none, and a reader then has no hub order for it.
+fn stamp_hub_id(record: &mut serde_json::Value, id: &str) {
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("hub_id".to_string(), serde_json::Value::String(id.to_string()));
+    }
+}
+
+/// [`stamp_hub_id`] for a record still in its wire spelling (the live tail
+/// forwards lines). A line that is not a JSON object passes through as is.
+fn stamp_hub_id_line(line: &str, id: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(mut v) if v.is_object() => {
+            stamp_hub_id(&mut v, id);
+            v.to_string()
+        }
+        _ => line.to_string(),
+    }
 }
 
 /// The millisecond part of a stream entry's `<ms>-<seq>` id.
@@ -5342,7 +5369,10 @@ fn xread_block_once(
                 continue;
             };
             if record_ts_matches_date(record_json, date_filter) {
-                records.push(record_json.to_string());
+                records.push(match redis_value_as_str(&parts[0]) {
+                    Some(id) => stamp_hub_id_line(record_json, id),
+                    None => record_json.to_string(),
+                });
             }
         }
     }

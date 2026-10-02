@@ -8,10 +8,13 @@ import {
   SOURCE,
   STAGE,
   TIER,
+  byReceiveOrder,
   byTime,
+  parseHubId,
   byTimeNewestFirst,
   ingest,
   ingestJsonl,
+  ingestRecord,
   isAsOf,
   isExecutionAction,
   recordsAsOf,
@@ -367,5 +370,32 @@ describe("ingest: the execution a record is of", () => {
     expect(isExecutionAction(ACTION.StepStart)).toBe(false);
     expect(isExecutionAction(ACTION.DispatchRoute)).toBe(false);
     expect(isExecutionAction(undefined)).toBe(false);
+  });
+});
+
+// (#3017) The hub's receive order, never a writer's clock.
+describe("hub order", () => {
+  const at = (ts: string, hub?: string) => ingestRecord({ ts, action: "operator.note", ...(hub ? { hub_id: hub } : {}) })!;
+
+  it("reads a stream id as one comparable number and refuses anything else", () => {
+    expect(parseHubId("1000-1")).toBeGreaterThan(parseHubId("1000-0") as number);
+    expect(parseHubId("1001-0")).toBeGreaterThan(parseHubId("1000-1023") as number);
+    for (const bad of [undefined, null, 5, "", "1000", "a-b", "1-2-3"]) expect(parseHubId(bad)).toBeNull();
+  });
+
+  it("orders by receive order even when the clocks say the opposite", () => {
+    const first = at("2026-08-19T10:00:00Z", "1000-0");
+    const second = at("2026-08-19T09:50:00Z", "1001-0"); // a slow clock
+    expect([second, first].sort(byReceiveOrder)).toEqual([first, second]);
+    expect([second, first].sort(byTime)).toEqual([second, first]);
+  });
+
+  it("puts a record the hub never saw after every hub-ordered one, and with no ids is byTime", () => {
+    const hubbed = at("2026-08-19T10:00:00Z", "1000-0");
+    const local = at("2026-08-19T08:00:00Z");
+    expect([local, hubbed].sort(byReceiveOrder)).toEqual([hubbed, local]);
+    const a = at("2026-08-19T10:00:00Z");
+    const b = at("2026-08-19T09:00:00Z");
+    expect([a, b].sort(byReceiveOrder)).toEqual([b, a]);
   });
 });

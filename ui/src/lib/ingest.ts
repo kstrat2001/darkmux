@@ -87,6 +87,12 @@ export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "categ
   payload?: Record<string, unknown>;
   /** `ts` parsed once; `null` when it is missing or does not parse. */
   readonly tMs: number | null;
+  /** (#3017) The hub's receive order for this record: the Redis stream id
+   *  (`<ms>-<seq>`) the daemon stamped as `hub_id`, as one comparable number
+   *  (see {@link parseHubId}). `null` for a record that never passed through
+   *  the hub (a local-only day-file line, a static replay). Cross-machine
+   *  ordering reads this, never `tMs`, which is each writer's own clock. */
+  readonly hub?: number | null;
   /** `payload`, aliased by the render model for records that only carry the
    *  one spelling. Added by the viewer; the wire's `FlowRecord` has `payload`. */
   fields?: Record<string, unknown>;
@@ -362,12 +368,25 @@ function parseTs(ts: unknown): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
+/** A hub stream id (`<ms>-<seq>`) as one number: `ms * 1024 + seq`, so ids
+ *  compare as the hub assigned them. The stream's sequence restarts every
+ *  millisecond and would have to exceed 1023 writes inside one millisecond to
+ *  collide with the next one; the product stays below 2^53 until the year
+ *  2255. `null` for anything that is not an id. */
+export function parseHubId(id: unknown): number | null {
+  if (typeof id !== "string") return null;
+  const m = /^(\d+)-(\d+)$/.exec(id);
+  if (!m) return null;
+  const n = Number(m[1]) * 1024 + Math.min(Number(m[2]), 1023);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /** One raw value as a record, or `null` for anything that is not one (a
  *  non-object, or the `{"_type":"schema"}` header every flow file leads
  *  with). */
 export function ingestRecord(raw: unknown): NormRecord | null {
   if (!isPlainObject(raw) || raw._type != null) return null;
-  const out: Record<string, unknown> = { ...raw, tMs: parseTs(raw.ts) };
+  const out: Record<string, unknown> = { ...raw, tMs: parseTs(raw.ts), hub: parseHubId(raw.hub_id) };
   for (const key of TAGGED_FIELDS) assignTyped(out, key, parseTag(raw[key]));
   const action = out.action as NormAction | undefined;
   if (action !== undefined && !isKnownAction(action)) warnUnknownAction(tagText(action));
@@ -519,6 +538,22 @@ export function byTime(a: NormRecord, b: NormRecord): number {
   if (a.tMs === null) return b.tMs === null ? 0 : 1;
   if (b.tMs === null) return -1;
   return a.tMs - b.tMs;
+}
+
+/** Ascending by the hub's receive order (#3017), for folding records that
+ *  come from machines whose clocks disagree. Records that carry a hub id sort
+ *  by it. A record with none (it never passed through the hub: a local-only
+ *  day-file line, a static replay) sorts after every hub-ordered one, by its
+ *  own time: only that tail is ordered by a clock, and only ever against
+ *  records the hub has no say over. With no hub ids at all this is
+ *  {@link byTime}. Stable. */
+export function byReceiveOrder(a: NormRecord, b: NormRecord): number {
+  const ha = a.hub ?? null;
+  const hb = b.hub ?? null;
+  if (ha !== null && hb !== null) return ha - hb;
+  if (ha !== null) return -1;
+  if (hb !== null) return 1;
+  return byTime(a, b);
 }
 
 /** Newest first, untimed records after every timed one (policy rule 3): the

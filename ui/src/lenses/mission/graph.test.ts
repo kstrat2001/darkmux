@@ -40,7 +40,7 @@ import {
   type MetricsMap,
   type MissionGraph,
 } from "./graph";
-import { isDispatchFamily, type NormRecord } from "../../lib/ingest";
+import { byReceiveOrder, isDispatchFamily, type NormRecord } from "../../lib/ingest";
 import { norm, type RawRecord } from "../../testing/records";
 
 function rec(over: RawRecord = {}): NormRecord {
@@ -853,6 +853,45 @@ describe("drawnEdges / phaseOrderEdges", () => {
       ["p1", "p2"],
       ["p2", "p3"],
     ]);
+  });
+});
+
+// (#3017) Cross-machine order is the hub's receive order, never a writer's own
+// clock. darkbook's clock runs 10 minutes slow: its live retry carries EARLIER
+// timestamps than the failed attempt on the studio, but the hub received it
+// later (a higher `hub_id`).
+describe("a slow-clock peer's retry (#3017)", () => {
+  const M = "m1";
+  const studio = (ts: string, action: string, hub: string) =>
+    rec({ ts, hub_id: hub, machine_id: "studio", session_id: "sS", action, payload: { step_id: "s1" } });
+  const darkbook = (ts: string, action: string, hub: string) =>
+    rec({ ts, hub_id: hub, machine_id: "darkbook", session_id: "sD", action, payload: { step_id: "s1" } });
+  const records = () => [
+    studio("2026-08-19T10:00:00Z", "dispatch.start", "1000-0"),
+    studio("2026-08-19T10:00:05Z", "dispatch.error", "1001-0"),
+    darkbook("2026-08-19T09:50:30Z", "dispatch.start", "1002-0"),
+    darkbook("2026-08-19T09:51:00Z", "dispatch.turn", "1003-0"),
+  ];
+
+  it("the live retry is the step's session, not the failed attempt the studio's clock favors", () => {
+    expect(stepDispatchSessions(records(), M).s1).toBe("sD");
+  });
+
+  it("without hub ids the same records fall back to each record's own time", () => {
+    const bare = records().map((r) => rec({ ...r, hub_id: undefined, hub: undefined, payload: r.payload }));
+    expect(stepDispatchSessions(bare, M).s1).toBe("sS");
+  });
+
+  it("the step shows the retry running, not a ~9.5 minute span stitched across two clocks", () => {
+    const g = baseGraph();
+    const idx = indexGraph({ ...g });
+    let m: MetricsMap = {};
+    for (const r of [...records()].sort(byReceiveOrder)) {
+      m = applyRecordToMetrics(m, { ...r, handle: "a-step", payload: {} } as NormRecord, idx, M);
+    }
+    const s = m["a-step"];
+    expect(s.endTs, "the retry has not ended").toBe(0);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T09:50:30Z"));
   });
 });
 
