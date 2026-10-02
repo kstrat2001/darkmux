@@ -823,11 +823,19 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
     crate::doctor::fleet_submission_checks(&facts)
 }
 
-/// (#3017) Each fleet machine's clock against the hub's, from the same view
-/// `machine list` prints: only machines with a beat and a readable hub clock.
+/// (#3017) Each machine's clock against the hub's, from presence beats and the
+/// hub's own clock alone: one Redis read, no dialing of peers. Empty when no
+/// hub is configured or it cannot be read.
 fn fleet_clock_skews() -> Vec<(String, i64)> {
-    let view = crate::machine_list::local_fleet_view();
-    view.machines.iter().filter_map(|m| Some((crate::machine_list::row_name(&view, m), m.clock_skew_ms?))).collect()
+    let Some(url) = darkmux_flow::redis_url() else { return Vec::new() };
+    let Ok(client) = redis::Client::open(url.expose_for_probe()) else { return Vec::new() };
+    let (Ok(beats), Ok(hub_now)) = (
+        darkmux_flow::presence::read_live(&client),
+        darkmux_flow::presence::read_hub_time_ms(&client),
+    ) else {
+        return Vec::new();
+    };
+    darkmux_flow::presence::skews_of(&beats, hub_now)
 }
 
 /// (#2916 review C8) What the local daemon says about its fleet listener

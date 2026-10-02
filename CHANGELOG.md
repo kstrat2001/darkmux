@@ -19,12 +19,14 @@ darkmux release.
 - **A relayed run is one run** (#3016). Work asked on one machine and executed
   on another (radio's answering seat on a peer, `dispatch --profile p@peer`, a
   fleet job) is one row on the runs board, owned by the machine that ran it: it
-  counts there and the Machine filter matches it. The asking machine's own
-  session for the same work folds into it. `GET /runs` rows gain an additive
-  `relay: { asked_on_machine, sender_run }`; the row subtitle ends "from
+  counts there and the Machine filter matches it (the asking side writes only a
+  `dispatch.route` record, so it never makes a second row). `GET /runs` rows gain
+  an additive `relay: { asked_on_machine, sender_run? }`, `sender_run` set only
+  when the asker was a mission; the row subtitle ends "from
   <asker>" and the run page header reads "on <executor>, asked on <asker>".
 - **Cross-machine order is the hub's receive order** (#3017). Records read off
-  the hub carry the Redis stream id as an additive `hub_id`; the mission graph
+  the hub carry the Redis stream id as an additive `hub_id` (documented on the
+  flow record wire type); the mission graph
   orders a step's attempts and folds its span by it, so a peer whose clock runs
   slow no longer loses its live retry to a failed attempt or stretches a
   "finished" span across two clocks. A reporting peer's quiet session is judged

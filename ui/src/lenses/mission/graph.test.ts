@@ -895,6 +895,50 @@ describe("a slow-clock peer's retry (#3017)", () => {
   });
 });
 
+// (#3017 review) /flow-mission mixes hub-stamped records with this machine's
+// unstamped day-file ones. Every record has ONE receive key (its hub id, else
+// its own time), so the order stays total and a step still folds start-first.
+describe("a window mixing stamped and unstamped records (#3017)", () => {
+  const M = "m1";
+  const idx = indexGraph(baseGraph());
+  const fold = (rs: NormRecord[]) => {
+    let m: MetricsMap = {};
+    for (const r of [...rs].sort(byReceiveOrder)) m = applyRecordToMetrics(m, r, idx, M);
+    return m["a-step"];
+  };
+
+  it("an unstamped start older than a stamped turn still folds first, so the turns count", () => {
+    const start = rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" });
+    const turns = [1, 2, 3].map((n) =>
+      rec({ ts: `2026-08-19T10:3${n}:00Z`, hub_id: `${Date.parse("2026-08-19T10:30:00Z") + n * 1000}-0`, handle: "a-step", action: "dispatch.turn", payload: { turns_so_far: n } }),
+    );
+    expect(fold([...turns, start]).turnRun).toBe(3);
+  });
+
+  it("a stamped live retry after an UNSTAMPED failed attempt is still recognized as the retry", () => {
+    const failed = [
+      rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:05Z", handle: "a-step", action: "dispatch.error" }),
+    ];
+    // darkbook's clock is 10 minutes slow; the hub received this AFTER the failure.
+    const retry = rec({ ts: "2026-08-19T09:50:30Z", hub_id: `${Date.parse("2026-08-19T10:01:00Z")}-0`, handle: "a-step", action: "dispatch.start" });
+    const s = fold([retry, ...failed]);
+    expect(s.endTs, "the retry has not ended").toBe(0);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T09:50:30Z"));
+  });
+
+  it("an older step whose dispatches ran one after another keeps its whole span", () => {
+    const s = fold([
+      rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:10Z", handle: "a-step", action: "dispatch.complete" }),
+      rec({ ts: "2026-08-19T10:00:20Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:40Z", handle: "a-step", action: "dispatch.complete" }),
+    ]);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T10:00:00Z"));
+    expect(s.endTs).toBe(Date.parse("2026-08-19T10:00:40Z"));
+  });
+});
+
 describe("isDispatchFamily (#2223): the evidence stepDispatchSessions keys on", () => {
   const actionOf = (action: string) => rec({ action }).action;
   it("admits dispatch work, known or not, and refuses bookkeeping/telemetry", () => {

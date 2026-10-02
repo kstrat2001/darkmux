@@ -161,7 +161,7 @@
   "ui/src/lenses/mission/graph.ts::buildStepHeaderFields": 26,
   "ui/src/lenses/mission/graph.ts::computeLayout": 26,
   "ui/src/lenses/mission/graph.ts::seedMetricsFromGraph": 17,
-  "ui/src/lenses/mission/graph.ts::stepDispatchSessions": 20,
+  "ui/src/lenses/mission/graph.ts::stepDispatchSessions": 18,
   "ui/src/lenses/mission/timeline.ts::groupTimeline": 17,
   "ui/src/lenses/mission/timeline.ts::taskAggMetrics": 18,
   "ui/src/lenses/runs/RunsBoard.tsx::RunsBoard": 36,

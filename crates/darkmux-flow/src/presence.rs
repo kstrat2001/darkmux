@@ -72,6 +72,11 @@ pub fn clock_skew_words(skew_ms: i64) -> Option<String> {
     Some(format!("clock {amount} {side} the hub"))
 }
 
+/// Every live machine's clock against the hub's: display name and skew.
+pub fn skews_of(beats: &[PresenceBeat], hub_now_ms: u64) -> Vec<(String, i64)> {
+    beats.iter().map(|b| (b.display_name.clone(), clock_skew_ms(b.beat_ts_ms, hub_now_ms))).collect()
+}
+
 /// The hub's own clock in Unix milliseconds (`TIME`), the reference a beat's
 /// timestamp is measured against.
 pub fn read_hub_time_ms(client: &redis::Client) -> Result<u64> {
@@ -422,6 +427,14 @@ mod tests {
         assert_eq!(at(10 * 60 * 1000).as_deref(), Some("clock 10m behind the hub"));
         assert_eq!(clock_skew_words(clock_skew_ms(hub + 3 * 60 * 1000, hub)).as_deref(), Some("clock 3m ahead of the hub"));
         assert_eq!(at(2 * 3600 * 1000 + 5 * 60 * 1000).as_deref(), Some("clock 2h5m behind the hub"));
+    }
+
+    #[test]
+    fn skews_of_pairs_each_beat_with_its_name() {
+        let mut b = sample_beat();
+        b.display_name = "studio".into();
+        b.beat_ts_ms = 1_000_000 - 600_000;
+        assert_eq!(skews_of(&[b], 1_000_000), vec![("studio".to_string(), -600_000)]);
     }
 
     fn sample_beat() -> PresenceBeat {

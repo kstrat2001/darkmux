@@ -938,7 +938,7 @@ RunListOutput
   usage?: UsageReport | null
 RunRelay
   asked_on_machine: string
-  sender_run: string
+  sender_run?: string | null
 RunSetStats
   runs: RunStats[]
   summary: SetSummary

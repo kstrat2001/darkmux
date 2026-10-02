@@ -390,12 +390,18 @@ describe("hub order", () => {
     expect([second, first].sort(byTime)).toEqual([second, first]);
   });
 
-  it("puts a record the hub never saw after every hub-ordered one, and with no ids is byTime", () => {
-    const hubbed = at("2026-08-19T10:00:00Z", "1000-0");
-    const local = at("2026-08-19T08:00:00Z");
-    expect([local, hubbed].sort(byReceiveOrder)).toEqual([hubbed, local]);
+  it("places a record the hub never saw by its own time on the hub's scale, in one total order", () => {
+    const ms = Date.parse("2026-08-19T10:00:00Z");
+    const stamped = (off: number) => at(new Date(ms + off).toISOString(), `${ms + off}-0`);
+    const local = at("2026-08-19T10:00:30Z");
+    const early = stamped(10_000);
+    const late = stamped(60_000);
+    expect([late, local, early].sort(byReceiveOrder)).toEqual([early, local, late]);
+    expect([local, late, early].sort(byReceiveOrder)).toEqual([early, local, late]);
     const a = at("2026-08-19T10:00:00Z");
     const b = at("2026-08-19T09:00:00Z");
     expect([a, b].sort(byReceiveOrder)).toEqual([b, a]);
+    const keyless = ingestRecord({ action: "operator.note" })!;
+    expect([keyless, early].sort(byReceiveOrder)).toEqual([early, keyless]);
   });
 });

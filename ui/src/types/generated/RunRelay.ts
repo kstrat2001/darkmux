@@ -14,8 +14,10 @@ export type RunRelay = {
  */
 asked_on_machine: string, 
 /**
- * The asker's own run id (its session's run), so the asking side can
- * be found there. The asker's session row itself is folded into this
- * one (see [`ghost_runs`]).
+ * The asker's own run id, only when that run is a mission (a row the
+ * asking machine's board lists under this id). A standalone asker (a
+ * radio route, a fleet check) names its run after the operation, not a
+ * row anyone can open, so the field is absent rather than a pointer to
+ * nothing.
  */
-sender_run: string, };
+sender_run?: string, };

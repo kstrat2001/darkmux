@@ -193,10 +193,14 @@ pub struct RunRelay {
     /// The machine that asked: the receiver's allow-list name for the
     /// submitter, normally its `machine_id`.
     pub asked_on_machine: String,
-    /// The asker's own run id (its session's run), so the asking side can
-    /// be found there. The asker's session row itself is folded into this
-    /// one (see [`ghost_runs`]).
-    pub sender_run: String,
+    /// The asker's own run id, only when that run is a mission (a row the
+    /// asking machine's board lists under this id). A standalone asker (a
+    /// radio route, a fleet check) names its run after the operation, not a
+    /// row anyone can open, so the field is absent rather than a pointer to
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub sender_run: Option<String>,
 }
 
 /// One row of the `/runs` view-model. Lenient-on-read WIRE shape (every
@@ -456,7 +460,7 @@ fn build_runs_in(
 ) -> RunsWithUsage {
     // (#2902 step 2b) The usage fold shares the session index's one pass.
     let mut usage_fold = crate::usage_sum::UsageFold::new(window.since_iso.clone());
-    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold));
+    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold), &PeerClocks::cached());
     let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
@@ -643,7 +647,7 @@ pub fn peer_mission_runs(
     fleet: &[serde_json::Value],
     known_mission_ids: &HashSet<String>,
 ) -> Vec<Run> {
-    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
     let flow_missions = build_flow_mission_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1606,7 +1610,7 @@ pub fn local_dispatch_status(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
 ) -> HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)> {
-    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
     let mission_id_index = build_mission_id_index(&flow_index);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2251,8 +2255,9 @@ fn build_flow_session_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
     window_days: i64,
+    peers: &PeerClocks,
 ) -> HashMap<String, SessionAgg> {
-    build_flow_session_index_in(flows_dir, fleet, &ScanWindow::within_days(window_days), None)
+    build_flow_session_index_in(flows_dir, fleet, &ScanWindow::within_days(window_days), None, peers)
 }
 
 /// [`build_flow_session_index`] over an explicit [`ScanWindow`], optionally
@@ -2265,6 +2270,7 @@ fn build_flow_session_index_in(
     fleet: &[serde_json::Value],
     window: &ScanWindow,
     mut usage: Option<&mut crate::usage_sum::UsageFold>,
+    peers: &PeerClocks,
 ) -> HashMap<String, SessionAgg> {
     let mut idx: HashMap<String, SessionAgg> = HashMap::new();
 
@@ -2301,7 +2307,7 @@ fn build_flow_session_index_in(
         std::ops::ControlFlow::Continue(())
     });
     settle_session_index(&mut idx);
-    PeerClocks::read().apply(&mut idx);
+    peers.apply(&mut idx);
     idx
 }
 
@@ -2312,6 +2318,12 @@ fn build_flow_session_index_in(
 /// interval. A peer with no live beat is not reporting: it has no entry and
 /// its sessions are judged against this daemon's clock as before, so a
 /// silent peer's runs still age out instead of reading live for good.
+/// How long a read of the peers' presence beats is reused: the presence beat
+/// interval (5 seconds), since a beat cannot change faster than it is written.
+/// A beat read up to this much older than the board's build shifts a peer's
+/// clock by that much, far inside the staleness budget it corrects.
+const PEER_CLOCKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
+
 #[derive(Default)]
 struct PeerClocks {
     now_ms: HashMap<String, u64>,
@@ -2324,6 +2336,30 @@ impl PeerClocks {
         let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
         let (beats, _) = crate::read_presence_beats(&url, "runs", darkmux_flow::presence::read_live);
         Self::from_beats(&beats)
+    }
+
+    /// [`PeerClocks::read`], at most once per [`PEER_CLOCKS_CACHE_TTL`]: the
+    /// board rebuilds on a few-second poll, and each read is a Redis SCAN plus
+    /// a GET per machine (and a Keychain lookup for the URL).
+    fn cached() -> Self {
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant, HashMap<String, u64>)>> = std::sync::Mutex::new(None);
+        Self::cached_in(&CACHE, std::time::Instant::now(), Self::read)
+    }
+
+    fn cached_in(
+        cache: &std::sync::Mutex<Option<(std::time::Instant, HashMap<String, u64>)>>,
+        now: std::time::Instant,
+        read: impl FnOnce() -> Self,
+    ) -> Self {
+        let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, now_ms)) = slot.as_ref() {
+            if now.saturating_duration_since(*at) < PEER_CLOCKS_CACHE_TTL {
+                return Self { now_ms: now_ms.clone() };
+            }
+        }
+        let fresh = read();
+        *slot = Some((now, fresh.now_ms.clone()));
+        fresh
     }
 
     fn from_beats(beats: &[darkmux_flow::presence::PresenceBeat]) -> Self {
@@ -2480,12 +2516,11 @@ fn ghost_runs(
     now_ms: u64,
 ) -> Vec<Run> {
     let mut out = Vec::new();
-    let echoes = relay_echo_sessions(flow_index);
     for (session_id, agg) in flow_index {
         if !agg.has_start && !agg.has_wait {
             continue;
         }
-        if known_session_ids.contains(session_id) || echoes.contains(session_id) {
+        if known_session_ids.contains(session_id) {
             continue;
         }
         if let Some(mid) = &agg.mission_id {
@@ -2574,32 +2609,10 @@ fn run_relay(session_id: &str) -> Option<RunRelay> {
     }
     match SessionId::parse(session_id).ok()?.kind() {
         SessionKind::Relay { sender, peer } => {
-            Some(RunRelay { asked_on_machine: peer.clone(), sender_run: sender.run_id().as_str().to_string() })
+            Some(RunRelay { asked_on_machine: peer.clone(), sender_run: sender.mission_id().map(str::to_string) })
         }
         _ => None,
     }
-}
-
-/// (#3016) The sessions that are only the ASKING side of work another
-/// session executed: the sender's session, named inside every relay
-/// session's id. One relayed run is one row, and the EXECUTOR owns it: it
-/// ran where the tokens were spent, so it counts there and the machine
-/// filter matches it. The sender's bookends around the same work are its
-/// echo and must not become a second row. A sender session is folded only
-/// when its relay session is itself a row here (it opened a dispatch); a
-/// relay this reader sees no start for leaves the sender's row standing,
-/// so the work never vanishes. Matching is by the exact sender wire, so an
-/// unrelated session never folds.
-fn relay_echo_sessions(flow_index: &HashMap<String, SessionAgg>) -> HashSet<String> {
-    use darkmux_types::session_id::{SessionId, SessionKind};
-    flow_index
-        .iter()
-        .filter(|(id, agg)| (agg.has_start || agg.has_wait) && id.contains(".relay."))
-        .filter_map(|(id, _)| match SessionId::parse(id).ok()?.kind() {
-            SessionKind::Relay { sender, .. } => Some(sender.wire()),
-            _ => None,
-        })
-        .collect()
 }
 
 // ─── Bounded day-file scan (#1523 gate scale-cap) ──────────────────────────
@@ -4695,7 +4708,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("task-__panel_args__").expect("session indexed");
         assert!(
             agg.is_ambiguous(),
@@ -4731,7 +4744,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("crew-dispatch-coder-1").expect("session indexed");
         assert!(
             !agg.is_ambiguous(),
@@ -4764,7 +4777,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("sess-1").expect("session indexed");
         assert_eq!(agg.endpoint.as_deref(), Some("azure:host/gpt-4o"));
         assert_eq!(agg.terminal_status, Some(RunStatus::Complete));
@@ -4791,7 +4804,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
     }
 
@@ -4837,7 +4850,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         assert_eq!(idx["sess-3"].terminal_status, Some(RunStatus::Error));
     }
 
@@ -4857,7 +4870,7 @@ mod tests {
                 "handle": "coder",
             })],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         assert!(
             !idx.contains_key("ancient-orphan-sess"),
             "a session older than the scan window must never be indexed at all"
@@ -4890,7 +4903,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("ticking-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -4935,7 +4948,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("outoforder-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -5029,24 +5042,35 @@ mod tests {
     }
 
     /// (#3016) A relayed run is ONE row: the executor's. The asker's own
-    /// session for the same work is its echo and folds into it.
+    /// session for it carries a `dispatch.route` record and never a dispatch
+    /// start (real 2026-09-30/10-01 flow files), so it makes no row to fold.
     #[test]
-    fn ghost_runs_fold_a_relay_pair_into_one_executor_row() {
-        let sender = sender_session("radio-1");
+    fn a_relayed_run_is_one_executor_row_naming_where_it_was_asked() {
+        let sender = sender_session("radio");
         let relayed = darkmux_types::session_id::SessionId::relay(sender.clone(), "MacBook-Pro").wire();
         let mut idx = HashMap::new();
-        idx.insert(sender.wire(), live_ghost_agg("MacBook-Pro"));
+        idx.insert(sender.wire(), SessionAgg { machine: Some("MacBook-Pro".into()), ..Default::default() });
         idx.insert(relayed.clone(), live_ghost_agg("darkbook"));
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
         let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
         assert_eq!(ghosts.len(), 1, "one relayed run is one row: {ghosts:?}");
-        let g = &ghosts[0];
-        assert_eq!(g.id, relayed);
-        assert_eq!(g.machine.as_deref(), Some("darkbook"), "the executor owns the row");
+        assert_eq!(ghosts[0].id, relayed);
+        assert_eq!(ghosts[0].machine.as_deref(), Some("darkbook"), "the executor owns the row");
         assert_eq!(
-            g.relay,
-            Some(RunRelay { asked_on_machine: "MacBook-Pro".into(), sender_run: "radio-1".into() })
+            ghosts[0].relay,
+            Some(RunRelay { asked_on_machine: "MacBook-Pro".into(), sender_run: None }),
+            "a radio asker has no run row to point at, so none is named"
         );
+    }
+
+    /// (#3016) A mission asker's run id is a real row, so it is carried.
+    #[test]
+    fn a_mission_asker_names_its_run() {
+        use darkmux_types::session_id::{RunId, SessionId};
+        let sender = SessionId::step(RunId::mission("review-17").unwrap(), "probe");
+        let relay = run_relay(&SessionId::relay(sender, "MacBook-Pro").wire()).expect("a relay");
+        assert_eq!(relay.sender_run.as_deref(), Some("review-17"));
+        assert_eq!(run_relay(&sender_session("radio").wire()), None, "a non-relay id has no origin");
     }
 
     /// (#3016) Two sessions that merely look alike stay two rows.
@@ -5162,6 +5186,22 @@ mod tests {
     /// (#3017) A peer with a live presence beat gets that beat's stamp as its
     /// clock; a peer with none (not reporting) and this machine keep this
     /// daemon's clock.
+    #[test]
+    fn peer_clocks_are_read_once_per_ttl() {
+        let cache = std::sync::Mutex::new(None);
+        let t0 = std::time::Instant::now();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            PeerClocks { now_ms: HashMap::from([("u".to_string(), 7)]) }
+        };
+        assert_eq!(PeerClocks::cached_in(&cache, t0, read).now_ms["u"], 7);
+        assert_eq!(PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL / 2, read).now_ms["u"], 7);
+        assert_eq!(reads.get(), 1, "a second build inside the TTL reuses the read");
+        PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL * 2, read);
+        assert_eq!(reads.get(), 2, "past the TTL it reads again");
+    }
+
     #[test]
     fn a_reporting_peers_sessions_get_its_beat_clock() {
         let sess = |uid: &str| SessionAgg { machine_uid: Some(uid.to_string()), ..Default::default() };
@@ -7440,7 +7480,7 @@ mod tests {
             serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": "dispatch.start", "session_id": "s-nouid",
                 "handle": "coder", "machine_id": "Mac"}),
         ];
-        let idx = build_flow_session_index(flows.path(), &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(flows.path(), &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         assert_eq!(idx["s-uid"].machine_uid.as_deref(), Some("UID-B"));
         assert_eq!(idx["s-nouid"].machine_uid, None);
     }
@@ -7792,7 +7832,7 @@ mod tests {
         // written to both.
         let rec = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
-        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
         let agg = idx.get("peer-session-1").expect("session present");
         assert!(agg.has_start);
         // The dedup is what this asserts: two sources, one session, and the

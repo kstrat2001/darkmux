@@ -386,7 +386,9 @@ export function parseHubId(id: unknown): number | null {
  *  with). */
 export function ingestRecord(raw: unknown): NormRecord | null {
   if (!isPlainObject(raw) || raw._type != null) return null;
-  const out: Record<string, unknown> = { ...raw, tMs: parseTs(raw.ts), hub: parseHubId(raw.hub_id) };
+  const out: Record<string, unknown> = { ...raw, tMs: parseTs(raw.ts) };
+  const hub = parseHubId(raw.hub_id);
+  if (hub !== null) out.hub = hub;
   for (const key of TAGGED_FIELDS) assignTyped(out, key, parseTag(raw[key]));
   const action = out.action as NormAction | undefined;
   if (action !== undefined && !isKnownAction(action)) warnUnknownAction(tagText(action));
@@ -540,20 +542,27 @@ export function byTime(a: NormRecord, b: NormRecord): number {
   return a.tMs - b.tMs;
 }
 
-/** Ascending by the hub's receive order (#3017), for folding records that
- *  come from machines whose clocks disagree. Records that carry a hub id sort
- *  by it. A record with none (it never passed through the hub: a local-only
- *  day-file line, a static replay) sorts after every hub-ordered one, by its
- *  own time: only that tail is ordered by a clock, and only ever against
- *  records the hub has no say over. With no hub ids at all this is
- *  {@link byTime}. Stable. */
+/** One record's place in the hub's receive order (#3017), as one number: its
+ *  hub id when it has one, else its own time on the same scale (ms x 1024).
+ *  A record the hub never saw (a local-only day-file line, a static replay)
+ *  was written by this machine, whose clock the hub's stamps are measured on
+ *  for the window it covers, so mixed windows stay in one total order. `null`
+ *  for a record with neither. */
+export function receiveKey(r: NormRecord): number | null {
+  if (r.hub != null) return r.hub;
+  return r.tMs !== null ? r.tMs * 1024 : null;
+}
+
+/** Ascending by {@link receiveKey}: the order a fold of records from machines
+ *  with disagreeing clocks must read them in. Every record has one key, so the
+ *  order is total and transitive (a pairwise "hub if both have it, else time"
+ *  rule is not). Keyless records last, in arrival order. Stable. */
 export function byReceiveOrder(a: NormRecord, b: NormRecord): number {
-  const ha = a.hub ?? null;
-  const hb = b.hub ?? null;
-  if (ha !== null && hb !== null) return ha - hb;
-  if (ha !== null) return -1;
-  if (hb !== null) return 1;
-  return byTime(a, b);
+  const ka = receiveKey(a);
+  const kb = receiveKey(b);
+  if (ka === null) return kb === null ? 0 : 1;
+  if (kb === null) return -1;
+  return ka - kb;
 }
 
 /** Newest first, untimed records after every timed one (policy rule 3): the

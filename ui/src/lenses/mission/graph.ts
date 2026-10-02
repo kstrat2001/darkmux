@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, receiveKey, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
@@ -351,10 +351,14 @@ export interface StepMetrics {
    *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
    *  one execution's end (a map step holds one per item), not the step's. */
   stepBookended?: boolean;
-  /** (#3017) The hub receive order of the newest terminal folded, when it
-   *  carried one: what tells a retry (a start the hub received AFTER the step
-   *  ended) from a sibling start of the same attempt. */
-  endHub?: number | null;
+  /** (#3017) The receive key ({@link receiveKey}) of the newest terminal
+   *  folded: what tells a retry (a start received AFTER the step ended) from
+   *  a sibling start of the same attempt. */
+  endKey?: number | null;
+  /** Whether that newest terminal was a failure. Only a failed attempt is
+   *  retried, so only then does a later start restart the span; a step whose
+   *  dispatches ran one after another keeps its whole span. */
+  endFailed?: boolean;
 }
 
 const EMPTY_METRICS: StepMetrics = {
@@ -430,7 +434,7 @@ export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: strin
  * time, and only against another such session.
  */
 export function stepDispatchSessions(records: NormRecord[], missionId: string): Record<string, string> {
-  type Tally = { n: number; lastTs: number; lastHub: number | null; ours: boolean };
+  type Tally = { n: number; lastKey: number; ours: boolean };
   const tally: Record<string, Record<string, Tally>> = {};
   for (const rec of records) {
     // (#2223) Evidence that a dispatch actually ran under this session, as
@@ -442,10 +446,9 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     if (!stepId || !sid) continue;
     if (rec.mission_id && rec.mission_id !== missionId) continue;
     const forStep = (tally[stepId] ||= {});
-    const t = (forStep[sid] ||= { n: 0, lastTs: 0, lastHub: null, ours: false });
+    const t = (forStep[sid] ||= { n: 0, lastKey: 0, ours: false });
     t.n += 1;
-    t.lastTs = Math.max(t.lastTs, rec.tMs ?? 0);
-    if (rec.hub != null) t.lastHub = Math.max(t.lastHub ?? 0, rec.hub);
+    t.lastKey = Math.max(t.lastKey, receiveKey(rec) ?? 0);
     if (rec.mission_id === missionId) t.ours = true;
   }
   const out: Record<string, string> = {};
@@ -466,27 +469,14 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
 /** Whether attempt `t` is the better representative of its step than `best`:
  *  one positively tagged with this mission, else the more recent, else the
  *  one with more records. */
-function attemptBeats(
-  t: { n: number; lastTs: number; lastHub: number | null; ours: boolean },
-  best: { n: number; lastTs: number; lastHub: number | null; ours: boolean },
-): boolean {
+function attemptBeats(t: { n: number; lastKey: number; ours: boolean }, best: { n: number; lastKey: number; ours: boolean }): boolean {
   if (t.ours !== best.ours) return t.ours;
-  const newer = attemptRecency(t, best);
-  return newer !== 0 ? newer > 0 : t.n > best.n;
+  return t.lastKey !== best.lastKey ? t.lastKey > best.lastKey : t.n > best.n;
 }
 
-/** Positive when attempt `a` is more recent than `b`, negative when older, 0
- *  when neither is (#3017): by the hub's receive order when both have one,
- *  else by their own latest record time. */
-function attemptRecency(a: { lastTs: number; lastHub: number | null }, b: { lastTs: number; lastHub: number | null }): number {
-  if (a.lastHub !== null && b.lastHub !== null) return a.lastHub - b.lastHub;
-  return a.lastTs - b.lastTs;
-}
-
-/** Whether folding a record left the step's accumulator unchanged. */
 const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
   "tokRun", "tokFinal", "tokEnded", "tokResult", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
-  "usageSeen", "startTs", "endTs", "endHub", "lastTs", "stepBookended",
+  "usageSeen", "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
 ];
 
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
@@ -516,21 +506,25 @@ function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsS
 function foldSpan(
   cur: StepMetrics,
   next: StepMetrics,
-  ev: { isStart: boolean; isTerminal: boolean; recMs: number; hub: number | null },
+  ev: { isStart: boolean; isTerminal: boolean; failed: boolean; recMs: number; key: number | null },
 ): void {
   if (ev.isStart && ev.recMs) {
-    const retried = ev.hub !== null && cur.endHub != null && ev.hub > cur.endHub;
+    const retried = ev.key !== null && cur.endFailed === true && cur.endKey != null && ev.key > cur.endKey;
     if (retried) {
       next.startTs = ev.recMs;
       next.endTs = 0;
-      next.endHub = null;
+      next.endKey = null;
+      next.endFailed = false;
     } else {
       next.startTs = next.startTs ? Math.min(next.startTs, ev.recMs) : ev.recMs;
     }
   }
   if (ev.isTerminal) {
     next.endTs = Math.max(next.endTs, ev.recMs || next.lastTs || next.startTs);
-    if (ev.hub !== null) next.endHub = Math.max(next.endHub ?? 0, ev.hub);
+    if (ev.key !== null && ev.key >= (next.endKey ?? 0)) {
+      next.endKey = ev.key;
+      next.endFailed = ev.failed;
+    }
   }
 }
 
@@ -559,7 +553,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   if (stepBookended) next.stepBookended = true;
   const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
-  foldSpan(cur, next, { isStart, isTerminal, recMs, hub: rec.hub ?? null });
+  foldSpan(cur, next, { isStart, isTerminal, failed: action === ACTION.StepError || action === ACTION.DispatchError, recMs, key: receiveKey(rec) });
 
   const fig = recordFigures(rec);
   const finalTok = fig.finalTok;
