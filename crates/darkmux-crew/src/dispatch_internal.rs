@@ -3408,8 +3408,8 @@ pub(crate) enum HostedCallError {
     /// 429 / RESOURCE_EXHAUSTED: the endpoint rejected the call, retryable.
     RateLimited(String),
     /// 503 / UNAVAILABLE / "high demand": the endpoint shed load, retryable.
-    /// Kept apart from `RateLimited` because it is a 5xx, which may have been
-    /// processed ([`call_may_have_spent`]), where a 429 never was.
+    /// Kept apart from `RateLimited` only for the exhausted message: neither
+    /// is charged ([`call_may_have_spent`]).
     ServerShed(String),
     Other(anyhow::Error),
 }
@@ -3428,8 +3428,12 @@ pub(crate) enum HostedFailure {
     Rejected,
     /// 429: rejected for rate, never processed.
     RateLimited,
-    /// 5xx: the endpoint failed after taking the call.
+    /// 5xx other than 503: the endpoint failed after taking the call.
     ServerError,
+    /// 503 / UNAVAILABLE / "high demand": the endpoint shed the load. Not
+    /// billed, and charging it can push the window into a false `wait` in an
+    /// outage, so it is never charged.
+    Shed,
 }
 
 /// A hosted-call error tagged with its [`HostedFailure`] class.
@@ -3461,8 +3465,9 @@ fn failure(kind: HostedFailure, message: impl Into<String>) -> anyhow::Error {
 
 /// (#2925) THE one policy for a hosted call that failed: did the endpoint
 /// possibly process it, so that it may have been billed? A timeout or dropped
-/// reply after the request was sent, and a 5xx, may have been; a failure
-/// before sending, a 4xx (400, 401, 403, ...) and a 429 never were. An error
+/// reply after the request was sent, and a 5xx other than 503, may have been;
+/// a failure before sending, a 4xx (400, 401, 403, ...), a 429 and a 503
+/// (shed load) never were. An error
 /// with no class (anything not raised by the hosted call itself) is not
 /// charged: a false budget wait costs more than one missed call. Every hosted
 /// path (`dispatch_unmanaged`, the `dispatch.single_shot` and `dispatch.map`
@@ -3512,28 +3517,42 @@ pub(crate) fn remote_chat_completion(
     timeout_seconds: u32,
 ) -> Result<serde_json::Value> {
     let attempts = RATE_LIMIT_BACKOFF_SECONDS.len() + 1;
-    let mut last = String::new();
-    let mut last_shed = false;
+    let mut last: Option<HostedCallError> = None;
     for (i, delay) in std::iter::once(0u64)
         .chain(RATE_LIMIT_BACKOFF_SECONDS.iter().copied())
         .enumerate()
     {
         if delay > 0 {
             eprintln!(
-                "darkmux: hosted endpoint rate-limited (429) — retry {i}/{} in {delay}s",
+                "darkmux: hosted endpoint rate-limited or unavailable, retry {i}/{} in {delay}s",
                 attempts - 1
             );
             std::thread::sleep(std::time::Duration::from_secs(delay));
         }
         match remote_chat_attempt(url, auth_header, body, timeout_seconds) {
             Ok(v) => return Ok(v),
-            Err(HostedCallError::RateLimited(msg)) => (last, last_shed) = (msg, false),
-            Err(HostedCallError::ServerShed(msg)) => (last, last_shed) = (msg, true),
+            Err(e @ (HostedCallError::RateLimited(_) | HostedCallError::ServerShed(_))) => last = Some(e),
             Err(HostedCallError::Other(e)) => return Err(e),
         }
     }
-    let kind = if last_shed { HostedFailure::ServerError } else { HostedFailure::RateLimited };
-    Err(failure(kind, format!("hosted endpoint rate-limited (429) after {attempts} attempts: {last}")))
+    Err(exhausted_hosted_error(last, attempts))
+}
+
+/// The error for a hosted call whose retries ran out on 429s or shed load,
+/// each with its own text and class (a 503 is not "rate-limited (429)").
+fn exhausted_hosted_error(last: Option<HostedCallError>, attempts: usize) -> anyhow::Error {
+    match last {
+        Some(HostedCallError::ServerShed(msg)) => failure(
+            HostedFailure::Shed,
+            format!("hosted endpoint unavailable (503 / UNAVAILABLE) after {attempts} attempts: {msg}"),
+        ),
+        Some(HostedCallError::RateLimited(msg)) => failure(
+            HostedFailure::RateLimited,
+            format!("hosted endpoint rate-limited (429) after {attempts} attempts: {msg}"),
+        ),
+        Some(HostedCallError::Other(e)) => e,
+        None => anyhow!("hosted endpoint call made no attempt"),
+    }
 }
 
 fn remote_chat_attempt(
@@ -3558,6 +3577,12 @@ fn remote_chat_attempt(
         cfg.push_str(&format!("header = \"{}: {}\"\n", esc(h), esc(v)));
     }
     cfg.push_str(&format!("data = \"{}\"\n", esc(&body.to_string())));
+    // The response body goes to its own 0600 file and curl's `%{http_code}`
+    // to stdout, so the status is read from a stream that never touches the
+    // body, and the charging policy keys on it (HTTP status first).
+    let body_path = cfg_path.with_extension("body");
+    cfg.push_str(&format!("output = \"{}\"\n", esc(&body_path.to_string_lossy())));
+    cfg.push_str("write-out = \"%{http_code}\"\n");
     // (#1177) Create the config 0600 ATOMICALLY (no world-readable window),
     // write the secret-bearing body, run curl — then ALWAYS remove the file,
     // even if the create/write/curl fails partway (a partial secret file must
@@ -3579,6 +3604,21 @@ fn remote_chat_attempt(
         f.write_all(cfg.as_bytes())
             .map_err(|e| failure(HostedFailure::NotSent, format!("writing curl config body: {e}")))?;
         drop(f);
+        // Pre-created 0600 so curl writes the response into a private file
+        // (curl keeps an existing file's mode).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&body_path)
+                .map_err(|e| failure(HostedFailure::NotSent, format!("creating the response file: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::File::create(&body_path)
+            .map_err(|e| failure(HostedFailure::NotSent, format!("creating the response file: {e}")))?;
         let child = Command::new("curl")
             .args([
                 "-sS",
@@ -3614,6 +3654,8 @@ fn remote_chat_attempt(
     };
     let result = run();
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
+    let response = std::fs::read(&body_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&body_path);
     let out = result.map_err(HostedCallError::Other)?;
     // (#2462) Gated on `!success()`, never overriding a clean exit — and
     // written as the SAME conjunction the docker container path's NEW-4
@@ -3646,7 +3688,50 @@ fn remote_chat_attempt(
             describe_curl_failure(url, exit, &String::from_utf8_lossy(&out.stderr)),
         )));
     }
-    parse_hosted_response(&out.stdout)
+    let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
+    classify_hosted_response(status, &response)
+}
+
+/// THE production mapping from a hosted reply to its result: the HTTP status
+/// first, the body only when there is no usable status.
+///
+/// curl runs without `--fail`, so a 4xx/5xx still exits 0 with the error in
+/// the body, and providers disagree on that body (OpenAI's 500 has
+/// `"code":null`, Azure's `"code":"InternalServerError"`, a gateway returns
+/// HTML). Keying the charge on `error.code` therefore missed real 500s and
+/// charged an HTML 404. The status decides instead: 429 is rate-limited, 503
+/// is shed load (both retried, neither charged), any other 5xx is a call the
+/// endpoint may have processed (charged), any other 4xx was rejected
+/// (not charged). A 2xx, or no status, falls through to the body's own shape
+/// ([`parse_hosted_response`]), which still catches an error object in a 200
+/// body (Google's "high demand").
+pub(crate) fn classify_hosted_response(
+    status: Option<u16>,
+    body: &[u8],
+) -> std::result::Result<serde_json::Value, HostedCallError> {
+    let Some(status) = status.filter(|s| matches!(s, 400..=599)) else {
+        return parse_hosted_response(body);
+    };
+    let message = || {
+        let text = String::from_utf8_lossy(body);
+        let from_body = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| {
+            let err = v.get("error").or_else(|| v.as_array().and_then(|a| a.first()).and_then(|f| f.get("error")))?;
+            Some(err.get("message")?.as_str()?.to_string())
+        });
+        from_body.unwrap_or_else(|| format!("HTTP {status}: {}", text.chars().take(200).collect::<String>()))
+    };
+    match status {
+        429 => Err(HostedCallError::RateLimited(message())),
+        503 => Err(HostedCallError::ServerShed(message())),
+        500..=599 => Err(HostedCallError::Other(failure(
+            HostedFailure::ServerError,
+            format!("hosted endpoint returned HTTP {status}: {}", message()),
+        ))),
+        _ => Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("hosted endpoint returned HTTP {status}: {}", message()),
+        ))),
+    }
 }
 
 /// Classify a hosted endpoint's response body. Pure — unit-testable.

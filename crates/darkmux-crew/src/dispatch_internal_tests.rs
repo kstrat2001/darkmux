@@ -3167,42 +3167,84 @@
         );
     }
 
-    /// The error `parse_hosted_response` raises for `body`, as `anyhow`.
-    fn parsed_hosted_error(body: &str) -> anyhow::Error {
-        match parse_hosted_response(body.as_bytes()) {
+    /// The error the PRODUCTION mapping raises for a reply with HTTP `status`
+    /// and `body`: [`classify_hosted_response`], then, for a retried class,
+    /// the error [`exhausted_hosted_error`] gives once the retries ran out.
+    fn classified_hosted_error(status: Option<u16>, body: &str) -> anyhow::Error {
+        match classify_hosted_response(status, body.as_bytes()) {
             Err(HostedCallError::Other(e)) => e,
-            Err(HostedCallError::RateLimited(m)) => failure(HostedFailure::RateLimited, m),
-            Err(HostedCallError::ServerShed(m)) => failure(HostedFailure::ServerError, m),
-            Ok(_) => panic!("{body} must be an error"),
+            Err(retried) => exhausted_hosted_error(Some(retried), 4),
+            Ok(_) => panic!("{status:?} {body} must be an error"),
         }
     }
 
-    /// (#2925) The one charging policy, class by class: charged are a timeout
-    /// or dropped reply after sending, an unreadable body, and a 5xx; not
-    /// charged are a failure before sending, every 4xx and a 429.
+    const OPENAI_500: &str = r#"{"error":{"message":"The server had an error","type":"server_error","param":null,"code":null}}"#;
+    const AZURE_500: &str = r#"{"error":{"code":"InternalServerError","message":"Internal server error"}}"#;
+    const HTML_404: &str = "<html><body><h1>404 Not Found</h1></body></html>";
+    const HTML_502: &str = "<html><body><h1>502 Bad Gateway</h1></body></html>";
+
+    /// (#2925) The one charging policy, class by class, keyed on the HTTP
+    /// STATUS (what curl reports), never the body's `error.code`, which the
+    /// providers disagree on. Charged: a timeout or dropped reply after
+    /// sending, and any 5xx but 503. Not charged: a failure before sending,
+    /// every 4xx, a 429, and a 503 (shed load).
     #[test]
     fn call_may_have_spent_charges_only_calls_the_endpoint_may_have_processed() {
-        // Charged.
+        // Charged, by curl exit.
         for exit in [28, 52, 56, 55, 18] {
             let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
             assert!(call_may_have_spent(&e), "curl exit {exit} came after the request went out");
         }
-        assert!(call_may_have_spent(&parsed_hosted_error("<html>502 Bad Gateway</html>")), "unreadable body");
-        assert!(call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":500,"message":"boom"}}"#)), "500");
-        assert!(call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":503,"message":"overloaded"}}"#)), "503");
-        // Not charged.
+        // Charged, by status, whatever the body says (or does not).
+        for (status, body, what) in [
+            (500, OPENAI_500, "an OpenAI 500 (code null)"),
+            (500, AZURE_500, "an Azure 500 (code a string)"),
+            (502, HTML_502, "an HTML 502"),
+            (500, "", "an empty 500"),
+            (504, r#"{"error":{"code":401,"message":"body says 401"}}"#, "a 504 whose body claims 401"),
+        ] {
+            assert!(call_may_have_spent(&classified_hosted_error(Some(status), body)), "{what}");
+        }
+        // Not charged, by curl exit (nothing was sent).
         for exit in [6, 7, 35, 60, 3] {
             let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
             assert!(!call_may_have_spent(&e), "curl exit {exit} failed before the request went out");
         }
-        for code in [400, 401, 403, 404] {
-            let body = format!(r#"{{"error":{{"code":{code},"message":"no"}}}}"#);
-            assert!(!call_may_have_spent(&parsed_hosted_error(&body)), "{code} was rejected, not processed");
+        // Not charged, by status.
+        for (status, body, what) in [
+            (404, HTML_404, "an HTML 404"),
+            (400, OPENAI_500, "a 400 whose body looks like a 500"),
+            (401, r#"{"error":{"code":500,"message":"body says 500"}}"#, "a 401 whose body claims 500"),
+            (403, "", "an empty 403"),
+            (429, r#"{"error":{"code":429,"message":"slow down"}}"#, "a 429"),
+            (429, HTML_404, "an HTML 429"),
+            (503, r#"{"error":{"code":503,"message":"overloaded"}}"#, "a 503 (shed load)"),
+            (503, HTML_502, "an HTML 503"),
+        ] {
+            assert!(!call_may_have_spent(&classified_hosted_error(Some(status), body)), "{what}");
         }
-        assert!(!call_may_have_spent(&parsed_hosted_error(r#"{"error":{"code":429,"message":"slow down"}}"#)), "429");
+        // No status: the body's own shape decides, as before.
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":503,"message":"overloaded"}}"#)), "body 503");
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":429,"message":"slow"}}"#)), "body 429");
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":401,"message":"no"}}"#)), "body 401");
+        assert!(call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":500,"message":"boom"}}"#)), "body 500");
+        assert!(call_may_have_spent(&classified_hosted_error(None, "<html>garbled</html>")), "an unreadable reply with no status");
         assert!(!call_may_have_spent(&anyhow!("an error from nowhere near the hosted call")), "unclassed");
         assert!(!call_may_have_spent(&failure(HostedFailure::NotSent, "x").context("wrapped")), "context keeps the class");
         assert!(call_may_have_spent(&failure(HostedFailure::Unanswered, "x").context("wrapped")), "context keeps the class");
+    }
+
+    /// The exhausted-retries text names what actually ran out: a 503 is not
+    /// "rate-limited (429)", and each maps to its own uncharged class.
+    #[test]
+    fn exhausted_retries_name_their_own_cause() {
+        let shed = classified_hosted_error(Some(503), r#"{"error":{"message":"overloaded"}}"#);
+        let limited = classified_hosted_error(Some(429), r#"{"error":{"message":"slow down"}}"#);
+        assert!(shed.to_string().contains("unavailable (503") && !shed.to_string().contains("429"), "{shed}");
+        assert!(shed.to_string().contains("overloaded"), "{shed}");
+        assert!(limited.to_string().contains("rate-limited (429)") && limited.to_string().contains("slow down"), "{limited}");
+        let kind = |e: &anyhow::Error| e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind);
+        assert_eq!((kind(&shed), kind(&limited)), (Some(HostedFailure::Shed), Some(HostedFailure::RateLimited)));
     }
 
     /// The charge is the conservative no-usage charge for a possibly
@@ -3223,18 +3265,30 @@
     /// and a refused connection (nothing listening) does not.
     #[test]
     #[serial]
-    fn dispatch_unmanaged_charges_a_5xx_and_not_a_4xx_or_an_unsent_call() {
-        let url = status_http_mock("500 Internal Server Error", r#"{"error":{"code":500,"message":"boom"}}"#);
-        let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&url);
-        assert!(result.is_err());
-        assert_eq!(charged, Some(unreported), "a 500 may have been processed");
-        assert_eq!(sources, vec!["absent"]);
-
-        let url = status_http_mock("401 Unauthorized", r#"{"error":{"code":401,"message":"bad key"}}"#);
-        let (result, charged, _, sources) = run_capped_hosted_dispatch(&url);
-        assert!(result.is_err());
-        assert_eq!((charged, sources.len()), (None, 0), "a 401 was rejected, not processed");
-
+    fn dispatch_unmanaged_charges_by_http_status_not_by_body_code() {
+        // Charged: provider 500 shapes whose `error.code` a body-keyed policy
+        // misses (null, a string), and an HTML 502.
+        for (status, body) in [
+            ("500 Internal Server Error", OPENAI_500),
+            ("500 Internal Server Error", AZURE_500),
+            ("502 Bad Gateway", HTML_502),
+            ("504 Gateway Timeout", r#"{"error":{"code":401,"message":"body says 401"}}"#),
+        ] {
+            let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&status_http_mock(status, body));
+            assert!(result.is_err());
+            assert_eq!(charged, Some(unreported), "{status} {body}: the endpoint may have processed it");
+            assert_eq!(sources, vec!["absent"], "{status} {body}");
+        }
+        // Not charged: an HTML 404, and a 401 whose body claims a 500.
+        for (status, body) in [
+            ("404 Not Found", HTML_404),
+            ("401 Unauthorized", r#"{"error":{"code":500,"message":"body says 500"}}"#),
+        ] {
+            let (result, charged, _, sources) = run_capped_hosted_dispatch(&status_http_mock(status, body));
+            assert!(result.is_err());
+            assert_eq!((charged, sources.len()), (None, 0), "{status}: rejected, not processed");
+        }
+        // Not charged: nothing listening, so nothing was sent.
         let dead = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://127.0.0.1:{}/v1/chat/completions", l.local_addr().unwrap().port())

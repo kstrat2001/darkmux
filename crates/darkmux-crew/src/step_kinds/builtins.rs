@@ -4968,14 +4968,20 @@ mod tests {
             env.actions()
         };
         assert_eq!(
-            actions("500 Internal Server Error", r#"{"error":{"code":500,"message":"boom"}}"#),
+            actions("500 Internal Server Error", r#"{"error":{"code":401,"message":"body says 401"}}"#),
             vec![darkmux_flow::FlowAction::BudgetWarn],
-            "a 500 may have been processed: charged against the cap"
+            "the 500 status decides, not the body's 401: charged against the cap"
         );
         assert!(
-            actions("401 Unauthorized", r#"{"error":{"code":401,"message":"bad key"}}"#).is_empty(),
-            "a 401 was rejected: nothing charged"
+            actions("401 Unauthorized", r#"{"error":{"code":500,"message":"body says 500"}}"#).is_empty(),
+            "the 401 status decides, not the body's 500: nothing charged"
         );
+        assert_eq!(
+            actions("502 Bad Gateway", "<html>502</html>"),
+            vec![darkmux_flow::FlowAction::BudgetWarn],
+            "an HTML 502 is a 5xx: charged"
+        );
+        assert!(actions("404 Not Found", "<html>404</html>").is_empty(), "an HTML 404 is a 4xx: nothing charged");
     }
 
     /// (5th review C2) A hosted map item settles its REPLY's spend into
