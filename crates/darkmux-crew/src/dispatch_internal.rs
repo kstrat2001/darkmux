@@ -3643,6 +3643,69 @@ fn emit_single_shot_usage(
     ));
 }
 
+/// (5.0) A hosted call that was SENT and never answered (a timeout, a dropped
+/// connection, a provider error) still happened, and may have been billed
+/// before it failed, so it is charged like a reply that reported no usage:
+/// an `absent` usage record, which the endpoint's window counts as a call,
+/// and the conservative per-dispatch charge ([`crate::budget::conservative_hosted_spend`],
+/// the granted cap plus the estimated prompt). Charging nothing let an
+/// endpoint whose calls kept timing out run off the meter.
+fn charge_unanswered_hosted_call(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    target: &crate::target::Target,
+    label: &str,
+    req_body: &serde_json::Value,
+    bucket: &Mutex<crate::dispatch_budget::DispatchBudget>,
+    caller: &crate::budget::BudgetCaller<'_>,
+) {
+    let (ep, model) = (&target.endpoint, &target.model.id);
+    emit_single_shot_usage(
+        &opts.role_id,
+        &opts.session,
+        execution,
+        model,
+        opts.phase_id.as_deref(),
+        crate::usage::usage_payload(
+            &crate::usage::CallFacts {
+                call_kind: crate::usage::CallKind::SingleShot,
+                role_id: Some(&opts.role_id),
+                requested_model: model,
+                reported_model: None,
+                endpoint: label,
+                endpoint_id: ep.named_id(),
+            },
+            &darkmux_trajectory::UsageCounts::default(),
+        ),
+    );
+    crate::budget::settle_dispatch_live(
+        bucket,
+        crate::budget::conservative_hosted_spend(
+            None,
+            single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
+            req_body,
+        ),
+        &opts.role_id,
+        caller,
+    );
+}
+
+/// A one-call dispatch is over: stop the session's liveness beat so the live
+/// view drops it instead of waiting out the TTL (#2344), then write the
+/// terminal record through the bookend guard, which disarms it. One owner of
+/// the order, shared by the hosted and local single-shot paths, so a terminal
+/// is never written while the beat is still running.
+fn finish_single_call<S: darkmux_flow::BookendSink + ?Sized>(
+    session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
+    bookend: &mut darkmux_flow::BookendGuard<'_, S>,
+    terminal: darkmux_flow::FlowRecord,
+) {
+    if let Some(em) = session_emitter.take() {
+        em.stop();
+    }
+    bookend.close("dispatch", terminal);
+}
+
 /// Build a dispatch flow record for a hosted call (#1230 Packet 0: split out
 /// of the former `emit_remote_record` so the bookend guard's `open`/`close`
 /// can emit it instead of this function emitting directly). Same builder +
@@ -3823,15 +3886,14 @@ fn dispatch_unmanaged(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
+            charge_unanswered_hosted_call(opts, execution, target, &label, &req_body, &dispatch_bucket, &budget_caller);
             // (#2344) The one HTTP call is over — stop the beat before the
             // terminal record, so the live view drops the session instead of
             // waiting out the TTL. Same ordering as the container path's own
             // stop site.
-            if let Some(em) = session_emitter.take() {
-                em.stop();
-            }
-            bookend.close(
-                "dispatch",
+            finish_single_call(
+                &mut session_emitter,
+                &mut bookend,
                 build_unmanaged_record(
                     &opts.role_id,
                     session,
@@ -3894,11 +3956,9 @@ fn dispatch_unmanaged(
 
     // (#2344) See the error arm above — the call is done, so the session is
     // no longer running; stop the beat before the terminal record.
-    if let Some(em) = session_emitter.take() {
-        em.stop();
-    }
-    bookend.close(
-        "dispatch",
+    finish_single_call(
+        &mut session_emitter,
+        &mut bookend,
         build_unmanaged_record(
             &opts.role_id,
             session,
@@ -4207,11 +4267,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             // actually means before handing the raw error on.
             let e = with_residency_lost_context(&model_id, e);
             // (#2344) The call is over — stop the beat before the terminal.
-            if let Some(em) = session_emitter.take() {
-                em.stop();
-            }
-            bookend.close(
-                "dispatch",
+            finish_single_call(
+                &mut session_emitter,
+                &mut bookend,
                 build_unmanaged_record(
                     &opts.role_id,
                     session,
@@ -4266,11 +4324,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) See the error arm above — stop the beat before the terminal.
-    if let Some(em) = session_emitter.take() {
-        em.stop();
-    }
-    bookend.close(
-        "dispatch",
+    finish_single_call(
+        &mut session_emitter,
+        &mut bookend,
         build_unmanaged_record(
             &opts.role_id,
             session,

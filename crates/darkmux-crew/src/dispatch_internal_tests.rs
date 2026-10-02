@@ -3167,6 +3167,142 @@
         );
     }
 
+    /// A loopback server that takes the request and never answers: the
+    /// hosted call is sent, then times out. Dropping the sender frees it.
+    fn silent_http_mock() -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let _ = held.recv_timeout(Duration::from_secs(20));
+        });
+        (format!("http://127.0.0.1:{port}/v1/chat/completions"), release)
+    }
+
+    /// Run `dispatch_unmanaged` against `base_url` with a per-dispatch cap of
+    /// one token, so ANY charge breaches it and reports what it charged.
+    /// Returns the dispatch's result, the `spent` figure of the cap breach it
+    /// reported, what an unreported call would be charged, and the
+    /// `token_source` of every usage record it wrote.
+    fn run_capped_hosted_dispatch(base_url: &str) -> (Result<DispatchResult>, Option<u64>, u64, Vec<String>) {
+        let flows_dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let session = crate::test_session("unanswered-call");
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = session.clone();
+        opts.json = false;
+        opts.timeout_seconds = 1;
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            Some(100000),
+            serde_json::json!({"url": base_url, "limits": {"tokens_per_dispatch": 1}}),
+        );
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_unmanaged(&opts, &ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target)
+        });
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let charged = env
+            .record(darkmux_flow::FlowAction::BudgetWarn)
+            .and_then(|r| r.payload_json()["spent"].as_u64());
+        let unreported = crate::budget::conservative_hosted_spend(
+            None,
+            single_shot_cap(opts.max_completion_tokens, None),
+            &single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None),
+        );
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(flows_dir.path()).unwrap().flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if v["action"] == "telemetry.tokens" {
+                    sources.push(v["payload"]["token_source"].as_str().unwrap_or("?").to_string());
+                }
+            }
+        }
+        (result, charged, unreported, sources)
+    }
+
+    /// (5.0) A hosted call that was sent and timed out is charged ONCE, the
+    /// conservative way a reply with no usage is: one `absent` usage record
+    /// (the endpoint's window counts it as a call) and the granted cap plus
+    /// the estimated prompt against the dispatch's cap.
+    #[test]
+    #[serial]
+    fn a_timed_out_hosted_call_is_charged_once() {
+        let (url, _held) = silent_http_mock();
+        let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&url);
+        assert!(result.is_err(), "the unanswered call fails");
+        assert_eq!(charged, Some(unreported), "charged like a reply that reported no usage");
+        assert_eq!(sources, vec!["absent"], "one usage record, marked absent");
+    }
+
+    /// The per-dispatch cap is settled exactly once for an unanswered call,
+    /// however it is reached: the helper's charge is the whole charge.
+    #[test]
+    #[serial]
+    fn an_unanswered_call_settles_the_dispatch_cap_exactly_once() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            Some(100000),
+            serde_json::json!({"url": "http://127.0.0.1:1", "limits": {"tokens_per_dispatch": 1000000}}),
+        );
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let body = single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None);
+        let bucket = Mutex::new(crate::dispatch_budget::DispatchBudget::for_endpoint(&target.endpoint).unwrap());
+        let execution = ExecutionId::mint();
+        let caller = crate::budget::BudgetCaller {
+            role_id: Some(&opts.role_id),
+            session: &opts.session,
+            execution: &execution,
+            model: Some("gpt-remote"),
+            phase_id: None,
+            profiles_file: None,
+        };
+        charge_unanswered_hosted_call(&opts, &execution, &target, "label", &body, &bucket, &caller);
+        let expected = crate::budget::conservative_hosted_spend(None, single_shot_cap(opts.max_completion_tokens, None), &body);
+        assert_eq!(bucket.lock().unwrap().settled(), expected);
+        assert!(expected >= u64::from(single_shot_cap(opts.max_completion_tokens, None)), "at least the granted cap");
+    }
+
+    /// The inverse: a completed call still charges exactly once, by what the
+    /// provider reported, with a `provider` usage record and no second one.
+    #[test]
+    #[serial]
+    fn a_completed_hosted_call_still_charges_exactly_once() {
+        let (url, _rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+        );
+        let (result, charged, _, sources) = run_capped_hosted_dispatch(&url);
+        result.expect("the answered call succeeds");
+        assert_eq!(charged, Some(7), "charged by the reported total");
+        assert_eq!(sources, vec!["provider"], "one usage record");
+    }
+
     // ─── #2580 review finding: the SECOND unguarded route into
     //     `dispatch_unmanaged` — `dispatch_local_single_shot` ignored
     //     `resume_from` exactly as `dispatch()`'s pre-fix branch did ───────
