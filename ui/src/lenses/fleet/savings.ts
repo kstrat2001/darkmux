@@ -60,7 +60,7 @@ export function tokensOffMeter(data: NormRecord[], rowKeys?: ReadonlySet<string>
  *  task session shared by a listed mission is not unlisted. Nothing without a
  *  listing: `undefined` (a failed or empty `/runs`, a replay) is unknown, not
  *  "everything is unlisted". */
-export function unlistedUsage(data: readonly NormRecord[], rowKeys?: ReadonlySet<string>): { calls: number; tokens: number } {
+function unlistedUsage(data: readonly NormRecord[], rowKeys?: ReadonlySet<string>): { calls: number; tokens: number } {
   if (!rowKeys) return { calls: 0, tokens: 0 };
   const claimedSessions = new Set<string>();
   for (const r of data) if (r.session_id && r.mission_id && rowKeys.has(r.mission_id)) claimedSessions.add(r.session_id);
@@ -72,7 +72,7 @@ export function unlistedUsage(data: readonly NormRecord[], rowKeys?: ReadonlySet
 
 /** The usage records on no run: neither a session nor a mission named, the
  *  rule `usage_sum`'s `no_run` applies. */
-export function noRunUsage(data: readonly NormRecord[]): { calls: number; tokens: number } {
+function noRunUsage(data: readonly NormRecord[]): { calls: number; tokens: number } {
   const s = sumUsage(data.filter((r) => !r.session_id && !r.mission_id));
   return { calls: s.usageRecords, tokens: s.total };
 }
