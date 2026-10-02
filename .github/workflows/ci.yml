@@ -226,7 +226,7 @@ jobs:
   fleet-e2e:
     name: fleet e2e (ubuntu-latest, real redis)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     # (#1662) These tests existed and had NEVER RUN AT A GATE.
     #
@@ -325,6 +325,35 @@ jobs:
         # sort of guard that costs more than it protects. Removed.
         run: |
           cargo test --workspace --test 'e2e_*'
+
+      # (#2101) In-process tests that need a real redis-server (the telemetry
+      # stream's pins: live-view subscription, listing scope, replay samples,
+      # tail supervision, the flow status probe). They skip silently without
+      # redis, and the macOS job has none, so they run HERE with
+      # DARKMUX_E2E_REQUIRED=1 (a missing redis fails them), and the step
+      # fails unless every named test is reported `ok`: a filter that matches
+      # nothing exits 0.
+      - name: Redis-backed pins (#2101)
+        if: steps.filter.outputs.rust == 'true'
+        env:
+          DARKMUX_E2E_REQUIRED: "1"
+        run: |
+          set -o pipefail
+          cargo test -p darkmux-serve -p darkmux-flow -- \
+            a_telemetry_flood_does_not_evict_a_usage_record \
+            the_live_tail_carries_work_records_and_machine_samples \
+            flow_stream_handler_carries_the_telemetry_stream \
+            a_dispatch_replay_carries_the_peers_host_samples_from_the_hub \
+            a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive \
+            probe_redis_reports_the_telemetry_stream_and_its_schemas 2>&1 | tee redis-pins.log
+          for t in a_telemetry_flood_does_not_evict_a_usage_record \
+            the_live_tail_carries_work_records_and_machine_samples \
+            flow_stream_handler_carries_the_telemetry_stream \
+            a_dispatch_replay_carries_the_peers_host_samples_from_the_hub \
+            a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive \
+            probe_redis_reports_the_telemetry_stream_and_its_schemas; do
+            grep -Eq "test .*${t} \.\.\. ok" redis-pins.log || { echo "pin did not run: ${t}"; exit 1; }
+          done
 
       # (#2916 stage 2) Two daemons on one runner: `dispatch --profile
       # <p>@<machine>` from one node through the other's fleet listener.

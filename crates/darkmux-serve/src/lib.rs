@@ -3751,6 +3751,16 @@ enum RecordKey {
 }
 
 impl RecordKey {
+    /// Which hub streams a replay of this key reads: only a dispatch replay
+    /// joins host samples (its SYSTEM pane), so a mission replay needs the
+    /// work stream alone. (#2101)
+    fn fleet_scope(self) -> FleetScope {
+        match self {
+            RecordKey::Mission => FleetScope::Work,
+            RecordKey::Dispatch => FleetScope::WithSamples,
+        }
+    }
+
     /// The flow-record field that holds the id.
     fn field(self) -> &'static str {
         match self {
@@ -3786,7 +3796,7 @@ async fn catalog_records_response(
             // missions lens now LISTS a peer's mission (#1705) and clicking
             // through to replay it returns zero records: a dead end created by
             // making the mission visible in the first place.
-            let fleet = fleet_flow_records_with_samples();
+            let fleet = fleet_flow_records_in(key.fleet_scope());
             let (mut records, truncated, mut records_scanned) =
                 collect_records_by_field(&dir, &fleet.records, key.field(), &id);
             // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
@@ -4385,12 +4395,6 @@ enum FleetScope {
     Work,
     /// Work records and the machine-telemetry stream.
     WithSamples,
-}
-
-/// [`fleet_flow_records`] plus the machine samples, for a session's replay
-/// (host charts join them by time).
-fn fleet_flow_records_with_samples() -> FleetRead {
-    fleet_flow_records_in(FleetScope::WithSamples)
 }
 
 fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {

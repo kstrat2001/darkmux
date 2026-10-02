@@ -69,14 +69,14 @@ darkmux release.
   `<redis.stream>:telemetry` under their own cap, `redis.telemetry_maxlen`
   (env `DARKMUX_REDIS_TELEMETRY_MAXLEN`, default 10000, `0` unbounded; `init`
   writes it, `config set` validates it, `doctor` and `flow status` show it).
-  `GET /flow/<date>`, `/runs`, `/flow-missions` and the live tail read both streams
-  and merge them in hub order; the outage backfill never re-sends a sample (the
+  `GET /flow/<date>`, a dispatch replay and the live tail read both streams
+  and merge them in hub order (the listings read the work stream only, below); the outage backfill never re-sends a sample (the
   next one supersedes it). `flow status --json` gains `telemetry_stream`,
   `telemetry_max_len`, `telemetry_xlen`, `telemetry_oldest_ts` and `telemetry_newest_ts`
   (`tests/cli-json.golden` regenerated); the schema-skew sample reads both streams.
-  `/runs` and `/flow-missions` read the work stream only (a full read of both
-  doubled the parse cost, 300 ms to 610 ms for 10k entries each); a session's
-  replay reads both for its host charts. A live tail on one stream only is closed
+  `/runs`, `/flow-missions` and a mission replay read the work stream only (a full
+  read of both doubled the parse cost, 300 ms to 610 ms for 10k entries each); a
+  dispatch replay reads both for its host charts. A live tail on one stream only is closed
   so the client reconnects.
   **Trade:** the outage backfill re-sends work records only, so a relayed run's
   host chart has a hole over the outage window. `redis.telemetry_maxlen` is part of

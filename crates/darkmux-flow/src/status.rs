@@ -396,39 +396,49 @@ struct StreamProbe {
     oldest_id: Option<String>,
     newest_id: Option<String>,
     schemas: Vec<String>,
+    /// All three commands answered.
+    answered: bool,
 }
 
 fn probe_stream(conn: &mut redis::Connection, stream: &str) -> StreamProbe {
     let xlen = redis::cmd("XLEN").arg(stream).query::<u64>(conn).ok();
+    let mut probe = StreamProbe { xlen, ..StreamProbe::default() };
+    if xlen.is_none() {
+        return probe;
+    }
     // XINFO STREAM <key> would give first-entry / last-entry IDs in one
     // shot, but parsing its mixed-array response across redis-rs versions
-    // is fragile. XRANGE/XREVRANGE with COUNT 1 is unambiguous.
-    let oldest_id: Option<String> = redis::cmd("XRANGE")
+    // is fragile. XRANGE/XREVRANGE with COUNT 1 is unambiguous. A reply that
+    // does not come (a hub that answered XLEN and then stalled) ends the
+    // probe: it is not asked the remaining commands, each a bounded wait.
+    let Ok(oldest) = redis::cmd("XRANGE")
         .arg(stream)
         .arg("-")
         .arg("+")
         .arg("COUNT")
         .arg(1)
         .query::<Vec<(String, Vec<(String, String)>)>>(conn)
-        .ok()
-        .and_then(|v| v.into_iter().next().map(|(id, _)| id));
-    let (newest_id, schemas) = redis::cmd("XREVRANGE")
+    else {
+        return probe;
+    };
+    probe.oldest_id = oldest.into_iter().next().map(|(id, _)| id);
+    let Ok(entries) = redis::cmd("XREVRANGE")
         .arg(stream)
         .arg("+")
         .arg("-")
         .arg("COUNT")
         .arg(100)
         .query::<Vec<(String, Vec<(String, String)>)>>(conn)
-        .map(|entries| {
-            let newest = entries.first().map(|(id, _)| id.clone());
-            let schemas: Vec<String> = entries
-                .iter()
-                .filter_map(|(_, fields)| fields.iter().find(|(k, _)| k == "schema").map(|(_, v)| v.clone()))
-                .collect();
-            (newest, schemas)
-        })
-        .unwrap_or((None, vec![]));
-    StreamProbe { xlen, oldest_id, newest_id, schemas }
+    else {
+        return probe;
+    };
+    probe.newest_id = entries.first().map(|(id, _)| id.clone());
+    probe.schemas = entries
+        .iter()
+        .filter_map(|(_, fields)| fields.iter().find(|(k, _)| k == "schema").map(|(_, v)| v.clone()))
+        .collect();
+    probe.answered = true;
+    probe
 }
 
 /// Probe Redis: open a connection, run XLEN + XREVRANGE for oldest/newest,
@@ -502,10 +512,10 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
     bound_redis_response(&conn);
 
     let work = probe_stream(&mut conn, &cfg.stream);
-    // A peer that did not answer the first command is not asked three more
+    // A peer that did not answer every command is not asked three more
     // about the second stream: a wedged hub costs the same bounded wait as
     // before the telemetry stream existed.
-    let telemetry = if work.xlen.is_some() {
+    let telemetry = if work.answered {
         probe_stream(&mut conn, &cfg.telemetry_stream)
     } else {
         StreamProbe::default()
@@ -2497,6 +2507,8 @@ mod telemetry_stream_probe_tests {
             .stderr(std::process::Stdio::null())
             .spawn()
         else {
+            // A job that opted in must never silently skip (#1662).
+            assert!(std::env::var("DARKMUX_E2E_REQUIRED").is_err(), "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set");
             eprintln!("skipping: redis-server not on PATH");
             return;
         };
