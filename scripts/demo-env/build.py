@@ -273,7 +273,7 @@ def specs_for(machine, world, ledger, now_ms, version, schema):
                           if util else None),
         # Never a real endpoint: this field is typed but unrendered, and a
         # committed fixture is the wrong place to find out that changed.
-        "redis_url_redacted": "redis://demo-hub.internal:6379",
+        "hub_configured": true,
         "generated_at_ms": now_ms,
     }
 

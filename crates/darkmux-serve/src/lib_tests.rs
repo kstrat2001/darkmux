@@ -896,7 +896,7 @@
             "ram_free_for_ai_bytes",
             "cpu_brand",
             "loaded_models",
-            "redis_url_redacted",
+            "hub_configured",
             "generated_at_ms",
         ] {
             assert!(
@@ -1069,16 +1069,9 @@
             "Redis password leaked through /machine/specs: {body_str}"
         );
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let redacted = json["redis_url_redacted"]
-            .as_str()
-            .expect("redis_url_redacted must be a string when DARKMUX_REDIS_URL is set");
-        // Sanity: redaction surface should mention example.com (it's the
-        // host, not the secret) so the operator can confirm WHICH Redis
-        // is being targeted without exposing creds.
-        assert!(
-            redacted.contains("example.com"),
-            "redacted form should keep the host visible: {redacted}"
-        );
+        // Only WHETHER a hub is configured is stated, never where (#3072).
+        assert_eq!(json["hub_configured"], true);
+        assert!(!body_str.contains("example.com"), "the hub's host is not on the wire: {body_str}");
     }
 
     /// /machine/specs reports operator-stamped provenance — `machine_id`

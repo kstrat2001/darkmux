@@ -357,7 +357,7 @@ describe("MachineDrawer (#2107)", () => {
           loaded_models: [],
           lms_unreachable: false,
           utility_model: null,
-          redis_url_redacted: null,
+          hub_configured: false,
           generated_at_ms: NOW,
         }}
         liveStatus="live"
@@ -404,7 +404,7 @@ describe("MachineDrawer (#2107)", () => {
           loaded_models: [],
           lms_unreachable: false,
           utility_model: null,
-          redis_url_redacted: null,
+          hub_configured: false,
           generated_at_ms: NOW,
         } as never}
         liveStatus="live"
@@ -1761,7 +1761,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           loaded_models: [],
           lms_unreachable: false,
           utility_model: null,
-          redis_url_redacted: null,
+          hub_configured: false,
           generated_at_ms: NOW,
         }}
         liveStatus="live"
@@ -1818,7 +1818,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           loaded_models: [],
           lms_unreachable: false,
           utility_model: null,
-          redis_url_redacted: null,
+          hub_configured: false,
           generated_at_ms: NOW,
         }}
         liveStatus="live"
@@ -2020,7 +2020,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
     ],
     lms_unreachable: false,
     utility_model: { id: "qwen3-4b-instruct-2507", loaded: true, n_ctx: null },
-    redis_url_redacted: null,
+    hub_configured: false,
     generated_at_ms: NOW,
   };
 

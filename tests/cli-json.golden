@@ -621,7 +621,7 @@ MachineSpecsResponse
   loaded_models: LoadedModel[]
   lms_unreachable: boolean
   utility_model: UtilityModel | null
-  redis_url_redacted: string | null
+  hub_configured: boolean
   generated_at_ms: uint64
 MachineStatusOutput
   machine_id: string | null

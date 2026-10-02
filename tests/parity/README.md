@@ -213,7 +213,7 @@ every SAFE field too — it's what lets `ansi_text` (the CLI's own rendered
 output, which legitimately mixes real mission titles with structural chrome
 no field-name policy alone could safely blank without destroying the
 golden's value) stay mostly-real while still catching entity references
-inside it, and it's what scrubs the tailnet IP in `redis_url_redacted`.
+inside it, and it is what scrubs a tailnet IP in any free-text field.
 
 Standalone machine-name fields (`MacBook-Pro`, `m1-max-32gb-studio`) are
 left alone — operator hardware names aren't client-identifying and the plan

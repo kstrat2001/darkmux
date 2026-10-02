@@ -47,7 +47,7 @@ function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpe
     loaded_models: [],
     lms_unreachable: false,
     utility_model: null,
-    redis_url_redacted: null,
+    hub_configured: false,
     generated_at_ms: 0,
     ...overrides,
   };
@@ -163,7 +163,7 @@ describe("specOf", () => {
     loaded_models: [],
     lms_unreachable: false,
     utility_model: null,
-    redis_url_redacted: null,
+    hub_configured: false,
     generated_at_ms: 0,
   };
 

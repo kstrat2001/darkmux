@@ -130,7 +130,7 @@ function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetM
     loaded_models: [],
     lms_unreachable: false,
     utility_model: null,
-    redis_url_redacted: null,
+    hub_configured: false,
     generated_at_ms: 0,
     ...specs,
   };

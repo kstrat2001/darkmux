@@ -58,18 +58,22 @@ pub(crate) struct Route {
     pub(crate) path: &'static str,
     pub(crate) reply: Reply,
     handler: MethodRouter<AppState>,
+    /// The handler redacts for a remote caller itself (the console panels,
+    /// whose terminal output needs escape-aware filtering), so the JSON layer
+    /// stays off it.
+    redacts_itself: bool,
 }
 
 /// A JSON route: the type is checked to exist, and named in the golden.
 macro_rules! json {
     ($ty:ty, $path:literal, $handler:expr) => {{
         let _: Option<$ty> = None;
-        Route { path: $path, reply: Reply::Json(stringify!($ty)), handler: get($handler) }
+        Route { path: $path, reply: Reply::Json(stringify!($ty)), handler: get($handler), redacts_itself: false }
     }};
 }
 
 fn plain(path: &'static str, reply: Reply, handler: MethodRouter<AppState>) -> Route {
-    Route { path, reply, handler }
+    Route { path, reply, handler, redacts_itself: false }
 }
 
 /// Every route the viewer daemon serves.
@@ -91,7 +95,7 @@ pub(crate) fn table() -> Vec<Route> {
         json!(MachineResourcesResponse, "/machine/resources", machine_resources_handler),
         json!(MissionsResponse, "/missions", missions_handler),
         json!(RunsResponse, "/runs", runs_handler),
-        json!(PanelResponse, "/panel/:id", panel::panel_handler),
+        Route { redacts_itself: true, ..json!(PanelResponse, "/panel/:id", panel::panel_handler) },
         json!(PhasesResponse, "/phases", phases_handler),
         json!(mission_graph::MissionGraph, "/mission/:id/graph.json", mission_graph_json_handler),
         plain("/manifest.webmanifest", Reply::Manifest, get(web_manifest_handler)),
@@ -111,6 +115,15 @@ pub(crate) fn table() -> Vec<Route> {
     ]
 }
 
+/// A JSON route's handler behind the one redaction layer
+/// ([`crate::redaction::redact_reads`]), unless the handler redacts itself.
+fn with_read_redaction(reply: Reply, redacts_itself: bool, handler: MethodRouter<AppState>) -> MethodRouter<AppState> {
+    match reply {
+        Reply::Json(_) if !redacts_itself => handler.layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
+        _ => handler,
+    }
+}
+
 /// The router: every non-streaming route gets a request timeout, bounding a slow
 /// or hung request; the long-lived event stream (#925) is kept apart so that
 /// timeout never applies to it.
@@ -119,7 +132,7 @@ pub(crate) fn router() -> Router<AppState> {
         table().into_iter().partition(|r| r.reply == Reply::EventStream);
     let timed = timed
         .into_iter()
-        .fold(Router::new(), |router, r| router.route(r.path, r.handler))
+        .fold(Router::new(), |router, r| router.route(r.path, with_read_redaction(r.reply, r.redacts_itself, r.handler)))
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(crate::REQUEST_TIMEOUT_SECS)));
     let streaming = streaming.into_iter().fold(Router::new(), |router, r| router.route(r.path, r.handler));
     timed.merge(streaming)

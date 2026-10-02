@@ -57,7 +57,9 @@ use std::time::Duration;
 /// `remote.concurrent_cap`; concurrency is per endpoint now
 /// (`endpoints.<id>.limits.concurrent_calls`), so there is no one number to
 /// report. 1.2 also adds `serves_radio` and `serves_profiles`, optional facts
-/// about what this machine serves to peers (absent when not stated). 1.0 and
+/// about what this machine serves to peers (absent when not stated), and
+/// `specs.redis_url_redacted` is `specs.hub_configured`: whether a hub is
+/// configured, never where it is (#3072). 1.0 and
 /// 1.1 are unreleased, so no shipped reader meets a 1.2 card.
 pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
@@ -1054,7 +1056,7 @@ pub(crate) mod tests {
                 }],
                 lms_unreachable: false,
                 utility_model: None,
-                redis_url_redacted: None,
+                hub_configured: false,
                 generated_at_ms: 1_000,
             },
             profiles: vec![

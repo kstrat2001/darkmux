@@ -18,6 +18,7 @@ machine_id: string | null,
  */
 machine_uid: string | null, os: string, ram_total_bytes: number | null, ram_free_for_ai_bytes: number | null, cpu_brand: string | null, loaded_models: Array<LoadedModel>, lms_unreachable: boolean, utility_model: UtilityModel | null, 
 /**
- * The Redis URL with its password redacted, when Redis is configured.
+ * Whether this machine has a fleet hub (Redis) configured. A fact, never
+ * the URL: the hub's host is not something a card shows anyone (#3072).
  */
-redis_url_redacted: string | null, generated_at_ms: number, };
+hub_configured: boolean, generated_at_ms: number, };

@@ -522,7 +522,7 @@ pub(crate) mod tests {
                 "machine_uid": null, "os": "macos aarch64", "ram_total_bytes": null,
                 "ram_free_for_ai_bytes": 64u64 * 1024 * 1024 * 1024, "cpu_brand": null,
                 "loaded_models": [{"identifier": "darkmux:qwen", "model": "qwen", "status": "idle", "size": "20 GB", "context": 65536}],
-                "lms_unreachable": false, "utility_model": null, "redis_url_redacted": null, "generated_at_ms": 1
+                "lms_unreachable": false, "utility_model": null, "hub_configured": false, "generated_at_ms": 1
             },
             "profiles": [
                 {"name": "deep", "description": null, "is_default": true, "endpoint_kind": "managed",

@@ -441,7 +441,7 @@ const MACHINE_SPECS = {
   loaded_models: [],
   lms_unreachable: false,
   utility_model: { id: "darkmux:util-layout", loaded: true, n_ctx: 32768 },
-  redis_url_redacted: null,
+  hub_configured: false,
   generated_at_ms: 0,
 };
 
