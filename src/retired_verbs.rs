@@ -293,13 +293,13 @@ mod tests {
     #[test]
     fn the_2_0_verbs_are_refused_with_a_pointer_not_a_guess() {
         let cases: &[(&[&str], &str, &str)] = &[
-            (&["swap", "fast"], "darkmux swap", "darkmux machine status"),
+            (&["swap", "fast"], "darkmux swap", "darkmux machine status"),  // drift-guard:allow retired verb: asserts the refusal names it
             (&["status"], "darkmux status", "darkmux machine status"),
-            (&["fleet", "list"], "darkmux fleet", "darkmux machine list"),
+            (&["fleet", "list"], "darkmux fleet", "darkmux machine list"),  // drift-guard:allow retired verb: asserts the refusal names it
             (&["lessons", "add", "x"], "darkmux lessons", "darkmux memory lesson"),
             (&["model", "eject"], "darkmux model", "darkmux machine eject"),
-            (&["crew", "sync"], "darkmux crew sync", "no replacement"),
-            (&["mission", "run", "coder-phase"], "darkmux mission run", "darkmux mission launch"),
+            (&["crew", "sync"], "darkmux crew sync", "no replacement"),  // drift-guard:allow retired verb: asserts the refusal names it
+            (&["mission", "run", "coder-phase"], "darkmux mission run", "darkmux mission launch"),  // drift-guard:allow retired verb: asserts the refusal names it
         ];
         for (argv, spelling, pointer) in cases {
             let msg = refusal(&args(argv)).unwrap_or_else(|| panic!("{argv:?} was not refused"));

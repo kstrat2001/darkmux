@@ -730,7 +730,7 @@ fn each_retired_key_is_judged_by_its_value() {
         ("machine_rollup.period_seconds", json!(60)),
         ("dirs.ack", json!("/any/where")),
         ("dirs.notebook", json!("/any/where")),
-        ("radio.router_profile", json!("p")),
+        ("radio.router_profile", json!("p")), // flow-action-guard:allow a retired config key, asserted by name
         ("remote.step_budget_policy", json!("wait")),
         ("machine_rollup.enabled", json!(true)),
         ("runtime.log_level", json!("debug")),
