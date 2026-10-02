@@ -27,7 +27,8 @@
  *   stopped  — an operator or budget terminal: aborted / abandoned /
  *              interrupted / escalated
  *   idle     — not started, or a word this map does not know: planned /
- *              unparseable / undefined / anything new (loud in the DOM via
+ *              unparseable / unknown (a run on a machine that is not
+ *              reporting, 5.0 R3) / undefined / anything new (loud in the DOM via
  *              `s-<raw>`, quiet on screen)
  *
  * Styling lives in ONE place: `.wstatus` in `styles.css`. A call site may add
@@ -77,6 +78,7 @@ const KIND: Record<string, WorkStatusKind> = {
   interrupted: "stopped",
   planned: "idle",
   unparseable: "idle",
+  unknown: "idle",
 };
 
 export function workStatusKind(raw: string | undefined): WorkStatusKind {

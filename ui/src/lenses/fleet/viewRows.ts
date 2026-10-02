@@ -14,7 +14,8 @@ import type { Liveness } from "../../types/generated/Liveness";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { UnavailableWhy } from "../../types/generated/UnavailableWhy";
 import type { UnreachableReason } from "../../types/generated/UnreachableReason";
-import { findUid, nameKey, sameUid } from "../../lib/machineIdentity";
+import { findUid, nameKey, sameMachine, sameUid, type MachineRef } from "../../lib/machineIdentity";
+import { isUnseen, machineAvailability } from "../../lib/machineAvailability";
 
 /** Whether a machine is up, as the card should say it. `unknown` is a real
  * third answer: presence could not say, and nothing else did either. */
@@ -148,18 +149,33 @@ export function rowServesProfiles(row: FleetMachine): number {
   return row.card.state === "available" ? (row.card.card.serves_profiles ?? 0) : 0;
 }
 
-/** Whether the machine a page shows is one the view's rows say declares
- * `hub`. `isLocal`: the page shows THIS machine, whose row is the view's own.
- * Any other machine is found by the hardware uid its card carries or by its
- * roster id, the two keys a machine page is reached by. */
-export function machineIsHub(rows: readonly FleetMachine[] | null, targetUid: string | null, isLocal: boolean): boolean {
-  return (rows ?? []).some(
-    (row) =>
-      rowIsHub(row) &&
-      (row.is_this_machine
+/** The view's row for the machine a page shows. `isLocal`: the page shows THIS
+ * machine, whose row is the view's own. Any other machine is found by the
+ * hardware uid its card carries or by its roster id, the two keys a machine
+ * page is reached by. */
+function rowOfMachine(rows: readonly FleetMachine[] | null, targetUid: string | null, isLocal: boolean): FleetMachine | null {
+  return (
+    (rows ?? []).find((row) =>
+      row.is_this_machine
         ? isLocal
-        : targetUid !== null && (sameUid(row.machine_uid, targetUid) || (!!row.entry && nameKey(row.entry.id) === nameKey(targetUid)))),
+        : targetUid !== null && (sameUid(row.machine_uid, targetUid) || (!!row.entry && nameKey(row.entry.id) === nameKey(targetUid))),
+    ) ?? null
   );
+}
+
+/** Whether the machine a page shows is one the view's rows say declares `hub`. */
+export function machineIsHub(rows: readonly FleetMachine[] | null, targetUid: string | null, isLocal: boolean): boolean {
+  const row = rowOfMachine(rows, targetUid, isLocal);
+  return row !== null && rowIsHub(row);
+}
+
+/** The hardware line the card the view read gives the machine a page shows;
+ * `""` when no card was read or it names no chip. A peer's own card is the
+ * freshest word on its hardware, ahead of a presence beat's string. */
+export function machineCardSpec(rows: readonly FleetMachine[] | null, targetUid: string | null, isLocal: boolean): string {
+  const row = rowOfMachine(rows, targetUid, isLocal);
+  const specs = row ? rowSpecs(row) : null;
+  return specs ? specsLine(specs) : "";
 }
 
 export interface RowFacts {
@@ -245,4 +261,21 @@ export function rowFacts(
     servesRadio: rowServesRadio(row),
     servesProfiles: rowServesProfiles(row),
   };
+}
+
+/** (5.0 R3) Whether the machine a run executes on is not saying anything:
+ * the view holds it, and holds it as down. A run recorded as running there has
+ * no live evidence behind it, so its state is unknown, not running. A machine
+ * the view does not hold, this machine, and an absent view claim nothing: the
+ * run's own records stand. A row's names are its card's own name and its
+ * roster id, the two a run may be recorded under. */
+export function machineNotReporting(rows: readonly FleetMachine[] | null, ref: MachineRef): boolean {
+  const row = (rows ?? []).find((r) => rowNamed(r, ref));
+  if (!row) return false;
+  return isUnseen(machineAvailability({ self: false, seen: true, standing: rowStanding(row) }));
+}
+
+function rowNamed(row: FleetMachine, ref: MachineRef): boolean {
+  const names = [rowSpecs(row)?.machine_id, row.entry?.id].filter((n): n is string => !!n);
+  return names.some((name) => sameMachine(ref, { uid: row.machine_uid, name }));
 }

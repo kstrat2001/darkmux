@@ -1,6 +1,6 @@
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
-import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -11,6 +11,10 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { emptyFilterSel, filterSelPairs, isFilterSelEmpty, type FilterDim, type FilterSel } from "../../lib/runsFilterQuery";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useFleetView } from "../../hooks/useFleetView";
+import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
+import { machineNotReporting } from "../fleet/viewRows";
+import { NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
 import { decodeMachineKey } from "../../lib/machineKey";
 import { useMachineKeyContext } from "../../hooks/useMachineKey";
 import { FilterBar } from "./RunsFilterBar";
@@ -29,6 +33,7 @@ import {
   runsAgo,
   runSubtitleParts,
   type SubtitlePart,
+  runBadgeStatus,
   runStatusLabel,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
@@ -496,7 +501,19 @@ export function RunsBoard({
   // Windows are minutes wide at their narrowest, so a once-a-minute clock keeps
   // the facet counts from recomputing on every poll.
   const nowBucket = Math.floor(nowMs / 60000) * 60000;
-  const env = useMemo<FilterEnv>(() => ({ now: nowBucket, machineOf: index.keyOf }), [nowBucket, index]);
+  // (5.0 R3) A run recorded as running on a peer the fleet view holds as down
+  // AND whose session presence does not list as live has no live evidence
+  // behind it, so it reads "unknown". `no_beat` only says no daemon beat was
+  // found: a peer running a bare dispatch still beats its session. Both are
+  // live reads; a static build has neither, and a run there is judged by its
+  // records.
+  const fleetView = useFleetView(daemonBacked);
+  const liveSessions = useLiveSessionIds(daemonBacked);
+  const notReporting = useCallback(
+    (r: Run) => r.status === "running" && !liveSessions.sessions.has(r.id) && !liveSessions.missions.has(r.id) && machineNotReporting(fleetView.rows, { uid: r.machine_uid, name: r.machine }),
+    [fleetView.rows, liveSessions],
+  );
+  const env = useMemo<FilterEnv>(() => ({ now: nowBucket, machineOf: index.keyOf, notReporting }), [nowBucket, index, notReporting]);
   // The selection in VALUE space: machine keys become machine identities.
   const selValues = useMemo<FilterSel>(
     () => ({ ...sel, machine: sel.machine.map((k) => valueOfMachineKey(keyCtx.ctx, index, k)) }),
@@ -652,7 +669,7 @@ export function RunsBoard({
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} onActivate={() => activateRun(r)} />
+              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} notReporting={notReporting(r)} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
               <div
@@ -818,7 +835,7 @@ function RunSubtitle({ parts }: { parts: SubtitlePart[] }) {
   ));
 }
 
-function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
+function RunRow({ run, machine, notReporting, onActivate }: { run: Run; machine: string | null; notReporting: boolean; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
   const subtitle = runSubtitleParts(run, machine);
@@ -842,7 +859,12 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
         : {})}
     >
       <div className="labrunmain">
-        <WorkStatus status={run.status} label={runStatusLabel(run)} className="labbadge" />
+        <WorkStatus
+          status={runBadgeStatus(run, notReporting)}
+          label={runStatusLabel(run, notReporting)}
+          className="labbadge"
+          title={notReporting ? NOT_REPORTING_TITLE : undefined}
+        />
         <span className={`runkind ${run.kind}`}>{run.kind}</span>
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}

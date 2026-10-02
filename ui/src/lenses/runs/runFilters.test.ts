@@ -12,7 +12,7 @@ const HOUR = 3600;
 
 let n = 0;
 const run = (o: Partial<Run>): Run => ({ id: `r${++n}`, kind: "dispatch", status: "complete", tracked: true, updated_ts: NOW_S - 60, ...o }) as Run;
-const envFor = (runs: Run[]): FilterEnv => ({ now: NOW, machineOf: machineKeyOfRuns(runs) });
+const envFor = (runs: Run[], silent: (r: Run) => boolean = () => false): FilterEnv => ({ now: NOW, machineOf: machineKeyOfRuns(runs), notReporting: silent });
 const sel = (o: Partial<FilterSel>): FilterSel => ({ ...emptyFilterSel(), ...o });
 const counts = (c: { value: string; count: number }[]) => Object.fromEntries(c.map((x) => [x.value, x.count]));
 
@@ -39,6 +39,14 @@ describe("facet counts", () => {
     expect(counts(facetChoices(RUNS, s, "role", env))).toEqual({ reviewer: 1, coder: 0 });
     // Status counts see role=coder only.
     expect(counts(facetChoices(RUNS, s, "status", env))).toEqual({ complete: 2, running: 0 });
+  });
+
+  // (5.0 R3) The status chip and the status filter say the same word.
+  it("a running run on a machine that is not reporting is filed under 'unknown', not 'running'", () => {
+    const env = envFor(RUNS, (r) => r.id === "c");
+    expect(counts(facetChoices(RUNS, sel({}), "status", env))).toEqual({ complete: 3, unknown: 1 });
+    expect(applyFilters(RUNS, sel({ status: ["unknown"] }), env).map((r) => r.id)).toEqual(["c"]);
+    expect(applyFilters(RUNS, sel({ status: ["running"] }), env)).toEqual([]);
   });
 
   it("(not set) is a value, listed last, and selectable", () => {

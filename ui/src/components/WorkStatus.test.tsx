@@ -28,6 +28,7 @@ describe("workStatusKind — every raw status the app has maps into six kinds", 
     ["escalated", "stopped"],
     ["planned", "idle"],
     ["unparseable", "idle"],
+    ["unknown", "idle"],
     [undefined, "idle"],
     ["something-new", "idle"],
   ])("%s → %s", (raw, kind) => {

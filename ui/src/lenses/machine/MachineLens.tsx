@@ -11,8 +11,8 @@ import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf, sameUid } from "../../lib/machineIdentity";
 import { windowAvailability, remoteIdleLine } from "../../lib/machineAvailability";
 import { relAgoFrom } from "../../lib/format";
-import { specOf } from "../fleet/cards";
-import { machineIsHub } from "../fleet/viewRows";
+import { specOf, specUnknownLabel } from "../fleet/cards";
+import { machineCardSpec, machineIsHub } from "../fleet/viewRows";
 import { HubBadge } from "../../components/HubBadge";
 import { useFleetView } from "../../hooks/useFleetView";
 import { utilityModelId } from "./memoryLedgerLines";
@@ -105,6 +105,20 @@ export function lineClass(line: string): string | undefined {
  * `lineClass` itself STAYS: it is independently exported, directly tested
  * (`lineClass.test.ts`, including the hostile-string inverted case), and any
  * such future region can call it without this wrapper existing. */
+
+/** (5.0 R3) The header's hardware line: the machine's OWN hardware, else "not
+ *  reported", never blank for a machine that did not report and never another
+ *  machine's. This machine is its `/machine/specs` probe (`beatSpec` is
+ *  `specOf`'s answer for it); a peer is the card the view just read, else its
+ *  presence beat's string (`specOf`, viewer.html:1124-1129). The placeholder is
+ *  said only once the answers are in (`settled`) and, for this machine, only
+ *  when its probe named no chip, so the header does not draw one that a card
+ *  replaces. */
+function machineHeaderSpec(f: { own: boolean; specs: MachineSpecsResponse | null; beatSpec: () => string; cardSpec: string; settled: boolean }): string {
+  const known = f.own ? f.beatSpec() : f.cardSpec || f.beatSpec();
+  const reportsNothing = !f.own || !f.specs?.cpu_brand;
+  return known || (reportsNothing && f.settled ? specUnknownLabel("not-reported") : "");
+}
 
 /**
  * The machine page — `renderMachine()` (viewer.html:1796-1991), now purely
@@ -419,15 +433,17 @@ export function MachineLens({
         : targetUid != null
           ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid, roster)
           : "this machine";
-  // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
-  // reused rather than re-derived here) — the local daemon's own
-  // `/machine/specs` probe (cpu + RAM) when this page IS that machine;
-  // otherwise the machine's own presence-beat `specs` string (a remote
-  // machine's hardware line, as broadcast by ITS heartbeat).
-  const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
-  // (#3022) Whether this machine's own card declares `fleet.mode hub`, read
-  // from the same view the fleet lens draws its HUB badge from.
-  const hub = machineIsHub(useFleetView(true).rows, targetUid, isLocalMach);
+  // (#3022) The view the fleet lens draws its cards from: the HUB badge and,
+  // for a peer, the hardware line read off the machine's own card.
+  const fleetView = useFleetView(true);
+  const hub = machineIsHub(fleetView.rows, targetUid, isLocalMach);
+  const spec = machineHeaderSpec({
+    own: isLocalMach,
+    specs,
+    beatSpec: () => (targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : ""),
+    cardSpec: machineCardSpec(fleetView.rows, targetUid, false),
+    settled: identityKnown && fleetView.answered,
+  });
 
   return (
     <div className="machine-lens">

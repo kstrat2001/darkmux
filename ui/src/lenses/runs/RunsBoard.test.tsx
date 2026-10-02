@@ -36,10 +36,12 @@ const RUNS = [
  *  start from a runs set without one, or it silently asserts nothing. */
 const NO_LAB_RUNS = RUNS.filter((r) => r.kind !== "lab");
 
-function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, unknown> = {}, runs: unknown[] = RUNS) {
+function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, unknown> = {}, runs: unknown[] = RUNS, fleetView: unknown[] | null = null, liveSessions: string[] = []) {
   vi.stubGlobal(
     "fetch",
     vi.fn((url: string) => {
+      if (url === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: liveSessions.map((session_id) => ({ session_id })), meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
+      if (url === "/fleet/view" && fleetView) return Promise.resolve(new Response(JSON.stringify({ machines: fleetView }), { status: 200 }));
       if (url === "/runs") {
         return Promise.resolve(
           runsOk
@@ -160,6 +162,47 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText("m-broken")).toBeInTheDocument());
     const badge = screen.getByText("unparseable");
     expect(badge).toHaveClass("wstatus", "is-idle", "s-unparseable");
+  });
+
+  // (5.0 R3) A run recorded as running on a peer that is down has no live
+  // evidence: its badge and its status filter both read "unknown".
+  describe("a running run on a machine that is not reporting", () => {
+    const peerRow = (liveness: "no_beat" | "live") => ({
+      entry: { id: "studio", address: "a:1", added_unix_ms: 1 },
+      is_this_machine: false,
+      machine_uid: "u-studio",
+      liveness,
+      card: { state: "unreachable", reason: "listener_off", detail: null },
+    });
+    const RUN = [{ id: "peer-run", kind: "dispatch", status: "running", tracked: true, updated_ts: 400, machine: "studio", machine_uid: "u-studio" }];
+
+    it("reads unknown, not running, and is filed under unknown", async () => {
+      mockFetch(true, true, {}, RUN, [peerRow("no_beat")]);
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("unknown", { selector: ".labbadge" })).toBeInTheDocument());
+      const badge = screen.getByText("unknown", { selector: ".labbadge" });
+      expect(badge).toHaveClass("wstatus", "is-idle", "s-unknown");
+      expect(badge).not.toHaveAttribute("data-live");
+      expect(badge.getAttribute("title")).toMatch(/not reporting/i);
+      expect(screen.queryByText("running", { selector: ".labbadge" })).not.toBeInTheDocument();
+    });
+
+    const asked = (u: string) => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => c[0] === u);
+
+    it("still reads running while its machine is reporting", async () => {
+      mockFetch(true, true, {}, RUN, [peerRow("live")]);
+      renderBoard();
+      await waitFor(() => expect(asked("/fleet/view") && asked("/fleet/dispatches/live")).toBe(true));
+      await waitFor(() => expect(screen.getByText("running", { selector: ".labbadge" })).toBeInTheDocument());
+    });
+
+    it("a run whose session is live is never unknown, even when its machine's row reads down", async () => {
+      mockFetch(true, true, {}, RUN, [peerRow("no_beat")], ["peer-run"]);
+      renderBoard();
+      await waitFor(() => expect(asked("/fleet/view") && asked("/fleet/dispatches/live")).toBe(true));
+      await new Promise((r) => setTimeout(r, 100));
+      expect(screen.getByText("running", { selector: ".labbadge" })).toBeInTheDocument();
+    });
   });
 
   /** (F10/F11) A cut-off or partial run is `degraded`, never `complete`: its

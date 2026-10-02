@@ -3,7 +3,7 @@ import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
 import { LampDot } from "../../components/LampDot";
 import { LampForm } from "../../lib/lamp";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
@@ -31,7 +31,11 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import type { RunRelay } from "../../types/generated/RunRelay";
 import { useRelayOrigin } from "../../hooks/useRelayOrigin";
-import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
+import { CLEAN_DETECTORS, runRegions, sessionMachine } from "../session/sessionRun";
+import { useFleetView } from "../../hooks/useFleetView";
+import { machineNotReporting } from "../fleet/viewRows";
+import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
+import type { MachineRef } from "../../lib/machineIdentity";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 
@@ -483,6 +487,25 @@ function askedOnSuffix(relay: RunRelay | null): string {
   return relay ? `, asked on ${relay.asked_on_machine}` : "";
 }
 
+/** The pill's tooltip: what the liveness pulse says, except for a run whose
+ *  machine is not reporting, which says why its state is unknown. */
+function pillTitle(status: string, liveness: string): string {
+  return status === NOT_REPORTING_STATUS ? NOT_REPORTING_TITLE : liveness;
+}
+
+/** (5.0 R3) Whether the page's run executed on a machine the fleet view holds
+ *  as down, and whether the page must treat the run as stopped: presence saw it
+ *  go (`endedByPresence`), or its machine is held as down while presence does
+ *  not list the session as live (`no_beat` only says no daemon beat was found:
+ *  a peer running a bare dispatch still beats its session). Presence is a fact
+ *  about now, so a parked playhead (`live` false) judges without it. */
+function useRunSilence(data: NormRecord[], hasRecords: boolean, sessionId: string, live: boolean, endedByPresence: boolean, sessionLive: boolean) {
+  const fleetView = useFleetView(getSource().kind === "daemon" && live);
+  const notReporting = useCallback((on: MachineRef) => !sessionLive && machineNotReporting(fleetView.rows, on), [fleetView.rows, sessionLive]);
+  const silent = hasRecords && notReporting(sessionMachine(data, sessionId));
+  return { notReporting, stopped: endedByPresence || silent };
+}
+
 export function SessionReplay({
   sessionId,
   missionId = null,
@@ -709,8 +732,12 @@ export function SessionReplay({
   const wallNow = Date.now();
   const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
+  // (5.0 R3) A run on a machine the fleet view holds as down has no live
+  // evidence and no terminal record can arrive: it is not plausibly running,
+  // so nothing ticks or pulses, and the pill says unknown.
+  const { notReporting, stopped } = useRunSilence(data, hasRecords, sessionId, playhead === null, endedByPresence, isLive);
   const plausiblyRunning =
-    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !endedByPresence;
+    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !stopped;
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
@@ -742,7 +769,7 @@ export function SessionReplay({
   // record): for a static or injected-date build, which has no wall clock to
   // judge a recording against, and (#2011) once presence saw the run go,
   // where the clock stops at the run's last sign of life.
-  const frozenAtRecords = source.kind === "static" || injectedPlaybackDate() != null || endedByPresence;
+  const frozenAtRecords = source.kind === "static" || injectedPlaybackDate() != null || stopped;
   const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : frozenAtRecords ? undefined : wallNow);
 
   if (!session) {
@@ -806,7 +833,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid, notReporting);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -831,7 +858,7 @@ export function SessionReplay({
           label={view.header.pillLabel}
           live={liveness.state}
           className="pill"
-          title={liveness.label}
+          title={pillTitle(view.header.status, liveness.label)}
         />{" "}
         {/* (#1974) No noun. This view's subject is ONE ROLE EXECUTION — one
             role, one model, its turns, tokens and signals. `RUN` was the one

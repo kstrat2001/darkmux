@@ -25,6 +25,11 @@
 import { MachineIcon } from "./MachineIcon";
 import { fleetCoverageMessage, type DegradedFleetSource } from "./FleetCoverageNotice";
 
+/** (5.0 R3) What "last dispatch" is the newest of: the line reads as the
+ *  fleet's (the count beside it is machines online), and it is computed over
+ *  the loaded window of records, whichever machine wrote them. */
+const LAST_DISPATCH_SCOPE = "The newest dispatch start in the loaded window, on any machine whose records reach this viewer, not only this machine.";
+
 /**
  * (#2683) `coverage` is the degraded fleet-source state, or `null` when
  * presence is being read cleanly.
@@ -57,7 +62,11 @@ export function ReadyHeadline({ n, ago, coverage = null }: { n: number; ago: str
         {coverage ? <span className="mco__warn">⚠ </span> : null}
         {n} <MachineIcon />
       </span>
-      {ago ? ` · last dispatch ${ago}` : null}
+      {ago ? (
+        <span data-scope="fleet" title={LAST_DISPATCH_SCOPE}>
+          {` · last dispatch ${ago}`}
+        </span>
+      ) : null}
     </>
   );
 }

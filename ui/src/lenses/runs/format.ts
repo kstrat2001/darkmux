@@ -23,6 +23,7 @@
 
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../../lib/format";
+import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { dispatchHash } from "../../lib/route";
 import { canonUid, machineRefKey, matchesMachine, nameKey, type MachineMatch, type MachineRef } from "../../lib/machineIdentity";
 
@@ -63,12 +64,24 @@ export function runsAgo(r: Run, now: number = Date.now()): string {
  * this reads it directly rather than re-deriving the distinction client-
  * side. Every other status keeps its own plain name, unchanged — this is
  * the ONE place `RunRow`'s badge text can diverge from `run.status` itself
- * (the CSS class backing the badge's COLOR stays keyed on `run.status`
- * verbatim, so `.labbadge.abandoned` styling is untouched by this).
+ * (the CSS class backing the badge's COLOR stays keyed on the status from
+ * `runBadgeStatus`, which is `run.status` verbatim except for a running run
+ * whose machine is not reporting, so `.labbadge.abandoned` styling is
+ * untouched by this).
  */
-export function runStatusLabel(r: Run): string {
-  if (r.status !== "abandoned") return r.status;
+export function runStatusLabel(r: Run, notReporting = false): string {
+  const status = runBadgeStatus(r, notReporting);
+  if (status !== "abandoned") return status;
   return r.abandoned_reason === "aborted" ? "aborted" : "no ending recorded";
+}
+
+/** (5.0 R3) The status a row's badge keys its color and pulse on. It is the
+ * run's own, except that a run recorded as running on a machine that is not
+ * reporting (held as down by the fleet view, with no live session beat, so no
+ * terminal record can arrive)
+ * is `unknown` (`NOT_REPORTING_STATUS`). */
+export function runBadgeStatus(r: Run, notReporting: boolean): string {
+  return notReporting && r.status === "running" ? NOT_REPORTING_STATUS : r.status;
 }
 
 /** A lab row's verify outcome, in three states (#2494): what the workload's
