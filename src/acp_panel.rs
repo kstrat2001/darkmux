@@ -852,11 +852,6 @@ pub fn run_ephemeral(
         &registry,
         &facts,
         &est,
-        // (#1665 review CONSIDER 5, closes #2681) Was a hardcoded `1` —
-        // now resolves the operator's real setting; behavior-preserving
-        // since `remote_concurrent_cap()`'s default moved to `1` in the
-        // same change (see that accessor's own doc).
-        darkmux_types::config_access::remote_concurrent_cap() as usize,
         &crate::crew::concurrent_dispatch::lms_host_factory,
         // Every record already carries this run (`correlation`): the
         // scheduler and every step kind mint their sessions in it.

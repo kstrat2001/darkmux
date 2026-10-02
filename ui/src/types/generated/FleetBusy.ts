@@ -4,4 +4,4 @@ import type { BusyPolicy } from "./BusyPolicy";
 /**
  * The fleet listener's busy policy, as running.
  */
-export type FleetBusy = { policy: BusyPolicy, hosted_cap: number, };
+export type FleetBusy = { policy: BusyPolicy, };

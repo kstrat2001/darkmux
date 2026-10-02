@@ -390,3 +390,22 @@ fn ids_are_in_declaration_order_and_round_trip() {
     }
     assert_eq!(ConfigKind::IDS.len(), ConfigKind::ALL.len());
 }
+
+/// (#3035) `bucket_group` and `bucket_budget` retired with the per-step
+/// shared allowance: a `dispatch.map` config naming either is refused, at the
+/// gate and at the kind's own load, with a pointer to the endpoint's rolling
+/// `limits.window` (how a whole-run budget is expressed now). Neither is
+/// read as an unknown key's near-miss, and neither is silently ignored.
+#[test]
+fn a_retired_bucket_key_is_refused_with_a_pointer_to_the_endpoint_window() {
+    for key in ["bucket_group", "bucket_budget"] {
+        let mut config = sample(ConfigKind::DispatchMap);
+        config.as_object_mut().unwrap().insert(key.to_string(), json!(if key == "bucket_group" { json!("probe") } else { json!(5000) }));
+        let doc = doc_with_step("dispatch.map", config.clone());
+        let text = rendered(&step_config_issues(&doc)).join("\n");
+        assert!(text.contains(&format!("`phases[0].tasks[0].steps[0].config.{key}`")), "{text}");
+        assert!(text.contains("endpoints.<id>.limits.window") && text.contains("tokens_per_dispatch"), "{text}");
+        let err = ConfigKind::DispatchMap.loads(&substituted(&config)).unwrap_err();
+        assert!(err.contains(key) && err.contains("limits.window"), "{key}: {err}");
+    }
+}

@@ -559,7 +559,6 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
-  "remote":  { "max_tokens_per_step": null, "step_budget_policy": null, "concurrent_cap": 1 },
   "serve":   { "port": 8765, "bind": "127.0.0.1", "token_keychain": false, "read_auth": false },
   "power":   { "min_battery_pct": 50, "refuse_start_below_min": true, "pause_running_below_min": true },
   "fleet":   { "mode": "standalone" }
@@ -619,21 +618,25 @@ Two rules worth carrying without looking anything up:
   `test_command`, `procedural.shell`'s `command`), on whose expiry the
   command's whole process group is killed and the step reports the timeout.
   `darkmux doctor` prints the resolved value and which reading it got.
-  (#2902 step 5) `remote.max_tokens_per_step = 0` is no per-step cap (no
-  warning, nothing metered); an endpoint budget's `limits.window.tokens: 0`
+  (#2902 step 5, #3035) An endpoint's `limits.tokens_per_dispatch: 0` is no
+  per-dispatch cap (no warning, nothing metered); an endpoint budget's `limits.window.tokens: 0`
   (or `calls: 0`) is REFUSED ("0 is not a budget; set policy off to turn it
   off"), because read either way it would be an eternal wait.
-- **Two concurrency caps, and they are not interchangeable (#2394).**
-  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` (default `1`,
-  `0` = unbounded) bounds HOSTED endpoint dispatches, and on a fleet
-  receiver the hosted jobs other machines send; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
-  `runtime.dispatch_free_concurrency` (default `8`) bounds steps that speak to
-  no model at all (`procedural.shell`, `mods.gate`, `records.gather`,
+- **Two concurrency bounds, and they are not interchangeable (#2394, #3035).**
+  An endpoint's `limits.concurrent_calls` (in `profiles.json`, on an
+  endpoint darkmux does NOT manage; absent, its calls run one at a time and
+  darkmux says so once per launch; `0` = unbounded; refused on a managed
+  endpoint, whose parallelism the scheduler owns) bounds the calls to that
+  endpoint, and on a fleet receiver the jobs other machines send it;
+  `DARKMUX_DISPATCH_FREE_CONCURRENCY` → `runtime.dispatch_free_concurrency`
+  (default `8`) bounds steps that speak to no model at all
+  (`procedural.shell`, `mods.gate`, `records.gather`,
   `deliver.github_review`). They were one cap only because a dispatch-free step
-  had no way to say what it consumed; a mission launch reads the remote cap
-  from config (default `1`, since #2681), so at the default six independent
-  shell waits ran strictly one at a time. See "Seat classes" in `DESIGN.md`.
-
+  had no way to say what it consumed, so at the old machine-wide hosted cap
+  of 1 six independent shell waits ran strictly one at a time. The
+  `remote.*` settings are retired (#3035): `tokens_per_dispatch`, `policy`
+  and `concurrent_calls` live on the endpoint. See "Seat classes" in
+  `DESIGN.md`.
 
 ## Fleet networking: what an agent sets up, and what it doesn't
 

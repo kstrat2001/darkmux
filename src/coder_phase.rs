@@ -543,7 +543,7 @@ impl StepKind for MissionWorktreeStepKind {
     /// and stamps the run's context artifact. It has always needed no model
     /// residency (the test harness's host factory panics if it is ever
     /// consulted); now it SAYS so, so it also stops queueing behind the
-    /// hosted-endpoint cap.
+    /// an endpoint's concurrency limit.
     fn seat(
         &self,
         _step: &crew::types::Step,

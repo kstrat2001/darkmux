@@ -377,7 +377,7 @@ impl TaskDisplayStatus {
 /// (#2343) `NodeStatus::Running` alone is NOT "genuinely executing" —
 /// `run_step_graph`'s wave loop flips EVERY ready step in a wave to
 /// `Running` at ADMISSION, before any of them necessarily get a turn on a
-/// concurrency-capped track (`remote_cap`/`dispatch_free_cap`/a local
+/// concurrency-capped track (an endpoint's concurrency/`dispatch_free_cap`/a local
 /// wave's own ordering). `Step::started_ts` is the honest signal
 /// (#2517/#2525): it is stamped only from inside the step's own job
 /// closure, the instant it actually starts dispatching. So a step reading

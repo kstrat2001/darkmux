@@ -65,9 +65,8 @@
           "held_by_peer_job": true
         }
       ],
-      "hosted": {
-        "held_by_peer_jobs": 1,
-        "cap": 3
+      "unmanaged": {
+        "held_by_peer_jobs": 1
       },
       "waiting": 0
     },

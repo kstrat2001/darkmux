@@ -58,7 +58,7 @@
 //!      maintained `duty_for_kind` table, would close this end-to-end;
 //!      tracked as a follow-up, not done here.
 //!
-//! The remaining model call in this crate, `probe_remote_endpoint`, is
+//! The remaining model call in this crate, `probe_unmanaged_endpoint`, is
 //! deliberately absent: `doctor --probe` is a 64-token connectivity check
 //! with no session id and no bookends, so there is no session for a beat
 //! to be the liveness of.
@@ -111,7 +111,7 @@ fn duty_for_kind(kind_id: &str) -> Option<Duty> {
         "dispatch.single_shot" => Duty::ModelWork(Site {
             file: "src/step_kinds/builtins.rs",
             func: "run_single_shot",
-            anchor: "dispatch.single_shot (local)",
+            anchor: "local_single_shot_reply(",
         }),
         "dispatch.map" => Duty::ModelWork(Site {
             file: "src/step_kinds/builtins.rs",
@@ -127,7 +127,7 @@ fn duty_for_kind(kind_id: &str) -> Option<Duty> {
 /// The model-bearing dispatch functions reachable WITHOUT a step kind —
 /// the CLI verb, the fleet queue, and `darkmux acp`'s radio seats all enter
 /// here. A registry walk cannot see these, and that is exactly how
-/// `dispatch_local_single_shot` and `dispatch_remote` stayed uncovered
+/// `dispatch_local_single_shot` and `dispatch_unmanaged` stayed uncovered
 /// through two passes at #2344.
 const ENTRY_POINTS: &[Site] = &[
     // The radio router + answering seats (`src/radio.rs` via
@@ -140,7 +140,7 @@ const ENTRY_POINTS: &[Site] = &[
     // The hosted arm of every `darkmux dispatch` and fleet-queue job.
     Site {
         file: "src/dispatch_internal.rs",
-        func: "dispatch_remote",
+        func: "dispatch_unmanaged",
         anchor: "runtime=direct (hosted)",
     },
 ];
@@ -339,14 +339,14 @@ fn the_extractor_discriminates_between_neighboring_functions() {
     // would report every site as conformant — a probe that passes without
     // actually testing anything, which is worse than no probe.
     let src = read_src("src/dispatch_internal.rs");
-    let remote = fn_body(&src, "dispatch_remote");
+    let remote = fn_body(&src, "dispatch_unmanaged");
     assert!(
         remote.contains("runtime=direct (hosted)"),
-        "sanity: the extracted body is `dispatch_remote`'s own"
+        "sanity: the extracted body is `dispatch_unmanaged`'s own"
     );
     assert!(
         !remote.contains("single-shot dispatch requires one"),
-        "`dispatch_remote`'s body ran on into its neighbor `dispatch_local_single_shot` — \
+        "`dispatch_unmanaged`'s body ran on into its neighbor `dispatch_local_single_shot` — \
          the extractor is over-reaching, so every other assertion here is unearned"
     );
 

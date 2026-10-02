@@ -989,12 +989,12 @@ pub fn mission_wall_clock_timeout_seconds() -> u64 {
 /// `procedural.noop`, `mods.gate`, `records.gather`,
 /// `deliver.github_review`, the crawl planners). Resolves
 /// `env(DARKMUX_DISPATCH_FREE_CONCURRENCY) >
-/// config.runtime.dispatch_free_concurrency > 8` — mirrors
-/// [`remote_concurrent_cap`]'s wiring exactly, and is deliberately a
-/// SEPARATE knob from it: that cap protects a hosted endpoint's rate limit,
-/// which a shell command does not have. Before this existed, dispatch-free
-/// steps rode the remote track, and a mission launch's `remote_cap: 1` made
-/// six independent `procedural.shell` waits run strictly one at a time.
+/// config.runtime.dispatch_free_concurrency > 8`, and is deliberately a
+/// SEPARATE knob from an endpoint's `limits.concurrent_calls`: that protects
+/// an endpoint's rate limit, which a shell command does not have. Before this
+/// existed, dispatch-free steps rode the hosted-endpoint track, and a mission
+/// launch's one-at-a-time cap made six independent `procedural.shell` waits
+/// run strictly one at a time.
 ///
 /// Not unbounded, which is the tempting default. `mods.gate` runs an
 /// operator-supplied `test_command` per mod; N of those at once is N test
@@ -1032,9 +1032,9 @@ pub fn dispatch_free_concurrency() -> u32 {
 /// 36 queued until 22 of them crossed the inactivity deadline and timed out.
 /// Before this accessor existed, nothing bounded how many `SeatClaim::
 /// LocalModel` jobs sharing one identifier `run_local_waves` fired at once
-/// (see that function's own #2772 comments) — the gap `remote_concurrent_cap`
-/// and `dispatch_free_concurrency` each cover their own seat class but never
-/// reached.
+/// (see that function's own #2772 comments) — the gap that an endpoint's
+/// `limits.concurrent_calls` and `dispatch_free_concurrency` each cover their
+/// own seat class but never reached.
 ///
 /// Clamped to >= 1 the same way its siblings are (a literal `0` would mean
 /// "run nothing, forever") — this is ALSO the answer when `declared_parallel`
@@ -1130,32 +1130,6 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
     pick_parsed_with_source("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", cfg, None)
 }
 
-// ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
-/// A per-step cap on hosted tokens (#2902 step 5; renamed from the
-/// per-execution allowance in 4.0): the hosted tokens one step may spend
-/// before `remote.step_budget_policy` applies. `dispatch.map` steps naming
-/// the same `bucket_group` share one allowance. Resolves
-/// `env(DARKMUX_REMOTE_MAX_TOKENS_PER_STEP)`, then
-/// `config.remote.max_tokens_per_step`, then none: there is no built-in
-/// default, `None` is no cap. Tokens only, never currency (#1260).
-pub fn remote_max_tokens_per_step() -> Option<u64> {
-    let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_step);
-    // (#2902 step 5) No built-in default: unset is no per-step cap. An
-    // unparseable env value falls through to the config tier, the same
-    // lenient rule every numeric accessor follows.
-    // (zero doctrine) `0` is no cap, the same as unset.
-    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", cfg, None).filter(|n| *n > 0)
-}
-
-/// (#2902 step 5) What a step that reaches its per-step cap does: `off` or
-/// `warn` (operator, 2026-09-27: `wait` is an endpoint budget's value only).
-/// Registered `ConfigEnum` (`remote.step_budget_policy`, env
-/// `DARKMUX_REMOTE_STEP_BUDGET_POLICY`), absent = `warn`. An unregistered
-/// value (including `wait`) is an error, refused at preflight.
-pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, crate::config_enum::BadEnumValue> {
-    resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
-}
-
 /// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
 /// `config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
 /// them is `refuse_retired_env`, called once at CLI entry; `doctor` reads this
@@ -1174,33 +1148,6 @@ pub fn check_retired_env() -> Result<Vec<crate::config::RetiredLeftover>, crate:
     let (refuse, warn): (Vec<_>, Vec<_>) =
         retired_env_leftovers().into_iter().partition(|l| l.policy == crate::config::LeftoverPolicy::Refuse);
     if refuse.is_empty() { Ok(warn) } else { Err(crate::config::RetiredEnvRefusal(refuse)) }
-}
-
-/// (#1230 Packet 1) Max CONCURRENT remote dispatches
-/// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
-/// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 1`
-/// — mirrors `remote_max_tokens_per_step`'s wiring exactly.
-///
-/// **Default is `1`, not `4` (#1665 review CONSIDER 5).** This accessor
-/// went unwired at every real call site for a while (#2681 found it: every
-/// production `run_step_graph` call hardcoded `remote_cap: 1` instead of
-/// resolving this function) — those call sites now resolve it, and the
-/// default was moved from the old placeholder `4` down to `1` in the SAME
-/// change so wiring it is behavior-preserving: an operator who never
-/// touches `remote.concurrent_cap`/`DARKMUX_REMOTE_CONCURRENT_CAP` gets
-/// today's serial behavior unchanged. Raising it to allow real concurrent
-/// remote dispatch is now an operator OPT-IN via `config set
-/// remote.concurrent_cap <n>`, not a silent default flip — a real
-/// concurrency increase on the main dispatch path deserves its own
-/// dogfood pass, per this repo's release-gate doctrine, not a side effect
-/// of wiring the knob.
-///
-/// `0` means UNBOUNDED (the darkmux bound convention), never "run nothing"
-/// and never "1": every consumer turns it into a job count through
-/// [`jobs_at_once`].
-pub fn remote_concurrent_cap() -> u32 {
-    let cfg = config().remote.as_ref().and_then(|r| r.concurrent_cap);
-    pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(1)).unwrap()
 }
 
 /// (#2916 stage 2) A concurrency cap as the number of jobs allowed at once:
@@ -1986,8 +1933,7 @@ pub fn power_pause_running_below_min_with_source() -> (bool, Source) {
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
 /// Resolves `env(DARKMUX_MISSION_STALE_ACTIVE_DAYS) >
-/// config.mission.stale_active_days > 14` — mirrors
-/// `remote_concurrent_cap`'s wiring exactly.
+/// config.mission.stale_active_days > 14`.
 pub fn mission_stale_active_days() -> u64 {
     let cfg = config().mission.as_ref().and_then(|m| m.stale_active_days);
     pick_parsed("DARKMUX_MISSION_STALE_ACTIVE_DAYS", cfg, Some(14)).unwrap()
@@ -3120,7 +3066,7 @@ mod tests {
     }
 
     // ── dispatch_free_concurrency (#2394): env > config > 8 default,
-    //    mirroring remote_concurrent_cap exactly ──
+    //    mirroring the other resolved caps ──
     #[serial_test::serial]
     #[test]
     fn dispatch_free_concurrency_env_overrides_then_default() {
@@ -4019,57 +3965,6 @@ mod tests {
         }
     }
 
-    // ── remote_max_tokens_per_step (#1260, #2902 step 5): env > config > none ──
-    #[serial_test::serial]
-    #[test]
-    fn remote_max_tokens_per_step_env_then_config_then_none() {
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::remove_var(k); }
-        // (#2902 step 5) No env + the empty test config (#811) → NO per-step
-        // budget. The built-in 500000 is gone.
-        assert_eq!(remote_max_tokens_per_step(), None);
-        unsafe { std::env::set_var(k, "25000"); }
-        assert_eq!(remote_max_tokens_per_step(), Some(25_000), "env tier wins live");
-        // An unparseable env value falls through (to no budget), never panics.
-        unsafe { std::env::set_var(k, "half-a-million"); }
-        assert_eq!(remote_max_tokens_per_step(), None);
-        // (zero doctrine) `0` on a darkmux bound is unbounded: no cap.
-        unsafe { std::env::set_var(k, "0"); }
-        assert_eq!(remote_max_tokens_per_step(), None, "0 is no cap");
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    // ── remote_concurrent_cap (#1230 Packet 1): env > config > 1 ──
-    // (#1665 review CONSIDER 5) Default moved from the old placeholder `4`
-    // to `1` in the same change that wired the real call sites — see
-    // `remote_concurrent_cap`'s own doc for why that keeps today's
-    // (unwired) behavior unchanged for an operator who never sets this.
-    #[serial_test::serial]
-    #[test]
-    fn remote_concurrent_cap_env_then_default() {
-        let k = "DARKMUX_REMOTE_CONCURRENT_CAP";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::remove_var(k); }
-        // No env + the empty test config (#811) → the built-in default 1.
-        assert_eq!(remote_concurrent_cap(), 1);
-        unsafe { std::env::set_var(k, "8"); }
-        assert_eq!(remote_concurrent_cap(), 8, "env tier wins live");
-        // An unparseable env value falls through to the default, never panics.
-        unsafe { std::env::set_var(k, "lots"); }
-        assert_eq!(remote_concurrent_cap(), 1);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
 
     // ── power.* (#2706): env > config > built-in default, for all three ──
     //
@@ -4432,12 +4327,12 @@ mod tests {
     /// silently excluded, the same discipline `coder_phase.rs` (#1352) uses
     /// for a documented narrowing. Grow this list only with a linked issue, never to
     /// silence a failure without one.
-    // (#1665 review CONSIDER 5) `remote_concurrent_cap` (#2681) was here —
+    // (#1665 review CONSIDER 5) a hosted-cap accessor (#2681) was here —
     // found BY this guard while it was being written, then resolved in the
     // same review pass: the real `run_step_graph` call sites now resolve
     // it, and its default moved from the old placeholder `4` down to `1`
     // in the same change, so wiring it is behavior-preserving (see
-    // `remote_concurrent_cap`'s own doc). No known gaps remain; keep this
+    // that accessor's own doc). No known gaps remain; keep this
     // list empty rather than deleting it so the NEXT dead knob has an
     // obvious place to land.
     const KNOWN_GAPS: &[(&str, &str)] = &[];

@@ -42,12 +42,12 @@ pub struct TrustView {
     pub workspace: bool,
 }
 
-/// (#2916 stage 2) A listener's busy settings: its `fleet.busy_policy`
-/// and its `remote.concurrent_cap` (hosted jobs at once, `0` = unbounded).
+/// (#2916 stage 2, #3035) A listener's busy settings: its
+/// `fleet.busy_policy`. (How many jobs one unmanaged endpoint takes at once
+/// is that endpoint's own `limits.concurrent_calls`, not a listener setting.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BusySettings {
     pub policy: darkmux_types::config::BusyPolicy,
-    pub hosted_cap: u32,
 }
 
 /// (#2916 stage 2 review C5) The busy settings the running daemon reports
@@ -345,10 +345,6 @@ fn busy_note(f: &FleetSubmissionFacts) -> String {
 
 fn describe_busy(b: BusySettings) -> String {
     use darkmux_types::config::BusyPolicy;
-    let hosted = match b.hosted_cap {
-        0 => "hosted jobs unbounded".to_string(),
-        n => format!("hosted jobs up to {n} (remote.concurrent_cap)"),
-    };
     let past = match b.policy {
         BusyPolicy::Queue => "queues the rest",
         BusyPolicy::Refuse => "refuses the rest at once",
@@ -357,7 +353,8 @@ fn describe_busy(b: BusySettings) -> String {
     // machines submit; a local model this machine is using for its own
     // dispatch is not "busy" to it.
     format!(
-        "one fleet job per local model (this machine's own dispatches are not counted), {hosted}; \
+        "one fleet job per local model (this machine's own dispatches are not counted), and per \
+         unmanaged endpoint as many as its limits.concurrent_calls allows (one when it declares none); \
          fleet.busy_policy `{}` {past}",
         b.policy.as_str()
     )
@@ -457,12 +454,12 @@ mod tests {
         }
     }
 
-    fn refuse(hosted_cap: u32) -> BusySettings {
-        BusySettings { policy: darkmux_types::config::BusyPolicy::Refuse, hosted_cap }
+    fn refuse() -> BusySettings {
+        BusySettings { policy: darkmux_types::config::BusyPolicy::Refuse }
     }
 
-    fn queue(hosted_cap: u32) -> BusySettings {
-        BusySettings { policy: darkmux_types::config::BusyPolicy::Queue, hosted_cap }
+    fn queue() -> BusySettings {
+        BusySettings { policy: darkmux_types::config::BusyPolicy::Queue }
     }
 
     fn facts() -> FleetSubmissionFacts {
@@ -478,7 +475,7 @@ mod tests {
             daemon_listener_state: None,
             daemon_token_set: None,
             daemon_hub_link: None,
-            busy: BusyFacts { running: Some(refuse(1)), configured: Some(refuse(1)) },
+            busy: BusyFacts { running: Some(refuse()), configured: Some(refuse()) },
             local_machine: Some("studio".into()),
             clock_skews: Vec::new(),
         }
@@ -520,7 +517,8 @@ mod tests {
         assert_eq!(
             row(&rows, "fleet listener").message,
             "listening on 100.64.0.2:8766; one fleet job per local model (this machine's own \
-             dispatches are not counted), hosted jobs up to 1 (remote.concurrent_cap); \
+             dispatches are not counted), and per unmanaged endpoint as many as its \
+             limits.concurrent_calls allows (one when it declares none); \
              fleet.busy_policy `refuse` refuses the rest at once"
         );
         assert!(row(&rows, "fleet identity").message.contains("this machine is `studio`"));
@@ -530,10 +528,10 @@ mod tests {
     /// name a `profile@machine` address uses for this machine.
     #[test]
     fn the_rows_name_the_busy_policy_and_the_address_name() {
-        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(queue(0)), configured: Some(queue(0)) }, ..facts() };
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(queue()), configured: Some(queue()) }, ..facts() };
         let rows = fleet_submission_checks(&f);
         let l = &row(&rows, "fleet listener").message;
-        assert!(l.contains("hosted jobs unbounded") && l.contains("`queue` queues the rest"), "{l}");
+        assert!(l.contains("limits.concurrent_calls allows") && l.contains("`queue` queues the rest"), "{l}");
         assert!(!l.contains("config.json"), "the daemon and the file agree: {l}");
         let i = &row(&rows, "fleet identity").message;
         assert!(i.contains("`<profile>@studio`") && i.contains("restart `darkmux serve`"), "{i}");
@@ -548,11 +546,11 @@ mod tests {
     /// such.
     #[test]
     fn the_busy_row_shows_the_running_values_and_what_a_restart_would_change() {
-        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(refuse(1)), configured: Some(queue(3)) }, ..facts() };
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(refuse()), configured: Some(queue()) }, ..facts() };
         let l = row(&fleet_submission_checks(&f), "fleet listener").message.clone();
         assert!(l.contains("`refuse` refuses the rest at once"), "shows the running policy: {l}");
-        assert!(l.contains("config.json now says") && l.contains("up to 3") && l.contains("restart `darkmux serve`"), "{l}");
-        let f = FleetSubmissionFacts { busy: BusyFacts { running: None, configured: Some(queue(2)) }, ..facts() };
+        assert!(l.contains("config.json now says") && l.contains("`queue` queues the rest") && l.contains("restart `darkmux serve`"), "{l}");
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: None, configured: Some(queue()) }, ..facts() };
         let l = row(&fleet_submission_checks(&f), "fleet listener").message.clone();
         assert!(l.contains("`queue`") && l.contains("from config.json; the running daemon did not report"), "{l}");
     }

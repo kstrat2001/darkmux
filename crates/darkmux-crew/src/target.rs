@@ -239,17 +239,14 @@ pub fn target_for(profile_name: String, profile: Profile, model: ProfileModel) -
     Ok(Target { profile_name, profile, model, endpoint, kind, dialect, chat_url })
 }
 
-/// A step's `config.endpoint`, resolved (#2902 step 3; the step kinds'
-/// "is this hosted?" test). `Ok(Some(ep))` when it names an UNMANAGED
-/// endpoint (the step's hosted arm); `Ok(None)` when absent or managed (the
-/// local arm). An inline definition is used as written; an `endpoints` id is
-/// looked up in the registry at `config_path` (one registry read, only for
-/// the id form). An undefined id or an endpoint of no declared kind is an
-/// error.
-pub fn step_unmanaged_endpoint(
+/// A step's `config.endpoint`, resolved, with its kind (#2902 step 3, #3035).
+/// An inline definition is used as written; an `endpoints` id is looked up in
+/// the registry at `config_path` (one registry read, only for the id form).
+/// An undefined id or an endpoint of no declared kind is an error.
+fn step_endpoint_of_any_kind(
     endpoint: Option<&crate::step_config::EndpointRef>,
     config_path: Option<&str>,
-) -> Result<Option<ModelEndpoint>> {
+) -> Result<Option<(ModelEndpoint, EndpointKind)>> {
     use crate::step_config::EndpointRef;
     let Some(endpoint) = endpoint else { return Ok(None) };
     let ep: ModelEndpoint = match endpoint {
@@ -257,9 +254,34 @@ pub fn step_unmanaged_endpoint(
         EndpointRef::Id(id) => darkmux_profiles::profiles::load_registry(config_path)?.registry.endpoint_named(id),
         EndpointRef::Inline(inline) => (**inline).clone(),
     };
-    Ok(match ep.kind()? {
-        EndpointKind::Managed(_) => None,
-        EndpointKind::Unmanaged => Some(ep),
+    let kind = ep.kind()?;
+    Ok(Some((ep, kind)))
+}
+
+/// A step's `config.endpoint` when it names an UNMANAGED endpoint (the step
+/// kinds' "is this hosted?" test): `Ok(Some(ep))` for the step's hosted arm,
+/// `Ok(None)` when absent or managed (the local arm).
+pub fn step_unmanaged_endpoint(
+    endpoint: Option<&crate::step_config::EndpointRef>,
+    config_path: Option<&str>,
+) -> Result<Option<ModelEndpoint>> {
+    Ok(match step_endpoint_of_any_kind(endpoint, config_path)? {
+        Some((ep, EndpointKind::Unmanaged)) => Some(ep),
+        Some((_, EndpointKind::Managed(_))) | None => None,
+    })
+}
+
+/// (#3035) A step's `config.endpoint` when it names a MANAGED endpoint: its
+/// local arm still carries that endpoint's limits (the window gate, the
+/// per-dispatch cap, the id its usage records are summed by). The inverse of
+/// [`step_unmanaged_endpoint`].
+pub fn step_managed_endpoint(
+    endpoint: Option<&crate::step_config::EndpointRef>,
+    config_path: Option<&str>,
+) -> Result<Option<ModelEndpoint>> {
+    Ok(match step_endpoint_of_any_kind(endpoint, config_path)? {
+        Some((ep, EndpointKind::Managed(_))) => Some(ep),
+        Some((_, EndpointKind::Unmanaged)) | None => None,
     })
 }
 
@@ -300,6 +322,13 @@ mod step_endpoint_tests {
         assert_eq!(named.named_id(), Some("hosted"));
         assert_eq!(named.url.as_deref(), Some("https://h.example/v1"));
         assert!(step_unmanaged_endpoint(&json!({"endpoint": "lms"}), path).unwrap().is_none());
+        // (#3035) The managed twin: only a managed endpoint is returned.
+        let managed = |config: &serde_json::Value| {
+            let endpoint: Option<EndpointRef> = config.get("endpoint").map(|v| serde_json::from_value(v.clone()).unwrap());
+            super::step_managed_endpoint(endpoint.as_ref(), path).unwrap()
+        };
+        assert_eq!(managed(&json!({"endpoint": "lms"})).unwrap().named_id(), Some("lms"));
+        assert!(managed(&json!({"endpoint": "hosted"})).is_none() && managed(&json!({})).is_none());
         let err = step_unmanaged_endpoint(&json!({"endpoint": "nope"}), path).unwrap_err();
         assert!(format!("{err:#}").contains("nope"), "{err:#}");
     }

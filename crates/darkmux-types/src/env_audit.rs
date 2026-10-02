@@ -136,13 +136,13 @@
 //! spawn` (this test is `#[serial]`, so — same as the two fixed above —
 //! this is an attribution gap, not a demonstrated race). Same known-gap
 //! class as the test-local spawns in `absence_backstop.rs`/
-//! `remote_budget.rs`/`workspace_spec/materialize.rs`/`step_kinds/
+//! `dispatch_budget.rs`/`workspace_spec/materialize.rs`/`step_kinds/
 //! builtins.rs`'s mock Redis server below, just newly surfaced now that
 //! `darkmux-lab` is swept for the first time (see "Crate coverage"
 //! below) — not chased further in this pass.
 //!
 //! The several test-local `thread::spawn` calls in `absence_backstop.rs`,
-//! `remote_budget.rs`, `workspace_spec/materialize.rs`, and
+//! `dispatch_budget.rs`, `workspace_spec/materialize.rs`, and
 //! `step_kinds/builtins.rs`'s mock Redis server are still unnamed — not
 //! implicated in the residual above, but still a live gap.
 //!

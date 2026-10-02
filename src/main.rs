@@ -656,7 +656,7 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     // share the verdict/exit-code path — a failed probe exits 1 like any
     // failed check.
     let probe_checks = if probe {
-        doctor::probe_remote_endpoints()
+        doctor::probe_unmanaged_endpoints()
     } else {
         Vec::new()
     };

@@ -774,7 +774,7 @@ pub fn check_scope(
 fn check_boundary(job: &WorkJob, scoped: &ScopedJob) -> std::result::Result<(), Refusal> {
     match (job.boundary, &scoped.seat) {
         (None, _) | (Some(Boundary::ManagedOnly), crate::seats::WorkSeat::Local { .. }) => Ok(()),
-        (Some(Boundary::ManagedOnly), crate::seats::WorkSeat::Hosted { .. }) => {
+        (Some(Boundary::ManagedOnly), crate::seats::WorkSeat::Unmanaged { .. }) => {
             Err(Refusal::BoundaryUnmanaged { profile: scoped.profile.clone() })
         }
         (Some(Boundary::Unknown), _) => Err(Refusal::BoundaryUnknown),
@@ -821,7 +821,14 @@ pub fn classify_profile(
             let seat = if t.kind.is_managed() {
                 crate::seats::WorkSeat::Local { model }
             } else {
-                crate::seats::WorkSeat::Hosted { model }
+                // (#3035) An unmanaged endpoint's own `limits.concurrent_calls`
+                // bounds the jobs that may hold it at once.
+                let slot = darkmux_crew::step_kinds::EndpointSlot::of(&t.endpoint);
+                crate::seats::WorkSeat::Unmanaged {
+                    endpoint: slot.key().to_string(),
+                    model,
+                    concurrent_calls: slot.declared(),
+                }
             };
             ProfileResolution::Work { profile: t.profile_name, seat }
         }
@@ -2097,7 +2104,7 @@ mod tests {
     }
 
     fn hosted(profile: &str) -> ProfileResolution {
-        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Hosted { model: "gpt".into() } }
+        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "azure".into(), model: "gpt".into(), concurrent_calls: None } }
     }
 
     /// The boundary is checked against the profile the job RESOLVES to:
@@ -2339,7 +2346,17 @@ mod tests {
         );
         assert_eq!(
             classify_profile(&reg, &r, Some("cloud"), None, "studio"),
-            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Hosted { model: "gpt-x".into() } }
+            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), model: "gpt-x".into(), concurrent_calls: None } }
+        );
+        // (#3035) The endpoint's own `limits.concurrent_calls` rides the seat.
+        let limited = registry(
+            r#"{"profiles":{"cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":"api"}]}},
+              "endpoints":{"api":{"url":"https://api.example/v1","limits":{"concurrent_calls":3}}},
+              "default_profile":"cloud"}"#,
+        );
+        assert_eq!(
+            classify_profile(&limited, &r, Some("cloud"), None, "studio"),
+            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Unmanaged { endpoint: "api".into(), model: "gpt-x".into(), concurrent_calls: Some(3) } }
         );
     }
 

@@ -186,14 +186,6 @@ const KEYS: &[(&str, Ty)] = &[
     // (#3022) What a fleet hub hands to machines with no setting of their
     // own; meaningful on the hub only.
     ("fleet.defaults.radio.answerer_profile", Ty::Str),
-    // (#1260, #2902 step 5) A per-step cap on hosted tokens; `dispatch.map`
-    // steps naming the same `bucket_group` share one allowance. Tokens,
-    // never currency. (Renamed from `remote.max_tokens_per_execution` in
-    // 4.0; `set_at` refuses the old key naming this one.)
-    ("remote.max_tokens_per_step", Ty::Uint),
-    // (#1230 Packet 1) Max concurrent remote dispatches
-    // `darkmux_crew::concurrent_dispatch::run_bounded` runs at once.
-    ("remote.concurrent_cap", Ty::Uint),
     // (#2706) The battery-charge gate. Two separate booleans, one per
     // decision (start vs in-flight) — see `PowerConfig`'s own doc for why
     // that is not one mode. A machine with no battery is never gated by
@@ -1340,22 +1332,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
     }
 
-    /// (#2902 step 5) `config set` refuses a renamed budget key, naming the
-    /// new key, and writes nothing.
+    /// (#3035) `config set` refuses each retired `remote.*` key naming the
+    /// `endpoints.<id>.limits` field that replaced it, and writes nothing.
     #[test]
-    fn config_set_refuses_a_renamed_budget_key_naming_the_new_one() {
+    fn config_set_refuses_a_retired_remote_key_naming_the_endpoint_limit() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
-        for r in darkmux_types::config::RENAMED_SETTINGS {
-            let (old, new) = (r.old_key, r.new_key);
-            let err = set_at(&path, old, "warn").unwrap_err().to_string();
-            assert!(err.contains(&format!("`{old}` was renamed to `{new}` in 4.0")), "{err}");
+        for (key, field) in [
+            ("remote.max_tokens_per_step", "limits.tokens_per_dispatch"),
+            ("remote.step_budget_policy", "limits.policy"),
+            ("remote.concurrent_cap", "limits.concurrent_calls"),
+        ] {
+            let err = set_at(&path, key, "1").unwrap_err().to_string();
+            assert!(err.contains(key) && err.contains(field), "{err}");
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
-        assert!(set_at(&path, "remote.max_tokens_per_step", "1000").is_ok());
-        let err = set_at(&path, "remote.step_budget_policy", "wait").unwrap_err().to_string();
-        assert!(err.contains("`wait`") && err.contains("off") && err.contains("warn"), "{err}");
     }
 
     /// (#2947 rename) `config set` refuses every retired spelling of every

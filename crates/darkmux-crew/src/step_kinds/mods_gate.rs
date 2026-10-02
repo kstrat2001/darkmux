@@ -146,7 +146,7 @@ impl StepKind for ModsGateStepKind {
     /// (#2394) [`SeatClaim::NoModel`] — this kind runs an operator-supplied `test_command` per mod; it
     /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
     /// and, per command, by `runtime.step_command_timeout_seconds` — never
-    /// by the hosted-endpoint cap.
+    /// by an endpoint's concurrency limit.
     /// The `test_command` per mod is why the dispatch-free cap is a real
     /// number and not "unbounded": N of these at once is N test suites.
     fn seat(

@@ -371,7 +371,7 @@ fn a_refused_local_single_shot_ends_in_an_error_terminal_with_its_context() {
 /// `opts.phase_id` — a #1177-era TODO ("resolved from phase in a follow-up")
 /// that never got its follow-up. A `dispatch.internal` step targeting a
 /// remote/hosted profile takes exactly this branch (`dispatch()` routes to
-/// `dispatch_remote` BEFORE it ever reaches the container path's own
+/// `dispatch_unmanaged` BEFORE it ever reaches the container path's own
 /// `resolve_mission_for_phase` call), so a graph step whose `phase_id`
 /// resolved to a real mission still produced unstamped heartbeat/dispatch
 /// records — silently dropping out of the mission view's drill-in, the same

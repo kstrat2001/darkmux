@@ -21,16 +21,16 @@
 //! terminal transitions in [`crate::lifecycle`]. The SAME envelope is the
 //! natural artifact for the mission board (`darkmux mission status`) and
 //! the future graph-lens viewer (#1284 Packet 5) to render — both read
-//! `status`/`reason`/`warnings`/`remote_budgets` without needing to
+//! `status`/`reason`/`warnings`/`dispatch_budgets` without needing to
 //! understand any mission type's own payload shape.
 //!
 //! # Status decision — who decides what, and who consumes it
 //!
 //! [`MissionOutcomeStatus`] has four values. A mission driver's OWN
 //! conversion logic decides which one applies (this module does not
-//! prescribe the mission-type-specific thresholds — see `CLAUDE.md`'s
-//! `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` budget-policy text for the
-//! review pipeline's own rules), but the SHAPE of the decision is uniform:
+//! prescribe the mission-type-specific thresholds — the review pipeline's
+//! own rules live in its mission config), but the SHAPE of the decision is
+//! uniform:
 //!
 //! - **Clean** — the mission produced its full intended output with no
 //!   constrained sub-work. (Review: `env.degenerate.is_none() &&
@@ -465,20 +465,14 @@ pub struct PhaseOutcome {
     pub reason: Option<String>,
 }
 
-/// One remote token bucket's outcome (a per-step cap since #2902 step 5; a
-/// "pipeline stage" in pre-4.0 envelopes) — the generic shape
-/// every mission-type-specific budget record (e.g. `darkmux-lab`'s
-/// `ReviewEnvelope::remote_budgets`, typed
-/// `Vec<crate::remote_budget::RemoteBudgetRecord>`) maps onto. Field-for-
-/// field identical by design so a mapping is a pure struct-literal copy,
-/// never a lossy translation. `RemoteBudgetRecord` moved into this crate
-/// alongside its producing bucket type in #1877, but stays a DISTINCT type
-/// from this row on purpose — `RemoteBudgetRecord` is a bucket's own
-/// accounting output, `RemoteBudgetRow` is `MissionEnvelope`'s
-/// generic mapping target; unifying them is a separate call from the
-/// bucket-type extraction #1877 made.
+/// One dispatch-cap bucket's outcome (a per-dispatch cap since #2902 step 5; a
+/// "pipeline stage" in pre-4.0 envelopes) — the generic shape every
+/// mission-type-specific budget record (e.g. `darkmux-lab`'s
+/// `ReviewEnvelope::dispatch_budgets`) maps onto. Field-for-field identical by
+/// design so a mapping is a pure struct-literal copy, never a lossy
+/// translation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteBudgetRow {
+pub struct DispatchBudgetRow {
     pub stage: String,
     pub max_tokens: u64,
     pub used_tokens: u64,
@@ -539,8 +533,10 @@ pub struct MissionEnvelope {
     /// run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_budgets: Vec<RemoteBudgetRow>,
+    /// Written as `dispatch_budgets`; an archived envelope's `remote_budgets`
+    /// key still reads (never written).
+    #[serde(default, alias = "remote_budgets", skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_budgets: Vec<DispatchBudgetRow>,
     /// Mission-type-specific payload — `ReviewEnvelope` (or any future
     /// mission type's own envelope) maps INTO this field rather than being
     /// replaced by `MissionEnvelope`. `Null` when the caller has nothing
@@ -607,7 +603,7 @@ impl MissionEnvelope {
                 .map(|id| PhaseOutcome { phase_id: id.to_string(), outcome: phase_outcome_kind, reason: None })
                 .collect(),
             warnings: Vec::new(),
-            remote_budgets: Vec::new(),
+            dispatch_budgets: Vec::new(),
             payload: serde_json::Value::Null,
             records_emitted: None,
             // (#2678) Not measured at construction — the launcher stamps it
@@ -1316,13 +1312,18 @@ mod tests {
             "reason": "remote judge token budget exhausted",
             "phases": [],
             "warnings": ["remote judge token budget exhausted"],
-            "remote_budgets": []
+            "remote_budgets": [{"stage": "judge-pass1", "max_tokens": 10, "used_tokens": 12, "exhausted": true, "skipped_calls": 0}]
         }"#;
         let envelope: MissionEnvelope =
             serde_json::from_str(old_json).expect("a pre-#1877 envelope must still deserialize");
         assert_eq!(envelope.mission_id, "m-old");
         assert_eq!(envelope.status, MissionOutcomeStatus::Degraded);
         assert_eq!(envelope.warnings, vec!["remote judge token budget exhausted".to_string()]);
+        // (#3035) The archived `remote_budgets` key still reads, and is written
+        // back as `dispatch_budgets`, never under the old name.
+        assert_eq!(envelope.dispatch_budgets.len(), 1);
+        let written = serde_json::to_string(&envelope).unwrap();
+        assert!(written.contains("\"dispatch_budgets\"") && !written.contains("remote_budgets"), "{written}");
         // The sensible default for a document that predates the field:
         // `None`, never a guessed `RunOutcome`.
         assert!(envelope.outcome.is_none());

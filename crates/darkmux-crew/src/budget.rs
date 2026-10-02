@@ -4,7 +4,9 @@
 //! **Nothing here runs unless the operator sets a budget.** darkmux ships no
 //! number: an endpoint with no `limits.window` budget, or with `policy:
 //! "off"`, is returned from [`EndpointBudget::of`] as `None` before any file
-//! is opened, so the gate costs a struct read. A `limits` that cannot be
+//! is opened, so the gate costs a struct read. Limits apply to any endpoint,
+//! managed or not (#3035): the window is summed from the usage records that
+//! carry the endpoint's id, whichever backend served the call. A `limits` that cannot be
 //! used as written (unreadable, or a window period that does not parse) is
 //! an ERROR, never "no budget": a typo must not silently disarm a budget
 //! (preflight refuses it first, `darkmux_profiles::preflight`).
@@ -34,9 +36,8 @@
 //! board and every other consumer already read. A stopped wait returns an
 //! error and the call is never sent.
 //!
-//! **The per-step cap** (`remote.max_tokens_per_step`, [`admit_step`] /
-//! [`settle_step`]) has only `off` and `warn` (operator, 2026-09-27): a step
-//! has no rolling window, so there is nothing to wait for.
+//! **The per-dispatch cap** (`limits.tokens_per_dispatch`, [`settle_dispatch`]) only warns, under `warn` and `wait` alike: a
+//! dispatch's own spend never expires, so there is nothing to wait for.
 //!
 //! **The window.** "The last `period` from now": a rolling window with no
 //! calendar reset. Its spend is the sum of this machine's usage records
@@ -117,54 +118,80 @@ pub struct EndpointBudget {
     pub period: String,
 }
 
+/// How a message names the endpoint a value belongs to.
+fn endpoint_phrase(ep: &ModelEndpoint) -> String {
+    match ep.named_id() {
+        Some(id) => format!("endpoint `{id}`"),
+        None => "an inline endpoint".to_string(),
+    }
+}
+
+/// The endpoint's limits as written, after every shape rule: `None` when it
+/// declares none. `Err` for limits that cannot be used (unreadable, a rule
+/// broken, or `concurrent_calls` on a managed endpoint, #3035). The one
+/// reading both the window budget and the per-dispatch cap go through.
+pub(crate) fn checked_limits(ep: &ModelEndpoint) -> Result<Option<&darkmux_types::UsageLimits>, String> {
+    let at = endpoint_phrase(ep);
+    let limits = match ep.limits.as_ref() {
+        None => return Ok(None),
+        Some(darkmux_types::Lenient::Known(l)) => l,
+        Some(darkmux_types::Lenient::Unrecognized(raw)) => {
+            let why = serde_json::from_value::<darkmux_types::UsageLimits>(raw.clone())
+                .err()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "darkmux: {at}'s `limits` could not be read{why}; a budget that cannot be read is refused, \
+                 never run as no budget. valid: {} (#2902)",
+                darkmux_types::config_enum::LIMITS_SHAPE
+            ));
+        }
+    };
+    limits.validate().map_err(|e| format!("darkmux: {at}: {e} (#2902)"))?;
+    ep.concurrent_calls_allowed().map_err(|e| format!("darkmux: {at}: {e} (#3035)"))?;
+    // (#3035) An inline endpoint (a step's own `config.endpoint` object) has
+    // no `endpoints` id, so no usage record can be summed against it: its
+    // `tokens_per_dispatch` and `concurrent_calls` work (neither needs an
+    // id), but a rolling window that would count is refused, never run as no
+    // window.
+    if ep.named_id().is_none() && limits.window_budget().is_some() && limits.resolved_policy().is_ok_and(BudgetPolicy::counts) {
+        return Err(format!(
+            "darkmux: {at}: a rolling `limits.window` is summed from the usage records that carry the endpoint's \
+             id, and an inline endpoint has none. Declare it once under `endpoints` in profiles.json and name it \
+             by id (`\"endpoint\": \"<id>\"`), or drop the `window` (#3035)"
+        ));
+    }
+    Ok(Some(limits))
+}
+
 impl EndpointBudget {
     /// The budget `ep` carries, or `None` when there is nothing to enforce:
-    /// no `limits`, no window budget, policy `off`, no `endpoints` id (an
-    /// inline endpoint: its usage records carry no id to sum by, which
-    /// `darkmux doctor` names), or a MANAGED endpoint (darkmux budgets the
-    /// calls it SENDS to an endpoint it does not manage).
+    /// no `limits`, no window budget, or policy `off`. Managed or not: the
+    /// window is what the endpoint's id served, whoever loaded the model
+    /// (#3035). An inline endpoint (no `endpoints` id to sum usage by) that
+    /// declares a counting window is an `Err`, see [`checked_limits`].
     ///
     /// `Err` (review M2), never `Ok(None)`, when the limits cannot be used as
     /// written: unreadable (one mistyped field makes the whole value
     /// unreadable), an unregistered `policy`, a set window whose `period`
-    /// does not parse, or `warn_at` outside (0, 1). Preflight refuses all of
-    /// them first; this keeps a caller that skipped preflight from running a
-    /// typo'd budget as no budget.
+    /// does not parse, `warn_at` outside (0, 1), or `concurrent_calls` on a
+    /// managed endpoint. Preflight refuses all of them first; this keeps a
+    /// caller that skipped preflight from running a typo'd budget as no
+    /// budget.
     pub fn of(ep: &ModelEndpoint) -> Result<Option<Self>, String> {
-        let at = match ep.named_id() {
-            Some(id) => format!("endpoint `{id}`"),
-            None => "an inline endpoint".to_string(),
-        };
-        let limits = match ep.limits.as_ref() {
-            None => return Ok(None),
-            Some(darkmux_types::Lenient::Known(l)) => l,
-            Some(darkmux_types::Lenient::Unrecognized(raw)) => {
-                let why = serde_json::from_value::<darkmux_types::UsageLimits>(raw.clone())
-                    .err()
-                    .map(|e| format!(" ({e})"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "darkmux: {at}'s `limits` could not be read{why}; a budget that cannot be read is refused, \
-                     never run as no budget. valid: {} (#2902)",
-                    darkmux_types::config_enum::LIMITS_SHAPE
-                ));
-            }
-        };
-        limits.validate().map_err(|e| format!("darkmux: {at}: {e} (#2902)"))?;
+        let Some(limits) = checked_limits(ep)? else { return Ok(None) };
+        let at = endpoint_phrase(ep);
         let policy = limits.resolved_policy().map_err(|raw| {
             format!(
                 "darkmux: {at}'s budget policy `{raw}` is not one of {} (#2902)",
                 <BudgetPolicy as darkmux_types::config_enum::ConfigEnum>::TOKENS.join(", ")
             )
         })?;
-        let Some(id) = ep.named_id() else { return Ok(None) };
-        if !matches!(ep.kind(), Ok(darkmux_types::EndpointKind::Unmanaged)) {
-            return Ok(None);
-        }
         if !policy.counts() {
             return Ok(None);
         }
         let Some(window) = limits.window_budget() else { return Ok(None) };
+        let Some(id) = ep.named_id() else { return Ok(None) };
         Ok(Some(EndpointBudget {
             endpoint_id: id.to_string(),
             policy,
@@ -369,9 +396,18 @@ fn resume_at_for(inside: &[(i64, Spend)], br: &Breach, period: i64) -> Option<i6
 /// Charging 0, the completion alone, or the cap alone would let such an
 /// endpoint run off the meter; over-counting is the safe direction.
 pub fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32, request: &serde_json::Value) -> u64 {
+    conservative_spend(total_tokens, granted_max_tokens, &request.to_string())
+}
+
+/// (#3035) THE charge rule for one call against a dispatch's cap, on every
+/// path (hosted or managed, single-shot, step arm or container turn): the
+/// reported total when known, else the `granted_max_tokens` the call could
+/// spend plus the estimated tokens of `prompt_text` it sent. A call that
+/// reports no usage must still reach its cap; charging 0 would let it run off
+/// the meter.
+pub fn conservative_spend(total_tokens: Option<u64>, granted_max_tokens: u32, prompt_text: &str) -> u64 {
     total_tokens.unwrap_or_else(|| {
-        let prompt = darkmux_trajectory::estimate_tokens(&request.to_string()) as u64;
-        u64::from(granted_max_tokens).saturating_add(prompt)
+        u64::from(granted_max_tokens).saturating_add(darkmux_trajectory::estimate_tokens(prompt_text) as u64)
     })
 }
 
@@ -682,7 +718,7 @@ impl BudgetEnv for LiveEnv {
 thread_local! {
     /// (review C1) A test's stand-in environment for [`admit_endpoint`], so
     /// a behavioral test drives a real production path (the step kinds,
-    /// `dispatch_remote`) and sees the gate fire. Thread-local: the paths
+    /// `dispatch_unmanaged`) and sees the gate fire. Thread-local: the paths
     /// under test gate on the thread that runs them.
     static TEST_ENV: std::cell::RefCell<Option<std::rc::Rc<dyn BudgetEnv>>> = const { std::cell::RefCell::new(None) };
 }
@@ -885,7 +921,7 @@ fn budget_payload(scope: BudgetScope, message: &str) -> BudgetPayload {
         scope,
         message: message.to_string(),
         endpoint_id: None,
-        step: None,
+        dispatch: None,
         policy: None,
         level: None,
         metric: None,
@@ -1261,50 +1297,39 @@ impl BudgetPacer {
     }
 }
 
-// ── The per-step cap ────────────────────────────────────────────────────
+// ── The per-dispatch cap ────────────────────────────────────────────────
 
-/// Admit one hosted call against a STEP bucket (`remote.max_tokens_per_step`),
-/// reserving `requested` (the call's completion cap) so concurrent siblings
-/// of one `bucket_group` see it in flight. Never holds, never refuses: the
-/// per-step cap has only `off` and `warn`.
-pub fn admit_step(bucket: &Mutex<crate::remote_budget::RemoteBudget>, requested: u32) {
-    bucket.lock().unwrap_or_else(|p| p.into_inner()).admit_reserve(requested);
-}
-
-/// [`settle_step`] against the environment in effect on this thread (the
+/// [`settle_dispatch`] against the environment in effect on this thread (the
 /// live one, or a test's stand-in, [`with_env`]): what the production call
 /// sites use, so a behavioral test sees the settle they perform.
-pub fn settle_step_live(
-    bucket: &Mutex<crate::remote_budget::RemoteBudget>,
-    reserved: u32,
+pub fn settle_dispatch_live(
+    bucket: &Mutex<crate::dispatch_budget::DispatchBudget>,
     actual: u64,
-    calls: u32,
-    step: &str,
+    label: &str,
     caller: &BudgetCaller<'_>,
 ) {
-    with_env(|env| settle_step(bucket, reserved, actual, calls, step, caller, env))
+    with_env(|env| settle_dispatch(bucket, actual, label, caller, env))
 }
 
-/// Settle one call against a STEP bucket and surface the breach, once, if
-/// this call's spend reached the cap (`warn`).
-pub fn settle_step(
-    bucket: &Mutex<crate::remote_budget::RemoteBudget>,
-    reserved: u32,
+/// Settle one call against a dispatch's bucket and surface the breach, once,
+/// if this call's spend reached the cap. `label` names the dispatch in the
+/// message (a role id, or a step id for a step's own call).
+pub fn settle_dispatch(
+    bucket: &Mutex<crate::dispatch_budget::DispatchBudget>,
     actual: u64,
-    calls: u32,
-    step: &str,
+    label: &str,
     caller: &BudgetCaller<'_>,
     env: &dyn BudgetEnv,
 ) {
     let breach = {
         let mut b = bucket.lock().unwrap_or_else(|p| p.into_inner());
-        b.settle(reserved, actual, calls);
+        b.settle(actual);
         b.take_breach()
     };
     let Some(br) = breach else { return };
     let message = format!(
-        "darkmux: ⚠ step `{step}` has reached its per-step cap: {} of {} hosted tokens \
-         (remote.max_tokens_per_step); policy warn: continuing",
+        "darkmux: ⚠ dispatch `{label}` has reached its per-dispatch cap: {} of {} tokens \
+         (limits.tokens_per_dispatch); policy warn: continuing",
         br.used, br.budget
     );
     env.say(&message);
@@ -1312,13 +1337,13 @@ pub fn settle_step(
         darkmux_flow::Level::Warn,
         caller,
         darkmux_flow::Payload::BudgetWarn(BudgetPayload {
-            step: Some(step.to_string()),
+            dispatch: Some(label.to_string()),
             policy: Some(BudgetPolicyKind::Warn),
             level: Some(BreachLevel::AtLimit),
             metric: Some(Metric::Tokens),
             spent: Some(br.used),
             limit: Some(br.budget),
-            ..budget_payload(BudgetScope::Step, &message)
+            ..budget_payload(BudgetScope::Dispatch, &message)
         }),
     ));
 }

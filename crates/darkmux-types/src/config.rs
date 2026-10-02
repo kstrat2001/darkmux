@@ -393,7 +393,20 @@ use std::path::Path;
 //           handoff (#755) and read by nothing in this darkmux, so it changes
 //           no admission decision. `workspace` stays a receiver PATH grant
 //           only.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.2";
+//   2.3 (#3035, darkmux 5.0): REMOVED the whole `remote{}` block:
+//           `remote.max_tokens_per_step`, `remote.step_budget_policy` and
+//           `remote.concurrent_cap` (and their three env vars, plus the
+//           4.0-renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`). "Remote"
+//           was the wrong axis: a local server on the same machine is an
+//           endpoint too, and what matters is whether darkmux MANAGES it.
+//           Limits live per endpoint in `profiles.json`
+//           (`endpoints.<id>.limits.tokens_per_dispatch`,
+//           `.concurrent_calls`, `.window`, `.policy`, `.warn_at`). Each is a
+//           `RETIRED_SETTINGS` entry naming its replacement: an env var
+//           warns, a leftover config key is named by the unknown-key gate.
+//           Nothing is carried over: limits are off until set per endpoint.
+//           Folded into a minor bump like 2.2's removals.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
 /// refuses the old key naming the new one; a leftover old key in
@@ -412,17 +425,11 @@ pub struct RenamedSetting {
     pub advice: &'static str,
 }
 
-/// Every setting renamed in 4.0.
-pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
-    RenamedSetting {
-        old_key: "remote.max_tokens_per_execution",
-        old_env: "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
-        new_key: "remote.max_tokens_per_step",
-        new_env: "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP",
-        advice: "delete it unless you chose that number (500000 was darkmux's old default); the 4.0 per-step \
-                 cap is unset by default, set remote.max_tokens_per_step only if you want one",
-    },
-];
+/// Every setting renamed and kept (none at present). The one 4.0 entry,
+/// `remote.max_tokens_per_execution` to `remote.max_tokens_per_step`, ended
+/// when 5.0 retired the whole `remote` block (it is a `RETIRED_SETTINGS`
+/// entry now).
+pub const RENAMED_SETTINGS: &[RenamedSetting] = &[];
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -446,6 +453,47 @@ pub struct RetiredSetting {
 
 /// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
 pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
+    RetiredSetting {
+        key: "remote",
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
+        line: "removed in 5.0 (#3035): \"remote\" was the wrong axis (a local server on the same machine is an \
+               endpoint too), so limits are declared per endpoint in profiles.json, under \
+               `endpoints.<id>.limits`. Nothing is carried over: delete the block, then set the limits you want \
+               on the endpoints that need them",
+    },
+    RetiredSetting {
+        key: "remote.max_tokens_per_step",
+        env: Some("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"),
+        env_policy: LeftoverPolicy::Refuse,
+        line: "removed in 5.0 (#3035): the cap is per DISPATCH (one role execution) now, set per endpoint as \
+               `endpoints.<id>.limits.tokens_per_dispatch` in profiles.json. A whole-run budget is that \
+               endpoint's rolling `limits.window`. Nothing is carried over: limits are off until you set them",
+    },
+    RetiredSetting {
+        key: "remote.max_tokens_per_execution",
+        env: Some("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"),
+        env_policy: LeftoverPolicy::Refuse,
+        line: "removed in 5.0 (#3035; it was renamed `remote.max_tokens_per_step` in 4.0): set \
+               `endpoints.<id>.limits.tokens_per_dispatch` on the endpoint in profiles.json instead. Nothing is \
+               carried over: limits are off until you set them (500000 was darkmux's old default, not a \
+               recommendation)",
+    },
+    RetiredSetting {
+        key: "remote.step_budget_policy",
+        env: Some("DARKMUX_REMOTE_STEP_BUDGET_POLICY"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3035): what reaching a limit does is `endpoints.<id>.limits.policy` (`off`, `warn` \
+               or `wait`) in profiles.json, one policy for the endpoint's whole `limits`",
+    },
+    RetiredSetting {
+        key: "remote.concurrent_cap",
+        env: Some("DARKMUX_REMOTE_CONCURRENT_CAP"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3035): concurrency is per endpoint. On an endpoint darkmux does not manage, set \
+               `endpoints.<id>.limits.concurrent_calls` in profiles.json (absent, its calls run one at a time); \
+               on a managed endpoint the scheduler owns parallelism and the field is refused",
+    },
     RetiredSetting {
         key: "dirs.ack",
         env: Some("DARKMUX_ACK_DIR"),
@@ -523,8 +571,8 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.stage_budget_policy",
         env: None,
         env_policy: LeftoverPolicy::Refuse,
-        line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), which takes `off` or `warn` (`wait` is an \
-               endpoint budget's policy only)",
+        line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), retired in 5.0 (#3035): the policy is \
+               `endpoints.<id>.limits.policy` in profiles.json",
     },
     RetiredSetting {
         key: "review",
@@ -653,8 +701,6 @@ pub struct DarkmuxConfig {
     pub runtime: Option<RuntimeBehaviorConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<RemoteConfig>,
     /// (#2706) The battery-charge policy gate — see [`PowerConfig`]'s own
     /// doc. Top-level rather than under `runtime` because it governs
     /// whether work STARTS at all, not how the runtime behaves once it has.
@@ -840,8 +886,8 @@ pub struct RuntimeBehaviorConfig {
     /// concurrently — `procedural.shell`, `procedural.noop`, `mods.gate`,
     /// `records.gather`, `deliver.github_review`, every step whose
     /// `StepKind::seat` claims `SeatClaim::NoModel`. Its own ceiling
-    /// because these consume no model: `remote.concurrent_cap` exists to
-    /// protect a hosted endpoint's rate limit and a shell command is not
+    /// because these consume no model: an endpoint's `limits.concurrent_calls`
+    /// exists to protect that endpoint's rate limit and a shell command is not
     /// one. Not unbounded, though — `mods.gate` runs a `test_command` per
     /// mod, and each such step is individually bounded by
     /// `step_command_timeout_seconds` above, not by anything global.
@@ -849,8 +895,8 @@ pub struct RuntimeBehaviorConfig {
     /// (#2772) Explicit override for how many LOCAL-MODEL dispatches run
     /// at once against ONE resident instance — its own ceiling, distinct
     /// from `dispatch_free_concurrency` above (that one bounds steps that
-    /// consume no model at all) and from `remote.concurrent_cap` (a hosted
-    /// endpoint's rate limit). Absent = the runtime derives it PER
+    /// consume no model at all) and from an endpoint's `limits.concurrent_calls`
+    /// (that endpoint's rate limit). Absent = the runtime derives it PER
     /// INSTANCE, per WAVE, from that resident's own declared `PARALLEL` as
     /// `lms ps --json` reports it, falling back to 1 (never unbounded)
     /// when that can't be read — see
@@ -1126,22 +1172,6 @@ impl DetectionPolicy {
         crate::config_enum::ConfigEnum::token(self)
     }
 }
-
-/// (#2902 step 5, operator 2026-09-27) What a STEP that reaches
-/// `remote.max_tokens_per_step` does. Only `off` and `warn`: a step has no
-/// rolling window, so there is nothing to wait for (`wait` is an ENDPOINT
-/// budget's value only, `endpoint::BudgetPolicy`), and nothing stops a step
-/// (a hard stop is `darkmux mission abort`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepBudgetPolicy {
-    Off,
-    Warn,
-}
-
-crate::config_enum!(StepBudgetPolicy, "step budget policy", [
-    Off = "off" => "nothing is counted",
-    Warn = "warn" => "reaching the per-step cap is surfaced (a CLI line and a budget.warn record) and the step keeps going (the default)",
-]);
 
 // (#2947) The value table: tokens, meanings, retired spellings, and
 // (through the macro's exhaustive match) the parser. An unknown or retired
@@ -1486,59 +1516,6 @@ pub struct AcceptWorkEntry {
     /// Reserved for git workspace handoff (#755); read by nothing in this
     /// darkmux.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repos: Option<Vec<String>>,
-    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-/// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs: the per-step cap
-/// on hosted tokens and the concurrency cap. Unlike `redis{}`/`audit{}`
-/// there is NO `enabled` gate: remote staffing is enabled by the profile
-/// itself (endpoint present on the staffing's model, contract 1).
-///
-/// **(#2902 step 5) The cap is the operator's.** darkmux ships no number:
-/// `max_tokens_per_step` unset means no per-step cap, and `init` writes it
-/// visibly as `null`. When set, `step_budget_policy` decides what reaching
-/// it does (`off` / `warn`; `wait` is an endpoint budget's value only: a
-/// step has no rolling window to wait on). Nothing stops a step any more.
-///
-/// **Which steps it meters:** a hosted `dispatch.map` step (`dispatch.map`
-/// steps naming the same `bucket_group` share one allowance, #1442), a
-/// hosted `dispatch.single_shot` step, and a tool-less hosted `dispatch`
-/// (`dispatch_remote`, one step). The AGENTIC-remote container loop (#1187)
-/// is not metered by this cap; an ENDPOINT window budget
-/// (`endpoints.<id>.limits` in `profiles.json`) does cover it. Tokens only,
-/// never currency.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct RemoteConfig {
-    /// A per-step cap on hosted tokens: remote `total_tokens` one step may
-    /// spend before `step_budget_policy` applies. No default (#2902 step
-    /// 5): `None` is no cap. Serialized even when `None` (as `null`) so the
-    /// knob `init` writes stays visible without carrying a number.
-    /// `dispatch.map` steps naming the same `bucket_group` share ONE
-    /// allowance (#1442). Renamed from `max_tokens_per_execution` in 4.0; the
-    /// old key lands in `extras` and is read by nothing (`darkmux doctor`
-    /// names it).
-    #[serde(default)] pub max_tokens_per_step: Option<u64>,
-    /// (#2902 step 5) What a step that reaches `max_tokens_per_step` does:
-    /// `off` / `warn` (a registered `ConfigEnum`, stored as a string and
-    /// parsed at the accessor; an unregistered value, `wait` included, is
-    /// refused at preflight). Absent: `warn`. Serialized even when `None`,
-    /// like the cap beside it.
-    #[serde(default)] pub step_budget_policy: Option<String>,
-    /// (#1230 Packet 1) Max CONCURRENT remote (hosted-endpoint) dispatches
-    /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote
-    /// jobs aren't RAM-bound (gestalt's wave scheduler only governs LOCAL
-    /// co-residency), so they run in their own separately-capped batch
-    /// instead of being serialized behind local waves.
-    ///
-    /// **Default `1` (#1665 review CONSIDER 5), not empirically tuned.**
-    /// Every real call site now resolves this (fixing #2681, where they
-    /// hardcoded `remote_cap: 1` and ignored the accessor entirely); the
-    /// default was moved down from the old placeholder `4` to `1` in the
-    /// same change so wiring it is behavior-preserving — an operator who
-    /// never touches this stays fully serial, exactly as before. Raise it
-    /// via `config set remote.concurrent_cap <n>` once real hosted-
-    /// endpoint rate-limit tiers justify a higher value.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub concurrent_cap: Option<u32>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2036,8 +2013,9 @@ crate::config_enum!(IdentityProvider, "identity provider", [
 /// (#2916 stage 2) What a machine's fleet listener does with a submitted job
 /// whose seat is already in use (`fleet.busy_policy`). A job on a LOCAL model
 /// holds that model for its whole run (one request at a time per instance);
-/// a job on a HOSTED endpoint runs beside others up to this machine's
-/// `remote.concurrent_cap`. Past either limit, this policy decides.
+/// a job on an endpoint darkmux does not manage runs beside others on that
+/// endpoint up to its `limits.concurrent_calls` (one at a time when it
+/// declares none). Past either limit, this policy decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -2202,17 +2180,6 @@ impl DarkmuxConfig {
                     }),
                     extras: Default::default(),
                 }),
-                extras: Default::default(),
-            }),
-            remote: Some(RemoteConfig {
-                // (#2902 step 5) Visible and unset: darkmux ships no budget.
-                max_tokens_per_step: None,
-                step_budget_policy: None,
-                // (#1665 review CONSIDER 5) Visible `1`, matching the
-                // resolved accessor default — see `RemoteConfig::
-                // concurrent_cap`'s own doc for why this moved down from
-                // the old placeholder `4`.
-                concurrent_cap: Some(1),
                 extras: Default::default(),
             }),
             // (#2706) Visible block with every default populated — the
@@ -2418,32 +2385,19 @@ mod tests {
         // (#933) The fleet block is written visible at the standalone default,
         // so the fleet surface is discoverable + one edit from hub/peer.
         assert_eq!(cfg.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
-        // (#2902 step 5) The remote block is written visible, and its per-step
-        // budget and budget policy visible AND unset: `null` in the file,
-        // never a number darkmux picked.
-        assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_step, None);
-        assert_eq!(cfg.remote.as_ref().unwrap().step_budget_policy, None);
-        let remote_json = serde_json::to_value(cfg.remote.as_ref().unwrap()).unwrap();
-        assert!(remote_json["max_tokens_per_step"].is_null(), "{remote_json}");
-        assert!(remote_json.as_object().unwrap().contains_key("max_tokens_per_step"), "visible: {remote_json}");
-        assert!(remote_json.as_object().unwrap().contains_key("step_budget_policy"), "visible: {remote_json}");
-        // (#1230 Packet 1) The concurrent-dispatch remote cap, same
-        // visible-default treatment as its token-allowance sibling.
-        // (#1665 review CONSIDER 5) `1`, not the old placeholder `4` —
-        // matches the resolved accessor default now that real call sites
-        // resolve it.
-        assert_eq!(cfg.remote.as_ref().unwrap().concurrent_cap, Some(1));
+        // (#3035) The `remote` block is gone: `init` writes nothing for it.
+        assert!(!json.contains("\"remote\""), "no remote block is written: {json}");
         // Lossless round-trip.
         let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
-        assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_step, None);
-        assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
     }
 
     /// The retired env vars nothing reads and whose loss changes nothing.
-    const RETIRED_WARN_VARS: [&str; 6] = [
+    const RETIRED_WARN_VARS: [&str; 8] = [
+        "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
+        "DARKMUX_REMOTE_CONCURRENT_CAP",
         "DARKMUX_ACK_DIR",
         "DARKMUX_NOTEBOOK_DIR",
         "DARKMUX_RADIO_ROUTER_PROFILE",
@@ -2452,17 +2406,44 @@ mod tests {
         "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS",
     ];
 
-    /// (#2902 step 5) A leftover renamed env var is found and named with its
-    /// new name and the advice. A leftover old `config.json` key is not a
-    /// leftover here: it is an unknown key, which `user_files` refuses with
-    /// the same rename (`config_retired_keys_name_their_replacement`).
+    /// (#3035) Each of the `remote.*` settings 5.0 retired is named with the
+    /// `endpoints.<id>.limits.*` field that replaces it, in its config-key
+    /// entry and its env-var leftover alike, and nothing is carried over. A
+    /// leftover old `config.json` key is not a leftover here: it is an
+    /// unknown key, which `user_files` refuses with the same line.
+    #[test]
+    fn the_remote_settings_are_retired_with_their_replacements() {
+        let replacement = [
+            ("remote.max_tokens_per_step", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "limits.tokens_per_dispatch"),
+            ("remote.max_tokens_per_execution", "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "limits.tokens_per_dispatch"),
+            ("remote.step_budget_policy", "DARKMUX_REMOTE_STEP_BUDGET_POLICY", "limits.policy"),
+            ("remote.concurrent_cap", "DARKMUX_REMOTE_CONCURRENT_CAP", "limits.concurrent_calls"),
+        ];
+        for (key, var, field) in replacement {
+            let entry = RETIRED_SETTINGS.iter().find(|r| r.key == key).unwrap_or_else(|| panic!("{key} is not retired"));
+            assert_eq!(entry.env, Some(var), "{key}");
+            // Ignoring a spend cap removes the cap, so its env var is REFUSED;
+            // ignoring the concurrency or policy var only makes things slower
+            // or quieter, so those warn (the `LeftoverPolicy` rule).
+            let spend_cap = field == "limits.tokens_per_dispatch";
+            let want = if spend_cap { LeftoverPolicy::Refuse } else { LeftoverPolicy::Warn };
+            assert_eq!(entry.env_policy, want, "{key}");
+            assert!(entry.line.contains(field) && entry.line.contains("endpoints.<id>"), "{key}: {}", entry.line);
+            let one = |k: &str| (k == var).then(|| "9".to_string());
+            let found = retired_env_leftovers(&one);
+            assert_eq!(found.len(), 1, "{var}: {found:?}");
+            assert_eq!(found[0].policy, want, "{var}");
+            assert!(found[0].line.contains(var) && found[0].line.contains(field), "{found:?}");
+        }
+        let block = RETIRED_SETTINGS.iter().find(|r| r.key == "remote").expect("the block is retired");
+        assert!(block.line.contains("endpoints.<id>.limits"), "{}", block.line);
+        let doc = serde_json::json!({ "remote": { "concurrent_cap": 2 } });
+        let issues = crate::user_files::key_issues::<DarkmuxConfig>(&doc, &crate::user_files::config_retired);
+        assert!(issues.iter().any(|i| i.to_string().contains("endpoints.<id>.limits")), "a leftover block is refused: {issues:?}");
+    }
+
     #[test]
     fn retired_env_leftovers_are_found_in_the_env() {
-        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "9".to_string());
-        let found = retired_env_leftovers(&env);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is refused"));
-        assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
         assert!(retired_env_leftovers(&|_| None).is_empty());
         let blank = |_: &str| Some("  ".to_string());
         assert!(retired_env_leftovers(&blank).is_empty(), "an empty env value reads as unset");
@@ -2479,8 +2460,8 @@ mod tests {
     }
 
     /// (operator, 2026-10-01) Each leftover's policy is decided by whether
-    /// ignoring it is safe: a renamed cap and the state-location
-    /// `DARKMUX_CREW_DIR` refuse (silently ignoring them changes behavior);
+    /// ignoring it is safe: the state-location `DARKMUX_CREW_DIR` refuses
+    /// (silently ignoring it changes behavior);
     /// `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE` and
     /// `DARKMUX_ACK_DIR` warn (nothing reads them and nothing is lost).
     #[test]
@@ -2491,7 +2472,7 @@ mod tests {
             assert_eq!(found.len(), 1, "{var}: {found:?}");
             (found[0].policy, found[0].line.clone())
         };
-        for var in ["DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "DARKMUX_CREW_DIR"] {
+        for var in ["DARKMUX_CREW_DIR", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"] {
             let (policy, line) = policy_of(var);
             assert_eq!(policy, LeftoverPolicy::Refuse, "{var}");
             assert!(line.contains("is refused"), "{line}");

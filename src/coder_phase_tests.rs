@@ -48,7 +48,6 @@
             crate::test_run(),
             None,
             None,
-            None,
             Arc::new(crew::step_kinds::ArtifactBus::new()),
         );
         let task = test_task("t1");
@@ -1538,7 +1537,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         });
         let mut bus = crew::step_kinds::ArtifactBus::new();
         bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
-        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, Arc::new(bus));
+        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, Arc::new(bus));
         let step = crew::types::Step {
             id: "s1-worktree-step".to_string(),
             task_id: "s1-worktree".to_string(),
@@ -1621,7 +1620,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             slot.clone() as Arc<dyn std::any::Any + Send + Sync>,
         );
         bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
-        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, Arc::new(bus));
+        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, Arc::new(bus));
         let kind = MissionVerifyStepKind;
         let step = crew::types::Step {
             id: "s1-verify-step".to_string(),
@@ -1882,7 +1881,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         // An explicit request for the remote-endpoint model — swap the
         // default so `select_model`'s no-vectors fallback picks it — must
-        // classify RemoteEndpoint, never a Placement. This is the CORRECT
+        // classify UnmanagedEndpoint, never a Placement. This is the CORRECT
         // silent case: it was never going to touch local residency.
         std::fs::write(
             &profiles_path,
@@ -1903,9 +1902,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(
             matches!(
                 resolve_local_seat("coder", None, Some(path_str), "test-seat"),
-                SeatClaim::RemoteEndpoint
+                SeatClaim::UnmanagedEndpoint(_)
             ),
-            "a remote-endpoint model must classify RemoteEndpoint, not a Placement"
+            "an unmanaged-endpoint model must classify UnmanagedEndpoint, not a Placement"
         );
 
         // An unresolvable role still fails OPEN (no panic, no error) — but

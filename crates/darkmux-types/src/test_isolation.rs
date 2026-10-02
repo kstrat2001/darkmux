@@ -181,7 +181,7 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
 /// written. Out of scope by construction, the same way a non-file
 /// destination is (see [`StateLeakSentinel`]'s doc).
 pub const CLEARED_STATE_VARS: &[&str] = &[
-    // Retired or renamed in 4.0: nothing reads them and every command but
+    // Retired or renamed in 4.0 or 5.0: nothing reads them and every command but
     // doctor/config refuses to start while one is set, so an ambient export
     // would fail every spawned darkmux. `every_retired_env_var_is_cleared`
     // keeps this in step with `config::RETIRED_SETTINGS` / `RENAMED_SETTINGS`.
@@ -193,6 +193,9 @@ pub const CLEARED_STATE_VARS: &[&str] = &[
     "DARKMUX_MACHINE_ROLLUP_ENABLED",
     "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS",
     "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+    "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP",
+    "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
+    "DARKMUX_REMOTE_CONCURRENT_CAP",
     "DARKMUX_AUDIT_DIR",
     "DARKMUX_PROFILES",
     "DARKMUX_TEMPLATES_DIR",

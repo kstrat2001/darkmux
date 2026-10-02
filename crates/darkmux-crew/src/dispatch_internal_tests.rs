@@ -244,7 +244,7 @@
     fn remote_routing_predicate_local_vs_remote() {
         // The fork's routing predicate: a model with no endpoint (or a
         // url-less endpoint) is LOCAL ⇒ container path; a url'd endpoint is
-        // REMOTE ⇒ dispatch_remote. This is the guard that keeps local
+        // REMOTE ⇒ dispatch_unmanaged. This is the guard that keeps local
         // dispatches out of the hosted fork.
         let local_no_ep = darkmux_types::ProfileModel {
             id: "qwen".into(),
@@ -317,33 +317,61 @@
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
 
-    /// (#2902 step 5) A bare hosted `dispatch` passes the endpoint budget
-    /// gate and reserves against the per-step cap before its first record,
-    /// and settles the cap after the call. Checked on the source with
+    /// (#2902 step 5, #3035) A bare hosted `dispatch` passes the endpoint
+    /// budget gate and reserves against its dispatch's token cap before its
+    /// first record, and settles the cap after the call. Checked on the source with
     /// comments stripped (the full ordering rule is
     /// `usage_conformance::every_hosted_call_site_passes_the_budget_gates`);
-    /// the gate firing is `the_endpoint_gate_fires_on_dispatch_remote`.
+    /// the gate firing is `the_endpoint_gate_fires_on_dispatch_unmanaged`.
     #[test]
-    fn dispatch_remote_passes_both_budget_gates_before_any_record() {
+    fn dispatch_unmanaged_passes_both_budget_gates_before_any_record() {
         let src: String = include_str!("dispatch_internal.rs")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let body = &src[src.find("fn dispatch_remote(").expect("dispatch_remote")..];
+        let body = &src[src.find("fn dispatch_unmanaged(").expect("dispatch_unmanaged")..];
         let body = &body[..body.find("\n}\n").expect("fn end")];
         let open = body.find("bookend.open(").expect("bookend opens");
         let endpoint_gate = body.find("crate::budget::admit_endpoint(ep,").expect("endpoint gate");
-        let step_gate = body.find("crate::budget::admit_step(").expect("per-step reservation");
         let call = body.find("remote_chat_completion(").expect("the call");
-        let settle = body.find("crate::budget::settle_step_live(").expect("per-step settle");
-        assert!(endpoint_gate < open && step_gate < open, "both run before the first record");
-        assert!(settle > call, "the per-step cap is settled with the call's real spend");
+        let settle = body.find("crate::budget::settle_dispatch_live(").expect("per-dispatch settle");
+        assert!(endpoint_gate < open, "the window gate runs before the first record");
+        assert!(settle > call, "the per-dispatch cap is settled with the call's real spend");
         assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
         // (3rd review #4) A call the gate holds is live work: the presence
         // heartbeat starts before the gate, the bookend only after it.
         let beat = body.find("session_presence::spawn_session_emitter(").expect("heartbeat");
         assert!(beat < endpoint_gate, "the heartbeat runs through a budget wait");
+    }
+
+    /// (#3035) A managed endpoint's limits apply to the container-free local
+    /// single-shot too: the window gate runs before the first record, and the
+    /// dispatch's token cap settles after the call, stamped with the
+    /// endpoint's id.
+    #[test]
+    fn dispatch_local_single_shot_passes_the_managed_endpoints_limits() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = &src[src.find("pub fn dispatch_local_single_shot(").expect("the fn")..];
+        let body = &body[..body.find("\n}\n").expect("fn end")];
+        let open = body.find("bookend.open(").expect("bookend opens");
+        let gate = body.find("admit_local_single_shot(&opts,").expect("the managed endpoint's window gate");
+        let call = body.find("single_shot_chat(&req)").expect("the call");
+        let settle = body.find("settle_local_single_shot(").expect("the dispatch cap settle");
+        assert!(gate < open, "the gate runs before the first record");
+        assert!(settle > call, "the cap settles with the call's real spend");
+        // The gate itself: a heartbeat held across the window gate.
+        let helper = &src[src.find("fn admit_local_single_shot(").expect("the gate helper")..];
+        let helper = &helper[..helper.find("\n}\n").expect("fn end")];
+        let beat = helper.find("let _gate_beat = matches!(crate::budget::EndpointBudget::of(ep), Ok(Some(_))).then(|| {").expect("a heartbeat across the gate");
+        assert!(beat < helper.find("crate::budget::admit_endpoint(ep, caller)").expect("the gate"), "the heartbeat is held across a budget wait");
+        let settle_fn = &src[src.find("fn settle_local_single_shot(").expect("the settle helper")..];
+        assert!(settle_fn.contains("crate::budget::settle_dispatch_live("), "the helper settles into the dispatch cap");
+        assert!(body.contains("tailer_endpoint_id(managed_pm.as_ref()).as_deref()"), "the usage record names the endpoint");
     }
 
     /// The live sampler hands the budget pacer what the governor pair holds
@@ -362,8 +390,9 @@
         assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
     }
 
-    /// (3rd review #4) The agentic pre-start gate holds a start behind a
-    /// heartbeat, so the held run is live on the fleet's presence.
+    /// (3rd review #4) The container pre-start gate (hosted brain or a
+    /// managed one, #3035) holds a start behind a heartbeat, so the held run
+    /// is live on the fleet's presence.
     #[test]
     fn the_agentic_prestart_gate_runs_under_a_heartbeat() {
         let src: String = include_str!("dispatch_internal.rs")
@@ -371,7 +400,7 @@
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let from = src.find("if let Some(t) = &agentic_pm {").expect("the pre-start gate block");
+        let from = src.find("fn admit_container_start(").expect("the pre-start gate");
         let block = &src[from..];
         let gate = block.find("crate::budget::admit_endpoint(").expect("the gate");
         let beat = block.find("let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {")
@@ -380,12 +409,12 @@
     }
 
     /// (#2902 step 5 review C1, M1) The endpoint gate FIRES on
-    /// `dispatch_remote`: an endpoint whose window is full under `wait`, on a
+    /// `dispatch_unmanaged`: an endpoint whose window is full under `wait`, on a
     /// run that was stopped, returns the gate's error, and the endpoint
     /// never receives a request.
     #[test]
     #[serial]
-    fn the_endpoint_gate_fires_on_dispatch_remote() {
+    fn the_endpoint_gate_fires_on_dispatch_unmanaged() {
         let (base_url, rx) = one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
         let home = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
@@ -406,7 +435,7 @@
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
         });
         unsafe {
             match prev_home {
@@ -477,6 +506,105 @@
             vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop],
             "the ended wait is recorded as a stop"
         );
+    }
+
+    /// (#3035) A MANAGED endpoint's window gates its dispatches too. Same
+    /// shape as the hosted gate tests above, on an `lms` endpoint
+    /// (`"managed": "lmstudio"`): a window full under `wait`, on a run that
+    /// was stopped, returns the gate's error and sends nothing, on the
+    /// container path (the pre-start gate) and on the local single-shot.
+    #[test]
+    #[serial]
+    fn a_managed_endpoints_window_gates_the_container_and_the_local_single_shot() {
+        let (base_url, rx) = one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let reg = TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8192,"endpoint":"lms"}]}},"default_profile":"p",
+                "endpoints":{"lms":{"managed":"lmstudio",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}}}"#,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let run = |role: &str, local_single_shot: bool| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = role.to_string();
+            opts.profile_name = Some("p".to_string());
+            opts.config_path = Some(pf.to_string_lossy().to_string());
+            opts.session = crate::test_session(&format!("budget-gate-managed-{role}-{}", std::process::id()));
+            opts.model_base_url_override = Some(base_url.clone());
+            let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
+            let result = crate::budget::with_test_env(env.clone(), || {
+                if local_single_shot { dispatch_local_single_shot(opts) } else { dispatch(opts) }
+            });
+            (format!("{:#}", result.expect_err("a stopped wait must not send")), env.actions())
+        };
+        let (container_err, container_actions) = run("code-reviewer", false);
+        let (single_err, single_actions) = run("pr-reviewer", true);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        for (path, err, actions) in [("container", container_err, container_actions), ("single-shot", single_err, single_actions)] {
+            assert!(err.contains("stopped waiting on endpoint `lms`'s budget") && err.contains("nothing was sent"), "{path}: {err}");
+            assert_eq!(actions, vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop], "{path}");
+        }
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
+    }
+
+    /// (#3035) A MANAGED brain's window pauses the runtime between turns through
+    /// the pace file, exactly as a hosted brain's does: `pacer_for` builds the
+    /// pacer from the target's endpoint, whatever its kind, and its tick on a
+    /// full window writes `pause` with the reason `budget`. An endpoint with no
+    /// window gets no pacer.
+    #[test]
+    fn a_managed_brains_window_pauses_the_runtime_between_turns_through_the_pace_file() {
+        let model = |limits: serde_json::Value| {
+            let mut pm: darkmux_types::ProfileModel =
+                serde_json::from_str(r#"{"id":"m","n_ctx":8192,"endpoint":"lms"}"#).unwrap();
+            let mut ep: darkmux_types::ModelEndpoint = serde_json::from_value(serde_json::json!({
+                "managed": "lmstudio", "limits": limits
+            }))
+            .unwrap();
+            ep.source = darkmux_types::EndpointSource::Named("lms".into());
+            pm.endpoint = Some(ep);
+            crate::target::target_for("p".into(), Default::default(), pm).unwrap()
+        };
+        assert!(pacer_for(Some(&model(serde_json::json!({"tokens_per_dispatch": 5}))), None).unwrap().is_none(), "no window, no pacer");
+        assert!(pacer_for(None, None).unwrap().is_none());
+        let target = model(serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokens": 1}}));
+        let mut pacer = pacer_for(Some(&target), None).unwrap().expect("a managed endpoint's window is paced");
+        let out = TempDir::new().unwrap();
+        let env = crate::budget::tests::FakeEnv::full_window();
+        let session = crate::test_session("s-managed-pacer");
+        let exec = darkmux_types::execution_id::ExecutionId::mint();
+        let caller = crate::budget::BudgetCaller {
+            session: &session,
+            execution: &exec,
+            role_id: Some("coder"),
+            model: Some("m"),
+            phase_id: None,
+            profiles_file: None,
+        };
+        let ev = pacer.on_tick(0, out.path(), &crate::budget::OtherPacing::default(), &caller, &env);
+        assert!(matches!(ev, Some(crate::budget::PacerEvent::Paused { .. })), "{ev:?}");
+        let pace: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
+        assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
     }
 
     /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
@@ -619,7 +747,7 @@
         assert!(none.reasoning_effort.is_none());
     }
 
-    // ─── #1177: doctor --probe (probe_remote_endpoint) ─────────────────
+    // ─── #1177: doctor --probe (probe_unmanaged_endpoint) ─────────────────
 
     /// One-shot HTTP mock on a real loopback socket: accepts a single
     /// connection, reads the full request (head + Content-Length body),
@@ -673,7 +801,7 @@
     }
 
     #[test]
-    fn probe_remote_endpoint_round_trips_and_reports_served_model_and_cost() {
+    fn probe_unmanaged_endpoint_round_trips_and_reports_served_model_and_cost() {
         let (base_url, rx) = one_shot_http_mock(
             r#"{"model":"mock-model-v1","usage":{"total_tokens":7},"choices":[{"message":{"content":"ok"}}]}"#,
         );
@@ -681,7 +809,7 @@
             url: Some(base_url),
             ..Default::default() // no auth ⇒ Keychain untouched (CI-safe)
         };
-        let report = probe_remote_endpoint(&ep, "probe-model-x", 15).unwrap();
+        let report = probe_unmanaged_endpoint(&ep, "probe-model-x", 15).unwrap();
         assert_eq!(report.served_model.as_deref(), Some("mock-model-v1"));
         assert_eq!(report.total_tokens, Some(7));
         // Host segment keeps the port (host:port form); model id closes the label.
@@ -690,7 +818,7 @@
             "label carries host + model: {}",
             report.label
         );
-        // The probe mirrors dispatch_remote's request form — same parameter
+        // The probe mirrors dispatch_unmanaged's request form — same parameter
         // name, the caller's model id, and the POST landing on the same
         // chat-completions path a real dispatch uses.
         let request = rx.recv().unwrap();
@@ -700,7 +828,7 @@
     }
 
     #[test]
-    fn probe_remote_endpoint_surfaces_the_endpoint_error_verbatim() {
+    fn probe_unmanaged_endpoint_surfaces_the_endpoint_error_verbatim() {
         // An HTTP-200-with-error-object body (curl without --fail also maps
         // real 4xx bodies through this same path) — the endpoint's own
         // message is the operator's diagnosis, so it must survive verbatim.
@@ -711,7 +839,7 @@
             url: Some(base_url),
             ..Default::default()
         };
-        let err = probe_remote_endpoint(&ep, "probe-model-x", 15).unwrap_err();
+        let err = probe_unmanaged_endpoint(&ep, "probe-model-x", 15).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Access denied due to invalid subscription key"),
@@ -2350,7 +2478,7 @@
     /// of that was false: model resolution runs AFTER the prompt is
     /// assembled. So this drives the real `dispatch()` with a REAL built-in
     /// role out of a temp `DARKMUX_HOME`, and a `config_path` naming a
-    /// registry file that does not exist — `try_resolve_remote_target`
+    /// registry file that does not exist — `try_resolve_unmanaged_target`
     /// folds that to `Ok(None)` (local container path) while
     /// `resolve_dispatch_model_internal` hard-stops on it, so the dispatch
     /// reaches the prompt, the seam captures it, and the run bails at model
@@ -2658,9 +2786,9 @@
     /// discipline as `dispatch_internal_resume_from_validates_before_
     /// model_selection` above, for a different bypass of the same promise.
     /// #2561 found that a tool-less role resolving to a remote endpoint
-    /// (the `dispatch_remote` single-shot fork) returned from `dispatch()`
+    /// (the `dispatch_unmanaged` single-shot fork) returned from `dispatch()`
     /// at the routing `if`/`else` — before EVER reaching the `--resume-from`
-    /// gate a few lines further down the SAME function. `dispatch_remote`'s
+    /// gate a few lines further down the SAME function. `dispatch_unmanaged`'s
     /// body contains the substring "resume" zero times: no checkpoint
     /// check, no refusal, just a fresh hosted call that spends real tokens
     /// and reports success.
@@ -2672,15 +2800,15 @@
     /// ORDER directly, the same way the #2162 test above proves it for
     /// model selection: a real loopback HTTP server stands in for the
     /// remote endpoint (`one_shot_http_mock`, already used by the
-    /// `probe_remote_endpoint` tests below), and its `rx` channel only
+    /// `probe_unmanaged_endpoint` tests below), and its `rx` channel only
     /// fires once the mock has ACCEPTED A CONNECTION and read a complete
     /// request. If the refusal check were ever deleted, or moved to run
-    /// only after `dispatch_remote`'s HTTP call, the call would reach the
+    /// only after `dispatch_unmanaged`'s HTTP call, the call would reach the
     /// mock and `rx.recv_timeout` would return the captured request
     /// instead of timing out — redding this test.
     #[test]
     #[serial]
-    fn dispatch_remote_refuses_resume_from_before_the_http_call() {
+    fn dispatch_unmanaged_refuses_resume_from_before_the_http_call() {
         let (base_url, rx) =
             one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
         let home = TempDir::new().unwrap();
@@ -2691,7 +2819,7 @@
         // REMOTE endpoint pointed at the mock server above — the same shape
         // `resolve_context_window_internal_unaffected_by_invalid_sibling_crew`
         // uses for a "cloud" profile, but here it's the DEFAULT so
-        // `try_resolve_remote_target` actually routes onto it.
+        // `try_resolve_unmanaged_target` actually routes onto it.
         let tmp = TempDir::new().unwrap();
         let pf = tmp.path().join("profiles.json");
         std::fs::write(
@@ -2744,7 +2872,7 @@
 
         // ORDER, not just refusal: the mock must never have been contacted.
         // A regression that deleted the check (or left it running only
-        // after `dispatch_remote`'s HTTP call) would let this recv succeed
+        // after `dispatch_unmanaged`'s HTTP call) would let this recv succeed
         // with the captured request instead of timing out.
         match rx.recv_timeout(std::time::Duration::from_millis(300)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -2756,13 +2884,13 @@
         }
     }
 
-    // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_remote itself ──
+    // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──
 
     /// (#1645 fix-pass review) `build_remote_record_threads_mission_id_
     /// through` (above) proves the BUILDER threads `mission_id`; it does
-    /// NOT prove `dispatch_remote` — the arm actually reachable in
+    /// NOT prove `dispatch_unmanaged` — the arm actually reachable in
     /// production today — ever calls it with a real resolved mission_id.
-    /// This drives `dispatch_remote` directly (it's accessible here via
+    /// This drives `dispatch_unmanaged` directly (it's accessible here via
     /// `super::*`, same module tree) through a real loopback HTTP mock
     /// (`one_shot_http_mock`, the same helper the resume-from test above
     /// uses), with a real on-disk phase resolving to a real mission, and
@@ -2773,7 +2901,7 @@
     /// readback) so this never touches the operator's real `~/.darkmux`.
     #[test]
     #[serial]
-    fn dispatch_remote_stamps_mission_id_resolved_from_phase_on_every_record() {
+    fn dispatch_unmanaged_stamps_mission_id_resolved_from_phase_on_every_record() {
         let (base_url, _rx) = one_shot_http_mock(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
         );
@@ -2811,10 +2939,10 @@
         opts.phase_id = Some(PHASE_ID.to_string());
         opts.json = false;
 
-        let role = quarantine_test_role(); // `dispatch_remote` ignores `_role` entirely
+        let role = quarantine_test_role(); // `dispatch_unmanaged` ignores `_role` entirely
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
 
-        let result = dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
 
         unsafe {
             match prev_home {
@@ -2827,7 +2955,7 @@
             }
         }
 
-        result.expect("dispatch_remote must succeed against the mock server");
+        result.expect("dispatch_unmanaged must succeed against the mock server");
 
         let mut records = Vec::new();
         for entry in std::fs::read_dir(flows_dir.path()).unwrap() {
@@ -2844,12 +2972,12 @@
                 }
             }
         }
-        assert!(!records.is_empty(), "dispatch_remote must have written flow records for this session");
+        assert!(!records.is_empty(), "dispatch_unmanaged must have written flow records for this session");
         for rec in &records {
             assert_eq!(
                 rec.get("mission_id").and_then(|v| v.as_str()),
                 Some(MISSION_ID),
-                "every dispatch_remote record must carry its session's mission, got: {rec:?}"
+                "every dispatch_unmanaged record must carry its session's mission, got: {rec:?}"
             );
         }
         let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
@@ -2858,11 +2986,11 @@
     }
 
     /// Two missions launching the SAME config run the same step `s1-1645`
-    /// under two sessions, one per run: `dispatch_remote` runs under its
+    /// under two sessions, one per run: `dispatch_unmanaged` runs under its
     /// caller's session, whichever arm the resolved profile routes to.
     #[test]
     #[serial]
-    fn dispatch_remote_scopes_a_config_derived_session_id_by_mission_so_two_missions_diverge() {
+    fn dispatch_unmanaged_scopes_a_config_derived_session_id_by_mission_so_two_missions_diverge() {
         let crew_dir = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
 
@@ -2906,8 +3034,8 @@
             opts.json = false;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let result =
-                dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
-            assert_eq!(result.session_id, step_session, "dispatch_remote runs under its caller's session");
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_unmanaged must succeed");
+            assert_eq!(result.session_id, step_session, "dispatch_unmanaged runs under its caller's session");
             seen_session_ids.insert(result.session_id);
         }
 
@@ -2932,14 +3060,14 @@
     }
 
     // ─── #2580 review finding: the SECOND unguarded route into
-    //     `dispatch_remote` — `dispatch_local_single_shot` ignored
+    //     `dispatch_unmanaged` — `dispatch_local_single_shot` ignored
     //     `resume_from` exactly as `dispatch()`'s pre-fix branch did ───────
 
     /// `dispatch_local_single_shot` is `dispatch_routed_via`'s substitutable
     /// `local_dispatch` primitive (see its own doc comment) — not just
     /// radio's private helper — so an unguarded `resume_from` here is the
     /// same #2561 bypass reintroduced verbatim for the next caller. Same
-    /// ORDER discipline as `dispatch_remote_refuses_resume_from_before_
+    /// ORDER discipline as `dispatch_unmanaged_refuses_resume_from_before_
     /// the_http_call` above: a real loopback HTTP mock stands in for the
     /// remote endpoint, and the assertion is that its `rx` channel NEVER
     /// receives a request, not merely that the call returns an `Err`
@@ -3012,8 +3140,8 @@
     }
 
     /// **Sound within a bounded scope, honestly scoped where it isn't.**
-    /// `dispatch_remote` is a module-PRIVATE `fn` (see its own `fn
-    /// dispatch_remote(` declaration, pinned bare/non-`pub` below), so
+    /// `dispatch_unmanaged` is a module-PRIVATE `fn` (see its own `fn
+    /// dispatch_unmanaged(` declaration, pinned bare/non-`pub` below), so
     /// Rust's visibility rule — a private item is visible to its defining
     /// module AND ALL of that module's DESCENDANTS — puts every possible
     /// call site inside either this file or a module this file declares.
@@ -3026,12 +3154,12 @@
     /// than the code delivered: adding `pub mod e6_child;` here with an
     /// unguarded call inside compiled and passed the pre-pin version of
     /// this test green, because nothing pinned the descendant-module set;
-    /// flipping `fn` to `pub fn` did too, because `"fn dispatch_remote("`
-    /// is *also* a substring of `"pub fn dispatch_remote("` and nothing
+    /// flipping `fn` to `pub fn` did too, because `"fn dispatch_unmanaged("`
+    /// is *also* a substring of `"pub fn dispatch_unmanaged("` and nothing
     /// pinned visibility. Both are pinned now — the two assertions
     /// immediately after the sanity check below.)
     ///
-    /// The scan then finds every genuine CALL to `dispatch_remote(` — the
+    /// The scan then finds every genuine CALL to `dispatch_unmanaged(` — the
     /// identifier, not a longer name that merely contains it, at a real
     /// code position (comments and string literals are lexically skipped
     /// via `skip_non_code_span`, not just line-matched, so a comment or
@@ -3055,25 +3183,25 @@
     /// to extend a list.
     ///
     /// **What this cannot see, named plainly:**
-    /// - **A `pub`/`pub(crate)` widening of `dispatch_remote`, or a new
+    /// - **A `pub`/`pub(crate)` widening of `dispatch_unmanaged`, or a new
     ///   descendant module.** Both are pinned by the assertions below, so
     ///   either fails LOUD (this test breaks) rather than silently — but if
-    ///   `dispatch_remote` genuinely needs wider visibility one day, this
+    ///   `dispatch_unmanaged` genuinely needs wider visibility one day, this
     ///   scan's whole premise is gone and it needs a real redesign (a
     ///   crate-or-workspace-wide scan), not a bigger pin.
     /// - **A reimplementation of the same "hosted single-shot HTTP call"
-    ///   behavior that never calls `dispatch_remote` itself.** That needs
+    ///   behavior that never calls `dispatch_unmanaged` itself.** That needs
     ///   its own named guard, not this one.
     /// - **The third route the #2580 review found** —
     ///   `darkmux dispatch --machine <peer> --resume-from`, routed through
     ///   `dispatch_via_queue` in `darkmux-fleet` before this file's
-    ///   `dispatch()` is ever reached — which never calls `dispatch_remote`
+    ///   `dispatch()` is ever reached — which never calls `dispatch_unmanaged`
     ///   from here at all. Filed separately as #2584, deliberately out of
     ///   scope for this enumeration.
     /// - **A call reached only through an alias** — binding
-    ///   `dispatch_remote` to a `fn` pointer or closure and calling through
+    ///   `dispatch_unmanaged` to a `fn` pointer or closure and calling through
     ///   that binding instead of the name. This scan matches the literal
-    ///   identifier `dispatch_remote` followed by `(`; it does no name
+    ///   identifier `dispatch_unmanaged` followed by `(`; it does no name
     ///   resolution or dataflow analysis, so an aliased indirect call is
     ///   genuinely invisible to it. Not attempted — a real fix needs a
     ///   Rust-aware analyzer, not a bigger text scan.
@@ -3114,8 +3242,8 @@
     /// `body.contains(site.anchor)` already accepts for that module's own
     /// conformance checks.
     #[test]
-    fn every_dispatch_remote_call_site_is_guarded_against_resume_from() {
-        const DEFINITION_MARKER: &str = "fn dispatch_remote(";
+    fn every_dispatch_unmanaged_call_site_is_guarded_against_resume_from() {
+        const DEFINITION_MARKER: &str = "fn dispatch_unmanaged(";
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dispatch_internal.rs");
         let src = std::fs::read_to_string(&path)
@@ -3134,12 +3262,12 @@
             functions.len()
         );
 
-        // ── pin: `dispatch_remote` stays module-PRIVATE ─────────────────
-        // `"fn dispatch_remote("` matches as a substring of `"pub fn
-        // dispatch_remote("` too, so counting occurrences alone (the
+        // ── pin: `dispatch_unmanaged` stays module-PRIVATE ─────────────────
+        // `"fn dispatch_unmanaged("` matches as a substring of `"pub fn
+        // dispatch_unmanaged("` too, so counting occurrences alone (the
         // pre-#2580-round-2 check) says nothing about visibility. Confirm
         // the text on the declaration's own line, before the marker, is
-        // empty — i.e. the declaration is bare `fn dispatch_remote(`, not
+        // empty — i.e. the declaration is bare `fn dispatch_unmanaged(`, not
         // `pub fn` / `pub(crate) fn`.
         assert_eq!(
             src.matches(DEFINITION_MARKER).count(),
@@ -3152,11 +3280,11 @@
         assert_eq!(
             line_prefix,
             "",
-            "`dispatch_remote` must stay module-PRIVATE for this whole scan's premise to hold \
-             (see this test's own doc comment) — found `{line_prefix}fn dispatch_remote(`, \
+            "`dispatch_unmanaged` must stay module-PRIVATE for this whole scan's premise to hold \
+             (see this test's own doc comment) — found `{line_prefix}fn dispatch_unmanaged(`, \
              which reads as a widened visibility (`pub fn` / `pub(crate) fn`). Reviewer-proven \
              (#2580 round 2): flipping `fn` to `pub fn` here compiled and passed the pre-pin \
-             version of this test green. If `dispatch_remote` genuinely needs wider visibility, \
+             version of this test green. If `dispatch_unmanaged` genuinely needs wider visibility, \
              this scan's premise is gone and it needs a real redesign, not a bigger pin."
         );
 
@@ -3172,18 +3300,18 @@
             vec!["mod tests;".to_string()],
             "this scan's premise requires this file to declare NO descendant module other than \
              its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
-             place a call to `dispatch_remote(` could live that this scan cannot see; if one is \
+             place a call to `dispatch_unmanaged(` could live that this scan cannot see; if one is \
              genuinely needed, this test must grow to also scan that module's file."
         );
 
-        // Every genuine CALL to `dispatch_remote(` — the identifier at a
+        // Every genuine CALL to `dispatch_unmanaged(` — the identifier at a
         // real code position (comments/strings lexically skipped),
         // tolerant of whitespace before the paren, excluding the
         // declaration itself.
-        let call_offsets = find_dispatch_remote_calls(&src);
+        let call_offsets = find_dispatch_unmanaged_calls(&src);
         assert!(
             !call_offsets.is_empty(),
-            "found zero calls to `dispatch_remote(` — either the extractor regressed or the \
+            "found zero calls to `dispatch_unmanaged(` — either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
         );
 
@@ -3193,7 +3321,7 @@
                 .find(|(_, start, end)| *start <= call_at && call_at < *end)
                 .unwrap_or_else(|| {
                     panic!(
-                        "a `dispatch_remote(` call at byte offset {call_at} is not inside any \
+                        "a `dispatch_unmanaged(` call at byte offset {call_at} is not inside any \
                          top-level (column-0 `fn`/`pub fn`) function this scan indexes. This is \
                          not necessarily a broken extractor: the two shapes this scan cannot map \
                          to an enclosing function are a call inside an `impl` block METHOD \
@@ -3208,7 +3336,7 @@
 
             assert!(
                 resume_from_guard_precedes(body, call_at_in_body, &src),
-                "`{fn_name}` calls `dispatch_remote(` at file offset {call_at} without a \
+                "`{fn_name}` calls `dispatch_unmanaged(` at file offset {call_at} without a \
                  `resume_from`-conditioned guard preceding it — this scan requires an `if` \
                  block whose condition mentions `resume_from`, closes BEFORE the call, contains \
                  a diverging bail!/return Err/panic!, and EITHER inlines the anchor \
@@ -3262,9 +3390,9 @@
     /// past it — i.e. where scanning should resume. Otherwise `None`: this
     /// index is genuine code. The ONE lexical rule every extractor in this
     /// test module shares (`top_level_function_spans`,
-    /// `top_level_mod_declarations`, `find_dispatch_remote_calls`,
+    /// `top_level_mod_declarations`, `find_dispatch_unmanaged_calls`,
     /// `find_if_blocks`) — so a comment or string mentioning
-    /// `dispatch_remote(` or `mod` cannot be treated as code by one pass
+    /// `dispatch_unmanaged(` or `mod` cannot be treated as code by one pass
     /// while being correctly skipped by another (the #2580 round 2 "a
     /// comment mentioning the function name reported as an unguarded call"
     /// false positive this generalizes away — every extractor now agrees
@@ -3444,8 +3572,8 @@
     /// string (e.g. a path like `runtime/src/tools/mod.rs`, or this very
     /// doc comment) is not mistaken for a declaration. Every module
     /// declared here is a DESCENDANT module, and Rust makes this file's
-    /// private items (including `dispatch_remote`) visible to every
-    /// descendant — see `every_dispatch_remote_call_site_is_guarded_
+    /// private items (including `dispatch_unmanaged`) visible to every
+    /// descendant — see `every_dispatch_unmanaged_call_site_is_guarded_
     /// against_resume_from`'s own doc comment.
     fn top_level_mod_declarations(src: &str) -> Vec<String> {
         let cs: Vec<char> = src.chars().collect();
@@ -3478,21 +3606,21 @@
         out
     }
 
-    /// Every call-shaped occurrence of `dispatch_remote` in `src`: the
-    /// whole identifier `dispatch_remote` (not a longer identifier that
-    /// merely contains it, e.g. a hypothetical `dispatch_remote_helper`),
+    /// Every call-shaped occurrence of `dispatch_unmanaged` in `src`: the
+    /// whole identifier `dispatch_unmanaged` (not a longer identifier that
+    /// merely contains it, e.g. a hypothetical `dispatch_unmanaged_helper`),
     /// found only at genuine code positions via `skip_non_code_span` (a
     /// comment or string mentioning the name is invisible here, same
     /// lexical rule `top_level_function_spans` uses), followed by optional
-    /// whitespace and then `(` — so `dispatch_remote (opts, ...)` (legal
-    /// Rust, invisible to a fixed `"dispatch_remote("` substring search) is
-    /// caught too. Excludes the `fn dispatch_remote(` / `pub fn
-    /// dispatch_remote(` declaration itself (identified the same way the
+    /// whitespace and then `(` — so `dispatch_unmanaged (opts, ...)` (legal
+    /// Rust, invisible to a fixed `"dispatch_unmanaged("` substring search) is
+    /// caught too. Excludes the `fn dispatch_unmanaged(` / `pub fn
+    /// dispatch_unmanaged(` declaration itself (identified the same way the
     /// visibility pin above does: the four characters immediately before
     /// the identifier end in `"fn "`). Returns the byte offset of the
-    /// start of `dispatch_remote` for each hit.
-    fn find_dispatch_remote_calls(src: &str) -> Vec<usize> {
-        const NAME: &str = "dispatch_remote";
+    /// start of `dispatch_unmanaged` for each hit.
+    fn find_dispatch_unmanaged_calls(src: &str) -> Vec<usize> {
+        const NAME: &str = "dispatch_unmanaged";
         let cs: Vec<char> = src.chars().collect();
         let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
         let name_chars: Vec<char> = NAME.chars().collect();
@@ -3606,7 +3734,7 @@
         out
     }
 
-    /// The refusal message every `dispatch_remote` guard must contain,
+    /// The refusal message every `dispatch_unmanaged` guard must contain,
     /// shared by `resume_from_guard_precedes` and the conformance test's
     /// own failure message.
     const RESUME_FROM_GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
@@ -3640,7 +3768,7 @@
     /// `resume_from_bare_hosted_refusal`'s message so it no longer
     /// carried `RESUME_FROM_GUARD_ANCHOR`, then adding a same-named
     /// nested `fn` earlier in `dispatch_internal.rs` whose body DID carry
-    /// the anchor, left `every_dispatch_remote_call_site_is_guarded_
+    /// the anchor, left `every_dispatch_unmanaged_call_site_is_guarded_
     /// against_resume_from` passing while the guard an operator actually
     /// hits emits text this scan never inspected. The same root cause
     /// covers a path-qualified call to the helper from another module —
@@ -3650,7 +3778,7 @@
     /// itself is unaffected there), but a same-named LOCAL helper in that
     /// other module would shadow it there the same way.
     ///
-    /// Fixed the same way this file already pins `dispatch_remote`'s own
+    /// Fixed the same way this file already pins `dispatch_unmanaged`'s own
     /// visibility (`DEFINITION_MARKER` above, `assert_eq!(...count(), 1,
     /// ...)`): require the marker occur EXACTLY ONCE anywhere in `src`
     /// before trusting the first (only) match's body. Zero occurrences
@@ -7397,6 +7525,7 @@
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 5) endpoint id
+                None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             )
@@ -8487,6 +8616,7 @@
             None,
             None,
             Some(ctx(serde_json::json!({"source": "app", "sha": "abc"}))),
+            None,
             None,
             None,
             None,
@@ -10384,17 +10514,17 @@
 
     // ─── build_remote_record (#1645 fix-pass MUST FIX 1) ───────────────
 
-    /// (#1645 fix-pass review) `dispatch_remote` performs real HTTP and is
+    /// (#1645 fix-pass review) `dispatch_unmanaged` performs real HTTP and is
     /// therefore never executed by the ordinary suite — the SAME class of
     /// gap `remote_usage_tokens`' own doc (right below) names for the token
     /// extraction. #1645's only new regression test drove
     /// `dispatch_local_single_shot`'s LOCAL arm, whose two production
     /// callers (`src/radio.rs`, `src/radio_answer.rs`) both pass
     /// `phase_id: None` — so that arm's `mission_id` threading is
-    /// prospective, while `dispatch_remote` is the arm ACTUALLY reachable
+    /// prospective, while `dispatch_unmanaged` is the arm ACTUALLY reachable
     /// today (`dispatch()` routes any `dispatch.internal` step whose
     /// resolved profile is remote here, before the container path's own
-    /// resolution ever runs). Proven: reverting `dispatch_remote`'s three
+    /// resolution ever runs). Proven: reverting `dispatch_unmanaged`'s three
     /// live `build_remote_record` call sites back to a hardcoded `None`
     /// (leaving the `on_abort` closure's `mission_id_for_abort` stamped, so
     /// nothing warns about an unused binding) left `cargo test -p
@@ -14647,6 +14777,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None, // (#2902) endpoint
             None, // (#2902 step 5) endpoint id
+            None, // (#3035) dispatch cap
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
         );
@@ -15012,6 +15143,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 5) endpoint id
+                None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             );
@@ -17410,6 +17542,56 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
     }
 
+    /// (#3035) A container dispatch's turns settle into its dispatch cap as they
+    /// land, whichever kind of endpoint the brain is on. A turn that reports
+    /// usage is charged what it reported (6 of 10: no breach); a turn that
+    /// reports NONE is charged the granted per-call cap (#1442 C4: a stream
+    /// that omits usage must still reach its cap), so the second turn warns
+    /// once, at the crossing, with `spent: 6 + 10000`. Later turns stay quiet.
+    #[test]
+    #[serial]
+    fn container_turns_settle_into_the_dispatch_cap_and_warn_once_at_the_crossing() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let cap = std::sync::Mutex::new(crate::dispatch_budget::DispatchBudget::new(Some(10), darkmux_types::BudgetPolicy::Warn));
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-dispatch-cap"),
+            "coder".into(),
+            "m".into(),
+        )
+        .with_dispatch_cap(Some(cap));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        crate::budget::with_test_env(env.clone(), || {
+            state.handle_event(
+                r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+            );
+            assert!(env.actions().is_empty(), "6 of 10: no breach yet: {:?}", env.actions());
+            state.handle_event(r#"{"type":"model.completed","seq":2,"finish_reason":"stop"}"#);
+            state.handle_event(
+                r#"{"type":"model.completed","seq":3,"finish_reason":"stop","usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+            );
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "one warning, at the crossing");
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert_eq!((w["spent"].as_u64(), w["limit"].as_u64()), (Some(10_006), Some(10)), "{w}");
+    }
+
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) What `dispatch()` hands
     /// the tailer as its endpoint id: the hosted brain's registry id when
     /// named, nothing for an inline endpoint or a local brain.
@@ -17477,38 +17659,42 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let call = src.find("spawn_guarded_tailer(\n        &stop_flag,").expect("dispatch()'s call") + "spawn_guarded_tailer".len();
         let args = call_args(&src, call);
         assert_eq!(args.len(), params.len(), "{args:#?}");
-        assert_eq!(args[at], "tailer_endpoint_id(agentic_pm.as_ref())", "{args:#?}");
+        assert_eq!(args[at], "tailer_endpoint_id(limits_pm)", "{args:#?}");
+        assert_eq!(args[at + 1], "dispatch_cap_for(limits_pm)?", "the dispatch cap rides beside the endpoint id: {args:#?}");
     }
 
-    /// (#2902 step 5 review, 3rd pass MUST FIX 1) `dispatch_remote` against
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) `dispatch_unmanaged` against
     /// a NAMED endpoint stamps its id on the usage record and settles the
-    /// REPLY's total into the per-step bucket: a 5-token cap and a 9-token
+    /// REPLY's total into the dispatch's token cap: a 5-token cap and a 9-token
     /// reply warn with `spent: 9` (settling 0 would stay silent).
     #[test]
     #[serial]
-    fn dispatch_remote_stamps_the_endpoint_id_and_settles_the_reply() {
+    fn dispatch_unmanaged_stamps_the_endpoint_id_and_settles_the_reply() {
         let (base_url, rx) = one_shot_http_mock(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9}}"#,
         );
         let home = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
-        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"];
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
         let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         unsafe {
             std::env::set_var("DARKMUX_HOME", home.path());
             std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
             std::env::remove_var("DARKMUX_REDIS_URL");
-            std::env::set_var("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "5");
         }
         let session = format!("budget-epid-remote-{}", std::process::id());
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
         opts.session = crate::test_session(&session);
         opts.phase_id = None;
-        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            None,
+            serde_json::json!({"url": base_url, "limits": {"tokens_per_dispatch": 5}}),
+        );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_remote(
+            dispatch_unmanaged(
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 &quarantine_test_role(),
                 "system prompt",
@@ -17526,11 +17712,111 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         result.expect("the mock answers");
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
-        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_unmanaged (named)");
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
-        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("dispatch"), Some(9), Some(5)), "{w}");
+    }
+
+    /// (#3035) A MANAGED endpoint's `limits.tokens_per_dispatch` applies to the
+    /// container-free local single-shot too: the reply's total (9) against a
+    /// 5-token cap warns once with `spent: 9`, and the usage record names the
+    /// endpoint's id, which is what its window sums by.
+    #[test]
+    #[serial]
+    fn dispatch_local_single_shot_settles_a_managed_endpoints_dispatch_cap() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let pf = home.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"local":{"models":[{"id":"m","n_ctx":8192,"endpoint":"lms"}]}},
+                "endpoints":{"lms":{"managed":"lmstudio","limits":{"tokens_per_dispatch":5}}},
+                "default_profile":"local"}"#,
+        )
+        .unwrap();
+        let session = format!("budget-managed-local-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::test_session(&session);
+        opts.phase_id = None;
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        opts.model_base_url_override = Some(base_url);
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || dispatch_local_single_shot(opts));
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        result.expect("the mock answers");
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "local single-shot (managed)");
+        assert_eq!(rec["payload"]["endpoint_id"], "lms", "{rec}");
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert_eq!((w["spent"].as_u64(), w["limit"].as_u64()), (Some(9), Some(5)), "{w}");
+    }
+
+    /// (#3035, #1442 C4) A managed local single-shot whose reply reports NO
+    /// usage is charged the granted cap plus its prompt, so it still reaches a
+    /// 5-token `tokens_per_dispatch` (charging 0 would never warn).
+    #[test]
+    #[serial]
+    fn a_managed_single_shot_that_reports_no_usage_is_charged_the_granted_cap() {
+        let (base_url, _rx) = one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let pf = home.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"local":{"models":[{"id":"m","n_ctx":8192,"endpoint":"lms"}]}},
+                "endpoints":{"lms":{"managed":"lmstudio","limits":{"tokens_per_dispatch":5}}},
+                "default_profile":"local"}"#,
+        )
+        .unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::test_session(&format!("budget-nousage-{}", std::process::id()));
+        opts.phase_id = None;
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        opts.model_base_url_override = Some(base_url);
+        opts.max_completion_tokens = Some(300);
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || dispatch_local_single_shot(opts));
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        result.expect("the mock answers");
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert!(w["spent"].as_u64().unwrap() > 300, "the granted cap plus the prompt, never 0: {w}");
     }
 
     /// A hosted single-shot call the endpoint refuses ends in ONE
@@ -17539,7 +17825,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     /// the three leaves the operator a bare `aborted` terminal.
     #[test]
     #[serial]
-    fn dispatch_remote_failure_terminal_carries_error_wall_and_endpoint() {
+    fn dispatch_unmanaged_failure_terminal_carries_error_wall_and_endpoint() {
         let server = httpmock::MockServer::start();
         server.mock(|when, then| {
             when.method(httpmock::Method::POST).path("/v1/chat/completions");
@@ -17564,7 +17850,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None,
             serde_json::json!({"url": format!("{}/v1", server.base_url())}),
         );
-        let result = dispatch_remote(
+        let result = dispatch_unmanaged(
             &opts,
             &darkmux_types::execution_id::ExecutionId::mint(),
             &quarantine_test_role(),
@@ -17597,29 +17883,32 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     /// no total.
     #[test]
     #[serial]
-    fn dispatch_remote_settles_the_cap_plus_the_prompt_when_the_prompt_count_is_unreported() {
+    fn dispatch_unmanaged_settles_the_cap_plus_the_prompt_when_the_prompt_count_is_unreported() {
         let (base_url, rx) = one_shot_http_mock(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":3}}"#,
         );
         let home = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
-        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"];
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
         let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         unsafe {
             std::env::set_var("DARKMUX_HOME", home.path());
             std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
             std::env::remove_var("DARKMUX_REDIS_URL");
-            std::env::set_var("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "5");
         }
         let session = format!("budget-unmetered-remote-{}", std::process::id());
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
         opts.session = crate::test_session(&session);
         opts.phase_id = None;
-        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            None,
+            serde_json::json!({"url": base_url, "limits": {"tokens_per_dispatch": 5}}),
+        );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_remote(
+            dispatch_unmanaged(
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 &quarantine_test_role(),
                 "system prompt",
@@ -17637,14 +17926,14 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         result.expect("the mock answers");
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
-        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_unmanaged (named)");
         assert!(rec["payload"].get("total_tokens").is_none(), "{rec}");
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         // No prompt count: the spend is unknown, so the step is charged the
         // whole granted cap (4096 by default) plus the prompt it sent, by
         // estimate: never the 3 it reported, never the cap alone.
-        assert_eq!((w["scope"].as_str(), w["limit"].as_u64()), (Some("step"), Some(5)), "{w}");
+        assert_eq!((w["scope"].as_str(), w["limit"].as_u64()), (Some("dispatch"), Some(5)), "{w}");
         let spent = w["spent"].as_u64().unwrap();
         let sent_prompt = darkmux_trajectory::estimate_tokens("system prompt") as u64;
         assert!(spent >= 4096 + sent_prompt, "the cap bounds only the completion; the prompt sent counts too: {w}");
@@ -17917,10 +18206,10 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(rec["handle"], "coder", "a turn stays the specialist's");
     }
 
-    /// `dispatch_remote` (hosted `darkmux dispatch`), `"single_shot"`.
+    /// `dispatch_unmanaged` (hosted `darkmux dispatch`), `"single_shot"`.
     /// (#2902) An unmanaged endpoint that declares
     /// `chat-completions-max-tokens` is sent `max_tokens`, on both hosted
-    /// single-shot paths: `dispatch_remote` (the target's dialect) and a
+    /// single-shot paths: `dispatch_unmanaged` (the target's dialect) and a
     /// crew seat's `single_shot_chat_hosted` (the endpoint's dialect).
     #[test]
     #[serial]
@@ -17965,7 +18254,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None,
             serde_json::json!({ "url": base_url, "dialect": "chat-completions-max-tokens" }),
         );
-        let result = dispatch_remote(
+        let result = dispatch_unmanaged(
             &opts, &darkmux_types::execution_id::ExecutionId::mint(),
             &quarantine_test_role(),
             "system prompt",
@@ -17981,7 +18270,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
             }
         }
-        result.expect("dispatch_remote must succeed against the mock server");
+        result.expect("dispatch_unmanaged must succeed against the mock server");
         let request = rx.recv().unwrap();
         assert!(request.contains("\"max_tokens\":55"), "{request}");
         assert!(!request.contains("max_completion_tokens"), "{request}");
@@ -17989,7 +18278,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
 
     #[test]
     #[serial]
-    fn usage_conformance_dispatch_remote() {
+    fn usage_conformance_dispatch_unmanaged() {
         let (base_url, _rx) = one_shot_http_mock(
             r#"{"model":"served-by-mock","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":9}}"#,
         );
@@ -18008,7 +18297,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.phase_id = None;
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-        let result = dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -18019,9 +18308,9 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
             }
         }
-        result.expect("dispatch_remote must succeed against the mock server");
+        result.expect("dispatch_unmanaged must succeed against the mock server");
         let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session_id));
-        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_unmanaged");
         let p = &rec["payload"];
         assert_eq!(p["requested_model"], "gpt-remote");
         assert_eq!(p["reported_model"], "served-by-mock");
@@ -18454,6 +18743,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None, // record context
             None, // endpoint
             None, // endpoint id
+            None, // dispatch cap
             None, // compactor endpoint
             None, // live sender
         );

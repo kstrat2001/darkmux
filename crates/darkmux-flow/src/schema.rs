@@ -21,6 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 // Version history:
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
+//           (5.0, #3035, folded in, unreleased: "remote" was the wrong axis,
+//           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
+//           field is `dispatch`; `step start` `seat_class` `remote_endpoint`
+//           is `unmanaged_endpoint`; `step result` `remote_max_tokens_per_execution`
+//           is `tokens_per_dispatch`)
 //           per event. Every action is a `FlowAction` variant (`action.rs`),
 //           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three
 //           dot-separated segments. Dotted only on write. Nothing in the
@@ -189,9 +194,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           records without it are never counted against a budget.
 //
 //           ACTIONS (category `telemetry`, source `budget`), each with
-//           `scope` (`endpoint` | `step`), `endpoint_id` (endpoint scope)
-//           or `step` (step scope: the step id, or `dispatch` for a bare
-//           hosted dispatch), and a human `message`:
+//           `scope` (`endpoint` | `dispatch`), `endpoint_id` (endpoint scope)
+//           or `dispatch` (dispatch scope: the role id, or the step id for
+//           a step's own call), and a human `message`:
 //           - `budget.warn` (level `warn`): a budget was reached, or its
 //             `warn_at` fraction was, or (endpoint scope, token budget) the
 //             window is not fully metered, and the call went ahead. Adds
@@ -211,11 +216,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `dispatch.rest` gains the reason `budget` (the pace-file pause
 //           an agentic-remote dispatch takes while its endpoint's window is
 //           full); its payload shape is unchanged.
-//           `step result.payload.remote_max_tokens_per_execution` (hosted
-//           `dispatch.single_shot`) keeps its shipped spelling (CLAUDE.md
-//           contract 8: the wire keeps its historical spelling) though the
-//           config key it echoes is now `remote.max_tokens_per_step`; it is
-//           null when no per-step cap is set (no default since 4.0), and
+//           `step result.payload.tokens_per_dispatch` (hosted
+//           `dispatch.single_shot`; named `remote_max_tokens_per_execution`
+//           before 5.0) echoes the endpoint's `limits.tokens_per_dispatch`
+//           (it was `remote.max_tokens_per_step`); it is
+//           null when no per-dispatch cap is set (no default since 4.0), and
 //           `max_tokens_sent` now always equals `max_tokens_requested` (no
 //           call is clamped). An older reader ignores all of it.
 //           `budget.stop` (level `warn`, endpoint scope): a budget wait
@@ -408,7 +413,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           record (category `telemetry`, source `tokens`) when its reply
 //           returns, built by ONE writer (`darkmux_crew::usage::usage_payload`).
 //
-//           New producers: `dispatch_remote` (hosted `darkmux dispatch`),
+//           New producers: `dispatch_unmanaged` (hosted `darkmux dispatch`),
 //           `dispatch_local_single_shot` (the radio's seats), and the
 //           `dispatch.single_shot` step kind (both arms). Before this their
 //           tokens reached only the `dispatch complete` payload, which keeps
@@ -922,7 +927,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           earliest-wins framing), that is the point to revisit this
 //           entry and bump then — the schema's Rust shape and every
 //           existing consumer's computed output are unchanged today.
-//   1.47.0 (#1645 fix-pass) — `dispatch_internal.rs`'s `dispatch_remote`/
+//   1.47.0 (#1645 fix-pass) — `dispatch_internal.rs`'s `dispatch_unmanaged`/
 //           `dispatch_local_single_shot` arms (the hosted and container-free
 //           local single-shot dispatch paths) now resolve `mission_id` via
 //           the SAME `resolve_mission_for_phase(phase_id)` lookup the
@@ -940,7 +945,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           grounds, because "a consumer that knows these keys reads a
 //           DIFFERENT ANSWER out of the same record set than one that does
 //           not." The same argument transfers verbatim here: a consumer
-//           that reads `mission_id` off a `dispatch_remote`/
+//           that reads `mission_id` off a `dispatch_unmanaged`/
 //           `dispatch_local_single_shot` record now gets a real mission
 //           where it used to get `None` — a different answer from the
 //           same record set, not a differently-shaped one.
@@ -959,7 +964,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           operator's own fleet is a mixed-writer fleet BY DESIGN (the
 //           laptop runs source builds, the hub runs brew/stable) — leaving
 //           this constant at 1.46.0 would report NO skew while two
-//           `dispatch_remote`/`dispatch_local_single_shot` record shapes
+//           `dispatch_unmanaged`/`dispatch_local_single_shot` record shapes
 //           were live on one stream, the exact failure 1.45.0's entry
 //           named ("Leaving it at 1.44.0 would have reported no skew while
 //           two shapes were live").
@@ -1058,7 +1063,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `dispatch.map` per-item record, and the hosted
 //           `dispatch.single_shot` step's record), and the `dispatch
 //           complete` record's own totals (the internal-runtime path and
-//           BOTH "direct" paths — `dispatch_remote` and
+//           BOTH "direct" paths — `dispatch_unmanaged` and
 //           `dispatch_local_single_shot`).
 //           Parses `usage.completion_tokens_details.reasoning_tokens` /
 //           `usage.prompt_tokens_details.cached_tokens` from a provider's
@@ -1957,8 +1962,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `payload.seat_class` — what that step CONSUMES, as declared by
 //           its own `StepKind::seat` hook. One of exactly four values:
 //           `"local_model"` (gestalt-wave-planned, residency-lease
-//           protected), `"remote_endpoint"` (a hosted seat, bounded by
-//           `remote.concurrent_cap`), `"no_model"` (dispatch-free —
+//           protected), `"unmanaged_endpoint"` (a seat on an endpoint darkmux
+//           does not manage, bounded by that endpoint's
+//           `limits.concurrent_calls` since 5.0, #3035; `remote_endpoint`
+//           before 5.0), `"no_model"` (dispatch-free —
 //           `procedural.shell`, `mods.gate`, `records.gather`,
 //           `deliver.github_review`, the crawl planners — bounded by
 //           `runtime.dispatch_free_concurrency`), or

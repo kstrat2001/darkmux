@@ -88,7 +88,6 @@ function writeConfig(stateDir, machineId, fleetMode) {
     redis: { enabled: true, host: "redis", port: 6379, stream: REDIS_STREAM, maxlen: REDIS_MAXLEN },
     audit: { enabled: false, dir: "~/.darkmux/audit" },
     runtime: { inactivity_timeout_seconds: 600, strict_selection: false, feedback_injection: true, check_updates: false },
-    remote: { max_tokens_per_step: null, step_budget_policy: null },
     fleet: { mode: fleetMode },
   });
 }

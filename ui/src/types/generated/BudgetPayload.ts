@@ -6,7 +6,7 @@ import type { BudgetScope } from "./BudgetScope";
 import type { RecordContext } from "./RecordContext";
 
 /**
- * An endpoint budget or a per-step cap acted: the payload of `budget.warn`, `budget.wait`,
+ * An endpoint budget or a dispatch's token cap acted: the payload of `budget.warn`, `budget.wait`,
  * `budget.resume` and `budget.stop`. One type for the four: `scope` and `message` are always
  * there; the rest belongs to the action and the scope.
  */
@@ -20,9 +20,9 @@ message: string,
  */
 endpoint_id?: string, 
 /**
- * On a per-step cap: the step.
+ * On a dispatch's token cap: the dispatch (a role id, or a step id for a step's own call).
  */
-step?: string, policy?: BudgetPolicyKind, level?: BreachLevel, metric?: BudgetMetric, 
+dispatch?: string, policy?: BudgetPolicyKind, level?: BreachLevel, metric?: BudgetMetric, 
 /**
  * The known spend; a floor when some calls reported no complete count.
  */

@@ -810,7 +810,7 @@ pub struct Step {
     /// **`None` while `status == Running` is a real, honest state** — it
     /// means the step has been admitted and claimed for this wave but
     /// hasn't actually started dispatching yet (typically queued behind a
-    /// concurrency cap, `remote_cap` or otherwise, alongside other ready
+    /// concurrency cap, an endpoint's or otherwise, alongside other ready
     /// siblings). It does NOT mean "unknown". Every consumer of this field
     /// must treat `Running` + `None` as "scheduled, not yet generating",
     /// never as "unknown start time" or a reason to fall back to `now()`.

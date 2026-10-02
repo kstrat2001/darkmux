@@ -123,9 +123,6 @@ CardGovernor
   thermal: ThermalNow | null
   battery: BatteryCharge | null
   battery_gate: CardBatteryGate
-CardHostedSeats
-  held_by_peer_jobs: uint32
-  cap: uint32 | null
 CardLocalSeat
   model: string
   held_by_peer_job: boolean
@@ -146,9 +143,11 @@ CardSeats
   busy_policy: CardBusyPolicy
   counts_own_work: boolean
   local: CardLocalSeat[]
-  hosted: CardHostedSeats
+  unmanaged: CardUnmanagedSeats
   waiting: uint32
 CardSource = "local" | "listener" | "unknown"
+CardUnmanagedSeats
+  held_by_peer_jobs: uint32
 ChargeState = "charging" | "held" | "discharging" | "full" | "unknown"
 CheckpointGate
   observations: uint

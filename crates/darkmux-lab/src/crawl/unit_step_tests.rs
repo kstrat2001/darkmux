@@ -2209,7 +2209,7 @@ fn graph_step(id: &str, task_id: &str, kind: &str, config: serde_json::Value) ->
 }
 
 /// The crawl kinds that run no model claim `NoModel`, so they schedule under
-/// the dispatch-free cap instead of queueing behind the hosted-endpoint cap
+/// the dispatch-free cap instead of queueing behind a serial endpoint
 /// (#2394). Re-classing any of the three must redden this.
 #[test]
 fn the_crawl_kinds_that_run_no_model_claim_no_model() {
@@ -2221,7 +2221,6 @@ fn the_crawl_kinds_that_run_no_model_claim_no_model() {
     ];
     let ctx = StepRunCtx::new(
         darkmux_types::session_id::RunId::mission("seat-table").unwrap(),
-        None,
         None,
         None,
         std::sync::Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()),
@@ -2332,7 +2331,6 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
             &registry,
             &facts,
             &est,
-            1,
             &host_factory,
             &mut |_record| {},
             &mut |step| {
@@ -2452,7 +2450,6 @@ fn run_one_failing_unit_through_the_real_scheduler(
             &registry,
             &facts,
             &est,
-            1,
             &host_factory,
             &mut |_record| {},
             &mut |step| {
@@ -2790,7 +2787,7 @@ impl Drop for ProfilesGuard {
 }
 
 /// (#2321) The scheduler wave-packs only the steps that DECLARE a residency;
-/// a kind that stays silent is queued as a remote job under `remote_cap`
+/// a kind that stays silent is queued as an endpoint job, one at a time
 /// (1 on the launch path), so sibling units ran strictly one at a time —
 /// measured 3× on a three-unit crawl whose model was already resident. The
 /// unit dispatches the `crawler` role locally; its residency must say so,
@@ -2812,7 +2809,7 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
     )
     .unwrap();
     let kind = DispatchUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
-    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
     let SeatClaim::LocalModel(placement) =
         kind.seat(&unit_step(serde_json::json!({})), &unit_task(), &BTreeMap::new(), &ctx)
     else {
@@ -2868,7 +2865,7 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
     .unwrap();
 
     let kind = DispatchUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
-    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
 
     // Sanity leg: the Task's role IS a registered role (unchanged from the
     // hardcoded-crawler test above, just spelled through the Task now) —

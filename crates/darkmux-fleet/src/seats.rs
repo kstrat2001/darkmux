@@ -6,9 +6,10 @@
 //!   serves one request at a time per instance (measured 2026-09-26, #2914),
 //!   so a second job for the same model is busy, while a job for a different
 //!   local model is not;
-//! - a job on a **hosted** endpoint runs beside other hosted jobs, up to this
-//!   machine's `remote.concurrent_cap` (`0` = unbounded, the darkmux bound
-//!   convention).
+//! - a job on an endpoint darkmux does **not manage** runs beside other jobs
+//!   on that endpoint up to its `limits.concurrent_calls` (`0` = unbounded,
+//!   the darkmux bound convention), and one at a time when it declares none
+//!   (#3035). Jobs on different endpoints never wait on each other.
 //!
 //! Past either limit the receiver's `fleet.busy_policy` decides: `refuse`
 //! answers at once, naming what is running ([`SeatBook::try_claim`]'s
@@ -29,17 +30,29 @@ use std::time::{Duration, Instant};
 pub enum WorkSeat {
     /// A model this machine loads and serves itself (a managed endpoint).
     Local { model: String },
-    /// A hosted endpoint this machine only sends requests to.
-    Hosted { model: String },
+    /// An endpoint this machine only sends requests to (an unmanaged one):
+    /// its id (or URL), the model asked of it, and its declared
+    /// `limits.concurrent_calls`.
+    Unmanaged { endpoint: String, model: String, concurrent_calls: Option<u32> },
 }
 
 impl WorkSeat {
-    /// The key waiters queue on: one per local model, one shared by every
-    /// hosted job.
+    /// The key waiters queue on: one per local model, one per unmanaged
+    /// endpoint.
     fn key(&self) -> String {
         match self {
             WorkSeat::Local { model } => format!("local:{model}"),
-            WorkSeat::Hosted { .. } => "hosted".to_string(),
+            WorkSeat::Unmanaged { endpoint, .. } => format!("endpoint:{endpoint}"),
+        }
+    }
+
+    /// How many jobs may hold this seat's key at once.
+    fn width(&self) -> usize {
+        match self {
+            WorkSeat::Local { .. } => 1,
+            WorkSeat::Unmanaged { concurrent_calls, .. } => {
+                concurrent_calls.map_or(1, |n| darkmux_types::config_access::jobs_at_once(n as usize))
+            }
         }
     }
 }
@@ -65,8 +78,8 @@ pub struct Occupied {
 struct Book {
     /// Local model -> the session running on it.
     local: BTreeMap<String, String>,
-    /// Sessions running on hosted endpoints.
-    hosted: Vec<String>,
+    /// Endpoint -> the sessions running on it.
+    unmanaged: BTreeMap<String, Vec<String>>,
     /// Waiters in arrival order: (seat key, ticket).
     waiting: VecDeque<(String, u64)>,
     next_ticket: u64,
@@ -74,8 +87,6 @@ struct Book {
 
 /// The receiver's record of running submitted jobs.
 pub struct SeatBook {
-    /// Hosted jobs allowed at once (`usize::MAX` for unbounded).
-    hosted_cap: usize,
     book: Mutex<Book>,
     freed: Condvar,
 }
@@ -86,10 +97,8 @@ pub struct SeatBook {
 pub struct SeatSnapshot {
     /// The local models a submitted job holds, sorted.
     pub local_held: Vec<String>,
-    /// Hosted jobs running.
-    pub hosted_held: usize,
-    /// Hosted jobs allowed at once; `None` is unbounded.
-    pub hosted_cap: Option<usize>,
+    /// Jobs running on unmanaged endpoints, all endpoints together.
+    pub unmanaged_held: usize,
     /// Jobs waiting for a seat.
     pub waiting: usize,
 }
@@ -110,9 +119,12 @@ impl Drop for SeatGuard {
                     b.local.remove(model);
                 }
             }
-            WorkSeat::Hosted { .. } => {
-                if let Some(i) = b.hosted.iter().position(|s| s == &self.session) {
-                    b.hosted.remove(i);
+            WorkSeat::Unmanaged { endpoint, .. } => {
+                if let Some(held) = b.unmanaged.get_mut(endpoint) {
+                    held.retain(|s| s != &self.session);
+                    if held.is_empty() {
+                        b.unmanaged.remove(endpoint);
+                    }
                 }
             }
         }
@@ -121,26 +133,35 @@ impl Drop for SeatGuard {
     }
 }
 
+impl Default for SeatBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SeatBook {
-    /// `remote_concurrent_cap` is the receiver's `remote.concurrent_cap`;
-    /// `0` means unbounded.
-    pub fn new(remote_concurrent_cap: u32) -> Self {
-        let hosted_cap = darkmux_types::config_access::jobs_at_once(remote_concurrent_cap as usize);
-        Self { hosted_cap, book: Mutex::new(Book::default()), freed: Condvar::new() }
+    pub fn new() -> Self {
+        Self { book: Mutex::new(Book::default()), freed: Condvar::new() }
     }
 
     /// Why `seat` cannot be taken now, or `None` when it can.
     fn occupied(&self, b: &Book, seat: &WorkSeat) -> Option<Occupied> {
         match seat {
             WorkSeat::Local { model } => b.local.get(model).map(|s| Occupied { what: format!("{s} is running on {model}") }),
-            WorkSeat::Hosted { .. } if b.hosted.len() >= self.hosted_cap => Some(Occupied {
-                what: format!(
-                    "{} hosted job(s) are running, its `remote.concurrent_cap` ({})",
-                    b.hosted.len(),
-                    b.hosted.join(", ")
-                ),
-            }),
-            WorkSeat::Hosted { .. } => None,
+            WorkSeat::Unmanaged { endpoint, concurrent_calls, .. } => {
+                let held = b.unmanaged.get(endpoint).map(Vec::as_slice).unwrap_or_default();
+                (held.len() >= seat.width()).then(|| Occupied {
+                    what: format!(
+                        "{} job(s) are running on endpoint {endpoint} ({}), {}",
+                        held.len(),
+                        held.join(", "),
+                        match concurrent_calls {
+                            Some(n) => format!("its `limits.concurrent_calls` ({n})"),
+                            None => "which declares no `limits.concurrent_calls`, so its calls run one at a time".to_string(),
+                        }
+                    ),
+                })
+            }
         }
     }
 
@@ -149,7 +170,9 @@ impl SeatBook {
             WorkSeat::Local { model } => {
                 b.local.insert(model.clone(), session.to_string());
             }
-            WorkSeat::Hosted { .. } => b.hosted.push(session.to_string()),
+            WorkSeat::Unmanaged { endpoint, .. } => {
+                b.unmanaged.entry(endpoint.clone()).or_default().push(session.to_string())
+            }
         }
         SeatGuard { owner: Arc::clone(self), seat: seat.clone(), session: session.to_string() }
     }
@@ -255,8 +278,7 @@ impl SeatBook {
         let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
         SeatSnapshot {
             local_held: b.local.keys().cloned().collect(),
-            hosted_held: b.hosted.len(),
-            hosted_cap: (self.hosted_cap != usize::MAX).then_some(self.hosted_cap),
+            unmanaged_held: b.unmanaged.values().map(Vec::len).sum(),
             waiting: b.waiting.len(),
         }
     }
@@ -264,7 +286,7 @@ impl SeatBook {
     /// Sessions running now (for tests and logs).
     pub fn running(&self) -> Vec<String> {
         let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        b.local.values().cloned().chain(b.hosted.iter().cloned()).collect()
+        b.local.values().cloned().chain(b.unmanaged.values().flatten().cloned()).collect()
     }
 }
 
@@ -275,8 +297,8 @@ mod tests {
     fn local(m: &str) -> WorkSeat {
         WorkSeat::Local { model: m.into() }
     }
-    fn hosted() -> WorkSeat {
-        WorkSeat::Hosted { model: "gpt-x".into() }
+    fn endpoint(id: &str, concurrent_calls: Option<u32>) -> WorkSeat {
+        WorkSeat::Unmanaged { endpoint: id.into(), model: "gpt-x".into(), concurrent_calls }
     }
 
     fn far() -> Instant {
@@ -296,24 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn the_snapshot_names_held_seats_and_the_cap_and_no_sessions() {
-        let book = Arc::new(SeatBook::new(2));
+    fn the_snapshot_names_held_seats_and_no_sessions() {
+        let book = Arc::new(SeatBook::new());
         let empty = book.snapshot();
-        assert_eq!(empty, SeatSnapshot { local_held: vec![], hosted_held: 0, hosted_cap: Some(2), waiting: 0 });
+        assert_eq!(empty, SeatSnapshot { local_held: vec![], unmanaged_held: 0, waiting: 0 });
         let _a = book.try_claim(&local("qwen-35b"), "s1").expect("free");
-        let _h = book.try_claim(&hosted(), "s2").expect("free");
+        let _h = book.try_claim(&endpoint("azure", None), "s2").expect("free");
         let snap = book.snapshot();
         assert_eq!(snap.local_held, vec!["qwen-35b".to_string()]);
-        assert_eq!(snap.hosted_held, 1);
+        assert_eq!(snap.unmanaged_held, 1);
         assert!(!format!("{snap:?}").contains("s1"), "a session id must not reach the snapshot");
         drop(_a);
         assert!(book.snapshot().local_held.is_empty(), "a freed seat leaves the snapshot");
-        assert_eq!(SeatBook::new(0).snapshot().hosted_cap, None, "0 means unbounded");
     }
 
     #[test]
     fn one_job_per_local_model_and_different_models_run_together() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         let a = book.try_claim(&local("qwen-35b"), "s1").expect("free");
         let busy = book.try_claim(&local("qwen-35b"), "s2").err().expect("same model is busy");
         assert!(busy.what.contains("s1") && busy.what.contains("qwen-35b"), "names what is running: {busy:?}");
@@ -322,27 +343,54 @@ mod tests {
         assert!(book.try_claim(&local("qwen-35b"), "s4").is_ok(), "the seat frees when the job ends");
     }
 
+    /// (#3035) Jobs on one unmanaged endpoint run together up to its
+    /// `limits.concurrent_calls`, and the refusal names the endpoint, who holds
+    /// it and the field that bounds it.
     #[test]
-    fn hosted_jobs_run_together_up_to_the_cap() {
-        let book = Arc::new(SeatBook::new(2));
-        let _a = book.try_claim(&hosted(), "h1").unwrap();
-        let _b = book.try_claim(&hosted(), "h2").expect("second hosted job fits the cap");
-        let busy = book.try_claim(&hosted(), "h3").err().expect("past the cap");
-        assert!(busy.what.contains("remote.concurrent_cap") && busy.what.contains("h1, h2"), "{busy:?}");
-        // A hosted job never blocks a local one, and the reverse.
+    fn jobs_on_an_endpoint_run_together_up_to_its_concurrent_calls() {
+        let book = Arc::new(SeatBook::new());
+        let azure = endpoint("azure", Some(2));
+        let _a = book.try_claim(&azure, "h1").unwrap();
+        let _b = book.try_claim(&azure, "h2").expect("second job fits the declared concurrency");
+        let busy = book.try_claim(&azure, "h3").err().expect("past the limit");
+        assert!(busy.what.contains("limits.concurrent_calls") && busy.what.contains("h1, h2") && busy.what.contains("azure"), "{busy:?}");
+        // An endpoint's jobs never block a local one, and the reverse.
         assert!(book.try_claim(&local("m"), "l1").is_ok());
     }
 
+    /// (#3035) An endpoint that declares no `limits.concurrent_calls` takes
+    /// one job at a time, and says why; another endpoint is not affected.
     #[test]
-    fn a_zero_cap_means_unbounded_hosted_jobs() {
-        let book = Arc::new(SeatBook::new(0));
-        let guards: Vec<_> = (0..20).map(|i| book.try_claim(&hosted(), &format!("h{i}")).unwrap()).collect();
+    fn an_endpoint_with_no_declared_concurrency_takes_one_job_at_a_time() {
+        let book = Arc::new(SeatBook::new());
+        let _a = book.try_claim(&endpoint("azure", None), "h1").unwrap();
+        let busy = book.try_claim(&endpoint("azure", None), "h2").err().expect("serial");
+        assert!(busy.what.contains("declares no `limits.concurrent_calls`") && busy.what.contains("h1"), "{busy:?}");
+        assert!(book.try_claim(&endpoint("openai", None), "h3").is_ok(), "another endpoint is its own seat");
+    }
+
+    /// (#3035) A queue is per endpoint: a job waiting for one endpoint's seat
+    /// holds a newcomer for THAT endpoint behind it, never one for another.
+    #[test]
+    fn a_waiter_for_one_endpoint_does_not_hold_another_endpoints_newcomers() {
+        let book = Arc::new(SeatBook::new());
+        book.book.lock().unwrap().waiting.push_back((endpoint("azure", None).key(), 7));
+        let behind = book.try_claim(&endpoint("azure", None), "h1").err().expect("behind the waiter");
+        assert!(behind.what.contains("waiting"), "{behind:?}");
+        assert!(book.try_claim(&endpoint("openai", None), "h2").is_ok(), "another endpoint's queue is not this one's");
+    }
+
+    #[test]
+    fn a_zero_concurrent_calls_means_unbounded_jobs() {
+        let book = Arc::new(SeatBook::new());
+        let guards: Vec<_> =
+            (0..20).map(|i| book.try_claim(&endpoint("azure", Some(0)), &format!("h{i}")).unwrap()).collect();
         assert_eq!(guards.len(), 20);
     }
 
     #[test]
     fn a_waiter_gets_the_seat_when_it_frees_and_hears_what_it_waits_for() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         let first = book.try_claim(&local("m"), "s1").unwrap();
         let b2 = book.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -369,7 +417,7 @@ mod tests {
     /// even in the instant the seat is free but the waiter has not woken.
     #[test]
     fn a_newcomer_never_overtakes_a_waiter_for_a_free_seat() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         book.book.lock().unwrap().waiting.push_back((local("m").key(), 999));
         let err = book.try_claim(&local("m"), "s-new").err().expect("the waiter holds its place");
         assert!(err.what.contains("waiting"), "{err:?}");
@@ -380,7 +428,7 @@ mod tests {
     /// it, a real claim still succeeds.
     #[test]
     fn a_peek_reports_a_claims_answer_without_taking_the_seat() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         assert_eq!(book.peek(&local("m")), None);
         assert!(book.try_claim(&local("m"), "s-real").is_ok(), "the peek held nothing");
         let held = book.try_claim(&local("n"), "s-held").unwrap();
@@ -396,7 +444,7 @@ mod tests {
     /// A waiter takes a free seat only when it is first in line for it.
     #[test]
     fn a_waiter_behind_an_earlier_waiter_does_not_take_the_free_seat() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         book.book.lock().unwrap().waiting.push_back((local("m").key(), 0));
         book.book.lock().unwrap().next_ticket = 1;
         let b2 = book.clone();
@@ -415,7 +463,7 @@ mod tests {
 
     #[test]
     fn waiters_on_one_seat_are_served_in_arrival_order() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         let first = book.try_claim(&local("m"), "s0").unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
@@ -449,7 +497,7 @@ mod tests {
     /// queue without the seat, and the next waiter is not held behind it.
     #[test]
     fn a_cancelled_waiter_leaves_the_queue_and_never_takes_the_seat() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         let first = book.try_claim(&local("m"), "s1").unwrap();
         let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (b2, g2) = (book.clone(), gone.clone());
@@ -471,7 +519,7 @@ mod tests {
     /// and says what held the seat.
     #[test]
     fn a_waiter_past_its_deadline_times_out_naming_what_held_the_seat() {
-        let book = Arc::new(SeatBook::new(1));
+        let book = Arc::new(SeatBook::new());
         let _first = book.try_claim(&local("m"), "s1").unwrap();
         let b2 = book.clone();
         let (tx, rx) = std::sync::mpsc::channel();

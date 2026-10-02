@@ -115,7 +115,7 @@ function recordDetailRaw(r: NormRecord): string {
   // wait must say so (with the CLI and `mission status`).
   const budget = budgetPayloadOf(r);
   if (a !== undefined && budget) {
-    const subject = String(budget.endpoint_id ?? budget.step ?? "budget");
+    const subject = String(budget.endpoint_id ?? budget.dispatch ?? "budget");
     if (a === ACTION.BudgetWait) {
       return typeof budget.wait_ms === "number" ? `${subject}: waiting ${spanWords(budget.wait_ms / 1000)}` : `${subject}: waiting`;
     }

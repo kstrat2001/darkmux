@@ -100,14 +100,9 @@ pub use records_gather::{
 };
 pub use registry::StepKindRegistry;
 pub use types::{
-    ArtifactBus, CwdPolicy, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, SeatClaim,
+    ArtifactBus, CwdPolicy, EndpointSlot, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, SeatClaim,
     StepKind, StepOutcome, StepRunCtx, WaveSignal,
 };
-// (#1877) `RemoteBudget`'s canonical home is `crate::remote_budget` (a
-// shared, public module of this crate); re-exported here too so a caller
-// of `StepRunCtx::remote_bucket()` can name the type without a second `use`.
-pub use crate::remote_budget::RemoteBudget;
-
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
 /// `coder_phase` — the `run_step_graph`/`StepKind::residency` caller for
 /// the mission-run migration, #1230 Packet 3) can name these types without

@@ -3507,7 +3507,7 @@ mod tests {
         //           producing step's id, never an absolute host path
         //           (#2310 swarm F / S2-2).
         //   1.41.0: every scheduler `step start` gains `payload.seat_class`
-        //           (one of `local_model` | `remote_endpoint` | `no_model` |
+        //           (one of `local_model` | `unmanaged_endpoint` | `no_model` |
         //           `local_model_unresolved`), plus a new `step seat
         //           unresolved` Warn action for the last of those (#2394).
         //   1.42.0: `telemetry.process` retired; `machine.telemetry`
@@ -3550,7 +3550,7 @@ mod tests {
         //           tokens` carry the whole-task view separately. See
         //           `schema.rs`'s own history entry for the full
         //           explanation.
-        //   1.47.0: `dispatch_remote`/`dispatch_local_single_shot` (the
+        //   1.47.0: `dispatch_unmanaged`/`dispatch_local_single_shot` (the
         //           hosted and container-free local single-shot dispatch
         //           paths) now resolve `mission_id` the same way the
         //           container-agentic path already did (#1645) — a

@@ -133,15 +133,6 @@ pub struct MapSource {
     pub collection_input: Option<String>,
 }
 
-/// The token allowance a `dispatch.map` step draws from.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
-pub struct BucketSpec {
-    /// Steps naming the same group share one token allowance.
-    pub bucket_group: Option<String>,
-    /// The allowance a launcher stamps for the step's group.
-    pub bucket_budget: Option<Count>,
-}
-
 /// `dispatch.map`: one single-shot call per item of a collection.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MapConfig {
@@ -151,8 +142,6 @@ pub struct MapConfig {
     pub source: MapSource,
     pub retry_on_empty: Option<Count>,
     pub retry_on_error: Option<Count>,
-    #[serde(flatten)]
-    pub bucket: BucketSpec,
     #[serde(flatten)]
     pub call: ModelCallConfig,
 }

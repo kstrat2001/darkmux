@@ -846,7 +846,6 @@ mod tests {
             &registry,
             &facts,
             &est,
-            1,
             &|| {
                 panic!(
                     "procedural.shell needs no model residency: the host factory must never \

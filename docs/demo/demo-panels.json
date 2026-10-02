@@ -1,7 +1,7 @@
 {
   "config-list": {
     "age_ms": 0,
-    "ansi_text": "{\n  \"schema_version\": \"1.2\",\n  \"machine_id\": \"m5-ultra-256gb\",\n  \"orchestrator\": \"claude-code\",\n  \"lms_bin\": \"lms\",\n  \"lmstudio_url\": \"http://localhost:1234\",\n  \"redis\": {\n    \"enabled\": false,\n    \"host\": \"127.0.0.1\",\n    \"port\": 6379,\n    \"stream\": \"darkmux:flow\",\n    \"maxlen\": 10000\n  },\n  \"audit\": {\n    \"enabled\": false,\n    \"dir\": \"~/.darkmux/audit\"\n  },\n  \"runtime\": {\n    \"inactivity_timeout_seconds\": 600,\n    \"strict_selection\": false,\n    \"feedback_injection\": true,\n    \"check_updates\": false\n  },\n  \"remote\": {\n    \"max_tokens_per_execution\": 500000\n  },\n  \"fleet\": {\n    \"mode\": \"peer\"\n  }\n}\n",
+    "ansi_text": "{\n  \"schema_version\": \"1.2\",\n  \"machine_id\": \"m5-ultra-256gb\",\n  \"orchestrator\": \"claude-code\",\n  \"lms_bin\": \"lms\",\n  \"lmstudio_url\": \"http://localhost:1234\",\n  \"redis\": {\n    \"enabled\": false,\n    \"host\": \"127.0.0.1\",\n    \"port\": 6379,\n    \"stream\": \"darkmux:flow\",\n    \"maxlen\": 10000\n  },\n  \"audit\": {\n    \"enabled\": false,\n    \"dir\": \"~/.darkmux/audit\"\n  },\n  \"runtime\": {\n    \"inactivity_timeout_seconds\": 600,\n    \"strict_selection\": false,\n    \"feedback_injection\": true,\n    \"check_updates\": false\n  },\n  \"fleet\": {\n    \"mode\": \"peer\"\n  }\n}\n",
     "argv": [
       "config",
       "list"

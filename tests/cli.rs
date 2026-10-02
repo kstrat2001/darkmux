@@ -5324,7 +5324,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
 /// routing seat (`radio::dispatch_router_call`) goes through
 /// `dispatch_local_single_shot` — the container-free direct-HTTP primitive
 /// (#1698 Packet B), not `crew::dispatch::dispatch`'s container-or-remote
-/// fork — which still falls through to the SAME `dispatch_remote` light
+/// fork — which still falls through to the SAME `dispatch_unmanaged` light
 /// single-shot hosted `curl` call when the resolved profile targets a
 /// remote endpoint (`radio-router`'s own role manifest is already
 /// tool-less, `tool_palette.allow: []`, so no role override is needed).
@@ -12873,57 +12873,79 @@ fn an_unregistered_endpoint_budget_policy_is_refused_by_every_dispatching_entry_
     assert!(!String::from_utf8_lossy(&out.stderr).contains("refusing to start: bad config"));
 }
 
-/// (#2902 step 5, operator 2026-09-27) The per-step cap has `off` and
-/// `warn` only: `wait` is refused at preflight by every dispatching entry
-/// point, naming the valid values.
+/// (#3035) Endpoint limits that cannot work are refused at preflight by every
+/// dispatching entry point, naming the endpoint and the reason: a `wait`
+/// policy with no rolling window (a dispatch's own cap has nothing that frees
+/// room), and `concurrent_calls` on a managed endpoint (the scheduler owns
+/// its parallelism).
 #[test]
-fn a_step_budget_policy_of_wait_is_refused_at_preflight() {
+fn endpoint_limits_that_cannot_work_are_refused_at_preflight() {
     let empty_path = TempDir::new().unwrap();
-    for args in [&["dispatch", "code-reviewer", "hello"][..], &["mission", "launch", "review", "--dry-run"][..]] {
-        let out = darkmux_std_cmd()
-            .env("PATH", empty_path.path())
-            .env("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "wait")
-            .args(args)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "{args:?}: {stderr}");
-        assert!(stderr.contains("refusing to start: bad config") && stderr.contains("`wait`"), "{args:?}: {stderr}");
-        assert!(stderr.contains("off") && stderr.contains("warn"), "{args:?}: {stderr}");
+    let reg_dir = TempDir::new().unwrap();
+    let profiles = reg_dir.path().join("profiles.json");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            r#"{"url":"https://h.example/v1","limits":{"tokens_per_dispatch":5,"policy":"wait"}}"#,
+            "endpoints.azure.limits",
+            "window",
+        ),
+        (r#"{"managed":"lmstudio","limits":{"concurrent_calls":2}}"#, "endpoints.azure.limits", "scheduler"),
+    ];
+    for (endpoint, where_, why) in cases {
+        std::fs::write(
+            &profiles,
+            format!(r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":4096}}]}}}},"endpoints":{{"azure":{endpoint}}}}}"#),
+        )
+        .unwrap();
+        for args in [&["dispatch", "code-reviewer", "hello"][..], &["mission", "launch", "review", "--dry-run"][..]] {
+            let out = darkmux_std_cmd()
+                .env("PATH", empty_path.path())
+                .env("DARKMUX_PROFILES", &profiles)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{args:?}: {stderr}");
+            assert!(stderr.contains("refusing to start: bad config"), "{args:?}: {stderr}");
+            assert!(stderr.contains(where_) && stderr.contains(why), "{args:?} ({endpoint}): {stderr}");
+        }
     }
 }
 
-/// (#2902 step 5) The renamed per-step cap key is refused by `config set`,
-/// naming the new key, through the real binary.
+/// (#3035) The retired `remote.*` keys are refused by `config set`, naming the
+/// `endpoints.<id>.limits` field that replaced each, through the real binary.
 #[test]
-fn config_set_refuses_the_renamed_per_execution_key() {
-    let out = darkmux_cmd()
-        .args(["config", "set", "remote.max_tokens_per_execution", "5000"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("`remote.max_tokens_per_execution` was renamed to `remote.max_tokens_per_step` in 4.0"),
-        "{stderr}"
-    );
+fn config_set_refuses_the_retired_remote_keys_naming_the_endpoint_limit() {
+    for (key, field) in [
+        ("remote.max_tokens_per_execution", "limits.tokens_per_dispatch"),
+        ("remote.max_tokens_per_step", "limits.tokens_per_dispatch"),
+        ("remote.step_budget_policy", "limits.policy"),
+        ("remote.concurrent_cap", "limits.concurrent_calls"),
+    ] {
+        let out = darkmux_cmd().args(["config", "set", key, "5000"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{key}: {stderr}");
+        assert!(stderr.contains(key) && stderr.contains(field), "{key}: {stderr}");
+    }
 }
 
-/// A renamed or retired setting's env var, still set, is refused at CLI entry
-/// like any other bad config: the pre-4.0 per-execution cap (renamed) and
-/// `DARKMUX_CREW_DIR` (retired) each name their replacement.
+/// A retired setting's env var whose silent loss would change behavior, still
+/// set, is refused at CLI entry like any other bad config: `DARKMUX_CREW_DIR`
+/// names its replacement.
 #[test]
 fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
     let cases = [
+        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 4.0"),
+        // (#3035) Ignoring a spend cap would remove the cap, so these refuse.
+        ("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "env var DARKMUX_REMOTE_MAX_TOKENS_PER_STEP (/x) is refused: removed in 5.0"),
         (
             "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
-            "env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is refused: renamed to `remote.max_tokens_per_step`",
+            "env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (/x) is refused: removed in 5.0",
         ),
-        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 4.0"),
     ];
     for (var, says) in cases {
         let empty_path = TempDir::new().unwrap();
-        let value = if var == "DARKMUX_CREW_DIR" { "/x" } else { "500000" };
+        let value = "/x";
         let out = darkmux_std_cmd()
             .env("PATH", empty_path.path())
             .env(var, value)
@@ -12940,12 +12962,18 @@ fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
 /// (operator, 2026-10-01) A retired env var that nothing reads and whose
 /// absence loses nothing (`DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`)
 /// is a warning, not a refusal: the command runs and says once, on stderr,
-/// that the variable is ignored and what to do. A leftover whose silent loss
-/// would change behavior (a renamed cap, the state-location `DARKMUX_CREW_DIR`)
-/// still refuses (the tests above and below).
+/// that the variable is ignored and what to do (the `DARKMUX_REMOTE_*` limits
+/// 5.0 moved to each endpoint are among them, #3035). A leftover whose silent
+/// loss would change behavior (the state-location `DARKMUX_CREW_DIR`) still
+/// refuses (the tests above and below).
 #[test]
 fn a_harmless_retired_env_var_warns_and_the_command_runs() {
-    for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+    for var in [
+        "DARKMUX_NOTEBOOK_DIR",
+        "DARKMUX_RADIO_ROUTER_PROFILE",
+        "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
+        "DARKMUX_REMOTE_CONCURRENT_CAP",
+    ] {
         let out = darkmux_std_cmd().env(var, "/x").args(["role", "list"]).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{var} must not refuse: {stderr}");

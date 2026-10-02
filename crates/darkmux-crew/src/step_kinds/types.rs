@@ -1,13 +1,12 @@
 //! `StepKind` trait + `StepOutcome` — the step-kind execution contract.
 
-use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
 use darkmux_types::session_id::{RunId, SessionId, SessionScope};
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// (#1442, ship-2b probe/verify retirement) One dispatch a `dispatch.map`
 /// item is about to make, surfaced to the scheduler-supplied
@@ -93,10 +92,7 @@ pub type MapDispatchOverride =
 ///   per graph run (not once per step) and handed to every step by
 ///   reference through [`StepRunCtx::artifact`]. Use this for state that
 ///   must be visible to and mutated by MULTIPLE steps across the same run
-///   — an accumulator, a shared counter, a scratch collection — the same
-///   shape `RemoteBudget`'s `bucket_group` already proves out for the
-///   one case that exists today (see the module doc note on why that
-///   mechanism is NOT retrofitted onto this bus in this packet). Carries a
+///   — an accumulator, a shared counter, a scratch collection. Carries a
 ///   `factory` the scheduler calls (at most once per name, per run) to
 ///   MATERIALIZE the artifact without needing to know its concrete type —
 ///   see [`ArtifactBus::materialize`].
@@ -110,7 +106,7 @@ pub type MapDispatchOverride =
 /// [`StepKind::provides`]/[`StepKind::requires`] stays a zero-cost empty
 /// slice rather than an allocated empty `Vec`. A future artifact that
 /// genuinely needs a runtime-captured factory (e.g. a budget value read
-/// from config, the shape `RemoteBudget` needs) is exactly the case
+/// from config) is exactly the case
 /// that stays OUTSIDE this mechanism — see the module doc note below.
 #[derive(Clone, Copy)]
 pub struct Port {
@@ -155,9 +151,7 @@ pub enum PortKind {
 /// per graph run, on the scheduler's MAIN thread, BEFORE any wave's workers
 /// spawn — `run_step_graph` scans every step kind actually present in the
 /// graph, calls [`Port::artifact`]'s factory for each declared
-/// [`PortKind::Artifact`] port (get-or-create by name, mirroring the
-/// proven `bucket_groups` discipline that same function already uses for
-/// `dispatch.map`'s `bucket_group` — see that call site), and wraps the
+/// [`PortKind::Artifact`] port (get-or-create by name), and wraps the
 /// result in an `Arc` shared by reference into every step's [`StepRunCtx`]
 /// for the WHOLE run.
 ///
@@ -169,11 +163,7 @@ pub enum PortKind {
 /// `BTreeMap`'s key set is closed before it ever crosses a thread
 /// boundary, and each entry's own concurrency (if any — e.g. an
 /// `Arc<Mutex<Vec<_>>>` artifact) is the CONCRETE type's own concern, not
-/// the bus's. Contrast with `RemoteBudget`'s `bucket_group` map, which
-/// stays mutable across the whole run (a NEW group name can appear in a
-/// later wave) and is therefore resolved per-step, inline in the main
-/// loop, rather than pre-scanned like this bus — see the module doc note
-/// for why that mechanism is not unified with this one in this packet.
+/// the bus's.
 #[derive(Default)]
 pub struct ArtifactBus {
     entries: BTreeMap<&'static str, Arc<dyn Any + Send + Sync>>,
@@ -190,9 +180,7 @@ impl ArtifactBus {
     /// Get-or-create the named artifact, calling `factory` only the FIRST
     /// time `name` is seen (idempotent re-registration — two step kinds
     /// that happen to declare the SAME `Artifact` port name share the one
-    /// instance, the same "first declaration wins" semantics
-    /// `bucket_groups`' `.entry(...).or_insert_with(...)` already
-    /// establishes for bucket groups). Intended to be called only from the
+    /// instance, "first declaration wins"). Intended to be called only from the
     /// scheduler's pre-wave-loop scan, on the main thread.
     pub fn materialize(&mut self, name: &'static str, factory: fn() -> Arc<dyn Any + Send + Sync>) {
         self.entries.entry(name).or_insert_with(factory);
@@ -255,12 +243,6 @@ impl ArtifactBus {
 ///    NEVER touches the global flow sink directly: the scheduler owns the
 ///    sink (and the lab/fleet boundary that picks WHICH sink), so routing
 ///    through this channel preserves that boundary.
-/// 2. **Scheduler-supplied shared remote bucket (#1442).** When a step
-///    names a `bucket_group`, the scheduler resolves the group's shared
-///    [`RemoteBudget`] and hands it here; sibling steps of the same group
-///    meter one allowance BETWEEN them. `None` when the step named no group
-///    (the kind falls back to a step-scoped bucket). Deliberately NOT
-///    unified with seam 4 below — see [`ArtifactBus`]'s doc for why.
 /// 3. **The caller-supplied dispatch interceptor** for `dispatch.map` items
 ///    (`None` on every production path — see [`MapDispatchOverride`]).
 /// 0. **The run this step belongs to.** Every session a step's records
@@ -277,7 +259,6 @@ impl ArtifactBus {
 pub struct StepRunCtx {
     run: RunId,
     emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
-    remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
     dispatch_override: Option<MapDispatchOverride>,
     artifacts: Arc<ArtifactBus>,
 }
@@ -352,23 +333,21 @@ impl StepRunCtx {
     /// `StepKind::run` directly with a hand-built context rather than only
     /// through a full `run_step_graph` call. Every production caller still
     /// goes through `run_step_graph`, which is the only place that assembles
-    /// the OTHER scheduler-owned seams (the live emitter, a `bucket_group`'s
-    /// shared bucket) correctly.
+    /// the OTHER scheduler-owned seams (the live emitter) correctly.
     pub fn new(
         run: RunId,
         emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
-        remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
         dispatch_override: Option<MapDispatchOverride>,
         artifacts: Arc<ArtifactBus>,
     ) -> Self {
-        Self { run, emitter, remote_bucket, dispatch_override, artifacts }
+        Self { run, emitter, dispatch_override, artifacts }
     }
 
-    /// A context in `run` with no emitter, no shared bucket, no dispatch
+    /// A context in `run` with no emitter, no dispatch
     /// interceptor and an empty [`ArtifactBus`]: a step run on its own,
     /// outside a scheduler.
     pub fn solo(run: RunId) -> Self {
-        Self::new(run, None, None, None, Arc::new(ArtifactBus::new()))
+        Self::new(run, None, None, Arc::new(ArtifactBus::new()))
     }
 
     /// This context when it streams live (the scheduler's, which has an
@@ -414,14 +393,6 @@ impl StepRunCtx {
         }
     }
 
-    /// The scheduler-supplied shared remote-token bucket for this step's
-    /// `bucket_group`, if the step named one. A grouped `dispatch.map` uses
-    /// THIS across its whole collection loop; an ungrouped one gets `None`
-    /// here and creates its own step-scoped bucket.
-    pub fn remote_bucket(&self) -> Option<&Arc<Mutex<RemoteBudget>>> {
-        self.remote_bucket.as_ref()
-    }
-
     /// The caller-supplied dispatch interceptor for `dispatch.map` items —
     /// `None` on every production path (see [`MapDispatchOverride`]).
     pub fn dispatch_override(&self) -> Option<&MapDispatchOverride> {
@@ -465,6 +436,67 @@ pub struct StepOutcome {
     pub degraded: Option<String>,
 }
 
+/// (#3035) The endpoint a call claims and how many calls to it may run at
+/// once: its `limits.concurrent_calls`, and one at a time when it declares
+/// none (darkmux never guesses a number). Calls to different endpoints do
+/// not wait on each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointSlot {
+    key: String,
+    concurrent_calls: Option<u32>,
+}
+
+impl EndpointSlot {
+    /// A slot for the endpoint `key` with the declared `concurrent_calls`.
+    pub fn new(key: impl Into<String>, concurrent_calls: Option<u32>) -> Self {
+        Self { key: key.into(), concurrent_calls }
+    }
+
+    /// The slot `ep` claims: keyed by its `endpoints` id (an inline endpoint,
+    /// which has none, by its URL), carrying its declared `concurrent_calls`.
+    pub fn of(ep: &darkmux_types::ModelEndpoint) -> Self {
+        let key = ep
+            .named_id()
+            .map(str::to_string)
+            .or_else(|| ep.url.clone())
+            .unwrap_or_else(|| "(unnamed endpoint)".to_string());
+        Self::new(key, ep.known_limits().and_then(|l| l.concurrent_calls))
+    }
+
+    /// The slot of a step whose endpoint could not be resolved: `run` refuses
+    /// it with the reason, and until then it waits its turn alone.
+    pub fn unresolved() -> Self {
+        Self::new("(unresolved endpoint)", None)
+    }
+
+    /// The slot the unresolved-local-seat fail-open claims (#1509): one at a
+    /// time, in a batch of its own. Not an endpoint, so it is never noted.
+    pub fn unresolved_local() -> Self {
+        Self::new("(unresolved local seat)", None)
+    }
+
+    /// True for a real endpoint's slot, false for the fail-open slots.
+    pub fn is_endpoint(&self) -> bool {
+        !self.key.starts_with('(')
+    }
+
+    /// The endpoint's id (or URL), for messages and grouping.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The declared `limits.concurrent_calls`, when there is one.
+    pub fn declared(&self) -> Option<u32> {
+        self.concurrent_calls
+    }
+
+    /// How many of this endpoint's calls run at once: the declared number
+    /// (`0` is unbounded, the darkmux bound convention), else one.
+    pub fn width(&self) -> usize {
+        self.concurrent_calls.map_or(1, |n| darkmux_types::config_access::jobs_at_once(n as usize))
+    }
+}
+
 /// (#2394) What ONE step consumes — the exhaustive classification
 /// [`StepKind::seat`] returns and the scheduler dispatches on. This is the
 /// polymorphic replacement for `residency() -> Option<Placement>`, whose
@@ -484,15 +516,17 @@ pub enum SeatClaim {
     /// residency lease keeps a concurrent darkmux command's `Exclusive`
     /// reconcile from evicting it mid-generation.
     LocalModel(darkmux_gestalt::Placement),
-    /// A HOSTED endpoint seat. Consumes zero local pool (#1177/#1260),
-    /// never reaches gestalt's planner, bounded only by
-    /// `remote.concurrent_cap` — which is what that cap is FOR.
-    RemoteEndpoint,
+    /// A call to an endpoint darkmux does NOT manage (#3035: the axis is
+    /// managed or not, never "remote"). Consumes zero local pool
+    /// (#1177/#1260), never reaches gestalt's planner, bounded by that
+    /// endpoint's own `limits.concurrent_calls`: absent, its calls run one
+    /// at a time.
+    UnmanagedEndpoint(EndpointSlot),
     /// This step runs NO model at all: `procedural.shell`,
     /// `procedural.noop`, `mods.gate`, `records.gather`,
     /// `deliver.github_review`, the crawl planners, every render/collect
     /// half that only shuffles data. Bounded by its own
-    /// `runtime.dispatch_free_concurrency`, never by the endpoint cap —
+    /// `runtime.dispatch_free_concurrency`, never by an endpoint's limit —
     /// each such step is already individually bounded by
     /// `runtime.step_command_timeout_seconds`.
     ///
@@ -506,7 +540,7 @@ pub enum SeatClaim {
     /// active profile, a local model with no declared `n_ctx`. #1509's
     /// fail-open, now NAMED instead of silent.
     ///
-    /// Scheduled like a remote seat (its historical behavior, unchanged),
+    /// Scheduled one at a time (its historical behavior, unchanged),
     /// but never quietly: the scheduler `eprintln!`s and emits a `Warn`
     /// flow record naming the step and `reason`, because this dispatch
     /// meant to be local and just lost its #1487 lease protection — a
@@ -524,7 +558,7 @@ impl SeatClaim {
         use darkmux_flow::payload::SeatClass;
         match self {
             SeatClaim::LocalModel(_) => SeatClass::LocalModel,
-            SeatClaim::RemoteEndpoint => SeatClass::RemoteEndpoint,
+            SeatClaim::UnmanagedEndpoint(_) => SeatClass::UnmanagedEndpoint,
             SeatClaim::NoModel => SeatClass::NoModel,
             SeatClaim::LocalModelUnresolved { .. } => SeatClass::LocalModelUnresolved,
         }
@@ -544,7 +578,7 @@ impl SeatClaim {
 /// and worse, in a scheduler test the SAME process-global is shared by
 /// every one of a wave's concurrently-dispatched sibling steps (#2577:
 /// `scheduler::tests::dispatch_free_siblings_do_not_serialize_behind_the_
-/// remote_cap` runs four of these on four worker threads at once). #2532
+/// a_serial_endpoint` runs four of these on four worker threads at once). #2532
 /// fixed `procedural.shell` itself: resolve a documented tier chain
 /// (`step_kinds::builtins::resolve_shell_cwd`) and refuse loudly, naming
 /// the tier, when nothing resolves. This enum is the DECLARATION half of
@@ -621,8 +655,8 @@ pub enum CwdPolicy {
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
     /// Run the step. `ctx` is what the scheduler supplies from outside the
-    /// step: the run it belongs to, the live emitter, a `bucket_group`'s
-    /// shared remote bucket, the dispatch interceptor and the run-scoped
+    /// step: the run it belongs to, the live emitter, the dispatch
+    /// interceptor and the run-scoped
     /// [`ArtifactBus`] (see [`StepRunCtx`]). A kind that emits nothing live
     /// and dispatches nothing ignores it.
     ///
@@ -684,7 +718,7 @@ pub trait StepKind: Send + Sync {
     /// anything was classified as a remote model dispatch. #2394 is what
     /// that cost live: six independent `procedural.shell` waits, none of
     /// which speaks to a model, executed strictly one at a time behind a
-    /// `remote_cap: 1` meant to protect a hosted endpoint — up to 54
+    /// a one-at-a-time cap meant to protect a hosted endpoint — up to 54
     /// minutes for a 9-minute window.
     ///
     /// The four claims, and what the scheduler does with each:
@@ -692,16 +726,17 @@ pub trait StepKind: Send + Sync {
     /// - [`SeatClaim::LocalModel`] — gestalt-wave-planned and #1487
     ///   lease-protected; the wave loader makes the [`darkmux_gestalt::
     ///   Placement`] resident before the step runs.
-    /// - [`SeatClaim::RemoteEndpoint`] — a hosted endpoint; consumes zero
-    ///   local pool, never reaches gestalt's planner, bounded by
-    ///   `remote.concurrent_cap`.
+    /// - [`SeatClaim::UnmanagedEndpoint`] — an endpoint darkmux does not
+    ///   manage; consumes zero local pool, never reaches gestalt's planner,
+    ///   bounded by that endpoint's `limits.concurrent_calls` (one at a
+    ///   time when it declares none).
     /// - [`SeatClaim::NoModel`] — dispatch-free. Bounded by its OWN
     ///   `runtime.dispatch_free_concurrency` (these are shell/store
     ///   operations, already bounded individually by
-    ///   `runtime.step_command_timeout_seconds`), never by the endpoint cap.
+    ///   `runtime.step_command_timeout_seconds`), never by an endpoint's limit.
     /// - [`SeatClaim::LocalModelUnresolved`] — a local seat whose placement
-    ///   could not be resolved (#1509's fail-open). Runs under the remote
-    ///   cap as it always has, but LOUDLY: the scheduler `eprintln!`s and
+    ///   could not be resolved (#1509's fail-open). Runs one at a time,
+    ///   but LOUDLY: the scheduler `eprintln!`s and
     ///   emits a `Warn` flow record naming the step and the reason, because
     ///   this dispatch just lost its residency-lease protection.
     ///

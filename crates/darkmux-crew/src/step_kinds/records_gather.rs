@@ -134,7 +134,7 @@ impl StepKind for RecordsGatherStepKind {
     /// (#2394) [`SeatClaim::NoModel`] — this kind reads records out of the flow store; it
     /// dispatches nothing. Bounded by `runtime.dispatch_free_concurrency`
     /// and, per command, by `runtime.step_command_timeout_seconds` — never
-    /// by the hosted-endpoint cap.
+    /// by an endpoint's concurrency limit.
     fn seat(
         &self,
         _step: &Step,

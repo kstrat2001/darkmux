@@ -66,7 +66,7 @@ If 3.x must keep running, upgrade a copy instead of the live home. Copy it (as i
 
 ## Step 2: The shell rc and open shells
 
-A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #2913) is the common one; `DARKMUX_CREW_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` are refused the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
+A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #2913) is the common one; `DARKMUX_CREW_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` are refused the same way. `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` and `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` are refused too (ignoring a spend cap would remove it); `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP` only warn and are ignored. Their limits moved to the endpoint (step 4d); remove all four exports the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
 
 1. Find the `export` line in the user's shell rc (`~/.zshrc`, `~/.bashrc`, or a file it sources) and remove it with the Edit tool. It is the user's file: show the line you removed. If they use the same name for something outside darkmux, say so and let them decide. **If 3.x keeps running on this machine, leave the export in place** (3.x still reads it) and prefix each new-binary command with `env -u DARKMUX_NOTEBOOK_DIR` instead.
 2. **Trap: an already-open shell keeps the old value.** The new binary refuses to start in that shell even after the rc is fixed. Open a new terminal, run `unset DARKMUX_NOTEBOOK_DIR` in the current one, or prefix commands with `env -u DARKMUX_NOTEBOOK_DIR`. Re-sourcing `.zshrc` may print harmless `compdef` noise.
@@ -80,6 +80,7 @@ A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #
 | `dirs.notebook` | Retired in 4.0 (#2913). The notebook verbs are gone. |
 | `orchestrator` | Removed in #1766; `init` wrote it before 1.8. |
 | `role_profiles.radio-router` | No effect since 4.0 (#2914); radio routing runs on `internal.utility`. |
+| `remote` (the whole block) | Retired in 5.0 (#3035): limits live on the endpoint, and nothing is carried over. Do step 4d first if the user ever set a number there, then delete the block. 3.x's `init` wrote it into every config. |
 
 Drop `dirs` if it becomes empty. Other retired keys have their fix in doctor's message: apply exactly what it names. Three of them are moves or respellings rather than deletions:
 
@@ -159,7 +160,25 @@ jq 'del(.hooks, .crews) | del(.profiles[].models[].role)' profiles.json > profil
 
 Any other key doctor names as unknown: it prints the closest valid key. Rename or delete exactly as it says.
 
-After this step, `darkmux doctor` should load `profiles.json`. If a row still fails, read it and repeat 4a to 4c for what it now names.
+### 4d. The `remote` limits move to the endpoint
+
+5.0 retired the `remote` block in `config.json` (`remote.max_tokens_per_step`, `remote.max_tokens_per_execution`, `remote.step_budget_policy`, `remote.concurrent_cap`) because "remote" was the wrong axis: a local server on the same machine is an endpoint too. The limits are written per endpoint in `profiles.json`, and **nothing is carried over**: they are off until set.
+
+| Old setting | New field, on `endpoints.<id>` |
+|---|---|
+| `remote.max_tokens_per_step` / `remote.max_tokens_per_execution` | `limits.tokens_per_dispatch` (per dispatch, one role execution, not per step) |
+| `remote.step_budget_policy` | `limits.policy` (`off`, `warn`, `wait`; `wait` needs a `limits.window`) |
+| `remote.concurrent_cap` | `limits.concurrent_calls`, on an endpoint with a `url` only (absent, its calls run one at a time; on a `managed` endpoint the field is refused) |
+
+**Judgment: whether to set anything, and on which endpoint.** Read the `remote` block in the user's `config.json`. If every value is `null`, absent, or `concurrent_cap: 1` (the 3.x defaults), there is nothing to move: delete the block. 3.x's own default of `max_tokens_per_execution: 500000` was a safety net, not a choice: say so and ask whether they want a cap on a billed endpoint. If they set a number deliberately, ask which endpoint it applies to (one number was machine-wide; limits are per endpoint) and write it:
+
+```bash
+jq --arg id "ENDPOINT-ID" --argjson n 500000 '.endpoints[$id].limits.tokens_per_dispatch = $n' profiles.json > profiles.json.new
+```
+
+A `dispatch.map` step's `bucket_group` or `bucket_budget` in a mission config is refused by name: delete the key, and use the endpoint's rolling `limits.window` for a whole-run budget.
+
+After this step, `darkmux doctor` should load `profiles.json`. If a row still fails, read it and repeat 4a to 4d for what it now names.
 
 ## Step 5: Lab runs
 
@@ -235,6 +254,6 @@ The retired-state failures should be gone. What remains falls into two groups; r
 - **Not an upgrade blocker, the user's call:** temp-directory residue, stale skills (`darkmux init` refreshes them), the roster's loopback address or identity, state-file permissions, legacy audit files, stray hook outboxes, a Redis password.
 - **A 3.x daemon still consuming the retired queue:** the row `retired work queue` fails while one is. The consumer can be another machine, or this machine's own 3.x daemon: check the consumer names in the row, and stopping this machine's 3.x `darkmux serve` is then the fix. Setting `redis.enabled` to false hides the row while the hole is still open, so do not use it to make the row go away.
 
-End with a short report: the backup path, each file changed, the judgments the user made (window size, endpoint ids), anything left as `LEFTOVERS`, and the `darkmux doctor` summary line. Do not paste any credential, machine uid, or tailnet name into it.
+End with a short report: the backup path, each file changed, the judgments the user made (window size, endpoint ids, endpoint limits), anything left as `LEFTOVERS`, and the `darkmux doctor` summary line. Do not paste any credential, machine uid, or tailnet name into it.
 
 To undo everything, restore from the backup: `mv -n "$ROOT" "$ROOT.failed"` then `cp -c -R "$ROOT.backup-<date>" "$ROOT"`. The user decides when the backup is deleted.

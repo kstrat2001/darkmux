@@ -271,11 +271,11 @@ pub(crate) fn dispatch_reconciled_with(
         }
         // A hosted-endpoint seat never touches local residency — nothing
         // to reconcile, exactly as `resolve_local_seat`'s own doc states.
-        SeatClaim::RemoteEndpoint => local_dispatch(opts),
+        SeatClaim::UnmanagedEndpoint(_) => local_dispatch(opts),
         // `resolve_local_seat` never returns this variant (it always
-        // resolves to LocalModel/RemoteEndpoint/LocalModelUnresolved for a
+        // resolves to LocalModel/UnmanagedEndpoint/LocalModelUnresolved for a
         // role that dispatches at all) — matched for exhaustiveness, same
-        // fall-through as RemoteEndpoint.
+        // fall-through as UnmanagedEndpoint.
         SeatClaim::NoModel => local_dispatch(opts),
         // (#2394 fail-open, matching the scheduler's own handling of this
         // exact variant) A local seat we could not place still runs —
@@ -684,7 +684,7 @@ mod tests {
 
         let result = dispatch_reconciled_with(
             test_opts("radio-router"),
-            SeatClaim::RemoteEndpoint,
+            SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None)),
             |_opts| {
                 Ok(DispatchResult {
                     exit_code: 0,

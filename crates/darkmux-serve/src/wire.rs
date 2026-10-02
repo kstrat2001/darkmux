@@ -66,7 +66,6 @@ pub struct HealthResponse {
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct FleetBusy {
     pub policy: BusyPolicy,
-    pub hosted_cap: u32,
 }
 
 /// The live channel as this daemon runs it: the cadence knob and the ingest's
