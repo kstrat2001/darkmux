@@ -234,61 +234,20 @@ impl Default for LocalFileSink {
     }
 }
 
-/// The directory `LocalFileSink` resolves per write.
+/// The directory `LocalFileSink` resolves per write: exactly `flows_dir()`
+/// (`env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`).
 ///
-/// Production builds: exactly `flows_dir()` (env > config > default) —
-/// byte-identical behavior, this helper compiles down to that one call.
-///
-/// Test / `test-support` builds (#1355 review round): a test binary that
-/// never sets `DARKMUX_FLOWS_DIR` must NOT write into the operator's real
-/// `~/.darkmux/flows` day files through the process-global default sink.
-/// Measured before this gate existed: one `cargo test -p darkmux-lab` run
-/// leaked ~302 real flow records (205 `step result` work records with
-/// session_id "case-1" + 97 `telemetry.tokens` records) into the live
-/// fleet dashboard's day file — polluting the token odometer with mock
-/// dispatches whose `reply()` fixture bills 10 tokens each. This is the
-/// 4th+ recurrence of the leak class; per the structural-over-procedural
-/// doctrine the fix is by-construction here, NOT another per-test env
-/// guard (the OnceLock-pinned default sink makes env-guard ordering
-/// load-bearing and therefore fragile).
-///
-/// Resolution in test builds: a LIVE `DARKMUX_FLOWS_DIR` still wins,
-/// per write — the documented LocalFileSink contract ~9 downstream tests
-/// (binary `phase_cli`/`flow_cli`, crew) rely on via their FlowsDirGuard
-/// pattern. Only the FALLBACK tier changes: instead of the operator's
-/// real flows dir, a per-process temp dir
-/// (`$TMPDIR/darkmux-flow-test-<pid>`), created once per test binary.
-///
-/// (#2707) That directory used to be created here by hand and never
-/// removed, so every test process this repo has ever run left one
-/// behind — 8,263 of them on one developer machine, the single largest
-/// population in its temp root. The NAME is unchanged; only the
-/// ownership is. `process_scratch_dir` hands back the same
-/// `$TMPDIR/darkmux-flow-test-<pid>` and takes responsibility for
-/// removing it, at exit and — for a process that was killed before it
-/// could unwind — on the next test process's way in.
+/// Test / `test-support` builds need no branch of their own (#2101): the
+/// fallback tier of `flows_dir()` is already "a per-process scratch dir when
+/// the root would be the operator's real `~/.darkmux`, else `<root>/flows`"
+/// (`config_access::flows_dir_default`), so a test binary that sets nothing
+/// never touches the operator's real day files (the #1355 leak: one
+/// `cargo test -p darkmux-lab` run put ~302 mock-dispatch records into the
+/// live fleet dashboard), and a test scoped to a `DARKMUX_HOME` tempdir
+/// writes under it. The sink used to special-case that here with its own
+/// scratch dir, which ignored `DARKMUX_HOME` and made it the one `dirs.*`
+/// default the root did not scope.
 fn local_sink_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        // (#2643 fix-round, CONSIDER 5) A FOURTH flow-side resolver that
-        // bypasses `config_access::env_str` by construction — this read is
-        // the one DECIDING between the operator's real flows dir (via
-        // `flows_dir()`, itself already instrumented) and the per-process
-        // temp fallback below, so it has to be wired into the same
-        // `env_audit` sink directly, same as `redis_url`/`serve_token`/
-        // `hook_signing_secret` above. Missing this made the env-audit
-        // sweep blind to exactly the read that decides which of two
-        // directories a test's `LocalFileSink` writes land in.
-        darkmux_types::env_audit::audit_env_read("DARKMUX_FLOWS_DIR");
-        if std::env::var_os("DARKMUX_FLOWS_DIR").is_none() {
-            static DIR: OnceLock<PathBuf> = OnceLock::new();
-            return DIR
-                .get_or_init(|| {
-                    darkmux_types::test_isolation::process_scratch_dir("darkmux-flow-test")
-                })
-                .clone();
-        }
-    }
     flows_dir()
 }
 
@@ -1510,9 +1469,23 @@ impl RedisSink {
     pub fn max_len(&self) -> Option<usize> { self.max_len }
 }
 
+/// Whether a record rides the shared fleet stream (#2101). Heartbeats are
+/// local-only liveness detail: the local file sink keeps every one, but at a
+/// 2 s cadence they were most of a long mission's records and flushed other
+/// machines' work out of the capped stream. The fleet stream carries work
+/// records and machine telemetry; presence is a separate TTL key, and any
+/// other timed record (`dispatch.tool`, `dispatch.turn`) keeps a peer's run
+/// live. Used by the live write AND the outage backfill.
+pub(crate) fn reaches_fleet_stream(action: &FlowAction) -> bool {
+    *action != FlowAction::DispatchTurnHeartbeat
+}
+
 impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
+        if !reaches_fleet_stream(&record.action) {
+            return Ok(());
+        }
         // (#388) A sink that is not due to try skips silently: no connection
         // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -2397,6 +2370,38 @@ mod tests {
         assert!(!sink.note_failure(&e, TS));
     }
 
+    /// (#2101) A heartbeat never reaches the fleet stream; any other record
+    /// does. Observed through the sink's own failure accounting against an
+    /// unreachable hub: a record that is attempted fails (and counts toward
+    /// the disable threshold), one that is skipped never touches the hub.
+    #[test]
+    fn a_heartbeat_is_not_xadded_but_a_tool_record_is() {
+        let record = |action: FlowAction| {
+            let mut r = minimal_record();
+            r.action = action;
+            r.execution_id = Some(darkmux_types::execution_id::ExecutionId::mint());
+            r.session_id = Some("sess-2101".to_string());
+            r
+        };
+        let beat = unreachable_sink();
+        for _ in 0..3 {
+            let r = record(FlowAction::DispatchTurnHeartbeat);
+            let checked = CheckedRecord::check(&r).expect("a heartbeat is a valid record");
+            beat.persist(checked).unwrap();
+        }
+        assert!(!beat.is_disabled(), "skipped heartbeats must never attempt (or fail against) the hub");
+
+        let tool = unreachable_sink();
+        for _ in 0..3 {
+            let r = record(FlowAction::DispatchTool);
+            let checked = CheckedRecord::check(&r).expect("a tool record is valid");
+            tool.persist(checked).unwrap();
+        }
+        assert!(tool.is_disabled(), "a tool record is attempted, and 3 failures trip the sink");
+        assert!(!reaches_fleet_stream(&FlowAction::DispatchTurnHeartbeat));
+        assert!(reaches_fleet_stream(&FlowAction::MachineTelemetry));
+    }
+
     #[test]
     fn redis_sink_success_resets_failure_streak() {
         let sink = unreachable_sink();
@@ -3057,6 +3062,33 @@ mod tests {
         };
         assert_eq!(payload.dropped_action, "dispatch.complete");
         assert_eq!(payload.dropped_session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// (#2101) A test (or a launch) scoped to a scratch `DARKMUX_HOME`, with no
+    /// explicit flows dir, must have the local sink write under that root, not
+    /// in a process-scratch dir or the operator's real day file.
+    #[serial_test::serial]
+    #[test]
+    fn the_local_sink_writes_under_a_scoped_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_FLOWS_DIR");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = local_sink_dir();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(dir, tmp.path().join("flows"));
     }
 
     #[serial_test::serial]

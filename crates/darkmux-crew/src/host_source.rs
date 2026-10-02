@@ -575,6 +575,11 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          there builds a record",
     ),
     (
+        "crates/darkmux-flow/src/lib.rs",
+        "consumer: a test asks `reaches_fleet_stream` about `FlowAction::MachineTelemetry`, \
+         and nothing there builds a record",
+    ),
+    (
         "crates/darkmux-crew/src/host_source.rs",
         "this file — the registry itself. Its literals ARE the table, plus the scanner's own \
          fixtures; scanning it would classify the table as its own producer",

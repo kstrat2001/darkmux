@@ -116,7 +116,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           and `budget.*` records of that execution, and on nothing else;
 //           `FlowAction::grain` declares which actions those are, and no
 //           sink writes one without it. A resumed dispatch keeps its
-//           execution's id (recorded in its out-dir's `resume_origin.json`);
+//           execution's id (recorded in the host-only `<out-dir>.resume_origin.json`);
 //           a specialist change is a new execution. A `dispatch.map` step no
 //           longer writes a `dispatch.*` pair around the whole step: each
 //           item writes its own, with `payload.item_index`. A record of a

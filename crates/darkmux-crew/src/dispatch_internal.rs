@@ -665,7 +665,7 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// It is left as-is regardless, because the branch is unreachable: a
 /// no-`--workdir` resume can never succeed at all, collision or not. The
 /// gate compares this dispatch's workspace path against the `workspace`
-/// string the PRIOR run stamped into its own `RESUME_ORIGIN_FILENAME`, and
+/// string the PRIOR run stamped into its own host-only origin record, and
 /// that prior auto-tempdir carries the PRIOR run's `unix_micros` — never
 /// this one's — so every no-`--workdir` resume ends in RESUME WORKSPACE
 /// MISMATCH. `--resume-from` is therefore usable only alongside `--workdir`,
@@ -895,8 +895,8 @@ pub(crate) fn validate_resume_checkpoint_content(
 /// prompt-injected model write access it never had. The host has no
 /// free way to know the ORIGINAL run's mount mode from `resume_from`
 /// alone, so `write_resume_origin_meta` stamps it into every dispatch's
-/// OWN `host_out` at creation time (`RESUME_ORIGIN_FILENAME`); this reads
-/// it back from `resume_from` and refuses — never guesses — when it's
+/// OWN host-only origin record at creation time ([`resume_origin_path`]); this
+/// reads it back from beside `resume_from` and refuses — never guesses — when it's
 /// missing, unparseable, names a different workspace path, or would
 /// upgrade a read-only origin to read-write. `dispatch()` passes
 /// `intended_workspace` here (the NOT-YET-CREATED path `workspace`
@@ -918,20 +918,14 @@ pub(crate) fn validate_resume_checkpoint(
     let src = resume_from.join(CHECKPOINT_FILENAME);
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
-    let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
-    // (#2869) Same no-follow read as the checkpoint: this file sits in the
-    // same model-writable out-dir.
-    let origin_contents = crate::contained_file::read_contained_to_string(
-        resume_from,
-        Path::new(RESUME_ORIGIN_FILENAME),
-        crate::contained_file::SMALL_FILE_MAX_BYTES,
-    )
-    .map_err(|e| {
+    let origin_path = resume_origin_path(resume_from);
+    let origin_contents = read_resume_origin(resume_from).map_err(|e| {
         resume_refusal!(
-            "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
-             no record of the workspace mount mode/path the checkpoint at {} was written \
-             under, and darkmux refuses to guess — resume only from a dir this host itself \
-             wrote the provenance file into",
+            "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read the host-only origin \
+             record {} ({e}); this host has no record of the workspace mount mode/path the \
+             checkpoint at {} was written under (a run from before 5.0 kept it inside the \
+             model-writable out-dir, which darkmux no longer trusts), so it refuses to \
+             guess. Start the dispatch fresh instead of resuming it",
             origin_path.display(),
             src.display()
         )
@@ -988,15 +982,145 @@ pub(crate) fn write_staged_resume_checkpoint(contents: &str, new_host_out: &Path
         .with_context(|| format!("writing staged resume checkpoint to {}", dest.display()))
 }
 
-/// (Security audit, #2114 resume follow-up) Filename `write_resume_origin_meta`
-/// writes into EVERY dispatch's `host_out` at creation time, naming the
-/// workspace path + mount mode THIS run used — the host-held record
-/// `validate_resume_checkpoint` reads back from `resume_from` on a LATER
-/// resume attempt, so it never has to guess. Lives alongside
-/// `checkpoint.json` in the same out-dir (never copied forward into a
-/// resumed dispatch's own fresh `host_out` — only read in place from the
-/// PRIOR dir).
-pub(crate) const RESUME_ORIGIN_FILENAME: &str = "resume_origin.json";
+/// Full path of the host-only resume-origin record for `out_dir`: BESIDE the
+/// out-dir (`<out-dir>.resume_origin.json`, in its parent), never inside it.
+/// The out-dir is bind-mounted read-write at `/darkmux-out`, so a record
+/// inside it is model-writable and a model could flip `workspace_read_only`
+/// to talk the resume gate (and the operator-facing resume hint) into a
+/// read-write mount (#2972). Nothing reads the old in-out-dir
+/// `resume_origin.json`: a checkpoint with no sibling record is refused for
+/// resume. The ONE place the path is derived is
+/// `darkmux_types::paths::resume_origin_record_path`; the writer and every
+/// reader go through this wrapper.
+pub(crate) fn resume_origin_path(out_dir: &Path) -> PathBuf {
+    darkmux_types::paths::resume_origin_record_path(out_dir)
+        .unwrap_or_else(|| out_dir.join(darkmux_types::paths::RESUME_ORIGIN_SUFFIX))
+}
+
+/// Read the host-only resume-origin record: no-follow, size-capped, and
+/// refused unless the current user owns it (the parent may be a shared temp
+/// dir another local user can write to).
+fn read_resume_origin(out_dir: &Path) -> std::result::Result<String, crate::contained_file::ContainedFileError> {
+    read_resume_origin_owned_by(out_dir, current_euid())
+}
+
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    Some(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn current_euid() -> Option<u32> {
+    None
+}
+
+/// [`read_resume_origin`] with the expected owner injected (tests cannot
+/// chown a file to another uid without privilege). `None` skips the check.
+fn read_resume_origin_owned_by(
+    out_dir: &Path,
+    owner: Option<u32>,
+) -> std::result::Result<String, crate::contained_file::ContainedFileError> {
+    use crate::contained_file::ContainedFileError;
+    use std::io::Read;
+    let path = resume_origin_path(out_dir);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ContainedFileError::NotFound);
+    };
+    let mut file = crate::contained_file::open_contained(parent, Path::new(name))?;
+    #[cfg(unix)]
+    if let Some(want) = owner {
+        use std::os::unix::fs::MetadataExt;
+        let have = file.metadata()?.uid();
+        if have != want {
+            return Err(ContainedFileError::Refused(format!(
+                "`{}` is owned by uid {have}, not uid {want}; not a record this user wrote",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    let cap = crate::contained_file::SMALL_FILE_MAX_BYTES;
+    if file.metadata()?.len() > cap {
+        return Err(ContainedFileError::Refused(format!("`{}` exceeds the {cap}-byte read cap", path.display())));
+    }
+    let mut body = String::new();
+    (&mut file)
+        .take(cap + 1)
+        .read_to_string(&mut body)
+        .map_err(ContainedFileError::Io)?;
+    if body.len() as u64 > cap {
+        return Err(ContainedFileError::Refused(format!("`{}` exceeds the {cap}-byte read cap", path.display())));
+    }
+    Ok(body)
+}
+
+/// Write `bytes` at `path` without following a symlink planted there: an
+/// exclusive (`O_EXCL`, mode 0600) temp file beside it, then a rename, which
+/// replaces whatever is at `path` (a stale record or a planted symlink)
+/// rather than writing through it.
+fn write_private_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = opts.open(&tmp).and_then(|mut f| f.write_all(bytes)).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Refusals decided from the assembled container config, before docker runs:
+/// the image reference, and (#2972) that no mount can reach the host-only
+/// resume record.
+fn preflight_docker_config(config: &DockerRunConfig) -> Result<()> {
+    validate_image_ref(&config.image)?;
+    refuse_origin_record_in_mounts(config)
+}
+
+/// (#2972) The structural guarantee: the host-only record must not sit
+/// inside anything the container mounts (workspace, out-dir, mod attachments,
+/// cache, injected runtime binary), or the record is model-writable again.
+/// `Err` names the record and the mount that would expose it.
+pub(crate) fn refuse_origin_record_in_mounts(config: &DockerRunConfig) -> Result<()> {
+    let mut mounts: Vec<(&str, &Path)> = vec![("workspace", &config.workspace), ("out-dir", &config.host_out)];
+    mounts.extend(config.mod_attachment_mounts.iter().map(|(p, _)| ("mod attachment", p.as_path())));
+    if let Some(cache) = &config.cache_dir {
+        mounts.push(("cache", cache));
+    }
+    if let (true, Some(bin)) = (config.inject, &config.runtime_binary) {
+        mounts.push(("injected runtime binary", bin));
+    }
+    origin_record_exposed_by(&config.host_out, &mounts)
+}
+
+fn origin_record_exposed_by(out_dir: &Path, mounts: &[(&str, &Path)]) -> Result<()> {
+    let record = resume_origin_path(out_dir);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let record_canon = match (record.parent(), record.file_name()) {
+        (Some(parent), Some(name)) => canon(parent).join(name),
+        _ => record.clone(),
+    };
+    for (label, mount) in mounts {
+        if record_canon.starts_with(canon(mount)) {
+            bail!(
+                "darkmux dispatch: the host-only resume record {} would sit inside the {label} mount {}, \
+                 which the container can write; refusing to dispatch. Choose a --workdir (and out-dir) \
+                 that does not contain the out-dir's parent directory",
+                record.display(),
+                mount.display()
+            );
+        }
+    }
+    Ok(())
+}
 
 /// (Security audit, #2114 resume follow-up) Stamp this dispatch's
 /// workspace path + read-only mode into its own `host_out`, unconditionally
@@ -1050,10 +1174,10 @@ pub(crate) fn write_resume_origin_meta(
         "image": image,
         "execution_id": execution,
     });
-    let path = host_out.join(RESUME_ORIGIN_FILENAME);
+    let path = resume_origin_path(host_out);
     match serde_json::to_vec_pretty(&body) {
         Ok(bytes) => {
-            if let Err(e) = fs::write(&path, bytes) {
+            if let Err(e) = write_private_no_follow(&path, &bytes) {
                 eprintln!(
                     "darkmux dispatch: ⚠ failed to write resume-origin metadata at {}: {e} \
                      (a future --resume-from this dir will refuse rather than guess)",
@@ -1068,20 +1192,21 @@ pub(crate) fn write_resume_origin_meta(
 }
 
 /// The execution a dispatch runs as. A resumed dispatch continues the one
-/// its checkpoint's out-dir recorded (in [`RESUME_ORIGIN_FILENAME`], beside
-/// the checkpoint: the runtime writes the checkpoint itself, inside the
-/// container, and knows no host identity); every other dispatch is a new
+/// its checkpoint's out-dir recorded (in the host-only record at
+/// [`resume_origin_path`]: the runtime writes the checkpoint itself, inside
+/// the container, and knows no host identity); every other dispatch is a new
 /// execution, as is a resume from a dir written before 4.0, which recorded
 /// none.
 pub(crate) fn execution_for(resume_from: Option<&Path>) -> ExecutionId {
     resume_from.and_then(recorded_execution).unwrap_or_else(ExecutionId::mint)
 }
 
-/// The execution `out_dir`'s resume-origin file names, when it names one.
-/// The file's content is model-controlled, so only a minted-grammar id is
-/// believed; anything else is refused with a note and the caller mints anew.
+/// The execution `out_dir`'s host-only resume-origin record names, when it
+/// names one. Only a minted-grammar id is believed (defense in depth; the
+/// record is host-written); anything else is refused with a note and the
+/// caller mints anew.
 fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
-    let origin: serde_json::Value = serde_json::from_str(&read_out_dir_text(out_dir, RESUME_ORIGIN_FILENAME)?).ok()?;
+    let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(out_dir).ok()?).ok()?;
     let named = origin.get("execution_id")?.as_str()?;
     match ExecutionId::parse_minted(named) {
         Ok(id) => Some(id),
@@ -1105,11 +1230,11 @@ fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
 /// RESUME WORKSPACE MOUNT ESCALATION without `--workspace-read-only`. A
 /// hint whose whole product is "here is how to continue" has to clear that
 /// gate, so it is built from the SAME file the gate reads —
-/// `<host_out>/resume_origin.json`, written by
+/// the host-only record at [`resume_origin_path`], written by
 /// [`write_resume_origin_meta`] at dispatch start — rather than from a
 /// separately-maintained idea of what this dispatch was doing.
 ///
-/// `resume_origin.json` missing or unreadable is the one case where no
+/// A missing or unreadable origin record is the one case where no
 /// valid command exists: the gate itself would refuse with RESUME ORIGIN
 /// UNKNOWN. The hint then says so plainly instead of printing a command
 /// that cannot work.
@@ -1117,24 +1242,23 @@ pub(crate) fn resume_hint_from_origin(
     host_out: &Path,
     role_id: &str,
 ) -> String {
-    let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
+    let origin = read_resume_origin(host_out)
+        .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     let Some(origin) = origin else {
         return format!(
-            "this run has no readable {} in {}, so `--resume-from` would refuse with RESUME \
-             ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once conditions \
-             look better",
-            RESUME_ORIGIN_FILENAME,
-            host_out.display()
+            "this run has no readable origin record at {}, so `--resume-from` would refuse with \
+             RESUME ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once \
+             conditions look better",
+            resume_origin_path(host_out).display()
         );
     };
     let Some(workspace) = origin.get("workspace").and_then(|v| v.as_str()) else {
         return format!(
-            "{} in {} names no `workspace`, so `--resume-from` would refuse with RESUME ORIGIN \
-             UNKNOWN — the run cannot be resumed; start a fresh dispatch once conditions look \
-             better",
-            RESUME_ORIGIN_FILENAME,
-            host_out.display()
+            "the origin record at {} names no `workspace`, so `--resume-from` would refuse with \
+             RESUME ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once \
+             conditions look better",
+            resume_origin_path(host_out).display()
         );
     };
     let read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -5829,7 +5953,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // arg. The `--` fence in build_docker_run_argv already prevents flag
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
-    validate_image_ref(&argv_config.image)?;
+    preflight_docker_config(&argv_config)?;
     let argv = build_docker_run_argv(&argv_config);
 
     // `build_docker_run_argv` returns a FULL command — the program (`docker`)
@@ -6888,22 +7012,10 @@ pub fn out_dir_trajectory(out_dir: &Path) -> darkmux_trajectory::TrajectoryFold 
         .unwrap_or_default()
 }
 
-/// (#2869) The read cap for an out-dir file: the small cap for the resume
-/// origin file, which the host parses whole and which is a few hundred
-/// bytes when genuine, the default for the streams (findings).
-fn out_dir_read_cap(rel: &str) -> u64 {
-    let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == RESUME_ORIGIN_FILENAME {
-        crate::contained_file::SMALL_FILE_MAX_BYTES
-    } else {
-        crate::contained_file::DEFAULT_MAX_BYTES
-    }
-}
-
 /// [`read_out_dir_text`] with the warning sink injected (tests capture it).
 pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&str)) -> Option<String> {
     use crate::contained_file::read_contained_to_string;
-    match read_contained_to_string(out_dir, Path::new(rel), out_dir_read_cap(rel)) {
+    match read_contained_to_string(out_dir, Path::new(rel), crate::contained_file::DEFAULT_MAX_BYTES) {
         Ok(body) => Some(body),
         Err(e) => {
             if e.is_refused() {
@@ -8374,7 +8486,7 @@ fn run_telemetry_sampler(
                          fan or active cooling on this machine, proximity to other hot machines, and \
                          airflow obstruction";
                     // (#2774 review F2) Built from this dispatch's OWN
-                    // `resume_origin.json` — the same file the resume gate
+                    // the host-only origin record — the same file the resume gate
                     // reads — so the command the operator pastes is one
                     // darkmux accepts. The earlier bare
                     // `--resume-from <dir>` form was refused by

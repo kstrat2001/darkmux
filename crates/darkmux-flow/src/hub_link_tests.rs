@@ -442,3 +442,23 @@ fn the_backfill_reads_two_days_and_keeps_only_the_newest_up_to_the_cap() {
         "a cap keeps the newest"
     );
 }
+
+/// (#2101) Backfill re-sends the local day file's records, but never the
+/// heartbeats: they are local-only liveness detail and would flush the stream.
+#[test]
+fn backfill_skips_heartbeats_and_still_sends_the_rest() {
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
+    // Written raw: the point is what the filter does with a day file's lines.
+    let line = |handle: &str, action: &str| {
+        serde_json::json!({"ts": ts_utc_at(now - 10), "action": action, "handle": handle}).to_string()
+    };
+    let body = [line("beat", "dispatch.turn.heartbeat"), line("tool", "dispatch.tool"), line("turn", "dispatch.turn")].join("\n");
+    std::fs::write(&today, body).unwrap();
+    let since = ts_utc_at(now - 60);
+    let lines = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.lines();
+    let handles: Vec<String> =
+        lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
+    assert_eq!(handles, ["tool", "turn"], "heartbeat skipped, the rest sent: {handles:?}");
+}

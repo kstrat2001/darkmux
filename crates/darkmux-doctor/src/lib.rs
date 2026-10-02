@@ -6089,6 +6089,9 @@ struct TempResidue {
     total: usize,
     families: Vec<(String, usize)>,
     truncated: bool,
+    /// (#2972) Resume-origin records (`<dir>.resume_origin.json`) whose
+    /// out-dir is gone: the record outlived the directory it describes.
+    orphaned_records: usize,
 }
 
 /// The stable part of a temp directory's name — the name with every
@@ -6132,6 +6135,7 @@ fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
     };
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut total = 0usize;
+    let mut orphaned_records = 0usize;
     let mut seen = 0usize;
     let mut truncated = false;
     for entry in entries.flatten() {
@@ -6147,7 +6151,11 @@ fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
         }
         // `file_type()` comes straight off the directory entry on the
         // platforms darkmux runs on, so this is not a stat per entry.
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            if darkmux_types::paths::is_orphaned_resume_origin(dir, name) {
+                orphaned_records += 1;
+            }
             continue;
         }
         total += 1;
@@ -6156,7 +6164,7 @@ fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
     let mut families: Vec<(String, usize)> = counts.into_iter().collect();
     // Largest first; ties by name so the report is stable run to run.
     families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    TempResidue { total, families, truncated }
+    TempResidue { total, families, truncated, orphaned_records }
 }
 
 /// (#2707) Abandoned darkmux directories in the system temp root.
@@ -6216,11 +6224,15 @@ fn check_temp_residue() -> Check {
     let residue = summarize_temp_residue(&tmp);
     let name = "temp residue".to_string();
 
-    if residue.total < TEMP_RESIDUE_WARN_AT {
+    let orphans = match residue.orphaned_records {
+        0 => String::new(),
+        n => format!(", {n} orphaned resume record(s)"),
+    };
+    if residue.total + residue.orphaned_records < TEMP_RESIDUE_WARN_AT {
         return Check {
             name,
             status: Status::Pass,
-            message: format!("{} darkmux director(ies) under {}", residue.total, tmp.display()),
+            message: format!("{} darkmux director(ies) under {}{orphans}", residue.total, tmp.display()),
             hint: None,
         };
     }
@@ -6238,7 +6250,7 @@ fn check_temp_residue() -> Check {
         name,
         status: Status::Warn,
         message: format!(
-            "{scope}{} darkmux director(ies) under {} ({breakdown})",
+            "{scope}{} darkmux director(ies) under {} ({breakdown}){orphans}",
             residue.total,
             tmp.display()
         ),
@@ -6248,6 +6260,8 @@ fn check_temp_residue() -> Check {
              run's prompt, trajectory and checkpoint, so they are kept deliberately and \
              removing one discards that run's record. The rest are test scratch, which a \
              test process now collects on its own (#2707); any still here predate that. \
+             Each `darkmux-out-*` dir has a sibling `<dir>.resume_origin.json`: delete the two \
+             together, and delete any record whose dir is already gone (an orphan). \
              Nothing here is removed for you: review {} and delete what you are done with.",
             tmp.display()
         )),
@@ -7881,6 +7895,19 @@ mod tests {
             std::fs::write(root.path().join(f), b"x").unwrap();
         }
         root
+    }
+
+    /// (#2972) A resume-origin record whose out-dir is gone is counted; one
+    /// with its dir is not, and the dir stays the only thing in `total`.
+    #[test]
+    fn the_scan_counts_an_orphaned_resume_record() {
+        let root = temp_root_with(
+            &["darkmux-out-coder-1"],
+            &["darkmux-out-coder-1.resume_origin.json", "darkmux-out-coder-2.resume_origin.json"],
+        );
+        let residue = summarize_temp_residue(root.path());
+        assert_eq!(residue.total, 1);
+        assert_eq!(residue.orphaned_records, 1, "only the record whose dir is gone is an orphan");
     }
 
     /// The namespace contract, which is the whole of this check's claim:

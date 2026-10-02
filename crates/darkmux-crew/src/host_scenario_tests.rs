@@ -376,7 +376,7 @@ fn the_tier_four_resume_hint_is_accepted_by_the_resume_gate_it_names() {
     // (#2774 review F2) The hold's whole value is that the operator can act
     // on it. The hint the sampler prints is built by
     // `dispatch_internal::resume_hint_from_origin` from the dispatch's own
-    // `resume_origin.json`, and the gate that has to ACCEPT it is
+    // host-only origin record, and the gate that has to ACCEPT it is
     // `validate_resume_checkpoint`. Both are private to `dispatch_internal`
     // and both are exercised by that module's own tests
     // (`resume_hint_*` / `validate_resume_checkpoint_*`), which is where
