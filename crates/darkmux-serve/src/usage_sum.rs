@@ -289,6 +289,7 @@ struct RunEntry {
     session_id: String,
     mission_id: String,
     sum: UsageSum,
+    first_ts: Option<u64>,
 }
 
 impl UsageFold {
@@ -303,7 +304,7 @@ impl UsageFold {
         if let Some(&i) = self.run_index.get(&key) {
             return i;
         }
-        self.runs.push(RunEntry { session_id: key.0.clone(), mission_id: key.1.clone(), sum: UsageSum::default() });
+        self.runs.push(RunEntry { session_id: key.0.clone(), mission_id: key.1.clone(), sum: UsageSum::default(), first_ts: None });
         self.run_index.insert(key, self.runs.len() - 1);
         self.runs.len() - 1
     }
@@ -331,6 +332,11 @@ impl UsageFold {
         let i = self.run_slot(v);
         let entry = &mut self.runs[i];
         entry.sum.add(&amount);
+        let ts = v.get("ts").and_then(|t| t.as_str()).and_then(crate::runs::parse_flow_ts);
+        entry.first_ts = match (entry.first_ts, ts) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if entry.session_id.is_empty() && entry.mission_id.is_empty() {
             self.no_run.add(&amount);
         }
@@ -393,12 +399,14 @@ impl UsageFold {
         // The entries naming no run are `no_run`'s: never a row's to claim.
         let no_run_entries: HashSet<usize> =
             self.runs.iter().enumerate().filter(|(_, e)| e.session_id.is_empty() && e.mission_id.is_empty()).map(|(i, _)| i).collect();
+        let first_ts = self.runs.iter().map(|e| e.first_ts).collect();
         let runs = self.runs.into_iter().map(|e| (e.mission_id, e.sum)).collect();
         UsageIndex {
             runs,
             by_session,
             by_mission,
             claimed: std::cell::RefCell::new(no_run_entries),
+            first_ts,
             breakdown: UsageBreakdown { overall, groups, no_run: self.no_run, unlisted: UsageSplit::default() },
         }
     }
@@ -415,14 +423,36 @@ pub struct UsageIndex {
     /// The entries a run row has read (or that belong to no run): what
     /// [`Self::unlisted`] leaves out.
     claimed: std::cell::RefCell<HashSet<usize>>,
+    /// Each entry's first record time (epoch seconds): the span a row must hold.
+    first_ts: Vec<Option<u64>>,
     pub breakdown: UsageBreakdown,
 }
 
+/// What a run row may read from the usage index, and what ranks it against
+/// another row naming the same entry (see [`UsageIndex::attribute`]).
+#[derive(Debug, Clone, Default)]
+pub struct RowClaim {
+    pub mission_id: Option<String>,
+    pub session_ids: Vec<String>,
+    /// The row's time span, epoch seconds.
+    pub started: Option<u64>,
+    pub ended: Option<u64>,
+    pub receive_key: u64,
+    pub id: String,
+}
+
+impl RowClaim {
+    /// Lower wins: a row whose span holds `ts` before one that does not, then
+    /// the lower receive key, then the id.
+    fn rank(&self, ts: Option<u64>) -> (bool, u64, &str) {
+        let holds = matches!((self.started, ts), (Some(s), Some(t)) if s <= t && self.ended.is_none_or(|e| t <= e));
+        (!holds, self.receive_key, self.id.as_str())
+    }
+}
+
 impl UsageIndex {
-    /// ALL tokens (utility included) of the run whose records carry
-    /// `mission_id` OR one of `session_ids`, each entry counted once.
-    /// `None` when nothing was measured: no entry matched, or none of
-    /// the matched entries' records reported a count.
+    /// The entries the run whose records carry `mission_id` OR one of
+    /// `session_ids` may read, each once.
     ///
     /// With a `mission_id`, a session hit counts only when its records
     /// name that mission or none: the scheduler stamps `session_id` from
@@ -430,42 +460,66 @@ impl UsageIndex {
     /// and a mission must never read the other's share of it (review
     /// CONSIDER 2). Without one (a ghost, a lab run) the session is read
     /// whole.
-    pub fn tokens_for<'a>(
-        &self,
-        mission_id: Option<&str>,
-        session_ids: impl IntoIterator<Item = &'a str>,
-    ) -> Option<u64> {
+    fn candidates<'a>(&self, mission_id: Option<&str>, session_ids: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
         let mission_id = mission_id.filter(|m| !m.is_empty());
         let mut seen: HashSet<usize> = HashSet::new();
-        let mut total = 0u64;
-        let mut reported = 0u64;
-        let mut claimed = self.claimed.borrow_mut();
-        let mut take = |i: usize, runs: &[(String, UsageSum)]| {
-            claimed.insert(i);
-            if seen.insert(i) {
-                total = total.saturating_add(runs[i].1.total);
-                reported += runs[i].1.reported;
-            }
-        };
+        let mut out = Vec::new();
         if let Some(mid) = mission_id {
             for &i in self.by_mission.get(mid).into_iter().flatten() {
-                take(i, &self.runs);
+                if seen.insert(i) {
+                    out.push(i);
+                }
             }
         }
         for sid in session_ids {
             for &i in self.by_session.get(sid).into_iter().flatten() {
                 let owner = self.runs[i].0.as_str();
-                if owner.is_empty() || mission_id.is_none() || mission_id == Some(owner) {
-                    take(i, &self.runs);
+                if (owner.is_empty() || mission_id.is_none() || mission_id == Some(owner)) && seen.insert(i) {
+                    out.push(i);
                 }
             }
         }
+        out
+    }
+
+    /// ALL tokens (utility included) a row may read: its candidates summed.
+    /// `None` when nothing was measured: no entry matched, or none of the
+    /// matched entries' records reported a count.
+    fn sum_of(&self, entries: &[usize]) -> Option<u64> {
+        let (total, reported) = entries.iter().fold((0u64, 0u64), |(t, r), &i| (t.saturating_add(self.runs[i].1.total), r + self.runs[i].1.reported));
         (reported > 0).then_some(total)
     }
 
-    /// (#3067) Everything no row has read through [`Self::tokens_for`]: the
-    /// entries naming a session or mission that has no row in the listing.
-    /// Call it after every row has read its tokens.
+    /// (#3067) Every row's tokens, with each entry read by ONE row: two rows
+    /// can name the same entry (peer missions sharing a task-id session, #1918;
+    /// a session whose records name no mission), and counting it on both would
+    /// put the rows above the total. The winner is the row whose time span holds
+    /// the entry's first record, then the lower (receive key, id): a property of
+    /// the rows and the records, never of build or hash order. Entries no row
+    /// wins are [`Self::unlisted`].
+    pub fn attribute(&self, rows: &[RowClaim]) -> Vec<Option<u64>> {
+        let cands: Vec<Vec<usize>> =
+            rows.iter().map(|r| self.candidates(r.mission_id.as_deref(), r.session_ids.iter().map(String::as_str))).collect();
+        let mut winner: HashMap<usize, usize> = HashMap::new();
+        for (ri, entries) in cands.iter().enumerate() {
+            for &e in entries {
+                let better = winner.get(&e).is_none_or(|&w| rows[ri].rank(self.first_ts[e]) < rows[w].rank(self.first_ts[e]));
+                if better {
+                    winner.insert(e, ri);
+                }
+            }
+        }
+        self.claimed.borrow_mut().extend(winner.keys().copied());
+        let mut won: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+        for (e, ri) in winner {
+            won[ri].push(e);
+        }
+        won.iter().map(|entries| self.sum_of(entries)).collect()
+    }
+
+    /// (#3067) Everything no row won in [`Self::attribute`]: the entries
+    /// naming a session or mission that has no row in the listing. Call it
+    /// after the rows are attributed.
     pub fn unlisted(&self) -> UsageSplit {
         let claimed = self.claimed.borrow();
         let mut out = UsageSplit::default();
@@ -477,7 +531,13 @@ impl UsageIndex {
         out
     }
 
+    #[cfg(test)]
+    pub fn tokens_for<'a>(&self, mission_id: Option<&str>, session_ids: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+        self.sum_of(&self.candidates(mission_id, session_ids))
+    }
+
     /// The run keyed on exactly one session (a ghost, a lab run).
+    #[cfg(test)]
     pub fn tokens_for_session(&self, session_id: &str) -> Option<u64> {
         self.tokens_for(None, std::iter::once(session_id))
     }
@@ -819,6 +879,19 @@ mod tests {
 
         // `sum_usage` is the same fold.
         assert_eq!(&sum_usage(records.iter()), s);
+    }
+
+    /// (#3067) Among rows that could read one entry, the row whose span holds
+    /// the entry's first record wins, then the lower receive key, then the id.
+    #[test]
+    fn a_rows_rank_prefers_the_span_that_holds_the_record_then_the_receive_key_then_the_id() {
+        let row = |started: Option<u64>, ended: Option<u64>, key: u64, id: &str| RowClaim { started, ended, receive_key: key, id: id.into(), ..Default::default() };
+        let holds = row(Some(10), Some(20), 9, "z");
+        let misses = row(Some(30), None, 1, "a");
+        assert!(holds.rank(Some(15)) < misses.rank(Some(15)), "span first, whatever the key");
+        assert!(row(Some(10), None, 1, "z").rank(Some(15)) < row(Some(10), None, 2, "a").rank(Some(15)), "then the key");
+        assert!(row(Some(10), None, 1, "a").rank(Some(15)) < row(Some(10), None, 1, "b").rank(Some(15)), "then the id");
+        assert!(row(None, None, 1, "a").rank(Some(15)) > holds.rank(Some(15)), "a row with no start holds nothing");
     }
 
     /// A `dispatch complete` carries no tokens here, whatever its payload

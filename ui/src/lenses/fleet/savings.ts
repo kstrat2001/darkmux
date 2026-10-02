@@ -48,16 +48,25 @@ export interface TokensOffMeter {
   unlisted: { calls: number; tokens: number };
 }
 
-export function tokensOffMeter(data: NormRecord[], runIds?: ReadonlySet<string>): TokensOffMeter {
+export function tokensOffMeter(data: NormRecord[], rowKeys?: ReadonlySet<string>): TokensOffMeter {
   const s = sumUsage(data);
-  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data), noRun: noRunUsage(data), unlisted: unlistedUsage(data, runIds) };
+  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data), noRun: noRunUsage(data), unlisted: unlistedUsage(data, rowKeys) };
 }
 
-/** The usage records that name a session or mission no row of `runIds` is,
- *  the twin of the run build's `unlisted`. Nothing without a listing. */
-export function unlistedUsage(data: readonly NormRecord[], runIds?: ReadonlySet<string>): { calls: number; tokens: number } {
-  if (!runIds) return { calls: 0, tokens: 0 };
-  const s = sumUsage(data.filter((r) => (r.session_id || r.mission_id) && !runIds.has(r.session_id ?? "") && !runIds.has(r.mission_id ?? "")));
+/** The usage records that name a session or mission no row claims, the twin of
+ *  the run build's `unlisted`. `rowKeys` is every row's id and representative
+ *  session (`dispatch_id`); like the server, a row also claims the sessions of
+ *  the records that name its mission (a peer mission's session list), so a
+ *  task session shared by a listed mission is not unlisted. Nothing without a
+ *  listing: `undefined` (a failed or empty `/runs`, a replay) is unknown, not
+ *  "everything is unlisted". */
+export function unlistedUsage(data: readonly NormRecord[], rowKeys?: ReadonlySet<string>): { calls: number; tokens: number } {
+  if (!rowKeys) return { calls: 0, tokens: 0 };
+  const claimedSessions = new Set<string>();
+  for (const r of data) if (r.session_id && r.mission_id && rowKeys.has(r.mission_id)) claimedSessions.add(r.session_id);
+  const named = (r: NormRecord) => !!(r.session_id || r.mission_id);
+  const claimed = (r: NormRecord) => rowKeys.has(r.session_id ?? "") || rowKeys.has(r.mission_id ?? "") || claimedSessions.has(r.session_id ?? "");
+  const s = sumUsage(data.filter((r) => named(r) && !claimed(r)));
   return { calls: s.usageRecords, tokens: s.total };
 }
 

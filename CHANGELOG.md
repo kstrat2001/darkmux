@@ -254,8 +254,9 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   /runs` gains additive `no_run` and `unlisted` (`calls`, `tokens` each): the
   usage that names no run, and the usage that names a run with no row in the
   listing (a start record outside the window), so the rows plus both equal the
-  total; `run list --usage` prints a line for each when non-zero (`unlisted` joins
-  `--usage --json`). A reported total of 0 beside one half now settles a step budget at that half, not 0. The fleet hero's hover says
+  total (a usage entry two rows could read, such as a task session shared by two peer
+  missions, is counted on one row only, chosen by span, receive key and id); `run list --usage` prints a line for each when non-zero (`unlisted` joins
+  `--usage --json`). A reported total of 0 beside both halves is their sum and beside one half is no total (a step budget charges it as a missing one). The fleet hero's hover says
   how many tokens it includes with no run or on unlisted runs. The run page's token tiles name the
   run's total on hover when INPUT + GENERATED fall short of it (a total-only
   record), so the page and the row agree; with no split reported at all the tiles read a dash.

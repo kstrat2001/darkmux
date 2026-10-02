@@ -725,8 +725,13 @@ export function FleetLens({
     () => recordsAsOf(flowWindow.data, playhead ?? wallNow),
     [flowWindow.data, playhead, wallNow],
   );
-  const runIds = useMemo(() => (runsQuery.data?.ok ? new Set(runs.map((r) => r.id)) : undefined), [runsQuery.data, runs]);
-  const tokens = useMemo(() => tokensOffMeter(scopedData, runIds), [scopedData, runIds]);
+  // (#3067) The listing the hero's `unlisted` is measured against: unknown (so
+  // never named) when `/runs` failed, is not asked, or came back empty.
+  const rowKeys = useMemo(() => {
+    if (!runsQuery.data?.ok || runs.length === 0) return undefined;
+    return new Set(runs.flatMap((r) => (r.dispatch_id ? [r.id, r.dispatch_id] : [r.id])));
+  }, [runsQuery.data, runs]);
+  const tokens = useMemo(() => tokensOffMeter(scopedData, rowKeys), [scopedData, rowKeys]);
 
   // (#2928) The live channel's overlay: at the live edge of a live route
   // only (`livePolling` is false on a static build, `playhead` is set on a

@@ -307,6 +307,13 @@ describe("the fleet hero (tokensOffMeter)", () => {
     const listedRows = sumUsage(recs.filter((x) => x.session_id === "s1" || x.mission_id === "m1")).total;
     expect(listedRows + listed.noRun.tokens + listed.unlisted.tokens).toBe(listed.total);
     expect(tokensOffMeter(recs).unlisted).toEqual({ calls: 0, tokens: 0 });
+    // A listed mission claims the sessions of its records (a task session
+    // shared with sessionless-owner usage), and a row's representative session
+    // (a lab row's `dispatch_id`) claims that session's usage.
+    const shared = [...recs, usage("s2", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 11 })];
+    expect(tokensOffMeter(shared, new Set(["s1", "m1"])).unlisted).toEqual({ calls: 1, tokens: 6 });
+    expect(tokensOffMeter(shared, new Set(["s1", "m1", "m2"])).unlisted).toEqual({ calls: 0, tokens: 0 });
+    expect(tokensOffMeter(shared, new Set(["s1", "s2"])).unlisted).toEqual({ calls: 1, tokens: 6 });
   });
 
   it("a compactor call or a single-shot record alone never opens an in-flight dispatch", () => {

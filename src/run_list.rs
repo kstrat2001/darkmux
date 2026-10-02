@@ -1793,8 +1793,6 @@ mod tests {
         }
     }
 
-    /// (#3067) A call that reported no usage is named under the totals, so a
-    /// short total is not read as a complete one.
     /// (#3067) Calls on a run with no row print their own line, only when there are some.
     #[test]
     fn usage_lines_name_calls_on_a_run_with_no_row_only_when_there_are_some() {
@@ -1805,6 +1803,8 @@ mod tests {
         assert!(text.contains("1 call on a run with no row here (50 tokens)"), "{text}");
     }
 
+    /// (#3067) A call that reported no usage is named under the totals, so a
+    /// short total is not read as a complete one.
     #[test]
     fn usage_lines_name_calls_that_reported_no_usage() {
         let mut report = sample_report();
