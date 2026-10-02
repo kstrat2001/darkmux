@@ -46,7 +46,8 @@
         "policy": "conclude"
       }
     },
-    "liveness_retention_hours": 168
+    "liveness_retention_hours": 168,
+    "verbose": false
   },
   "fleet": {
     "mode": "standalone",

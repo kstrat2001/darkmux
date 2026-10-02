@@ -3586,8 +3586,8 @@ fn dispatch_unmanaged(
     let pm = &target.model;
     let session = &opts.session;
     let label = crate::target::endpoint_route_label(ep, &pm.id);
-    eprintln!(
-        "darkmux dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
+    darkmux_types::diag_eprintln!(
+        "darkmux dispatch: runtime=direct (hosted), endpoint: {label}, model={}",
         pm.id
     );
 
@@ -5344,8 +5344,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         darkmux_image.id.clone()
     };
-    eprintln!(
-        "darkmux dispatch: runtime=internal — image: {image}{}",
+    darkmux_types::diag_eprintln!(
+        "darkmux dispatch: runtime=internal, image: {image}{}",
         if inject {
             " (darkmux-runtime binary injected)".to_string()
         } else {
@@ -5547,11 +5547,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // viewer as a local dispatch, an operator-sovereignty violation (the
     // operator has no way to tell where the model actually ran).
     let unmanaged_endpoint_raw_label = agentic_pm.as_ref().and_then(crate::target::Target::route_label);
-    eprintln!(
+    darkmux_types::diag_eprintln!(
         "darkmux dispatch: model={model}{}",
         unmanaged_endpoint_raw_label
             .as_deref()
-            .map(|l| format!(" — brain: {l}"))
+            .map(|l| format!(", brain: {l}"))
             .unwrap_or_default()
     );
 
@@ -5654,7 +5654,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     } else {
         "fresh tempdir (no --workdir given)"
     };
-    eprintln!(
+    darkmux_types::diag_eprintln!(
         "darkmux dispatch: workspace={} ({})",
         workspace.display(),
         workspace_source
@@ -5687,7 +5687,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //     (#2153) `opts.host_out` lets a caller name this dir up front —
     //     see `resolve_host_out`'s own doc.
     let host_out = resolve_host_out(opts.host_out.as_deref(), &opts.role_id, unix_micros)?;
-    eprintln!(
+    darkmux_types::diag_eprintln!(
         "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
         host_out.display()
     );
@@ -11561,9 +11561,9 @@ fn resolve_dispatch_model_with_hosts(
         // rather than silently printing a second spelling of one model
         // and leaving the operator to work out they are the same thing.
         if wire_id == id {
-            eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
+            darkmux_types::diag_eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
         } else {
-            eprintln!(
+            darkmux_types::diag_eprintln!(
                 "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
                  dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
             );

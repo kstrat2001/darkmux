@@ -148,6 +148,7 @@ fn main() -> Result<()> {
         std::process::exit(2);
     }
     let cli = Cli::parse_from(argv);
+    darkmux_types::diagnostics::set_verbose_flag(cli.verbose);
     refuse_retired_env(&cli.command)?;
     let code = run(cli.command)?;
     std::process::exit(code);
@@ -215,7 +216,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             max_completion_tokens,
             resume_from,
         }),
-        Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
+        Cmd::Doctor { probe } => cmd_doctor(darkmux_types::diagnostics::verbose_flag(), probe),
         Cmd::Profile { sub } => cmd_profile(sub),
         // (#1426) Bare `machine` routes to `machine status` (no id) — one
         // code path, no separate overview render.

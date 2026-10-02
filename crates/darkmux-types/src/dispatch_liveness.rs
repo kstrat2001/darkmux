@@ -164,11 +164,20 @@ fn emit(phase: &str, case: &str, detail: &str) {
     let line = format!("{ts} +{ms}ms {phase} pid={pid} case={case}{tail}", ts = ts_utc_now());
     // stderr FIRST — the most reliable surface. The `[darkmux-liveness]` prefix
     // makes the markers greppable in a workflow run log (where #563 showed
-    // nothing at all).
-    eprintln!("[darkmux-liveness] {line}");
+    // nothing at all). An interactive terminal skips the echo (5.0): the
+    // heartbeat file below still records every marker.
+    echo_to(crate::diagnostics::verbose(), &mut std::io::stderr(), &line);
     // Best-effort heartbeat-file append. EVERY failure is swallowed: a liveness
     // marker must NEVER panic or block a dispatch (#1311).
     let _ = append_heartbeat(pid, &line);
+}
+
+/// Write the `[darkmux-liveness]` stderr echo of `line` to `w` when `echo`.
+/// A closed stderr must never fail a marker, so the write result is dropped.
+fn echo_to(echo: bool, w: &mut dyn Write, line: &str) {
+    if echo {
+        let _ = writeln!(w, "[darkmux-liveness] {line}");
+    }
 }
 
 /// Append `line` to `<darkmux-home>/liveness/<pid>.log`, creating the dir.
@@ -408,6 +417,39 @@ fn epoch_to_yyyymmdd(epochs: i64) -> (i32, u8, u8) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// (5.0) The stderr echo follows the verbosity decision; the format is
+    /// unchanged for logs, and a quiet terminal gets nothing.
+    #[test]
+    fn echo_prints_the_prefixed_line_only_when_verbose() {
+        let mut out = Vec::new();
+        echo_to(true, &mut out, "T +1ms phase pid=1 case=c");
+        assert_eq!(String::from_utf8(out).unwrap(), "[darkmux-liveness] T +1ms phase pid=1 case=c\n");
+        let mut quiet = Vec::new();
+        echo_to(false, &mut quiet, "T +1ms phase pid=1 case=c");
+        assert!(quiet.is_empty());
+    }
+
+    /// (5.0) The heartbeat file is written whether or not the echo prints:
+    /// the decision gates stderr only.
+    #[serial_test::serial]
+    #[test]
+    fn heartbeat_file_is_written_when_the_echo_is_suppressed() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
+        let mut quiet = Vec::new();
+        echo_to(false, &mut quiet, "quiet-line");
+        append_heartbeat(std::process::id(), "quiet-line").unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(quiet.is_empty());
+        assert!(read_only_heartbeat(&tmp.path().join("liveness")).contains("quiet-line"));
+    }
 
     /// Read the single `<pid>.log` heartbeat file under a liveness dir. The
     /// floor writes exactly one file per process, so a test that sets

@@ -92,7 +92,7 @@ The audit dir + file are created on first write. Trigger one with a benign flow 
 darkmux flow note --text "audit substrate enable smoke"
 ```
 
-Should print one line (the stderr `flow: AuditFileSink enabled — audit_dir=… (hash-chained, flock-serialized)` notice on first invocation of the new sink). Verify the file landed:
+Should print one line (the stderr `flow: AuditFileSink enabled: audit_dir=… (hash-chained, flock-serialized)` notice on first invocation of the new sink; an interactive terminal prints it only under `--verbose` or `DARKMUX_VERBOSE=1`). Verify the file landed:
 
 ```bash
 ls "${DARKMUX_AUDIT_DIR}"

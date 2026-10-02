@@ -1771,7 +1771,7 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
         #[cfg(unix)]
         {
             let path = audit_dir().display().to_string();
-            eprintln!("flow: AuditFileSink enabled — audit_dir={path} (hash-chained, flock-serialized)");
+            darkmux_types::diag_eprintln!("flow: AuditFileSink enabled: audit_dir={path} (hash-chained, flock-serialized)");
             sinks.push(Arc::new(AuditFileSink::new()));
         }
         #[cfg(not(unix))]
@@ -1818,8 +1818,8 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
                 // documented place to show a resolved value with its
                 // provenance. A banner confirming the sink came up needs the
                 // stream name and nothing else.
-                eprintln!(
-                    "flow: Redis sink enabled — stream={stream} \
+                darkmux_types::diag_eprintln!(
+                    "flow: Redis sink enabled: stream={stream} \
                      max_len={max_len:?} (composed via TeeSink)"
                 );
                 sinks.push(Arc::new(redis_sink));
@@ -1850,8 +1850,8 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
         };
         match hooks::HookSink::new(&rules, outbox_dir, report_sink) {
             Ok(hook_sink) => {
-                eprintln!(
-                    "flow: Hooks sink enabled — {} rule(s), outbox={}",
+                darkmux_types::diag_eprintln!(
+                    "flow: Hooks sink enabled: {} rule(s), outbox={}",
                     rules.len(),
                     hook_sink.outbox_dir().display()
                 );
@@ -4746,7 +4746,7 @@ mod tests {
         // future refactor that reintroduces `url={...}` fails here even if it
         // routes through the redacting form.
         let banner = format!(
-            "flow: Redis sink enabled — stream={} max_len={:?} (composed via TeeSink)",
+            "flow: Redis sink enabled: stream={} max_len={:?} (composed via TeeSink)",
             "darkmux:flow",
             Some(10000_usize),
         );

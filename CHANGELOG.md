@@ -62,6 +62,13 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **Informational stderr lines stay out of an interactive terminal** (5.0).
+  `[darkmux-liveness]` markers, the `flow: ... sink enabled` banners, and the
+  dispatch progress headers print only when stderr is not a terminal (CI logs,
+  pipes, the daemon log, ACP), under the new global `--verbose` / `-v` flag
+  (`doctor -v` is the same flag), with `DARKMUX_VERBOSE=1`, or with
+  `runtime.verbose: true`. Warnings and errors always print, and the liveness
+  heartbeat file is written either way.
 - **A retired `config.json` key at its old default warns; a value you set is
   still refused** (#3057). The retired `remote` block, `machine_rollup` block,
   `runtime.log_level`, `runtime.daemon_auth_enabled`, `runtime.telemetry_record_every_samples`,

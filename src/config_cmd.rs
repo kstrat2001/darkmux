@@ -159,6 +159,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (the same zero-means-off convention as `host_sampler_interval_ms`
     // above and `redis.maxlen` below — never "retain nothing").
     ("runtime.liveness_retention_hours", Ty::Uint),
+    // (5.0) Informational stderr lines on an interactive terminal; see
+    // `darkmux_types::diagnostics`.
+    ("runtime.verbose", Ty::Bool),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
