@@ -11651,7 +11651,7 @@ mod tests {
         //
         // (fleet route check) 70: `check_fleet_routes` joined beside it.
         //
-        // (5.0) 64: `check_beat33_legacy_crew_dir`, `check_mission_state_files`,
+        // (5.0) Four rows left (-4): `check_beat33_legacy_crew_dir`, `check_mission_state_files`,
         // `check_lab_dir_location` and `check_retired_role_leftovers` left
         // with the readers of the pre-5.0 layouts they reported.
         //
