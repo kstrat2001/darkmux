@@ -1510,7 +1510,9 @@ darkmux release.
   different `--image` is refused as `RESUME IMAGE MISMATCH`. A resume while the
   original (or another resume) still runs is refused naming that execution, and
   one after the execution ended in success is refused as `RESUME ALREADY
-  COMPLETED`; resuming again after an interrupted or failed run still works.
+  COMPLETED`; resuming again after an interrupted or failed run (any non-zero
+  exit) still works. A run that stops at `max_turns` exits 0, so it counts as
+  completed and cannot be resumed.
   The lock is `<out-dir>.execution.lock`, beside the out-dir like the resume
   origin record, and `doctor`'s orphan count covers it.
 - **A hosted call the endpoint may have processed is charged, once, one way** (5.0).

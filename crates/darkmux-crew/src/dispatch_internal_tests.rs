@@ -5914,6 +5914,23 @@
         assert!(origin["workspace"].is_string());
     }
 
+    /// An execution completes only on a clean exit: a non-zero exit leaves
+    /// both the dispatch's own out-dir and the origin it resumed resumable;
+    /// exit 0 marks both, so neither can be resumed again.
+    #[test]
+    fn only_a_clean_exit_completes_an_execution() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, own, _) = origin_dir();
+        complete_execution_on_success(1, own.path(), Some(origin.path()));
+        complete_execution_on_success(137, own.path(), Some(origin.path()));
+        drop(claim_resume_origin(origin.path()).expect("a non-zero exit leaves the origin resumable"));
+        drop(claim_resume_origin(own.path()).expect("and the dispatch's own out-dir"));
+
+        complete_execution_on_success(0, own.path(), Some(origin.path()));
+        assert!(claim_resume_origin(origin.path()).is_err(), "exit 0 completes the origin it resumed");
+        assert!(claim_resume_origin(own.path()).is_err(), "and its own out-dir");
+    }
+
     /// The lock file is a sibling of the out-dir, never inside it: the
     /// container mounts the out-dir read-write, and a model must not be able
     /// to delete the file whose lock keeps a second resume out.
@@ -6046,6 +6063,28 @@
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+
+    /// The tier-4 hold's dispatch keeps its execution lock while it waits, so
+    /// the printed command is refused until that dispatch is stopped. The hint
+    /// must say to stop it first, and the claim must really hold: the same
+    /// command is refused while the lock is held and accepted once released.
+    #[test]
+    fn the_tier4_resume_hint_says_to_stop_the_held_dispatch_first() {
+        let workspace = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), workspace.path(), false, None, &ExecutionId::mint());
+        let hint = resume_hint_from_origin(prior.path(), "coder");
+        assert!(hint.contains("stop this dispatch with Ctrl-C"), "{hint}");
+        assert!(hint.contains("holds the execution lock"), "{hint}");
+        // The command part still parses as one command.
+        assert_eq!(parse_hint_args(&hint).first().map(String::as_str), Some("darkmux"), "{hint}");
+
+        let mut held = ExecutionLock { _guards: Vec::new() };
+        hold_own_execution_lock(&mut held, prior.path()).unwrap();
+        assert!(claim_resume_origin(prior.path()).is_err(), "refused while the held dispatch runs");
+        drop(held);
+        claim_resume_origin(prior.path()).expect("accepted once it was stopped");
+    }
 
     /// The crawl-unit case, which needs BOTH the right `--workdir` and
     /// `--workspace-read-only`: a read-only origin resumed read-write is

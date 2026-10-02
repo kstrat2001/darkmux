@@ -1437,7 +1437,13 @@ pub(crate) fn resume_hint_from_origin(
     if read_only {
         cmd.push_str(" --workspace-read-only");
     }
-    format!("{cmd} (once conditions look better — this pause does not clear on its own)")
+    // The held dispatch still owns the execution lock, so this command is
+    // refused ("still running") until that dispatch is stopped: say so.
+    format!(
+        "{cmd} (once conditions look better, and only after you stop this dispatch with Ctrl-C: \
+         it holds the execution lock, so a resume is refused while it runs; \
+         this pause does not clear on its own)"
+    )
 }
 
 // (#2158 / #2456) `create_dir_exclusive_0700` and
