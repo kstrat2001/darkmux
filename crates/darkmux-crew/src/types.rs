@@ -599,7 +599,7 @@ pub struct Phase {
     pub created_ts: u64,
     /// When the phase first transitioned to `Running` (or last transitioned
     /// to `Running` after being `Abandoned` and restarted). None until
-    /// `darkmux phase start` runs. Wall-clock UI shows live elapsed when
+    /// the phase's first step starts. Wall-clock UI shows live elapsed when
     /// `status == Running` (now - started_ts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
@@ -611,8 +611,8 @@ pub struct Phase {
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
     /// When the phase transitioned to `Abandoned`. Cleared when the
-    /// operator changes their mind and runs `phase start` again — the
-    /// state machine treats `Abandoned → Running` as a legal restart.
+    /// phase restarts — the state machine treats `Abandoned → Running` as a
+    /// legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub abandoned_ts: Option<u64>,

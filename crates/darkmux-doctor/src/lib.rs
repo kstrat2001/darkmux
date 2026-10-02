@@ -11535,8 +11535,7 @@ mod tests {
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + utility-model-binding
-        // [#590] + beat-33-crew-dir [Beat 33
-        // directory flatten] + role-tool-vocab [#340] +
+        // [#590] + role-tool-vocab [#340] +
         // redis-config [#661] +
         // remote-endpoint-credentials [#85/#91] + audit-write-drops [#877] +
         // serve-daemon-auth [#881] + fleet.mode [#933] + env-masks-config

@@ -4586,7 +4586,7 @@ fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<
 }
 
 /// The records an `XREVRANGE` reply holds, read through the flow reader
-/// (so a pre-4.0 spelling comes back current), filtered to `date` when one
+/// (so a retired spelling comes back as an unknown action), filtered to `date` when one
 /// is given, in chronological order.
 ///
 /// The read is cut (D5) when it may not hold the whole date: its oldest entry

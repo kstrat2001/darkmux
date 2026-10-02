@@ -348,9 +348,7 @@ pub(crate) fn expand_tilde(s: &str) -> PathBuf {
 }
 
 pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
-    // Not the lab dir: its one writer (`lab run`) creates it per run, after
-    // the pre-4.0 `runs/` check has passed. Creating it here would turn an
-    // un-moved `runs/` into a split one on the next unrelated command.
+    // Not the lab dir: its one writer (`lab run`) creates it per run.
     for p in [&paths.root, &paths.sandboxes] {
         if !p.exists() {
             fs::create_dir_all(p)

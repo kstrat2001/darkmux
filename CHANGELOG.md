@@ -60,6 +60,81 @@ darkmux release.
   `error` (additive, absent for a step that did not error;
   `tests/cli-json.golden` regenerated for the new field).
 
+### Removed (breaking, 5.0): readers of pre-5.0 shapes
+
+5.0 is the compatibility break. Code whose only job was to read or report a
+pre-5.0 shape is deleted. The retired config-key and environment-variable
+refusals stay (`RETIRED_SETTINGS`). The renames a 4.x install has to apply by
+hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`).
+
+- **Retired verbs and flags get clap's own error.** The table that refused
+  them by name is gone: `swap`, `status`, `fleet`, `lessons`, `model`,
+  `crew sync`, `mission run`, `mission dispatch|add-phase|start|pause|resume`,
+  `lab eval`, `lab run list|inspect|stats|compare`, `finding list --dispatch`
+  and the retired `--session-id`, `--session`, `--runs`, `--phase-id` and
+  `--missions` flags now fail with "unrecognized subcommand" or "unexpected
+  argument" instead of a line naming the replacement (and `lab run list` now
+  launches a workload called `list`). The replacements are listed in the
+  upgrade skill.
+- **A mission state file in an old spelling is no longer refused or reported.**
+  A `mission.json` with `sprint_ids` loads as a mission with no phases, a task
+  file with `sprint_id` loses its phase, a `sprints/` directory is not read,
+  and a status of `closed` or `paused` reads as an unknown status (the
+  `paused` alias is gone). `darkmux doctor` no longer has the `mission state
+  files` row. A state file from a newer darkmux is still refused.
+- **`darkmux doctor` stops reporting the old layouts.** The rows `beat-33
+  crew/ layout`, `mission state files`, `lab runs location` and `retired roles
+  (mission-compiler, scribe)` are gone, and the skills row no longer warns on
+  an installed skill the binary stopped shipping. State under `<root>/crew/`
+  stays invisible and is not named.
+- **Lab runs left in `<root>/runs` are not read and not named.** Every lab
+  verb, `darkmux run list --kind lab` and `darkmux serve` used to refuse or
+  warn with the `mv` that moves them; now `run list --kind lab` shows none of
+  them. `GET /lab/runs` loses its `pending_move` field and the `serve` banner
+  its move line.
+- **`darkmux init` no longer prunes retired skills.** A leftover `darkmux-*`
+  skill directory the binary stopped shipping stays installed until you delete
+  it, and `init --dry-run` no longer prints a "would prune" line.
+- **`profiles.json` retired keys read as unknown keys.** `crews`, `hooks`, a
+  model's `role`, `runtime.config_path`, `runtime.contextTokens` and the
+  openclaw `runtime.compaction.*` keys are still refused, as unknown keys with
+  the closest valid key suggested, rather than with a line naming what
+  replaced them.
+- **A role manifest with `"role_family": "admin"`** gets the generic "not a
+  recognized family" error instead of a message naming `"utility"`.
+- **An archived step record naming a retired kind or output label is not
+  mapped.** A mission run before #2430 shows its `crawl.unit` and
+  `crawl.summary` steps under those names, and an archived `crawl.unit-outcome`
+  output is refused as the wrong producer. A mission config that names a retired
+  step kind is still refused, naming the new id.
+- **Pre-4.0 session ids attribute to nothing.** The free-form strings
+  (`task-<id>`, `step-<id>[-<mission>]`, `mission-run-<mission>-<phase>`) in an
+  old flow archive are not sessions: `flow tail` shows `-` for their run,
+  `/flow-mission` does not name their step, the mission graph does not fold
+  their tokens into a step, and `memory correction list` and the coder brief
+  do not read their corrections.
+- **Old lab artifacts read less.** A run recorded before its trajectory was
+  copied into the run directory (#364) shows zero turns instead of reading the
+  sandbox it names, a pre-2.0 openclaw reply envelope is no longer unwrapped,
+  and an openclaw trajectory line is no longer forced to an unknown event.
+- **The viewer draws no host-load track from a retired record.** A
+  `telemetry.process` record in a pre-4.0 archive no longer feeds the machine
+  drawer, the mission header's host readout or a run's SYSTEM pane (current
+  `machine.telemetry` is unchanged), and a mission step whose kind starts with
+  `review.` gets no AI styling from its name.
+- **The `remote` rename aliases are gone** (#3064). An archived envelope's
+  `remote_budgets` key, a `remote` seat flag on an archived staffing snapshot
+  or `step result` record, and a peer card's `seats.hosted` key are no longer
+  read as their `dispatch_budgets` / `unmanaged` successors: the budget rows
+  and the unmanaged flag read as empty or false, and a card still carrying
+  `hosted` shows its peer as unavailable. The 1.0 and 1.1 card fixtures are
+  deleted with the alias.
+- **Internal migrations for old stores are gone.** The SQLite crew index no
+  longer drops its pre-rename `capability*` and `knowledge` tables when it opens
+  (it is rebuilt from the manifests on every change, so nothing is
+  observable), and a residency lease with no start stamp is described as one
+  whose writer could not read its start time, not as an older binary's.
+
 ### Changed (5.0)
 
 - **Machine telemetry has its own hub stream, so work records keep their window** (#2101).
@@ -101,10 +176,6 @@ darkmux release.
   A command with no preflight (a read such as `run list`) now prints a
   `config.json` problem as a `warning:` instead of staying silent. `RENAMED_SETTINGS`
   (always empty after 5.0) is gone; a rename is a `RETIRED_SETTINGS` entry.
-- **The older retired verbs say where they went** (5.0). `swap`, `status`,
-  `fleet`, `lessons`, `model`, `crew sync` and `mission run` are refused with a
-  pointer (`machine`, `memory`, `mission launch`) instead of clap's "similar
-  subcommand" guess (`model` used to suggest `mod`).
 - **One owner for an unmanaged endpoint's seat** (5.0). The key a call claims
   (`ModelEndpoint::seat_key`) and how many calls run at once
   (`concurrent_width`) are each derived once, shared by the scheduler and a
@@ -1043,7 +1114,7 @@ darkmux release.
   (`--mode`, `--workdirs`, `--prosecutor-profile`, `--defender-profile`,
   `--judge-profile`, `--cases-dir`, `--scores-out`), the `dialectic-*` and
   `pr-reviewer-agentic`/`-freeform` roles, and the `pr-review-bench` fixture are
-  gone. It is refused by name, pointing at `darkmux lab run <workload>` and
+  gone. Use `darkmux lab run <workload>` and
   `darkmux mission launch review`. The runs board no longer prints a
   `try it yourself` line naming the removed verb. `pr-reviewer` stays.
 - **Stale docs and an unused plugin are deleted** (#3036). `ROADMAP.md`,

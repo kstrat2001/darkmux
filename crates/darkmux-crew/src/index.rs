@@ -1847,7 +1847,7 @@ mod tests {
         // (4.0) The index resolves each kind through the loader's helpers,
         // which no longer fall back to the pre-Beat-33 `<root>/crew/<subdir>/`
         // layout. A role left there is invisible to the index, as it is to
-        // the loader; `darkmux doctor` fails on the leftover directory.
+        // the loader.
         let guard = CrewDirGuard::new();
         let legacy_roles = guard.path().join("crew").join("roles");
         std::fs::create_dir_all(&legacy_roles).unwrap();

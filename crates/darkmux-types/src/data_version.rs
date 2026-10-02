@@ -13,7 +13,7 @@
 //!
 //! **Where each is enforced.** The authored user files go through the
 //! unknown-key gate (`crate::user_files`, via `UserFileKind::schema_version`);
-//! mission state goes through `darkmux_crew::retired_state::parse_state`;
+//! mission state goes through `darkmux_crew::state_file::parse_state`;
 //! `lessons.db` through its `user_version` pragma; the lab run manifest, the
 //! trajectory (`darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION`, a leaf crate
 //! that cannot depend on this one) and `resume_origin` through their own
