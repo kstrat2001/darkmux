@@ -3602,340 +3602,364 @@ fn drainer_loop(
     nudge: Arc<(Mutex<bool>, Condvar)>,
     report_sink: Arc<dyn FlowSink>,
 ) {
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return;
-        }
+    while !stop.load(Ordering::Acquire) {
         let mut did_work = false;
         for rt in &rules {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            // (fix-round finding 3) Heartbeat every poll cycle, whether or
-            // not this rule has pending work — see `heartbeat_path`'s doc.
-            let _ = fs::write(heartbeat_path(&rt.rule.cursor_path), schema::ts_utc_now());
-            if Instant::now() < *rt.next_attempt.lock().unwrap() {
-                continue;
-            }
-            // (#2093 merge-gate finding 3) Non-blocking — another
-            // `HookSink` instance (or drainer thread) draining this SAME
-            // rule's outbox right now just means this cycle is skipped;
-            // the next poll tries again. Held across the ENTIRE
-            // read-cursor → POST → write-cursor sequence below, so two
-            // concurrent drainers can never both read the same pending
-            // line, both POST it, and both advance the cursor.
-            let Ok(Some(_drain_lock)) = darkmux_types::flock::try_lock_exclusive(&rt.rule.drain_lock_path) else {
-                continue;
-            };
-            // (fix-round finding 1) A STALLED rule gets ONE writability
-            // probe per backoff cycle before anything else this
-            // iteration — a no-op `write_cursor` of the CURRENT offset
-            // (never advances past an undelivered line). A failing probe
-            // re-applies backoff and moves on to the next rule WITHOUT
-            // ever reaching `next_pending_line`/`try_post` — that's what
-            // keeps a persistently-unwritable cursor from re-POSTing the
-            // same line every cycle. A succeeding probe clears the stall
-            // and falls through to normal delivery this same cycle.
-            if rt.stalled.load(Ordering::Acquire) {
-                // (security review round 2, 2026-08-31) A rule can also
-                // be `stalled` because its transform orphan cap has been
-                // full for `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` cycles
-                // running (see `RuleRuntime::consecutive_busy`'s doc) —
-                // NOT a cursor-write problem, so the cursor-writability
-                // probe below would trivially succeed and incorrectly
-                // clear the stall while the backlog is still real. Skip
-                // the probe entirely (stay backed off, try again next
-                // cycle) until the orphan count itself drops back under
-                // the cap.
-                if rt.orphaned_transforms.load(Ordering::Acquire)
-                    >= crate::hook_transform::MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE
-                {
-                    apply_backoff(rt);
-                    continue;
-                }
-                let probe_cursor = read_cursor(&rt.rule.cursor_path);
-                if write_cursor(&rt.rule.cursor_path, probe_cursor).is_err() {
-                    apply_backoff(rt);
-                    continue;
-                }
-                rt.stalled.store(false, Ordering::Release);
-                rt.cursor_write_failures.store(0, Ordering::Release);
-                rt.consecutive_busy.store(0, Ordering::Release);
-                reset_backoff(rt);
-            }
-            // (#2093 merge-gate finding 5) Compaction runs under the SAME
-            // drain lock this iteration already holds — checked (and, at
-            // most, performed) once per poll cycle per rule.
-            maybe_compact_outbox(&rt.rule.outbox_path, &rt.rule.cursor_path, DEFAULT_COMPACTION_THRESHOLD_BYTES);
-            let cursor = read_cursor(&rt.rule.cursor_path);
-            let Some((line, new_cursor)) = next_pending_line(&rt.rule.outbox_path, cursor) else {
-                continue;
-            };
-            did_work = true;
-            // (#2135 option 2) Computed ONCE per line, deterministically
-            // from the line's own bytes — every retry of THIS exact
-            // undelivered line reuses the SAME delivery id (see
-            // `delivery_id_for_line`'s doc), and every terminal outcome
-            // below stamps it on the emitted `hook.fired`/`hook.failed`.
-            let delivery_id = delivery_id_for_line(&line);
-            // (#2093 merge-gate finding 4) A line that isn't valid JSON —
-            // most likely a torn fragment that `ensure_trailing_newline`
-            // turned into its own complete-but-malformed line at
-            // construction — is never POSTed. Quarantine it (preserve the
-            // raw bytes, never silently drop them), advance the cursor
-            // past it so it doesn't block every line after it forever,
-            // and emit `hook.failed` naming the reason.
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) else {
-                quarantine_line(&rt.rule.outbox_path, &line);
-                advance_cursor(rt, new_cursor);
-                let reason = "invalid outbox line";
-                write_last_status(rt, false, Some(reason));
-                emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason), &delivery_id);
-                continue;
-            };
-            // (#2183) Apply this rule's `transform`, if configured —
-            // evaluated at DELIVERY time (never enqueue), so the outbox
-            // keeps raw records and a corrected adapter re-drains the
-            // SAME lines (see hook_transform's module doc). A jq error,
-            // timeout, oversize output, or a non-object/non-string
-            // result is TERMINAL: quarantine + `hook.failed`, never
-            // `RetryableFailure` (the #2178 wedge lesson — a
-            // construction-class error must route to the give-up path,
-            // not retry an unfixable line forever).
-            let body: String = if let Some(adapter) = &rt.rule.transform {
-                match crate::hook_transform::apply_transform(
-                    &adapter.source,
-                    &line,
-                    Duration::from_millis(darkmux_types::config_access::hooks_jq_timeout_ms()),
-                    darkmux_types::config_access::hooks_jq_max_output_bytes() as usize,
-                    &rt.orphaned_transforms,
-                ) {
-                    crate::hook_transform::TransformOutcome::Body(b) => {
-                        // A non-Busy outcome — the backlog (if there was
-                        // one) is not blocking THIS attempt, so the
-                        // consecutive-Busy count that would promote the
-                        // rule to `stalled` resets.
-                        rt.consecutive_busy.store(0, Ordering::Release);
-                        b
-                    }
-                    crate::hook_transform::TransformOutcome::Error(e) => {
-                        rt.consecutive_busy.store(0, Ordering::Release);
-                        quarantine_line(&rt.rule.outbox_path, &line);
-                        advance_cursor(rt, new_cursor);
-                        let reason = format!("transform `{}` failed: {e}", adapter.path.display());
-                        write_last_status(rt, false, Some(&reason));
-                        emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(&reason), &delivery_id);
-                        continue;
-                    }
-                    // (security review round 2, 2026-08-31) NOT a claim
-                    // about this line/adapter — this rule already has
-                    // too many timed-out transform threads still running
-                    // in the background (see hook_transform's module
-                    // doc). Back off and retry the SAME undelivered line
-                    // later (never quarantine — an otherwise-fine
-                    // adapter must not be permanently disabled because
-                    // the process is momentarily backed up). Unlike the
-                    // first cut, this is no longer SILENT: the status is
-                    // written and a rate-limited `hook.failed` names the
-                    // reason, and — since the canonical orphan
-                    // (`def rec: rec; rec`) never finishes, so the
-                    // backlog can persist for the life of the process —
-                    // `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` consecutive
-                    // `Busy` outcomes promote the rule into the existing
-                    // `stalled` state, so `doctor` surfaces it as
-                    // ongoing, not transient.
-                    crate::hook_transform::TransformOutcome::Busy => {
-                        let orphan_count = rt.orphaned_transforms.load(Ordering::Acquire);
-                        let busy_count = rt.consecutive_busy.fetch_add(1, Ordering::AcqRel) + 1;
-                        if busy_count >= MAX_CONSECUTIVE_BUSY_BEFORE_STALL && !rt.stalled.swap(true, Ordering::AcqRel) {
-                            // Just transitioned into `stalled` — persist
-                            // it to the `.last` sidecar IMMEDIATELY,
-                            // never waiting on `maybe_warn_busy`'s own
-                            // rate limit: a cross-process-visible STATE
-                            // TRANSITION (what `doctor`/`flow status`
-                            // read) must never lag a full warning
-                            // interval behind the in-memory flag.
-                            write_cursor_write_status(
-                                &rt.rule.last_status_path,
-                                rt.cursor_write_failures.load(Ordering::Acquire),
-                                true,
-                            );
-                        }
-                        maybe_warn_busy(rt, report_sink.as_ref(), orphan_count);
-                        apply_backoff(rt);
-                        continue;
-                    }
-                }
-            } else {
-                line.clone()
-            };
-            // (#2183) Sign/derive-metadata-headers-from `parsed` (the TRUE
-            // record — so `hook.fired`'s attribution stays tied to what
-            // actually happened), but pass `&body` as the signed payload:
-            // the signature must cover what's ACTUALLY on the wire, not
-            // the pre-transform record, or a receiver verifying against
-            // the body it received would never match.
-            let headers = build_delivery_headers(
-                &body,
-                Some(&parsed),
-                &delivery_id,
-                rt.rule.signing_secret.as_ref(),
-                &rt.rule.headers,
-                rt.rule.attribution_headers,
-            );
-            // (#2183) The `file` transport — no network, ever. Mutually
-            // exclusive with `http` at load time (`resolve_one_rule`), so
-            // exactly one of `file_dir`/a real `try_post` call applies.
-            if let Some(dir) = &rt.rule.file_dir {
-                match write_file_delivery(dir, &delivery_id, &rt.rule.url, &headers, &body) {
-                    Ok(()) => {
-                        advance_cursor(rt, new_cursor);
-                        write_last_status(rt, true, None);
-                        let dump_path = dir.join(format!("{delivery_id}.json"));
-                        emit_dry_run_record(report_sink.as_ref(), rt, &line, &delivery_id, &dump_path);
-                    }
-                    Err(e) => {
-                        // A write failure (unwritable dir, full disk) is
-                        // the `file` transport's counterpart of a
-                        // transient network failure — back off and retry,
-                        // never quarantine (the RECORD is fine; the
-                        // destination is momentarily unwritable).
-                        eprintln!("flow::HookSink: file-transport write to {} failed: {e:#}", dir.display());
-                        apply_backoff(rt);
-                    }
-                }
-                continue;
-            }
-            match try_post(&rt.rule.url, &body, &headers) {
-                DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons } => {
-                    let attempt = {
-                        let mut c = rt.attempt_count.lock().unwrap();
-                        *c += 1;
-                        *c
-                    };
-                    advance_cursor(rt, new_cursor);
-                    // (#2273) Persist the rejection count durably (not
-                    // just onto the `hook.fired` flow record) so a later
-                    // `darkmux doctor` invocation can still see it after
-                    // the flow event itself has scrolled past. TWO
-                    // writes, deliberately: the `.last` sidecar carries
-                    // the LAST delivery's count as context (and is
-                    // wholesale-overwritten by the next delivery, clean
-                    // or not), while the `<key>.rejected` counter sidecar
-                    // ACCUMULATES and is never reset — that one is what
-                    // doctor / `flow status` key on, so one clean
-                    // delivery seconds later cannot erase the signal.
-                    //
-                    // (#2196) `reasons_for_status` rides the SAME gate as
-                    // the count (`rejected_for_status`) rather than an
-                    // independent one keyed on `receiver_rejected_reasons`
-                    // being non-empty — a receiver's `results[]` entries
-                    // without a top-level `rejected` count is not a shape
-                    // this contract defines, so reasons are only surfaced
-                    // as context for a rejection the count already named.
-                    let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
-                    let reasons_for_status: Vec<String> =
-                        if rejected_for_status.is_some() { receiver_rejected_reasons } else { Vec::new() };
-                    write_last_status_full(rt, true, None, rejected_for_status, reasons_for_status.clone());
-                    if let Some(n) = rejected_for_status {
-                        let total =
-                            add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
-                        // (#2196 fix-round MUST FIX 1) Quoted +
-                        // re-sanitized; (#2196 fix-round 4, MUST FIX G)
-                        // and on its own INDENTED line(s) rather than
-                        // inline, because this string reaches a real
-                        // terminal, the same as `flow status` and
-                        // `doctor` — see `receiver_rejection_stderr_lines`.
-                        for line in receiver_rejection_stderr_lines(
-                            &rt.rule.url,
-                            n,
-                            total,
-                            &reasons_for_status,
-                        ) {
-                            eprintln!("{line}");
-                        }
-                    }
-                    emit_hook_record_with(
-                        report_sink.as_ref(),
-                        true,
-                        rt,
-                        &line,
-                        attempt,
-                        None,
-                        receiver_rejected,
-                        &reasons_for_status,
-                        &delivery_id,
-                    );
-                }
-                DeliveryOutcome::ClientError => {
-                    let attempt = {
-                        let mut c = rt.attempt_count.lock().unwrap();
-                        *c += 1;
-                        *c
-                    };
-                    // (#2093 merge-gate finding 6) The give-up threshold
-                    // counts CLIENT-ERROR attempts only — a line that also
-                    // saw retryable 5xx/network failures first must not be
-                    // abandoned early because `attempt` (the mixed total)
-                    // happened to cross 3.
-                    let client_errors = {
-                        let mut c = rt.client_error_count.lock().unwrap();
-                        *c += 1;
-                        *c
-                    };
-                    if client_errors >= MAX_CLIENT_ERROR_ATTEMPTS {
-                        advance_cursor(rt, new_cursor);
-                        let reason = format!("4xx response, skipped after {client_errors} client-error attempts");
-                        write_last_status(rt, false, Some(&reason));
-                        emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason), &delivery_id);
-                    } else {
-                        apply_backoff(rt);
-                    }
-                }
-                // (#2093 merge-gate finding 2) A redirect is a PERMANENT
-                // failure — never retried, cursor advances immediately —
-                // because following it would mean sending this record's
-                // body to a receiver-chosen destination `resolve_rules`
-                // never validated.
-                DeliveryOutcome::RedirectRefused(status, target_host) => {
-                    let attempt = {
-                        let mut c = rt.attempt_count.lock().unwrap();
-                        *c += 1;
-                        *c
-                    };
-                    advance_cursor(rt, new_cursor);
-                    let reason = format!("redirect refused: {status} to {target_host}");
-                    write_last_status(rt, false, Some(&reason));
-                    emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason), &delivery_id);
-                }
-                DeliveryOutcome::RetryableFailure => {
-                    {
-                        let mut c = rt.attempt_count.lock().unwrap();
-                        *c += 1;
-                    }
-                    apply_backoff(rt);
-                }
-            }
+            did_work |= drain_rule(rt, report_sink.as_ref());
         }
         if !did_work && !stop.load(Ordering::Acquire) {
-            // (#2093 merge-gate finding 16) `unwrap_or_else(|e| e.into_inner())`
-            // recovers from a poisoned lock rather than propagating a
-            // second panic — a nudge signal is best-effort coordination,
-            // never a correctness invariant, so a stale/lost signal from
-            // recovering a poisoned lock is a harmless missed wakeup (the
-            // next poll cycle catches up), while panicking here would
-            // take the WHOLE drainer thread down silently.
-            let (lock, cvar) = &*nudge;
-            let pending = lock.lock().unwrap_or_else(|e| e.into_inner());
-            if !*pending {
-                let (mut pending, _timeout) =
-                    cvar.wait_timeout(pending, POLL_INTERVAL).unwrap_or_else(|e| e.into_inner());
-                *pending = false;
-            } else {
-                drop(pending);
-                *lock.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            wait_for_nudge(&nudge);
+        }
+    }
+}
+
+/// Sleep until a writer nudges the drainer or the poll interval elapses.
+///
+/// (#2093 merge-gate finding 16) `unwrap_or_else(|e| e.into_inner())`
+/// recovers from a poisoned lock rather than propagating a second panic — a
+/// nudge signal is best-effort coordination, never a correctness invariant,
+/// so a stale/lost signal from recovering a poisoned lock is a harmless
+/// missed wakeup (the next poll cycle catches up), while panicking here would
+/// take the WHOLE drainer thread down silently.
+fn wait_for_nudge(nudge: &(Mutex<bool>, Condvar)) {
+    let (lock, cvar) = nudge;
+    let pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !*pending {
+        let (mut pending, _timeout) = cvar.wait_timeout(pending, POLL_INTERVAL).unwrap_or_else(|e| e.into_inner());
+        *pending = false;
+    } else {
+        drop(pending);
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+}
+
+/// One poll cycle for one rule. Returns whether a pending line was found
+/// (the loop only sleeps when no rule had work).
+fn drain_rule(rt: &RuleRuntime, report_sink: &dyn FlowSink) -> bool {
+    // (fix-round finding 3) Heartbeat every poll cycle, whether or not this
+    // rule has pending work — see `heartbeat_path`'s doc.
+    let _ = fs::write(heartbeat_path(&rt.rule.cursor_path), schema::ts_utc_now());
+    if Instant::now() < *rt.next_attempt.lock().unwrap() {
+        return false;
+    }
+    // (#2093 merge-gate finding 3) Non-blocking — another `HookSink` instance
+    // (or drainer thread) draining this SAME rule's outbox right now just
+    // means this cycle is skipped; the next poll tries again. Held across
+    // the ENTIRE read-cursor → POST → write-cursor sequence, so two
+    // concurrent drainers can never both read the same pending line, both
+    // POST it, and both advance the cursor.
+    let Ok(Some(_drain_lock)) = darkmux_types::flock::try_lock_exclusive(&rt.rule.drain_lock_path) else {
+        return false;
+    };
+    if rt.stalled.load(Ordering::Acquire) && !stall_cleared(rt) {
+        return false;
+    }
+    // (#2093 merge-gate finding 5) Compaction runs under the SAME drain lock
+    // this iteration already holds — checked (and, at most, performed) once
+    // per poll cycle per rule.
+    maybe_compact_outbox(&rt.rule.outbox_path, &rt.rule.cursor_path, DEFAULT_COMPACTION_THRESHOLD_BYTES);
+    let cursor = read_cursor(&rt.rule.cursor_path);
+    let Some((line, new_cursor)) = next_pending_line(&rt.rule.outbox_path, cursor) else {
+        return false;
+    };
+    // (#2135 option 2) Computed ONCE per line, deterministically from the
+    // line's own bytes — every retry of THIS exact undelivered line reuses
+    // the SAME delivery id (see `delivery_id_for_line`'s doc), and every
+    // terminal outcome stamps it on the emitted `hook.fired`/`hook.failed`.
+    let delivery_id = delivery_id_for_line(&line);
+    Pending { rt, report_sink, line: &line, new_cursor, delivery_id }.deliver();
+    true
+}
+
+/// (fix-round finding 1) A STALLED rule gets ONE writability probe per
+/// backoff cycle before anything else — a no-op `write_cursor` of the CURRENT
+/// offset (never advances past an undelivered line). A failing probe
+/// re-applies backoff and the rule is skipped this cycle WITHOUT ever
+/// reaching `next_pending_line`/`try_post` — that's what keeps a
+/// persistently-unwritable cursor from re-POSTing the same line every cycle.
+/// A succeeding probe clears the stall and delivery proceeds this same cycle.
+/// Returns whether the stall is cleared.
+fn stall_cleared(rt: &RuleRuntime) -> bool {
+    // (security review round 2, 2026-08-31) A rule can also be `stalled`
+    // because its transform orphan cap has been full for
+    // `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` cycles running (see
+    // `RuleRuntime::consecutive_busy`'s doc) — NOT a cursor-write problem, so
+    // the cursor-writability probe below would trivially succeed and
+    // incorrectly clear the stall while the backlog is still real. Skip the
+    // probe entirely (stay backed off, try again next cycle) until the orphan
+    // count itself drops back under the cap.
+    if rt.orphaned_transforms.load(Ordering::Acquire) >= crate::hook_transform::MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE
+    {
+        apply_backoff(rt);
+        return false;
+    }
+    let probe_cursor = read_cursor(&rt.rule.cursor_path);
+    if write_cursor(&rt.rule.cursor_path, probe_cursor).is_err() {
+        apply_backoff(rt);
+        return false;
+    }
+    rt.stalled.store(false, Ordering::Release);
+    rt.cursor_write_failures.store(0, Ordering::Release);
+    rt.consecutive_busy.store(0, Ordering::Release);
+    reset_backoff(rt);
+    true
+}
+
+/// One undelivered outbox line and everything its outcome handlers share.
+struct Pending<'a> {
+    rt: &'a RuleRuntime,
+    report_sink: &'a dyn FlowSink,
+    line: &'a str,
+    new_cursor: u64,
+    delivery_id: String,
+}
+
+impl Pending<'_> {
+    fn bump_attempt(&self) -> u32 {
+        let mut c = self.rt.attempt_count.lock().unwrap();
+        *c += 1;
+        *c
+    }
+
+    /// Give up on this line: advance the cursor past it, record the reason on
+    /// the status sidecar and as a `hook.failed`.
+    fn give_up(&self, attempt: u32, reason: &str) {
+        advance_cursor(self.rt, self.new_cursor);
+        write_last_status(self.rt, false, Some(reason));
+        emit_hook_record(self.report_sink, false, self.rt, self.line, attempt, Some(reason), &self.delivery_id);
+    }
+
+    /// [`Self::give_up`] after preserving the raw line in the quarantine file.
+    fn quarantine(&self, reason: &str) {
+        quarantine_line(&self.rt.rule.outbox_path, self.line);
+        self.give_up(1, reason);
+    }
+
+    fn deliver(&self) {
+        let rt = self.rt;
+        // (#2093 merge-gate finding 4) A line that isn't valid JSON — most
+        // likely a torn fragment that `ensure_trailing_newline` turned into
+        // its own complete-but-malformed line at construction — is never
+        // POSTed. Quarantine it (preserve the raw bytes, never silently drop
+        // them), advance the cursor past it so it doesn't block every line
+        // after it forever, and emit `hook.failed` naming the reason.
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(self.line) else {
+            self.quarantine("invalid outbox line");
+            return;
+        };
+        let Some(body) = self.body() else {
+            return;
+        };
+        // (#2183) Sign/derive-metadata-headers-from `parsed` (the TRUE record
+        // — so `hook.fired`'s attribution stays tied to what actually
+        // happened), but pass `&body` as the signed payload: the signature
+        // must cover what's ACTUALLY on the wire, not the pre-transform
+        // record, or a receiver verifying against the body it received would
+        // never match.
+        let headers = build_delivery_headers(
+            &body,
+            Some(&parsed),
+            &self.delivery_id,
+            rt.rule.signing_secret.as_ref(),
+            &rt.rule.headers,
+            rt.rule.attribution_headers,
+        );
+        // (#2183) The `file` transport — no network, ever. Mutually exclusive
+        // with `http` at load time (`resolve_one_rule`), so exactly one of
+        // `file_dir`/a real `try_post` call applies.
+        if let Some(dir) = &rt.rule.file_dir {
+            self.deliver_to_file(dir, &headers, &body);
+            return;
+        }
+        match try_post(&rt.rule.url, &body, &headers) {
+            DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons } => {
+                self.on_success(receiver_rejected, receiver_rejected_reasons)
+            }
+            DeliveryOutcome::ClientError => self.on_client_error(),
+            DeliveryOutcome::RedirectRefused(status, target_host) => self.on_redirect(status, &target_host),
+            DeliveryOutcome::RetryableFailure => self.on_retryable(),
+        }
+    }
+
+    /// The body to send: the line itself, or the rule's `transform` of it.
+    /// `None` when the transform's outcome already settled the line.
+    fn body(&self) -> Option<String> {
+        match &self.rt.rule.transform {
+            None => Some(self.line.to_string()),
+            Some(adapter) => self.transformed(adapter),
+        }
+    }
+
+    /// (#2183) Apply this rule's `transform` — evaluated at DELIVERY time
+    /// (never enqueue), so the outbox keeps raw records and a corrected
+    /// adapter re-drains the SAME lines (see hook_transform's module doc). A
+    /// jq error, timeout, oversize output, or a non-object/non-string result
+    /// is TERMINAL: quarantine + `hook.failed`, never `RetryableFailure` (the
+    /// #2178 wedge lesson — a construction-class error must route to the
+    /// give-up path, not retry an unfixable line forever).
+    fn transformed(&self, adapter: &crate::hook_transform::LoadedAdapter) -> Option<String> {
+        use crate::hook_transform::TransformOutcome;
+        let rt = self.rt;
+        let outcome = crate::hook_transform::apply_transform(
+            &adapter.source,
+            self.line,
+            Duration::from_millis(darkmux_types::config_access::hooks_jq_timeout_ms()),
+            darkmux_types::config_access::hooks_jq_max_output_bytes() as usize,
+            &rt.orphaned_transforms,
+        );
+        match outcome {
+            TransformOutcome::Body(b) => {
+                // A non-Busy outcome — the backlog (if there was one) is not
+                // blocking THIS attempt, so the consecutive-Busy count that
+                // would promote the rule to `stalled` resets.
+                rt.consecutive_busy.store(0, Ordering::Release);
+                Some(b)
+            }
+            TransformOutcome::Error(e) => {
+                rt.consecutive_busy.store(0, Ordering::Release);
+                self.quarantine(&format!("transform `{}` failed: {e}", adapter.path.display()));
+                None
+            }
+            TransformOutcome::Busy => {
+                self.on_busy();
+                None
             }
         }
+    }
+
+    /// (security review round 2, 2026-08-31) NOT a claim about this
+    /// line/adapter — this rule already has too many timed-out transform
+    /// threads still running in the background (see hook_transform's module
+    /// doc). Back off and retry the SAME undelivered line later (never
+    /// quarantine — an otherwise-fine adapter must not be permanently
+    /// disabled because the process is momentarily backed up). Not SILENT:
+    /// the status is written and a rate-limited `hook.failed` names the
+    /// reason, and — since the canonical orphan (`def rec: rec; rec`) never
+    /// finishes, so the backlog can persist for the life of the process —
+    /// `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` consecutive `Busy` outcomes
+    /// promote the rule into the existing `stalled` state, so `doctor`
+    /// surfaces it as ongoing, not transient.
+    fn on_busy(&self) {
+        let rt = self.rt;
+        let orphan_count = rt.orphaned_transforms.load(Ordering::Acquire);
+        let busy_count = rt.consecutive_busy.fetch_add(1, Ordering::AcqRel) + 1;
+        if busy_count >= MAX_CONSECUTIVE_BUSY_BEFORE_STALL && !rt.stalled.swap(true, Ordering::AcqRel) {
+            // Just transitioned into `stalled` — persist it to the `.last`
+            // sidecar IMMEDIATELY, never waiting on `maybe_warn_busy`'s own
+            // rate limit: a cross-process-visible STATE TRANSITION (what
+            // `doctor`/`flow status` read) must never lag a full warning
+            // interval behind the in-memory flag.
+            write_cursor_write_status(
+                &rt.rule.last_status_path,
+                rt.cursor_write_failures.load(Ordering::Acquire),
+                true,
+            );
+        }
+        maybe_warn_busy(rt, self.report_sink, orphan_count);
+        apply_backoff(rt);
+    }
+
+    fn deliver_to_file(&self, dir: &Path, headers: &DeliveryHeaders, body: &str) {
+        let rt = self.rt;
+        match write_file_delivery(dir, &self.delivery_id, &rt.rule.url, headers, body) {
+            Ok(()) => {
+                advance_cursor(rt, self.new_cursor);
+                write_last_status(rt, true, None);
+                let dump_path = dir.join(format!("{}.json", self.delivery_id));
+                emit_dry_run_record(self.report_sink, rt, self.line, &self.delivery_id, &dump_path);
+            }
+            Err(e) => {
+                // A write failure (unwritable dir, full disk) is the `file`
+                // transport's counterpart of a transient network failure —
+                // back off and retry, never quarantine (the RECORD is fine;
+                // the destination is momentarily unwritable).
+                eprintln!("flow::HookSink: file-transport write to {} failed: {e:#}", dir.display());
+                apply_backoff(rt);
+            }
+        }
+    }
+
+    fn on_success(&self, receiver_rejected: Option<u64>, receiver_rejected_reasons: Vec<String>) {
+        let rt = self.rt;
+        let attempt = self.bump_attempt();
+        advance_cursor(rt, self.new_cursor);
+        // (#2273) Persist the rejection count durably (not just onto the
+        // `hook.fired` flow record) so a later `darkmux doctor` invocation
+        // can still see it after the flow event itself has scrolled past. TWO
+        // writes, deliberately: the `.last` sidecar carries the LAST
+        // delivery's count as context (and is wholesale-overwritten by the
+        // next delivery, clean or not), while the `<key>.rejected` counter
+        // sidecar ACCUMULATES and is never reset — that one is what doctor /
+        // `flow status` key on, so one clean delivery seconds later cannot
+        // erase the signal.
+        //
+        // (#2196) `reasons_for_status` rides the SAME gate as the count
+        // (`rejected_for_status`) rather than an independent one keyed on
+        // `receiver_rejected_reasons` being non-empty — a receiver's
+        // `results[]` entries without a top-level `rejected` count is not a
+        // shape this contract defines, so reasons are only surfaced as
+        // context for a rejection the count already named.
+        let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
+        let reasons_for_status: Vec<String> =
+            if rejected_for_status.is_some() { receiver_rejected_reasons } else { Vec::new() };
+        write_last_status_full(rt, true, None, rejected_for_status, reasons_for_status.clone());
+        if let Some(n) = rejected_for_status {
+            let total = add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
+            // (#2196 fix-round MUST FIX 1) Quoted + re-sanitized; (#2196
+            // fix-round 4, MUST FIX G) and on its own INDENTED line(s) rather
+            // than inline, because this string reaches a real terminal, the
+            // same as `flow status` and `doctor` — see
+            // `receiver_rejection_stderr_lines`.
+            for line in receiver_rejection_stderr_lines(&rt.rule.url, n, total, &reasons_for_status) {
+                eprintln!("{line}");
+            }
+        }
+        emit_hook_record_with(
+            self.report_sink,
+            true,
+            rt,
+            self.line,
+            attempt,
+            None,
+            receiver_rejected,
+            &reasons_for_status,
+            &self.delivery_id,
+        );
+    }
+
+    fn on_client_error(&self) {
+        let attempt = self.bump_attempt();
+        // (#2093 merge-gate finding 6) The give-up threshold counts
+        // CLIENT-ERROR attempts only — a line that also saw retryable
+        // 5xx/network failures first must not be abandoned early because
+        // `attempt` (the mixed total) happened to cross 3.
+        let client_errors = {
+            let mut c = self.rt.client_error_count.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        if client_errors >= MAX_CLIENT_ERROR_ATTEMPTS {
+            self.give_up(attempt, &format!("4xx response, skipped after {client_errors} client-error attempts"));
+        } else {
+            apply_backoff(self.rt);
+        }
+    }
+
+    /// (#2093 merge-gate finding 2) A redirect is a PERMANENT failure — never
+    /// retried, cursor advances immediately — because following it would mean
+    /// sending this record's body to a receiver-chosen destination
+    /// `resolve_rules` never validated.
+    fn on_redirect(&self, status: u16, target_host: &str) {
+        let attempt = self.bump_attempt();
+        self.give_up(attempt, &format!("redirect refused: {status} to {target_host}"));
+    }
+
+    fn on_retryable(&self) {
+        self.bump_attempt();
+        apply_backoff(self.rt);
     }
 }
 
