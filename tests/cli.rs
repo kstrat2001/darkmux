@@ -13945,8 +13945,7 @@ fn stderr_on_a_pty(mut cmd: std::process::Command) -> String {
     let mut child = cmd.spawn().unwrap();
     drop(cmd); // closes the parent's copy of the slave so the read ends
     child.wait().unwrap();
-    let out = reader.join().unwrap();
-    out
+    reader.join().unwrap()
 }
 
 /// (5.0) Diagnostic lines go quiet on an interactive terminal and stay in
