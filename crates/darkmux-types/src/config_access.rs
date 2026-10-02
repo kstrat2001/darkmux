@@ -2064,7 +2064,13 @@ fn flows_dir_default() -> std::path::PathBuf {
 fn flows_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
-    if real_user_root.as_ref() == Some(&resolved.root) {
+    // (#2717) A root the leak sentinel pinned was not created by the test, so
+    // it is treated like the real root: records go to the scratch dir.
+    let sentinel_root = std::env::var_os(crate::test_isolation::SENTINEL_ROOT_VAR)
+        .map(std::path::PathBuf::from);
+    if real_user_root.as_ref() == Some(&resolved.root)
+        || sentinel_root.as_ref() == Some(&resolved.root)
+    {
         return crate::paths::test_isolated_dir("flows");
     }
     resolved.root.join("flows")
@@ -3395,6 +3401,35 @@ mod tests {
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
+    }
+
+    /// (#2717) A root the leak sentinel pinned is not a root the test created:
+    /// with `DARKMUX_HOME` equal to the sentinel's announced root and no
+    /// explicit flows dir, a test build must resolve to the per-process
+    /// scratch dir, never `<sentinel root>/flows`.
+    #[serial_test::serial]
+    #[test]
+    fn flows_dir_ignores_a_root_the_leak_sentinel_pinned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev: Vec<_> = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", crate::test_isolation::SENTINEL_ROOT_VAR]
+            .iter()
+            .map(|v| (*v, std::env::var_os(v)))
+            .collect();
+        unsafe {
+            std::env::remove_var("DARKMUX_FLOWS_DIR");
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+            std::env::set_var(crate::test_isolation::SENTINEL_ROOT_VAR, tmp.path());
+        }
+        let dir = flows_dir();
+        for (v, old) in prev {
+            unsafe {
+                match old {
+                    Some(o) => std::env::set_var(v, o),
+                    None => std::env::remove_var(v),
+                }
+            }
+        }
+        assert!(!dir.starts_with(tmp.path()), "{} is under the sentinel root", dir.display());
     }
 
     /// (#2359) `flows_dir` must scope under `DARKMUX_HOME`, exactly as its
