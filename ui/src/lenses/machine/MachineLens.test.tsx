@@ -278,7 +278,7 @@ describe("MachineLens", () => {
         "fleet › machine — M1 Max · 32 GB",
       ),
     );
-    expect(screen.getByText(/residency \/ RAM not reported from here — local-probe only/i)).toBeInTheDocument();
+    expect(screen.getByText(/residency \/ RAM not reported from here: local-probe only/i)).toBeInTheDocument();
     expect(screen.getByText(/View the machine page on studio directly/i)).toBeInTheDocument();
     expect(screen.queryByText(/limit source/i)).not.toBeInTheDocument();
     // The whole point of the gate — never even ISSUE the local probe request

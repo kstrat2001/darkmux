@@ -239,7 +239,7 @@ pub(crate) struct GhVerbJson {
 #[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct ModelJson {
     pub id: String,
-    pub remote: bool,
+    pub unmanaged: bool,
     pub n_ctx: Option<u32>,
 }
 
@@ -258,7 +258,7 @@ pub(crate) enum Residency {
     LoadedStaleCtx,
     LoadedByUser,
     NotLoaded,
-    Remote,
+    Unmanaged,
     Unavailable,
     Unknown,
 }
@@ -271,7 +271,7 @@ impl Residency {
             Residency::LoadedStaleCtx => "loaded stale ctx",
             Residency::LoadedByUser => "loaded by user",
             Residency::NotLoaded => "not loaded",
-            Residency::Remote => "remote",
+            Residency::Unmanaged => "unmanaged",
             Residency::Unavailable => "unavailable",
             Residency::Unknown => "unknown",
         }
@@ -473,7 +473,7 @@ fn resolve_role(
     // applies before trusting a local `ProfileModel` — see
     // `resourcing.rs::resolve_task_role`, `dispatch_internal.rs`, and
     // `darkmux-lab`'s `review.rs`, all of which call `require_n_ctx()` on a
-    // non-remote model before staffing it. Without this, a local model
+    // managed model before staffing it. Without this, a local model
     // missing `n_ctx` rendered here as a healthy `not loaded` while
     // `mission launch` would refuse the whole run.
     if pm.is_managed() {
@@ -489,7 +489,7 @@ fn resolve_role(
         provenance: Some(provenance),
         model: Some(ModelJson {
             id: pm.id.clone(),
-            remote: !pm.is_managed(),
+            unmanaged: !pm.is_managed(),
             n_ctx: pm.n_ctx,
         }),
         residency,
@@ -513,7 +513,7 @@ fn model_residency(
     loaded_models: Result<&[LoadedModel], &str>,
 ) -> (Residency, Option<String>) {
     if !pm.is_managed() {
-        return (Residency::Remote, None);
+        return (Residency::Unmanaged, None);
     }
     match loaded_models {
         // (merge-gate CONSIDER 6) The cause already carries in the show-level
@@ -714,7 +714,7 @@ fn render_role_line(role: &RoleResolution) -> String {
         Some(m) => {
             let ctx = match m.n_ctx {
                 Some(n) => format!("n_ctx {n}"),
-                None if m.remote => "remote".to_string(),
+                None if m.unmanaged => "unmanaged".to_string(),
                 None => "n_ctx ?".to_string(),
             };
             format!("{} ({ctx})", m.id)
@@ -1081,7 +1081,7 @@ mod tests {
         ProfileModel { id: id.to_string(), n_ctx: Some(n_ctx), ..Default::default() }
     }
 
-    fn remote_model(id: &str) -> ProfileModel {
+    fn unmanaged_model(id: &str) -> ProfileModel {
         ProfileModel {
             id: id.to_string(),
             endpoint: Some(ModelEndpoint {
@@ -1292,27 +1292,27 @@ mod tests {
     }
 
     #[test]
-    fn remote_model_without_n_ctx_is_unaffected_by_the_n_ctx_gate() {
+    fn unmanaged_model_without_n_ctx_is_unaffected_by_the_n_ctx_gate() {
         let registry = StepKindRegistry::new();
-        let remote = remote_model("gpt-4-remote"); // no n_ctx declared
-        let profiles = reg(vec![("fast", vec![remote])], Some("fast"));
+        let unmanaged = unmanaged_model("gpt-4-remote"); // no n_ctx declared
+        let profiles = reg(vec![("fast", vec![unmanaged])], Some("fast"));
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
         let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
         let role = show.phases[0].tasks[0].role.as_ref().unwrap();
-        assert!(role.error.is_none(), "a remote model must never be gated on n_ctx: {:?}", role.error);
-        assert_eq!(role.residency, Residency::Remote);
+        assert!(role.error.is_none(), "an unmanaged model must never be gated on n_ctx: {:?}", role.error);
+        assert_eq!(role.residency, Residency::Unmanaged);
     }
 
     #[test]
-    fn resolved_model_reports_remote_only_for_an_unmanaged_model() {
-        // (#2902 step 3) `remote` is derived from `is_managed()`; a managed
-        // (local) model must read `remote: false`, an endpoint one `true`.
+    fn resolved_model_reports_unmanaged_only_for_an_unmanaged_model() {
+        // (#2902 step 3) `unmanaged` is derived from `is_managed()`; a managed
+        // (local) model must read `unmanaged: false`, an endpoint one `true`.
         let registry = StepKindRegistry::new();
-        for (model, want_remote) in [
+        for (model, want_unmanaged) in [
             (local_model("m-local", 8000), false),
-            (remote_model("gpt-4-remote"), true),
+            (unmanaged_model("gpt-4-remote"), true),
         ] {
             let profiles = reg(vec![("fast", vec![model])], Some("fast"));
             let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
@@ -1321,7 +1321,7 @@ mod tests {
             let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
             let role = show.phases[0].tasks[0].role.as_ref().unwrap();
             let m = role.model.as_ref().expect("a resolved role carries its model");
-            assert_eq!(m.remote, want_remote, "model {} remote flag", m.id);
+            assert_eq!(m.unmanaged, want_unmanaged, "model {} unmanaged flag", m.id);
         }
     }
 
@@ -1355,12 +1355,12 @@ mod tests {
     }
 
     #[test]
-    fn residency_remote_never_consults_lms() {
-        let m = remote_model("gpt-4-remote");
-        // `Err` loaded_models — a remote model's residency must not depend
+    fn residency_unmanaged_never_consults_lms() {
+        let m = unmanaged_model("gpt-4-remote");
+        // `Err` loaded_models — an unmanaged model's residency must not depend
         // on `lms` being reachable at all.
         let (residency, detail) = model_residency(&m, Err("lms not found"));
-        assert_eq!(residency, Residency::Remote);
+        assert_eq!(residency, Residency::Unmanaged);
         assert!(detail.is_none());
     }
 

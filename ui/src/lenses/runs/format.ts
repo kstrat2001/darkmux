@@ -1,16 +1,9 @@
 /**
- * Pure port of the runs-lens formatting/grouping logic in `viewer.html`
- * (the `── the runs lens ──` and `── Lab observer lens ──` sections). Kept
- * as standalone functions — not component-local — so they're independently
- * unit-testable against the same inputs/outputs the legacy `<script>` block
- * produces, and so `RunsBoard.tsx` reads as "wire data in, JSX out" rather
- * than re-deriving this logic inline.
- *
- * Every function name and behavior below is a DELIBERATE 1:1 match to its
- * `viewer.html` namesake (see that file's own comments for the "why", not
- * repeated here) — this is a port, not a redesign. `RUNS_KINDS`/`RunsKind`
- * live in `../../lib/route.ts` already (the scaffold's hash-grammar port);
- * imported from there rather than redeclared.
+ * The runs lens's pure formatting and grouping logic. Kept as standalone
+ * functions, not component-local, so they are independently unit-testable
+ * and `RunsBoard.tsx` reads as "wire data in, JSX out" rather than
+ * re-deriving this logic inline. `RUNS_KINDS`/`RunsKind` live in
+ * `../../lib/route.ts`, imported from there rather than redeclared.
  *
  * `shortModel` lives in `../../lib/format.ts` and is re-exported from here.
  * The "lab-series six" it once belonged to (`labFieldVal`/`labTaskKey`/
@@ -29,18 +22,17 @@ import { canonUid, machineRefKey, matchesMachine, nameKey, type MachineMatch, ty
 
 export { shortModel };
 
-export const RUNS_CAP = 25; // viewer.html: `const RUNS_CAP=25`
+export const RUNS_CAP = 25;
 
-/** viewer.html: `function runActivity(r)`. STRICTLY newest-activity-first
- * ordering — see that function's own comment for why `running` rows are
- * never hoisted above their actual last-activity time. */
+/** A run's last-activity time. Ordering is STRICTLY newest-activity-first:
+ * `running` rows are never hoisted above their actual last-activity time. */
 export function runActivity(r: Run): number {
   return r.updated_ts || r.completed_ts || r.started_ts || 0;
 }
 
-/** viewer.html: `function runsAgo(r)`, minus the `runsIsPlayback()` branch —
- * this port has no playback/`daemon-mode-play` concept (the scaffold's
- * `/next` route is always "live"), so only the relative-time branch applies.
+/** How long ago a run was last active, relative to `now`. The board is
+ * always live (it has no playback mode), so only the relative-time branch
+ * exists.
  * `now` defaults to `Date.now()` but is threaded as a parameter so a test
  * (or a future frozen-clock caller) doesn't have to mock the global clock. */
 export function runsAgo(r: Run, now: number = Date.now()): string {
@@ -99,7 +91,7 @@ export interface SubtitlePart {
   verify?: { outcome: VerifyOutcome; word: string };
 }
 
-/** viewer.html: `function runSubtitle(r, showMachine)`, as parts. `machine` is
+/** A run row's subtitle, as parts. `machine` is
  * the machine's display label (`runMachineLabels`), or `null` to leave it out. */
 export function runSubtitleParts(r: Run, machine: string | null): SubtitlePart[] {
   const parts: SubtitlePart[] = [];
@@ -165,8 +157,7 @@ export function machineKeyOfRuns(runs: Run[]): (r: Run) => string | null {
   };
 }
 
-/** viewer.html: `function runsMultiMachine()`, generalized to take the runs
- * array as a parameter (legacy reads the module-global `RUNS`). Counts
+/** Whether the runs span more than one machine. Counts
  * MACHINES, not spellings: one machine under two names is one, two machines
  * under one name are two. */
 export function runsMultiMachine(runs: Run[]): boolean {
@@ -201,8 +192,7 @@ export function runMachineLabels(runs: Run[]): Map<string, string> {
   return labels;
 }
 
-/** viewer.html: `function runsFiltered()`, parameterized over `runs`/`kind`
- * rather than reading `state.runsKind`/`RUNS` off module globals. */
+/** The runs a kind tab shows, filtered by `kind`. */
 export function runsFiltered(runs: Run[], kind: string): Run[] {
   const rows = kind === "all" ? runs.slice() : runs.filter((r) => r.kind === kind);
   rows.sort((a, b) => runActivity(b) - runActivity(a));
@@ -212,9 +202,7 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
 
 /**
  * (#1809, #1508 step 4) Filter a runs list down to ONE pinned machine — the
- * runs-lens half of the machine dimension legacy never had. Unlike every
- * other export in this file (see the module doc's opening paragraph), this
- * one has no `viewer.html` namesake; it is new.
+ * runs-lens half of the machine dimension.
  *
  * A run belongs to a machine by UID (`Run.machine_uid`, stamped from the
  * records that produced the row), compared case-normalized: one machine under
@@ -362,9 +350,9 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
   return { kind: "hash", hash: `mission=${encodeURIComponent(run.id)}` };
 }
 
-/** The notice used to point at "the classic viewer at /" — `viewer.html`
- * was deleted in #1865 and `/` now serves THIS SAME app, so a daemon-less
- * visitor was being told to go to the page they were already on. There is
+/** The notice used to point at "the classic viewer at /", but `/` serves
+ * THIS SAME app (#1865), so a daemon-less visitor was being told to go to
+ * the page they were already on. There is
  * genuinely nowhere else to send them (a static build has no daemon to
  * reach, full stop), so the fix names the missing capability instead of a
  * bogus destination — matching `RunsBoard.tsx`'s own `onLabRunUnresolvable`
@@ -372,4 +360,4 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
  * redeclared per caller) so the two surfaces that can hit `runDestination`'s
  * `unreachable` branch say the same thing. */
 export const MISSION_GRAPH_UNREACHABLE_NOTICE =
-  "mission graph needs a running daemon behind this page — this static build has no mission graph data to show.";
+  "mission graph needs a running daemon behind this page: this static build has no mission graph data to show.";

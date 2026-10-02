@@ -55,13 +55,13 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("machine (a specific/remote drill) round-trips with an explicit machine key — the drill-in widening (#2929: machine=, never uid=)", () => {
+  it("machine (a specific/remote drill) round-trips with an explicit machine key: the drill-in widening (#2929: machine=, never uid=)", () => {
     const route: Route = { kind: "machine", machine: "studio" };
     expect(canonicalHash(route)).toBe("lens=machine&machine=studio");
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("runs (kind=lab, a resolved run) round-trips with an explicit lab param — the lab-run-detail deep link", () => {
+  it("runs (kind=lab, a resolved run) round-trips with an explicit lab param: the lab-run-detail deep link", () => {
     const route: Route = { kind: "runs", runsKind: "lab", lab: "live/gate-1", machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&kind=lab&lab=live%2Fgate-1");
     expect(roundTrip(route)).toEqual(route);

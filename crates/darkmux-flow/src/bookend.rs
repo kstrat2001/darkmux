@@ -196,7 +196,7 @@ pub type DynBookendGuard<'a> = BookendGuard<'a, dyn BookendSink + 'a>;
 /// every endpoint host darkmux has seen in practice (an Azure deployment's
 /// hostname always contains `azure`, e.g. `*.cognitiveservices.azure.com`
 /// or `*.openai.azure.com`), and host is all this function is given.
-pub fn remote_route_label(host: &str, model_id: &str) -> String {
+pub fn unmanaged_route_label(host: &str, model_id: &str) -> String {
     // (#1660) Strip URL userinfo before the `@`, HERE rather than in each
     // caller. This function is the single point every route label flows
     // through, so sanitizing at the chokepoint makes every caller — present
@@ -364,11 +364,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_route_label_matches_expected_shape() {
+    fn unmanaged_route_label_matches_expected_shape() {
         assert_eq!(
-            remote_route_label("myorg.cognitiveservices.azure.com", "gpt-4o"),
+            unmanaged_route_label("myorg.cognitiveservices.azure.com", "gpt-4o"),
             "azure:myorg.cognitiveservices.azure.com/gpt-4o"
         );
-        assert_eq!(remote_route_label("api.openai.com", "gpt-4o"), "openai:api.openai.com/gpt-4o");
+        assert_eq!(unmanaged_route_label("api.openai.com", "gpt-4o"), "openai:api.openai.com/gpt-4o");
     }
 }

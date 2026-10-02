@@ -50,8 +50,8 @@ pub(crate) struct FixtureManifest {
     pub version: String,
 
     /// What abstract fixture definition this artifact satisfies.
-    /// Format: `<definition-name>@<version>`. Phase 3 uses this for
-    /// the workload's `requires_fixture` resolution.
+    /// Format: `<definition-name>@<version>`. The resolver uses this
+    /// for the workload's `requires_fixture` resolution.
     #[serde(default)]
     pub satisfies: Option<String>,
 
@@ -63,7 +63,7 @@ pub(crate) struct FixtureManifest {
 
     /// Verify-command template. `{test_files}` and other `{fixture.*}`
     /// placeholders substituted at dispatch time by the workload's
-    /// verify-command template (Phase 3).
+    /// verify-command template.
     #[serde(default)]
     pub verify_command: Option<String>,
 

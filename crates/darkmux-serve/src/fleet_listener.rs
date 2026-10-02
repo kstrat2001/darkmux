@@ -291,7 +291,7 @@ impl RefusalLog {
 fn refuse(state: &FleetListenerState, peer: Option<std::net::IpAddr>, r: &Refusal) -> Response {
     let receiver = &state.receiver;
     let code = StatusCode::from_u16(r.http_status()).unwrap_or(StatusCode::FORBIDDEN);
-    state.refusal_log.log(peer, &format!("darkmux serve: fleet listener: refused — {}", r.reason(receiver)));
+    state.refusal_log.log(peer, &format!("darkmux serve: fleet listener: refused: {}", r.reason(receiver)));
     (code, Json(r.reply(receiver))).into_response()
 }
 
@@ -727,7 +727,7 @@ impl Worker {
         let receiver = &self.state.receiver;
         self.state.refusal_log.log(
             Some(self.peer),
-            &format!("darkmux serve: fleet listener: refused queued {} — {}", self.job.session_id, r.reason(receiver)),
+            &format!("darkmux serve: fleet listener: refused queued {}: {}", self.job.session_id, r.reason(receiver)),
         );
         if let Some(p) = &self.progress {
             let reply = SubmissionReply { session_id: self.base.session_id.clone(), ..r.reply(receiver) };

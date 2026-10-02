@@ -417,7 +417,7 @@ fn trust_row(f: &FleetSubmissionFacts) -> Check {
             if e.roles.is_empty() { "none".to_string() } else { e.roles.join(", ") },
             if e.images.is_empty() { "runtime only".to_string() } else { e.images.join(", ") },
             if e.workspace { "yes" } else { "no" },
-            if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) }
+            if notes.is_empty() { String::new() } else { format!(": {}", notes.join("; ")) }
         ));
     }
     let provider = match &f.provider {

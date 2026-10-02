@@ -700,7 +700,7 @@ impl ModelEndpoint {
                 && auth.keychain.as_deref().unwrap_or("").is_empty()
                 && auth.key_env.as_deref().unwrap_or("").is_empty()
             {
-                return Err("endpoint.auth.type is set but no credential source is declared — set \
+                return Err("endpoint.auth.type is set but no credential source is declared: set \
                      endpoint.auth.keychain (a macOS Keychain item name) or endpoint.auth.key_env \
                      (the NAME of an env var holding the key)"
                     .to_string());

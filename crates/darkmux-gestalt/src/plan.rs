@@ -274,7 +274,7 @@ impl EvictionOrder {
     fn describe(self) -> &'static str {
         match self {
             EvictionOrder::HostReported => {
-                "host-reported order (no recency fact exists yet — this is not LRU)"
+                "host-reported order (no recency fact exists yet: this is not LRU)"
             }
         }
     }
@@ -302,7 +302,7 @@ fn fmt_foreign_no_capacity(
     }
     write!(
         f,
-        "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
+        "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux: darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
         gb(est_bytes),
         gb(limit_bytes)
     )
@@ -312,7 +312,7 @@ fn fmt_foreign_no_capacity(
 fn fmt_unknown_model_key(f: &mut fmt::Formatter<'_>, nearest: &[String]) -> fmt::Result {
     write!(
         f,
-        "the model key is not in the host catalog — refused before any load attempt could hang or prompt a download (#1276)"
+        "the model key is not in the host catalog: refused before any load attempt could hang or prompt a download (#1276)"
     )?;
     if !nearest.is_empty() {
         write!(f, "; nearest catalog keys: {}", nearest.join(", "))?;
@@ -331,17 +331,17 @@ fn fmt_claimed_resident(
 ) -> fmt::Result {
     write!(
         f,
-        "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
+        "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs: it is already claimed"
     )?;
     if clearable {
         write!(
             f,
-            " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
+            " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands: #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling: pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
         )
     } else {
         write!(
             f,
-            " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
+            " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting: the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672): lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
         )
     }
 }

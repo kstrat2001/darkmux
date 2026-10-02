@@ -724,7 +724,7 @@ ModelEndpoint
   limits?: Lenient3 | null
 ModelJson
   id: string
-  remote: boolean
+  unmanaged: boolean
   n_ctx: uint32 | null
 ModelLedger
   schema_version: string
@@ -876,7 +876,7 @@ RegistryJson
 ReserveConfig
   bail_after_token_count?: uint64 | null
   bail_after_compactions?: uint32 | null
-Residency = "loaded" | "loaded_stale_ctx" | "loaded_by_user" | "not_loaded" | "remote" | "unavailable" | "unknown"
+Residency = "loaded" | "loaded_stale_ctx" | "loaded_by_user" | "not_loaded" | "unmanaged" | "unavailable" | "unknown"
 ResidencyBlockJson
   available: boolean
   error: string | null

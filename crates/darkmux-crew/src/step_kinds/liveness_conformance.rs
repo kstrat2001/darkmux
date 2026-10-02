@@ -346,7 +346,7 @@ fn the_extractor_discriminates_between_neighboring_functions() {
     );
     assert!(
         !remote.contains("single-shot dispatch requires one"),
-        "`dispatch_unmanaged`'s body ran on into its neighbor `dispatch_local_single_shot` — \
+        "`dispatch_unmanaged`'s body ran on into its neighbor `dispatch_local_single_shot`: \
          the extractor is over-reaching, so every other assertion here is unearned"
     );
 

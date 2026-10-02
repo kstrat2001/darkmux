@@ -257,7 +257,7 @@ pub fn mismatch_refusal(image: &str, verdict: &ImageVerdict, host_version: &str)
 /// The stderr notice when the default path skips a local `:latest`.
 pub fn skipped_latest_notice(verdict: &ImageVerdict, host_version: &str) -> String {
     format!(
-        "darkmux dispatch: local {}; this darkmux is {host_version} — not using it; \
+        "darkmux dispatch: local {}; this darkmux is {host_version}: not using it; \
          running the version-pinned `{}` instead (#2923). Rebuild it with `{}`, or remove it \
          with `docker rmi {RUNTIME_IMAGE}`.",
         describe_non_match(RUNTIME_IMAGE, verdict),

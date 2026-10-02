@@ -162,9 +162,9 @@ export function notLocalMessage(machineName: string): string {
   // (#2921 follow-up) "on unnamed machine" names nothing the user can find,
   // so a nameless machine's sentence says how to give it a name instead.
   if (isUnnamedMachineLabel(machineName)) {
-    return "residency / RAM not reported from here — local-probe only. This machine reports no name: run `darkmux config set machine_id <name>` on it.";
+    return "residency / RAM not reported from here: local-probe only. This machine reports no name: run `darkmux config set machine_id <name>` on it.";
   }
-  return `residency / RAM not reported from here — local-probe only. View the machine page on ${machineName || "that machine"} directly for live figures.`;
+  return `residency / RAM not reported from here: local-probe only. View the machine page on ${machineName || "that machine"} directly for live figures.`;
 }
 
 /** The daemon-unreachable-with-no-cached-data placeholder — viewer.html:1873. */

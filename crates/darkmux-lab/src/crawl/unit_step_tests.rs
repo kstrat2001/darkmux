@@ -1375,7 +1375,7 @@ fn the_summary_totals_every_unit_and_keeps_the_retired_launchers_payload_keys() 
         PHASE,
         "u3",
         NodeStatus::Error,
-        Some("`dispatch.unit`: unit `u-0003` ended `timeout` — dispatch ended `timeout`"),
+        Some("`dispatch.unit`: unit `u-0003` ended `timeout`: dispatch ended `timeout`"),
     );
 
     let s = summarize_mission(MISSION).unwrap();
@@ -1419,7 +1419,7 @@ fn a_thermal_stop_gets_its_own_bucket_and_names_the_run_without_hiding_the_error
         PHASE,
         "u2",
         NodeStatus::Error,
-        Some("`dispatch.unit`: unit `u-0002` ended `timeout` — dispatch ended `timeout`"),
+        Some("`dispatch.unit`: unit `u-0002` ended `timeout`: dispatch ended `timeout`"),
     );
     // Then the breaker tripped and the last two never dispatched.
     save_unit_step(MISSION, PHASE, "u3", NodeStatus::Complete, Some(&outcome_json("u-0003", THERMAL_STOP, 0, 0, 0)));
@@ -1500,7 +1500,7 @@ fn an_interrupt_outranks_an_earlier_error_the_same_way_thermal_does() {
         PHASE,
         "u1",
         NodeStatus::Error,
-        Some("`dispatch.unit`: unit `u-0001` ended `timeout` — dispatch ended `timeout`"),
+        Some("`dispatch.unit`: unit `u-0001` ended `timeout`: dispatch ended `timeout`"),
     );
     save_unit_step(MISSION, PHASE, "u2", NodeStatus::Abandoned, None);
 
@@ -1714,7 +1714,7 @@ fn not_run_outranks_an_earlier_error() {
         PHASE,
         "u1",
         NodeStatus::Error,
-        Some("`dispatch.unit`: unit `u-0001` ended `timeout` — dispatch ended `timeout`"),
+        Some("`dispatch.unit`: unit `u-0001` ended `timeout`: dispatch ended `timeout`"),
     );
     save_unit_step(MISSION, PHASE, "u2", NodeStatus::Running, None);
 
@@ -1814,7 +1814,7 @@ fn eight_units_covering_every_outcome_reconcile_exactly_to_the_plan_total() {
         PHASE,
         "u4",
         NodeStatus::Error,
-        Some("`dispatch.unit`: unit `u-0004` ended `error` — container refused"),
+        Some("`dispatch.unit`: unit `u-0004` ended `error`: container refused"),
     );
     save_unit_step(MISSION, PHASE, "u5", NodeStatus::Abandoned, None);
     save_unit_step(MISSION, PHASE, "u6", NodeStatus::Complete, Some(&outcome_json("u-0006", THERMAL_STOP, 0, 0, 0)));
@@ -1931,7 +1931,7 @@ fn an_errored_unit_never_refuses_the_whole_summary() {
         config: serde_json::json!({"unit": "u-0002", "rule": "swallowed-error"}),
         started_ts: None,
         completed_ts: None,
-        output: Some("`dispatch.unit`: unit `u-0002` ended `error` — container refused".into()),
+        output: Some("`dispatch.unit`: unit `u-0002` ended `error`: container refused".into()),
     };
     darkmux_crew::lifecycle::save_step(MISSION, PHASE, &errored).unwrap();
 
@@ -2589,7 +2589,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/2")],
-        "`<execution>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
+        "`<execution>/<emit_seq>`, 1-based over non-empty lines: the runtime's own ordinal"
     );
     assert_eq!(
         body.finding_refs[0].id,
@@ -2892,7 +2892,7 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
     let SeatClaim::LocalModelUnresolved { reason } = claim else {
         panic!(
             "a Task naming a role the registry has no manifest for must not silently resolve as \
-             if it were \"crawler\" — expected LocalModelUnresolved, got {:?}",
+             if it were \"crawler\": expected LocalModelUnresolved, got {:?}",
             claim.class()
         );
     };

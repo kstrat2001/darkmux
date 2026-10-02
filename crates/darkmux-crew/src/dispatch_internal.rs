@@ -719,7 +719,7 @@ pub(crate) fn validate_resume_checkpoint_content(
     );
     if let Err(e @ crate::contained_file::ContainedFileError::Refused(_)) = &read {
         bail_resume!(
-            "darkmux dispatch: RESUME CHECKPOINT REFUSED — {} was {e}; darkmux reads a \
+            "darkmux dispatch: RESUME CHECKPOINT REFUSED: {} was {e}; darkmux reads a \
              checkpoint only as a regular file inside --resume-from {}",
             src.display(),
             resume_from.display()
@@ -921,7 +921,7 @@ pub(crate) fn validate_resume_checkpoint(
     let origin_path = resume_origin_path(resume_from);
     let origin_contents = read_resume_origin(resume_from).map_err(|e| {
         resume_refusal!(
-            "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read the host-only origin \
+            "darkmux dispatch: RESUME ORIGIN UNKNOWN: could not read the host-only origin \
              record {} ({e}); this host has no record of the workspace mount mode/path the \
              checkpoint at {} was written under (a run from before 5.0 kept it inside the \
              model-writable out-dir, which darkmux no longer trusts), so it refuses to \
@@ -939,7 +939,7 @@ pub(crate) fn validate_resume_checkpoint(
     })?;
     if let Some(file_version) = darkmux_types::data_version::newer(&origin, RESUME_ORIGIN_SCHEMA_VERSION) {
         bail_resume!(
-            "darkmux dispatch: RESUME ORIGIN NEWER — {}: {}",
+            "darkmux dispatch: RESUME ORIGIN NEWER: {}: {}",
             origin_path.display(),
             darkmux_types::data_version::newer_refusal("resume origin", &file_version, RESUME_ORIGIN_SCHEMA_VERSION)
         );
@@ -1260,7 +1260,7 @@ pub(crate) fn resume_hint_from_origin(
     let Some(origin) = origin else {
         return format!(
             "this run has no readable origin record at {}, so `--resume-from` would refuse with \
-             RESUME ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once \
+             RESUME ORIGIN UNKNOWN: the run cannot be resumed; start a fresh dispatch once \
              conditions look better",
             resume_origin_path(host_out).display()
         );
@@ -1268,7 +1268,7 @@ pub(crate) fn resume_hint_from_origin(
     let Some(workspace) = origin.get("workspace").and_then(|v| v.as_str()) else {
         return format!(
             "the origin record at {} names no `workspace`, so `--resume-from` would refuse with \
-             RESUME ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once \
+             RESUME ORIGIN UNKNOWN: the run cannot be resumed; start a fresh dispatch once \
              conditions look better",
             resume_origin_path(host_out).display()
         );
@@ -2067,7 +2067,7 @@ pub struct DockerRunConfig {
     /// container as `-e DARKMUX_TURN_DELAY_MS=<ms>` — the SAME #1548 pattern
     /// `feedback_injection` above uses (the runtime crate can't depend on
     /// `config_access`; the host does the tier resolution and always
-    /// forwards its result, even at `0`). The remote single-shot path
+    /// forwards its result, even at `0`). The unmanaged-endpoint single-shot path
     /// never sets this at all — it never builds a `DockerRunConfig`. An
     /// agentic-REMOTE dispatch (a tool-granting role on an endpoint
     /// profile, `remote_chat_url.is_some()` below) DOES build one and run
@@ -2876,7 +2876,7 @@ fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Re
     let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
         anyhow!(
             "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-             conventional roles dir, and the embedded table) — hosted dispatch requires one",
+             conventional roles dir, and the embedded table): hosted dispatch requires one",
             opts.role_id,
             role.prompt_path
         )
@@ -3403,7 +3403,7 @@ fn remote_chat_attempt(
     // to stop.
     if darkmux_types::interrupt::is_set() && !out.status.success() {
         return Err(HostedCallError::Other(anyhow!(
-            "hosted dispatch {} (SIGINT/SIGTERM/SIGHUP) — \
+            "hosted dispatch {} (SIGINT/SIGTERM/SIGHUP): \
              the request to {url} was killed mid-flight",
             darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         )));
@@ -3530,7 +3530,7 @@ fn emit_single_shot_usage(
 /// original `emit_remote_record`'s behavior on every action including
 /// `"dispatch error"` — a hosted-call failure surfaces via
 /// `payload.result_class`/`payload.error`, not the record level.
-fn build_remote_record(
+fn build_unmanaged_record(
     role_id: &str,
     session: &SessionId,
     execution: &ExecutionId,
@@ -3662,7 +3662,7 @@ fn dispatch_unmanaged(
     bookend.open(
         "dispatch",
         "dispatch",
-        build_remote_record(
+        build_unmanaged_record(
             &opts.role_id,
             session,
             execution,
@@ -3707,7 +3707,7 @@ fn dispatch_unmanaged(
             }
             bookend.close(
                 "dispatch",
-                build_remote_record(
+                build_unmanaged_record(
                     &opts.role_id,
                     session,
                     execution,
@@ -3774,7 +3774,7 @@ fn dispatch_unmanaged(
     }
     bookend.close(
         "dispatch",
-        build_remote_record(
+        build_unmanaged_record(
             &opts.role_id,
             session,
             execution,
@@ -3913,13 +3913,13 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         if opts.resume_from.is_some() {
             bail!(
                 "darkmux dispatch: --resume-from is not supported on the \
-                 remote single-shot dispatch path (role `{}` resolved to a \
+                 unmanaged-endpoint single-shot dispatch path (role `{}` resolved to a \
                  bare hosted chat-completions call via the container-free \
-                 single-shot primitive — no Docker, no container, no \
+                 single-shot primitive: no Docker, no container, no \
                  checkpoint). darkmux never silently starts a dispatch \
                  fresh under a name that looked like a resume: resume \
                  needs the container path (the ordinary `dispatch()` entry \
-                 point with a tool-granting role) — or drop --resume-from \
+                 point with a tool-granting role): or drop --resume-from \
                  to start this role fresh on purpose.",
                 opts.role_id
             );
@@ -4027,7 +4027,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     bookend.open(
         "dispatch",
         "dispatch",
-        build_remote_record(
+        build_unmanaged_record(
             &opts.role_id,
             session,
             execution,
@@ -4087,7 +4087,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             }
             bookend.close(
                 "dispatch",
-                build_remote_record(
+                build_unmanaged_record(
                     &opts.role_id,
                     session,
                     execution,
@@ -4146,7 +4146,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     }
     bookend.close(
         "dispatch",
-        build_remote_record(
+        build_unmanaged_record(
             &opts.role_id,
             session,
             execution,
@@ -5004,14 +5004,14 @@ pub(crate) fn refuse_resume_on_bare_hosted_path(opts: &DispatchOpts) -> Result<(
 pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
     format!(
         "darkmux dispatch: --resume-from is not supported on the \
-         remote single-shot dispatch path (role `{role_id}` grants no \
+         unmanaged-endpoint single-shot dispatch path (role `{role_id}` grants no \
          tools, so this dispatch resolved to a bare hosted \
-         chat-completions call — no Docker, no container, no \
+         chat-completions call: no Docker, no container, no \
          checkpoint). darkmux never silently starts a dispatch \
          fresh under a name that looked like a resume: resume \
          needs the container path, which a tool-granting role \
          (e.g. a coder or reviewer role with a non-empty \
-         tool_palette) resolves to — or drop --resume-from to \
+         tool_palette) resolves to: or drop --resume-from to \
          start this role fresh on purpose."
     )
 }
@@ -6576,7 +6576,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // way; there is nothing left to deregister here).
         return Err(anyhow!(
             "darkmux-runtime container dispatch {} \
-             (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run",
+             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
             darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         ));
     }
@@ -7213,7 +7213,7 @@ pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&s
         Ok(body) => Some(body),
         Err(e) => {
             if e.is_refused() {
-                sink(&format!("darkmux: {} not read — {e}", out_dir.join(rel).display()));
+                sink(&format!("darkmux: {} not read: {e}", out_dir.join(rel).display()));
             }
             None
         }
@@ -9600,7 +9600,7 @@ impl TailerState {
                 if !self.trajectory_refusal_warned {
                     self.trajectory_refusal_warned = true;
                     (self.warning_sink)(&format!(
-                        "darkmux: live trajectory {} not read — {why}; this dispatch's \
+                        "darkmux: live trajectory {} not read: {why}; this dispatch's \
                          live records and turn counts will be missing",
                         self.trajectory_path.display()
                     ));
@@ -10674,12 +10674,12 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         E::CycleSuspected(e) => Some(TelemetryDetectorPayload {
             area: tool_target_area(&e.tool_name, &e.canonical_args, e.code_hash.as_deref()),
             ..new(DetectorKind::Cycle, DetectorSeverity::Warn, format!(
-                "`{}` called {}× in the last {} tool calls — repeated-tool-call cycle (#418)",
+                "`{}` called {}× in the last {} tool calls: repeated-tool-call cycle (#418)",
                 e.tool_name, e.count, e.window_size
             ))
         }),
         E::ReasoningLoopSuspected(e) => Some(new(DetectorKind::ReasoningLoop, DetectorSeverity::Warn, format!(
-            "same reasoning repeated {}× in {} turns — reasoning loop (#461)",
+            "same reasoning repeated {}× in {} turns: reasoning loop (#461)",
             e.count, e.window_size
         ))),
         E::RepeatedToolFailure(e) => Some(TelemetryDetectorPayload {
@@ -10699,7 +10699,7 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         E::EmptyToolCallsRecovered(e) => Some(TelemetryDetectorPayload {
             bound: e.bound.as_ref().map(bound_ref),
             ..new(DetectorKind::EmptyToolCalls, DetectorSeverity::Info, format!(
-                "the model returned finish_reason=tool_calls with no tool calls — turn dropped + \
+                "the model returned finish_reason=tool_calls with no tool calls: turn dropped + \
                  recovered; request bound was {} (budget {}/{}, {} tokens) (#2190)",
                 bound_clause(e.bound.as_ref()), e.recoveries_used, e.recoveries_budget, count_or_unknown(e.completion_tokens)
             ))
@@ -10716,7 +10716,7 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
             arguments_chars: Some(e.arguments_chars),
             cut: Some(e.cut.to_string()),
             ..new(DetectorKind::DiscardedToolCall, DetectorSeverity::Warn, format!(
-                "tool call `{}` was cut after {} character{} of arguments (cut={}) — the JSON does \
+                "tool call `{}` was cut after {} character{} of arguments (cut={}): the JSON does \
                  not parse, so it was neither dispatched nor sent back; that turn's work is gone (#2836)",
                 e.name, e.arguments_chars, if e.arguments_chars == 1 { "" } else { "s" }, e.cut
             ))
@@ -10733,7 +10733,7 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
             model: Some(e.model.clone()),
             prompt_tokens: Some(e.prompt_tokens),
             ..new(DetectorKind::Escalation, DetectorSeverity::Warn, format!(
-                "escalated out of local-tier ({}) — model={}, prompt_tokens={} (#2190)",
+                "escalated out of local-tier ({}): model={}, prompt_tokens={} (#2190)",
                 e.reason, e.model, e.prompt_tokens
             ))
         }),
@@ -10799,18 +10799,18 @@ fn malformed_detail(e: &darkmux_trajectory::MalformedToolNames) -> String {
     match e.reason {
         darkmux_trajectory::MalformedReason::RealToolNotGranted => format!(
             "{count} tool call(s) this turn named a REAL tool this dispatch's role is not granted \
-             (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
+             (model={model}, sample=\"{sample}\"): never dispatched, coalesced into one feedback \
              message (#2169)"
         ),
         // (#3035) A reason a newer runtime named: say only what is known, that
         // the calls never ran. Never "not a real tool", which is a claim.
         darkmux_trajectory::MalformedReason::Unknown => format!(
             "{count} tool call(s) this turn were malformed for a reason this darkmux does not know \
-             (model={model}, sample=\"{sample}\") — never dispatched (#2169)"
+             (model={model}, sample=\"{sample}\"): never dispatched (#2169)"
         ),
         darkmux_trajectory::MalformedReason::NotATool => format!(
             "{count} tool call(s) this turn carried a `name` that is not a real tool \
-             (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
+             (model={model}, sample=\"{sample}\"): never dispatched, coalesced into one feedback \
              message (#2169)"
         ),
     }
@@ -10825,7 +10825,7 @@ fn gate_observation_detail(g: &darkmux_trajectory::GateObservation) -> Option<St
     }
     let ratio = g.tail_ratio.map_or_else(|| "?".to_string(), |r| format!("{r:.3}"));
     let base = format!(
-        "observation {}: tail_ratio={ratio} over {} characters — the degeneracy gate judged this \
+        "observation {}: tail_ratio={ratio} over {} characters: the degeneracy gate judged this \
          repeating (#2836)",
         g.observation, g.slice_chars
     );
@@ -10833,8 +10833,8 @@ fn gate_observation_detail(g: &darkmux_trajectory::GateObservation) -> Option<St
         return Some(format!("{base} and ended the call"));
     }
     Some(match recorded_policy(g.policy.as_deref()) {
-        Some(DetectionPolicy::Record) => format!("{base} — recorded, not concluded"),
-        Some(DetectionPolicy::Warn) => format!("{base} — warned, not concluded"),
+        Some(DetectionPolicy::Record) => format!("{base}: recorded, not concluded"),
+        Some(DetectionPolicy::Warn) => format!("{base}: warned, not concluded"),
         Some(DetectionPolicy::Off) | Some(DetectionPolicy::Conclude) | None => base,
     })
 }
@@ -11539,7 +11539,7 @@ fn resolve_dispatch_model_with_hosts(
                     bail!(
                         "darkmux dispatch: profile `{active_name}` selects \
                          `{id}`, but LMStudio has loaded [{loaded}] and \
-                         DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
+                         DARKMUX_STRICT_SELECTION is set: refusing to dispatch \
                          against an unselected model. Fix: `lms load {id}` to load \
                          the selected model, update `default_profile` to match \
                          what's loaded, or unset DARKMUX_STRICT_SELECTION to \
@@ -11547,7 +11547,7 @@ fn resolve_dispatch_model_with_hosts(
                     );
                 }
                 eprintln!(
-                    "darkmux dispatch: WARNING — profile `{active_name}` \
+                    "darkmux dispatch: WARNING: profile `{active_name}` \
                      selects `{id}`, but LMStudio has loaded [{loaded}]. \
                      Residents loaded for another profile don't update \
                      `default_profile` in the registry; your loaded model \

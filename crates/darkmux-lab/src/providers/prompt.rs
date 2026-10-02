@@ -430,9 +430,9 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOu
 /// that reports one.
 pub(crate) fn verify_note(verify: Option<&VerifyOutcome>) -> String {
     match verify {
-        Some(v) if v.passed => format!("verify: ok — {}", v.details),
-        Some(v) => format!("verify: fail — {}", v.details),
-        None => "verify: not checked — no verify spec".to_string(),
+        Some(v) if v.passed => format!("verify: ok: {}", v.details),
+        Some(v) => format!("verify: fail: {}", v.details),
+        None => "verify: not checked: no verify spec".to_string(),
     }
 }
 
@@ -663,9 +663,9 @@ mod tests {
     #[test]
     fn verify_note_names_each_state() {
         let v = |passed| VerifyOutcome { passed, details: "d".into() };
-        assert_eq!(verify_note(Some(&v(true))), "verify: ok — d");
-        assert_eq!(verify_note(Some(&v(false))), "verify: fail — d");
-        assert_eq!(verify_note(None), "verify: not checked — no verify spec");
+        assert_eq!(verify_note(Some(&v(true))), "verify: ok: d");
+        assert_eq!(verify_note(Some(&v(false))), "verify: fail: d");
+        assert_eq!(verify_note(None), "verify: not checked: no verify spec");
     }
 
     #[test]

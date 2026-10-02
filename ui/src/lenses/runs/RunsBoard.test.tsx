@@ -974,7 +974,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     expect(window.history.length).toBe(before);
   });
 
-  it("(#2929) an old uid link is not rewritten until the roster has landed — a roster name renumbers the unnamed", async () => {
+  it("(#2929) an old uid link is not rewritten until the roster has landed: a roster name renumbers the unnamed", async () => {
     // The roster answers late. Before it lands this uid-only machine reads as
     // "unnamed machine" (key `unnamed-1`); after, it is "studio". Rewriting
     // on the early answer would leave a key that stops resolving.

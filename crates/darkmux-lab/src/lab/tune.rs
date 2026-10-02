@@ -183,7 +183,7 @@ pub(crate) fn render_report(r: &TuneReport) -> String {
     let mut out = String::new();
     p!(
         out,
-        "darkmux tune — workload `{}` profile `{}` × {} run(s), {} completed",
+        "darkmux tune: workload `{}` profile `{}` × {} run(s), {} completed",
         r.workload,
         r.profile.as_deref().unwrap_or("(default)"),
         r.outcomes.len(),
@@ -208,7 +208,7 @@ pub(crate) fn render_report(r: &TuneReport) -> String {
         p!(out, "  • `darkmux run compare {} {}` for a head-to-head diff", first.run_id, last.run_id);
     }
     if s.slow_cluster.count > 0 {
-        p!(out, "  • Slow cluster present — re-tune compaction knobs and re-run");
+        p!(out, "  • Slow cluster present: re-tune compaction knobs and re-run");
     }
     out
 }
@@ -258,7 +258,7 @@ fn render_failures(out: &mut String, outcomes: &[RunOutcome], n: usize) {
     if dispatch_failures > 0 {
         p!(
             out,
-            "⚠ {dispatch_failures} of {n} dispatches failed (runtime non-zero exit) — check \
+            "⚠ {dispatch_failures} of {n} dispatches failed (runtime non-zero exit): check \
              `darkmux doctor` and individual run dirs for the trace"
         );
     }
@@ -323,7 +323,7 @@ mod tests {
         let text = render_report(&tune_report(vec![outcome(8), outcome(9)]));
         assert_eq!(
             text,
-            "darkmux tune — workload `w` profile `(default)` × 2 run(s), 2 completed\n\n\
+            "darkmux tune: workload `w` profile `(default)` × 2 run(s), 2 completed\n\n\
              ┌─ wall clock\n│  range:  8s – 9s\n│  mean:   8s\n│  total:  17s across 2 run(s)\n\
              │  cluster: single (variance < 1.5×, no meaningful bimodal split)\n└─\n\n\n\
              Next steps:\n  • `darkmux run inspect <run-id>` for any individual run\n\
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn empty_and_single_run_reports() {
         let empty = render_report(&tune_report(vec![]));
-        assert_eq!(empty, "darkmux tune — workload `w` profile `(default)` × 0 run(s), 0 completed\n\n(no runs completed)\n");
+        assert_eq!(empty, "darkmux tune: workload `w` profile `(default)` × 0 run(s), 0 completed\n\n(no runs completed)\n");
         let one = render_report(&tune_report(vec![outcome(5)]));
         assert!(!one.contains("run compare"), "{one}");
         assert!(!one.contains("⚠"), "{one}");
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(crate::lab::run::exit_code(&r.outcomes), 1);
         assert_eq!(r.stats.n, 3, "stats cover the completed runs");
         let text = render_report(&r);
-        assert!(text.starts_with("darkmux tune — workload `wbatch` profile `(default)` × 4 run(s), 3 completed\n"), "{text}");
+        assert!(text.starts_with("darkmux tune: workload `wbatch` profile `(default)` × 4 run(s), 3 completed\n"), "{text}");
         assert!(
             text.contains(&format!("✗ {} errored before completing: scripted failure on run 2\n", failed[0].run_id)),
             "{text}"
@@ -413,7 +413,7 @@ mod tests {
         let text = render_report(&tune_report(vec![o]));
         assert_eq!(
             text,
-            "darkmux tune — workload `w` profile `(default)` × 1 run(s), 0 completed\n\n(no runs completed)\n\
+            "darkmux tune: workload `w` profile `(default)` × 1 run(s), 0 completed\n\n(no runs completed)\n\
              ✗ test-0 errored before completing: boom\n"
         );
     }

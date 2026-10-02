@@ -1,9 +1,10 @@
 //! Lab fixture registry — thin name → path map persisted as JSON.
 //!
-//! Phase 2 of the lab-reproducibility cluster (#487, #489). Operators
+//! Part of the lab-reproducibility cluster (#487, #489). Operators
 //! register their fixture directories (anywhere on disk) by name +
 //! version. The runtime consults this registry when resolving a
-//! workload's `requires_fixture` (Phase 3). Each entry records the
+//! workload's `requires_fixture` (`run.rs`'s `resolve_source_sandbox`,
+//! #490). Each entry records the
 //! fixture's content hash at register time so drift can be detected.
 //!
 //! ## Why thin
@@ -99,7 +100,7 @@ pub(crate) struct RegisteredFixture {
     /// Absolute path to the fixture directory.
     pub path: PathBuf,
     /// Content hash recorded at register time. Use this to detect
-    /// drift via `dm lab doctor` (Phase 4) or pre-dispatch check.
+    /// drift via `darkmux lab doctor` or the pre-dispatch check.
     pub content_hash: String,
     /// When the hash was last recorded (ISO 8601 UTC).
     pub hashed_at: String,
@@ -108,8 +109,8 @@ pub(crate) struct RegisteredFixture {
     /// on-disk manifest version drifts.
     pub manifest_version: String,
     /// `satisfies` field from the fixture's `.fixture.json` at
-    /// register time. Optional. Phase 3's resolver uses this to
-    /// match against a workload's `requires_fixture`.
+    /// register time. Optional. The resolver uses this to match
+    /// against a workload's `requires_fixture`.
     #[serde(default)]
     pub satisfies: Option<String>,
 }
@@ -131,7 +132,7 @@ impl LabRegistry {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let doc: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
-            format!("parsing {} as lab registry — the file is not valid JSON", path.display())
+            format!("parsing {} as lab registry: the file is not valid JSON", path.display())
         })?;
         // (#3035) A registry a newer darkmux wrote may name fixtures in a
         // shape this build cannot place: refused, and never rewritten.
@@ -326,7 +327,7 @@ impl LabRegistry {
     }
 
     /// Find the first registered fixture that satisfies the given
-    /// requirement (Phase 3's resolver entry point). Requirement
+    /// requirement (the resolver's entry point, #490). Requirement
     /// format: `<definition-name>@<version>`, matched LITERALLY (exact
     /// `satisfies` string equality). Semver range operators (`>=`/`^`/…)
     /// are NOT supported here — the caller (`resolve_source_sandbox`)
@@ -334,7 +335,7 @@ impl LabRegistry {
     /// #496.
     ///
     /// Returns `(name, fixture)` of the first match in sorted-by-name
-    /// order. Phase 3 may add disambiguation if multiple match.
+    /// order. Disambiguation between multiple matches is not implemented.
     pub(crate) fn find_satisfying(&self, requirement: &str) -> Option<(&String, &RegisteredFixture)> {
         self.fixtures
             .iter()

@@ -49,7 +49,7 @@ function tokenRec(sid: string, turnSeq: number | undefined, prompt: number, comp
  * `tokenRec`: the two shapes are two different things on the wire, every
  * test that uses one should be legible as being about that one, and the
  * pairs below assert them side by side precisely because the difference is
- * the whole point. `remote` is stamped unconditionally by the producer,
+ * the whole point. `unmanaged` is stamped unconditionally by the producer,
  * `false` included — `tokenRec` above is what a record looks like when it
  * did NOT come from that emitter, never "that emitter said nothing". */
 function seatTokenRec(
@@ -57,11 +57,11 @@ function seatTokenRec(
   turnSeq: number | undefined,
   prompt: number,
   completion: number,
-  seat: { remote: boolean; index: number },
+  seat: { unmanaged: boolean; index: number },
   ts = "2026-08-08T00:00:00.000Z",
 ): NormRecord {
   const base = tokenRec(sid, turnSeq, prompt, completion, ts);
-  return { ...base, payload: { ...(base.payload as object), remote: seat.remote, index: seat.index } };
+  return { ...base, payload: { ...(base.payload as object), unmanaged: seat.unmanaged, index: seat.index } };
 }
 
 describe("tokensOffMeter", () => {
@@ -88,7 +88,7 @@ describe("tokensOffMeter", () => {
     expect(t.total).toBe(240);
   });
 
-  it("a session with NO dispatch bookend at all classifies as unknown — never as the endpoint-less local bucket (#1607)", () => {
+  it("a session with NO dispatch bookend at all classifies as unknown: never as the endpoint-less local bucket (#1607)", () => {
     // Token telemetry with no dispatch.start/complete anywhere for the
     // session — darkmux has no evidence of where this ran.
     const data: NormRecord[] = [tokenRec("s3", 1, 500, 10)];
@@ -325,7 +325,7 @@ describe("tokensOffMeter", () => {
     // PRE-1.49.0 wire, with no seat on the record — so the cloud-over-local
     // precedence is what answers, and this is what it answers. #2690's
     // producer change gave a `dispatch.map` seat's token record its own
-    // `remote`; a record carrying one never reaches this rule (see the
+    // `unmanaged`; a record carrying one never reaches this rule (see the
     // `1.49.0 wire` tests above). This pins the fallback, which every
     // archived record and every non-map lineage still takes.
   });
@@ -472,7 +472,7 @@ describe("tokensOffMeter", () => {
     const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-hosted", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
-      seatTokenRec(sid, 1, 90, 10, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
+      seatTokenRec(sid, 1, 90, 10, { unmanaged: false, index: 0 }, "2026-08-08T00:01:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
     ];
     const t = tokensOffMeter(data);
@@ -539,7 +539,7 @@ describe("tokensOffMeter", () => {
     const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
-      seatTokenRec(sid, 1, 900, 100, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
+      seatTokenRec(sid, 1, 900, 100, { unmanaged: false, index: 0 }, "2026-08-08T00:01:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
     ];
     const t = tokensOffMeter(data);
@@ -594,10 +594,10 @@ describe("tokensOffMeter", () => {
     const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local-1" }),
-      seatTokenRec(sid, 1, 900, 100, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
+      seatTokenRec(sid, 1, 900, 100, { unmanaged: false, index: 0 }, "2026-08-08T00:01:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local-2" }),
-      seatTokenRec(sid, 1, 900, 100, { remote: false, index: 1 }, "2026-08-08T00:02:00Z"),
+      seatTokenRec(sid, 1, 900, 100, { unmanaged: false, index: 1 }, "2026-08-08T00:02:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
     ];
     const t = tokensOffMeter(data);
@@ -612,14 +612,14 @@ describe("tokensOffMeter", () => {
   // does not — and the record still lands on the cloud tile, because the
   // seat said so.
   //
-  // Without this, `remote` would be a one-way ratchet toward LOCAL, which
+  // Without this, `unmanaged` would be a one-way ratchet toward LOCAL, which
   // is exactly the direction #2709 measured as costing 144,638 tokens of
   // live Azure spend the last time this function moved.
   it("(#2690) a hosted seat's own token record reads CLOUD even under a key whose only terminal is local", () => {
     const sid = "task:review-probe-inverted";
     const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
-      seatTokenRec(sid, 1, 900, 100, { remote: true, index: 0 }, "2026-08-08T00:01:00Z"),
+      seatTokenRec(sid, 1, 900, 100, { unmanaged: true, index: 0 }, "2026-08-08T00:01:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
     ];
     const t = tokensOffMeter(data);
@@ -668,7 +668,7 @@ describe("tokensOffMeter", () => {
     // cloud while the run reads local. That is what the arity-2 form of
     // this same group has always done (pinned in the test above);
     // asserting it here keeps the two arities visibly identical instead of
-    // only claiming they are. On the 1.49.0 wire the seat's own `remote`
+    // only claiming they are. On the 1.49.0 wire the seat's own `unmanaged`
     // decides instead (#2690).
     expect(t.total).toBe(100);
   });
@@ -1083,7 +1083,7 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
 
   /** The REAL producer shape for a `dispatch.map` step's completion:
    * `DispatchMapStepKind`'s bookend stamps `result_class`/`items_in`/
-   * `ok_count`/`failed_count` and adds `remote_tokens` ONLY when the step
+   * `ok_count`/`failed_count` and adds `unmanaged_tokens` ONLY when the step
    * is hosted (`stamp_remote_classification` is called `if
    * endpoint_label.is_some()`). A LOCAL map step's completion therefore
    * carries NO token total at all, fails `hasAnyTokenCounts`, and never
@@ -1345,7 +1345,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     // The tokens are unchanged — a hosted endpoint was called under this
     // key and THIS fixture's `telemetry.tokens` record names no seat (the
     // pre-1.49.0 wire), so they over-claim CLOUD rather than crediting
-    // hosted spend as free. A record carrying `payload.remote` (#2690)
+    // hosted spend as free. A record carrying `payload.unmanaged` (#2690)
     // answers from the seat instead; this arrival sequence deliberately
     // keeps the older shape so the run-count assertions above are about
     // bookends alone.

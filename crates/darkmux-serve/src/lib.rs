@@ -780,7 +780,7 @@ every read not from this machine would be refused with no way to pass.\n  Fix: {
         return Ok(());
     }
     Err(format!(
-        "refusing to bind the serve daemon to a non-loopback address ({bind}) with reads open — the daemon \
+        "refusing to bind the serve daemon to a non-loopback address ({bind}) with reads open: the daemon \
 would expose flow records, machine specs and mission state of in-flight \
 dispatches to any reachable peer, unauthenticated.\n  Fix: `darkmux config set serve.read_auth true` with a \
 serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it through `tailscale serve`."
@@ -4064,9 +4064,6 @@ async fn aggregate_flow_records_for_date(
     }
 }
 
-/// XRANGE the flow stream + filter by `record.ts` matching `<date>`.
-/// Synchronous (uses the sync `redis::Client`) — call site wraps in
-/// `spawn_blocking` so the daemon's async runtime stays responsive.
 /// (#1570) UNION the Redis view with the local file rather than letting Redis
 /// REPLACE it.
 ///
@@ -4111,15 +4108,6 @@ fn union_flow_records(
 
 pub(crate) use darkmux_flow::flow_record_identity;
 
-/// Every record the FLEET stream currently holds (#1705) — the peers' work
-/// this machine can see but never wrote to its own `flows/` directory.
-///
-/// Blocking (sync `redis::Client`, same as the per-date read); every caller
-/// is already inside `spawn_blocking`. Returns EMPTY — never an error — when
-/// Redis is unconfigured, unreachable, or malformed: a degraded fleet view
-/// must degrade to local-only, exactly as `aggregate_flow_records_for_date`
-/// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
-/// COUNT 10000` cap as every other read of this stream.
 /// The cached fleet snapshot: when it was read, and what it held.
 ///
 /// (#2479 audit) `SystemTime`, not `Instant`, deliberately: this is the
@@ -4320,6 +4308,15 @@ fn read_fleet_snapshot_file(path: &StdPath) -> Option<FleetRead> {
     snapshot.into_fleet_read()
 }
 
+/// Every record the FLEET stream currently holds (#1705) — the peers' work
+/// this machine can see but never wrote to its own `flows/` directory.
+///
+/// Blocking (sync `redis::Client`, same as the per-date read); every caller
+/// is already inside `spawn_blocking`. Returns EMPTY — never an error — when
+/// Redis is unconfigured, unreachable, or malformed: a degraded fleet view
+/// must degrade to local-only, exactly as `aggregate_flow_records_for_date`
+/// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
+/// COUNT 10000` cap as every other read of this stream.
 pub(crate) fn fleet_flow_records() -> FleetRead {
     // (#1705) Short-TTL shared cache. The read costs ~344ms over a tailnet
     // (measured: `XREVRANGE … COUNT 10000` against the hub), and the viewer
@@ -4447,6 +4444,10 @@ fn bound_redis_response(conn: &redis::Connection) {
     let _ = conn.set_write_timeout(Some(darkmux_flow::REDIS_RESPONSE_TIMEOUT));
 }
 
+/// XREVRANGE the flow stream, keeping the records whose `ts` falls on `date`
+/// (every record when `date` is `None`). Synchronous (the sync
+/// `redis::Client`): the call site wraps it in `spawn_blocking` so the
+/// daemon's async runtime stays responsive.
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,

@@ -93,7 +93,7 @@ function renderRegion(resources: MachineResourcesResponse | null, extra: Partial
   );
 }
 
-describe("MachineHealthRegion — absence vs zero (the machine-lens provenance key (deleted in 5.0)'s central honesty rule)", () => {
+describe("MachineHealthRegion: absence vs zero (the machine-lens provenance key (deleted in 5.0)'s central honesty rule)", () => {
   it("draws NO .mm-row-pot layer at all for an unpriced model — absence, not a zero-width bar", () => {
     const { container } = renderRegion(BASE);
     const unpricedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("unpriced-model"))!;
@@ -487,7 +487,7 @@ describe("MachineHealthRegion — the machine's own shrink hint", () => {
   it("still renders the machine-level hint on its own when it targets nothing resident", () => {
     const untargeted: MachineResourcesResponse = {
       ...BASE,
-      machine: { ...BASE.machine, state: "amber", shrink_hint: "over the limit by 4.00 GiB with no shrinkable context — unload a resident or load a smaller quant to reach green at load time" } as MachineResourcesResponse["machine"],
+      machine: { ...BASE.machine, state: "amber", shrink_hint: "over the limit by 4.00 GiB with no shrinkable context: unload a resident or load a smaller quant to reach green at load time" } as MachineResourcesResponse["machine"],
     };
     const { getByText } = renderRegion(untargeted);
     expect(getByText(/unload a resident or load a smaller quant/)).toBeInTheDocument();
@@ -557,7 +557,7 @@ describe("MachineHealthRegion — structure the e2e/parity suites also check", (
   });
 });
 
-describe("MachineHealthRegion — ghost/NEW residency rows (the machine-lens proposal (deleted in 5.0) §8)", () => {
+describe("MachineHealthRegion: ghost/NEW residency rows (the machine-lens proposal (deleted in 5.0) §8)", () => {
   it("a departed model renders a dimmed DEPARTED row with its last observed figure", () => {
     const first = advanceResidency(null, BASE.models, 1000);
     const second = advanceResidency(first.state, [BASE.models[0]], 2000); // the unpriced model departs
@@ -807,7 +807,7 @@ describe("MachineHealthRegion — the per-row state chip only speaks when it dis
 // (#2915) The `utility` row chip is superseded by the machine page's Utility
 // section (`UtilitySection`), which names the model, its residency and
 // footprint, and what it is doing. No residency row carries it any more.
-describe("MachineHealthRegion — no utility row chip (#2915)", () => {
+describe("MachineHealthRegion: no utility row chip (#2915)", () => {
   it("no row carries a `utility` chip", () => {
     const { container } = renderRegion(BASE);
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);

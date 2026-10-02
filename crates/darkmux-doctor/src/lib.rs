@@ -431,7 +431,7 @@ fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectStat
 const MISSION_STATE_CHECK_NAME: &str = "mission state files";
 const CREW_LAYOUT_CHECK_NAME: &str = "beat-33 crew/ layout";
 const LAB_DIR_CHECK_NAME: &str = "lab runs location";
-const RETIRED_ENV_CHECK_NAME: &str = "retired env vars (4.0)";
+const RETIRED_ENV_CHECK_NAME: &str = "retired env vars";
 
 /// (4.0) Mission state 4.0 no longer reads, so a leftover is state the
 /// operator would otherwise lose silently. Fail, naming every file. Two
@@ -665,7 +665,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
              they go to `{archive}`, kept and never overwritten, because 4.0 reads neither.\n\n\
              Nothing is overwritten: every move is `mv -n`, so a file whose name ALREADY \
              exists at the flattened destination is left where it is and the script prints a \
-             `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
+             `LEFTOVERS in ...` line naming the directory it stayed in: compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: the paths above are computed from the darkmux root (`DARKMUX_HOME` when \
              set, else `~/.darkmux`).{pins_hint}",
@@ -723,7 +723,7 @@ fn crew_merge_script_lines(
         push_move_or_merge(&mut lines, subdir, &src, &dest, src.is_file());
     }
     lines.push(format!(
-        "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
+        "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty: whatever remains is either \
          operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\""
     ));
     lines
@@ -746,18 +746,18 @@ fn push_move_or_merge(
         lines.push(format!("mv -n \"{src}\" \"{dest}\""));
     } else if dest_is_dir {
         lines.push(format!(
-            "# {label}: destination directory already exists — merging entries, not \
+            "# {label}: destination directory already exists: merging entries, not \
              moving the directory (a plain `mv` would nest it)"
         ));
         lines.push(format!(
             "for e in \"{src}\"/* \"{src}\"/.[!.]* \"{src}\"/..?*; do [ -e \"$e\" ] || continue; mv -n \"$e\" \"{dest}/\"; done"
         ));
         lines.push(format!(
-            "rmdir \"{src}\" || echo \"LEFTOVERS in {src} — those names already exist under {dest} \
+            "rmdir \"{src}\" || echo \"LEFTOVERS in {src}: those names already exist under {dest} \
              and were NOT overwritten; compare and merge them by hand\""
         ));
     } else {
-        lines.push(format!("# {label}: destination absent — plain move"));
+        lines.push(format!("# {label}: destination absent: plain move"));
         lines.push(format!("mv -n \"{src}\" \"{dest}\""));
     }
 }
@@ -1345,7 +1345,7 @@ fn serve_token_status(token_present: bool) -> (Status, String, Option<String>) {
     if token_present {
         (
             Status::Pass,
-            "serve token resolves — fleet work submission requires it (with a verified sender); reads need it only \
+            "serve token resolves: fleet work submission requires it (with a verified sender); reads need it only \
              when serve.read_auth is on"
                 .into(),
             None,
@@ -1353,7 +1353,7 @@ fn serve_token_status(token_present: bool) -> (Status, String, Option<String>) {
     } else {
         (
             Status::Pass,
-            "no serve token — the daemon is loopback-only and this machine takes and sends no fleet work".into(),
+            "no serve token: the daemon is loopback-only and this machine takes and sends no fleet work".into(),
             Some(
                 "To take or send fleet work, set ONE shared bearer token on every machine: \
                  `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) + \
@@ -1383,7 +1383,7 @@ fn serve_reads_status(read_auth: bool, token_present: bool) -> (Status, String, 
         ),
         (true, false) => (
             Status::Fail,
-            "serve.read_auth is on but no serve token resolves — `darkmux serve` refuses to start".into(),
+            "serve.read_auth is on but no serve token resolves: `darkmux serve` refuses to start".into(),
             Some(
                 "Store the token: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` + \
                  `darkmux config set serve.token_keychain true` (or export DARKMUX_SERVE_TOKEN), or \
@@ -1473,7 +1473,7 @@ fn utility_binding_status(
                       dispatch on this machine (no runtime fallback since #2571)"
                 .into(),
             hint: Some(
-                "No action needed for compaction if you are deliberately running without it; radio and ACP routing NEED this binding (a message cannot be routed without a utility model). To set it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": { \"id\": \"<model-id>\", \"n_ctx\": <window> } }`. It serves compaction and radio routing for every role, decoupled from your profiles, and is never selectable for a task. (#590, #2571, #2914)".into(),
+                "No action needed for compaction if you are deliberately running without it; radio and ACP routing NEED this binding (a message cannot be routed without a utility model). To set it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json: `\"internal\": { \"utility\": { \"id\": \"<model-id>\", \"n_ctx\": <window> } }`. It serves compaction and radio routing for every role, decoupled from your profiles, and is never selectable for a task. (#590, #2571, #2914)".into(),
             ),
         };
     };
@@ -1530,7 +1530,7 @@ fn utility_binding_status(
                     // What remains true is only that a hand-load moves the
                     // cost earlier. Say that and nothing more.
                     hint: Some(
-                        "No verb needs this loaded first — the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)".into(),
+                        "No verb needs this loaded first: the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context: `lms load <id> --context-length <n> --identifier darkmux:<id>`: since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)".into(),
                     ),
                 }
             }
@@ -1566,7 +1566,7 @@ fn check_utility_model_in_profiles() -> Check {
         Err(_) => Check {
             name: "utility model in profiles".into(),
             status: Status::Warn,
-            message: "the profile registry did not load (see the `profile registry` row) — can't check whether a profile lists the utility model".into(),
+            message: "the profile registry did not load (see the `profile registry` row): can't check whether a profile lists the utility model".into(),
             hint: None,
         },
     }
@@ -1614,11 +1614,11 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     let window = match (registry.utility_model_n_ctx(), offenders.iter().filter_map(|(_, n)| *n).max()) {
         (Some(declared), _) => format!("The binding already declares n_ctx {declared}"),
         (None, Some(largest)) => format!(
-            "Move the window into the binding — `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
+            "Move the window into the binding: `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
              \"n_ctx\": {largest} }} }}` (the largest a profile declared for it)"
         ),
         (None, None) => format!(
-            "Declare its window in the binding — `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
+            "Declare its window in the binding: `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
              \"n_ctx\": <window> }} }}`"
         ),
     };
@@ -1666,7 +1666,7 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
         // unset`), so this is a hand edit, the way every other removed key's
         // check says: name the file and the block.
         message: format!(
-            "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; \
+            "config.json binds `role_profiles.radio-router` to `{profile}`: the router has no profile; \
              delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
         ),
         hint: Some(
@@ -1780,7 +1780,7 @@ fn check_unreachable_darkmux_residents() -> Check {
             return Check {
                 name: "unreachable residents".into(),
                 status: Status::Warn,
-                message: "the profile registry did not load (see the `profile registry` row) — can't check resident reachability".into(),
+                message: "the profile registry did not load (see the `profile registry` row): can't check resident reachability".into(),
                 hint: None,
             };
         }
@@ -1852,7 +1852,7 @@ fn unreachable_residents_status(
         String::new()
     } else {
         format!(
-            " Note: {} registry entr{} {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, or a profile naming a quarantined endpoint, it may simply be waiting on that entry to be fixed, not genuinely orphaned.",
+            " Note: {} registry entr{} {} currently quarantined (failed to parse: see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, or a profile naming a quarantined endpoint, it may simply be waiting on that entry to be fixed, not genuinely orphaned.",
             registry.quarantined.len(),
             if registry.quarantined.len() == 1 { "y" } else { "ies" },
             if registry.quarantined.len() == 1 { "is" } else { "are" },
@@ -2320,7 +2320,7 @@ fn check_machine_id_resolution() -> Check {
             status: Status::Pass,
             message: format!("`{id}` (from hostname)"),
             hint: Some(
-                "Set a logical fleet name (e.g. `studio`, `mini-1`) with `darkmux config set machine_id <name>` — this name is what flow records, presence and the fleet roster all join on, and an operator-chosen one survives a hostname change.".into(),
+                "Set a logical fleet name (e.g. `studio`, `mini-1`) with `darkmux config set machine_id <name>`: this name is what flow records, presence and the fleet roster all join on, and an operator-chosen one survives a hostname change.".into(),
             ),
         },
         None => Check {
@@ -2760,7 +2760,7 @@ fn check_role_skill_references() -> Check {
         name: name.into(),
         status: Status::Warn,
         message: format!(
-            "{} — no skill manifest defines it; the crew index skips that link",
+            "{}: no skill manifest defines it; the crew index skips that link",
             found.join("; ")
         ),
         hint: Some(steps.join("; ")),
@@ -2790,7 +2790,7 @@ fn check_retired_role_leftovers() -> Check {
         status: Status::Warn,
         message: format!("retired-role file(s) left in the user tier: {}", list.join(", ")),
         hint: Some(format!(
-            "delete {} — `mission-compiler` retired with `mission propose` (#2912) and `scribe` with \
+            "delete {}: `mission-compiler` retired with `mission propose` (#2912) and `scribe` with \
              `lab notebook` (#2913) in 4.0; a leftover `.json` still loads as a user role and appears in \
              `darkmux role list`, but nothing dispatches it",
             list.join(" and ")
@@ -2882,7 +2882,7 @@ fn check_dispatch_free_concurrency() -> Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
-            "{n} ({provenance}) — dispatch-free steps (procedural.shell/noop, mods.gate, \
+            "{n} ({provenance}): dispatch-free steps (procedural.shell/noop, mods.gate, \
              records.gather, deliver.github_review) run this many at a time, on their own \
              track; an endpoint's limits.concurrent_calls does not govern them"
         ),
@@ -2961,7 +2961,7 @@ fn classify_live_channel(
             name: name.into(),
             status: Status::Pass,
             message: format!(
-                "off ({provenance}) — viewers see model state at the durable heartbeat \
+                "off ({provenance}): viewers see model state at the durable heartbeat \
                  cadence (2 s); runtime.live_sample_ms 0 turns the channel off"
             ),
             hint: None,
@@ -2979,7 +2979,7 @@ fn classify_live_channel(
         _ => "no daemon socket yet (start `darkmux serve`)",
     };
     let base = format!(
-        "{} ms ({provenance}) — model state and utility jobs reach this machine's viewers at \
+        "{} ms ({provenance}): model state and utility jobs reach this machine's viewers at \
          this cadence through the local daemon ({}, {listening}); never written to the flow \
          log, Redis or the audit chain. Durable heartbeats stay at 2 s",
         c.effective_ms,
@@ -4225,7 +4225,7 @@ fn check_unmanaged_endpoint_credentials() -> Check {
                         .unwrap_or_default();
                     problems.push(format!(
                         "{subject}: endpoint.auth.type is set \
-                         but no credential source resolved — set endpoint.auth.keychain or \
+                         but no credential source resolved: set endpoint.auth.keychain or \
                          export endpoint.auth.key_env{via}"
                     ));
                 }
@@ -5922,7 +5922,7 @@ fn classify_runtime_image_freshness(probe: RuntimeImageProbe, installed: &str) -
             name: RUNTIME_IMAGE_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!(
-                "no local `{RUNTIME_IMAGE}` — dispatch uses the version-pinned `{pinned}`{others_note}"
+                "no local `{RUNTIME_IMAGE}`: dispatch uses the version-pinned `{pinned}`{others_note}"
             ),
             hint: None,
         },
@@ -5936,13 +5936,13 @@ fn classify_runtime_image_freshness(probe: RuntimeImageProbe, installed: &str) -
             name: RUNTIME_IMAGE_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!(
-                "local {}; this binary is {installed} — dispatch skips it and runs \
+                "local {}; this binary is {installed}: dispatch skips it and runs \
                  `{pinned}` (pulling it if absent); a darkmux older than this fix still runs it, \
                  and `--image {RUNTIME_IMAGE}` is refused{others_note}",
                 describe_non_match(RUNTIME_IMAGE, &verdict)
             ),
             hint: Some(format!(
-                "rebuild it from a darkmux {installed} source checkout: `{}` — or remove it \
+                "rebuild it from a darkmux {installed} source checkout: `{}`: or remove it \
                  (`docker rmi {RUNTIME_IMAGE}`) so nothing can pick it up",
                 rebuild_command(RUNTIME_IMAGE, installed)
             )),
@@ -6298,7 +6298,7 @@ fn check_temp_residue() -> Check {
         ),
         hint: Some(format!(
             "each one is a directory darkmux created and left. `darkmux-out-*` and \
-             `darkmux-dispatch-*` are a dispatch's out-dir and workspace — they hold that \
+             `darkmux-dispatch-*` are a dispatch's out-dir and workspace: they hold that \
              run's prompt, trajectory and checkpoint, so they are kept deliberately and \
              removing one discards that run's record. The rest are test scratch, which a \
              test process now collects on its own (#2707); any still here predate that. \
@@ -6578,13 +6578,13 @@ pub fn check_mission_config_registry(catalog: &darkmux_crew::mission_config::Kin
             hint: Some(
                 "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or, for \
                  an operator-pointed `DARKMUX_TEMPLATES_DIR`/`config.dirs.templates` override, its \
-                 `templates/builtin/mission-configs/<id>.json`) — a \
+                 `templates/builtin/mission-configs/<id>.json`): a \
                  dangling depends_on, an empty id, or a schema_version your darkmux build \
                  doesn't recognize. (A document declaring a schema_version NEWER than this \
                  binary's is refused at preflight and reported by the user-file check, not \
-                 here.) These documents DO execute — `darkmux mission launch <id>` runs any config whose \
+                 here.) These documents DO execute: `darkmux mission launch <id>` runs any config whose \
                  graph names step kinds this build can construct, so a finding here is a config \
-                 that MAY fail at launch, not a dormant one — an Error-tier finding bails the \
+                 that MAY fail at launch, not a dormant one: an Error-tier finding bails the \
                  launch, a Warning-tier one (a schema_version drift, say) only prints."
                     .into(),
             ),
@@ -6680,7 +6680,7 @@ fn check_profile_loaded_match() -> Check {
             return Check {
                 name: "profile match".into(),
                 status: Status::Warn,
-                message: "the profile registry did not load (see the `profile registry` row) — can't check match".into(),
+                message: "the profile registry did not load (see the `profile registry` row): can't check match".into(),
                 hint: None,
             };
         }
@@ -6806,7 +6806,7 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             name,
             status: Status::Warn,
             message: format!(
-                "Docker is up; no local runtime image built for this darkmux ({}) — darkmux \
+                "Docker is up; no local runtime image built for this darkmux ({}): darkmux \
                  will pull it on the first dispatch",
                 env!("CARGO_PKG_VERSION")
             ),
@@ -6832,7 +6832,7 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             name,
             status: Status::Warn,
             message: "Docker is up, but the runtime image dispatch would use does not match this \
-                      darkmux — dispatches will be refused"
+                      darkmux: dispatches will be refused"
                 .to_string(),
             hint: Some(refusal),
         },
@@ -7268,7 +7268,7 @@ fn check_platform_and_provider() -> Check {
                  128GB tier is measured; 32GB and 64GB are extrapolated from it). Your \
                  hardware doesn't match any of them; profile draft suggestions will use \
                  conservative defaults. Consider opening a PR with measured rules for \
-                 your platform — see crates/darkmux-heuristics/ for the trait + existing \
+                 your platform: see crates/darkmux-heuristics/ for the trait + existing \
                  examples."
                     .into(),
             ),

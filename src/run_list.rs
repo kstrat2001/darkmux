@@ -109,11 +109,11 @@ fn fleet_warning(state: &darkmux_serve::source_state::SourceState) -> Option<Str
     match state {
         SourceState::Ok | SourceState::Off => None,
         SourceState::Stale { age_ms, .. } => Some(format!(
-            "fleet: could not reach the shared stream; showing a snapshot {} old — runs on other machines may be missing or out of date",
+            "fleet: could not reach the shared stream; showing a snapshot {} old: runs on other machines may be missing or out of date",
             format_span(age_ms / 1_000)
         )),
         SourceState::Unavailable { .. } => Some(
-            "fleet: could not reach the shared stream and nothing was cached — runs on other machines are missing from this list".to_string(),
+            "fleet: could not reach the shared stream and nothing was cached: runs on other machines are missing from this list".to_string(),
         ),
     }
 }
@@ -201,7 +201,7 @@ fn footer(sel: &Selection, width: Option<usize>) -> Option<String> {
     let shown = sel.rows.len();
     let hidden = sel.total_terminal - sel.shown_terminal;
     let total = shown + hidden;
-    let full = format!("showing {shown} of {total} runs ({hidden} more not shown — `--all` for every run)");
+    let full = format!("showing {shown} of {total} runs ({hidden} more not shown: `--all` for every run)");
     match width {
         Some(w) if full.chars().count() > w => {
             // The compact form keeps all three load-bearing facts: what
@@ -696,7 +696,7 @@ fn render_text(
     let id_w = id_width(&sel.rows, width);
     let now = now_unix();
 
-    println!("{}", style::header(&format!("runs — {} shown", sel.rows.len())));
+    println!("{}", style::header(&format!("runs: {} shown", sel.rows.len())));
     println!("{}", header_line(id_w, machine_col));
     for r in &sel.rows {
         println!("{}", format_row(now, r, id_w, width, machine_col));
@@ -972,7 +972,7 @@ mod tests {
 
         assert!(
             sel.rows.iter().any(|r| r.id == "running-old"),
-            "the live run was truncated away — this is the exact defect #1905 exists to fix"
+            "the live run was truncated away: this is the exact defect #1905 exists to fix"
         );
         // `limit` is the TOTAL row count, so the one live row spends part
         // of the budget: 1 live + 9 terminal = 10 rows.
@@ -1113,7 +1113,7 @@ mod tests {
         let w = id_width(&rows, None);
         assert!(
             w < 40,
-            "one 83-char id widened the column to {w} — the other 20 rows now carry that padding"
+            "one 83-char id widened the column to {w}: the other 20 rows now carry that padding"
         );
     }
 
@@ -1304,7 +1304,7 @@ mod tests {
             let label = status_label(st);
             assert!(
                 label.chars().count() <= STATUS_COLS,
-                "status label {label:?} is {} cols, STATUS_COLS is {STATUS_COLS} — every row \
+                "status label {label:?} is {} cols, STATUS_COLS is {STATUS_COLS}: every row \
                  carrying this status renders over budget",
                 label.chars().count()
             );
@@ -1704,12 +1704,12 @@ mod tests {
 
         let route_ts = include_str!("../ui/src/lib/route.ts");
         let (_, after) = route_ts.split_once("RUNS_KINDS = [").expect(
-            "RUNS_KINDS not found in ui/src/lib/route.ts — the twin this test pins against \
+            "RUNS_KINDS not found in ui/src/lib/route.ts: the twin this test pins against \
              was renamed or removed; darkmux run list --kind and the RUNS lens's kind chips \
              can now drift apart silently (#1905)",
         );
         let (body, _) = after.split_once(']').expect(
-            "RUNS_KINDS has no closing `]` in ui/src/lib/route.ts — the twin this test pins \
+            "RUNS_KINDS has no closing `]` in ui/src/lib/route.ts: the twin this test pins \
              against changed shape (#1905)",
         );
         let mut ts_kinds: Vec<String> = body
@@ -1724,7 +1724,7 @@ mod tests {
         assert_eq!(
             rust_kinds, ts_kinds,
             "darkmux run list --kind's accepted values (RunKindArg, src/cli.rs) drifted from \
-             ui/src/lib/route.ts's RUNS_KINDS — update BOTH twins together (#1905), the pill \
+             ui/src/lib/route.ts's RUNS_KINDS: update BOTH twins together (#1905), the pill \
              row and the CLI flag must show the same vocabulary"
         );
 
@@ -1743,12 +1743,12 @@ mod tests {
         // loudly rather than passing empty.
         let panel_rs = include_str!("../crates/darkmux-serve/src/panel.rs");
         let (_, after) = panel_rs.split_once("const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {").expect(
-            "RUN_LIST_KIND_OPT not found in crates/darkmux-serve/src/panel.rs — the console \
+            "RUN_LIST_KIND_OPT not found in crates/darkmux-serve/src/panel.rs: the console \
              option table this pins against was renamed or removed, so `darkmux run list \
              --kind` and the panel that spawns it can now drift apart silently (#1911)",
         );
         let (body, _) = after.split_once("};").expect(
-            "RUN_LIST_KIND_OPT has no closing `};` in panel.rs — the twin changed shape (#1911)",
+            "RUN_LIST_KIND_OPT has no closing `};` in panel.rs: the twin changed shape (#1911)",
         );
         let mut panel_kinds: Vec<String> = body
             .match_indices("value: \"")
@@ -1761,7 +1761,7 @@ mod tests {
         assert_eq!(
             rust_kinds, panel_kinds,
             "darkmux run list --kind's accepted values drifted from the console panel's own \
-             RUN_LIST_KIND_OPT table (crates/darkmux-serve/src/panel.rs) — the panel would \
+             RUN_LIST_KIND_OPT table (crates/darkmux-serve/src/panel.rs): the panel would \
              spawn a flag the CLI no longer accepts, or hide one it does (#1911)"
         );
     }

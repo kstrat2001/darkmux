@@ -34,7 +34,7 @@ function stubFlow(status: { today: number; yesterday: number }) {
   );
 }
 
-describe("useFlowWindow — a failed day read is reported, not folded into a quiet day (#2965)", () => {
+describe("useFlowWindow: a failed day read is reported, not folded into a quiet day (#2965)", () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
@@ -49,7 +49,7 @@ describe("useFlowWindow — a failed day read is reported, not folded into a qui
       wrapper: wrapper(new QueryClient({ defaultOptions: { queries: { retry: false } } })),
     });
 
-  it("both days answer 200 []: settled, no failure — the inverted case", async () => {
+  it("both days answer 200 []: settled, no failure: the inverted case", async () => {
     stubFlow({ today: 200, yesterday: 200 });
     const { result } = render();
     await waitFor(() => expect(result.current.settled).toBe(true));

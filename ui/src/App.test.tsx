@@ -231,7 +231,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("no runs")).toBeInTheDocument());
   });
 
-  it("renders the real dispatch run view for #dispatch=<id> (drill-in packet — SessionReplay is no longer a placeholder)", async () => {
+  it("renders the real dispatch run view for #dispatch=<id> (drill-in packet: SessionReplay is no longer a placeholder)", async () => {
     // `#lens=console` was this test's original target before Packet 6 ported
     // the console lens for real, then `#dispatch=<id>` rendered a bare
     // `LensPlaceholder` before the drill-in packet landed `SessionReplay`'s
@@ -2001,7 +2001,7 @@ describe("App — presence coverage on the masthead", () => {
     await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("checking…"));
   });
 
-  it("shows no flow-read notice when the flow reads succeed — the inverted case", async () => {
+  it("shows no flow-read notice when the flow reads succeed: the inverted case", async () => {
     mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
     const { container } = renderApp();
     await waitFor(() => expect(container.querySelector(".mco")).toBeTruthy());

@@ -396,7 +396,7 @@ const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_findin
 pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
     let missing = |rule: &str| {
         anyhow!(
-            "dispatch.unit: no rule resolved for id `{rule}` — the plan names a rule the current \
+            "dispatch.unit: no rule resolved for id `{rule}`: the plan names a rule the current \
              rule set no longer declares; re-plan this rule"
         )
     };
@@ -484,7 +484,7 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
             "{}",
             darkmux_types::style::warn(&format!(
                 "dispatch.unit: unit `{unit_id}` produced non-JSON stdout (expected a `--json` \
-                 envelope) — first 120 chars: {excerpt:?}"
+                 envelope): first 120 chars: {excerpt:?}"
             ))
         );
     }
@@ -758,7 +758,7 @@ fn readback_findings(
         if let Err(e) = std::fs::write(into, buf) {
             eprintln!(
                 "{}",
-                darkmux_types::style::warn(&format!("dispatch.unit: writing {} — {e:#}", into.display()))
+                darkmux_types::style::warn(&format!("dispatch.unit: writing {}: {e:#}", into.display()))
             );
         }
     }
@@ -890,7 +890,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
     let ps = the_plan.sources.iter().find(|s| s.id == source).ok_or_else(|| {
         anyhow!(
             "`{DISPATCH_UNIT_KIND}`: unit `{}` names source `{source}`, which the plan's `sources` \
-             list does not declare — re-plan this rule",
+             list does not declare: re-plan this rule",
             unit.id()
         )
     })?;
@@ -900,7 +900,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
     if ps.sha.trim().is_empty() {
         bail!(
             "`{DISPATCH_UNIT_KIND}`: unit `{}` names source `{source}`, whose plan entry records an \
-             empty sha — a finding stamped with no sha is unversioned; re-plan this rule",
+             empty sha: a finding stamped with no sha is unversioned; re-plan this rule",
             unit.id()
         );
     }
@@ -1126,7 +1126,7 @@ impl StepKind for DispatchUnitStepKind {
         .body;
         let unit = the_plan.units.iter().find(|u| u.id() == cfg.unit).ok_or_else(|| {
             anyhow!(
-                "`{DISPATCH_UNIT_KIND}`: the plan has no unit `{}` (it holds {} unit(s)) — the step's \
+                "`{DISPATCH_UNIT_KIND}`: the plan has no unit `{}` (it holds {} unit(s)): the step's \
                  `unit` must name one the plan it points at actually planned",
                 cfg.unit,
                 the_plan.units.len()
@@ -1203,7 +1203,7 @@ impl StepKind for DispatchUnitStepKind {
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "`{DISPATCH_UNIT_KIND}`: unit `{}` skipped — {what}, and its STOP file is \
+                        "`{DISPATCH_UNIT_KIND}`: unit `{}` skipped: {what}, and its STOP file is \
                          present at {}; this unit was never dispatched. {remedy}",
                         ctx.unit_id,
                         stop_path.display()
@@ -1254,7 +1254,7 @@ impl StepKind for DispatchUnitStepKind {
             if !ctx.rule_ids.iter().any(|r| r == declared) {
                 bail!(
                     "`{DISPATCH_UNIT_KIND}`: step config names rule `{declared}`, but plan unit `{}` \
-                     names {:?} — the step and the plan disagree about what this unit is for",
+                     names {:?}: the step and the plan disagree about what this unit is for",
                     ctx.unit_id,
                     ctx.rule_ids
                 );
@@ -1526,7 +1526,7 @@ impl StepKind for DispatchUnitStepKind {
                     finding_refs: dedup_across_draws(cfg.draws, all_finding_refs),
                 };
                 return Err(anyhow!(
-                    "`{DISPATCH_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {} — {detail} (outcome: {})",
+                    "`{DISPATCH_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {}: {detail} (outcome: {})",
                     ctx.unit_id,
                     draw + 1,
                     cfg.draws,
@@ -1884,7 +1884,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
                         .with_context(|| {
                             format!(
                                 "`{DISPATCH_SUMMARY_KIND}`: step `{}` completed but recorded an output \
-                                 that is not a `UnitOutcome` — every `{DISPATCH_UNIT_KIND}` output is \
+                                 that is not a `UnitOutcome`: every `{DISPATCH_UNIT_KIND}` output is \
                                  read through that struct, so a producer that drifted is refused \
                                  here rather than summarized as zeros",
                                 step.id

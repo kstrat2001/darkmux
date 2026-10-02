@@ -655,7 +655,7 @@ fn a_failed_lms_ps_is_an_unverified_profile_warning() {
     let profile: darkmux_types::Profile = serde_json::from_str(r#"{"models":[{"id":"m","n_ctx":1}]}"#).unwrap();
     let w = envelope_check(&profile, "fast");
     assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].starts_with("could not verify profile-load match — `lms ps` failed ("), "{w:?}");
+    assert!(w[0].starts_with("could not verify profile-load match: `lms ps` failed ("), "{w:?}");
     assert!(w[0].ends_with("this run's `profile=fast` tag is unverified. (#365)"), "{w:?}");
 }
 

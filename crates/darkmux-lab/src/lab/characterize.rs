@@ -54,7 +54,7 @@ pub fn print_report(r: &CharacterizeReport) {
 /// The text `lab characterize` prints.
 pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     let mut out = String::new();
-    p!(out, "darkmux characterize — workload `{}`", r.workload);
+    p!(out, "darkmux characterize: workload `{}`", r.workload);
     p!(out);
     for o in &r.outcomes {
         let status = match o.end() {
@@ -62,7 +62,7 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
             DispatchEnd::Escalated { .. } => "↑",
             DispatchEnd::Failed => "✗",
         };
-        p!(out, "  {} {} — {}", status, o.run_id, format_seconds(o.duration_ms));
+        p!(out, "  {} {}: {}", status, o.run_id, format_seconds(o.duration_ms));
         for note in &o.notes {
             p!(out, "      {note}");
         }
@@ -95,7 +95,7 @@ fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
     }
     if outcomes.iter().any(|o| o.end() == DispatchEnd::Failed) {
         return Some(
-            "at least one dispatch failed — inspect `darkmux run inspect <run-id>` \
+            "at least one dispatch failed: inspect `darkmux run inspect <run-id>` \
              and check `darkmux doctor` for setup problems"
                 .to_string(),
         );
@@ -111,7 +111,7 @@ fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
     let timing = classify_wall_clock(slowest);
     Some(if outcomes.iter().any(RunOutcome::verify_failed) {
         format!(
-            "dispatch succeeded ({timing}) BUT the workload's verify check failed — \
+            "dispatch succeeded ({timing}) BUT the workload's verify check failed: \
              the model didn't produce the expected reply. This is normal for non-deterministic \
              single-turn smoke prompts; re-run a few times for distribution. For tighter \
              contracts, replace the keyword check with a coding-task workload (npm test etc.)"
@@ -135,10 +135,10 @@ fn format_seconds(duration_ms: u128) -> String {
 /// this with comparison to shipped baselines.
 fn classify_wall_clock(secs: u128) -> &'static str {
     match secs {
-        0..=10 => "fast — single-turn dispatch in expected range for any modern Apple Silicon",
-        11..=30 => "ok — slightly slower than expected; check `darkmux doctor` if this is a fast machine",
-        31..=120 => "slow — model may be loading from cold, or context is high. Re-run for warm-cache time",
-        _ => "very slow — likely a setup issue (model not loaded, swap pressure, or wrong profile). Run `darkmux doctor`",
+        0..=10 => "fast: single-turn dispatch in expected range for any modern Apple Silicon",
+        11..=30 => "ok: slightly slower than expected; check `darkmux doctor` if this is a fast machine",
+        31..=120 => "slow: model may be loading from cold, or context is high. Re-run for warm-cache time",
+        _ => "very slow: likely a setup issue (model not loaded, swap pressure, or wrong profile). Run `darkmux doctor`",
     }
 }
 
@@ -183,8 +183,8 @@ mod tests {
         let text = render_report(&report(vec![outcome("r1", true, None, 8)]));
         assert_eq!(
             text,
-            "darkmux characterize — workload `w`\n\n  ✓ r1 — 8s\n      provider=stub\n\n\
-             verdict: fast — single-turn dispatch in expected range for any modern Apple Silicon\n\n\
+            "darkmux characterize: workload `w`\n\n  ✓ r1: 8s\n      provider=stub\n\n\
+             verdict: fast: single-turn dispatch in expected range for any modern Apple Silicon\n\n\
              Next steps:\n  • `darkmux run inspect <run-id>` for the per-run breakdown\n\
              \x20 • Re-run for distribution: `darkmux lab run w --repeat 5` then \
              `darkmux run compare <a> <b>` for variance\n"
@@ -198,9 +198,9 @@ mod tests {
         let v = |o: Vec<RunOutcome>| verdict(&o).unwrap();
         assert!(v(vec![outcome("a", false, Some(false), 1)]).starts_with("at least one dispatch failed"));
         let verify = v(vec![outcome("a", true, Some(true), 1), outcome("b", true, Some(false), 40)]);
-        assert!(verify.starts_with("dispatch succeeded (slow — "), "{verify}");
+        assert!(verify.starts_with("dispatch succeeded (slow: "), "{verify}");
         assert!(verify.contains("BUT the workload's verify check failed"), "{verify}");
-        assert!(v(vec![outcome("a", true, None, 20)]).starts_with("ok — "));
+        assert!(v(vec![outcome("a", true, None, 20)]).starts_with("ok: "));
         assert_eq!(verdict(&[]), None);
     }
 
@@ -214,7 +214,7 @@ mod tests {
         let text = render_report(&report(vec![esc.clone()]));
         // flow-action-guard:allow: report prose this test asserts is absent, not a flow action
         assert!(!text.contains('✗') && !text.contains("dispatch failed"), "{text}");
-        assert!(text.contains("  ↑ e — 1s\n"), "{text}");
+        assert!(text.contains("  ↑ e: 1s\n"), "{text}");
         let v = verdict(&[esc.clone()]).unwrap();
         assert!(v.starts_with("at least one dispatch escalated"), "{v}");
         assert!(!v.contains("failed"), "{v}");
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn the_report_marks_failures_and_drops_the_rerun_hint_for_several_runs() {
         let text = render_report(&report(vec![outcome("a", false, None, 1), outcome("b", true, None, 1)]));
-        assert!(text.contains("  ✗ a — 1s\n") && text.contains("  ✓ b — 1s\n"), "{text}");
+        assert!(text.contains("  ✗ a: 1s\n") && text.contains("  ✓ b: 1s\n"), "{text}");
         assert!(!text.contains("Re-run for distribution"), "{text}");
         let empty = render_report(&report(vec![]));
         assert!(!empty.contains("verdict:"), "{empty}");
@@ -259,7 +259,7 @@ mod tests {
         errored.provider_error = Some("boom".into());
         errored.notes = vec!["provider=stub".into(), "error: boom".into()];
         let text = render_report(&report(vec![errored]));
-        assert!(text.contains("  ✗ r2 — 0s\n      provider=stub\n      error: boom\n"), "{text}");
+        assert!(text.contains("  ✗ r2: 0s\n      provider=stub\n      error: boom\n"), "{text}");
         assert!(text.contains("verdict: at least one dispatch failed"), "{text}");
     }
 

@@ -61,7 +61,7 @@ pub(crate) fn envelope_warnings(
             // A missing non-default model is common and not worth the noise.
             PreflightDecision::LoadFresh { foreign_identifier: None } if Some(pm.id.as_str()) == default_id => Some(format!(
                 "declares default model `{}` (ctx {}) but it is not among the currently loaded \
-                 models — the dispatch loads a new instance, so this run's wall-clock includes a \
+                 models: the dispatch loads a new instance, so this run's wall-clock includes a \
                  model load and is not comparable to a warm run.",
                 pm.id,
                 declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
@@ -83,14 +83,14 @@ pub(crate) fn envelope_warnings(
             PreflightDecision::Reload { stale_ctx, .. } => declared.map(|d| {
                 format!(
                     "declares model `{}` at {d} ctx but the resident instance is at {stale_ctx} \
-                     — the dispatch unloads it and loads a new instance at the declared window, \
+                    : the dispatch unloads it and loads a new instance at the declared window, \
                      so this run's wall-clock includes a model load.",
                     pm.id,
                 )
             }),
             PreflightDecision::LoadFresh { foreign_identifier: Some(foreign_identifier) } => Some(format!(
                 "model `{}` is resident only as `{foreign_identifier}`, which darkmux never reuses \
-                 — the dispatch loads a new instance beside it, so this run's wall-clock includes \
+                : the dispatch loads a new instance beside it, so this run's wall-clock includes \
                  a model load.",
                 pm.id,
             )),

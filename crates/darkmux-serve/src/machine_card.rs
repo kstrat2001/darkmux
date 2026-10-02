@@ -56,8 +56,10 @@ use std::time::Duration;
 /// were the wrong axis), and its `cap` is gone. `cap` was the machine's
 /// `remote.concurrent_cap`; concurrency is per endpoint now
 /// (`endpoints.<id>.limits.concurrent_calls`), so there is no one number to
-/// report. A 1.2 reader reads an older card's `hosted` key and ignores its
-/// `cap`; 1.0 and 1.1 are unreleased, so no shipped reader meets a 1.2 card.
+/// report. 1.2 also adds `serves_radio` and `serves_profiles`, optional facts
+/// about what this machine serves to peers (absent when not stated). A 1.2
+/// reader reads an older card's `hosted` key and ignores its `cap`; 1.0 and
+/// 1.1 are unreleased, so no shipped reader meets a 1.2 card.
 pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location

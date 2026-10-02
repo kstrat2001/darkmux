@@ -56,8 +56,9 @@ export interface UsagePayload {
   prompt_tokens?: unknown;
   completion_tokens?: unknown;
   cached_tokens?: unknown;
-  /** The retired review path's spelling of its own spend, on a legacy
-   *  `dispatch complete` only. */
+  /** What an unmanaged-endpoint `dispatch.map` item spent, on its
+   *  `dispatch.complete`. An archived record spells it `remote_tokens`. */
+  unmanaged_tokens?: unknown;
   remote_tokens?: unknown;
 }
 
@@ -146,7 +147,7 @@ function amountOf(p: UsagePayload, opts: SumOptions): UsageAmount | null {
   if (opts.exclude === purpose) return null;
   const prompt = num(p.prompt_tokens);
   const completion = num(p.completion_tokens);
-  const total = num(p.total_tokens) || prompt + completion || num(p.remote_tokens);
+  const total = num(p.total_tokens) || prompt + completion || num(p.unmanaged_tokens) || num(p.remote_tokens);
   const cached = isFiniteNumber(p.cached_tokens) ? num(p.cached_tokens) : null;
   return { total, prompt, completion, cached, purpose };
 }
@@ -163,7 +164,7 @@ export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAm
 
 /** True when a `dispatch complete`'s payload carries any token count. */
 export function hasAnyTokenCounts(p: UsagePayload): boolean {
-  return !!(num(p.total_tokens) || num(p.prompt_tokens) || num(p.completion_tokens) || num(p.remote_tokens));
+  return !!(num(p.total_tokens) || num(p.prompt_tokens) || num(p.completion_tokens) || num(p.unmanaged_tokens) || num(p.remote_tokens));
 }
 
 /** THE LEGACY FALLBACK, and the only exception to the plain sum: a

@@ -195,7 +195,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum SeatClass {
         Local,
-        Remote,
+        Unmanaged,
         NoModel,
         Unresolved,
     }
@@ -204,7 +204,7 @@ mod tests {
         fn of(claim: &SeatClaim) -> Self {
             match claim {
                 SeatClaim::LocalModel(_) => SeatClass::Local,
-                SeatClaim::UnmanagedEndpoint(_) => SeatClass::Remote,
+                SeatClaim::UnmanagedEndpoint(_) => SeatClass::Unmanaged,
                 SeatClaim::NoModel => SeatClass::NoModel,
                 SeatClaim::LocalModelUnresolved { .. } => SeatClass::Unresolved,
             }
@@ -214,7 +214,7 @@ mod tests {
     /// The seat class each crew-crate step kind MUST claim, with a
     /// representative step config where the answer depends on it. The kinds
     /// that run no model (`procedural.*`, `mods.gate`, `records.gather`,
-    /// `deliver.github_review`) must be `NoModel`: claiming `Remote` puts them
+    /// `deliver.github_review`) must be `NoModel`: claiming `Unmanaged` puts them
     /// behind the a serial endpoint's one-at-a-time limit, so
     /// independent shell and gate steps run one at a time (#2394).
     fn expected_seat(kind_id: &str) -> Option<(SeatClass, serde_json::Value)> {
@@ -224,9 +224,9 @@ mod tests {
             "procedural.shell" | "procedural.noop" | "mods.gate" | "records.gather" | "deliver.github_review" => {
                 (SeatClass::NoModel, json!({}))
             }
-            "dispatch.single_shot" => (SeatClass::Remote, json!({ "model": "m", "user": "hi", "endpoint": endpoint })),
+            "dispatch.single_shot" => (SeatClass::Unmanaged, json!({ "model": "m", "user": "hi", "endpoint": endpoint })),
             "dispatch.map" => (
-                SeatClass::Remote,
+                SeatClass::Unmanaged,
                 json!({ "model": "m", "user_template": "check {item}", "collection": ["a"], "endpoint": endpoint }),
             ),
             // No role on the task or in config: nothing to resolve.

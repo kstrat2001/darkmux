@@ -284,7 +284,7 @@ describe("buildActivityTimeline — reused step session ids across missions (#21
     expect(new Set(bars.map((b) => b.key)).size).toBe(2);
   });
 
-  it("the older mission's bar reads 'complete', the newer's reads 'error' (aborted) — not both 'abandoned' off a blended close-edge", () => {
+  it("the older mission's bar reads 'complete', the newer's reads 'error' (aborted): not both 'abandoned' off a blended close-edge", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
     const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
     const classes = bars.map((b) => b.status).sort();

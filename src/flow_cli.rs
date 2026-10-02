@@ -14,7 +14,7 @@ use darkmux_types::execution_id::ExecutionId;
 pub enum FlowCmd {
     /// Record an operator-narrative observation. With `--execution <id>
     /// --source adjudication` it records a reviewer correction against a
-    /// dispatch, which later coder briefs in that mission carry (#849).
+    /// dispatch, which later coder briefs in that mission carry.
     Note {
         #[arg(long)]
         text: String,
@@ -44,7 +44,7 @@ pub enum FlowCmd {
         #[arg(long, value_enum)]
         source: Option<OperatorSource>,
     },
-    /// Record a raw flow event — all six fields explicit from flags.
+    /// Record a raw flow event: all six fields explicit from flags.
     Record {
         #[arg(long)]
         level: Level,
@@ -78,12 +78,12 @@ pub enum FlowCmd {
         #[arg(long = "mission-id")]
         mission_id: Option<String>,
     },
-    /// Record a tier-decision — the frontier orchestrator's reasoning for
-    /// routing a piece of work to local vs. holding in frontier (#136).
+    /// Record a tier-decision: the frontier orchestrator's reasoning for
+    /// routing a piece of work to local vs. holding in frontier.
     ///
     /// Tier-decision records form the audit substrate's *why* layer.
     /// Where dispatch records show *what* ran, tier-decision records
-    /// show *why this layer was chosen* — the routing rationale that
+    /// show *why this layer was chosen*: the routing rationale that
     /// dispatch records alone don't capture.
     ///
     /// Typical use: the frontier orchestrator runs this verb before
@@ -97,7 +97,7 @@ pub enum FlowCmd {
         #[arg(long)]
         decision: String,
         /// Operator-readable rationale. The prose that future audit will
-        /// read to understand *why* this routing was chosen. Required —
+        /// read to understand *why* this routing was chosen. Required:
         /// a tier-decision record without reasoning is just a dispatch.
         #[arg(long)]
         reasoning: String,
@@ -131,8 +131,8 @@ pub enum FlowCmd {
     },
     /// Walk every audit file under `DARKMUX_AUDIT_DIR` (or the default
     /// `~/.darkmux/audit/`), recompute the hash chain, and report the
-    /// first divergence per file (#163). A clean walk means no divergence
-    /// was found at this check — not that the file is unaltered; see
+    /// first divergence per file. A clean walk means no divergence
+    /// was found at this check: not that the file is unaltered; see
     /// SECURITY.md for the chain's known gaps. Exits with status 2 when
     /// any chain is broken so CI/cron can flag tampering, and with 3 under
     /// `--strict` when a file could not be content-verified at all.
@@ -147,8 +147,8 @@ pub enum FlowCmd {
         /// summary.
         #[arg(long)]
         json: bool,
-        /// (#1775) Exit 3 when a file PRESENT in the walk could not be
-        /// content-verified — a legacy pre-2.6.0 struct-hash file, one
+        /// Exit 3 when a file PRESENT in the walk could not be
+        /// content-verified: a legacy pre-2.6.0 struct-hash file, one
         /// whose `hash_format` header marker is missing, or one naming a
         /// format this binary does not recognize. Without this the walk
         /// reports those files honestly but still exits 0, so a tripwire
@@ -156,14 +156,14 @@ pub enum FlowCmd {
         /// checked".
         ///
         /// Scope: this is about files that ARE there. It says nothing
-        /// about records or files that are ABSENT — a truncated tail or a
+        /// about records or files that are ABSENT: a truncated tail or a
         /// deleted file still exits 0, because the chain records neither
         /// how many records a file should hold nor which files should
         /// exist (see SECURITY.md).
         ///
         /// Opt-in because a genuine read-only pre-2.6.0 archive is not a
         /// failure. On a fleet already writing byte-hashed files, no NEW
-        /// legacy file should appear — use this there.
+        /// legacy file should appear: use this there.
         #[arg(long)]
         strict: bool,
     },
@@ -179,13 +179,13 @@ pub enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
-    /// (#1959 — the `hooks` sub-family under `flow` retired; this was
+    /// (the `hooks` sub-family under `flow` retired; this was
     /// `hooks drain`.)
     /// Deliver whatever a sink has queued on disk, synchronously, then
     /// report delivered/failed and exit. Today the only sink that queues
     /// is the hook sink (its outbox); `--rule <N>`, `--max-seconds`,
     /// `--file <path> --to <loopback url>` (stray outbox), `--json` keep
-    /// their meaning. Sink-agnostic name and shape — same precedent as
+    /// their meaning. Sink-agnostic name and shape: same precedent as
     /// `flow integrity-check`, an on-demand action against a sink, not a
     /// sink-specific sub-family.
     Drain {
@@ -197,19 +197,19 @@ pub enum FlowCmd {
         /// Give up waiting for the queue to empty after this many
         /// seconds (the drainer's own retry/backoff still applies, so an
         /// unreachable receiver's pending lines may remain undelivered
-        /// when this returns — that's reported, not treated as an
+        /// when this returns: that's reported, not treated as an
         /// error).
         #[arg(long, default_value_t = 30)]
         max_seconds: u64,
         /// (fix-round finding 6) Drain a STRAY outbox file by exact path
-        /// instead — one `darkmux doctor`/`flow status` named as
+        /// instead: one `darkmux doctor`/`flow status` named as
         /// belonging to no currently-configured rule (its rule was
         /// removed or edited). Requires `--to`. One straight pass, no
-        /// retry/backoff — a repeat call after fixing the receiver picks
+        /// retry/backoff: a repeat call after fixing the receiver picks
         /// up where the last one stopped.
         #[arg(long, conflicts_with = "rule")]
         file: Option<std::path::PathBuf>,
-        /// The loopback URL to deliver `--file`'s lines to — validated
+        /// The loopback URL to deliver `--file`'s lines to: validated
         /// the same way every configured rule's `http` target is.
         #[arg(long, requires = "file")]
         to: Option<String>,

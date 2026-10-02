@@ -208,7 +208,7 @@ fn gate_summary(rec: &ModRecord) -> String {
     match (&rec.gate, &rec.gate_skipped_reason) {
         (Some(g), _) if g.passed => format!("passed ({})", g.command),
         (Some(g), _) => format!("failed ({})", g.command),
-        (None, Some(reason)) => format!("skipped — {reason}"),
+        (None, Some(reason)) => format!("skipped: {reason}"),
         (None, None) => "(not yet gated)".to_string(),
     }
 }

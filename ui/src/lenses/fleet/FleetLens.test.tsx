@@ -2189,7 +2189,7 @@ describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog pa
 // has it; a NEGATIVE claim ("idle", "no model working", "0 running",
 // "offline") waits for every source that could contradict it and says
 // "checking…" (stat word, tube, and a dash for the count) until then.
-describe("FleetLens — a card says checking… until its first data arrives (#2958)", () => {
+describe("FleetLens: a card says checking… until its first data arrives (#2958)", () => {
   const BEAT = [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.parse(FROZEN_NOW) }];
   const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
   const stat = (card: Element) => card.querySelector(".stat")!.textContent;
@@ -2515,7 +2515,7 @@ describe("FleetLens — a card says checking… until its first data arrives (#2
   // (#2965) The inverted case: the same machine, the same sources, every read
   // healthy, reads "idle". Without it the test above passes for a card that
   // could never say "idle" at all.
-  it("the same fleet with healthy flow reads says 'idle' — the inverted case", async () => {
+  it("the same fleet with healthy flow reads says 'idle': the inverted case", async () => {
     mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [] });
     renderFleetLens({}, newClient());
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
@@ -3181,7 +3181,7 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
   const cardNamed = (name: string) =>
     [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".name")?.textContent?.trim().endsWith(name))!;
 
-  it("card body click and Enter: a name, or distinct unnamed ordinals — no uid in any hash", async () => {
+  it("card body click and Enter: a name, or distinct unnamed ordinals: no uid in any hash", async () => {
     mountThree();
     await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(3));
     const hashes: Record<string, string[]> = {};
@@ -3380,7 +3380,7 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
 // changes: this machine first, then every other machine by its stable key
 // (its uid, or the roster id of a machine only the roster knows), never by the
 // display name a source happens to give it.
-describe("FleetLens — card order is stable", () => {
+describe("FleetLens: card order is stable", () => {
   const cardNames = () => [...document.querySelectorAll(".mach-name")].map((n) => n.textContent);
   const flowRecords = () => {
     const today = todayUTC();

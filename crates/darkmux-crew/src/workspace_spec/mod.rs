@@ -395,7 +395,7 @@ impl WorkspaceSpec {
             {
                 if got != want {
                     warnings.push(format!(
-                        "workspace spec '{name}': schema_version '{sv}' is an older major version than this binary's spec schema ('{WORKSPACE_SPEC_SCHEMA_VERSION}') — fields may not resolve as expected"
+                        "workspace spec '{name}': schema_version '{sv}' is an older major version than this binary's spec schema ('{WORKSPACE_SPEC_SCHEMA_VERSION}'): fields may not resolve as expected"
                     ));
                 }
             }

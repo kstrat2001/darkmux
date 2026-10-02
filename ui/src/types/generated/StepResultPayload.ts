@@ -39,9 +39,9 @@ index?: number,
  */
 ok?: boolean, 
 /**
- * On a `dispatch.map` item or aggregate: whether it ran on a hosted endpoint.
+ * On a `dispatch.map` item or aggregate: whether it ran on an unmanaged endpoint.
  */
-remote?: boolean, 
+unmanaged?: boolean, 
 /**
  * On a hosted `dispatch.map` item: the endpoint-reported served model.
  */

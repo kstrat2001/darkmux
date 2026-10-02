@@ -304,7 +304,7 @@ impl OneRun<'_> {
     /// be evicted between runs.
     fn announce(&self, i: u32, runs: u32, run_id: &str, envelope: &mut EnvelopeWarnings) {
         println!(
-            "[lab] run {i}/{runs} — workload={} ({} tier) profile={} → {run_id}",
+            "[lab] run {i}/{runs}: workload={} ({} tier) profile={} → {run_id}",
             self.opts.workload_id, self.workload.source, self.profile_name
         );
         for w in envelope.fresh(envelope_check(self.profile, self.profile_name)) {
@@ -411,7 +411,7 @@ fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<S
     match darkmux_profiles::lms::list_loaded() {
         Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded),
         Err(e) => vec![format!(
-            "could not verify profile-load match — `lms ps` failed ({e}); \
+            "could not verify profile-load match: `lms ps` failed ({e}); \
              this run's `profile={profile_name}` tag is unverified. (#365)"
         )],
     }
@@ -462,7 +462,7 @@ fn settle_verify(
             false,
             format!("verify gate could not be applied: {e}"),
             Some(format!(
-                "applying verify work gate failed ({e}) — failing verify closed rather than trusting the raw result"
+                "applying verify work gate failed ({e}): failing verify closed rather than trusting the raw result"
             )),
         ),
     };
