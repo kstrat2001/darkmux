@@ -1795,7 +1795,9 @@ pub struct CmdConfig {
 ///
 /// Every `write()` is filtered against `rules` (see `HookRule`/`HookMatch`);
 /// a match appends the record verbatim to that rule's outbox file, and a
-/// background drainer POSTs it to `http` with bounded retries. The write
+/// background drainer POSTs it to `http`, retrying 5xx and network failures
+/// without a cap (1s doubling to 60s) and giving up on other 4xx after 3 and
+/// on a redirect at once. The write
 /// path never blocks on the network — see `darkmux_flow::hooks` for the
 /// sink implementation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

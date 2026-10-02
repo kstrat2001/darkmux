@@ -528,7 +528,7 @@ fn print_torn_tails(r: &flow::IntegrityReport) {
     for sidecar in &r.torn_tails {
         println!(
             "{}",
-            style::warn(&format!("       torn tail set aside after an interrupted write: {sidecar}"))
+            darkmux_types::style::warn(&format!("       torn tail set aside after an interrupted write: {sidecar}"))
         );
     }
 }

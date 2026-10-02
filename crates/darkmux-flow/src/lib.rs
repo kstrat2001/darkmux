@@ -301,6 +301,11 @@ impl FlowSink for LocalFileSink {
 // "audit sink is unix-only on this platform". Cross-platform support
 // would need `LockFileEx` and a separate code path — out of scope here.
 //
+// The chain check detects edits, reordering, and deletions from the head
+// or middle of a day file. It does NOT detect records removed from the END
+// of a day file: the shorter chain still verifies, because nothing records
+// how many records the file should hold.
+//
 // Edit-detecting, NOT tamper-proof. OS-level append-only flags
 // (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
 // chain layer. Operators who need stronger guarantees compose this with

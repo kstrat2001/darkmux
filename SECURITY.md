@@ -127,6 +127,12 @@ frame:
   should have ended. A tail anchor or an external high-water mark would be
   needed.
 
+  A write interrupted mid-line is handled by the next append, which moves the
+  incomplete bytes to a `<day>.jsonl.torn-<ts>` sidecar beside the day file and
+  continues the chain from the last complete line; `flow integrity-check` and
+  `darkmux doctor` name the sidecar. Anyone with write access can produce the
+  same file shape, so a sidecar is a signal to look, not a finding.
+
   **Whole-file deletion is undetectable**, because each per-day file seeds its
   own chain and nothing records which files should exist.
 

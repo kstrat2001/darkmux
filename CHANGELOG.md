@@ -1523,6 +1523,27 @@ darkmux release.
   the day (it said a complete day was cut).
 - **`profile list --machine <missing>` no longer prints a stray "machine card"
   line first** in a terminal; the line prints for a log or under `--verbose`.
+- **A crash mid-append no longer breaks the audit chain.** Each audit line and
+  its newline are one write; before an append, an incomplete last line is moved
+  to `<day>.jsonl.torn-<ts>` beside the day file and the chain continues from
+  the last complete line (a complete line missing only its newline is kept).
+  `flow integrity-check` lists the sidecar as `torn_tails` and `darkmux doctor`
+  warns naming it. Removal from the END of a day file is still not detected, and
+  the audit docs now say so.
+- **The hub backfill survives a restart.** The earliest unsent record time is
+  kept in `<darkmux root>/state/hub-outage.json`; any process whose hub write
+  fails records it, and the daemon backfills from it on start and after
+  recovery, so a restart mid-outage and records written by one-shot CLI runs are
+  re-sent. Delivery is at-least-once, de-duplicated on read.
+- **Hook retry docs match the code.** A 5xx, 408, 429, or network failure retries
+  without a cap (1s doubling to 60s); other 4xx give up after 3 and a redirect at
+  once, each with `hook.failed`. The guide, config docs, and
+  comments said "bounded retries" and implied `hook.failed` for a receiver that
+  stays down.
+- **The jq transform timeout cannot leak its orphan counter.** The worker thread
+  owns the decrement, so a worker finishing in the timeout window no longer
+  leaves the rule stuck `Busy`.
+
 - **Selecting text on a card or row never clicks it.** A drag that selects
   text, or a double-click that selects a word, no longer drills the fleet
   machine card, a run row, an event row, or a mission step; a plain click

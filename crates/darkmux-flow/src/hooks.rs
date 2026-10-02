@@ -2,8 +2,11 @@
 //! operator-configured rules, and POST a match verbatim to a receiver.
 //! **Enqueue, never block**: `write()` only appends to a local outbox file
 //! (flock'd, mirroring `AuditFileSink`); a background drainer thread does
-//! the actual HTTP delivery with bounded retries, so a down receiver never
-//! stalls a dispatch.
+//! the actual HTTP delivery, so a down receiver never stalls a dispatch. A
+//! 5xx, a 408/429 or a network failure retries without a cap, waiting 1s
+//! doubling to 60s between attempts; any other 4xx gives up after 3
+//! (`MAX_CLIENT_ERROR_ATTEMPTS`) and a redirect gives up at once, each with a
+//! `hook.failed`.
 //!
 //! # URL policy (#2135 option 2)
 //!
@@ -3034,8 +3037,8 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
         // `ClientError`), so treating it as retryable would re-POST the
         // same line forever and silently block every later record on
         // this rule. Classifying it as `ClientError` routes it through
-        // the existing give-up path instead (bounded retries, then
-        // quarantine + a loud `hook.failed`). `Error::kind()` maps
+        // the existing give-up path instead (3 attempts, then the line is
+        // skipped with a loud `hook.failed`). `Error::kind()` maps
         // `Status` to `ErrorKind::HTTP`, so this arm only ever matches a
         // genuine `Transport` failure of this kind.
         Err(e) if e.kind() == ureq::ErrorKind::BadHeader => DeliveryOutcome::ClientError,
@@ -5482,7 +5485,7 @@ mod tests {
     /// refuses to send it. `try_post` is exercised directly with a
     /// hand-built `DeliveryHeaders` carrying a raw (unsanitized) CRLF —
     /// this must resolve to `ClientError`, which is what routes into the
-    /// existing give-up path (bounded retries → quarantine + `hook.failed`)
+    /// existing give-up path (3 attempts → skipped + `hook.failed`)
     /// instead of retrying the same unpostable line forever.
     #[test]
     fn try_post_classifies_a_malformed_header_value_as_client_error_not_retryable_forever() {
