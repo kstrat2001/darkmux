@@ -2194,7 +2194,7 @@ describe("FleetLens — a card says checking… until its first data arrives (#2
   const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
   const stat = (card: Element) => card.querySelector(".stat")!.textContent;
   const utilLabel = (card: Element) => card.querySelector(".mach-util")!.getAttribute("aria-label")!;
-  const SPECS = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 };
+  const SPECS = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:util-4b", loaded: true, n_ctx: null } };
   const newClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
   it("a live lab run: 'checking…' while /runs is unanswered, then 'dispatch in flight'", async () => {
@@ -3538,5 +3538,60 @@ describe("FleetLens: cards belong to machines by uid", () => {
     renderFleetLens();
     await waitFor(() => expect(cards()).toHaveLength(1));
     await waitFor(() => expect(cards()[0].textContent).toContain("1 running"));
+  });
+});
+
+// (5.0) The utility robot reads each card's OWN statement of its utility
+// model, so the fleet reads the same from any serving machine.
+describe("fleet card: the utility robot from the card alone", () => {
+  const um = (id: string, loaded: boolean) => ({ id, loaded, n_ctx: null });
+  const peer = (id: string, specs: Partial<MachineSpecsResponse>) =>
+    viewRow({ machine_id: id, machine_uid: `u-${id}`, ...specs }, { entry: { id, address: "100.64.1.2:8765", added_unix_ms: 1000 } });
+
+  const robots = () =>
+    Object.fromEntries(
+      [...document.querySelectorAll(".mach")].map((c) => {
+        const u = c.querySelector<HTMLElement>(".mach-util")!;
+        return [c.querySelector(".mach-name")!.textContent, { dot: u.getAttribute("data-dot"), residency: u.getAttribute("data-residency"), svg: u.querySelector("svg") !== null, title: u.getAttribute("title") }];
+      }),
+    );
+
+  it("three cards draw three robot states, and a card registering none draws none", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", utility_model: um("darkmux:util-4b", true) },
+      view: [peer("studio", { utility_model: um("qwen/qwen3-4b-2507", true) }), peer("mini", { utility_model: um("util", false) }), peer("darkbook", { utility_model: null })],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(4));
+    const r = robots();
+    expect(r["MacBook-Pro"]).toMatchObject({ dot: "filled", svg: true, title: "Utility model: darkmux:util-4b\nresident · idle" });
+    expect(r["studio"]).toMatchObject({ dot: "filled", residency: "resident", svg: true });
+    expect(r["mini"]).toMatchObject({ dot: "hollow", residency: "not_loaded", svg: true });
+    expect(r["darkbook"]).toMatchObject({ residency: "none", svg: false, title: null });
+  });
+
+  it("a machine reads the same whether it serves the page or is a peer of it", async () => {
+    const studio = { machine_id: "studio", machine_uid: "u-studio", utility_model: um("qwen/qwen3-4b-2507", true) };
+    mockFleetFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", utility_model: null }, view: [peer("studio", studio)], runs: [] });
+    const asPeer = renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const fromPeer = robots()["studio"];
+    asPeer.unmount();
+    mockFleetFetch({ specs: studio, view: [peer("MacBook-Pro", { utility_model: null })], runs: [] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const fromSelf = robots()["studio"];
+    expect(fromSelf.dot).toBe(fromPeer.dot);
+    expect(fromSelf.residency).toBe(fromPeer.residency);
+  });
+
+  it("a peer whose card was not read is unknown, dashed", async () => {
+    mockFleetFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" }, view: [unreachableRow("darkbook", "listener_off")], runs: [] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const dark = Object.values(robots()).filter((x) => x.residency === "unknown");
+    expect(dark).toHaveLength(1);
+    expect(dark[0].dot).toBe("unknown");
   });
 });

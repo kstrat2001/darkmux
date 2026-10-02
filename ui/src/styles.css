@@ -3839,6 +3839,11 @@ body {
   stroke-linejoin: round;
   opacity: 0.75;
 }
+/* Resident: the status lamp's healthy green, the one shared token. Faded and
+   dashed stay the identity gray. */
+.mach-util--resident {
+  color: var(--scope-phosphor);
+}
 .mach-util[data-dot="hollow"] .mach-util__bot {
   opacity: 0.4;
 }

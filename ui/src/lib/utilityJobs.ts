@@ -318,23 +318,47 @@ function machineUtilityRecords(data: readonly NormRecord[], uid: string): NormRe
   return index.get(canonUid(uid)) ?? [];
 }
 
-/** (#2915) A fleet card's utility strip: the machine's utility model, whether
- *  it is resident (`null`: the viewer cannot tell, a peer), and its live job
- *  with the visual that draws it (`null`: quiet). */
+/** What a machine's own card says about its utility model. `Unknown`: the
+ *  card was not read, or an older card states nothing. `None`: a card that WAS
+ *  read registers no utility model, a distinct fact. */
+export enum UtilityResidency {
+  Resident = "resident",
+  NotLoaded = "not_loaded",
+  Unknown = "unknown",
+  None = "none",
+}
+
+/** A card's reading of its machine's utility model: the residency and, when
+ *  the card names one, the model id. */
+export interface UtilityReading {
+  residency: UtilityResidency;
+  id: string | null;
+}
+
+/** The reading for a card. `model` is the card's `specs.utility_model`
+ *  (`undefined`: the card states nothing). `read`: a card was read at all. */
+export function utilityReading(read: boolean, model: { id: string; loaded: boolean } | null | undefined): UtilityReading {
+  if (!read || model === undefined) return { residency: UtilityResidency.Unknown, id: null };
+  if (model === null) return { residency: UtilityResidency.None, id: null };
+  return { residency: model.loaded ? UtilityResidency.Resident : UtilityResidency.NotLoaded, id: model.id };
+}
+
+/** (#2915) A fleet card's utility strip: the machine's utility model, its
+ *  residency as its own card states it, and its live job with the visual that
+ *  draws it (`null`: quiet). */
 export interface UtilityStrip {
   model: string | null;
-  resident: boolean | null;
+  residency: UtilityResidency;
   job: (LiveUtilityJob & { visual: UtilityJobVisual; word: string }) | null;
 }
 
 /** The strip for machine `uid` as of `t`, over the whole window `data`.
- *  `binding` is this machine's own `internal.utility` as `/machine/specs`
- *  reports it, when `uid` is the machine the page is served from. */
+ *  `reading` is what the machine's own card says about its utility model. */
 export function utilityStrip(
   data: readonly NormRecord[],
   uid: string,
   t: number,
-  binding: { id: string; loaded: boolean } | null,
+  reading: UtilityReading,
   /** (#2928) This machine's live utility edges (`LiveOverlay.utility`), for
    *  the machine the page is served from only: the live channel is
    *  local-daemon only. A sub-second job shows open while it runs, instead
@@ -359,8 +383,10 @@ export function utilityStrip(
   }
   const live = machineUtilityJob(recs, t);
   return {
-    model: binding?.id ?? lastUtilityModel(own, t),
-    resident: binding ? binding.loaded : null,
+    // A card that names no model (`None`) has none; one that was not read
+    // (`Unknown`) falls back to the model its utility records name.
+    model: reading.id ?? (reading.residency === UtilityResidency.Unknown ? lastUtilityModel(own, t) : null),
+    residency: reading.residency,
     job: live ? { ...live, visual: utilityJobVisual(live.job), word: utilityJobWord(live.job) } : null,
   };
 }

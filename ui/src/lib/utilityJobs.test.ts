@@ -10,6 +10,7 @@ import {
   utilityStrip,
   utilityJobVisual,
   utilityUsageByJob,
+  utilityReading,
 } from "./utilityJobs";
 
 const M = "mach-a";
@@ -236,12 +237,12 @@ describe("utilityStrip: another machine's records never close this machine's job
   test("a receiver-side turn on a peer, in the same session, leaves the sender's open compaction open", () => {
     const own = start(1, UTILITY_JOB.compaction, { session_id: SID });
     const peerTurn = norm({ ts: at(5), action: ACTION.DispatchTurn, machine_uid: "mach-b", session_id: SID });
-    const strip = utilityStrip([own, peerTurn], M, ms(6), null);
+    const strip = utilityStrip([own, peerTurn], M, ms(6), utilityReading(false, null));
     expect(strip.job?.job).toBe(UTILITY_JOB.compaction);
   });
   test("this machine's own later turn in that session still closes it", () => {
     const own = start(1, UTILITY_JOB.compaction, { session_id: SID });
     const ownTurn = norm({ ts: at(5), action: ACTION.DispatchTurn, machine_uid: M, session_id: SID });
-    expect(utilityStrip([own, ownTurn], M, ms(6), null).job).toBeNull();
+    expect(utilityStrip([own, ownTurn], M, ms(6), utilityReading(false, null)).job).toBeNull();
   });
 });

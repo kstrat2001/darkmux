@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
-import { machineIsHub, machineNotReporting, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { UtilityResidency } from "../../lib/utilityJobs";
+import { machineIsHub, machineNotReporting, rowUtility, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -295,5 +296,32 @@ describe("machineNotReporting", () => {
 
   it("a different uid is a different machine even when the names agree", () => {
     expect(machineNotReporting([offlineCardless], { uid: "UID-OTHER", name: "studio" })).toBe(false);
+  });
+});
+
+// (5.0) The utility robot reads the row's OWN card, for every machine: the
+// same fleet reads the same from any serving machine.
+describe("rowUtility: the card's own statement of its utility model", () => {
+  const withModel = (utility_model: MachineSpecsResponse["utility_model"]) =>
+    row({ card: { state: "available", card: { specs: { ...SPECS, utility_model } } as unknown as MachineCard, source: "listener" } });
+
+  it("a resident model", () => {
+    expect(rowUtility(withModel({ id: "qwen/qwen3-4b-2507", loaded: true, n_ctx: 32768 }))).toEqual({ residency: UtilityResidency.Resident, id: "qwen/qwen3-4b-2507" });
+  });
+  it("a registered model that is not loaded", () => {
+    expect(rowUtility(withModel({ id: "m", loaded: false, n_ctx: null }))).toEqual({ residency: UtilityResidency.NotLoaded, id: "m" });
+  });
+  it("a card that was read and registers none is None, not unknown", () => {
+    expect(rowUtility(withModel(null))).toEqual({ residency: UtilityResidency.None, id: null });
+  });
+  it("a card that was not read, or states nothing, is unknown", () => {
+    const unread = row({ card: { state: "unreachable", reason: "listener_off", detail: null } });
+    expect(rowUtility(unread)).toEqual({ residency: UtilityResidency.Unknown, id: null });
+    const older = row({ card: { state: "available", card: { specs: { ...SPECS, utility_model: undefined } } as unknown as MachineCard, source: "listener" } });
+    expect(rowUtility(older)).toEqual({ residency: UtilityResidency.Unknown, id: null });
+  });
+  it("is the same whichever machine serves the page", () => {
+    const m = withModel({ id: "m", loaded: true, n_ctx: null });
+    expect(rowUtility({ ...m, is_this_machine: true })).toEqual(rowUtility({ ...m, is_this_machine: false }));
   });
 });

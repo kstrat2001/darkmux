@@ -16,7 +16,7 @@
 
 import { fmtC, memBytes } from "../../lib/format";
 import { sameUid, uidOf } from "../../lib/machineIdentity";
-import { utilityJobWord, utilityStrip, utilityUsageByJob, type UtilityStrip } from "../../lib/utilityJobs";
+import { UtilityResidency, utilityJobWord, utilityReading, utilityStrip, utilityUsageByJob, type UtilityStrip } from "../../lib/utilityJobs";
 import type { ModelRow } from "../../types/generated/ModelRow";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
@@ -64,17 +64,14 @@ export function utilitySectionView(args: {
   const held = noSignal || unseen;
   const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
-  const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
+  const reading = args.isLocal ? utilityReading(args.specs != null, args.specs?.utility_model) : utilityReading(false, null);
+  const strip = utilityStrip(args.data, args.uid, args.nowMs, reading);
   const win = binding?.n_ctx != null ? `window ${binding.n_ctx.toLocaleString("en-US")}` : "window —";
   const residency = !identityKnown
     ? "—"
     : !args.isLocal
       ? "residency unknown (another machine)"
-      : strip.resident === true
-        ? `resident${args.residentRow?.current_bytes != null ? ` · ${memBytes(args.residentRow.current_bytes)}` : ""}`
-        : strip.resident === false
-          ? "not loaded"
-          : "no utility model registered";
+      : residencyLine(strip.residency, args.residentRow?.current_bytes ?? null);
   const liveLine = liveLineOf(strip.job, noSignal ? "checking…" : unseen ? NOT_REPORTED : null, args.nowMs);
   const mine = recordsAsOf(args.data, args.nowMs).filter((r) => sameUid(uidOf(r), args.uid));
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
@@ -102,6 +99,19 @@ export function utilitySectionView(args: {
     noSignal: held,
     jobs,
   };
+}
+
+/** The facts line's residency words, one per state. */
+function residencyLine(residency: UtilityResidency, bytes: number | null): string {
+  switch (residency) {
+    case UtilityResidency.Resident:
+      return `resident${bytes != null ? ` · ${memBytes(bytes)}` : ""}`;
+    case UtilityResidency.NotLoaded:
+      return "not loaded";
+    case UtilityResidency.Unknown:
+    case UtilityResidency.None:
+      return "no utility model registered";
+  }
 }
 
 /** The live line: the held word when the page cannot say (no signal, not

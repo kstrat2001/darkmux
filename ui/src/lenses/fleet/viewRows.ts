@@ -15,6 +15,7 @@ import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsRes
 import type { UnavailableWhy } from "../../types/generated/UnavailableWhy";
 import type { UnreachableReason } from "../../types/generated/UnreachableReason";
 import { findUid, nameKey, sameMachine, sameUid, type MachineRef } from "../../lib/machineIdentity";
+import { utilityReading, type UtilityReading } from "../../lib/utilityJobs";
 import { isUnseen, machineAvailability } from "../../lib/machineAvailability";
 
 /** Whether a machine is up, as the card should say it. `unknown` is a real
@@ -129,6 +130,15 @@ export function rowSpecs(row: FleetMachine): MachineSpecsResponse | null {
   return row.card.state === "available" ? row.card.card.specs : null;
 }
 
+/** The row's own card's statement of its utility model, for every machine
+ * alike (a card states only facts about its own machine). A card that was not
+ * read, or an older one that states nothing, reads unknown; one read that
+ * registers none reads none. */
+export function rowUtility(row: FleetMachine): UtilityReading {
+  const specs = rowSpecs(row);
+  return utilityReading(specs !== null, specs?.utility_model);
+}
+
 /** Whether the row's own card declares `fleet.mode hub`. A machine whose card
  * was not read declares nothing the view can show. */
 export function rowIsHub(row: FleetMachine): boolean {
@@ -205,6 +215,8 @@ export interface RowFacts {
   servesRadio: boolean;
   /** How many profiles the row's card says its machine serves (0: none shown). */
   servesProfiles: number;
+  /** The row's card's own statement of its machine's utility model. */
+  utility: UtilityReading;
 }
 
 /** Whether this viewer is receiving the row's machine. A view whose presence
@@ -260,6 +272,7 @@ export function rowFacts(
     hub: rowIsHub(row),
     servesRadio: rowServesRadio(row),
     servesProfiles: rowServesProfiles(row),
+    utility: rowUtility(row),
   };
 }
 

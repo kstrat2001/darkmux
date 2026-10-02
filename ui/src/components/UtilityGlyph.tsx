@@ -1,4 +1,4 @@
-import type { UtilityStrip } from "../lib/utilityJobs";
+import { UtilityResidency, type UtilityStrip } from "../lib/utilityJobs";
 
 /**
  * (#2915) The fleet card's utility strip: darkmux's own jobs on the machine's
@@ -16,8 +16,10 @@ import type { UtilityStrip } from "../lib/utilityJobs";
  * model" (operator, 2026-10-01). Everything happens inside the robot, so
  * nothing spills into the name row:
  * - quiet: the robot in the identity gray, solid when the utility model is
- *   resident, faded when it is not loaded, dashed when the viewer cannot
- *   tell (a fleet peer) or no utility model is known;
+ *   resident (and then in the lamp's healthy green), faded gray when it is
+ *   not loaded, dashed gray when residency is not known (the card was not
+ *   read, or an older card states nothing); none at all when the card was
+ *   read and registers no utility model, its slot kept;
  * - radio routing: its antenna blinks (a radio signal);
  * - compacting: its body squeezes;
  * - any job this build has no visual for: its eyes pulse, so a new job is
@@ -28,6 +30,19 @@ import type { UtilityStrip } from "../lib/utilityJobs";
  * Fast transitions are shown as they happen: the glyph is a function of the
  * reading at this instant, with no hold or smoothing.
  */
+const RESIDENCY_WORD: Record<Exclude<UtilityResidency, UtilityResidency.None>, string> = {
+  [UtilityResidency.Resident]: "resident",
+  [UtilityResidency.NotLoaded]: "not loaded",
+  [UtilityResidency.Unknown]: "residency unknown",
+};
+
+/** The robot's drawn state (`data-dot`): solid, faded, dashed. */
+const DOT: Record<Exclude<UtilityResidency, UtilityResidency.None>, string> = {
+  [UtilityResidency.Resident]: "filled",
+  [UtilityResidency.NotLoaded]: "hollow",
+  [UtilityResidency.Unknown]: "unknown",
+};
+
 export function UtilityGlyph({
   strip,
   noSignal = false,
@@ -40,27 +55,25 @@ export function UtilityGlyph({
   noSignal?: boolean;
 }) {
   const job = strip.job;
+  if (strip.residency === UtilityResidency.None) {
+    // A card that was read and registers no utility model: no robot, its
+    // slot kept so nothing in the name row shifts.
+    return <span className="mach-util" data-testid="fleet-utility" data-residency={strip.residency} data-visual="quiet" data-job="" data-stalled="false" aria-hidden="true" />;
+  }
   const visual = job ? job.visual : "quiet";
-  const residency =
-    strip.model == null
-      ? "no utility model known"
-      : strip.resident === true
-        ? "resident"
-        : strip.resident === false
-          ? "not loaded"
-          : "residency unknown";
   const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "checking…" : "idle";
   const label =
-    strip.model != null ? `Utility model: ${strip.model}\n${residency} · ${doing}` : `Utility model: unknown\n${doing}`;
-  const dot = strip.resident === true ? "filled" : strip.resident === false ? "hollow" : "unknown";
+    strip.model != null ? `Utility model: ${strip.model}\n${RESIDENCY_WORD[strip.residency]} · ${doing}` : `Utility model: unknown\n${doing}`;
+  const dot = DOT[strip.residency];
   return (
     <span
-      className="mach-util"
+      className={strip.residency === UtilityResidency.Resident ? "mach-util mach-util--resident" : "mach-util"}
       data-testid="fleet-utility"
       data-visual={visual}
       data-job={job?.job ?? ""}
       data-stalled={job?.stalled ? "true" : "false"}
       data-dot={dot}
+      data-residency={strip.residency}
       role="img"
       aria-label={label}
       title={label}

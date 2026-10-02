@@ -7,7 +7,7 @@ import { act, renderHook } from "@testing-library/react";
 
 import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, MAX_TRANSIENT_FRAMES_PER_SESSION, MAX_TRANSIENT_TRAIN, TRANSIENT_FRAME_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
 import { deriveLiveState, currentTokenRate, heartbeatSamples } from "./tokenRate";
-import { UTILITY_JOB, utilityStrip } from "./utilityJobs";
+import { UTILITY_JOB, utilityReading, utilityStrip } from "./utilityJobs";
 import { ACTION, type NormRecord } from "./ingest";
 import { norm, normAll } from "../testing/records";
 
@@ -153,7 +153,7 @@ describe("the issue's defect: a short think burst between 2 s heartbeats", () =>
 describe("the utility glyph shows a sub-second job live", () => {
   // The durable stream delivers a 300 ms routing job's start and end
   // together, after it has ended: it is never drawn open.
-  const specsBinding = { id: "u4b", loaded: true };
+  const specsBinding = utilityReading(true, { id: "u4b", loaded: true });
 
   test("live start: open for the job's 300 ms; live end: closed", () => {
     const store = new LiveStore();
@@ -295,7 +295,7 @@ describe("(#2928 review, C2) a state that came and went between renders is drawn
     vi.setSystemTime(T0);
     const store = new LiveStore();
     const open: boolean[] = [];
-    store.subscribe(() => open.push(utilityStrip([], M, T0 + 100, { id: "u4b", loaded: true }, store.snapshot().utility).job !== null));
+    store.subscribe(() => open.push(utilityStrip([], M, T0 + 100, utilityReading(true, { id: "u4b", loaded: true }), store.snapshot().utility).job !== null));
     store.ingest(wireModel(T0, 1, 1), T0); // leading edge taken by something else
     store.ingest(wireUtility(T0 + 10, "start", "fast"), T0);
     store.ingest(wireUtility(T0 + 60, "end", "fast"), T0);

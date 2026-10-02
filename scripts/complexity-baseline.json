@@ -137,7 +137,6 @@
   "ui/src/components/RecordView.tsx::Value": 16,
   "ui/src/components/TokenScope.tsx::TokenScope": 51,
   "ui/src/components/TokenScope.tsx::drawFrame": 31,
-  "ui/src/components/UtilityGlyph.tsx::UtilityGlyph": 16,
   "ui/src/components/machineStatsContent.tsx::BatteryLensBlock": 17,
   "ui/src/components/machineStatsContent.tsx::HostExtras": 38,
   "ui/src/components/machineStatsContent.tsx::effectiveHostAggregate": 32,
