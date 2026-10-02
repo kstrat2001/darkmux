@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Canonical location of the lab registry file inside a resolved
-/// darkmux home. Phase 4 CLI verbs read/write this path. Operators
+/// darkmux home. The `lab fixture` verbs read/write this path. Operators
 /// who want a custom location can hand-edit + move; the resolver
 /// always honors the canonical name under `{root}`.
 ///
@@ -268,7 +268,7 @@ impl LabRegistry {
     /// the same content).
     ///
     /// **In-memory only.** Caller MUST call [`Self::save`] to persist
-    /// the change to disk. Phase 4 CLI verbs are responsible for the
+    /// the change to disk. The `lab fixture` verbs are responsible for the
     /// save step.
     pub(crate) fn register(
         &mut self,

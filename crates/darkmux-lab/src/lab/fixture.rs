@@ -1,7 +1,7 @@
 //! Fixture manifest format — `.fixture.json` lives inside every
 //! registered fixture directory.
 //!
-//! Phase 2 of the lab-reproducibility cluster (#487, #489). A fixture
+//! Part of the lab-reproducibility cluster (#487, #489). A fixture
 //! is a self-contained directory (definition + artifact merged). The
 //! manifest declares what the fixture is, what it satisfies, how to
 //! verify it, and what's load-bearing for hashing.
