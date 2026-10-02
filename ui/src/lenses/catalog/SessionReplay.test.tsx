@@ -822,20 +822,20 @@ describe("SessionReplay", () => {
       return () => document.querySelector(".session-run__header .pill");
     };
 
-    it("reads UNKNOWN and does not pulse", async () => {
+    it("reads NOT REPORTING and does not pulse", async () => {
       const pill = await mount("no_beat");
-      await waitFor(() => expect(pill()?.textContent).toBe("UNKNOWN"));
+      await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       expect(pill()?.getAttribute("data-live")).toBeNull();
       expect(pill()?.getAttribute("title")).toMatch(/not reporting/i);
       // One status place: the brief's timing line does not call it running either.
       const timing = [...document.querySelectorAll(".brief-pair")].find((p) => p.textContent?.startsWith("timing"));
-      expect(timing?.textContent).toMatch(/· unknown$/);
+      expect(timing?.textContent).toMatch(/· not reporting$/);
       expect(document.querySelector(".session-run")?.textContent).not.toMatch(/\brunning\b/i);
     });
 
     it("does not count a clock up toward now for a run nobody is reporting on", async () => {
       const pill = await mount("no_beat");
-      await waitFor(() => expect(pill()?.textContent).toBe("UNKNOWN"));
+      await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       const readout = () => document.querySelector(".metrics")?.textContent;
       const before = readout();
       await new Promise((r) => setTimeout(r, 2100));

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { render, act, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
-import { buildFleetCard } from "../fleet/cards";
+import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { computeTMax, shapeRecords } from "../../lib/flow";
 import { ACTION, ingest, isAsOf } from "../../lib/ingest";
 
@@ -117,14 +117,13 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
     const NALL = shapeRecords(ALLN);
     const livePresence = new Set([SID]);
     const liveTMax = computeTMax(liveData);
-    const live = buildFleetCard(liveData, new Map(), null, livePresence, false, m, true, liveTMax);
+    const live = buildFleetCard(liveData, new Map(), null, livePresence, false, m, liveTMax);
     // playback: the whole day, no presence, playhead X (PlaybackLens -> FleetLens historical)
-    const play = buildFleetCard(NALL, new Map(), null, new Set(), false, m, false, X);
+    const play = buildFleetCard(NALL, new Map(), null, new Set(), false, m, X);
     const pick = (c: typeof live) => ({
       active: c.active,
-      stat: c.stat,
+      status: faceOf(c).status,
       runsCount: c.runsCount,
-      runsLabel: c.runsLabel,
       liveTokRate: c.liveTokRate == null ? null : Math.round(c.liveTokRate),
       liveTokStalled: c.liveTokStalled,
       runningSessionIds: c.runningSessionIds,

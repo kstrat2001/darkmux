@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason, servesLine, servesParts, DISCONNECTED_LAMP, executionCountText } from "./cards";
+import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, shownExecution } from "./cards";
+import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
+import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { LampForm } from "../../lib/lamp";
 import { utilityReading, UtilityResidency } from "../../lib/utilityJobs";
 import { outcomeLine, rowStanding, type RowFacts } from "./viewRows";
@@ -262,25 +264,24 @@ describe("runningRuns: bookkeeping is not a run", () => {
   // counts runs, not bookkeeping.
   it("an open mission lifecycle session alone reads idle", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "mission-m1", mission_id: "m1", action: "mission.start" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, Date.parse("2026-08-08T00:01:00.000Z"));
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", Date.parse("2026-08-08T00:01:00.000Z"));
     expect(card.runsCount).toBe(0);
-    expect(card.stat).toBe("idle");
+    expect(faceOf(card).status).toBe(CardStatus.Idle);
   });
 });
 
 describe("buildFleetCard", () => {
   it("an absent machine reads 'offline' regardless of activity", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), /* machAbsent */ true, "u1", true, T_MAX);
-    expect(card.stat).toBe("offline");
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), /* machAbsent */ true, "u1", T_MAX);
+    expect(faceOf(card).status).toBe(CardStatus.Offline);
   });
 
   it("a present machine with a live dispatch reads 'dispatch in flight'", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
-    expect(card.stat).toBe("dispatch in flight");
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
+    expect(faceOf(card).status).toBe(CardStatus.Running);
     expect(card.runsCount).toBe(1);
-    expect(card.runsLabel).toBe("running");
   });
 
   it("a present machine with no live dispatch reads 'idle', even with completed history", () => {
@@ -288,8 +289,8 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
-    expect(card.stat).toBe("idle");
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX);
+    expect(faceOf(card).status).toBe(CardStatus.Idle);
     // LIVE counts only running sessions — a completed dispatch from earlier
     // today must not inflate the count into reading as current crew.
     expect(card.runsCount).toBe(0);
@@ -311,10 +312,9 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.complete" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX);
     expect(card.runsCount).toBe(0);
-    expect(card.runsLabel).toBe("running");
-    expect(card.stat).toBe("idle");
+    expect(faceOf(card).status).toBe(CardStatus.Idle);
   });
 
   // The regression this pair used to guard was the OPPOSITE of parity: "live
@@ -326,8 +326,8 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
     ];
-    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX).runsCount).toBe(0);
-    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX).runsCount).toBe(0);
+    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX).runsCount).toBe(0);
+    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX).runsCount).toBe(0);
   });
 
   // (#2060) A mission's own run session (opened by `run.start`, see
@@ -340,9 +340,8 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "mission-1.run", mission_id: "mission-1", action: "run.start" }),
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", T_MAX);
     expect(card.runsCount).toBe(1);
-    expect(card.runsLabel).toBe("running");
     // The single "in flight" tap target must land on the MISSION's own
     // session, not whichever seat happened to be encountered first.
     expect(card.runningSessionIds).toEqual(["mission-1.run"]);
@@ -360,7 +359,7 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "mission-1.run", mission_id: "mission-1", action: "run.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", T_MAX);
     expect(card.runsCount).toBe(1);
     expect(card.runningSessionIds).toEqual(["mission-1.run"]);
   });
@@ -373,7 +372,7 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1", "solo-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1", "solo-1"]), false, "u1", T_MAX);
     expect(card.runsCount).toBe(2);
   });
 
@@ -385,7 +384,7 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "mission-2", mission_id: "mission-2", action: "dispatch.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "mission-2"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "mission-2"]), false, "u1", T_MAX);
     expect(card.runsCount).toBe(2);
   });
 
@@ -406,8 +405,8 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
-      expect(card.stat).toBe("idle");
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX);
+      expect(faceOf(card).status).toBe(CardStatus.Idle);
       expect(card.liveTokRate).toBeNull();
     });
 
@@ -416,8 +415,8 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 40 } }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
-      expect(card.stat).toBe("dispatch in flight");
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
+      expect(faceOf(card).status).toBe(CardStatus.Running);
       // One fresh heartbeat: generating, but not enough samples for a rate
       // yet. The scope is up at 0 rather than absent.
       expect(card.liveTokRate).toBe(0);
@@ -441,14 +440,14 @@ describe("buildFleetCard", () => {
 
     it("reads AS OF the playhead: a durable heartbeat stamped after it does not reach the card", () => {
       const data = [...silentRun(), rec({ ts: iso(T_MAX + 10_000), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: futureBeat })];
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, [], true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, [], true, T_MAX);
       expect(card.liveTokState).toBe("stalled");
     });
 
     it("reads a live sample AS OF the playhead too: one stamped after it does not reach the card", () => {
       const future = liveSampleToRecord({ v: 1, kind: "model", at_ms: T_MAX + 10_000, session_id: "s1", role: "coder", fields: { turn_seq: 1, generated_chars: 4_120 } });
       const live: LiveOverlay = { version: 1, bySession: new Map([["s1", [future!]]]), utility: [] };
-      const card = buildFleetCard(silentRun(), new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, [], true, T_MAX, [], live);
+      const card = buildFleetCard(silentRun(), new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, [], true, T_MAX, [], live);
       expect(card.liveTokState).toBe("stalled");
     });
 
@@ -458,7 +457,7 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
       // 80 chars / 2000ms = 40 chars/sec, DEFAULT_CHARS_PER_TOKEN (4) → 10 tok/s.
       expect(card.liveTokRate).toBeCloseTo(10, 5);
       expect(card.liveTokStalled).toBe(false);
@@ -473,11 +472,11 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
       ];
-      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBe(0);
+      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX).liveTokRate).toBe(0);
       data.push(rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }));
-      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBe(0);
+      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX).liveTokRate).toBe(0);
       // Control: a fresh array gets a fresh index and reads the rate.
-      expect(buildFleetCard([...data], new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBeCloseTo(10, 5);
+      expect(buildFleetCard([...data], new Map(), null, new Set(["s1"]), false, "u1", T_MAX).liveTokRate).toBeCloseTo(10, 5);
     });
 
     // (#2885) A short turn's lone first heartbeat carries the previous
@@ -496,7 +495,7 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1c, generated_chars: 1_600, turn_seq: 1 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: T_MAX, generated_chars: 50, turn_seq: 2 } }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
       expect(card.liveTokState).toBe("generating");
       // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
       expect(card.liveTokRate).toBeCloseTo(100, 5);
@@ -515,7 +514,6 @@ describe("buildFleetCard", () => {
         new Set(["s1"]),
         false,
         "u1",
-        true,
         T_MAX,
       );
       expect(card.liveTokCarried).toBe(false);
@@ -530,7 +528,7 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 200 } }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", T_MAX);
       // s1: 40 chars/sec / 4 = 10 tok/s. s2: 80 chars/sec / 4 = 20 tok/s.
       expect(card.liveTokRate).toBeCloseTo(30, 5);
     });
@@ -559,7 +557,7 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(BEAT2).toISOString(), payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
       ];
       // Empty `liveSet` — a real replay call never has presence to consult.
-      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX);
       expect(card.liveTokRate).toBeCloseTo(10, 5);
     });
 
@@ -581,7 +579,7 @@ describe("buildFleetCard", () => {
       ];
       // The playhead is T_MAX (2026) while the heartbeats above are near
       // epoch 0 — many hours stale by any measure, well past STALL_AFTER_MS.
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
       expect(card.liveTokStalled).toBe(true);
       expect(card.liveTokRate).toBe(0);
     });
@@ -595,10 +593,10 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
       ];
-      const connectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true);
+      const connectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, undefined, true);
       expect(connectedCard.liveTokStalled).toBe(true);
       expect(connectedCard.liveTokState).toBe("stalled");
-      const disconnectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, false);
+      const disconnectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, undefined, false);
       expect(disconnectedCard.liveTokStalled).toBe(false);
       expect(disconnectedCard.liveTokState).toBeNull();
       // Still mounted (a running session exists) — just no state to claim.
@@ -617,11 +615,11 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
       ];
       // Contact confirmed BEFORE the 33,000ms deadline — the half-open gap.
-      const staleContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 32_999);
+      const staleContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, undefined, true, 32_999);
       expect(staleContact.liveTokStalled).toBe(false);
       expect(staleContact.liveTokState).toBeNull();
       // Contact confirmed AFTER the deadline — a genuine, trustworthy stall.
-      const freshContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 33_001);
+      const freshContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, undefined, undefined, true, 33_001);
       expect(freshContact.liveTokStalled).toBe(true);
       expect(freshContact.liveTokState).toBe("stalled");
     });
@@ -635,7 +633,7 @@ describe("buildFleetCard", () => {
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.complete", mission_id: "m1" }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(["m1"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["m1"]), false, "u1", T_MAX);
       expect(card.liveTokRate).toBeNull();
       expect(card.liveTokState ?? null).toBeNull();
     });
@@ -651,7 +649,7 @@ describe("buildFleetCard", () => {
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
         rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
       ];
-      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX);
       expect(card.executions.map((e) => e.sessionId)).toEqual(["e1"]);
     });
 
@@ -663,7 +661,7 @@ describe("buildFleetCard", () => {
       ];
       // T_MAX ("2026-08-09T00:00:00.000Z") matches the second (fallback,
       // whole-second `ts`-derived) heartbeat exactly — fresh, not stalled.
-      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
       expect(card.liveTokRate).not.toBeNull();
       expect(card.liveTokRate!).toBeGreaterThan(0);
     });
@@ -680,8 +678,8 @@ describe("buildFleetCard", () => {
   it("(#1923) a running lab run makes the card active even with zero flow presence", () => {
     const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
-    expect(card.stat).toBe("dispatch in flight");
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX, null, machineRuns);
+    expect(faceOf(card).status).toBe(CardStatus.Running);
     expect(card.runsCount).toBe(1);
   });
 
@@ -704,9 +702,9 @@ describe("buildFleetCard", () => {
     const labSession = "darkmux-coding-long-agentic-1756000000000";
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: labSession, action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set([labSession]), false, "u1", true, T_MAX, null, machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set([labSession]), false, "u1", T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(1);
-    expect(card.stat).toBe("dispatch in flight");
+    expect(faceOf(card).status).toBe(CardStatus.Running);
   });
 
   // The other side of the same `Math.max`: flow work beyond the lab run's
@@ -720,7 +718,7 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
     ];
     const machineRuns: Run[] = [run({ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set([labSession, "solo-1"]), false, "u1", true, T_MAX, null, machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set([labSession, "solo-1"]), false, "u1", T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(2);
   });
 
@@ -732,7 +730,7 @@ describe("buildFleetCard", () => {
       run({ id: "lab-a", kind: "lab", status: "running", machine: "u1" }),
       run({ id: "lab-b", kind: "lab", status: "running", machine: "u1" }),
     ];
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(2);
   });
 
@@ -741,8 +739,8 @@ describe("buildFleetCard", () => {
   it("(#1923) a completed lab run does not count as active", () => {
     const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "complete", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
-    expect(card.stat).toBe("idle");
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", T_MAX, null, machineRuns);
+    expect(faceOf(card).status).toBe(CardStatus.Idle);
     expect(card.runsCount).toBe(0);
   });
 
@@ -752,7 +750,7 @@ describe("buildFleetCard", () => {
   it("(#1923) a running mission row in /runs is not double-counted against flow presence", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "s1", kind: "dispatch", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, null, machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(1);
   });
 
@@ -763,8 +761,8 @@ describe("buildFleetCard", () => {
   // for `m` directly, matching how `FleetLens.tsx` calls this for a roster
   // entry with no known uid.
   it("(#1855) a rostered entry with no known identity reads 'offline', not 'idle'", () => {
-    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio", true, T_MAX);
-    expect(card.stat).toBe("offline");
+    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio", T_MAX);
+    expect(faceOf(card).status).toBe(CardStatus.Offline);
     expect(card.active).toBe(false);
     expect(card.runsCount).toBe(0);
     // (#2921) The card builder never echoes an unknown `m` back as a title
@@ -789,7 +787,7 @@ describe("buildFleetCard", () => {
       cpu_brand: "Apple M5 Max",
       ram_total_bytes: 137438953472,
     });
-    const card = buildFleetCard([], new Map(), specs, new Set(), /* machAbsent */ false, uid, true, T_MAX);
+    const card = buildFleetCard([], new Map(), specs, new Set(), /* machAbsent */ false, uid, T_MAX);
     expect(card.name).toBe("MacBook-Pro");
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();
@@ -803,7 +801,7 @@ describe("buildFleetCard", () => {
     const uid = "00000000-0000-4000-8000-ABCDEF000011";
     const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" });
     const data: NormRecord[] = [rec({ machine_uid: uid, machine_id: "MacBook-Pro.local" })];
-    const card = buildFleetCard(data, new Map(), specs, new Set(), false, uid, true, T_MAX);
+    const card = buildFleetCard(data, new Map(), specs, new Set(), false, uid, T_MAX);
     expect(card.name).toBe("MacBook-Pro.local");
   });
 });
@@ -813,7 +811,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
 
   it("a machine that beat WITHOUT specs reads 'not-reported' — it answered and said nothing", () => {
     const live = new Map([["u1", beat({ machine_uid: "u1" })]]);
-    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", T);
     expect(card.spec).toBe("");
     expect(card.specUnknown).toBe("not-reported");
     expect(specUnknownLabel(card.specUnknown!)).toBe("hardware not reported");
@@ -821,7 +819,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
 
   it("a machine nothing has been received from reads 'not-seen'", () => {
     // The rostered-but-silent card: forced absent, no beat, no snapshot entry.
-    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio-2", true, T);
+    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio-2", T);
     expect(card.spec).toBe("");
     expect(card.specUnknown).toBe("not-seen");
     expect(specUnknownLabel(card.specUnknown!)).toBe("hardware unknown (nothing received)");
@@ -830,7 +828,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
   it("a machine WITH hardware reports no unknown at all", () => {
     // Inverted case 1 — the healthy card must carry no marker of any kind.
     const live = new Map([["u1", beat({ machine_uid: "u1", specs: "Apple M5 Max · 128 GB" })]]);
-    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", T);
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();
   });
@@ -841,7 +839,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
     // bucket just because presence is switched off.
     const data = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro", action: "dispatch.start" })];
     const specs = machineSpecs({ machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
-    const card = buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, T);
+    const card = buildFleetCard(data, new Map(), specs, new Set(), false, "u1", T);
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();
   });
@@ -951,7 +949,7 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
   const BEAT2 = T_MAX;
 
   it("is empty while idle", () => {
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX);
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", T_MAX);
     expect(card.executions).toEqual([]);
     expect(card.defaultExecutionSessionId).toBeNull();
   });
@@ -962,7 +960,7 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", T_MAX);
     expect(card.executions).toHaveLength(1);
     expect(card.executions[0].sessionId).toBe("s1");
     expect(card.executions[0].role).toBe("coder");
@@ -981,7 +979,7 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", T_MAX);
     expect(card.executions.map((e) => e.sessionId)).toEqual(["s1", "s2"]);
     expect(card.executions.find((e) => e.sessionId === "s2")?.state).toBe("rest");
     // Busiest = generating, not array/session-id order.
@@ -1000,7 +998,7 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   const routeEnd = (s: number) =>
     rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } });
   const card = (data: NormRecord[], t: number, specs: MachineSpecsResponse | null = null) =>
-    buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t, specs ? rowFactsFor({ isSelf: true }) : null);
+    buildFleetCard(data, new Map(), specs, new Set(), false, "u1", t, specs ? rowFactsFor({ isSelf: true }) : null);
 
   it("shows the routing job while it runs, and is quiet once its usage record lands", () => {
     expect(card([routeStart(0)], tAt(2)).utility.job).toMatchObject({ job: "radio_routing", visual: "radio", stalled: false });
@@ -1025,13 +1023,13 @@ describe("(#2915) buildFleetCard's utility strip", () => {
     const utility = utilityReading(true, { id: "util-4b", loaded: true });
     const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1" });
     for (const isSelf of [true, false]) {
-      const c = buildFleetCard([], new Map(), specs, new Set(), false, "u1", true, T_MAX, rowFactsFor({ isSelf, utility }));
+      const c = buildFleetCard([], new Map(), specs, new Set(), false, "u1", T_MAX, rowFactsFor({ isSelf, utility }));
       expect(c.utility, `isSelf ${isSelf}`).toMatchObject({ model: "util-4b", residency: UtilityResidency.Resident, job: null });
     }
   });
 
   it("a card that registers none has no model, whatever its old records name", () => {
-    const c = buildFleetCard([routeStart(0), routeEnd(1)], new Map(), null, new Set(), false, "u1", true, tAt(2), rowFactsFor({ utility: utilityReading(true, null) }));
+    const c = buildFleetCard([routeStart(0), routeEnd(1)], new Map(), null, new Set(), false, "u1", tAt(2), rowFactsFor({ utility: utilityReading(true, null) }));
     expect(c.utility).toMatchObject({ model: null, residency: UtilityResidency.None });
   });
 
@@ -1061,8 +1059,8 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
   const selfSpecs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "u4b", loaded: true } } as Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">);
 
   it("no overlay: exactly the durable reading (playback and every existing caller)", () => {
-    const a = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T);
-    const b = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T, undefined, [], true, null, [], null);
+    const a = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", T);
+    const b = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", T, undefined, [], true, null, [], null);
     expect(b.liveTokRate).toBeCloseTo(10, 5);
     expect(b).toEqual(a);
   });
@@ -1072,14 +1070,14 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
     const store = new LiveStore();
     store.ingest(liveModel(T + 250, 200, 200), T + 250);
     store.ingest(liveModel(T + 500, 400, 200), T + 500); // reasoning: the text holds
-    const card = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T + 500, undefined, [], true, null, [], store.snapshot());
+    const card = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", T + 500, undefined, [], true, null, [], store.snapshot());
     // 200 chars / 250 ms = 800 chars/s at 4 chars/token = 200 tok/s.
     expect(card.liveTokRate).toBeCloseTo(200, 5);
     expect(card.liveTokState).toBe("generating");
     expect(card.executions[0]?.thinking).toBe(true);
     // The same instant from durable records alone: the last pair (40 -> 120,
     // both visible) reads GEN, not THINK.
-    const durableOnly = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T + 500);
+    const durableOnly = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", T + 500);
     expect(durableOnly.executions[0]?.thinking).toBeUndefined();
   });
 
@@ -1088,9 +1086,9 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
     const { UTILITY_JOB } = await import("../../lib/utilityJobs");
     const store = new LiveStore();
     store.ingest(JSON.stringify({ v: 1, kind: "utility", role: "radio-router", model: "u4b", at_ms: T, cadence_ms: 250, fields: { event: "start", job: UTILITY_JOB.radio_routing, job_id: "r1", stall_after_ms: 30000 } }), T);
-    const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", true, T + 100, rowFactsFor({ isSelf: true }), [], true, null, [], store.snapshot());
+    const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", T + 100, rowFactsFor({ isSelf: true }), [], true, null, [], store.snapshot());
     expect(self.utility.job?.visual).toBe("radio");
-    const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", true, T + 100, rowFactsFor({ uid: "u2" }), [], true, null, [], store.snapshot());
+    const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", T + 100, rowFactsFor({ uid: "u2" }), [], true, null, [], store.snapshot());
     expect(peer.utility.job).toBeNull();
   });
 });
@@ -1105,24 +1103,24 @@ describe("card availability when the view's liveness says the stream stopped (5.
 
   it("a peer whose card was read but whose beat stopped is not_streamed, though the window holds a day-old record", () => {
     const row = rowFactsFor({ uid: "darkbook", known: true, standing: "online", liveness: "no_beat" });
-    const c = buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", true, T, row);
+    const c = buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", T, row);
     expect(c.availability).toBe("not_streamed");
-    expect(cardFace({ absent: false, active: false, runsCount: 0, standing: c.standing, availability: c.availability, note: c.note }, false, { flow: true, presence: true, sessions: true, runs: true })).toMatchObject({ stat: "online", secondLine: "not streaming", noSignal: true });
+    expect(cardFace({ active: false, runsCount: 0, standing: c.standing, availability: c.availability, note: c.note }, false, { flow: true, presence: true, sessions: true, runs: true })).toMatchObject({ status: CardStatus.OnlineNotStreaming, noSignal: true });
   });
 
   it("an unknown liveness falls back to what the window holds", () => {
-    const build = (known: boolean) => buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", known, liveness: "unknown" })).availability;
+    const build = (known: boolean) => buildFleetCard([], new Map(), null, new Set(), false, "darkbook", T, rowFactsFor({ uid: "darkbook", known, liveness: "unknown" })).availability;
     expect(build(true)).toBe("known");
     expect(build(false)).toBe("not_streamed");
   });
 
   it("a live beat is known", () => {
-    expect(buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", known: true, liveness: "live" })).availability).toBe("known");
+    expect(buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", T, rowFactsFor({ uid: "darkbook", known: true, liveness: "live" })).availability).toBe("known");
   });
 
   it("a powered-off machine nothing was seen from is not_reporting, and the hero does not list it as not streaming", () => {
     const row = rowFactsFor({ uid: "darkbook", known: false, standing: "offline", liveness: "no_beat" });
-    const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, row);
+    const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", T, row);
     expect(c.availability).toBe("not_reporting");
     expect(notStreamedNames([c])).toEqual([]);
   });
@@ -1130,65 +1128,65 @@ describe("card availability when the view's liveness says the stream stopped (5.
 describe("the status line's word and reason follow the availability (5.0 R3)", () => {
   const answered = { flow: true, presence: true, sessions: true, runs: true };
   const face = (availability: "known" | "not_streamed" | "not_reporting", standing: "online" | "offline", note: string | null = null) =>
-    cardFace({ absent: standing === "offline", active: false, runsCount: 0, standing, availability, note }, false, answered);
+    cardFace({ active: false, runsCount: 0, standing, availability, note }, false, answered);
 
   it("not_streamed with the card read says online, and not streaming", () => {
     const f = face("not_streamed", "online");
-    expect(f.stat).toBe("online");
-    expect(f.secondLine).toBe("not streaming");
-    expect(statusReason({ note: null }, f)).toBe("online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.");
+    expect(STATUS_WORD[f.status]).toBe("online");
+    expect(secondLineOf(f.status)).toBe("not streaming");
+    expect(statusReason(null, f.status)).toBe("online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.");
   });
 
   it("not_streamed with the card unread claims no evidence it is up", () => {
     const f = face("not_streamed", "online", "not listening");
-    expect(f.stat).toBe("not streaming");
-    expect(f.secondLine).toBeNull();
-    expect(statusReason({ note: "not listening" }, f)).toBe("not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read.");
+    expect(STATUS_WORD[f.status]).toBe("not streaming");
+    expect(secondLineOf(f.status)).toBeNull();
+    expect(statusReason("not listening", f.status)).toBe("not streaming: not listening");
   });
 
   it("not_reporting reads offline, with the card's reason when it has one", () => {
     const f = face("not_reporting", "offline");
-    expect(f.stat).toBe("offline");
-    expect(statusReason({ note: "not listening" }, f)).toBe("offline: not listening");
-    expect(statusReason({ note: null }, f)).toBe("offline: its presence beat stopped");
+    expect(STATUS_WORD[f.status]).toBe("offline");
+    expect(statusReason("not listening", f.status)).toBe("offline: not listening");
+    expect(statusReason(null, f.status)).toBe("offline: its presence beat stopped");
   });
 
   it("a known, quiet machine has no reason to give", () => {
-    expect(statusReason({ note: null }, face("known", "online"))).toBeUndefined();
+    expect(statusReason(null, face("known", "online").status)).toBeUndefined();
   });
 });
 describe("cardFace (#2958)", () => {
   const none = { flow: false, presence: false, sessions: false, runs: false };
   const all = { flow: true, presence: true, sessions: true, runs: true };
-  const quiet = { absent: false, active: false, runsCount: 0, standing: "online" as const, availability: "known" as const, note: null };
+  const quiet = { active: false, runsCount: 0, standing: "online" as const, availability: "known" as const, note: null };
 
   it("a peer whose records never reach this viewer never reads idle, whatever answered (5.0 R3)", () => {
     const silent = { ...quiet, availability: "not_streamed" as const };
-    expect(cardFace(silent, false, all)).toMatchObject({ stat: "online", secondLine: "not streaming", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false });
+    expect(cardFace(silent, false, all)).toMatchObject({ status: CardStatus.OnlineNotStreaming, noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false });
   });
 
   it("a not-streamed peer still shows work a /runs row proves (a positive reading)", () => {
     const silent = { ...quiet, availability: "not_streamed" as const, active: true, runsCount: 1 };
-    expect(cardFace(silent, false, all)).toMatchObject({ stat: "dispatch in flight", countShown: true });
+    expect(cardFace(silent, false, all)).toMatchObject({ status: CardStatus.Running, countShown: true });
   });
 
   it("nothing answered: an idle card says checking…, with no-signal static and no count", () => {
-    expect(cardFace(quiet, false, none)).toMatchObject({ stat: "checking…", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false, absent: false });
+    expect(cardFace(quiet, false, none)).toMatchObject({ status: CardStatus.Checking, noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false });
   });
 
   it("everything answered: idle is a reading", () => {
-    expect(cardFace(quiet, false, all)).toMatchObject({ stat: "idle", noSignal: false, tube: "idle", countShown: true, utilityQuietKnown: true });
+    expect(cardFace(quiet, false, all)).toMatchObject({ status: CardStatus.Idle, noSignal: false, tube: "idle", countShown: true, utilityQuietKnown: true });
   });
 
   it("idle waits on EVERY source, one at a time", () => {
     for (const k of ["flow", "presence", "sessions", "runs"] as const) {
-      expect(cardFace(quiet, false, { ...all, [k]: false }).stat, k).toBe("checking…");
+      expect(cardFace(quiet, false, { ...all, [k]: false }).status, k).toBe(CardStatus.Checking);
     }
   });
 
   it("a live reading and 'dispatch in flight' show before anything else answers", () => {
     const f = cardFace({ ...quiet, active: true, runsCount: 2 }, true, { ...none, flow: true });
-    expect(f).toMatchObject({ stat: "dispatch in flight", active: true, noSignal: false, tube: "reading", countShown: true });
+    expect(f).toMatchObject({ status: CardStatus.Running, active: true, noSignal: false, tube: "reading", countShown: true });
   });
 
   it("in flight with no model working: the tube's 'no model working' waits for every source", () => {
@@ -1197,18 +1195,18 @@ describe("cardFace (#2958)", () => {
   });
 
   it("offline waits on presence and the flow window, not on /runs; it keeps the tube's box, powered off", () => {
-    const gone = { absent: true, active: false, runsCount: 0, standing: "offline" as const, availability: "known" as const, note: null };
-    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ stat: "checking…", absent: false, tube: "nosignal" });
-    expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ stat: "checking…", absent: false });
-    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
-    expect(cardFace(gone, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
+    const gone = { active: false, runsCount: 0, standing: "offline" as const, availability: "known" as const, note: null };
+    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ status: CardStatus.Checking, tube: "nosignal" });
+    expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ status: CardStatus.Checking });
+    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ status: CardStatus.Offline, tube: "off", noSignal: false, countShown: false });
+    expect(cardFace(gone, false, all)).toMatchObject({ status: CardStatus.Offline, tube: "off", countShown: true });
   });
 
   it("offline wins over a reading: an offline card's tube is powered off", () => {
-    const gone = { absent: true, active: true, runsCount: 1, standing: "offline" as const, availability: "known" as const, note: null };
-    expect(cardFace(gone, true, all)).toMatchObject({ stat: "offline", absent: true, active: false, tube: "off" });
+    const gone = { active: true, runsCount: 1, standing: "offline" as const, availability: "known" as const, note: null };
+    expect(cardFace(gone, true, all)).toMatchObject({ status: CardStatus.Offline, active: false, tube: "off" });
     // Before presence has answered, the reading stays: it is a positive one.
-    expect(cardFace(gone, true, { ...all, presence: false })).toMatchObject({ stat: "dispatch in flight", tube: "reading" });
+    expect(cardFace(gone, true, { ...all, presence: false })).toMatchObject({ status: CardStatus.Running, tube: "reading" });
   });
 
   it("a quiet utility strip waits only on the flow window", () => {
@@ -1222,25 +1220,28 @@ describe("buildFleetCard: a machine the fleet view holds", () => {
     // No beat, no records: the reported case. Presence says nothing about
     // this peer; the view read its card.
     const row = rowFactsFor({ uid: "studio", known: false, name: "studio", spec: "Apple M1 Max · 32 GB", standing: "online" });
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
-    expect(card).toMatchObject({ name: "studio", spec: "Apple M1 Max · 32 GB", standing: "online", absent: false, stat: "idle" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", T_MAX, row);
+    expect(card).toMatchObject({ name: "studio", spec: "Apple M1 Max · 32 GB", standing: "online" });
   });
 
   it("an unreachable peer carries the view's status note and no hardware", () => {
     const row = rowFactsFor({ uid: "studio", known: false, name: "studio", note: "listener off", standing: "offline" });
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
-    expect(card).toMatchObject({ spec: "", note: "listener off", standing: "offline", absent: true, stat: "offline" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", T_MAX, row);
+    expect(card).toMatchObject({ spec: "", note: "listener off", standing: "offline" });
+    expect(faceOf(card).status).toBe(CardStatus.Offline);
   });
 
   it("a standing the view could not decide says checking…, never idle", () => {
     const row = rowFactsFor({ uid: "studio", known: false, name: "studio", note: "listener unavailable", standing: "unknown" });
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
-    expect(card).toMatchObject({ absent: false, stat: "checking…" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", T_MAX, row);
+    expect(card.standing).toBe("unknown");
+    // Never idle, whatever has answered.
+    expect(faceOf(card).status).not.toBe(CardStatus.Idle);
   });
 
   it("a machine outside the view keeps the flow-derived standing", () => {
-    expect(buildFleetCard([], new Map(), null, new Set(), true, "u9", true, T_MAX).standing).toBe("offline");
-    expect(buildFleetCard([], new Map(), null, new Set(), false, "u9", true, T_MAX).standing).toBe("online");
+    expect(buildFleetCard([], new Map(), null, new Set(), true, "u9", T_MAX).standing).toBe("offline");
+    expect(buildFleetCard([], new Map(), null, new Set(), false, "u9", T_MAX).standing).toBe("online");
   });
 });
 
@@ -1248,25 +1249,36 @@ describe("cardFace: an undecided standing is not idle", () => {
   const all = { flow: true, presence: true, sessions: true, runs: true };
   const none = { flow: false, presence: false, sessions: false, runs: false };
   it("says checking… until presence answers, then not streaming; offline only when the standing is offline", () => {
-    const base = { absent: false, active: false, runsCount: 0, availability: "known" as const, note: "not listening" as string | null };
-    expect(cardFace({ ...base, standing: "unknown" }, false, none)).toMatchObject({ stat: "checking…", secondLine: null, tube: "nosignal" });
-    expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ stat: "not streaming", secondLine: null, tube: "nosignal", absent: false });
-    expect(cardFace({ ...base, note: null, standing: "online" }, false, all)).toMatchObject({ stat: "idle", tube: "idle" });
-    expect(cardFace({ ...base, absent: true, standing: "offline" }, false, all)).toMatchObject({ stat: "offline", tube: "off", absent: true });
+    const base = { active: false, runsCount: 0, availability: "known" as const, note: "not listening" as string | null };
+    expect(cardFace({ ...base, standing: "unknown" }, false, none)).toMatchObject({ status: CardStatus.Checking, tube: "nosignal" });
+    expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ status: CardStatus.NotStreaming, tube: "nosignal" });
+    expect(cardFace({ ...base, note: null, standing: "online" }, false, all)).toMatchObject({ status: CardStatus.Idle, tube: "idle" });
+    expect(cardFace({ ...base, standing: "offline" }, false, all)).toMatchObject({ status: CardStatus.Offline, tube: "off" });
+  });
+
+  // 5.0 UI packet: a card nothing has read has no count to claim. It said
+  // "not streaming" over a confident "0 running" (proven by probe).
+  it("an unread card of unknown standing holds the no-reading line, not '0 running'", () => {
+    const unread = { active: false, runsCount: 0, availability: "known" as const, note: "not listening", standing: "unknown" as const };
+    const f = cardFace(unread, false, all);
+    expect(f.status).toBe(CardStatus.NotStreaming);
+    expect(f.countShown).toBe(false);
+    // Work a /runs row proves is still a positive reading.
+    expect(cardFace({ ...unread, active: true, runsCount: 1 }, false, all).countShown).toBe(true);
   });
 });
 
 describe("card availability (5.0 R3, #3012)", () => {
   const T = Date.parse("2026-08-09T00:00:00.000Z");
   it("a view row the window holds nothing from is not_streamed; its own row and a flow-only card are known", () => {
-    const build = (row: RowFacts | null) => buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, row).availability;
+    const build = (row: RowFacts | null) => buildFleetCard([], new Map(), null, new Set(), false, "darkbook", T, row).availability;
     expect(build(rowFactsFor({ uid: "darkbook", known: false }))).toBe("not_streamed");
     expect(build(rowFactsFor({ uid: "darkbook", known: true }))).toBe("known");
     expect(build(rowFactsFor({ uid: "darkbook", known: false, isSelf: true }))).toBe("known");
     expect(build(null)).toBe("known");
   });
   it("a seen peer whose card says offline is not_reporting", () => {
-    const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", standing: "offline" }));
+    const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", T, rowFactsFor({ uid: "darkbook", standing: "offline" }));
     expect(c.availability).toBe("not_reporting");
   });
 });
@@ -1274,26 +1286,26 @@ describe("card availability (5.0 R3, #3012)", () => {
 describe("the status lamp's form (rec 1)", () => {
   const none = { flow: false, presence: false, sessions: false, runs: false };
   const all = { flow: true, presence: true, sessions: true, runs: true };
-  const quiet = { absent: false, active: false, runsCount: 0, standing: "online" as const, availability: "known" as const, note: null };
+  const quiet = { active: false, runsCount: 0, standing: "online" as const, availability: "known" as const, note: null };
 
   it("proven work is filled", () => {
-    expect(cardFace({ ...quiet, active: true, runsCount: 1 }, false, all).lamp).toBe(LampForm.Filled);
-    expect(cardFace({ ...quiet, active: true, runsCount: 2 }, true, all).lamp).toBe(LampForm.Filled);
+    expect(lampOf(cardFace({ ...quiet, active: true, runsCount: 1 }, false, all).status)).toBe(LampForm.Filled);
+    expect(lampOf(cardFace({ ...quiet, active: true, runsCount: 2 }, true, all).status)).toBe(LampForm.Filled);
   });
   it("proven quiet is hollow", () => {
-    expect(cardFace(quiet, false, all).lamp).toBe(LampForm.Hollow);
+    expect(lampOf(cardFace(quiet, false, all).status)).toBe(LampForm.Hollow);
   });
   it("no reading is dashed: checking, not streaming (read or unread card)", () => {
-    expect(cardFace(quiet, false, none).lamp).toBe(LampForm.Dashed);
-    expect(cardFace({ ...quiet, availability: "not_streamed" as const }, false, all)).toMatchObject({ stat: "online", lamp: LampForm.Dashed });
-    expect(cardFace({ ...quiet, availability: "not_streamed" as const, note: "not listening" }, false, all)).toMatchObject({ stat: "not streaming", lamp: LampForm.Dashed });
-    expect(DISCONNECTED_LAMP).toBe(LampForm.Dashed);
+    expect(lampOf(cardFace(quiet, false, none).status)).toBe(LampForm.Dashed);
+    expect(lampOf(cardFace({ ...quiet, availability: "not_streamed" as const }, false, all).status)).toBe(LampForm.Dashed);
+    expect(lampOf(cardFace({ ...quiet, availability: "not_streamed" as const, note: "not listening" }, false, all).status)).toBe(LampForm.Dashed);
+    expect(lampOf(CardStatus.Disconnected)).toBe(LampForm.Dashed);
   });
   it("offline is dim filled", () => {
-    expect(cardFace({ ...quiet, absent: true, standing: "offline" as const }, false, all).lamp).toBe(LampForm.Off);
+    expect(lampOf(cardFace({ ...quiet, standing: "offline" as const }, false, all).status)).toBe(LampForm.Off);
   });
   it("offline wins over work, as the status word does", () => {
-    expect(cardFace({ ...quiet, absent: true, active: true, standing: "offline" as const }, true, all).lamp).toBe(LampForm.Off);
+    expect(lampOf(cardFace({ ...quiet, active: true, standing: "offline" as const }, true, all).status)).toBe(LampForm.Off);
   });
 });
 
@@ -1315,14 +1327,14 @@ describe("what the machine serves, in words (rec 2)", () => {
 
 describe("the count line with several executions (W3)", () => {
   it("reads the position after the running count", () => {
-    expect(executionCountText({ runsCount: 2, runsLabel: "running", executions: 2, position: 1 })).toBe("2 running · 1/2");
-    expect(executionCountText({ runsCount: 3, runsLabel: "running", executions: 3, position: 3 })).toBe("3 running · 3/3");
+    expect(executionCountText({ runsCount: 2, executions: 2, position: 1 })).toBe("2 running · 1/2");
+    expect(executionCountText({ runsCount: 3, executions: 3, position: 3 })).toBe("3 running · 3/3");
   });
   it("names the executions when a mission folds them into fewer runs", () => {
-    expect(executionCountText({ runsCount: 1, runsLabel: "running", executions: 9, position: 5 })).toBe("1 run · 5/9 executions");
+    expect(executionCountText({ runsCount: 1, executions: 9, position: 5 })).toBe("1 run · 5/9 executions");
   });
   it("a single execution is the plain count", () => {
-    expect(executionCountText({ runsCount: 1, runsLabel: "running", executions: 1, position: 1 })).toBe("1 running");
+    expect(executionCountText({ runsCount: 1, executions: 1, position: 1 })).toBe("1 running");
   });
 });
 
@@ -1336,42 +1348,57 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
     name: string;
     row: FleetMachine;
     active: boolean;
-    expect: { status: string; reason: string | null };
+    expect: { status: string; word: string; second_line: string | null; reason: string | null };
   }
   const cases = JSON.parse(
     readFileSync(path.join(__dirname, "../../../../tests/fixtures/card-status-rows.json"), "utf8"),
   ) as SharedCase[];
   const answered = { flow: true, presence: true, sessions: true, runs: true };
 
-  /** The card's word as the Rust status vocabulary names it. */
-  function statusName(face: ReturnType<typeof cardFace>): string {
-    if (face.absent) return "offline";
-    if (face.stat === "dispatch in flight") return "running";
-    if (face.notStreaming) return face.stat === "online" ? "online_not_streaming" : "not_streaming";
-    return face.stat;
-  }
-
+  // The VISIBLE words, from the one shared fixture: the status line's word,
+  // the count line's second line and the tooltip. No translation table.
   it.each(cases.map((c) => [c.name, c] as const))("%s", (_name, c) => {
     const standing = rowStanding(c.row);
     // The view-only stand-in for "records reach this viewer": a live beat, or this machine.
     const seen = c.row.is_this_machine || c.row.liveness === "live";
-    const note = outcomeLine(c.row.card);
     const card = {
-      absent: standing === "offline",
       active: c.active,
       runsCount: 0,
       standing,
       availability: machineAvailability({ self: c.row.is_this_machine, seen, standing }),
-      note,
+      note: outcomeLine(c.row.card),
     };
     const face = cardFace(card, false, answered);
-    expect(statusName(face)).toBe(c.expect.status);
-    expect(statusReason(card, face) ?? null).toBe(c.expect.reason);
+    expect(face.status).toBe(c.expect.status);
+    expect(STATUS_WORD[face.status]).toBe(c.expect.word);
+    expect(secondLineOf(face.status)).toBe(c.expect.second_line);
+    expect(statusReason(card.note, face.status) ?? null).toBe(c.expect.reason);
   });
 
   it("the shared rows cover every status the console shows", () => {
     expect(new Set(cases.map((c) => c.expect.status))).toEqual(
       new Set(["idle", "running", "online_not_streaming", "not_streaming", "offline"]),
     );
+  });
+});
+
+describe("shownExecution (#2881, #2886 F6)", () => {
+  const ex = (sessionId: string, state: ExecutionTokenReading["state"], tokensPerSec: number | null = null) =>
+    ({ sessionId, role: "coder", state, tokensPerSec, carried: false }) as ExecutionTokenReading;
+  const execs = [ex("a", "rest"), ex("b", "generating", 40), ex("c", "generating", 10)];
+
+  it("shows the busiest execution when nothing is remembered or pinned", () => {
+    expect(shownExecution(execs, undefined, undefined)).toEqual({ selectedIdx: 1, defaultSid: "b" });
+  });
+  it("keeps the remembered default against a tie, replaces it only when another is strictly busier", () => {
+    expect(shownExecution(execs, "c", undefined)).toEqual({ selectedIdx: 2, defaultSid: "c" });
+    expect(shownExecution(execs, "a", undefined)).toEqual({ selectedIdx: 1, defaultSid: "b" });
+  });
+  it("a pick holds while its execution runs, and falls back to the default once it ends", () => {
+    expect(shownExecution(execs, "b", "a")).toEqual({ selectedIdx: 0, defaultSid: "b" });
+    expect(shownExecution(execs, "b", "gone")).toEqual({ selectedIdx: 1, defaultSid: "b" });
+  });
+  it("shows nothing when nothing runs", () => {
+    expect(shownExecution([], "b", "a")).toEqual({ selectedIdx: -1, defaultSid: null });
   });
 });

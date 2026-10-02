@@ -4,22 +4,18 @@
  * `machActive()` (viewer.html:1315-1322) and `specOf()`
  * (viewer.html:1120-1125).
  *
- * (Playback parity, Change A, 2026-09-24) `liveMode` used to select which of
- * TWO implementations ran: live counted sessions against a live set that
- * describes NOW; replay counted ALL of the day's sessions and labeled them
+ * (Playback parity, Change A, 2026-09-24) The card used to branch on a
+ * live/replay mode: replay counted ALL of the day's sessions and labeled them
  * "specialist(s)" regardless of whether anything was actually running at
  * the playhead — `goldens/playback-date.txt` used to read "48 specialists"
  * at 5% into the day with zero sessions started, where `goldens/fleet.txt`
  * read "0 running" for the live arm of the identical instant (findings #3,
- * #4 in the parity audit). `runsCount`/`runsLabel`/`runningSessionIds`/
- * `liveTokRate`/`liveTokStalled` are now ONE derivation, run over records
- * up to `t` through `runningRuns()` (the lifecycle of each run, with
- * presence as an ADDITIVE input, empty in every real replay call) in BOTH
- * modes: "N running" at the instant the playhead sits on, live or
- * replayed. `liveMode` is kept as a parameter for now (dozens of existing
- * call sites), but nothing in this file's returned `FleetCard` fields reads
- * it any more — it decides nothing here. `machActive` needs the playhead
- * honored for its own "hasn't started yet" guard; see its own doc.
+ * #4 in the parity audit). `runsCount`/`runningSessionIds`/`liveTokRate`/
+ * `liveTokStalled` are now ONE derivation, run over records up to `t`
+ * through `runningRuns()` (the lifecycle of each run, with presence as an
+ * ADDITIVE input, empty in every real replay call): "N running" at the
+ * instant the playhead sits on, live or replayed. `machActive` needs the
+ * playhead honored for its own "hasn't started yet" guard; see its own doc.
  */
 
 import {
@@ -49,7 +45,8 @@ import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
-import { LampForm } from "../../lib/lamp";
+import { CardStatus } from "./cardStatus";
+import { RUNNING_WORD } from "../../components/WorkStatus";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -108,40 +105,6 @@ export function specOf(
  * never why the machine is down (that is the status line's tooltip). */
 export function specDimLabel(card: { specUnknown: SpecUnknownReason | null }): string {
   return specUnknownLabel(card.specUnknown ?? "not-reported");
-}
-
-/** The status word and tooltip for a machine whose flow stream does not reach
- * this hub (`not_streamed`). One mapping, chosen by what the view knows:
- *  - the card was read: the machine answered, so it IS up and only its
- *    activity feed is missing: the status line says "online" and the count
- *    line below it "not streaming";
- *  - the card was not read (and presence did not say offline, which wins
- *    before this is asked): nothing is fresh evidence it is up, so the word
- *    claims no "online" ("not streaming"). */
-function notStreamingStatus(cardRead: boolean): { word: string; secondLine: string | null; reason: string } {
-  return cardRead
-    ? {
-        word: "online",
-        secondLine: "not streaming",
-        reason: "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.",
-      }
-    : {
-        word: "not streaming",
-        secondLine: null,
-        reason: "not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read.",
-      };
-}
-
-/** The status line's tooltip: why it says `offline` or `not streaming`, from
- * the same face the word came from. `undefined` when the word needs no reason
- * (idle, running, a state still loading). `note` is the view's typed reason
- * for a card it could not read; `null` means the card was read. */
-export function statusReason(
-  card: { note: string | null },
-  face: { absent: boolean; notStreaming: boolean },
-): string | undefined {
-  if (face.absent) return `offline: ${card.note ?? "its presence beat stopped"}`;
-  return face.notStreaming ? notStreamingStatus(card.note === null).reason : undefined;
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
@@ -323,14 +286,7 @@ export interface FleetCard {
    *  all. Anything but `known` means a quiet card proves nothing. */
   availability: MachineAvailability;
   active: boolean;
-  absent: boolean;
-  stat: string;
   runsCount: number;
-  /** Always `"running"` (Playback parity, Change A) — the same word at the
-   * same instant, live or replayed. Used to be `liveMode?'running':
-   * 'specialist'+(runs===1?'':'s')` (viewer.html:1713); see this file's own
-   * module doc for why that branch was a parity defect, not a feature. */
-  runsLabel: string;
   /** (#1903) The machine's currently-running FLOW sessions, collapsed to
    * top-level runs — as of `t`, in BOTH modes now (Playback parity, Change
    * A): `runningRuns()` is one algorithm over records up to `t`, with
@@ -428,79 +384,6 @@ export interface FleetCard {
   utility: UtilityStrip;
 }
 
-/** `machPresent()`'s boolean-or-null result, narrowed to "definitely
- * absent" — the only value the fleet card's `stat`/CSS branch reads
- * (`unknown` presence renders the same as "present" for this purpose,
- * matching `absent?'offline':(act?...)`'s two-way branch). */
-export function buildFleetCard(
-  data: NormRecord[],
-  liveMachines: Map<string, PresenceBeat>,
-  specs: MachineSpecsResponse | null,
-  presence: Presence,
-  machAbsent: boolean,
-  m: string,
-  /** (Playback parity, Change A) No longer read by anything this function
-   * RETURNS — kept as a parameter only so the many existing call sites
-   * (live and replay alike) don't all need a positional-argument rewrite.
-   * `runsCount`/`runsLabel`/`runningSessionIds`/`liveTokRate`/
-   * `liveTokStalled` are now ONE derivation over records up to `t` in both
-   * modes; see this module's own doc. */
-  _liveMode: boolean,
-  /** The playhead — `PlaybackLens`'s scrubbable `t` (#1869), pinned to the
-   * day's true max in live mode (there is no scrubber on `/next`'s default
-   * route). Every run's lifecycle is read as of it. */
-  t: number,
-  /** The fleet view's row for this machine, when the view holds one: its
-   * hardware line, status note and standing replace the flow-derived
-   * ones. */
-  row: RowFacts | null = null,
-  /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
-   * own doc for why reading this here is a display-layer join, not a sink
-   * crossing. Defaults to `[]` so every pre-#1923 call site (none of which
-   * has `/runs` data to hand) keeps behaving exactly as before. A replay
-   * caller has no `/runs` fetch to hand either, so this is naturally `[]`
-   * there too — nothing here branches on mode; the data simply isn't
-   * fetched (the one thing mode is still allowed to decide). */
-  machineRuns: Run[] = [],
-  /** (#2886 pass 3, "STALL while disconnected") Whether the PAGE has a
-   * working connection to the daemon right now — read by the caller from
-   * the same liveness source the header renders (`hooks/useLiveTail.ts`'s
-   * `LiveTailStatus`). Defaults to `true` so every existing call site
-   * (tests, and a replay call — see `liveStateWhileConnected`'s own doc for
-   * why disconnection is meaningless there) keeps behaving exactly as
-   * before; `FleetLens.tsx`'s live-mode render is the one caller that
-   * passes the real value. */
-  connected = true,
-  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
-   * race") The last moment the page confirmed contact with the daemon
-   * (`App.tsx`'s `lastContactRef`, sourced from `useLiveTail`'s
-   * `onContact`) — `null` when unknown (tests, a replay call, or a
-   * genuinely never-live route), in which case the half-open check inside
-   * `liveStateWhileConnected` is skipped and only `connected` governs, same
-   * as before this parameter existed. */
-  lastContactMs: number | null = null,
-  /** (#2921 follow-up) The declared roster, so a machine nothing else names
-   *  takes its roster id — the same `displayNameOf` its activity lane uses. */
-  roster: readonly RosterName[] = [],
-  /** (#2928) The live channel's overlay (`lib/liveChannel.ts`), passed by the
-   *  live fleet lens at the live edge only. `null` (every replay, every test
-   *  that does not opt in) derives from durable records exactly as before.
-   *  Merged per execution into the scope's record sets and, for this
-   *  machine only (the channel is local-daemon only), into the utility
-   *  strip. */
-  live: LiveOverlay | null = null,
-  /** The daemon's lifecycle policy (`/runs.policy`). */
-  policy: LifecyclePolicy = DEFAULT_POLICY,
-): FleetCard {
-  return withLiveReadings(
-    buildFleetCardBase(data, liveMachines, specs, presence, machAbsent, m, _liveMode, t, row, machineRuns, roster, policy),
-    t,
-    connected,
-    lastContactMs,
-    live,
-  );
-}
-
 /** What a card says about WHO the machine is and whether it is up. A machine
  * the view holds reads its hardware line, status note and standing
  * from its row; any other (an unverified source, a beating machine nobody
@@ -579,7 +462,6 @@ export function buildFleetCardBase(
   presence: Presence,
   machAbsent: boolean,
   m: string,
-  _liveMode: boolean,
   t: number,
   row: RowFacts | null = null,
   machineRuns: Run[] = [],
@@ -597,7 +479,6 @@ export function buildFleetCardBase(
   const active = flowActive || labRunning > 0;
   const id = cardIdentity(data, liveMachines, specs, machAbsent, m, roster, row);
   const standing = id.standing;
-  const stat = standing === "offline" ? "offline" : active ? "dispatch in flight" : standing === "unknown" ? CHECKING_STAT : "idle";
   // (#2060) `topLevelRuns` collapses a mission's own session together with
   // any of its seat/step dispatches into ONE entry — a mission with one seat
   // running reads "1 running", not "2 running", in both modes.
@@ -672,26 +553,11 @@ export function buildFleetCardBase(
     standing,
     availability: id.availability,
     active,
-    absent: standing === "offline",
-    stat,
     runsCount,
-    // (Playback parity, Change A, finding #3) Always "running" now — a
-    // replayed instant with genuinely running sessions reads the same word
-    // a live viewer would have seen. `liveMode` no longer changes this, and
-    // "running" (a gerund, not a count noun) never pluralizes.
-    runsLabel: "running",
     runningSessionIds,
     liveInputs: { data, runningSids, durableSets, policy, presence, self: id.self, utility: row?.utility ?? utilityReading(false, null) },
   };
 }
-
-/** (#2958) The word a card shows in place of its status until the first
- *  data it is derived from has arrived. */
-const CHECKING_STAT = "checking…";
-
-/** (#2886) The word a running execution's line shows when the page itself
- *  lost the daemon: the machine is running, this page cannot see it. */
-export const DISCONNECTED_STAT = "disconnected";
 
 /** (#2958) Which of a fleet card's sources have answered at least once on
  *  this mount (success or failure; a source this mount never reads counts
@@ -719,22 +585,14 @@ export interface CardSourcesAnswered {
 
 /** (#2958) What a card may say, given what has answered so far. */
 export interface CardFace {
-  /** The status word: "offline", "dispatch in flight", "idle", "checking…",
-   *  or (the stream does not reach this hub) "online" / "not streaming". */
-  stat: string;
-  /** Drawn as offline (dimmed card, powered-off tube). */
-  absent: boolean;
+  /** The status line's one fact; `STATUS_WORD`, `lampOf`, `statusReason` and
+   *  `secondLineOf` say everything else about it. */
+  status: CardStatus;
   /** Drawn as active. */
   active: boolean;
   /** The word is neither idle nor a reading nor offline (the card reads as
    *  having no reading). */
   noSignal: boolean;
-  /** The status lamp's form, from the same inputs as `stat`: `lampFormOf`. */
-  lamp: LampForm;
-  /** The word is one of the not-streaming forms. */
-  notStreaming: boolean;
-  /** Replaces the running-count line ("N running" / "—"); `null` keeps it. */
-  secondLine: string | null;
   /** The tube: a live execution's reading, the idle tube, the powered-off
    *  screen of an offline machine, or no-signal static. */
   tube: "reading" | "idle" | "off" | "nosignal";
@@ -754,33 +612,14 @@ function isNotStreaming(f: { absent: boolean; active: boolean; seen: boolean; un
   return f.answered && (!f.seen || f.undecided) && !f.absent && !f.active;
 }
 
-/** The card's status word, in precedence order: offline, then work a `/runs`
- * row proves, then the not-streaming forms, then idle, else "checking…". */
-function statusWord(f: { absent: boolean; active: boolean; notStreaming: boolean; idleKnown: boolean; cardRead: boolean }): string {
-  if (f.absent) return "offline";
-  if (f.active) return "dispatch in flight";
-  if (f.notStreaming) return notStreamingStatus(f.cardRead).word;
-  return f.idleKnown ? "idle" : CHECKING_STAT;
+/** The card's status, in precedence order: offline, then work a `/runs` row
+ * proves, then the not-streaming forms, then idle, else checking. */
+function statusOf(f: { absent: boolean; active: boolean; notStreaming: boolean; idleKnown: boolean; cardRead: boolean }): CardStatus {
+  if (f.absent) return CardStatus.Offline;
+  if (f.active) return CardStatus.Running;
+  if (f.notStreaming) return f.cardRead ? CardStatus.OnlineNotStreaming : CardStatus.NotStreaming;
+  return f.idleKnown ? CardStatus.Idle : CardStatus.Checking;
 }
-
-/** The status lamp's form (#3030), from the same inputs and in the same
- * precedence as `statusWord`: offline is dim filled, work a record or a
- * `/runs` row proves is filled, idle (proven quiet) is hollow, and every other
- * word (the not-streaming forms, whose machine is never `idleKnown`, and
- * "checking…") says the viewer has no reading, so it is dashed. A live
- * execution's reading rides `active`, so it is filled too. */
-function lampFormOf(f: { absent: boolean; active: boolean; idleKnown: boolean }): LampForm {
-  if (f.absent) return LampForm.Off;
-  if (f.active) return LampForm.Filled;
-  return f.idleKnown ? LampForm.Hollow : LampForm.Dashed;
-}
-
-/** The status line's tooltip while the page is disconnected. */
-export const DISCONNECTED_REASON = "disconnected: this page lost its daemon";
-
-/** The lamp beside "disconnected": the page lost the daemon, so there is no
- * reading, whatever the card's last records said. */
-export const DISCONNECTED_LAMP = LampForm.Dashed;
 
 /** (#2958) A POSITIVE reading shows as soon as the source that produced it
  *  has it; a NEGATIVE claim waits until every source that could contradict
@@ -805,7 +644,7 @@ export const DISCONNECTED_LAMP = LampForm.Dashed;
  *    source of utility jobs.
  *  Until then the card says "checking…", in the same boxes. */
 export function cardFace(
-  card: { absent: boolean; active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability; note: string | null },
+  card: { active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability; note: string | null },
   hasReading: boolean,
   answered: CardSourcesAnswered,
 ): CardFace {
@@ -814,27 +653,24 @@ export function cardFace(
   const seen = card.availability === "known";
   const all = seen && everySourceAnswered(answered);
   const offlineKnown = answered.flow && answered.presence;
-  const absent = card.absent && offlineKnown;
+  const absent = card.standing === "offline" && offlineKnown;
   const active = card.active && !absent;
   const idleKnown = all && card.standing === "online";
   // Once presence and flow have answered, a machine whose stream does not
   // reach this hub says so rather than still "checking…".
   const notStreaming = isNotStreaming({ absent, active: card.active, seen, undecided: card.standing === "unknown", answered: offlineKnown });
-  const cardRead = card.note === null;
-  const stat = statusWord({ absent, active: card.active, notStreaming, idleKnown, cardRead });
+  const status = statusOf({ absent, active: card.active, notStreaming, idleKnown, cardRead: card.note === null });
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
   const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : "nosignal";
   return {
-    stat,
-    absent,
+    status,
     active,
     noSignal: !absent && !card.active && !idleKnown,
-    lamp: lampFormOf({ absent, active: card.active, idleKnown }),
-    notStreaming,
-    secondLine: notStreaming ? notStreamingStatus(cardRead).secondLine : null,
     tube,
-    countShown: card.runsCount > 0 || all,
+    // A card whose standing is unknown has no reading to count from: its
+    // quiet "0 running" would be a claim nothing backs.
+    countShown: card.runsCount > 0 || (all && card.standing !== "unknown"),
     utilityQuietKnown: answered.flow && seen,
   };
 }
@@ -958,6 +794,27 @@ export function withLiveReadings(
   };
 }
 
+/** (#2881) The execution a card's tube shows. `execs` is sorted by session id,
+ *  which IS the pager's page order. The user's pick (`pinnedSid`) holds while
+ *  it is still among `execs`; otherwise the auto default, which is sticky
+ *  (#2886 pass 5, F6): it keeps what was shown last render (`stickySid`)
+ *  unless that execution is gone or another is STRICTLY busier by state class,
+ *  so a flapping tie never reshuffles the page. `defaultSid` is the auto
+ *  default the caller remembers for the next render. */
+export function shownExecution(
+  execs: ExecutionTokenReading[],
+  stickySid: string | undefined,
+  pinnedSid: string | undefined,
+): { selectedIdx: number; defaultSid: string | null } {
+  const sticky = stickySid != null ? execs.find((e) => e.sessionId === stickySid) : undefined;
+  const busiest = busiestExecution(execs);
+  const keepSticky = sticky != null && busiest != null && !isStrictlyBusier(busiest, sticky);
+  const defaultSid = keepSticky ? sticky.sessionId : (busiest?.sessionId ?? null);
+  const pinned = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid);
+  const selectedSid = pinned ? pinnedSid : defaultSid;
+  return { selectedIdx: selectedSid != null ? execs.findIndex((e) => e.sessionId === selectedSid) : -1, defaultSid };
+}
+
 /** (5.0 R3) The names of the machines whose records never reach this viewer. */
 export function notStreamedNames(cards: readonly Pick<FleetCard, "name" | "availability">[]): string[] {
   return cards.flatMap((c) => (c.availability === "not_streamed" ? [c.name] : []));
@@ -990,8 +847,8 @@ export function servesLine(profiles: number, radio: boolean): string {
  * mission folds its seats into fewer runs it names the executions
  * ("1 run · 5/9 executions"), since nine pages under one "running" would read
  * as a bug. */
-export function executionCountText(f: { runsCount: number; runsLabel: string; executions: number; position: number }): string {
-  if (f.executions < 2) return `${f.runsCount} ${f.runsLabel}`;
-  if (f.runsCount === f.executions) return `${f.runsCount} ${f.runsLabel} · ${f.position}/${f.executions}`;
+export function executionCountText(f: { runsCount: number; executions: number; position: number }): string {
+  if (f.executions < 2) return `${f.runsCount} ${RUNNING_WORD}`;
+  if (f.runsCount === f.executions) return `${f.runsCount} ${RUNNING_WORD} · ${f.position}/${f.executions}`;
   return `${f.runsCount} ${f.runsCount === 1 ? "run" : "runs"} · ${f.position}/${f.executions} executions`;
 }

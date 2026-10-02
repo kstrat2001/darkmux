@@ -86,11 +86,11 @@ describe("buildActivityTimeline — lanes and bars", () => {
     expect(bar.title).toContain("complete");
   });
 
-  it("classifies a watchdog-killed dispatch.error (exit 137) as 'error'/killed", () => {
+  it("classifies a watchdog-killed dispatch.error (exit 137) as 'error'", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s3")!;
     expect(bar.status).toBe("error");
-    expect(bar.title).toContain("killed");
+    expect(bar.title).toContain("error");
   });
 
   it("classifies an abandoned session (session.end, no dispatch terminal) as the canonical 'abandoned'", () => {

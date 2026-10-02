@@ -42,7 +42,7 @@ describe("a later mission's wait is not closed by an earlier mission's stop", ()
   const t = t0 + 3600_000;
 
   it("the fleet card reads REST budget · azure", () => {
-    const card = withLiveReadings(buildFleetCardBase(data, new Map(), null, new Set(), false, "M", false, t), t);
+    const card = withLiveReadings(buildFleetCardBase(data, new Map(), null, new Set(), false, "M", t), t);
     expect(card.liveTokState).toBe("rest");
   });
 

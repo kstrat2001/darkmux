@@ -1,9 +1,4 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
-import { queryKeys } from "../../lib/queryKeys";
-import type { SelfIdentity } from "../../lib/machineIdentity";
-import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 
 /** How long the cards wait for the fleet view before laying out in key order
  *  anyway. The view is cached daemon-side and normally answers in tens of
@@ -23,32 +18,14 @@ function useOrderWait(ms: number): boolean {
 }
 
 /**
- * Who this machine is for ORDERING the cards, and whether their order is final.
+ * Whether the cards' order is final.
  *
- * `orderSelf` is known before the fleet view answers. The view gathers every
- * peer's card (a slow peer can hold it for seconds), while `/machine/specs` is
- * the daemon's own hardware probe, read by the app shell into this cache slot;
- * a disabled observer here reads it without a second fetch. The view's own
- * self row (`viewSelf`) wins once it lands. Live only: a replay describes a
- * past day.
- *
- * The cards are laid out only once their order is final: when the view has
- * answered, when this machine is already known from the shell's specs (self is
- * first from the first paint), or after `ORDER_WAIT_MS`. Until then the grid
- * keeps the cards' boxes, unpainted (`.fleet[data-order="pending"]`), so
- * nothing moves under the operator's eye and the page does not change size.
+ * The cards are laid out only once their names are settled: when the fleet
+ * view has answered, or after `ORDER_WAIT_MS`. Until then the grid keeps the
+ * cards' boxes, unpainted (`.fleet[data-order="pending"]`), so nothing moves
+ * under the operator's eye and the page does not change size.
  */
-export function useCardOrderGate(
-  liveMode: boolean,
-  viewSelf: SelfIdentity | null,
-  viewAnswered: boolean,
-): { orderSelf: SelfIdentity | null; orderState: "pending" | "final" } {
-  const state = useQuery({
-    enabled: false,
-    queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
-  });
+export function useCardOrderGate(viewAnswered: boolean): "pending" | "final" {
   const waited = useOrderWait(ORDER_WAIT_MS);
-  const shell = liveMode && state.data?.ok ? state.data.data : null;
-  return { orderSelf: viewSelf ?? shell, orderState: !viewAnswered && !shell?.machine_uid && !waited ? "pending" : "final" };
+  return viewAnswered || waited ? "final" : "pending";
 }

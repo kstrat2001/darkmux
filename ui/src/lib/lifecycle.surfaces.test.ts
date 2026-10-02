@@ -5,7 +5,7 @@
 // is in flight, and the timeline bar and the pill on how it ended.
 process.env.TZ = "UTC";
 import { describe, expect, it } from "vitest";
-import { buildFleetCard } from "../lenses/fleet/cards";
+import { buildFleetCard } from "../testing/fleetCard";
 import { buildActivityTimeline } from "../lenses/fleet/timeline";
 import { runRegions } from "../lenses/session/sessionRun";
 import { flowToRenderModel } from "./flow";
@@ -30,7 +30,7 @@ const STALE_S = DEFAULT_POLICY.staleAfterMs / 1000;
 
 /** What each surface says about the run on `sid` at `t`. */
 function surfaces(data: NormRecord[], sid: string, t: number) {
-  const card = buildFleetCard(data, new Map(), null, new Set(), false, U, false, t);
+  const card = buildFleetCard(data, new Map(), null, new Set(), false, U, t);
   const bars = buildActivityTimeline(data, new Map(), [U], new Set(), t, t, 1440).lanes[0].bars.filter((b) => b.sid === sid);
   // The run page is handed its records cut at the playhead (SessionReplay).
   const view = runRegions(flowToRenderModel(recordsAsOf(data, t)), sid, t);
@@ -97,7 +97,7 @@ describe("every surface states the same lifecycle (the PR 4 promise)", () => {
     expect(expectAgreement(data, "s1", t, "shared").phase).toBe("open");
     const bars = buildActivityTimeline(data, new Map(), [U], new Set(), t, t, 1440).lanes[0].bars;
     expect(bars.map((b) => b.status)).toEqual(["complete", "running"]);
-    expect(buildFleetCard(data, new Map(), null, new Set(), false, U, false, t).runsCount).toBe(1);
+    expect(buildFleetCard(data, new Map(), null, new Set(), false, U, t).runsCount).toBe(1);
   });
 });
 

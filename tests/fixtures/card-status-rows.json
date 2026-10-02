@@ -75,6 +75,8 @@
   "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  },
@@ -154,6 +156,8 @@
   "active": true,
   "expect": {
    "status": "running",
+   "word": "dispatch in flight",
+   "second_line": null,
    "reason": null
   }
  },
@@ -233,6 +237,8 @@
   "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  },
@@ -312,6 +318,8 @@
   "active": true,
   "expect": {
    "status": "running",
+   "word": "dispatch in flight",
+   "second_line": null,
    "reason": null
   }
  },
@@ -391,7 +399,9 @@
   "active": false,
   "expect": {
    "status": "online_not_streaming",
-   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+   "word": "online",
+   "second_line": "not streaming",
+   "reason": "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
   }
  },
  {
@@ -462,7 +472,9 @@
   "active": false,
   "expect": {
    "status": "online_not_streaming",
-   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+   "word": "online",
+   "second_line": "not streaming",
+   "reason": "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
   }
  },
  {
@@ -492,6 +504,8 @@
   "active": false,
   "expect": {
    "status": "offline",
+   "word": "offline",
+   "second_line": null,
    "reason": "offline: not listening"
   }
  },
@@ -521,6 +535,8 @@
   "active": false,
   "expect": {
    "status": "offline",
+   "word": "offline",
+   "second_line": null,
    "reason": "offline: another machine answered"
   }
  },
@@ -551,7 +567,9 @@
   "active": false,
   "expect": {
    "status": "not_streaming",
-   "reason": "not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read."
+   "word": "not streaming",
+   "second_line": null,
+   "reason": "not streaming: not listening"
   }
  },
  {
@@ -582,6 +600,8 @@
   "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  }
