@@ -353,8 +353,8 @@ const STATES = [
 ];
 
 /** (#2955 review) Two executions generating on the fixture machine: the
- *  fleet card's pager state ("‹ 1/2 coder ›"). Not in `STATES`: the run page
- *  suite measures one execution, and only the fleet card has a pager. */
+ *  fleet card's paged state ("2 running · 1/2"). Not in `STATES`: the run page
+ *  suite measures one execution, and only the fleet card pages them. */
 const MULTI = {
   id: "multi-exec",
   date: "2026-07-10",
@@ -493,11 +493,11 @@ const PEER_ROW = viewRow(
     accepts: { state: "granted", accepts: { peer_name: MACHINE.machine_id, profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
   },
 );
-PEER_ROW.card.card.serves_radio = true; // the card's own statement: the icon never reads `accepts`
-PEER_ROW.card.card.serves_profiles = 12; // two digits: the widest count a name row is likely to carry
+PEER_ROW.card.card.serves_radio = true; // the card's own statement: the serves line never reads `accepts`
+PEER_ROW.card.card.serves_profiles = 12; // two digits: the widest count the serves line is likely to carry
 
-/** A read peer whose card states one icon (profiles served), and one that states
- *  neither: with PEER_ROW (both), the three name-row icon states. */
+/** A read peer whose card states one thing it serves (profiles), and one that
+ *  states neither: with PEER_ROW (both), the three serves-line states. */
 const ONE_ICON_ROW = viewRow(
   { machine_id: "layout-one-icon", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
   { entry: { id: "layout-one-icon", address: "100.64.0.9:8765", added_unix_ms: 1 }, liveness: "no_beat" },

@@ -49,6 +49,7 @@ import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
+import { LampForm } from "../../lib/lamp";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -242,7 +243,7 @@ export type SpecUnknownReason = "not-reported" | "not-seen";
  * apart. `not-reported` is verbatim the legacy string (viewer.html's
  * `specdim` fallback). */
 export function specUnknownLabel(reason: SpecUnknownReason): string {
-  return reason === "not-seen" ? "hardware unknown — nothing received" : "hardware not reported";
+  return reason === "not-seen" ? "hardware unknown (nothing received)" : "hardware not reported";
 }
 
 /** (#2881) The pager's default page when the operator hasn't picked one:
@@ -725,9 +726,11 @@ export interface CardFace {
   absent: boolean;
   /** Drawn as active. */
   active: boolean;
-  /** The word is neither idle nor a reading nor offline (the dot takes the
-   *  no-reading gray). */
+  /** The word is neither idle nor a reading nor offline (the card reads as
+   *  having no reading). */
   noSignal: boolean;
+  /** The status lamp's form, from the same inputs as `stat`: `lampFormOf`. */
+  lamp: LampForm;
   /** The word is one of the not-streaming forms. */
   notStreaming: boolean;
   /** Replaces the running-count line ("N running" / "—"); `null` keeps it. */
@@ -759,6 +762,25 @@ function statusWord(f: { absent: boolean; active: boolean; notStreaming: boolean
   if (f.notStreaming) return notStreamingStatus(f.cardRead).word;
   return f.idleKnown ? "idle" : CHECKING_STAT;
 }
+
+/** The status lamp's form (#3030), from the same inputs and in the same
+ * precedence as `statusWord`: offline is dim filled, work a record or a
+ * `/runs` row proves is filled, idle (proven quiet) is hollow, and every other
+ * word (the not-streaming forms, whose machine is never `idleKnown`, and
+ * "checking…") says the viewer has no reading, so it is dashed. A live
+ * execution's reading rides `active`, so it is filled too. */
+function lampFormOf(f: { absent: boolean; active: boolean; idleKnown: boolean }): LampForm {
+  if (f.absent) return LampForm.Off;
+  if (f.active) return LampForm.Filled;
+  return f.idleKnown ? LampForm.Hollow : LampForm.Dashed;
+}
+
+/** The status line's tooltip while the page is disconnected. */
+export const DISCONNECTED_REASON = "disconnected: this page lost its daemon";
+
+/** The lamp beside "disconnected": the page lost the daemon, so there is no
+ * reading, whatever the card's last records said. */
+export const DISCONNECTED_LAMP = LampForm.Dashed;
 
 /** (#2958) A POSITIVE reading shows as soon as the source that produced it
  *  has it; a NEGATIVE claim waits until every source that could contradict
@@ -808,6 +830,7 @@ export function cardFace(
     absent,
     active,
     noSignal: !absent && !card.active && !idleKnown,
+    lamp: lampFormOf({ absent, active: card.active, idleKnown }),
     notStreaming,
     secondLine: notStreaming ? notStreamingStatus(cardRead).secondLine : null,
     tube,
@@ -938,4 +961,37 @@ export function withLiveReadings(
 /** (5.0 R3) The names of the machines whose records never reach this viewer. */
 export function notStreamedNames(cards: readonly Pick<FleetCard, "name" | "availability">[]): string[] {
   return cards.flatMap((c) => (c.availability === "not_streamed" ? [c.name] : []));
+}
+
+/** One thing a machine serves, as the card's serves line names it. */
+export interface ServesPart {
+  kind: "profiles" | "radio";
+  text: string;
+}
+
+/** What the machine's own card says it serves, as words: profiles (with the
+ * count) then radio. Empty for a machine that serves nothing or does not say. */
+export function servesParts(profiles: number, radio: boolean): ServesPart[] {
+  const parts: ServesPart[] = [];
+  if (profiles > 0) parts.push({ kind: "profiles", text: `${profiles} ${profiles === 1 ? "profile" : "profiles"}` });
+  if (radio) parts.push({ kind: "radio", text: "radio" });
+  return parts;
+}
+
+/** The serves line's whole text: "serves 3 profiles · radio", or "" when there
+ * is nothing to say (the line keeps its height regardless). */
+export function servesLine(profiles: number, radio: boolean): string {
+  const parts = servesParts(profiles, radio);
+  return parts.length ? `serves ${parts.map((p) => p.text).join(" · ")}` : "";
+}
+
+/** The count line. With one execution it is the plain count; with several it
+ * ends in the shown execution's position ("2 running · 1/2"), and when a
+ * mission folds its seats into fewer runs it names the executions
+ * ("1 run · 5/9 executions"), since nine pages under one "running" would read
+ * as a bug. */
+export function executionCountText(f: { runsCount: number; runsLabel: string; executions: number; position: number }): string {
+  if (f.executions < 2) return `${f.runsCount} ${f.runsLabel}`;
+  if (f.runsCount === f.executions) return `${f.runsCount} ${f.runsLabel} · ${f.position}/${f.executions}`;
+  return `${f.runsCount} ${f.runsCount === 1 ? "run" : "runs"} · ${f.position}/${f.executions} executions`;
 }

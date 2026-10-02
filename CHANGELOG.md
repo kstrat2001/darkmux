@@ -1407,15 +1407,30 @@ darkmux release.
 - **A fleet card shows only facts about its own machine; the console names the
   machine it runs on.** The grant line ("runs fast") is gone from the fleet
   cards: what a peer lets the serving machine do is a relationship, not a card
-  fact, and the same fleet must read the same from any server. The radio icon
-  stays, now meaning "serves radio", and a layers icon with a count joins it
-  for the profiles the machine serves. The machine card (schema 1.2) carries
+  fact, and the same fleet must read the same from any server. A line under the
+  count says, in words, what the machine serves ("serves 3 profiles · radio").
+  The machine card (schema 1.2) carries
   `serves_radio` (its `fleet.accept_work` grants `radio-host` to at least one
   peer) and `serves_profiles` (how many distinct work-class profiles of its
   registry the allow-list grants to at least one peer); neither names who, and a
-  1.1 card states nothing and draws no icon. `/fleet/view`'s `accepts` is unchanged, for `machine list` and
+  1.1 card states nothing and its serves line is empty. `/fleet/view`'s `accepts` is unchanged, for `machine list` and
   `profile list`. The console's command line now reads `<machine> $ darkmux ...`,
   naming the machine the daemon runs the command on.
+
+- **The fleet machine card, read at a glance and the same size in every state.**
+  The status dot is a lamp whose form says what the viewer knows: filled for
+  proven work, a ring for proven quiet (idle), dashed for no reading (checking…,
+  not streaming, online with no stream, disconnected), dim for offline; while a
+  reading is on the line the lamp takes its color, as the run page's lamps do
+  (one shared component). What the machine serves is a fixed line in words under
+  the count, shown on a phone too. On a desktop the readout is centered on the
+  tube's axis and the tube's center word is larger; on a phone the robot sits on
+  the card's content edge. "not streaming" and the placeholder dash read dim,
+  and the hardware line of a machine nothing has arrived from reads "hardware
+  unknown (nothing received)".
+  With two or more executions the count line reads "2 running · 1/2" and
+  tapping the tube shows the next one; the pager row, which made that card
+  taller, is gone.
 
 - **`darkmux profile list --machine <peer>` and `--remote` list the profiles a
   peer lets this machine use.** `--machine <peer>` prints each profile the

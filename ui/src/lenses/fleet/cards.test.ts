@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason, servesLine, servesParts, DISCONNECTED_LAMP, executionCountText } from "./cards";
+import { LampForm } from "../../lib/lamp";
 import type { RowFacts } from "./viewRows";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -817,7 +818,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
     const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio-2", true, T);
     expect(card.spec).toBe("");
     expect(card.specUnknown).toBe("not-seen");
-    expect(specUnknownLabel(card.specUnknown!)).toBe("hardware unknown — nothing received");
+    expect(specUnknownLabel(card.specUnknown!)).toBe("hardware unknown (nothing received)");
   });
 
   it("a machine WITH hardware reports no unknown at all", () => {
@@ -1252,5 +1253,60 @@ describe("card availability (5.0 R3, #3012)", () => {
   it("a seen peer whose card says offline is not_reporting", () => {
     const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", standing: "offline" }));
     expect(c.availability).toBe("not_reporting");
+  });
+});
+
+describe("the status lamp's form (rec 1)", () => {
+  const none = { flow: false, presence: false, sessions: false, runs: false };
+  const all = { flow: true, presence: true, sessions: true, runs: true };
+  const quiet = { absent: false, active: false, runsCount: 0, standing: "online" as const, availability: "known" as const, note: null };
+
+  it("proven work is filled", () => {
+    expect(cardFace({ ...quiet, active: true, runsCount: 1 }, false, all).lamp).toBe(LampForm.Filled);
+    expect(cardFace({ ...quiet, active: true, runsCount: 2 }, true, all).lamp).toBe(LampForm.Filled);
+  });
+  it("proven quiet is hollow", () => {
+    expect(cardFace(quiet, false, all).lamp).toBe(LampForm.Hollow);
+  });
+  it("no reading is dashed: checking, not streaming (read or unread card)", () => {
+    expect(cardFace(quiet, false, none).lamp).toBe(LampForm.Dashed);
+    expect(cardFace({ ...quiet, availability: "not_streamed" as const }, false, all)).toMatchObject({ stat: "online", lamp: LampForm.Dashed });
+    expect(cardFace({ ...quiet, availability: "not_streamed" as const, note: "not listening" }, false, all)).toMatchObject({ stat: "not streaming", lamp: LampForm.Dashed });
+    expect(DISCONNECTED_LAMP).toBe(LampForm.Dashed);
+  });
+  it("offline is dim filled", () => {
+    expect(cardFace({ ...quiet, absent: true, standing: "offline" as const }, false, all).lamp).toBe(LampForm.Off);
+  });
+  it("offline wins over work, as the status word does", () => {
+    expect(cardFace({ ...quiet, absent: true, active: true, standing: "offline" as const }, true, all).lamp).toBe(LampForm.Off);
+  });
+});
+
+describe("what the machine serves, in words (rec 2)", () => {
+  it("names the profile count and radio", () => {
+    expect(servesLine(3, true)).toBe("serves 3 profiles · radio");
+    expect(servesLine(0, true)).toBe("serves radio");
+    expect(servesLine(1, false)).toBe("serves 1 profile");
+    expect(servesLine(12, false)).toBe("serves 12 profiles");
+  });
+  it("is empty when the machine serves nothing or does not say", () => {
+    expect(servesLine(0, false)).toBe("");
+    expect(servesParts(0, false)).toEqual([]);
+  });
+  it("parts carry the tooltips' subject", () => {
+    expect(servesParts(1, true)).toEqual([{ kind: "profiles", text: "1 profile" }, { kind: "radio", text: "radio" }]);
+  });
+});
+
+describe("the count line with several executions (W3)", () => {
+  it("reads the position after the running count", () => {
+    expect(executionCountText({ runsCount: 2, runsLabel: "running", executions: 2, position: 1 })).toBe("2 running · 1/2");
+    expect(executionCountText({ runsCount: 3, runsLabel: "running", executions: 3, position: 3 })).toBe("3 running · 3/3");
+  });
+  it("names the executions when a mission folds them into fewer runs", () => {
+    expect(executionCountText({ runsCount: 1, runsLabel: "running", executions: 9, position: 5 })).toBe("1 run · 5/9 executions");
+  });
+  it("a single execution is the plain count", () => {
+    expect(executionCountText({ runsCount: 1, runsLabel: "running", executions: 1, position: 1 })).toBe("1 running");
   });
 });

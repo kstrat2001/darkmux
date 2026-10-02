@@ -1,6 +1,8 @@
 import { scopeCenter } from "../../lib/scopeCenter";
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
+import { LampDot } from "../../components/LampDot";
+import { LampForm } from "../../lib/lamp";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
@@ -125,7 +127,7 @@ export function ScopeLamps({
         const thinking = on && state === "generating" && reading.thinking === true;
         return (
           <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"} data-thinking={thinking ? "true" : undefined}>
-            <span className="scope-lamp__dot" aria-hidden="true" />
+            <LampDot form={on ? LampForm.Filled : LampForm.Off} />
             {/* Only the lit lamp shows its word; the rest read as dots, so
                 the row stays one line in a narrow tile (operator, 2026-09-24:
                 "the lights are too big, taking too much space"). The text
