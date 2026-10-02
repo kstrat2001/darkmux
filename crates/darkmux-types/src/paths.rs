@@ -180,22 +180,40 @@ pub fn resume_origin_record_path(out_dir: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{name}{RESUME_ORIGIN_SUFFIX}")))
 }
 
-/// Remove an out-dir AND its sibling resume-origin record, so no orphaned
-/// record outlives its directory. Every darkmux path that removes a dispatch
-/// out-dir goes through here. A missing record is fine.
+/// Suffix of a dispatch out-dir's execution lock file. Like the resume-origin
+/// record it sits BESIDE the out-dir, never inside the directory the
+/// container mounts read-write: a model must not be able to delete or
+/// replace the file whose lock keeps a second resume out.
+pub const EXECUTION_LOCK_SUFFIX: &str = ".execution.lock";
+
+/// The execution lock file for `out_dir`: the one place the path is derived.
+/// `None` when `out_dir` has no name to derive from.
+pub fn execution_lock_path(out_dir: &Path) -> Option<PathBuf> {
+    let parent = out_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = out_dir.file_name()?.to_str()?;
+    Some(parent.join(format!("{name}{EXECUTION_LOCK_SUFFIX}")))
+}
+
+/// Remove an out-dir AND its sibling resume-origin record and execution lock
+/// file, so no orphaned sibling outlives its directory. Every darkmux path
+/// that removes a dispatch out-dir goes through here. A missing sibling is
+/// fine.
 pub fn remove_out_dir(dir: &Path) -> std::io::Result<()> {
     let result = std::fs::remove_dir_all(dir);
-    if let Some(record) = resume_origin_record_path(dir) {
-        let _ = std::fs::remove_file(record);
+    for sibling in [resume_origin_record_path(dir), execution_lock_path(dir)].into_iter().flatten() {
+        let _ = std::fs::remove_file(sibling);
     }
     result
 }
 
-/// Whether `name` (a directory-entry name) is a resume-origin record whose
-/// out-dir no longer exists in `parent`: an orphan `darkmux doctor` counts.
+/// Whether `name` (a directory-entry name) is a resume-origin record or an
+/// execution lock file whose out-dir no longer exists in `parent`: an orphan
+/// `darkmux doctor` counts.
 pub fn is_orphaned_resume_origin(parent: &Path, name: &str) -> bool {
-    name.strip_suffix(RESUME_ORIGIN_SUFFIX)
-        .is_some_and(|stem| !stem.is_empty() && !parent.join(stem).is_dir())
+    [RESUME_ORIGIN_SUFFIX, EXECUTION_LOCK_SUFFIX]
+        .iter()
+        .filter_map(|suffix| name.strip_suffix(suffix))
+        .any(|stem| !stem.is_empty() && !parent.join(stem).is_dir())
 }
 
 /// What a `<repo>/.darkmux/` directory legitimately holds: the files darkmux

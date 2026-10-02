@@ -1270,6 +1270,93 @@ pub(crate) fn resume_effective_image(
     }
 }
 
+/// Holds one execution's exclusive lock for as long as it lives (released
+/// on drop, and by the kernel if the process dies).
+pub(crate) struct ExecutionLock {
+    _guards: Vec<darkmux_types::flock::FlockGuard>,
+}
+
+/// Take the non-blocking exclusive lock on `out_dir`'s execution lock file.
+/// `Ok(None)` when another live dispatch or resume holds it.
+fn try_lock_out_dir(out_dir: &Path) -> Result<Option<darkmux_types::flock::FlockGuard>> {
+    let path = darkmux_types::paths::execution_lock_path(out_dir)
+        .ok_or_else(|| anyhow!("{} has no name to derive an execution lock path from", out_dir.display()))?;
+    darkmux_types::flock::try_lock_exclusive(&path)
+}
+
+/// One live execution per out-dir. A dispatch holds its own out-dir's lock
+/// for its whole life; a resume additionally holds its ORIGIN's, taken here
+/// before any image or model work. Without it, the original (or another
+/// resume) and a resume ran side by side on one execution id and one
+/// workspace. Refuses, naming the live execution, when the origin is held;
+/// refuses when the origin's execution already ended in success, since a
+/// completed execution has nothing to resume. A dispatch that ended any
+/// other way (interrupted, error, killed) released its lock and may be
+/// resumed again, in sequence.
+pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
+    let named = recorded_execution(resume_from)
+        .map_or("an execution".to_string(), |id| format!("execution {}", id.as_str()));
+    if resume_origin_completed(resume_from) {
+        bail_resume!(
+            "darkmux dispatch: RESUME ALREADY COMPLETED — {named} (out-dir {}) already ended in \
+             success; there is nothing left to resume",
+            resume_from.display()
+        );
+    }
+    match try_lock_out_dir(resume_from).context("locking the resume origin")? {
+        Some(guard) => Ok(ExecutionLock { _guards: vec![guard] }),
+        None => bail_resume!(
+            "darkmux dispatch: RESUME REFUSED — {named} (out-dir {}) is still running; a second \
+             run would share its execution id and workspace. Wait for it to end (or stop it), then \
+             resume",
+            resume_from.display()
+        ),
+    }
+}
+
+/// Take `host_out`'s own execution lock into `held`, so a resume of THIS
+/// dispatch is refused while it runs. The out-dir is fresh and named by this
+/// dispatch alone, so contention here means something else is wrong: refuse
+/// rather than run unlocked.
+pub(crate) fn hold_own_execution_lock(held: &mut ExecutionLock, host_out: &Path) -> Result<()> {
+    match try_lock_out_dir(host_out).context("locking this execution")? {
+        Some(guard) => {
+            held._guards.push(guard);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "darkmux dispatch: the execution lock for {} is already held by another process",
+            host_out.display()
+        )),
+    }
+}
+
+/// Record, in each of `out_dirs`' host-only origin records, that the
+/// execution ended in success: a later `--resume-from` any of them is
+/// refused ([`claim_resume_origin`]). Best effort: a record that cannot be
+/// read or rewritten leaves that dir resumable, which is the pre-existing
+/// behavior and never a wrong refusal.
+pub(crate) fn mark_execution_completed(out_dirs: &[&Path]) {
+    for dir in out_dirs {
+        let path = resume_origin_path(dir);
+        let Ok(raw) = read_resume_origin(dir) else { continue };
+        let Ok(mut origin) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let Some(obj) = origin.as_object_mut() else { continue };
+        obj.insert("completed".to_string(), serde_json::Value::Bool(true));
+        if let Ok(bytes) = serde_json::to_vec_pretty(&origin) {
+            let _ = write_private_no_follow(&path, &bytes);
+        }
+    }
+}
+
+fn resume_origin_completed(out_dir: &Path) -> bool {
+    read_resume_origin(out_dir)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|origin| origin.get("completed").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
 /// (#2774 review F2) Build tier 4's `resume_hint` — the command an
 /// operator reads at 3am and pastes — so that it is a command darkmux will
 /// actually ACCEPT.
@@ -5407,6 +5494,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .context("darkmux dispatch --resume-from")?,
         None => opts.image.clone(),
     };
+    //
+    // And it is the only live execution of that origin ([`claim_resume_origin`]);
+    // the lock is held, with this dispatch's own, until the function returns.
+    let mut execution_lock = match opts.resume_from.as_deref() {
+        Some(resume_from) => claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?,
+        None => ExecutionLock { _guards: Vec::new() },
+    };
     let inject = image_arg
         .as_deref()
         .is_some_and(|img| !is_darkmux_runtime_image(img));
@@ -5802,6 +5896,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
     write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, image_arg.as_deref(), &execution);
+    hold_own_execution_lock(&mut execution_lock, &host_out)?;
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -6853,6 +6948,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace for inspection (status quo). Only error/panic exits BEFORE
     // this point reclaim it.
     workspace_cleanup.disarm();
+    // A clean exit completes the execution: a resume of this out-dir, or of
+    // the one this resumed, is refused from here on.
+    if exit_code == 0 {
+        let origins: Vec<&Path> = std::iter::once(host_out.as_path()).chain(opts.resume_from.as_deref()).collect();
+        mark_execution_completed(&origins);
+    }
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the

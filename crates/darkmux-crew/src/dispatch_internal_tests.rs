@@ -5597,6 +5597,104 @@
         assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
     }
 
+    /// An origin dir with a recorded execution, as a finished dispatch left it.
+    fn origin_dir() -> (TempDir, TempDir, ExecutionId) {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        let minted = ExecutionId::mint();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &minted);
+        (ws, prior, minted)
+    }
+
+    /// One live execution per origin: while the original dispatch (which
+    /// holds its own out-dir's lock) or another resume runs, a resume is
+    /// refused, naming the live execution.
+    #[test]
+    fn a_resume_is_refused_while_its_origin_is_live() {
+        let (_ws, prior, minted) = origin_dir();
+        // The original dispatch, still running: it holds its own lock.
+        let mut original = ExecutionLock { _guards: Vec::new() };
+        hold_own_execution_lock(&mut original, prior.path()).unwrap();
+        let err = claim_resume_origin(prior.path()).err().expect("refused while the original runs");
+        assert!(err.is::<ResumeRefusal>(), "{err:#}");
+        let msg = err.to_string();
+        assert!(msg.contains("RESUME REFUSED") && msg.contains("still running") && msg.contains(minted.as_str()), "{msg}");
+        drop(original);
+
+        // A first resume claims the origin; a second one is refused.
+        let first = claim_resume_origin(prior.path()).expect("free once the original ended");
+        assert!(claim_resume_origin(prior.path()).is_err(), "a second concurrent resume is refused");
+        drop(first);
+        claim_resume_origin(prior.path()).expect("sequential resumes stay allowed after the first ends");
+    }
+
+    /// A resume after an interrupted or failed run (no completion marker) is
+    /// allowed again and again; one after a success is refused.
+    #[test]
+    fn a_resume_of_a_completed_execution_is_refused() {
+        let (_ws, prior, minted) = origin_dir();
+        drop(claim_resume_origin(prior.path()).expect("an interrupted run can be resumed"));
+        drop(claim_resume_origin(prior.path()).expect("and resumed again"));
+
+        mark_execution_completed(&[prior.path()]);
+        let err = claim_resume_origin(prior.path()).err().expect("refused after success");
+        assert!(err.is::<ResumeRefusal>(), "{err:#}");
+        let msg = err.to_string();
+        assert!(msg.contains("RESUME ALREADY COMPLETED") && msg.contains(minted.as_str()), "{msg}");
+        // The marker rewrites the record in place: everything else survives.
+        let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(prior.path()).unwrap()).unwrap();
+        assert_eq!(origin["execution_id"].as_str(), Some(minted.as_str()));
+        assert!(origin["workspace"].is_string());
+    }
+
+    /// The lock file is a sibling of the out-dir, never inside it: the
+    /// container mounts the out-dir read-write, and a model must not be able
+    /// to delete the file whose lock keeps a second resume out.
+    #[test]
+    fn the_execution_lock_file_lives_beside_the_out_dir_not_in_it() {
+        let (_ws, prior, _) = origin_dir();
+        let _held = claim_resume_origin(prior.path()).unwrap();
+        let lock = darkmux_types::paths::execution_lock_path(prior.path()).unwrap();
+        assert!(lock.exists(), "{}", lock.display());
+        assert_eq!(lock.parent(), prior.path().parent());
+        assert_eq!(std::fs::read_dir(prior.path()).unwrap().count(), 0, "nothing written inside the out-dir");
+    }
+
+    /// `dispatch()` itself, not just the helpers, takes the origin's lock
+    /// and image decision: both refusals fire before any image, model or
+    /// workspace work, named as the resume gate's own.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_a_live_origin_and_a_different_image_before_any_work() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &ExecutionId::mint());
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        let run = |image: Option<&str>| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "coder".to_string();
+            opts.resume_from = Some(prior.path().to_path_buf());
+            opts.image = image.map(str::to_string);
+            format!("{:#}", dispatch(opts).expect_err("both cases refuse"))
+        };
+        let different_image = run(Some("python:3.12"));
+        let live = {
+            let _original = claim_resume_origin(prior.path()).unwrap();
+            run(None)
+        };
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(different_image.contains("RESUME IMAGE MISMATCH"), "{different_image}");
+        assert!(live.contains("RESUME REFUSED") && live.contains("still running"), "{live}");
+    }
+
     /// (#2774 round-3 MF2) The F2 regression the round-2 fix did NOT
     /// close, proven through the real gate: a dispatch that ran WITHOUT
     /// `--workdir` gets `auto_workspace_path`, i.e.
