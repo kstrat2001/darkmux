@@ -21,6 +21,18 @@ darkmux release.
   TypeScript twins), and `scripts/contract-additive-guard.py` fails a PR that removes
   or changes a line of it, of `tests/cli-json.golden` or of `ui/src/types/generated/*.ts`
   unless the PR carries the `breaking-v6` label. It starts at the first `v5.*` tag.
+- **A mod names its change, its proposer and its site** (MOD schema `2` to
+  `2.1`, additive; `mod list --json` and `mod show --json` gain three optional
+  fields, `tests/cli-json.golden` regenerated). `change_key` is `chg-<blake3>`
+  over the sorted `for` keys, the kit bytes (with a kind derived from them,
+  never the `--kit-kind` label) and the attachment hashes, taken from the
+  bytes as they are stored, so byte-identical proposals share it and any
+  different diff does not;
+  `proposer` is `{role, profile, model}` when a darkmux role proposed the mod
+  (`by` is unchanged); `site` is `{source, sha, file, start_line, end_line}`
+  when the finding it answers sat in a planned crawl or review site. `mod show`
+  prints each when present. A schema-2 record still reads, with all three
+  absent.
 - **`step.error` says why** (FLOW 2.0.0, additive). A step's error
   record carries `{cause}`: the message on one line, control and invisible
   characters dropped, URL userinfo and token-looking query values redacted,

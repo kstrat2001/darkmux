@@ -213,6 +213,31 @@ fn gate_summary(rec: &ModRecord) -> String {
     }
 }
 
+/// (#2265, 5.0) The `mod show` lines for the fields a darkmux-written mod
+/// adds: the convergence handle, the proposing role, the planned site. Each
+/// line appears only when its field is present, so a schema-2 record or a
+/// `mod create` mod renders as before.
+fn provenance_lines(rec: &ModRecord) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(k) = &rec.change_key {
+        lines.push(format!("change    {k}"));
+    }
+    if let Some(p) = &rec.proposer {
+        let profile = p.profile.as_deref().map(|x| format!(", profile {x}")).unwrap_or_default();
+        lines.push(format!("proposer  {} ({}{profile})", p.role, p.model));
+    }
+    if let Some(s) = &rec.site {
+        lines.push(format!("site      {}@{} {}:{}-{}", s.source, s.sha, s.file, s.start_line, s.end_line));
+    }
+    lines
+}
+
+fn print_provenance(rec: &ModRecord) {
+    for line in provenance_lines(rec) {
+        println!("{line}");
+    }
+}
+
 /// `mod show <key>` — one record, whole, with the kit printed RAW.
 pub fn show(key: &str, json: bool) -> Result<i32> {
     let root = config_access::mods_dir();
@@ -239,6 +264,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     println!("recorded  {}", rec.ts);
     println!("by        {}", rec.by);
     println!("kind      {}", rec.kit_kind.as_deref().unwrap_or("(untyped)"));
+    print_provenance(&rec);
     // (#2310 P4c-2b neighbor check) `mods.gate` is the one write path
     // besides `mod create`/the runtime `create_mod` tool that mutates a
     // stored mod — `mod show --json` already surfaces it for free (the
@@ -308,4 +334,38 @@ fn preview(kit: Option<&str>) -> String {
         return compact;
     }
     format!("{}…", compact.chars().take(PREVIEW_CHARS).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkmux_crew::mods::{ModProposer, ModSite};
+
+    fn bare() -> ModRecord {
+        serde_json::from_str(
+            r#"{"key":"mod-1","ts":"t","by":"kain","for":[],"kit":"k","attachments":[],"schema_version":"2"}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_schema_2_record_renders_no_provenance_lines() {
+        assert!(provenance_lines(&bare()).is_empty());
+    }
+
+    #[test]
+    fn show_names_the_change_key_proposer_and_site_when_present() {
+        let mut r = bare();
+        r.change_key = Some("chg-abc".into());
+        r.proposer = Some(ModProposer { role: "coder".into(), profile: Some("p1".into()), model: "m1".into() });
+        r.site = Some(ModSite { source: "app".into(), sha: "abc".into(), file: "src/a.ts".into(), start_line: 3, end_line: 9 });
+        assert_eq!(
+            provenance_lines(&r),
+            vec![
+                "change    chg-abc".to_string(),
+                "proposer  coder (m1, profile p1)".to_string(),
+                "site      app@abc src/a.ts:3-9".to_string(),
+            ]
+        );
+    }
 }

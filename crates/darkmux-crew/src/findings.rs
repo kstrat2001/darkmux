@@ -274,6 +274,36 @@ pub fn build_record(
     }
 }
 
+/// One planned `{file, start, end}` span, as `(start, end)` when it is in
+/// `file` and holds `line`, both ends inclusive.
+fn span_around(span: &serde_json::Value, file: &str, line: u64) -> Option<(u64, u64)> {
+    let (start, end) = (span.get("start")?.as_u64()?, span.get("end")?.as_u64()?);
+    (span.get("file")?.as_str()? == file && (start..=end).contains(&line)).then_some((start, end))
+}
+
+/// (#2265, 5.0) Stamp the planned span that holds this finding onto its
+/// `context` as `site: {file, start, end}`. `sites` is the unit's span list
+/// (`DispatchOpts::finding_sites`); the match is made on the record's own
+/// mapped `file` and `line`. A finding with no file/line, outside every span,
+/// or with a non-object context is left exactly as it was: never guessed.
+pub fn stamp_site(record: &mut FindingRecord, sites: &serde_json::Value) {
+    let (Some(file), Some(line)) = (
+        record.emitted.get("file").and_then(|v| v.as_str()),
+        record.emitted.get("line").and_then(|v| v.as_u64()),
+    ) else {
+        return;
+    };
+    let Some((start, end)) =
+        sites.as_array().and_then(|a| a.iter().find_map(|s| span_around(s, file, line)))
+    else {
+        return;
+    };
+    let site = serde_json::json!({"file": file, "start": start, "end": end});
+    if let Some(ctx) = record.context.as_object_mut() {
+        ctx.insert("site".to_string(), site);
+    }
+}
+
 /// Write a finding **once**. An existing file is never overwritten — a finding
 /// is an event, and the first writer's version is the one that happened. The
 /// second producer to arrive reports [`Materialized::AlreadyPresent`] and
@@ -1042,5 +1072,68 @@ mod tests {
 
         // An absent flows dir is empty, not an error.
         assert_eq!(sync_at(&tmp.path().join("nope"), &store, None).unwrap(), SyncReport::default());
+    }
+
+    // ── (#2265, 5.0) stamp_site ──────────────────────────────────────────
+
+    fn finding_at(file: &str, line: u64) -> FindingRecord {
+        build_record(
+            "exec-1",
+            1,
+            "2026-09-05T01:00:00Z".to_string(),
+            "create_finding",
+            proposer(),
+            Scope::default(),
+            Some(serde_json::json!({"source": "app"})),
+            serde_json::json!({"file": file, "line": line}),
+        )
+    }
+
+    fn spans() -> serde_json::Value {
+        serde_json::json!([
+            {"file": "src/a.ts", "start": 1, "end": 20},
+            {"file": "src/b.ts", "start": 30, "end": 60}
+        ])
+    }
+
+    fn site_of(file: &str, line: u64) -> Option<serde_json::Value> {
+        let mut r = finding_at(file, line);
+        stamp_site(&mut r, &spans());
+        r.context.get("site").cloned()
+    }
+
+    #[test]
+    fn a_finding_inside_a_span_gets_that_span_as_its_site() {
+        assert_eq!(
+            site_of("src/b.ts", 42),
+            Some(serde_json::json!({"file": "src/b.ts", "start": 30, "end": 60}))
+        );
+    }
+
+    /// Both ends of a span are inside it: the first and last line of a
+    /// planned site are findings' real locations.
+    #[test]
+    fn the_span_bounds_are_inclusive_at_both_ends() {
+        assert!(site_of("src/b.ts", 30).is_some(), "line == start");
+        assert!(site_of("src/b.ts", 60).is_some(), "line == end");
+        assert!(site_of("src/b.ts", 29).is_none(), "one before start");
+        assert!(site_of("src/b.ts", 61).is_none(), "one past end");
+    }
+
+    #[test]
+    fn the_file_has_to_match_not_only_the_line() {
+        assert_eq!(site_of("src/c.ts", 42), None);
+    }
+
+    #[test]
+    fn a_finding_with_no_location_or_no_object_context_is_left_alone() {
+        let mut r = finding_at("src/b.ts", 42);
+        r.emitted = serde_json::json!({"file": "src/b.ts"});
+        stamp_site(&mut r, &spans());
+        assert!(r.context.get("site").is_none(), "no line, no site");
+        let mut r = finding_at("src/b.ts", 42);
+        r.context = serde_json::Value::Null;
+        stamp_site(&mut r, &spans());
+        assert!(r.context.is_null(), "a non-object context is not turned into one");
     }
 }

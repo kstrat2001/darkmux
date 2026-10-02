@@ -444,6 +444,7 @@ mod tests {
 
     fn local_opts(role_id: &str) -> DispatchOpts {
         DispatchOpts {
+            finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,

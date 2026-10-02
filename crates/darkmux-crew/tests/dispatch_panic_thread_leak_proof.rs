@@ -240,6 +240,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
     let _panic_guard = EnvVarGuard::set("DARKMUX_TEST_PANIC_AFTER_GUARD_SPAWN", "1");
 
     let opts = DispatchOpts {
+        finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,

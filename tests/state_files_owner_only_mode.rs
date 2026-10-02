@@ -571,6 +571,9 @@ fn mod_store_is_owner_only_mode() {
         source: None,
         gate: None,
         gate_skipped_reason: None,
+        change_key: None,
+        proposer: None,
+        site: None,
         schema_version: darkmux_crew::mods::MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
@@ -721,6 +724,7 @@ fn mod_attachment_from_emission_is_owner_only_mode() {
             bytes: b"--- a/secret.rs\n+++ b/secret.rs\n".to_vec(),
         }],
         darkmux_crew::findings::Scope { mission_id: None, phase_id: None, step_id: None },
+        None,
         None,
         Vec::new(),
     )

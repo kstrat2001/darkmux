@@ -241,6 +241,14 @@ pub struct DispatchOpts {
     /// rather than corrupting the payload shape — see
     /// `dispatch_internal::merge_record_context`'s own doc).
     pub record_context: Option<serde_json::Value>,
+    /// (#2265, 5.0) The spans a planned unit covers, `[{file, start, end}]`,
+    /// for the host tailer to stamp onto the FINDINGS this dispatch records
+    /// (the one span holding each finding becomes its `context.site`). Kept
+    /// out of `record_context` on purpose: that merges into every flow record
+    /// of the dispatch, and a unit's whole span list on every heartbeat and
+    /// tool record is cost on the stream and the audit chain for a fact only
+    /// a finding needs. `None` for every caller but the crawl launcher.
+    pub finding_sites: Option<serde_json::Value>,
     /// (#2928) Whether this execution feeds the LIVE channel (sub-second
     /// model state to the local daemon's viewers; never a flow record).
     /// `false` turns off both the sampler and the sender for this dispatch,

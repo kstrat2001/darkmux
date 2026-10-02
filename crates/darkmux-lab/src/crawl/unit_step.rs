@@ -865,6 +865,10 @@ struct UnitContext {
     source: String,
     sha: String,
     rule_ids: Vec<String>,
+    /// (#2265, 5.0) The unit's planned line spans, handed to the dispatch as
+    /// `finding_sites` so a finding, and a mod answering it, can name the
+    /// site it sat in.
+    sites: Value,
     session_id: SessionId,
     /// The materialized workspace tree ROOT — the parent of this unit's
     /// own source tree, so the container's `/workspace/<source>/…` paths
@@ -914,9 +918,31 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
         source,
         sha: ps.sha.clone(),
         rule_ids: unit_rules(unit),
+        sites: planned_sites(unit),
         session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
         tree_root,
     })
+}
+
+/// (#2265, 5.0) The line spans a unit was planned over, as `[{file, start,
+/// end}]`: a site or edge unit's sites, a read unit's line-range entries. A
+/// whole-file read entry has no span and contributes none.
+fn planned_sites(u: &Unit) -> Value {
+    let span = |file: &str, start: usize, end: usize| json!({"file": file, "start": start, "end": end});
+    match u {
+        Unit::Site { sites, .. } | Unit::Edge { sites, .. } => {
+            Value::Array(sites.iter().map(|s| span(&s.file, s.start, s.end)).collect())
+        }
+        Unit::Read { files, .. } => Value::Array(
+            files
+                .iter()
+                .filter_map(|f| match f {
+                    ReadFileEntry::Range { file, start, end } => Some(span(file, *start, *end)),
+                    ReadFileEntry::Whole(_) => None,
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// The rule ids one unit names, in the plan's own order.
@@ -1302,6 +1328,10 @@ impl StepKind for CrawlUnitStepKind {
             };
             let started = std::time::Instant::now();
             let opts = DispatchOpts {
+                // (#2265, 5.0) The unit's planned spans go to the tailer for
+                // the FINDINGS only. In `record_context` they would ride
+                // every flow record of the dispatch.
+                finding_sites: Some(ctx.sites.clone()),
                 // (#2914) Work never runs on the utility model.
                 allow_utility_model: false,
                 remote_origin: None,

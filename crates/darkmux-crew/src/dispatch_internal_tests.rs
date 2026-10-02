@@ -1762,6 +1762,34 @@
         .unwrap()
     }
 
+    /// (#2265, 5.0) The profile a mod's `proposer` names is the one the
+    /// dispatch resolved to: `--profile` when it names a defined profile, else
+    /// the role-aware default.
+    #[test]
+    #[serial]
+    fn the_proposer_profile_is_the_one_the_dispatch_resolved() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2265-proposer.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                "main":{"default_model":"m","models":[{"id":"m","n_ctx":32000,"capabilities":{"code":1.0}}]},
+                "alt":{"default_model":"m","models":[{"id":"m","n_ctx":32000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"main"}"#,
+        )
+        .unwrap();
+        let role = windows_role(&["coding"]);
+        let no_load = |_: &darkmux_types::ProfileModel| Ok(());
+        let nothing_loaded = || Ok(Vec::new());
+        let resolve = |profile: Option<&str>| {
+            resolve_dispatch_model_with_hosts(&role, profile, pf.to_str(), true, false, &no_load, &nothing_loaded)
+                .unwrap()
+                .profile_name
+        };
+        assert_eq!(resolve(None), "main");
+        assert_eq!(resolve(Some("alt")), "alt");
+    }
+
     /// (#2902 step 3) The defect the one resolver closes: with several
     /// models in a profile, the compaction window came from the profile's
     /// DEFAULT model even when `select_model` picked another. Here the
@@ -2588,6 +2616,7 @@
     /// daemon is contacted on the way.
     fn dispatch_preflight_probe_opts() -> crate::dispatch::DispatchOpts {
         crate::dispatch::DispatchOpts {
+            finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,
@@ -7355,6 +7384,8 @@
                 crate::test_session("sess-real-watchdog"), darkmux_types::execution_id::ExecutionId::mint(),
                 "coder".into(),
                 "darkmux:qwen3.6".into(),
+                None, // (#2265) profile
+                None, // (#2265) finding_sites
                 None,
                 None,
                 tailer_stop,
@@ -8343,6 +8374,157 @@
                 }
             }
         }
+    }
+
+    /// (#2265, 5.0) The dispatch that ran `create_mod` names itself on the mod:
+    /// role, resolved profile and model, and the planned site the finding it
+    /// answers sat in (traced through the finding's copied `record_context`).
+    #[test]
+    #[serial]
+    fn a_mod_from_a_dispatch_records_its_proposer_and_planned_site() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let findings_store = tmp.path().join("findings");
+        let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+        let frec = crate::findings::build_record(
+            "sess-p",
+            1,
+            "2026-09-05T01:00:00Z".to_string(),
+            "create_finding",
+            crate::findings::Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            crate::findings::Scope::default(),
+            Some(serde_json::json!({
+                "source": "app", "sha": "abc",
+                "site": {"file": "src/a.ts", "start": 3, "end": 9}
+            })),
+            serde_json::json!({"file": "src/a.ts", "line": 4}),
+        );
+        crate::findings::materialize(&findings_store, &frec).unwrap();
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-prop"),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_profile(Some("coder-qwen38".into()));
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emitted": {"kit": "a kit", "for": ["sess-p/1"], "attach": []}, "emit_seq": 1,
+            })
+            .to_string(),
+        );
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        restore_env(prev);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(
+            all[0].proposer,
+            Some(crate::mods::ModProposer {
+                role: "coder".into(),
+                profile: Some("coder-qwen38".into()),
+                model: "darkmux:qwen3.6".into()
+            })
+        );
+        let site = all[0].site.as_ref().expect("the finding sat inside a planned site");
+        assert_eq!((site.file.as_str(), site.start_line, site.end_line), ("src/a.ts", 3, 9));
+    }
+
+    /// (#2265, 5.0) Through the REAL spawned tailer (the wiring `dispatch()`
+    /// uses): the resolved profile names the proposer, a finding gets the
+    /// planned span holding it as `context.site` and the mod inherits it, and
+    /// the unit's span list reaches NO flow record (it would otherwise ride
+    /// every heartbeat and tool record of the dispatch).
+    #[test]
+    #[serial]
+    fn the_spawned_tailer_stamps_findings_and_proposers_without_leaking_spans_into_flow_records() {
+        let tmp = TempDir::new().unwrap();
+        let flows = tmp.path().join("flows");
+        let mods_store = tmp.path().join("mods");
+        let findings_store = tmp.path().join("findings");
+        std::fs::create_dir_all(&flows).unwrap();
+        let prev = mod_test_env(&flows, &mods_store, &findings_store);
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(out_dir.join(".darkmux-runtime")).unwrap();
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+        let execution_str = execution.as_str().to_string();
+        let key = format!("{execution_str}/1");
+        let finding = serde_json::json!({
+            "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_finding",
+            "args": "{}", "result": "ok", "ok": true,
+            "emitted": {"file": "src/a.ts", "line": 4}, "emit_seq": 1,
+        });
+        let modev = serde_json::json!({
+            "type": "tool.completed", "seq": 2, "tool_seq": 1, "tool_name": "create_mod",
+            "args": "{}", "result": "ok", "ok": true,
+            "emitted": {"kit": "a kit", "for": [key], "attach": []}, "emit_seq": 1,
+        });
+        std::fs::write(
+            out_dir.join(".darkmux-runtime").join("trajectory.jsonl"),
+            format!("{finding}\n{modev}\n"),
+        )
+        .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(true));
+        let (_guard, handle) = spawn_guarded_tailer(
+            &stop,
+            out_dir,
+            crate::test_session("sess-spawn"),
+            execution,
+            "coder".to_string(),
+            "darkmux:m".to_string(),
+            Some("prof-x".to_string()),
+            Some(serde_json::json!([
+                {"file": "src/a.ts", "start": 2, "end": 9},
+                {"file": "src/unrelated-span-9.ts", "start": 1, "end": 5}
+            ])),
+            None,
+            None,
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            600,
+            None,
+            None,
+            Some(serde_json::json!({"source": "app", "sha": "abc"})),
+            None,
+            None,
+            None,
+            None,
+        );
+        handle.join().expect("tailer thread");
+
+        let mods = crate::mods::load_all_at(&mods_store).unwrap();
+        let finding_ctx = crate::findings::load_at(&findings_store, execution_str.as_str(), 1).unwrap().expect("finding").context;
+        let mut flow_text = String::new();
+        for e in std::fs::read_dir(&flows).unwrap().flatten() {
+            if e.path().is_file() {
+                flow_text.push_str(&std::fs::read_to_string(e.path()).unwrap_or_default());
+            }
+        }
+        restore_env(prev);
+        assert_eq!(finding_ctx["site"], serde_json::json!({"file": "src/a.ts", "start": 2, "end": 9}));
+        assert_eq!(mods.len(), 1, "{mods:?}");
+        assert_eq!(mods[0].proposer.as_ref().and_then(|p| p.profile.as_deref()), Some("prof-x"));
+        assert_eq!(mods[0].site.as_ref().map(|s| (s.start_line, s.end_line)), Some((2, 9)));
+        assert!(flow_text.contains("create_finding"), "premise: the tool records were written: {flow_text}");
+        assert!(!flow_text.contains("unrelated-span-9"), "the span list leaked into a flow record");
+    }
+
+    /// `dispatch()` hands the tailer the profile its own model resolution
+    /// settled on and the unit's spans, not a placeholder. The spawn call
+    /// cannot run without Docker, so this pins its source, the way the sibling
+    /// wiring tests here do.
+    #[test]
+    fn dispatch_passes_the_resolved_profile_and_finding_sites_to_the_tailer() {
+        let src = include_str!("dispatch_internal.rs");
+        let call = src.find("spawn_guarded_tailer(\n        &stop_flag,").expect("dispatch()'s call");
+        let args = &src[call..call + 1600];
+        assert!(args.contains("Some(resolved_profile.clone()),"), "profile argument: {args}");
+        assert!(args.contains("opts.finding_sites.clone(),"), "finding_sites argument: {args}");
+        assert!(
+            src.contains("        (r.wire_id, r.profile_name)\n"),
+            "the profile in play is the one the model resolution returned"
+        );
     }
 
     /// (#2265 review, CRITICAL 1) The host reads the SAME wire shape the
@@ -13300,10 +13482,12 @@ fn resolvers_set_the_utility_model_aside_unless_the_lab_opts_in() {
     // The container/single-shot resolver, residency skipped so the bare
     // selection is what comes back.
     let picked = super::resolve_dispatch_model_with_hosts(&wire_id_test_role(), None, pf.to_str(), true, false, &no_load, &nothing_loaded)
-        .unwrap();
+        .unwrap()
+        .wire_id;
     assert_eq!(picked, "worker-35b", "work never runs on the utility model");
     let lab = super::resolve_dispatch_model_with_hosts(&wire_id_test_role(), None, pf.to_str(), true, true, &no_load, &nothing_loaded)
-        .unwrap();
+        .unwrap()
+        .wire_id;
     assert_eq!(lab, "util-4b", "the lab benchmarks a candidate utility model through a profile that lists it");
     // The remote-target resolver takes the same set-aside.
     let t = super::resolve_target(&wire_id_test_role(), None, pf.to_str(), false).unwrap().unwrap();
@@ -13399,7 +13583,8 @@ fn resolver_returns_the_namespaced_identifier_for_a_real_lmstudio_dispatch() {
         // match and this test exercises the wire path, not the warning.
         &|| Ok(vec!["model-a".to_string(), "darkmux:model-a".to_string()]),
     )
-    .expect("a healthy local profile must resolve");
+    .expect("a healthy local profile must resolve")
+    .wire_id;
     assert_eq!(
         ensured.borrow().as_slice(),
         &["model-a".to_string()],
@@ -13434,7 +13619,8 @@ fn resolver_stays_bare_when_residency_is_skipped_for_a_non_lmstudio_base_url() {
         &|pm| panic!("residency preflight must not run when it is skipped: {}", pm.id),
         &|| panic!("`lms ps` must not run when residency is skipped"),
     )
-    .expect("a healthy local profile must resolve");
+    .expect("a healthy local profile must resolve")
+    .wire_id;
     assert_eq!(
         wire, "model-a",
         "a mock-server dispatch has no darkmux instance to address; the wire id \
@@ -14446,6 +14632,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".to_string(),
             "test-model".to_string(),
+            None, // (#2265) profile
+            None, // (#2265) finding_sites
             None,
             None,
             // stop_flag — deliberately never set. Only the interrupt
@@ -14814,6 +15002,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
                 "test-role".to_string(),
                 "test-model".to_string(),
+                None, // (#2265) profile
+                None, // (#2265) finding_sites
                 None,
                 None,
                 inactivity_deadline_for_closure,
@@ -18253,6 +18443,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             crate::test_session("sess-2869-drain"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".into(),
             "darkmux:m".into(),
+            None, // (#2265) profile
+            None, // (#2265) finding_sites
             None,
             None,
             stop,

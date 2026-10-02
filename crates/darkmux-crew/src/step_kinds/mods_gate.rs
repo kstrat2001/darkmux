@@ -689,6 +689,9 @@ mod tests {
             source: None,
             gate: None,
             gate_skipped_reason: None,
+            change_key: None,
+            proposer: None,
+            site: None,
             schema_version: crate::mods::MOD_SCHEMA_VERSION.to_string(),
             extras: Default::default(),
         }

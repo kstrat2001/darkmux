@@ -5378,17 +5378,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
-    let model = if let Some(t) = &agentic_pm {
-        t.model.id.clone()
+    let (model, resolved_profile) = if let Some(t) = &agentic_pm {
+        (t.model.id.clone(), t.profile_name.clone())
     } else {
-        resolve_dispatch_model_internal(
+        let r = resolve_dispatch_internal(
             role,
             opts.profile_name.as_deref(),
             opts.config_path.as_deref(),
             opts.model_base_url_override.is_some(),
             opts.allow_utility_model,
         )
-        .context("model selection failed")?
+        .context("model selection failed")?;
+        (r.wire_id, r.profile_name)
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
@@ -6123,6 +6124,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         execution.clone(),
         opts.role_id.clone(),
         model.clone(),
+        // (#2265) The profile this dispatch resolved to, so a mod it proposes
+        // names it in `proposer`.
+        Some(resolved_profile.clone()),
+        // (#2265, 5.0) The unit's planned spans, for findings only.
+        opts.finding_sites.clone(),
         phase_id.clone(),
         step_id.clone(),
         Arc::clone(&inactivity_deadline),
@@ -7352,6 +7358,8 @@ fn spawn_guarded_tailer(
     execution: ExecutionId,
     role_id: String,
     model: String,
+    profile: Option<String>,
+    finding_sites: Option<serde_json::Value>,
     phase_id: Option<String>,
     step_id: Option<String>,
     inactivity_deadline: Arc<Mutex<Instant>>,
@@ -7378,6 +7386,8 @@ fn spawn_guarded_tailer(
             execution,
             role_id,
             model,
+            profile,
+            finding_sites,
             phase_id,
             step_id,
             stop,
@@ -7426,6 +7436,8 @@ fn run_tailer(
     execution: ExecutionId,
     role_id: String,
     model: String,
+    profile: Option<String>,
+    finding_sites: Option<serde_json::Value>,
     phase_id: Option<String>,
     step_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
@@ -7453,6 +7465,8 @@ fn run_tailer(
     )
     .with_phase(phase_id)
     .with_step(step_id)
+    .with_profile(profile)
+    .with_finding_sites(finding_sites)
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
@@ -8955,6 +8969,12 @@ struct TailerState {
     execution: ExecutionId,
     role_id: String,
     model: String,
+    /// (#2265) The profile this dispatch resolved to, when one did. Names the
+    /// proposer on a mod this execution's `create_mod` call records.
+    profile: Option<String>,
+    /// (#2265, 5.0) `DispatchOpts::finding_sites`: stamped onto the findings
+    /// this execution records, never onto its flow records.
+    finding_sites: Option<serde_json::Value>,
     /// (#714) Mission/phase this dispatch belongs to (when phase-bound),
     /// stamped onto every per-event flow record so they group under the
     /// mission in the observability view. `None` for a one-off dispatch.
@@ -9146,6 +9166,8 @@ impl TailerState {
             execution,
             role_id,
             model,
+            profile: None,
+            finding_sites: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -9173,6 +9195,18 @@ impl TailerState {
     /// only production `run_tailer` opts in.
     fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// (#2265) The resolved profile name; see the field.
+    fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// (#2265, 5.0) The planned spans; see the field.
+    fn with_finding_sites(mut self, sites: Option<serde_json::Value>) -> Self {
+        self.finding_sites = sites;
         self
     }
 
@@ -9374,6 +9408,8 @@ impl TailerState {
             execution: ExecutionId::mint(),
             role_id,
             model,
+            profile: None,
+            finding_sites: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -9993,7 +10029,7 @@ impl TailerState {
         let Some(seq) = t.emit_seq else {
             return;
         };
-        let record = crate::findings::build_record(
+        let mut record = crate::findings::build_record(
             self.execution.as_str(),
             seq,
             darkmux_flow::ts_utc_now(),
@@ -10018,6 +10054,9 @@ impl TailerState {
             self.record_context.as_ref().filter(|c| c.is_object()).cloned(),
             emitted,
         );
+        if let Some(sites) = &self.finding_sites {
+            crate::findings::stamp_site(&mut record, sites);
+        }
         let root = crate::findings::findings_dir();
         if let Err(e) = crate::findings::materialize(&root, &record) {
             eprintln!(
@@ -10155,6 +10194,11 @@ impl TailerState {
             // source checkout, whose paths are repo-relative. A dispatch
             // whose launcher named no source is not mapped at all.
             crate::findings::source_id_of(self.record_context.as_ref()).as_deref(),
+            Some(crate::mods::ModProposer {
+                role: self.role_id.clone(),
+                profile: self.profile.clone(),
+                model: self.model.clone(),
+            }),
             warnings,
         ) {
             eprintln!("[darkmux] warning: could not write mod: {e:#}");
@@ -11123,6 +11167,15 @@ pub(crate) fn residency_lost_detail(wire_model: &str, detail: &str) -> Option<St
     ))
 }
 
+/// (#2265) What one dispatch's model resolution settled on: the wire model id
+/// and the profile it came from, from the ONE resolution (the profile name is
+/// provenance for a mod's `proposer`, so it must be the one that selected the
+/// model, not a second derivation).
+struct ResolvedDispatch {
+    wire_id: String,
+    profile_name: String,
+}
+
 fn resolve_dispatch_model_internal(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -11130,6 +11183,18 @@ fn resolve_dispatch_model_internal(
     skip_lmstudio_residency: bool,
     allow_utility_model: bool,
 ) -> Result<String> {
+    resolve_dispatch_internal(role, profile_override, config_path, skip_lmstudio_residency, allow_utility_model)
+        .map(|r| r.wire_id)
+}
+
+/// [`resolve_dispatch_model_internal`] keeping the resolved profile name.
+fn resolve_dispatch_internal(
+    role: &crate::types::Role,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+    skip_lmstudio_residency: bool,
+    allow_utility_model: bool,
+) -> Result<ResolvedDispatch> {
     resolve_dispatch_model_with_hosts(
         role,
         profile_override,
@@ -11166,7 +11231,7 @@ fn resolve_dispatch_model_with_hosts(
     allow_utility_model: bool,
     ensure_resident: &dyn Fn(&darkmux_types::ProfileModel) -> Result<()>,
     list_loaded: &dyn Fn() -> Result<Vec<String>>,
-) -> Result<String> {
+) -> Result<ResolvedDispatch> {
     use darkmux_profiles::profiles::load_registry;
 
     let loaded = load_registry(config_path).map_err(|e| {
@@ -11325,7 +11390,7 @@ fn resolve_dispatch_model_with_hosts(
                  dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
             );
         }
-        Ok(wire_id)
+        Ok(ResolvedDispatch { wire_id, profile_name: active_name })
 }
 
 /// (#590) Best-effort: the machine's registered utility model

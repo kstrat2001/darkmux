@@ -211,6 +211,7 @@ fn captured_docker_argv_with(
     let _lmstudio_url = lmstudio_url.map(|u| EnvVarGuard::set("DARKMUX_LMSTUDIO_URL", u));
 
     let opts = DispatchOpts {
+        finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: remote_origin.map(str::to_string),
