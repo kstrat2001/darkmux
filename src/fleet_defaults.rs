@@ -86,16 +86,12 @@ enum HubRead {
     Absent,
 }
 
-fn machine_name(view: &FleetView, m: &FleetMachine) -> String {
-    crate::machine_list::row_name(view, m)
-}
-
 fn read_hub(view: &FleetView, now_ms: u64) -> HubRead {
     match view.declared_hubs() {
         DeclaredHubs::One(m) => match &m.card {
             CardOutcome::Available { card, .. } => card.hub_defaults().map_or(HubRead::Absent, |d| {
                 HubRead::Stated(LastKnown {
-                    hub: machine_name(view, m),
+                    hub: view.row_name(m),
                     seen_at_ms: m.received_at_ms.unwrap_or(now_ms),
                     defaults: d.clone(),
                 })
@@ -182,7 +178,7 @@ fn check(name: &str, status: Status, message: String, hint: Option<&str>) -> Che
 }
 
 fn names(view: &FleetView, machines: &[&FleetMachine]) -> String {
-    machines.iter().map(|m| machine_name(view, m)).collect::<Vec<_>>().join(", ")
+    machines.iter().map(|m| view.row_name(m)).collect::<Vec<_>>().join(", ")
 }
 
 /// Whether `redis_host` (this machine's `redis.host`) points at the machine
@@ -238,7 +234,7 @@ fn hub_row(
     resolve: impl Fn(&str) -> Vec<std::net::IpAddr>,
 ) -> Check {
     const NAME: &str = "fleet hub";
-    let hub_name = machine_name(view, hub);
+    let hub_name = view.row_name(hub);
     let hosts = match &hub.card {
         CardOutcome::Available { card, .. } => card.hosts_fleet_redis == Some(true),
         _ => false,

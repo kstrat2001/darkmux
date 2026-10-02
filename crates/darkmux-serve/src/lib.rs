@@ -60,7 +60,7 @@ mod runs;
 mod run_lifecycle;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
-    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
+    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
 /// The daemon's response bodies: one Rust type per JSON route, and the source
@@ -1055,6 +1055,45 @@ where
     }
 }
 
+/// The session and mission ids with a live beat right now (a mission's own
+/// session never beats, so any beat naming its mission counts). Quiet: it logs
+/// nothing, since a CLI calls it. `Some(empty)` when presence is off (then no
+/// view row reads `no_beat` either); `None` when presence is configured and the
+/// read failed, so [`apply_not_reporting`] marks nothing rather than marking a
+/// beating run on an empty set.
+pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
+    let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
+    let client = redis::Client::open(url.expose_for_probe()).ok()?;
+    let beats = darkmux_flow::session_presence::read_live_sessions(&client).ok()?;
+    Some(beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
+}
+
+/// Log a failed live-beat read once per failure streak (the daemon's `/runs`,
+/// never the CLI), as `read_presence_beats` does: the next success re-arms it.
+fn log_beat_read_once(failed: bool) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !failed {
+        LOGGED.store(false, Ordering::Relaxed);
+    } else if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("darkmux serve: GET /runs — reading the live session beats failed; no run is marked not reporting until it succeeds");
+    }
+}
+
+/// Mark the running rows whose machine the view holds as down and whose session
+/// has no live beat ([`runs::mark_not_reporting`]), but only when BOTH facts
+/// were read: no view, or a failed beat read, marks nothing (never "not
+/// reporting" by default). The ONE call both `GET /runs` and `darkmux run list`
+/// make.
+pub fn apply_not_reporting(
+    rows: &mut [Run],
+    view: Option<&fleet_view::FleetView>,
+    live: Option<&std::collections::HashSet<String>>,
+) {
+    if let (Some(view), Some(live)) = (view, live) {
+        runs::mark_not_reporting(rows, view, live);
+    }
+}
+
 /// GET /fleet/dispatches/live — the dispatches with a live heartbeat right now
 /// (#638). Each running dispatch refreshes a short-TTL
 /// `darkmux:session-presence:<sid>` Redis key; this returns every unexpired
@@ -1846,9 +1885,14 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let lab_dir = state.lab_dir.clone();
     // (#1705) One blocking task: read the fleet stream, then build every
     // row against local + fleet together.
+    let view = fleet_view::cached_view(&state).await.ok();
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
-        (runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records), fleet.state)
+        let mut rows = runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records);
+        let live = live_session_ids();
+        log_beat_read_once(live.is_none());
+        apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
+        (rows, fleet.state)
     })
     .await;
     let (runs, fleet_state) = result.unwrap_or_else(|e| {

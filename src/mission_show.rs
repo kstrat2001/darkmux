@@ -203,7 +203,7 @@ fn graph_lines(graph: &MissionGraph) -> Vec<String> {
 
 fn run_line(run: &Run) -> String {
     let tokens = run.tokens.map(|t| format!(" · {} tokens", crate::run_list::grouped(t))).unwrap_or_default();
-    format!("  {} {}{tokens}", crate::run_list::kind_label(run.kind), crate::run_list::status_label(run.status))
+    format!("  {} {}{tokens}", crate::run_list::kind_label(run.kind), crate::run_list::status_label(run))
 }
 
 /// Render `show` as plain text, no color: the terminal and the editor panel

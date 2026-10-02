@@ -197,5 +197,7 @@ export function runForCell(cell: MatrixCell, activityTs: number | undefined): Ru
     ...(cell.abandonReason ? { abandoned_reason: cell.abandonReason } : {}),
     ...(activityTs === undefined ? {} : { updated_ts: activityTs }),
     machine: "MacBook-Pro",
+    // The local receive time on the key's scale (`Run.receive_key`).
+    receive_key: (activityTs ?? 0) * 1000 * 1024,
   };
 }

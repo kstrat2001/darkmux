@@ -5258,6 +5258,7 @@
     /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
     struct CrewDirGuard {
         prev: Option<String>,
+        prev_home: Option<String>,
         // Held only to keep the temp dir alive for the guard's lifetime
         // (RAII) — never read after construction, hence the underscore.
         _tmp: TempDir,
@@ -5266,10 +5267,14 @@
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
             let prev = std::env::var("DARKMUX_HOME").ok();
+            let prev_home = std::env::var("HOME").ok();
+            // HOME too, not just the darkmux root: a path resolved from the
+            // home directory must not reach the operator's own state.
             unsafe {
                 std::env::set_var("DARKMUX_HOME", tmp.path());
+                std::env::set_var("HOME", tmp.path());
             }
-            Self { prev, _tmp: tmp }
+            Self { prev, prev_home, _tmp: tmp }
         }
     }
     impl Drop for CrewDirGuard {
@@ -5278,6 +5283,10 @@
                 match &self.prev {
                     Some(v) => std::env::set_var("DARKMUX_HOME", v),
                     None => std::env::remove_var("DARKMUX_HOME"),
+                }
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
                 }
             }
         }
@@ -5373,7 +5382,9 @@
     /// `/runs` publishes the lifecycle policy its rows were judged by, the
     /// numbers the viewer judges flow sessions by (`ui/src/lib/lifecycle.ts`).
     #[tokio::test]
+    #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_publishes_its_lifecycle_policy() {
+        let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
@@ -5384,8 +5395,89 @@
         assert_eq!(json["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
     }
 
+    /// 5.0: `/runs` applies the not-reporting overlay. A dispatch running on a
+    /// peer the daemon's fleet view holds as down (no beat, card unreadable) is
+    /// marked on its row; the same dispatch on a machine the view holds as up is
+    /// not. Removing the overlay call from the handler turns this red.
     #[tokio::test]
+    #[serial_test::serial] // pins HOME, DARKMUX_HOME and DARKMUX_REDIS_URL
+    async fn runs_handler_marks_a_running_row_on_a_down_peer_not_reporting() {
+        use crate::fleet_view::{tests as fv, CardOutcome, FleetContext, UnreachableReason};
+        let _home = CrewDirGuard::new();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let flows = TempDir::new().unwrap();
+        let ts = darkmux_flow::ts_utc_now();
+        let record = |sid: &str, machine: &str| {
+            serde_json::json!({
+                "ts": ts, "level": "info", "category": "work", "stage": "dispatch",
+                "action": "dispatch.start", "handle": "coder", "session_id": sid,
+                "source": "crew_dispatch", "machine_id": machine,
+            })
+            .to_string()
+        };
+        let lines = [record("s-down", "far-peer"), record("s-up", "near-peer")].join("\n");
+        fs::write(flows.path().join(format!("{}.jsonl", &ts[..10])), lines + "\n").unwrap();
+        // Presence answered (this machine and near-peer beat), so far-peer reads `no_beat`.
+        let s = fv::Scripted {
+            local: fv::identity("laptop", None, Some("nLAPTOP")),
+            roster: vec![fv::entry("far-peer"), fv::entry("near-peer")],
+            beats: vec![fv::beat("laptop", "U1", None), fv::beat("near-peer", "U2", None)],
+            ..Default::default()
+        };
+        let unreadable = || CardOutcome::Unreachable { reason: UnreachableReason::ListenerOff, detail: None };
+        fv::peer_says(&s, "far-peer", 0, unreadable(), crate::fleet_view::AcceptsState::Unknown);
+        fv::peer_says(&s, "near-peer", 0, unreadable(), crate::fleet_view::AcceptsState::Unknown);
+        let app = build_router_full(flows.path().to_path_buf(), None, None, FleetContext::with_sources(std::sync::Arc::new(s)))
+            .layer(from_fn(assume_loopback_peer));
+        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        unsafe {
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let flag = |id: &str| json["runs"].as_array().unwrap().iter().find(|r| r["id"] == id).map(|r| r["not_reporting"].as_bool().unwrap_or(false));
+        assert_eq!(flag("s-down"), Some(true), "{json}");
+        assert_eq!(flag("s-up"), Some(false), "a peer with a beat is up: {json}");
+    }
+
+    /// 5.0: the overlay marks nothing unless BOTH the view and the beats were
+    /// read (a failed beat read must not mark a beating run).
+    #[test]
+    fn apply_not_reporting_marks_nothing_without_both_the_view_and_the_beats() {
+        use crate::fleet_view::{gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL};
+        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
+        let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+        let mut down = view.machines[0].clone();
+        down.is_this_machine = false;
+        down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("far-peer")));
+        down.liveness = Liveness::NoBeat;
+        down.card = CardOutcome::Unknown;
+        view.machines.push(down);
+        let row = || {
+            let mut r = crate::runs::tests_support_run("r");
+            r.machine = Some("far-peer".into());
+            r
+        };
+        let none = std::collections::HashSet::new();
+        let mut rows = vec![row()];
+        apply_not_reporting(&mut rows, Some(&view), Some(&none));
+        assert!(rows[0].not_reporting, "both reads succeeded: marked");
+        let mut rows = vec![row()];
+        apply_not_reporting(&mut rows, Some(&view), None);
+        assert!(!rows[0].not_reporting, "a failed beat read marks nothing");
+        let mut rows = vec![row()];
+        apply_not_reporting(&mut rows, None, Some(&none));
+        assert!(!rows[0].not_reporting, "no view marks nothing");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_includes_lab_runs_with_kind_lab() {
+        let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");

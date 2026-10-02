@@ -45,12 +45,13 @@ import {
   type GraphNode,
   type MetricsMap,
 } from "./graph";
+import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
 import { endedSelectionOrDrag } from "../../lib/clickIntent";
 
 interface MissionNodeData {
   label: string;
   kind: string;
-  status: string;
+  status: GraphNodeStatus;
   description?: string;
   steps: GraphNode["steps"];
   metrics: MetricsMap;
@@ -101,7 +102,7 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
 
 function PhaseGroup({
   data,
-}: NodeProps<{ label: string; status: string; description?: string; statusNote?: string }>) {
+}: NodeProps<{ label: string; status: GraphNodeStatus; description?: string; statusNote?: string }>) {
   // (#2406, post-review) The phase box used to carry NO status word at
   // all — a degraded phase was conveyed purely by border color, and the
   // counts reached the page only as a `title=`. Tooltips do not exist on

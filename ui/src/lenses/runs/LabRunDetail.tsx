@@ -232,7 +232,7 @@ export function LabRunDetail({
           ‹ runs
         </button>
         {` · ${dir} `}
-        <WorkStatus status={isFinished ? "finished" : pollUnreachable ? "error" : "live"} label={labBadgeText(isFinished, pollUnreachable)} className="labbadge" />
+        <WorkStatus status={isFinished ? "complete" : pollUnreachable ? "error" : "running"} label={labBadgeText(isFinished, pollUnreachable)} className="labbadge" />
       </div>
 
       <div className="labpipe">

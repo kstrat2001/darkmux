@@ -21,7 +21,6 @@ import {
   keepPageStatus,
   mergeGraphs,
   missionTotals,
-  normalizeMissionStatus,
   phaseOrderEdges,
   recordInMission,
   seedMetricsFromGraph,
@@ -236,9 +235,9 @@ describe("statusRank / keepPageStatus", () => {
     expect(keepPageStatus("waiting", "running")).toBe(true);
   });
 
-  it("normalizes the pre-rename 'closed' spelling to 'finalized'", () => {
-    expect(normalizeMissionStatus("closed")).toBe("finalized");
-    expect(normalizeMissionStatus("finalized")).toBe("finalized");
+  it("ranks no word the generated unions lack: the retired `paused` and `closed` are unknown", () => {
+    expect(isUnknownStatus("paused")).toBe(true);
+    expect(isUnknownStatus("closed")).toBe(true);
   });
 });
 

@@ -439,15 +439,15 @@ export function endMs(l: Lifecycle, asOf: number): number | null {
 function closedState(edge: CloseEdge): RunState {
   switch (edge.kind) {
     case "complete":
-      return { status: "complete", killed: false };
+      return { status: "complete" };
     case "error":
-      return { status: "error", killed: edge.killed };
+      return { status: "error" };
     case "session_end":
-      return { status: "abandoned", killed: false, abandonReason: "noterminal" };
+      return { status: "abandoned", abandonReason: "noterminal" };
     case "budget_stop":
-      return { status: "abandoned", killed: false, abandonReason: edge.byOperator ? "aborted" : "noterminal" };
+      return { status: "abandoned", abandonReason: edge.byOperator ? "aborted" : "noterminal" };
     case "mission_abort":
-      return { status: "abandoned", killed: false, abandonReason: "aborted" };
+      return { status: "abandoned", abandonReason: "aborted" };
   }
 }
 
@@ -456,11 +456,11 @@ export function toRunState(l: Lifecycle): RunState {
   switch (l.phase) {
     case "open":
     case "waiting":
-      return { status: "running", killed: false };
+      return { status: "running" };
     case "not_started":
-      return l.close ? closedState(l.close.edge) : { status: "planned", killed: false };
+      return l.close ? closedState(l.close.edge) : { status: "planned" };
     case "stale":
-      return { status: "abandoned", killed: false, abandonReason: "noterminal" };
+      return { status: "abandoned", abandonReason: "noterminal" };
     case "closed":
       return closedState(l.close?.edge ?? { kind: "session_end" });
   }

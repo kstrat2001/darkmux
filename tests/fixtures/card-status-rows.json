@@ -72,9 +72,10 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  },
@@ -151,9 +152,10 @@
     "state": "unknown"
    }
   },
-  "active": true,
   "expect": {
    "status": "running",
+   "word": "dispatch in flight",
+   "second_line": null,
    "reason": null
   }
  },
@@ -230,9 +232,10 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  },
@@ -309,9 +312,10 @@
     "state": "unknown"
    }
   },
-  "active": true,
   "expect": {
    "status": "running",
+   "word": "dispatch in flight",
+   "second_line": null,
    "reason": null
   }
  },
@@ -388,10 +392,11 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "online_not_streaming",
-   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+   "word": "online",
+   "second_line": "not streaming",
+   "reason": "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
   }
  },
  {
@@ -459,10 +464,11 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "online_not_streaming",
-   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+   "word": "online",
+   "second_line": "not streaming",
+   "reason": "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
   }
  },
  {
@@ -489,10 +495,40 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "offline",
+   "word": "offline",
+   "second_line": null,
    "reason": "offline: not listening"
+  }
+ },
+ {
+  "name": "peer, no beat, card state unknown",
+  "row": {
+   "entry": {
+    "id": "mini",
+    "address": "mini.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "no_beat",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "unknown"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "expect": {
+   "status": "offline",
+   "word": "offline",
+   "second_line": null,
+   "reason": "offline: card state unknown"
   }
  },
  {
@@ -518,9 +554,10 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "offline",
+   "word": "offline",
+   "second_line": null,
    "reason": "offline: another machine answered"
   }
  },
@@ -548,10 +585,11 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "not_streaming",
-   "reason": "not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read."
+   "word": "not streaming",
+   "second_line": null,
+   "reason": "not streaming: not listening"
   }
  },
  {
@@ -579,9 +617,10 @@
     "state": "unknown"
    }
   },
-  "active": false,
   "expect": {
    "status": "idle",
+   "word": "idle",
+   "second_line": null,
    "reason": null
   }
  }

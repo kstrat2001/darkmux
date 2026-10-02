@@ -52,7 +52,8 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
-import { statusLabel, computeTMax, type RunState } from "../../lib/flow";
+import { computeTMax, type RunState } from "../../lib/flow";
+import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
@@ -63,11 +64,10 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
-import type { RunStatus } from "../../types/generated/RunStatus";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
 import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
-import { sameMachine, sameUid, type MachineRef } from "../../lib/machineIdentity";
+import { sameMachine, sameUid } from "../../lib/machineIdentity";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 
 /** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
@@ -103,9 +103,9 @@ interface SessionHeader {
    * "uppercase the STRING directly" discipline, rather than depending on a
    * stylesheet rule this port is free to change). */
   pillLabel: string;
-  /** (#2813) The canonical run status; the pill's look reads it. `unknown` (5.0
+  /** (#2813) The canonical run status; the pill's look reads it. `not_reporting` (5.0
    *  R3): the run reads running but the machine it ran on is not reporting. */
-  status: RunStatus | typeof NOT_REPORTING_STATUS;
+  status: RunBadgeStatus;
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
@@ -633,7 +633,7 @@ function noRunContext(nowMs: number): RunContext {
     c: null,
     done: false,
     skewedClose: false,
-    state: { status: "planned", killed: false },
+    state: { status: "planned" },
   };
 }
 
@@ -756,28 +756,18 @@ function ranOn(d: NormRecord | null, first: NormRecord | null | undefined): { na
 }
 
 /** The status and word the page's pill shows (5.0 R3): the run's own, except
- *  that a run reading running on a machine that is not reporting is unknown.
+ *  that a run reading running on a machine that is not reporting reads "not reporting".
  *  `open` is what the brief's timing line says of a run with no end: the same
  *  word, so the page states its status in one voice. */
 function pillOf(
   state: RunState,
-  on: { name: string; uid: string },
-  notReporting: ((on: MachineRef) => boolean) | undefined,
+  notReporting: boolean | undefined,
 ): { status: SessionHeader["status"]; label: string; open: string } {
-  if (state.status === "running" && notReporting?.(machineRefOf(on))) {
-    return { status: NOT_REPORTING_STATUS, label: NOT_REPORTING_STATUS, open: NOT_REPORTING_STATUS };
+  if (state.status === "running" && notReporting) {
+    const word = runStatusWord(NOT_REPORTING_STATUS);
+    return { status: NOT_REPORTING_STATUS, label: word, open: word };
   }
-  return { status: state.status, label: statusLabel(state), open: "running" };
-}
-
-const machineRefOf = (on: { name: string; uid: string }): MachineRef => ({ uid: on.uid || null, name: on.name || null });
-
-/** The machine a session's run executed on, as a reference to match against
- *  the fleet (`ranOn`'s rule, over the raw records): `{}` when its records
- *  name none. */
-export function sessionMachine(data: readonly NormRecord[], sid: string): MachineRef {
-  const own = data.filter((r) => r.session_id === sid);
-  return machineRefOf(ranOn(own.find((r) => r.action === ACTION.DispatchStart) ?? null, own[0]));
+  return { status: state.status, label: runStatusWord(state.status, state.abandonReason), open: "running" };
 }
 
 /** Whether the run executed on the machine showing it. `viewerUid` is the page's
@@ -1601,7 +1591,7 @@ export function runRegions(
   viewerUid: string | null = null,
   /** (5.0 R3) Whether the machine a run executed on is not reporting. A run
    *  that reads running there has no live evidence, so its status is unknown. */
-  notReporting?: (on: MachineRef) => boolean,
+  notReporting?: boolean,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
@@ -1629,7 +1619,7 @@ export function runRegions(
 
   const role = roleOf(d ?? firstSessRec);
   const on = ranOn(d, firstSessRec);
-  const pill = pillOf(state, on, notReporting);
+  const pill = pillOf(state, notReporting);
 
   const sp: DispatchStartPayload = payloadOf(d, ACTION.DispatchStart) ?? {};
   const remoteEp = sp.endpoint || endPayloadOf(c)?.endpoint;

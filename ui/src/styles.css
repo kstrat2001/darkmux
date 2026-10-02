@@ -2839,7 +2839,8 @@ body {
    tells it apart from `stopped`. */
 .wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-idle { color: var(--dim); border-color: var(--border); }
+.wstatus.is-idle,
+.wstatus.is-unknown { color: var(--dim); border-color: var(--border); }
 
 .labbadge {
   flex: 0 0 auto;
@@ -3756,12 +3757,9 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px;
-  /* NO `cursor: pointer` and no hover affordance until the machine drill-in
-     is ported. Legacy's `.mach` navigates (`drillMachine`); this port has no
-     click handler behind it, so a pointer cursor + hover highlight is a TRAP
-     CONTROL — it advertises an interaction that silently does nothing, on the
-     card an operator is most likely to try first. Same call as the
-     `history →` link. Restore both when the drill-in lands. */
+  /* The card drills to the runs lens pinned to its machine (`MachineCard`'s
+     `onClick`), so it looks clickable. */
+  cursor: pointer;
   transition: border-color 0.15s;
 }
 /* The cards' order is not final yet (`FleetLens`'s `orderPending`): each card
@@ -3770,9 +3768,6 @@ body {
    settles. Not `display: none`: that would change the grid's size. */
 .fleet[data-order="pending"] .mach > * {
   visibility: hidden;
-}
-.mach:hover {
-  /* intentionally inert — see `.mach` */
 }
 .mach.active {
   border-color: var(--accent);
@@ -3911,8 +3906,18 @@ body {
   opacity: 0.5;
   font-style: italic;
 }
+/* The status line. The lamp's form says what the viewer knows (filled: proven
+   work, ring: proven quiet, dashed: no reading, plain and dim: offline) and,
+   while a reading is on the line, it takes the reading's color. The line clips
+   its overflow (one line, ellipsized), which would cut the lit lamp's glow to
+   the line's box: a padding the same size as a negative margin gives the glow
+   room and moves nothing. */
 .mach .stat {
-  margin-top: 12px;
+  --lit: var(--accent);
+  --lamp-unlit: var(--dim);
+  --lamp-size: 8px;
+  padding: 4px 8px;
+  margin: 8px -8px -4px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
 }
 /* (#2877) Only present while the card computed a live tok/s reading — see
@@ -4205,15 +4210,7 @@ body {
     font-size: 11px;
   }
 }
-/* The status lamp (`components/LampDot.tsx`): its form says what the viewer
-   knows (filled: proven work, ring: proven quiet, dashed: no reading, plain
-   and dim: offline) and, while a reading is on the line, it takes the
-   reading's color, as the run page's state lamps do. */
-.mach .stat {
-  --lit: var(--accent);
-  --lamp-unlit: var(--dim);
-  --lamp-size: 8px;
-}
+/* The status lamp (`components/LampDot.tsx`), as the run page's state lamps. */
 .mach .stat[data-lamp="dashed"],
 .mach .stat[data-lamp="off"] {
   --lit: var(--dim);
@@ -4222,13 +4219,6 @@ body {
   display: inline-block;
   margin-right: 7px;
   vertical-align: middle;
-}
-/* The line clips its overflow (one line, ellipsized), which would cut the lit
-   lamp's glow to the line's box: a padding the same size as a negative margin
-   gives the glow room and moves nothing. */
-.mach .stat {
-  padding: 4px 8px;
-  margin: 8px -8px -4px;
 }
 .mach .stat.mach-scope__rate {
   --lit: var(--scope-phosphor);

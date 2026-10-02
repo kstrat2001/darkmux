@@ -64,7 +64,7 @@ function expectedBadgeText(cell: MatrixCell): string {
   // whatever label the lens passes (see `WorkStatus`'s own doc).
   if (workStatusKind(cell.status) === "running") return RUNNING_WORD;
   if (cell.status !== "abandoned") return cell.status;
-  return cell.abandonReason === "aborted" ? "aborted" : "no ending recorded";
+  return cell.abandonReason === "aborted" ? "aborted" : "no ending";
 }
 
 function mockRuns(runs: unknown[]) {

@@ -17,7 +17,9 @@
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../../lib/format";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
+import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { dispatchHash } from "../../lib/route";
+import { relayedFromText } from "../../lib/relayWords";
 import { canonUid, machineRefKey, matchesMachine, nameKey, type MachineMatch, type MachineRef } from "../../lib/machineIdentity";
 
 export { shortModel };
@@ -45,35 +47,19 @@ export function runsAgo(r: Run, now: number = Date.now()): string {
   return `${Math.floor(secs / 86400)}d ago`;
 }
 
-/**
- * (#1907) The status BADGE's display text. `RunStatus::Abandoned` alone
- * covers two genuinely different situations — a human ran `mission abort`,
- * or nothing ever wrote an ending (killed/crashed/no terminal record) —
- * and reading the same word for both is what prompted "i'm not sure what
- * abandoned means?" on the console's own activity list (this function's
- * origin issue). `Run.abandoned_reason` is set ONLY alongside `"abandoned"`
- * (`crates/darkmux-serve/src/runs.rs::Run::abandoned_reason`'s own doc), so
- * this reads it directly rather than re-deriving the distinction client-
- * side. Every other status keeps its own plain name, unchanged — this is
- * the ONE place `RunRow`'s badge text can diverge from `run.status` itself
- * (the CSS class backing the badge's COLOR stays keyed on the status from
- * `runBadgeStatus`, which is `run.status` verbatim except for a running run
- * whose machine is not reporting, so `.labbadge.abandoned` styling is
- * untouched by this).
- */
-export function runStatusLabel(r: Run, notReporting = false): string {
-  const status = runBadgeStatus(r, notReporting);
-  if (status !== "abandoned") return status;
-  return r.abandoned_reason === "aborted" ? "aborted" : "no ending recorded";
+/** The status BADGE's display text: `runStatusWord`, the one status-to-word map
+ * (#1907 split `abandoned` on `Run.abandoned_reason`, which it reads). */
+export function runStatusLabel(r: Run): string {
+  return runStatusWord(runBadgeStatus(r), r.abandoned_reason);
 }
 
 /** (5.0 R3) The status a row's badge keys its color and pulse on. It is the
  * run's own, except that a run recorded as running on a machine that is not
- * reporting (held as down by the fleet view, with no live session beat, so no
- * terminal record can arrive)
- * is `unknown` (`NOT_REPORTING_STATUS`). */
-export function runBadgeStatus(r: Run, notReporting: boolean): string {
-  return notReporting && r.status === "running" ? NOT_REPORTING_STATUS : r.status;
+ * reporting (`Run.not_reporting`, decided once by the daemon: the fleet view
+ * holds its machine as down and no live session beat names it, so no terminal
+ * record can arrive) is `not_reporting` (`NOT_REPORTING_STATUS`). */
+export function runBadgeStatus(r: Run): RunBadgeStatus {
+  return r.not_reporting === true && r.status === "running" ? NOT_REPORTING_STATUS : r.status;
 }
 
 /** A lab row's verify outcome, in three states (#2494): what the workload's
@@ -105,7 +91,7 @@ export function runSubtitleParts(r: Run, machine: string | null): SubtitlePart[]
   // (#3016) The machine above is the one that RAN it; a relayed run also says
   // where it was asked. The same words from any serving machine: both names
   // come from the row, never from who is looking.
-  if (r.relay) parts.push({ text: `from ${r.relay.asked_on_machine}` });
+  if (r.relay) parts.push({ text: relayedFromText(r.relay) });
   return parts;
 }
 
@@ -192,10 +178,11 @@ export function runMachineLabels(runs: Run[]): Map<string, string> {
   return labels;
 }
 
-/** The runs a kind tab shows, filtered by `kind`. */
+/** The runs a kind tab shows, filtered by `kind`. Newest first by the hub's
+ * receive order (`Run.receive_key`, #3017), never an executor's clock. */
 export function runsFiltered(runs: Run[], kind: string): Run[] {
   const rows = kind === "all" ? runs.slice() : runs.filter((r) => r.kind === kind);
-  rows.sort((a, b) => runActivity(b) - runActivity(a));
+  rows.sort((a, b) => b.receive_key - a.receive_key);
   return rows;
 }
 

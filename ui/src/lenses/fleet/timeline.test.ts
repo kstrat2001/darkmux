@@ -86,11 +86,23 @@ describe("buildActivityTimeline — lanes and bars", () => {
     expect(bar.title).toContain("complete");
   });
 
-  it("classifies a watchdog-killed dispatch.error (exit 137) as 'error'/killed", () => {
+  // 5.0: the daemon marks `not_reporting` on the row; a running bar's title
+  // says it as the board does, and a finished run's does not.
+  it("a running bar's title says not reporting when the daemon marks its run", () => {
+    const silent = new Set(["s1", "s2"]);
+    const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60, false, 0, TMAX, undefined, null, [], undefined, silent);
+    const title = (sid: string) => tl.lanes[0].bars.find((b) => b.sid === sid)!.title;
+    expect(title("s1")).toContain("not reporting");
+    expect(title("s2")).toContain("complete");
+    const plain = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
+    expect(plain.lanes[0].bars.find((b) => b.sid === "s1")!.title).toContain("running");
+  });
+
+  it("classifies a watchdog-killed dispatch.error (exit 137) as 'error'", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s3")!;
     expect(bar.status).toBe("error");
-    expect(bar.title).toContain("killed");
+    expect(bar.title).toContain("error");
   });
 
   it("classifies an abandoned session (session.end, no dispatch terminal) as the canonical 'abandoned'", () => {

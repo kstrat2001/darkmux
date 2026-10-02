@@ -30,7 +30,9 @@ import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../li
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
 import type { GraphNode } from "../../types/generated/GraphNode";
+import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
 import type { MissionGraph } from "../../types/generated/MissionGraph";
+import type { MissionStatus } from "../../types/generated/MissionStatus";
 import type { StepRow } from "../../types/generated/StepRow";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
@@ -197,14 +199,15 @@ export function computeLayout(nodes: GraphNode[], narrow = false): Layout {
   return { positions, boxes, widths };
 }
 
-// ─── status vocabulary (mission-graph.html: normalizeMissionStatus,
-// STATUS_RANK, statusRank, keepPageStatus) ──────────────────────────────────
+// ─── status vocabulary (mission-graph.html: STATUS_RANK, statusRank,
+// keepPageStatus) ────────────────────────────────────────────────────────────
 
-export function normalizeMissionStatus(s: string | undefined): string | undefined {
-  return s === "closed" ? "finalized" : s;
-}
+/** The statuses a rank is defined for, from the generated unions: a new
+ *  variant is a compile error here until it is ranked. `unknown` (a mission
+ *  the daemon could not classify) deliberately has none. */
+type RankedStatus = Exclude<GraphNodeStatus | MissionStatus, "unknown">;
 
-const STATUS_RANK: Record<string, number> = {
+const STATUS_RANK: Record<RankedStatus, number> = {
   planned: 0,
   running: 1,
   complete: 2,
@@ -234,18 +237,16 @@ const STATUS_RANK: Record<string, number> = {
   waiting: 1,
   active: 1,
   finalized: 2,
-  closed: 2,
   aborted: 2,
-  paused: 1,
 };
 const UNKNOWN_STATUS_RANK = 99;
 
 export function statusRank(s: string | undefined): number {
-  if (s === undefined) return UNKNOWN_STATUS_RANK;
-  return STATUS_RANK[s] !== undefined ? STATUS_RANK[s] : UNKNOWN_STATUS_RANK;
+  return isRanked(s) ? STATUS_RANK[s] : UNKNOWN_STATUS_RANK;
 }
+const isRanked = (s: string | undefined): s is RankedStatus => s !== undefined && Object.hasOwn(STATUS_RANK, s);
 export function isUnknownStatus(s: string | undefined): boolean {
-  return s === undefined || STATUS_RANK[s] === undefined;
+  return !isRanked(s);
 }
 /** Whether a merge should KEEP the page's current value over an incoming
  * one. See mission-graph.html's own extensive comment on the asymmetry:
@@ -670,7 +671,7 @@ export function missionTotals(metrics: MetricsMap): MissionTotals {
 // ─── status transitions from flow records (mission-graph.html: STATUS_ACTIONS,
 // statusFromRecord, App's onMessage node/step status-flip branch) ──────────
 
-const STATUS_ACTIONS: ReadonlyMap<NormAction, string> = new Map<NormAction, string>([
+const STATUS_ACTIONS: ReadonlyMap<NormAction, GraphNodeStatus | MissionStatus> = new Map<NormAction, GraphNodeStatus | MissionStatus>([
   [ACTION.StepStart, "running"],
   [ACTION.StepComplete, "complete"],
   [ACTION.StepError, "error"],
@@ -682,8 +683,8 @@ const STATUS_ACTIONS: ReadonlyMap<NormAction, string> = new Map<NormAction, stri
   [ACTION.MissionAbort, "aborted"],
 ]);
 
-export function statusFromRecord(rec: NormRecord): string | undefined {
-  return normalizeMissionStatus(rec.action === undefined ? undefined : STATUS_ACTIONS.get(rec.action));
+export function statusFromRecord(rec: NormRecord): GraphNodeStatus | MissionStatus | undefined {
+  return rec.action === undefined ? undefined : STATUS_ACTIONS.get(rec.action);
 }
 
 /** `applyFlowRecord` — the pure counterpart to mission-graph.html's App

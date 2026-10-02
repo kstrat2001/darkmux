@@ -43,7 +43,11 @@ pub(crate) fn run(
     // /runs` — `fleet_records_for_runs()` degrades to an empty vec on a
     // standalone install (no `DARKMUX_REDIS_URL`), same as the handler.
     let fleet = darkmux_serve::fleet_records_for_runs();
-    let built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
+    let mut built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
+    overlay_not_reporting(&mut built.runs, || {
+        let view = darkmux_serve::fleet_view::fetch_local_daemon_view_within(&darkmux_types::config_access::serve_client_addr(), darkmux_serve::fleet_view::LOCAL_VIEW_COLD_WAIT)?;
+        Some((view, darkmux_serve::live_session_ids()))
+    });
     let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
     let report = usage.then(|| UsageReport {
         since: built.since.clone(),
@@ -127,11 +131,8 @@ fn filter_by_kind(rows: Vec<Run>, kind: RunKindArg) -> Vec<Run> {
     }
 }
 
-/// `updated_ts || completed_ts || started_ts || 0` — ported verbatim from
-/// `ui/src/lenses/runs/format.ts::runActivity`, the RUNS lens's own recency
-/// key (see `Run::updated_ts`'s own doc: "the one field the runs lens can
-/// always order by, across all three sources"). Drives both the ordering
-/// within each half of [`select_rows`] and the JSON default order.
+/// `updated_ts || completed_ts || started_ts || 0`: the row's own time, for the
+/// `--since` bound only. Ordering is by `Run::receive_key`.
 fn run_activity(r: &Run) -> u64 {
     r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(0)
 }
@@ -161,12 +162,12 @@ struct Selection {
 ///    in-flight run", and a cap that could hide live work reintroduces
 ///    that bug in a new place. A shorter table is the better failure.
 ///
-/// Both halves are ordered newest-activity-first via [`run_activity`].
+/// Both halves are ordered newest-first by the hub's receive order (`Run::receive_key`).
 /// `all` lifts the cap, and `limit == 0` is treated as unlimited too — the
 /// SAME convention `mission status --limit` documents ("0 = no cap"), kept
 /// consistent here rather than reinventing a second meaning for zero.
 fn select_rows(mut rows: Vec<Run>, limit: usize, all: bool) -> Selection {
-    rows.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.receive_key));
     let (running, terminal): (Vec<Run>, Vec<Run>) =
         rows.into_iter().partition(|r| r.status == RunStatus::Running);
     let total_terminal = terminal.len();
@@ -235,8 +236,54 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
     }
 }
 
-pub(crate) fn status_label(status: RunStatus) -> &'static str {
-    status.as_str()
+
+/// Whether a running row executed on a machine other than this one: the only
+/// rows that can read "not reporting".
+fn running_on_another_machine(r: &Run) -> bool {
+    if r.status != RunStatus::Running {
+        return false;
+    }
+    match (&r.machine_uid, darkmux_hardware::machine_uid()) {
+        (Some(uid), Some(mine)) => !uid.eq_ignore_ascii_case(mine),
+        // No uid to compare: by name. A machine whose own name is unknown cannot rule
+        // a row out, and a needless look costs only time (the view never marks this machine).
+        _ => match (&r.machine, darkmux_types::config_access::machine_id()) {
+            (Some(name), Some(mine)) => !name.eq_ignore_ascii_case(&mine),
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+    }
+}
+
+/// The overlay the daemon's `/runs` applies (`darkmux_serve::apply_not_reporting`,
+/// the one owner of "not reporting"). It gathers only when some running row is on
+/// ANOTHER machine, quietly and within a bound (the view from its own local daemon,
+/// which on a cold cache waits up to one peer-card timeout; the live beats from
+/// Redis, read directly and bounded); a gather that fails marks nothing
+/// and says nothing.
+fn overlay_not_reporting(
+    rows: &mut [Run],
+    gather: impl FnOnce() -> Option<(darkmux_serve::fleet_view::FleetView, Option<std::collections::HashSet<String>>)>,
+) {
+    if !rows.iter().any(running_on_another_machine) {
+        return;
+    }
+    if let Some((view, live)) = gather() {
+        darkmux_serve::apply_not_reporting(rows, Some(&view), live.as_ref());
+    }
+}
+
+/// The STATUS column's word: the same one the viewer's board and run page
+/// read (`ui/src/lib/runStatusWord.ts`). `tests/fixtures/run-status-words.json`
+/// holds the words both sides must give. An abandoned run says why in its own
+/// word, so the column needs no second line for it.
+pub(crate) fn status_label(r: &Run) -> &'static str {
+    match r.status {
+        RunStatus::Running if r.not_reporting => "not reporting",
+        RunStatus::Abandoned if r.abandoned_reason == Some(AbandonReason::Aborted) => "aborted",
+        RunStatus::Abandoned => "no ending",
+        status => status.as_str(),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -377,26 +424,22 @@ fn short_model(model: &str) -> &str {
 /// The narrow-pane subtitle: everything [`subtitle_for`] carries, plus the
 /// machine, for when the MACHINE column has been shed (#1929).
 fn subtitle_with_machine(r: &Run) -> String {
-    let base = subtitle_for(r);
-    match (&r.machine, base.is_empty()) {
-        (Some(m), true) => m.clone(),
-        (Some(m), false) => format!("{base} · {m}"),
-        (None, _) => base,
-    }
+    let mut bits = subtitle_bits(r);
+    bits.extend(r.machine.clone());
+    bits.extend(relay_text(r));
+    bits.join(" · ")
 }
 
-/// `[reason ·] [workload ·] [verify ·] role · model · via route` — the same fields, join and order
-/// as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
-/// `shortModel` treatment of the model id (see [`short_model`]).
-///
-/// (#1907) `abandoned_reason` leads the line when present. `STATUS_COLS` is
-/// fixed-width, pinned to `"unparseable"` (11 chars); widening it to fit
-/// "no ending recorded" would make every row carry that width even when
-/// the reason is absent. The subtitle is already free-width text, so the
-/// honest split is here: the STATUS column still reads `abandoned` (a
-/// caller scanning column-by-column sees the same six values
-/// `status_label` has always emitted) and the reason sits first on the
-/// line under it.
+/// A relayed run says where it was asked: "from <machine>", the same words as
+/// `ui/src/lib/relayWords.ts` (`tests/fixtures/run-status-words.json`).
+fn relay_text(r: &Run) -> Option<String> {
+    r.relay.as_ref().map(|relay| format!("from {}", relay.asked_on_machine))
+}
+
+/// `[workload ·] [verify ·] role · model · via route · [from machine]` — the
+/// same fields, join and order as `ui/src/lenses/runs/format.ts::runSubtitle`,
+/// including its `shortModel` treatment of the model id (see [`short_model`]).
+/// Why an abandoned run stopped is in its STATUS word, not here.
 ///
 /// (#1929) Machine is NOT here any more — it is a real headed column. It
 /// used to ride in this subtitle, which reads as prose on a mission row
@@ -406,17 +449,13 @@ fn subtitle_with_machine(r: &Run) -> String {
 /// See [`subtitle_with_machine`] for the narrow-pane case where the
 /// column is shed and machine rejoins the line.
 fn subtitle_for(r: &Run) -> String {
+    let mut bits = subtitle_bits(r);
+    bits.extend(relay_text(r));
+    bits.join(" · ")
+}
+
+fn subtitle_bits(r: &Run) -> Vec<String> {
     let mut bits: Vec<String> = Vec::new();
-    if let Some(reason) = r.abandoned_reason {
-        bits.push(
-            match reason {
-                AbandonReason::Aborted => "aborted",
-                AbandonReason::NoTerminal => "no ending recorded",
-                AbandonReason::Unknown => "reason not recognized",
-            }
-            .to_string(),
-        );
-    }
     if let Some(workload) = &r.workload {
         bits.push(workload.clone());
     }
@@ -432,7 +471,7 @@ fn subtitle_for(r: &Run) -> String {
     if let Some(route) = &r.route {
         bits.push(format!("via {route}"));
     }
-    bits.join(" · ")
+    bits
 }
 
 /// A lab row's verify outcome, in three states rather than two (#2494): what
@@ -466,7 +505,7 @@ const VERIFY_FAIL_LABEL: &str = "verify FAIL";
 /// over budget, since `{:<10}` is a minimum and never truncates.
 const INDENT_COLS: usize = 2;
 const KIND_COLS: usize = 8; // "dispatch"
-const STATUS_COLS: usize = 11; // "unparseable"
+const STATUS_COLS: usize = 13; // "not reporting"
 const STARTED_COLS: usize = 10;
 const DURATION_COLS: usize = 10;
 /// (#2902) `999.99k` is the widest [`tokens_cell`] below a billion tokens.
@@ -614,7 +653,7 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
         "{:i$}{:<k$} {:<s$} {:<t$} {:<d$} {:>n$}{:g$}{}{}",
         "",
         kind_label(r.kind),
-        status_label(r.status),
+        status_label(r),
         started_cell(now, r),
         duration_cell(now, r),
         tokens_cell(r.tokens),
@@ -750,7 +789,7 @@ fn json_payload<'a>(
     usage: Option<&'a UsageReport>,
 ) -> RunListOutput<'a> {
     let mut sorted: Vec<&Run> = rows.iter().collect();
-    sorted.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.receive_key));
     RunListOutput { kind, total: sorted.len(), runs: sorted, fleet, since, usage }
 }
 
@@ -964,6 +1003,8 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
+            receive_key: updated_ts * 1000 * 1024,
+            not_reporting: false,
         }
     }
 
@@ -1314,11 +1355,111 @@ mod tests {
         }
     }
 
-    /// (F10/F11) A degraded run is listed as `degraded`, never `complete`.
+    #[derive(serde::Deserialize)]
+    struct WordCase {
+        status: RunStatus,
+        #[serde(default)]
+        abandoned_reason: Option<AbandonReason>,
+        #[serde(default)]
+        not_reporting: bool,
+        word: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct RelayCase {
+        asked_on_machine: String,
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Words {
+        statuses: Vec<WordCase>,
+        relay: RelayCase,
+    }
+    fn words() -> Words {
+        serde_json::from_str(include_str!("../tests/fixtures/run-status-words.json")).expect("the shared words parse")
+    }
+
+    /// 5.0: the STATUS column reads the word the viewer's board and run page
+    /// read, from one shared fixture (`runStatusWord.test.ts` reads it too).
+    /// A degraded run is `degraded`, never `complete` (F10/F11).
     #[test]
-    fn a_degraded_run_is_labeled_degraded_not_complete() {
-        assert_eq!(status_label(RunStatus::Degraded), "degraded");
-        assert_ne!(status_label(RunStatus::Degraded), status_label(RunStatus::Complete));
+    fn the_status_column_reads_the_words_the_board_reads() {
+        for c in words().statuses {
+            let mut r = mk_run("r", RunKind::Mission, c.status, 1);
+            r.abandoned_reason = c.abandoned_reason;
+            r.not_reporting = c.not_reporting;
+            assert_eq!(status_label(&r), c.word, "{:?} {:?}", c.status, c.abandoned_reason);
+        }
+    }
+
+    fn running_on(machine: &str) -> Run {
+        let mut r = mk_run("r", RunKind::Dispatch, RunStatus::Running, 1);
+        r.machine = Some(machine.to_string());
+        r
+    }
+
+    fn down_peer_view() -> darkmux_serve::fleet_view::FleetView {
+        use crate::machine_list::tests::{machine, own_row, view};
+        use darkmux_serve::fleet_view::{CardOutcome, Liveness, UnreachableReason};
+        view(vec![
+            own_row(),
+            machine("far-peer", Liveness::NoBeat, CardOutcome::Unreachable { reason: UnreachableReason::ListenerOff, detail: None }),
+        ])
+    }
+
+    /// 5.0: `run list` pays for no gather unless a row is running on ANOTHER machine.
+    #[test]
+    fn the_overlay_gathers_nothing_when_no_row_runs_on_another_machine() {
+        let mut done_elsewhere = running_on("far-peer");
+        done_elsewhere.status = RunStatus::Complete;
+        let mut rows = vec![done_elsewhere, mk_run("local", RunKind::Dispatch, RunStatus::Running, 1)];
+        overlay_not_reporting(&mut rows, || panic!("a gather happened with no running remote row"));
+        assert!(rows.iter().all(|r| !r.not_reporting));
+    }
+
+    /// The overlay is wired at this call site: a running row on a down peer reads
+    /// not reporting; a gather that fails, or a failed beat read, marks nothing.
+    #[test]
+    fn the_overlay_marks_a_running_row_on_a_down_peer_and_nothing_on_a_failed_read() {
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || Some((down_peer_view(), Some(Default::default()))));
+        assert!(rows[0].not_reporting, "the down peer's running row is marked");
+
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || None);
+        assert!(!rows[0].not_reporting, "no view: nothing is marked");
+
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || Some((down_peer_view(), None)));
+        assert!(!rows[0].not_reporting, "a failed beat read: nothing is marked");
+    }
+
+    /// 5.0 (#3017): `run list` orders by the hub's receive order like the board,
+    /// never by an executor's clock.
+    #[test]
+    fn rows_order_by_receive_key_not_by_the_executors_clock() {
+        let mut skewed = mk_run("skewed", RunKind::Mission, RunStatus::Complete, 4_000_000_000);
+        skewed.receive_key = 1_700_000_000_000 * 1024;
+        let mut honest = mk_run("honest", RunKind::Dispatch, RunStatus::Complete, 1_700_000_100);
+        honest.receive_key = 1_700_000_100_000 * 1024;
+        let sel = select_rows(vec![skewed.clone(), honest.clone()], 10, false);
+        let ids: Vec<&str> = sel.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["honest", "skewed"]);
+        let rows = [skewed, honest];
+        let payload = json_payload(&rows, RunKindArg::All, &darkmux_serve::source_state::SourceState::Ok, None, None);
+        assert_eq!(payload.runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["honest", "skewed"]);
+    }
+
+    /// A relayed run says "from <machine>", in the subtitle (and in the narrow
+    /// pane, after the machine), as the board does.
+    #[test]
+    fn a_relayed_run_reads_from_the_asking_machine() {
+        let w = words().relay;
+        let mut r = mk_run("r", RunKind::Dispatch, RunStatus::Complete, 1);
+        r.role = Some("coder".into());
+        r.machine = Some("studio".into());
+        r.relay = Some(darkmux_serve::RunRelay { asked_on_machine: w.asked_on_machine, sender_run: None });
+        assert_eq!(subtitle_for(&r), format!("coder · {}", w.text));
+        assert_eq!(subtitle_with_machine(&r), format!("coder · studio · {}", w.text));
     }
 
     /// Every label a column can emit must FIT that column, because
@@ -1327,17 +1468,8 @@ mod tests {
     /// is why `STATUS_COLS` is not 10.
     #[test]
     fn every_column_label_fits_its_width() {
-        for st in [
-            RunStatus::Planned,
-            RunStatus::Running,
-            RunStatus::Complete,
-            RunStatus::Degraded,
-            RunStatus::Error,
-            RunStatus::Escalated,
-            RunStatus::Abandoned,
-            RunStatus::Unparseable,
-        ] {
-            let label = status_label(st);
+        for c in words().statuses {
+            let label = c.word;
             assert!(
                 label.chars().count() <= STATUS_COLS,
                 "status label {label:?} is {} cols, STATUS_COLS is {STATUS_COLS}: every row \
@@ -1388,13 +1520,15 @@ mod tests {
     /// when it cannot fit the known width.
     #[test]
     fn an_overlong_subtitle_is_dropped_whole_not_wrapped() {
+        // The narrowest pane the table supports (`MIN_ROW_COLS`). The STATUS column grew to
+        // 13 for "not reporting", so this floor is 2 columns wider than it was at 60.
         let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
         r.role = Some("a-role-name-far-too-long-to-fit-in-this-narrow-pane".to_string());
         let rows = vec![r];
-        let id_w = id_width(&rows, Some(60));
-        let line = format_row(2, &rows[0], id_w, Some(60), show_machine_column(Some(60)));
+        let id_w = id_width(&rows, Some(MIN_ROW_COLS));
+        let line = format_row(2, &rows[0], id_w, Some(MIN_ROW_COLS), show_machine_column(Some(MIN_ROW_COLS)));
         assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
-        assert!(line.chars().count() <= 60);
+        assert!(line.chars().count() <= MIN_ROW_COLS);
         assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
     }
 
@@ -1462,31 +1596,9 @@ mod tests {
         assert_eq!(subtitle_for(&r), "gpt-4o");
     }
 
-    /// (#1907) `abandoned_reason` leads the subtitle line — see that
-    /// field's own doc on `subtitle_for` for why it lives here rather than
-    /// widening the fixed-width STATUS column (`STATUS_COLS` is pinned to
-    /// `"unparseable"`'s width, and "no ending recorded" is longer).
+    /// An abandoned row's reason is its STATUS word, so the subtitle carries none.
     #[test]
-    fn subtitle_for_leads_with_the_abandoned_reason_when_present() {
-        let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Abandoned, 1);
-        r.abandoned_reason = Some(AbandonReason::Aborted);
-        assert_eq!(subtitle_for(&r), "aborted");
-
-        r.abandoned_reason = Some(AbandonReason::NoTerminal);
-        assert_eq!(subtitle_for(&r), "no ending recorded");
-
-        r.role = Some("coder".to_string());
-        assert_eq!(
-            subtitle_for(&r),
-            "no ending recorded · coder",
-            "the reason leads; the usual role/model/route/machine bits still follow"
-        );
-    }
-
-    /// A non-abandoned row (or an abandoned row from an older server with
-    /// no `abandoned_reason` on the wire) must not print a phantom reason.
-    #[test]
-    fn subtitle_for_omits_the_reason_when_absent() {
+    fn subtitle_for_carries_no_reason() {
         let r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
         assert_eq!(subtitle_for(&r), "");
     }

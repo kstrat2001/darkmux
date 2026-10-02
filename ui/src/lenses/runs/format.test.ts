@@ -16,7 +16,7 @@ import { machineMatch } from "../../lib/machineIdentity";
 import { FLEET_UID as U, fleetRun, lower, machineFleet } from "../../testing/machineFleet";
 
 function run(over: Partial<Run> & Pick<Run, "id" | "kind" | "status" | "tracked">): Run {
-  return over;
+  return { receive_key: (over.updated_ts ?? 0) * 1000 * 1024, ...over };
 }
 
 describe("shortModel", () => {
@@ -142,26 +142,27 @@ describe("runStatusLabel", () => {
     const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "aborted" });
     expect(runStatusLabel(r)).toBe("aborted");
   });
-  it("reads a missing terminal record as 'no ending recorded'", () => {
+  it("reads a missing terminal record as 'no ending'", () => {
     const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "noterminal" });
-    expect(runStatusLabel(r)).toBe("no ending recorded");
+    expect(runStatusLabel(r)).toBe("no ending");
   });
-  it("falls back to 'no ending recorded' when abandoned but the reason is absent (an older server)", () => {
+  it("falls back to 'no ending' when abandoned but the reason is absent (an older server)", () => {
     const r = run({ id: "a", kind: "dispatch", status: "abandoned", tracked: false });
-    expect(runStatusLabel(r)).toBe("no ending recorded");
+    expect(runStatusLabel(r)).toBe("no ending");
   });
   // (5.0 R3) A running run on a machine that is not reporting has no live
-  // evidence behind it, so it reads unknown. Nothing else changes.
-  it("reads a running run on a machine that is not reporting as 'unknown'", () => {
-    const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true });
-    expect(runStatusLabel(r, true)).toBe("unknown");
-    expect(runBadgeStatus(r, true)).toBe("unknown");
-    expect(runStatusLabel(r, false)).toBe("running");
+  // evidence behind it, so it reads "not reporting", a word of its own that is
+  // not the `unparseable` run status. Nothing else changes.
+  it("reads a running run on a machine that is not reporting as 'not reporting'", () => {
+    const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true, not_reporting: true });
+    expect(runStatusLabel(r)).toBe("not reporting");
+    expect(runBadgeStatus(r)).toBe("not_reporting");
+    expect(runStatusLabel({ ...r, not_reporting: false })).toBe("running");
   });
   it("leaves a finished run's status alone even when its machine is not reporting", () => {
-    const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true });
-    expect(runStatusLabel(r, true)).toBe("complete");
-    expect(runBadgeStatus(r, true)).toBe("complete");
+    const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, not_reporting: true });
+    expect(runStatusLabel(r)).toBe("complete");
+    expect(runBadgeStatus(r)).toBe("complete");
   });
   it("leaves every other status unchanged", () => {
     for (const status of ["planned", "running", "complete", "degraded", "error", "unparseable"] as const) {
@@ -217,6 +218,22 @@ describe("runsFiltered", () => {
   });
   it("filters to one kind", () => {
     expect(runsFiltered(runs, "mission").map((r) => r.id)).toEqual(["a"]);
+  });
+});
+
+// 5.0: the board orders by the row's receive key (#3017), the hub's order,
+// never a writer's clock: a peer whose clock runs ahead cannot sit above work
+// received later.
+describe("runsFiltered by the receive key", () => {
+  const skewed = run({ id: "peer-run", kind: "mission", status: "running", tracked: false, updated_ts: 4_000_000_000, receive_key: 1_700_000_000_000 * 1024 });
+  const honest = run({ id: "local-run", kind: "dispatch", status: "complete", tracked: true, updated_ts: 1_700_000_100, receive_key: 1_700_000_100_000 * 1024 });
+
+  it("puts the run the hub received last first, whatever the executor's clock says", () => {
+    expect(runsFiltered([skewed, honest], "all").map((r) => r.id)).toEqual(["local-run", "peer-run"]);
+  });
+  it("ignores the executor's updated_ts entirely", () => {
+    const flipped = { ...honest, updated_ts: 1 };
+    expect(runsFiltered([skewed, flipped], "all").map((r) => r.id)).toEqual(["local-run", "peer-run"]);
   });
 });
 

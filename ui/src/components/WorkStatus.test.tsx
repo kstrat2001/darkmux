@@ -6,31 +6,29 @@ import { WorkStatus, workStatusKind } from "./WorkStatus";
 // mission shows a non-pulsing green ACTIVE … meant to mean the same thing at
 // a different scope level … prefer re-usable and consistent indicators." One
 // chip, one vocabulary, one pulse — every scope's raw status maps into it.
-describe("workStatusKind — every raw status the app has maps into six kinds", () => {
+describe("workStatusKind — every raw status the app has maps into seven kinds", () => {
   it.each([
     ["running", "running"],
     ["active", "running"],
-    ["live", "running"],
     ["complete", "done"],
-    ["finished", "done"],
     ["finalized", "done"],
-    ["closed", "done"],
     ["error", "error"],
-    ["errored", "error"],
-    ["killed", "error"],
     // (#2406) A mixed terminal — real output shipped, some of it did not.
     // Its own kind, distinct from `stopped` even though they share a color.
     ["degraded", "degraded"],
     ["aborted", "stopped"],
     ["abandoned", "stopped"],
-    ["interrupted", "stopped"],
     // (F2) A deliberate escalation is a caution, never the error color.
     ["escalated", "stopped"],
     ["planned", "idle"],
     ["unparseable", "idle"],
-    ["unknown", "idle"],
-    [undefined, "idle"],
-    ["something-new", "idle"],
+    ["waiting", "idle"],
+    ["not_reporting", "idle"],
+    // A mission the daemon could not classify, no status at all, and a word this
+    // build has never heard: all `unknown`, never `idle`.
+    ["unknown", "unknown"],
+    [undefined, "unknown"],
+    ["something-new", "unknown"],
   ])("%s → %s", (raw, kind) => {
     expect(workStatusKind(raw)).toBe(kind);
   });
@@ -59,7 +57,7 @@ describe("<WorkStatus>", () => {
     expect(done.textContent).toBe("finalized");
     const aborted = render(<WorkStatus status="abandoned" label="no ending recorded" />).container.firstElementChild!;
     expect(aborted.textContent).toBe("no ending recorded");
-    const el = render(<WorkStatus status="live" label="● live" live="stale" />).container.firstElementChild!;
+    const el = render(<WorkStatus status="running" label="● live" live="stale" />).container.firstElementChild!;
     expect(el.textContent).toBe("running");
     expect(el.getAttribute("data-live")).toBe("stale");
   });

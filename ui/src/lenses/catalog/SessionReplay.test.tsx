@@ -97,7 +97,7 @@ describe("SessionReplay", () => {
       vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
     );
     renderReplay(sid);
-    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, asked on MacBook-Pro/));
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, from MacBook-Pro/));
   });
 
   it("(#3017) reads the relay origin from the runs board's cached answer, without fetching /runs again", async () => {
@@ -115,7 +115,7 @@ describe("SessionReplay", () => {
         <SessionReplay sessionId={sid} viewerUid={null} />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/asked on MacBook-Pro/));
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/from MacBook-Pro/));
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/runs"))).toHaveLength(0);
   });
 
@@ -781,7 +781,7 @@ describe("SessionReplay", () => {
     renderReplay("s-ended");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     const pillEl = document.querySelector(".session-run__header .pill");
-    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending recorded");
+    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending");
     expect(pillEl?.getAttribute("title")).toBe("finished");
   });
 
@@ -789,53 +789,42 @@ describe("SessionReplay", () => {
   // evidence and no terminal record can arrive: the pill says UNKNOWN, in the
   // place the page already states its status, instead of RUNNING.
   describe("a run on a machine that is not reporting", () => {
-    const peerRow = (liveness: "no_beat" | "live") => ({
-      entry: { id: "studio", address: "a:1", added_unix_ms: 1 },
-      is_this_machine: false,
-      machine_uid: "u-studio",
-      liveness,
-      card: { state: "unreachable", reason: "listener_off", detail: null },
-    });
-    const mount = async (liveness: "no_beat" | "live", ended = false, liveSession = false) => {
+    // The daemon marks the row (`Run.not_reporting`, `mark_not_reporting` in
+    // Rust, which owns the live-beat exception); the page reads it from the
+    // runs board's answer and derives nothing of its own.
+    const mount = async (notReporting: boolean, ended = false) => {
       const at = (ms: number) => new Date(Date.now() - ms).toISOString();
       const records = [
         { ts: at(30_000), action: "dispatch.start", session_id: "s-peer", machine_id: "studio", machine_uid: "u-studio", payload: { role: "coder" } },
         ...(ended ? [{ ts: at(10_000), action: "dispatch.complete", session_id: "s-peer", machine_id: "studio", machine_uid: "u-studio", payload: { wall_ms: 20_000 } }] : []),
       ];
+      const runs = [{ id: "s-peer", kind: "dispatch", status: ended ? "complete" : "running", tracked: false, dispatch_id: "s-peer", machine: "studio", machine_uid: "u-studio", ...(notReporting ? { not_reporting: true } : {}) }];
       vi.stubGlobal(
         "fetch",
-        vi.fn((url: string) => {
-          if (url === "/fleet/dispatches/live") {
-            const dispatches = liveSession ? [{ session_id: "s-peer", machine_id: "studio" }] : [];
-            return Promise.resolve(new Response(JSON.stringify({ dispatches, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
-          }
-          if (url === "/fleet/view") return Promise.resolve(new Response(JSON.stringify({ machines: [peerRow(liveness)] }), { status: 200 }));
-          return Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }));
-        }),
+        vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
       );
       renderReplay("s-peer");
       await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
-      // Both reads the verdict depends on have been asked and answered.
-      const asked = (u: string) => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => c[0] === u);
-      await waitFor(() => expect(asked("/fleet/view") && asked("/fleet/dispatches/live")).toBe(true));
+      const asked = (u: string) => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => String(c[0]).includes(u));
+      await waitFor(() => expect(asked("/runs")).toBe(true));
       await new Promise((r) => setTimeout(r, 0));
       return () => document.querySelector(".session-run__header .pill");
     };
 
-    it("reads UNKNOWN and does not pulse", async () => {
-      const pill = await mount("no_beat");
-      await waitFor(() => expect(pill()?.textContent).toBe("UNKNOWN"));
+    it("reads NOT REPORTING and does not pulse", async () => {
+      const pill = await mount(true);
+      await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       expect(pill()?.getAttribute("data-live")).toBeNull();
       expect(pill()?.getAttribute("title")).toMatch(/not reporting/i);
       // One status place: the brief's timing line does not call it running either.
       const timing = [...document.querySelectorAll(".brief-pair")].find((p) => p.textContent?.startsWith("timing"));
-      expect(timing?.textContent).toMatch(/· unknown$/);
+      expect(timing?.textContent).toMatch(/· not reporting$/);
       expect(document.querySelector(".session-run")?.textContent).not.toMatch(/\brunning\b/i);
     });
 
     it("does not count a clock up toward now for a run nobody is reporting on", async () => {
-      const pill = await mount("no_beat");
-      await waitFor(() => expect(pill()?.textContent).toBe("UNKNOWN"));
+      const pill = await mount(true);
+      await waitFor(() => expect(pill()?.textContent).toBe("NOT REPORTING"));
       const readout = () => document.querySelector(".metrics")?.textContent;
       const before = readout();
       await new Promise((r) => setTimeout(r, 2100));
@@ -843,22 +832,31 @@ describe("SessionReplay", () => {
     });
 
     it("leaves a run that recorded its end alone: it finished, whoever is reporting now", async () => {
-      const pill = await mount("no_beat", true);
+      const pill = await mount(true, true);
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("complete"));
     });
 
-    it("keeps reading RUNNING while the machine is reporting", async () => {
-      const pill = await mount("live");
-      await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("running"));
+    // A mission row carries only its earliest session as `dispatch_id`; a later
+    // step's page finds the row by its mission id, or it ticks "running" for a
+    // mission on a machine that is down.
+    it("a later step of a running mission on a not-reporting machine reads NOT REPORTING", async () => {
+      const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+      const records = [
+        { ts: at(30_000), action: "dispatch.start", session_id: "s-step2", mission_id: "m-peer", machine_id: "studio", machine_uid: "u-studio", payload: { role: "coder" } },
+      ];
+      const runs = [{ id: "m-peer", kind: "mission", status: "running", tracked: false, dispatch_id: "s-step1", machine: "studio", machine_uid: "u-studio", not_reporting: true }];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+      );
+      renderReplay("s-step2");
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent).toBe("NOT REPORTING"));
+      expect(document.querySelector(".session-run__header .pill")?.getAttribute("data-live")).toBeNull();
     });
 
-    // `no_beat` is "no daemon beat found", not "down": a peer running a bare
-    // dispatch still beats its session, and a live session is never unknown.
-    it("a run whose session is live is never unknown, even when its machine's row reads down", async () => {
-      const pill = await mount("no_beat", false, true);
+    it("keeps reading RUNNING when the row is not marked", async () => {
+      const pill = await mount(false);
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("running"));
-      await new Promise((r) => setTimeout(r, 100));
-      expect(pill()?.textContent?.toLowerCase()).toBe("running");
       expect(pill()?.getAttribute("data-live")).not.toBeNull();
     });
   });
@@ -882,7 +880,7 @@ describe("SessionReplay", () => {
 
       const pillEl = document.querySelector(".session-run__header .pill");
       const pill = pillEl?.textContent ?? "";
-      expect(pill.toLowerCase()).toContain("no ending recorded");
+      expect(pill.toLowerCase()).toContain("no ending");
       expect(pill.toLowerCase()).not.toContain("running");
       // Not a running chip, so no pulse rides it; its description says the
       // run may be abandoned, never that it finished.

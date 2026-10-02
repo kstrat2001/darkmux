@@ -5279,6 +5279,8 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
+            receive_key: 0,
+            not_reporting: false,
         };
         let payload = board_value(&[], std::slice::from_ref(&peer_run), &SourceState::Ok);
         assert_eq!(payload["peer_missions"][0]["id"], "review-peer-3");
@@ -5350,6 +5352,8 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
+            receive_key: 0,
+            not_reporting: false,
         }
     }
 

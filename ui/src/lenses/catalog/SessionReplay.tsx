@@ -1,9 +1,10 @@
 import { scopeCenter } from "../../lib/scopeCenter";
 import { WorkStatus } from "../../components/WorkStatus";
+import { relayOf, relayedFromText } from "../../lib/relayWords";
 import { Shimmer } from "../../components/Placeholder";
 import { LampDot } from "../../components/LampDot";
 import { LampForm } from "../../lib/lamp";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
@@ -29,13 +30,11 @@ import { liveStateLabel, reasonForLine, toolReadout, type LiveStateReading } fro
 import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
+import type { Run } from "../../types/generated/Run";
 import type { RunRelay } from "../../types/generated/RunRelay";
-import { useRelayOrigin } from "../../hooks/useRelayOrigin";
-import { CLEAN_DETECTORS, runRegions, sessionMachine } from "../session/sessionRun";
-import { useFleetView } from "../../hooks/useFleetView";
-import { machineNotReporting } from "../fleet/viewRows";
+import { useRunRow } from "../../hooks/useRunRow";
+import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
-import type { MachineRef } from "../../lib/machineIdentity";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 
@@ -482,9 +481,9 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
-/** (#3017) ", asked on <machine>" for relayed work, else nothing. */
-function askedOnSuffix(relay: RunRelay | null): string {
-  return relay ? `, asked on ${relay.asked_on_machine}` : "";
+/** (#3017) ", from <machine>" for relayed work, else nothing. */
+function relayedSuffix(relay: RunRelay | null): string {
+  return relay ? `, ${relayedFromText(relay)}` : "";
 }
 
 /** The pill's tooltip: what the liveness pulse says, except for a run whose
@@ -493,17 +492,13 @@ function pillTitle(status: string, liveness: string): string {
   return status === NOT_REPORTING_STATUS ? NOT_REPORTING_TITLE : liveness;
 }
 
-/** (5.0 R3) Whether the page's run executed on a machine the fleet view holds
- *  as down, and whether the page must treat the run as stopped: presence saw it
- *  go (`endedByPresence`), or its machine is held as down while presence does
- *  not list the session as live (`no_beat` only says no daemon beat was found:
- *  a peer running a bare dispatch still beats its session). Presence is a fact
- *  about now, so a parked playhead (`live` false) judges without it. */
-function useRunSilence(data: NormRecord[], hasRecords: boolean, sessionId: string, live: boolean, endedByPresence: boolean, sessionLive: boolean) {
-  const fleetView = useFleetView(getSource().kind === "daemon" && live);
-  const notReporting = useCallback((on: MachineRef) => !sessionLive && machineNotReporting(fleetView.rows, on), [fleetView.rows, sessionLive]);
-  const silent = hasRecords && notReporting(sessionMachine(data, sessionId));
-  return { notReporting, stopped: endedByPresence || silent };
+/** Whether the page's run is not reporting and whether the page must treat the
+ *  run as stopped: presence saw it go (`endedByPresence`), or the daemon marks
+ *  its row `not_reporting` (`Run.not_reporting`, decided once in Rust: the fleet
+ *  view holds its machine as down and no live beat names it). */
+function useRunSilence(hasRecords: boolean, row: Run | null, endedByPresence: boolean) {
+  const notReporting = row?.not_reporting === true;
+  return { notReporting, stopped: endedByPresence || (hasRecords && notReporting) };
 }
 
 export function SessionReplay({
@@ -574,7 +569,6 @@ export function SessionReplay({
   // (`judgementAt`, below: the rule the event log beside this page reads).
   const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
   const policy = useLifecyclePolicy();
-  const relay = useRelayOrigin(sessionId);
 
   // (#2065) A static build has no `/flow-dispatch/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -633,6 +627,9 @@ export function SessionReplay({
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId, missionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
+  // The run's row on the board: a later step of a mission is found by its mission id.
+  const runRow = useRunRow(sessionId, ownMissionId, playhead === null);
+  const relay = relayOf(runRow);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
     [ownRaw, sessionId],
@@ -735,7 +732,7 @@ export function SessionReplay({
   // (5.0 R3) A run on a machine the fleet view holds as down has no live
   // evidence and no terminal record can arrive: it is not plausibly running,
   // so nothing ticks or pulses, and the pill says unknown.
-  const { notReporting, stopped } = useRunSilence(data, hasRecords, sessionId, playhead === null, endedByPresence, isLive);
+  const { notReporting, stopped } = useRunSilence(hasRecords, runRow, endedByPresence);
   const plausiblyRunning =
     pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !stopped;
   // (#2757) `playhead === null` — a non-null playhead means the operator has
@@ -872,7 +869,7 @@ export function SessionReplay({
         {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName}
-          {askedOnSuffix(relay)})
+          {relayedSuffix(relay)})
         </span>
       </h2>
 

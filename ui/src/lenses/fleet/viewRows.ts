@@ -14,9 +14,8 @@ import type { Liveness } from "../../types/generated/Liveness";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { UnavailableWhy } from "../../types/generated/UnavailableWhy";
 import type { UnreachableReason } from "../../types/generated/UnreachableReason";
-import { findUid, nameKey, sameMachine, sameUid, type MachineRef } from "../../lib/machineIdentity";
+import { findUid, nameKey, sameUid } from "../../lib/machineIdentity";
 import { utilityReading, type UtilityReading } from "../../lib/utilityJobs";
-import { isUnseen, machineAvailability } from "../../lib/machineAvailability";
 
 /** Whether a machine is up, as the card should say it. `unknown` is a real
  * third answer: presence could not say, and nothing else did either. */
@@ -276,19 +275,3 @@ export function rowFacts(
   };
 }
 
-/** (5.0 R3) Whether the machine a run executes on is not saying anything:
- * the view holds it, and holds it as down. A run recorded as running there has
- * no live evidence behind it, so its state is unknown, not running. A machine
- * the view does not hold, this machine, and an absent view claim nothing: the
- * run's own records stand. A row's names are its card's own name and its
- * roster id, the two a run may be recorded under. */
-export function machineNotReporting(rows: readonly FleetMachine[] | null, ref: MachineRef): boolean {
-  const row = (rows ?? []).find((r) => rowNamed(r, ref));
-  if (!row) return false;
-  return isUnseen(machineAvailability({ self: false, seen: true, standing: rowStanding(row) }));
-}
-
-function rowNamed(row: FleetMachine, ref: MachineRef): boolean {
-  const names = [rowSpecs(row)?.machine_id, row.entry?.id].filter((n): n is string => !!n);
-  return names.some((name) => sameMachine(ref, { uid: row.machine_uid, name }));
-}

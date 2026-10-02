@@ -413,6 +413,27 @@ pub enum DeclaredHubs<'a> {
 }
 
 impl FleetView {
+    /// The name a row is listed under: its roster id, or this machine's own
+    /// name when the roster has no entry for it.
+    pub fn row_name(&self, m: &FleetMachine) -> String {
+        match &m.entry {
+            Some(e) => e.id.clone(),
+            None => self.local_machine_id.clone().unwrap_or_else(|| "<this machine>".to_string()),
+        }
+    }
+
+    /// Every name a machine selector may name: each row's [`Self::row_name`],
+    /// this machine's own included. The ONE legal set, for the CLI's
+    /// `--machine` and for the panel's machine option alike.
+    pub fn selector_names(&self) -> Vec<String> {
+        self.machines.iter().map(|m| self.row_name(m)).collect()
+    }
+
+    /// The row a selector names, matched without regard to case.
+    pub fn find_row(&self, name: &str) -> Option<&FleetMachine> {
+        self.machines.iter().find(|m| self.row_name(m).eq_ignore_ascii_case(name))
+    }
+
     /// The machines whose cards declare `hub`.
     pub fn declared_hubs(&self) -> DeclaredHubs<'_> {
         let mut hubs: Vec<&FleetMachine> =
@@ -775,6 +796,12 @@ pub fn gather_fleet_view_now() -> FleetView {
 /// machine's seats and governor readings. `None` when no daemon answers, or
 /// it answers with something that is not a view (an older darkmux).
 pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
+    fetch_local_daemon_view_within(daemon_addr, LOCAL_VIEW_TIMEOUT)
+}
+
+/// [`fetch_local_daemon_view`] with its own bound, for a caller that must not
+/// wait (`darkmux run list`): a daemon that is absent or slow reads `None`.
+pub fn fetch_local_daemon_view_within(daemon_addr: &str, timeout: Duration) -> Option<FleetView> {
     let provider = darkmux_fleet::configured_provider_or_unavailable();
     let target = darkmux_fleet::local_daemon_target(
         daemon_addr,
@@ -784,7 +811,7 @@ pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
     .ok()?
     .already_settled()
     .ok()?;
-    let resp = darkmux_fleet::fleet_get(&target, "/fleet/view", LOCAL_VIEW_TIMEOUT, &[]).ok()?;
+    let resp = darkmux_fleet::fleet_get(&target, "/fleet/view", timeout, &[]).ok()?;
     let mut v = read_json(resp)?;
     darkmux_fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
     serde_json::from_value(v).ok()
@@ -792,6 +819,11 @@ pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
 
 /// The longest a CLI waits for its own daemon's view: the daemon gathers
 /// every peer in parallel behind its own per-request bounds.
+/// How long a caller that must not wait long (`darkmux run list`) gives its own
+/// daemon's view: one cold gather waits up to `PEER_CARD_TIMEOUT` on a peer that
+/// is off, so the bound is that plus a margin for the round trip.
+pub const LOCAL_VIEW_COLD_WAIT: Duration = Duration::from_millis(PEER_CARD_TIMEOUT.as_millis() as u64 + 500);
+
 const LOCAL_VIEW_TIMEOUT: Duration = Duration::from_secs(12);
 
 // ─── asking one peer ───────────────────────────────────────────────────────
@@ -1023,6 +1055,18 @@ impl FleetContext {
     }
 }
 
+/// The daemon's view, from its cache or one gather (shared by every reader in
+/// the daemon: the route and the panel's machine option).
+pub(crate) async fn cached_view(state: &crate::AppState) -> Result<FleetView, (axum::http::StatusCode, &'static str)> {
+    let sources = state.fleet.sources.clone();
+    state
+        .fleet
+        .cache
+        .get(move || gather_view(sources.as_ref(), FLEET_VIEW_CACHE_TTL))
+        .await
+        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: fleet view gather panicked\n"))
+}
+
 /// `GET /fleet/view`. Every card's seats go to a reader on this machine or one
 /// holding the fleet token: the audience of the doctor panel and of every
 /// other read of the execution surface
@@ -1033,13 +1077,7 @@ pub(crate) async fn fleet_view_handler(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::Json<FleetView>, (axum::http::StatusCode, &'static str)> {
-    let sources = state.fleet.sources.clone();
-    let view = state
-        .fleet
-        .cache
-        .get(move || gather_view(sources.as_ref(), FLEET_VIEW_CACHE_TTL))
-        .await
-        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: fleet view gather panicked\n"))?;
+    let view = cached_view(&state).await?;
     let peer = peer.map(|c| c.0);
     // Grants go to every reader: reads stay tailnet-open, and a grant is a
     // read (operator, 2026-10-01).
@@ -1092,7 +1130,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn identity(id: &str, uid: Option<&str>, node: Option<&str>) -> LocalIdentity {
+    pub(crate) fn identity(id: &str, uid: Option<&str>, node: Option<&str>) -> LocalIdentity {
         LocalIdentity { machine_id: Some(id.into()), machine_uid: uid.map(str::to_string), node_id: node.map(str::to_string) }
     }
 
@@ -1158,7 +1196,7 @@ pub(crate) mod tests {
         v
     }
 
-    fn peer_says(s: &Scripted, id: &str, delay_ms: u64, outcome: CardOutcome, accepts: AcceptsState) {
+    pub(crate) fn peer_says(s: &Scripted, id: &str, delay_ms: u64, outcome: CardOutcome, accepts: AcceptsState) {
         s.fetches.lock().unwrap().insert(id.to_string(), (delay_ms, Fetched { outcome, accepts }));
     }
 
@@ -1174,7 +1212,7 @@ pub(crate) mod tests {
         view.machines.iter().find(|m| m.entry.as_ref().is_some_and(|e| e.id == id)).unwrap_or_else(|| panic!("no {id} row"))
     }
 
-    fn scripted(local: LocalIdentity, roster: Vec<MachineEntry>) -> Scripted {
+    pub(crate) fn scripted(local: LocalIdentity, roster: Vec<MachineEntry>) -> Scripted {
         Scripted { local, roster, presence_off: true, ..Default::default() }
     }
 
@@ -2361,4 +2399,19 @@ pub(crate) mod tests {
         }
         assert_eq!(gathers.load(Ordering::SeqCst), 1);
     }
+    /// 5.0: the legal names for a machine selector are the view's own row
+    /// names: every roster id, and this machine's name for its own row when
+    /// the roster does not list it. One set for the CLI and the panel.
+    #[test]
+    fn selector_names_include_this_machines_own_name_and_resolve_without_regard_to_case() {
+        let s = scripted(identity("laptop", None, Some("nLAPTOP")), vec![entry("studio")]);
+        let view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+        let mut names = view.selector_names();
+        names.sort();
+        assert_eq!(names, vec!["laptop".to_string(), "studio".to_string()]);
+        assert!(view.find_row("LAPTOP").is_some_and(|m| m.is_this_machine));
+        assert!(view.find_row("Studio").is_some_and(|m| !m.is_this_machine));
+        assert!(view.find_row("nowhere").is_none());
+    }
+
 }

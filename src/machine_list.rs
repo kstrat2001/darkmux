@@ -239,15 +239,6 @@ fn detail_line(card: &MachineCard) -> String {
     format!("  {}", parts.join("; "))
 }
 
-/// The name a row is listed under: its roster id, or this machine's own name
-/// when the roster has no entry for it.
-pub(crate) fn row_name(view: &FleetView, m: &FleetMachine) -> String {
-    match &m.entry {
-        Some(e) => e.id.clone(),
-        None => view.local_machine_id.clone().unwrap_or_else(|| "<this machine>".to_string()),
-    }
-}
-
 /// The reasons a peer is not asked at all, in the order their remedies print.
 const UNVERIFIED_REASONS: [UnreachableReason; 6] = [
     UnreachableReason::PinMismatch,
@@ -260,7 +251,7 @@ const UNVERIFIED_REASONS: [UnreachableReason; 6] = [
 
 fn remedies(view: &FleetView) -> Vec<String> {
     let names = |want: &dyn Fn(&CardOutcome) -> bool| -> Vec<String> {
-        view.machines.iter().filter(|m| want(&m.card)).map(|m| row_name(view, m)).collect()
+        view.machines.iter().filter(|m| want(&m.card)).map(|m| view.row_name(m)).collect()
     };
     let reason = |r: UnreachableReason| -> Vec<String> {
         names(&|c| matches!(c, CardOutcome::Unreachable { reason, .. } if *reason == r))
@@ -352,7 +343,7 @@ fn card_words(outcome: &CardOutcome) -> String {
 /// name, an address or a token: only what the card states and what the user
 /// can act on.
 fn grounding_lines(view: &FleetView, m: &FleetMachine) -> Vec<String> {
-    let name = row_name(view, m);
+    let name = view.row_name(m);
     let here = if m.is_this_machine { " (the user's machine, where the question was asked)" } else { "" };
     let mut lines = vec![format!("- {name}{here}: liveness {}; {}", liveness_words(m.liveness), card_words(&m.card))];
     if let CardOutcome::Available { card, .. } = &m.card {
@@ -416,7 +407,7 @@ fn loaded_now_lines(view: &FleetView) -> Vec<String> {
     let mut by_model: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
     for m in &view.machines {
         let CardOutcome::Available { card, .. } = &m.card else { continue };
-        let name = if m.is_this_machine { format!("{} (the user's machine)", row_name(view, m)) } else { row_name(view, m) };
+        let name = if m.is_this_machine { format!("{} (the user's machine)", view.row_name(m)) } else { view.row_name(m) };
         for x in &card.specs.loaded_models {
             let hosts = by_model.entry(bare_model_id(&x.identifier)).or_default();
             if !hosts.contains(&name) {
@@ -484,7 +475,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         let [ram, os, version, last] = cells(m);
         let row = format!(
             "{:<14} {:<5} {:<11} {:<13} {:<12} {}",
-            darkmux_fleet::truncate_chars(&row_name(view, m), 14),
+            darkmux_fleet::truncate_chars(&view.row_name(m), 14),
             liveness_cell(m.liveness),
             darkmux_fleet::truncate_chars(&ram, 11),
             darkmux_fleet::truncate_chars(&os, 13),
@@ -496,7 +487,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         // (#3017) A clock the hub disagrees with, said here and in `doctor`
         // only, past `CLOCK_SKEW_THRESHOLD_MS`; never on a fleet card.
         if let Some(words) = m.clock_skew_ms.and_then(darkmux_flow::presence::clock_skew_words) {
-            out.push_str(&format!("{}\n", style::warn(&format!("  {}: {words}", row_name(view, m)))));
+            out.push_str(&format!("{}\n", style::warn(&format!("  {}: {words}", view.row_name(m)))));
         }
         for line in crate::card_status::status_lines(m) {
             out.push_str(&format!("{}\n", style::dim(&line)));
@@ -992,9 +983,11 @@ pub(crate) mod tests {
         let text = render_text(&view(machines), "fleet.json");
         let lines: Vec<&str> = text.lines().collect();
         let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {text}"));
-        assert!(lines[at("  status: offline: not listening") - 1].starts_with("mini"), "{text}");
-        assert!(text.contains("  status: online · not streaming: its flow stream doesn't reach this hub"), "{text}");
+        assert!(lines[at("  why: offline: not listening") - 2].starts_with("mini"), "{text}");
+        assert!(text.contains("  status: online\n"), "{text}");
+        assert!(text.contains("  why: online · not streaming: its flow stream doesn't reach this hub"), "{text}");
+        assert!(text.contains("  why: not streaming: not listening"), "{text}");
         assert!(text.contains("  utility model: qwen3-4b, resident; job: not shown here"), "{text}");
-        assert!(text.contains("  status: running"), "{text}");
+        assert!(text.contains("  status: dispatch in flight"), "{text}");
     }
 }

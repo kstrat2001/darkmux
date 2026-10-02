@@ -6,6 +6,7 @@
  * this module owns none of the DOM.
  */
 import type { GraphEdge, GraphNode, MetricsMap, StepMeter } from "./graph";
+import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
 import { NO_STEP_PHASES, isAiKind, stepDisplayMetrics, stepEndMs, stepMeterFor, stepStartMs, type StepPhases } from "./graph";
 
 /** (#1404) The renderer breakpoint — kept `<= 700` to match the CSS
@@ -131,7 +132,7 @@ export interface TimelinePhase {
   /** (#2406) `statusNote` widened in — `phaseList` below is really a
    *  `GraphNode[]` (or the synthetic single-phase fallback, which carries
    *  none), so the field is already present at runtime; this just types it. */
-  phase: { id: string; label: string; status: string; description?: string; statusNote?: string };
+  phase: { id: string; label: string; status: GraphNodeStatus; description?: string; statusNote?: string };
   tasks: TimelineTask[];
 }
 
@@ -176,7 +177,7 @@ export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: M
   }
   for (const k of Object.keys(tasksByPhase)) tasksByPhase[k].sort((a, b) => a.depth - b.depth);
 
-  let phaseList: Array<{ id: string; label: string; status: string; description?: string }> = phases;
+  let phaseList: Array<{ id: string; label: string; status: GraphNodeStatus; description?: string }> = phases;
   if (!phaseList.length && (tasksByPhase["__none__"] || []).length) {
     phaseList = [{ id: "__none__", label: "tasks", status: "planned", description: "" }];
   }

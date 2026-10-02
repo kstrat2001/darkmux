@@ -444,7 +444,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.error", payload: { exit_code: 1 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.header.pillLabel).toBe("ERRORED");
+    expect(view.header.pillLabel).toBe("ERROR");
     expect(view.header.status).toBe("error");
     // (#2860) The figure alone in `value`, the outcome on the `sub` line: the
     // tile value is `nowrap` because it is contracted to be one short figure
@@ -455,13 +455,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(wall?.sub).toBe("errored (exit 1)");
   });
 
-  it("a watchdog-killed dispatch (exit 137) reads 'killed', not 'errored'", () => {
+  it("a watchdog-killed dispatch (exit 137) reads ERROR on the pill, like the board; the tile says how it ended", () => {
     const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.error", payload: { exit_code: 137 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.header.pillLabel).toBe("KILLED");
+    expect(view.header.pillLabel).toBe("ERROR");
     const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("1:00");
     expect(wall?.sub).toBe("killed (timeout)");

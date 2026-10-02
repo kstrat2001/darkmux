@@ -237,6 +237,6 @@ describe("SessionReplay: presence is a fact about now, not about a scrubbed inst
       </QueryClientProvider>,
     );
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
-    expect(pillText().toLowerCase()).toContain("no ending recorded");
+    expect(pillText().toLowerCase()).toContain("no ending");
   });
 });
