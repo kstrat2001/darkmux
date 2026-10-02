@@ -457,17 +457,13 @@ fn check_audit_integrity() -> Check {
 }
 
 /// Turn a set of `flow integrity-check` reports into one doctor `Check`.
-/// Pure (no I/O), split out of `check_audit_integrity` so the three-way
-/// split — a genuine chain break, a legacy-format file (#1769), or a fully
-/// verified walk — is unit-testable without touching the filesystem or
+/// Pure (no I/O), split out of `check_audit_integrity` so the split — a
+/// chain break (including a file not in the byte-hash format), a torn tail,
+/// or a fully verified walk — is unit-testable without touching the filesystem or
 /// `DARKMUX_AUDIT_DIR`.
 ///
-/// The three statuses map to doctor's own exit code (`main.rs`: `Fail` → 1,
-/// everything else → 0): a genuine break is the only thing that flips it.
-/// A legacy-format file is readable but was NOT content-verified at all
-/// (see `IntegrityReport::legacy_format`) — that is neither "everything
-/// verified" (Pass would overclaim) nor "tampering" (Fail would be a false
-/// accusation), so it gets its own `Warn`.
+/// The statuses map to doctor's own exit code (`main.rs`: `Fail` → 1,
+/// everything else → 0): a break is the only thing that flips it.
 fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
     let broken: Vec<&darkmux_flow::IntegrityReport> =
         reports.iter().filter(|r| !r.chain_valid).collect();
@@ -495,53 +491,23 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
         };
     }
 
-    // Two kinds of caveat, both `Warn`: the walk found nothing broken, so
-    // neither is a `Fail`, and neither may hide the other.
-    //
     // A crash mid-append left an incomplete last line; a later append set it
     // aside in a sidecar. The remaining chain verifies, so this is a caveat
     // (the cut bytes are not part of the chain), not a break.
-    //
-    // (#1769) A legacy-format file is one this binary does not attempt to
-    // content-verify (recomputing a struct-hash would repeat the exact lossy
-    // round trip #1768/#1769 exploited): a format boundary, not tampering,
-    // and not the same claim as "everything verified" either.
     let torn: Vec<&str> = reports
         .iter()
         .flat_map(|r| r.torn_tails.iter().map(String::as_str))
         .collect();
-    let legacy: Vec<&darkmux_flow::IntegrityReport> =
-        reports.iter().filter(|r| r.legacy_format).collect();
-    if !torn.is_empty() || !legacy.is_empty() {
-        let mut parts = Vec::new();
-        let mut hints = Vec::new();
-        if !torn.is_empty() {
-            parts.push(format!(
-                "{} torn audit tail(s) set aside after an interrupted write: {}",
-                torn.len(),
-                torn.join(", ")
-            ));
-            hints.push("A write was interrupted mid-line; the incomplete bytes were moved to the named sidecar file and the chain continues from the last complete line. Inspect or delete the sidecar once reviewed. The chain check does not detect records removed from the end of a day file.");
-        }
-        if !legacy.is_empty() {
-            let total_unverified: u64 = legacy.iter().map(|r| r.records_checked).sum();
-            let note = legacy[0]
-                .note
-                .clone()
-                .unwrap_or_else(|| "written in a legacy format this binary cannot re-verify".into());
-            parts.push(format!(
-                "{}/{} file(s) in the legacy pre-2.6.0 format — {total_unverified} record(s) \
-                 NOT content-verified (readable only). {note}",
-                legacy.len(),
-                reports.len(),
-            ));
-            hints.push("Rotate legacy audit files (move/rename so a fresh chain starts under the byte-hash format, #1769) if you want them re-verifiable. This is not evidence of tampering — run `darkmux flow integrity-check` for the full per-file breakdown.");
-        }
+    if !torn.is_empty() {
         return Check {
             name: "audit integrity".into(),
             status: Status::Warn,
-            message: parts.join("; "),
-            hint: Some(hints.join(" ")),
+            message: format!(
+                "{} torn audit tail(s) set aside after an interrupted write: {}",
+                torn.len(),
+                torn.join(", ")
+            ),
+            hint: Some("A write was interrupted mid-line; the incomplete bytes were moved to the named sidecar file and the chain continues from the last complete line. Inspect or delete the sidecar once reviewed. The chain check does not detect records removed from the end of a day file.".into()),
         };
     }
 
@@ -9510,28 +9476,9 @@ mod tests {
             chain_valid: true,
             break_at_line: None,
             break_reason: None,
-            legacy_format: false,
-            note: None,
             writer_schema_version: Some("1.19.0".into()),
             torn_tails: Vec::new(),
         }
-    }
-
-    #[test]
-    fn summarize_audit_reports_torn_tail_does_not_hide_the_legacy_warning() {
-        let torn = darkmux_flow::IntegrityReport {
-            torn_tails: vec!["/audit/a.jsonl.torn-1".into()],
-            ..mk_clean_report(3)
-        };
-        let legacy = darkmux_flow::IntegrityReport {
-            legacy_format: true,
-            note: Some("legacy note".into()),
-            ..mk_clean_report(5)
-        };
-        let check = summarize_audit_reports(&[torn, legacy]);
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("a.jsonl.torn-1"), "{}", check.message);
-        assert!(check.message.contains("legacy pre-2.6.0"), "{}", check.message);
     }
 
     #[test]
@@ -9581,44 +9528,9 @@ mod tests {
             check.status,
             Status::Fail,
             "a genuine chain break must FAIL the check — this is the only status that flips \
-             doctor's exit code to 1, and it must not be softened by the legacy-format case"
+             doctor's exit code to 1, and it must not be softened by a torn tail elsewhere"
         );
         assert!(check.message.contains("BROKEN"));
-    }
-
-    #[test]
-    fn summarize_audit_reports_legacy_format_is_warn_not_fail() {
-        let legacy = darkmux_flow::IntegrityReport {
-            chain_valid: true,
-            legacy_format: true,
-            note: Some(
-                "written in the legacy struct-hash format (pre-2.6.0); not re-verifiable under \
-                 byte-hash verification (#1769) — the stored hash was computed over a \
-                 re-serialization of the parsed record, which this binary cannot reproduce \
-                 byte-for-byte. This is a format boundary, not evidence of editing."
-                    .into(),
-            ),
-            writer_schema_version: Some("1.18.0".into()),
-            ..mk_clean_report(5)
-        };
-        let check = summarize_audit_reports(&[legacy]);
-        assert_eq!(
-            check.status,
-            Status::Warn,
-            "#1769: a legacy-format file was never content-verified — it must never reach \
-             Fail (doctor's only exit-code-flipping status), but it also must not silently \
-             fold into Pass, or the caveat disappears"
-        );
-        assert!(
-            !check.message.to_lowercase().contains("edited") && !check.message.contains("BROKEN"),
-            "wording must not assert editing; got {:?}",
-            check.message
-        );
-        assert!(
-            check.message.contains("5 record"),
-            "the unverified count must be surfaced; got {:?}",
-            check.message
-        );
     }
 
     #[test]

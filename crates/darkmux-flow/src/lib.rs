@@ -4546,7 +4546,6 @@ mod tests {
              dismiss the real thing; got {:?}",
             report.break_reason
         );
-        assert!(!report.legacy_format);
         assert_eq!(report.records_checked, 3);
 
         unsafe {
@@ -5434,7 +5433,6 @@ mod tests {
 
         let report = integrity_check_file(&path).unwrap();
         assert!(report.chain_valid, "an untouched chain must validate cleanly: {report:?}");
-        assert!(!report.legacy_format);
         assert_eq!(report.records_checked, 5);
         assert!(report.break_reason.is_none());
     }
@@ -5664,24 +5662,16 @@ mod tests {
         assert!(report.chain_valid && report.torn_tails.is_empty());
     }
 
-    // (#1775) The exit-status belt. "Verified" and "could not verify" are
-    // DIFFERENT claims, and the automated consumer the docs name — a cron
-    // keyed on the exit code — could previously only see the first one.
-    // Stripping a file's `hash_format` marker downgraded it to legacy,
-    // skipped content verification entirely, and still exited 0.
-    //
-    // These exercise the decision directly rather than through a spawned
-    // binary, because the belt used to be reachable only by review.
+    // (#1775) The exit-status belt, exercised directly rather than through a
+    // spawned binary.
 
-    fn report(legacy: bool, valid: bool) -> crate::integrity::IntegrityReport {
+    fn report(valid: bool) -> crate::integrity::IntegrityReport {
         crate::integrity::IntegrityReport {
             path: "x.jsonl".into(),
             records_checked: 1,
             chain_valid: valid,
             break_at_line: None,
             break_reason: None,
-            legacy_format: legacy,
-            note: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
         }
@@ -5689,85 +5679,41 @@ mod tests {
 
     #[test]
     fn integrity_exit_code_is_zero_when_every_chain_verified() {
-        let r = vec![report(false, true), report(false, true)];
-        assert_eq!(crate::integrity::integrity_exit_code(&r, false), 0);
-        // Strict changes nothing when there is nothing unverifiable.
-        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 0);
+        let r = vec![report(true), report(true)];
+        assert_eq!(crate::integrity::integrity_exit_code(&r), 0);
     }
 
     #[test]
-    fn integrity_exit_code_is_two_for_a_genuine_break_regardless_of_strict() {
-        let r = vec![report(false, false)];
-        assert_eq!(crate::integrity::integrity_exit_code(&r, false), 2);
-        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 2);
-    }
-
-    /// The #1775 gap itself: a file whose content was never verified must
-    /// not report the same status as one that passed. Non-strict keeps 0
-    /// (a genuine read-only pre-2.6.0 archive is not a failure); strict
-    /// makes it loud for the unattended consumer.
-    #[test]
-    fn integrity_exit_code_flags_unverifiable_only_under_strict() {
-        let r = vec![report(true, true)];
-        assert_eq!(
-            crate::integrity::integrity_exit_code(&r, false),
-            0,
-            "default must stay 0 — a genuine legacy archive is not a failure"
-        );
-        assert_eq!(
-            crate::integrity::integrity_exit_code(&r, true),
-            3,
-            "strict must distinguish could-not-verify from verified"
-        );
-    }
-
-    /// A real break outranks an unverifiable file: 2 means "evidence of a
-    /// break", 3 means "no evidence either way". Collapsing them would tell
-    /// a cron the wrong thing about which file to look at.
-    #[test]
-    fn integrity_exit_code_prefers_a_break_over_unverifiable() {
-        let r = vec![report(true, true), report(false, false)];
-        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 2);
+    fn integrity_exit_code_is_two_for_a_genuine_break() {
+        let r = vec![report(true), report(false)];
+        assert_eq!(crate::integrity::integrity_exit_code(&r), 2);
     }
 
     #[test]
     fn integrity_exit_code_is_zero_for_no_files() {
-        assert_eq!(crate::integrity::integrity_exit_code(&[], true), 0);
+        assert_eq!(crate::integrity::integrity_exit_code(&[]), 0);
     }
 
-    /// A legacy-format file (no `hash_format` marker on its header) must
-    /// report Warn-shaped honesty — readable, not re-verifiable — never
-    /// tampering, and never a silent pass. (#1769)
+    /// A file whose header lacks the `hash_format` marker (every file written
+    /// before 2.6.0) is not verified, and must never read as verified: it is
+    /// reported as a break at the header, naming what to do. (#1769)
     #[test]
     #[serial_test::serial]
-    fn legacy_format_file_reports_honestly_not_as_tampering() {
+    fn a_header_without_the_hash_format_marker_is_not_verified() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("chain.jsonl");
-
-        // A pre-2.6.0 struct-hash-format file: bare JSON per line, `hash`
-        // embedded, header lacking the `hash_format` marker.
-        let legacy_header = crate::integrity::schema_header_line().unwrap();
+        let old_header = crate::integrity::schema_header_line().unwrap();
         let mut rec = minimal_record();
         rec.hash = Some("deadbeef".repeat(8));
-        let legacy_line = serde_json::to_string(&rec).unwrap();
-        std::fs::write(&path, format!("{legacy_header}\n{legacy_line}\n")).unwrap();
+        let old_line = serde_json::to_string(&rec).unwrap();
+        std::fs::write(&path, format!("{old_header}\n{old_line}\n")).unwrap();
 
         let report = integrity_check_file(&path).unwrap();
-        assert!(
-            report.chain_valid,
-            "a legacy-format file is a format boundary, not tampering — chain_valid must stay \
-             true: {report:?}"
-        );
-        assert!(report.legacy_format, "must be flagged legacy: {report:?}");
-        let note = report.note.expect("a legacy file must carry an honest note");
-        assert!(
-            !note.to_lowercase().contains("tamper") && !note.to_lowercase().contains("edited"),
-            "wording must not assert editing or tampering; got {note:?}"
-        );
-        assert!(
-            note.contains("legacy") || note.contains("not re-verifiable"),
-            "wording must say why, honestly; got {note:?}"
-        );
+        assert!(!report.chain_valid, "an unrecognized format must not read as verified: {report:?}");
+        assert_eq!(report.break_at_line, Some(1));
+        assert_eq!(report.records_checked, 0);
+        let reason = report.break_reason.expect("the break names why");
+        assert!(reason.contains("hash_format") && reason.contains("Archive"), "{reason}");
     }
 
 

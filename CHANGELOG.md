@@ -129,6 +129,14 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   and the unmanaged flag read as empty or false, and a card still carrying
   `hosted` shows its peer as unavailable. The 1.0 and 1.1 card fixtures are
   deleted with the alias.
+- **A pre-2.6 audit file is no longer verified.** `darkmux flow integrity-check`
+  reports a file whose header has no `hash_format` marker (every file written
+  before 2.6.0, or one naming another format) as a break at line 1 and exits 2;
+  `darkmux doctor` fails the `audit integrity` row for it, where both used to
+  report it as a legacy file that was readable but not verified. `--strict` and
+  exit 3 are gone, and the `legacy_format` and `note` fields leave
+  `integrity-check --json`. The doctor warning for a torn audit tail is kept.
+  Archive the file so a fresh chain starts.
 - **Internal migrations for old stores are gone.** The SQLite crew index no
   longer drops its pre-rename `capability*` and `knowledge` tables when it opens
   (it is rebuilt from the manifests on every change, so nothing is

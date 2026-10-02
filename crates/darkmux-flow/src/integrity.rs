@@ -28,13 +28,11 @@
 //! the reason the bypass existed, which is why it is deleted rather than
 //! papered over again.
 //!
-//! Pre-2.6.0 audit files were written in the OLD format — a bare JSON
-//! object per line, no hash prefix, `hash` embedded as a JSON field. Such
-//! a file's header line lacks the `hash_format` marker `AUDIT_HASH_FORMAT`
-//! below carries; a reader treats that absence as "legacy, not
-//! re-verifiable" (see `integrity_check_file`) rather than attempting to
-//! recompute anything from it — recomputing would mean repeating the exact
-//! lossy round trip that made #1768/#1769 possible.
+//! A file whose header line lacks the `hash_format` marker
+//! `AUDIT_HASH_FORMAT` below carries (every file written before 2.6.0, or one
+//! naming a format this binary does not know) is not verified: the walk
+//! reports it as a break at line 1 and never attempts to recompute anything
+//! from it. Archive such a file so a fresh chain can start.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,13 +43,11 @@ use crate::schema::{FlowRecord, FLOW_SCHEMA_VERSION};
 
 /// Marker written into a byte-hashed audit file's schema-header line
 /// (#1769). Its presence is how a reader tells a byte-hashed audit file
-/// (this module's format — see the module doc) apart from a pre-2.6.0
-/// legacy audit file (bare JSON per line, `hash` embedded, hashed via a
-/// parse-then-re-serialize round trip). Bump this string if the on-disk
-/// shape of the prefix or `record-json` ever changes in a way that isn't
-/// itself re-verifiable against the prior value — a reader that doesn't
-/// recognize the marker treats the file the same way it treats a legacy
-/// one: readable, not re-verifiable, reported honestly.
+/// (this module's format — see the module doc) apart from any other file.
+/// Bump this string if the on-disk shape of the prefix or `record-json`
+/// ever changes in a way that isn't itself re-verifiable against the prior
+/// value — a reader that doesn't recognize the marker reports the file as a
+/// break at line 1.
 pub(crate) const AUDIT_HASH_FORMAT: &str = "prefix-blake3-v1";
 
 /// `true` when `s` is a 64-character lowercase-or-uppercase hex string —
@@ -166,12 +162,12 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
             // validating chain on the next write — silently laundering
             // tampering.
             //
-            // (#1769) The format check folds into the same guard: a
-            // legacy (pre-2.6.0) header also cannot seed a byte-hash
-            // chain, and this binary has no way to tell "a genuine
-            // legacy file, needs rotation" apart from "a real file
-            // truncated to one fabricated line" — so both refuse, with
-            // the same fail-closed posture #899 already established.
+            // (#1769) The format check folds into the same guard: a header
+            // in another format also cannot seed a byte-hash chain, and
+            // this binary has no way to tell "an old file, needs archiving"
+            // apart from "a real file truncated to one fabricated line" —
+            // so both refuse, with the same fail-closed posture #899
+            // already established.
             let last_line = non_empty[0];
             let is_schema_header = serde_json::from_str::<serde_json::Value>(last_line)
                 .ok()
@@ -184,7 +180,7 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
                 return Err(anyhow::anyhow!(
                     "audit log {} cannot be safely extended: its sole surviving line is not a \
                      byte-hash-format schema header (#1769) — refusing to re-seed a chain from \
-                     unverified content. If this is a genuine pre-2.6.0 legacy file, rotate it \
+                     unverified content. If this is a file from before 2.6.0, archive it \
                      (move/rename so a fresh chain can start); if the file was truncated, this \
                      is the intended fail-closed response.",
                     path.display()
@@ -198,9 +194,9 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
             let header_line = non_empty[0];
             if !header_is_byte_hash_format(header_line) {
                 return Err(anyhow::anyhow!(
-                    "audit log {} was written in the legacy struct-hash format (pre-2.6.0) and \
-                     cannot be safely extended under byte-hash verification (#1769) — rotate \
-                     this file (move/rename it) so a fresh chain can start under the new format",
+                    "audit log {} is not in the byte-hash format (a file from before 2.6.0, or \
+                     another format) and cannot be safely extended (#1769) — archive this file \
+                     (move/rename it) so a fresh chain can start",
                     path.display()
                 ));
             }
@@ -408,8 +404,8 @@ pub(crate) fn schema_header_line() -> Result<String> {
 
 /// Build the schema header line used by AuditFileSink. Same shape as
 /// `schema_header_line()` plus `hash_format` (#1769) — the marker a
-/// reader uses to recognize this file as byte-hashed rather than a
-/// pre-2.6.0 legacy struct-hashed one. See `header_is_byte_hash_format`.
+/// reader uses to recognize this file as byte-hashed. See
+/// `header_is_byte_hash_format`.
 pub(crate) fn audit_schema_header_line() -> Result<String> {
     let header = serde_json::json!({
         "_type": "schema",
@@ -422,8 +418,7 @@ pub(crate) fn audit_schema_header_line() -> Result<String> {
 
 /// Extract the `hash_format` field from an audit file's header line, if
 /// present. `None` when the header isn't parseable JSON or lacks the
-/// field — which is exactly what every pre-2.6.0 (legacy) audit header
-/// looks like, since the field didn't exist before #1769.
+/// field.
 fn header_hash_format(header_line: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(header_line)
         .ok()
@@ -431,10 +426,9 @@ fn header_hash_format(header_line: &str) -> Option<String> {
 }
 
 /// `true` when the header names the byte-hash format this binary knows
-/// how to verify (`AUDIT_HASH_FORMAT`). `false` for a legacy pre-2.6.0
-/// header (field absent) AND for a header naming some OTHER format this
-/// binary doesn't recognize (a future format bump) — either way, this
-/// binary cannot safely extend or re-verify the chain from here.
+/// how to verify (`AUDIT_HASH_FORMAT`). `false` when the field is absent
+/// or names some OTHER format this binary doesn't recognize — either way,
+/// this binary cannot safely extend or re-verify the chain from here.
 fn header_is_byte_hash_format(header_line: &str) -> bool {
     header_hash_format(header_line).as_deref() == Some(AUDIT_HASH_FORMAT)
 }
@@ -449,23 +443,6 @@ fn header_schema_version(header_line: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(header_line)
         .ok()
         .and_then(|v| v.get("version").and_then(|f| f.as_str()).map(str::to_string))
-}
-
-/// Honest, non-accusatory note for a legacy-format file — see
-/// `IntegrityReport::legacy_format`.
-fn legacy_format_note(hash_format: Option<&str>) -> String {
-    match hash_format {
-        None => "written in the legacy struct-hash format (pre-2.6.0); not re-verifiable under \
-                 byte-hash verification (#1769) — the stored hash was computed over a \
-                 re-serialization of the parsed record, which this binary cannot reproduce \
-                 byte-for-byte. This is a format boundary, not evidence of editing."
-            .to_string(),
-        Some(other) => format!(
-            "header names hash_format \"{other}\", which this binary does not recognize \
-             (expected \"{AUDIT_HASH_FORMAT}\"); not re-verifiable. This is a format boundary, \
-             not evidence of editing."
-        ),
-    }
 }
 
 /// Walk a single audit file, recomputing the hash chain and reporting
@@ -497,8 +474,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             chain_valid: true,
             break_at_line: None,
             break_reason: None,
-            legacy_format: false,
-            note: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
         });
@@ -508,22 +483,29 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
     let writer_schema_version = header_schema_version(header_line);
 
     if !header_is_byte_hash_format(header_line) {
-        // (#1769) A legacy (or unrecognized-future) format file. Report
-        // honestly — readable, NOT re-verifiable — rather than attempting
-        // to recompute anything, which would mean repeating the exact
+        // (#1769) Not a byte-hash-format file (one written before 2.6.0, or
+        // another format). Nothing is recomputed: doing so would repeat the
         // lossy parse -> re-serialize round trip that made #1768/#1769
-        // possible in the first place. `chain_valid` stays `true`: this is
-        // not evidence of tampering, it's a format boundary, and callers
-        // must never fold that into "verified" either — `legacy_format`
-        // and `note` carry the honest caveat.
+        // possible. It is reported as a break at the header, so it is never
+        // counted as verified.
+        let reason = match header_hash_format(header_line).as_deref() {
+            None => format!(
+                "the header names no `hash_format` (a file from before 2.6.0, or its marker was \
+                 removed); this binary verifies only \"{AUDIT_HASH_FORMAT}\" files, so nothing \
+                 in this file was verified. Archive it so a fresh chain can start."
+            ),
+            Some(other) => format!(
+                "the header names hash_format \"{other}\", which this binary does not recognize \
+                 (expected \"{AUDIT_HASH_FORMAT}\"); nothing in this file was verified. \
+                 Archive it so a fresh chain can start."
+            ),
+        };
         return Ok(IntegrityReport {
             path: path.display().to_string(),
-            records_checked: (lines.len() - 1) as u64,
-            chain_valid: true,
-            break_at_line: None,
-            break_reason: None,
-            legacy_format: true,
-            note: Some(legacy_format_note(header_hash_format(header_line).as_deref())),
+            records_checked: 0,
+            chain_valid: false,
+            break_at_line: Some(1),
+            break_reason: Some(reason),
             writer_schema_version,
             torn_tails: Vec::new(),
         });
@@ -548,8 +530,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                      the byte-hash format, or the chain is corrupted"
                         .to_string(),
                 ),
-                legacy_format: false,
-                note: None,
                 writer_schema_version,
                 torn_tails: Vec::new(),
             });
@@ -566,8 +546,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                      foreign content"
                         .to_string(),
                 ),
-                legacy_format: false,
-                note: None,
                 writer_schema_version,
                 torn_tails: Vec::new(),
             });
@@ -584,8 +562,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                     chain_valid: false,
                     break_at_line: Some((idx + 1) as u64),
                     break_reason: Some(format!("unparseable JSON: {e}")),
-                    legacy_format: false,
-                    note: None,
                     writer_schema_version,
                     torn_tails: Vec::new(),
                 });
@@ -605,8 +581,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 break_reason: Some(format!(
                     "prev_hash mismatch: stored `{stored_prev}` != expected `{expected_prev}` (audit log has been edited or a write was interleaved)"
                 )),
-                legacy_format: false,
-                note: None,
                 writer_schema_version,
                 torn_tails: Vec::new(),
             });
@@ -626,8 +600,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 break_reason: Some(format!(
                     "hash mismatch: stored `{stored_hash}` != recomputed `{recomputed}` (record content has been edited)"
                 )),
-                legacy_format: false,
-                note: None,
                 writer_schema_version,
                 torn_tails: Vec::new(),
             });
@@ -642,8 +614,6 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
         chain_valid: true,
         break_at_line: None,
         break_reason: None,
-        legacy_format: false,
-        note: None,
         writer_schema_version,
         torn_tails: Vec::new(),
     })
@@ -654,24 +624,8 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
 ///
 /// | code | meaning |
 /// |---|---|
-/// | `0` | every chain walked clean, nothing unverifiable |
-/// | `2` | a chain BREAK was found — evidence of divergence |
-/// | `3` | `strict` only: a file could not be content-verified at all |
-///
-/// The distinction `2` vs `3` is the point. **"Verified" and "could not
-/// verify" are different claims**, and an unattended consumer needs to
-/// tell them apart: `2` says "look at this file, something diverged";
-/// `3` says "this file carries no evidence either way". Collapsing them
-/// would point a cron at the wrong thing.
-///
-/// A break OUTRANKS an unverifiable file — evidence beats absence of
-/// evidence, so a run with both exits `2`.
-///
-/// `strict` is opt-in because the only false positive is a genuine
-/// read-only pre-2.6.0 archive, which is not a failure and should not
-/// wake anyone. But on a fleet that has adopted byte-hashing, no NEW
-/// legacy file should ever legitimately appear — so an unexpected one is
-/// itself a signal, and `--strict` is what lets a tripwire say so.
+/// | `0` | every chain walked clean |
+/// | `2` | a chain BREAK was found, including a file whose header is not in the byte-hash format (nothing in it was verified) |
 ///
 /// This does NOT change the chain's inherent ceiling: an attacker with
 /// write access can still reach exit `0` by rewriting a whole file —
@@ -679,12 +633,9 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
 /// of any anchorless local hash chain and is documented in SECURITY.md.
 /// What it removes is the strictly *simpler* second route, where merely
 /// deleting the format marker skipped verification silently.
-pub fn integrity_exit_code(reports: &[IntegrityReport], strict: bool) -> i32 {
+pub fn integrity_exit_code(reports: &[IntegrityReport]) -> i32 {
     if reports.iter().any(|r| !r.chain_valid) {
         return 2;
-    }
-    if strict && reports.iter().any(|r| r.legacy_format) {
-        return 3;
     }
     0
 }
@@ -720,8 +671,8 @@ pub struct IntegrityReport {
     pub path: String,
     /// (#906) Number of RECORDS verified — the schema header on line 1 is
     /// NOT counted, so this is a record count, not a file-line count. For
-    /// a legacy-format file (`legacy_format == true`) this counts lines
-    /// present but NONE of them were actually hash-verified — see `note`.
+    /// a file whose header is not in the byte-hash format this is `0`:
+    /// nothing in it was verified.
     pub records_checked: u64,
     pub chain_valid: bool,
     /// (#906) 1-indexed FILE LINE of the break (the header counts as line 1,
@@ -733,31 +684,6 @@ pub struct IntegrityReport {
     pub break_at_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub break_reason: Option<String>,
-    /// (#1769) True when this file's header does NOT carry the byte-hash
-    /// format marker — either a genuine pre-2.6.0 legacy struct-hash file,
-    /// or a header naming some other format this binary doesn't recognize.
-    /// Such a file is READABLE but its content was NOT hash-verified at
-    /// all: recomputing a struct-hash-format hash would repeat the exact
-    /// lossy parse -> re-serialize round trip that made #1768 (false
-    /// positives) and #1769 (a false-negative bypass) possible, so this
-    /// binary does not attempt it.
-    ///
-    /// `chain_valid` stays `true` for a legacy file — this is a format
-    /// boundary, not evidence of tampering — but a caller must not fold
-    /// that into "verified" either. `note` carries the honest wording;
-    /// `darkmux doctor` reports `Warn`, never `Pass` or `Fail`, for this
-    /// case; `darkmux flow integrity-check` keeps exit 0 but prints the
-    /// caveat loudly.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub legacy_format: bool,
-    /// Honest, non-accusatory explanation — set for a legacy-format file
-    /// (see `legacy_format`'s doc for the wording). `None` for a normally
-    /// verified or normally broken byte-hash-format file; there is no
-    /// "excused mismatch" case that sets this alongside `chain_valid ==
-    /// false` — under byte-hashing a mismatch always means tampering, full
-    /// stop, and is never paired with an excuse.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
     /// The `FLOW_SCHEMA_VERSION` the file's header names as its writer,
     /// for CONTEXT ONLY (e.g. "written under schema 1.18.0" in a human
     /// report) — never used to excuse a divergence. `None` when the
@@ -771,56 +697,4 @@ pub struct IntegrityReport {
     /// can inspect it. Empty (and omitted) when nothing was set aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub torn_tails: Vec<String>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// (#2578) The READ-side twin every `integrity_check_file` test in
-    /// `lib.rs` is missing: those all construct an `IntegrityReport` by
-    /// running the real checker (the WRITE side) and assert on the
-    /// returned struct — none of them ever deserialize a JSON document
-    /// back into this type. `legacy_format` pairs `#[serde(default)]`
-    /// with `skip_serializing_if = "is_false"`, so it's OMITTED from
-    /// every normally-verified or normally-broken byte-hash-format
-    /// report — the common case — and only present (as `true`) for the
-    /// rarer legacy-format case. `flow integrity-check --json` writes
-    /// this type; nothing in this codebase reads it back today (per
-    /// #2578's own framing — "written ... never read back"), but the
-    /// derive is `Serialize, Deserialize` (both), so a future consumer
-    /// (an operator's own tooling, a `darkmux doctor` cross-check reading
-    /// its own prior run) inherits the omission-tolerance whether anyone
-    /// has built that consumer yet or not.
-    ///
-    /// **Proved failing first** (2026-09-10, this packet): dropping
-    /// `default` from `IntegrityReport::legacy_format` while keeping
-    /// `skip_serializing_if`, rebuilding (`cargo build -p darkmux-flow
-    /// --tests`, confirmed exit 0), and running `cargo test -p
-    /// darkmux-flow --lib` left all 254 other tests in this crate green.
-    /// Restored before writing this test.
-    #[test]
-    fn integrity_report_with_legacy_format_omitted_round_trips() {
-        // The common case: a normally-verified byte-hash-format file.
-        // `legacy_format` is `false`, so `is_false` skips it entirely —
-        // this document never carries the key at all.
-        let json = r#"{"path": "2026-09-10.jsonl", "records_checked": 12, "chain_valid": true}"#;
-        let report: IntegrityReport = serde_json::from_str(json)
-            .unwrap_or_else(|e| panic!("a report with legacy_format omitted must still deserialize: {e}"));
-        assert!(!report.legacy_format, "an omitted legacy_format must default to false");
-        assert_eq!(report.path, "2026-09-10.jsonl");
-        assert_eq!(report.records_checked, 12);
-        assert!(report.chain_valid);
-
-        // Round-trip fidelity: re-serializing must still omit the false flag.
-        let out = serde_json::to_value(&report).unwrap();
-        assert!(
-            out.as_object().unwrap().get("legacy_format").is_none(),
-            "is_false should have skipped legacy_format on re-serialize"
-        );
-    }
 }

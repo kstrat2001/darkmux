@@ -119,8 +119,7 @@ frame:
   conspicuous of the three** — it leaves a present, plausible-looking file
   rather than a missing day. Delete the last record line (or the last k of them)
   and the walk sees a shorter but fully consistent chain: every `prev_hash`
-  links, every byte-hash matches, the file reports valid — including under
-  `--strict`. Nothing records how many records a file should contain or
+  links, every byte-hash matches, the file reports valid. Nothing records how many records a file should contain or
   hashes its tail. The next append then extends the chain from the truncated
   end, so the deletion is permanent. Note this is *not* addressed by anchoring
   the chain root: a root anchor proves where the chain started, not where it
@@ -146,12 +145,12 @@ frame:
   breaks the following record's `prev_hash` linkage. Only records removed from
   the very end leave nothing behind to disagree with.
 
-  A file that cannot be content-verified at all — a pre-2.6.0 struct-hash
-  file, or one whose `hash_format` header marker has been removed — is
-  reported honestly but exits 0 by default. Pass `--strict` to
-  `darkmux flow integrity-check` to make that exit 3
-  ([#1775](https://github.com/kstrat2001/darkmux/issues/1775)), so an
-  unattended consumer can distinguish "verified" from "never checked".
+  A file that cannot be content-verified at all — a file from before 2.6.0,
+  or one whose `hash_format` header marker has been removed or names another
+  format — is reported as a break at line 1 (exit 2, a `darkmux doctor`
+  failure), never as verified
+  ([#1775](https://github.com/kstrat2001/darkmux/issues/1775)). Archive such
+  a file so a fresh chain can start.
 
   Treat all of this as a supporting detective control composed with disk
   encryption and filesystem permissions, not as a standalone guarantee against
