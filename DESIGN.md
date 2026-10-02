@@ -663,7 +663,7 @@ A long local run heats the machine and can drain a battery, and both need a resp
 | 4 | the Nth `serious` episode (`episode_threshold`, default 2; `0` is unbounded) | an indefinite pause that resumes only on operator intervention |
 | 5 | `critical` | the breaker: a crawl's `STOP` file so no further unit dispatches, and the managed models are ejected once a turn boundary is reached or a short bound elapses |
 
-An episode is a transition, not a sample, so a long stretch at `serious` counts once. A paused execution resumes with `darkmux dispatch <role> --resume-from <out-dir>`.
+An episode is a transition, not a sample, so a long stretch at `serious` counts once. A paused execution resumes with `darkmux dispatch <role> --resume-from <out-dir>`. A resume runs on the image its origin recorded, refuses a different `--image`, refuses while the origin's execution is still running (an exclusive lock on `<out-dir>.execution.lock`, held by the original and by any resume) and refuses once it ended in success; resuming again after an interrupted or failed run is allowed.
 
 **A pause needs an active writer.** The runtime honors a pause only while the pace file is fresher than `max_pause_ms`, with no per-reason exemption: a `thermal-critical` stop gets no more lenience than any other. "Indefinite" is therefore expressed as "someone keeps renewing it", and the governor re-stamps the file every `max_pause_ms / 4` for as long as the state holds. A dead host writer cannot leave a container paused forever, and a torn read of the file never releases a live pause. A gap in thermal readings mid-pause is treated as time passing with no new information.
 

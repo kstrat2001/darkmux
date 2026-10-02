@@ -6173,8 +6173,9 @@ struct TempResidue {
     total: usize,
     families: Vec<(String, usize)>,
     truncated: bool,
-    /// (#2972) Resume-origin records (`<dir>.resume_origin.json`) whose
-    /// out-dir is gone: the record outlived the directory it describes.
+    /// (#2972) Resume-origin records (`<dir>.resume_origin.json`) and
+    /// execution lock files (`<dir>.execution.lock`) whose out-dir is gone:
+    /// the sibling outlived the directory it describes.
     orphaned_records: usize,
 }
 
@@ -6344,8 +6345,9 @@ fn check_temp_residue() -> Check {
              run's prompt, trajectory and checkpoint, so they are kept deliberately and \
              removing one discards that run's record. The rest are test scratch, which a \
              test process now collects on its own (#2707); any still here predate that. \
-             Each `darkmux-out-*` dir has a sibling `<dir>.resume_origin.json`: delete the two \
-             together, and delete any record whose dir is already gone (an orphan). \
+             Each `darkmux-out-*` dir has siblings `<dir>.resume_origin.json` and \
+             `<dir>.execution.lock`: delete them together, and delete any sibling whose dir \
+             is already gone (an orphan). \
              Nothing here is removed for you: review {} and delete what you are done with.",
             tmp.display()
         )),

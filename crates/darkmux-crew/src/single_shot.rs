@@ -908,8 +908,8 @@ mod tests {
         // guard and a regression there would silently widen or narrow
         // what single_shot_chat's callers see as retryable.
         match parse_hosted_response(br#"{"error":{"code":503,"message":"overloaded"}}"#) {
-            Err(HostedCallError::RateLimited(msg)) => assert_eq!(msg, "overloaded"),
-            _ => panic!("expected a retryable RateLimited error for 503"),
+            Err(HostedCallError::ServerShed(msg)) => assert_eq!(msg, "overloaded"),
+            _ => panic!("expected a retryable ServerShed error for 503"),
         }
         // Array-shaped errors (Google's OpenAI-compat layer) classify the
         // same way through the shared function — not re-derived, reused.

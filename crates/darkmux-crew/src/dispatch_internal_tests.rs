@@ -607,60 +607,358 @@
         assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
     }
 
-    /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
-    /// the real `run_telemetry_sampler`: a held run that was stopped is
-    /// never released; the pace file keeps `pause`, a `budget.stop` is
-    /// recorded, and the run is ended the way an interrupt ends it.
-    #[test]
-    #[serial]
-    fn the_sampler_pacer_ends_a_stopped_run_it_holds() {
-        let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the sampler's `machine.telemetry` goes to the real flow sink otherwise
-        darkmux_types::interrupt::reset_for_test();
-        let out = TempDir::new().unwrap();
+    /// A budget pacer over a full one-token window, so its first tick holds
+    /// the run (and, when the run is stopped, reports the stop).
+    fn full_window_pacer() -> crate::budget::BudgetPacer {
         let mut ep: darkmux_types::ModelEndpoint = serde_json::from_str(
             r#"{"url":"http://127.0.0.1:1","limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}"#,
         )
         .unwrap();
         ep.source = darkmux_types::EndpointSource::Named("azure".into());
-        let pacer = crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None);
-        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped("mission `m` is aborted"));
+        crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None)
+    }
+
+    /// (#2925) One real `run_telemetry_sampler` for a dispatch of `phase` in
+    /// `mission`, reading stops from disk the way production does. Returns
+    /// its stop flag and join handle; it runs until that flag is set.
+    fn spawn_paced_sampler(
+        mission: &'static str,
+        phase: &'static str,
+        local_stop: DispatchStop,
+    ) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
         let stop = Arc::new(AtomicBool::new(false));
-        let stopper = Arc::clone(&stop);
-        // End the sampler once the interrupt was raised (or after a bound),
-        // never on a fixed guess at how long its first tick takes.
-        let t = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !darkmux_types::interrupt::is_set() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-            stopper.store(true, Ordering::SeqCst);
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let out = TempDir::new().unwrap();
+            let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().reading_disk_for_stops());
+            crate::budget::with_test_env(env, || {
+                run_telemetry_sampler(
+                    stop_for_thread,
+                    "coder".into(),
+                    crate::mission_test_session(mission, phase),
+                    darkmux_types::execution_id::ExecutionId::mint(),
+                    "gpt-remote".into(),
+                    None,
+                    None,
+                    Some(phase.to_string()),
+                    out.path().to_path_buf(),
+                    None,
+                    crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                    Some(full_window_pacer()),
+                    local_stop,
+                )
+            });
         });
-        crate::budget::with_test_env(env.clone(), || {
-            run_telemetry_sampler(
-                stop,
-                "coder".into(),
-                crate::test_session("s-pacer"), darkmux_types::execution_id::ExecutionId::mint(),
-                "gpt-remote".into(),
-                None,
-                None,
-                None,
+        (stop, handle)
+    }
+
+    /// Write `status` into the mission or phase JSON `abort`/`abandon` would.
+    fn write_status(path: std::path::PathBuf, status: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
+    }
+
+    /// Wait (bounded) until every stop in `stops` has been requested.
+    fn wait_requested(stops: &[&DispatchStop]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !stops.iter().all(|s| s.is_requested()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        stops.iter().all(|s| s.is_requested())
+    }
+
+    /// (#2925) Abandoning ONE phase ends that phase's dispatch and no other:
+    /// the stop lands on the dispatch's own `DispatchStop`, never on the
+    /// process-global interrupt flag that a concurrent dispatch of another
+    /// phase (same mission) also reads. Real sampler threads, real disk read.
+    #[test]
+    #[serial]
+    fn abandoning_one_phase_ends_only_that_phases_dispatch() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        darkmux_types::interrupt::reset_for_test();
+        write_status(crate::lifecycle::mission_path("m-ph"), "active");
+        write_status(crate::lifecycle::phase_path("m-ph", "p1"), "abandoned");
+        write_status(crate::lifecycle::phase_path("m-ph", "p2"), "running");
+        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (flag_1, t1) = spawn_paced_sampler("m-ph", "p1", stop_1.clone());
+        let (flag_2, t2) = spawn_paced_sampler("m-ph", "p2", stop_2.clone());
+        let ended = wait_requested(&[&stop_1]);
+        // Give p2's sampler a few ticks to (wrongly) stop, were it going to.
+        thread::sleep(Duration::from_millis(2_500));
+        let (global, other) = (darkmux_types::interrupt::is_set(), stop_2.is_requested());
+        for f in [&flag_1, &flag_2] {
+            f.store(true, Ordering::SeqCst);
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(ended, "the abandoned phase's dispatch is ended");
+        assert!(stop_1.reason().unwrap().contains("phase `p1`"), "{:?}", stop_1.reason());
+        assert!(!global, "a phase stop must not raise the process-global interrupt");
+        assert!(!other, "the other phase's dispatch keeps running: {:?}", stop_2.reason());
+    }
+
+    /// (#2925) The inverse: a mission aborted on disk ends EVERY dispatch of
+    /// that mission, each through its own stop.
+    #[test]
+    #[serial]
+    fn aborting_the_mission_ends_every_dispatch_of_it() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        darkmux_types::interrupt::reset_for_test();
+        write_status(crate::lifecycle::mission_path("m-ab"), "aborted");
+        write_status(crate::lifecycle::phase_path("m-ab", "p1"), "running");
+        write_status(crate::lifecycle::phase_path("m-ab", "p2"), "running");
+        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (flag_1, t1) = spawn_paced_sampler("m-ab", "p1", stop_1.clone());
+        let (flag_2, t2) = spawn_paced_sampler("m-ab", "p2", stop_2.clone());
+        let ended = wait_requested(&[&stop_1, &stop_2]);
+        for f in [&flag_1, &flag_2] {
+            f.store(true, Ordering::SeqCst);
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let global = darkmux_types::interrupt::is_set();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(ended, "both dispatches of an aborted mission end");
+        assert!(stop_1.reason().unwrap().contains("m-ab"), "{:?}", stop_1.reason());
+        assert!(!global, "still no process-global interrupt");
+    }
+
+    /// (#2925) The tailer honors a dispatch-scoped stop like an interrupt:
+    /// it flushes, runs `docker kill <this container>` (a shim on PATH records
+    /// the call) and ends its loop, while its own stop flag is never set. A
+    /// tailer that ignored the stop would hang this test past its bound.
+    #[test]
+    #[serial]
+    fn the_tailer_ends_on_its_dispatchs_own_stop() {
+        darkmux_types::interrupt::reset_for_test();
+        let shim_dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&shim_dir);
+        let out = TempDir::new().unwrap();
+        let local_stop = DispatchStop::new("darkmux-test-local-stop".into());
+        local_stop.request("phase `p` of mission `m` is abandoned".into());
+        let handoff = local_stop.watchdog_handoff();
+        let handle = thread::spawn(move || {
+            run_tailer(
                 out.path().to_path_buf(),
+                crate::test_session("sess-local-stop"),
+                darkmux_types::execution_id::ExecutionId::mint(),
+                "coder".into(),
+                "darkmux:m".into(),
                 None,
-                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
-                Some(pacer),
+                None,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+                600,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                local_stop,
             )
         });
-        t.join().unwrap();
-        let interrupted = darkmux_types::interrupt::is_set();
-        darkmux_types::interrupt::reset_for_test();
-        assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
-        // (5th review C6) Stopped before any wait was announced: no orphan
-        // `budget.stop` (a stop record always follows its wait).
-        assert!(!env.actions().contains(&darkmux_flow::FlowAction::BudgetStop), "{:?}", env.actions());
-        let pace: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
-        assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let finished = handle.is_finished();
+        restore_path(prev_path);
+        assert!(finished, "the tailer must end on a dispatch-scoped stop");
+        handle.join().unwrap();
+        let recorded = std::fs::read_to_string(&record_path).expect("the stop ran `docker`");
+        assert_eq!(recorded.trim(), "kill darkmux-test-local-stop", "kills this dispatch's container, only it");
+        assert!(!handoff.load(Ordering::SeqCst), "a kill that worked does not wake the watchdog");
     }
+
+    /// A `docker` shim on PATH that records every call and fails the first
+    /// `kill` it sees (a counter file beside it), then succeeds. `ps` prints a
+    /// container id while a `running` file exists beside the shim.
+    fn install_scripted_docker(dir: &TempDir) -> (std::path::PathBuf, Option<String>) {
+        let record = dir.path().join("invoked-with.txt");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = warm-up ] && exit 0\necho \"$@\" >> {rec}\n\
+             if [ \"$1\" = kill ]; then\n  n=$(cat {cnt} 2>/dev/null || echo 0)\n  echo $((n+1)) > {cnt}\n  [ \"$n\" = 0 ] && exit 1\nfi\n\
+             if [ \"$1\" = ps ] && [ -e {run} ]; then case \"$*\" in *\"$(cat {run})\"*) echo abc123;; esac; fi\nexit 0\n",
+            rec = record.display(),
+            cnt = dir.path().join("kills").display(),
+            run = dir.path().join("running").display(),
+        );
+        let path = dir.path().join("docker");
+        std::fs::write(&path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::process::Command::new(&path).arg("warm-up").status().unwrap();
+        let prev = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        (record, prev)
+    }
+
+    /// A failed local-stop `docker kill` hands the container to the
+    /// watchdog's retried kill at once: the watchdog wakes as abandoned (not on
+    /// its 600 s deadline) and kills again, and that second kill lands.
+    #[test]
+    #[serial]
+    fn a_failed_local_stop_kill_hands_off_to_the_watchdogs_retried_kill() {
+        let dir = TempDir::new().unwrap();
+        let (record, prev_path) = install_scripted_docker(&dir);
+        let stop = DispatchStop::new("darkmux-test-handoff".into());
+        let (_guard, handle) = spawn_guarded_watchdog(
+            &stop.watchdog_handoff(),
+            "darkmux-test-handoff".to_string(),
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+        );
+        stop.kill_container(); // the shim fails this first kill
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let finished = handle.is_finished();
+        restore_path(prev_path);
+        assert!(finished, "the watchdog never took the handoff");
+        assert_eq!(handle.join().unwrap(), WatchdogWake::Abandoned, "woken by the handoff, not the deadline");
+        let kills = std::fs::read_to_string(&record).unwrap().lines().filter(|l| l.starts_with("kill ")).count();
+        assert_eq!(kills, 2, "the stop's own kill failed once, the watchdog's retried kill landed");
+    }
+
+    /// A succeeding local-stop kill leaves the watchdog alone.
+    #[test]
+    #[serial]
+    fn a_successful_local_stop_kill_does_not_wake_the_watchdog() {
+        let dir = TempDir::new().unwrap();
+        let (_record, prev_path) = install_fake_docker(&dir);
+        let stop = DispatchStop::new("darkmux-test-ok".into());
+        stop.kill_container();
+        restore_path(prev_path);
+        assert!(!stop.watchdog_handoff().load(Ordering::SeqCst));
+    }
+
+    /// The lock outlives nothing: after a SIGKILL of darkmux the lock is gone
+    /// but the container runs on. A resume asks docker, and is refused while
+    /// the origin's recorded container is up.
+    #[test]
+    #[serial]
+    fn a_resume_is_refused_while_the_origins_container_is_still_running() {
+        let (_ws, prior, _) = origin_dir();
+        record_origin_container(prior.path(), "darkmux-dispatch-orphan", None);
+        let dir = TempDir::new().unwrap();
+        let (record, prev_path) = install_scripted_docker(&dir);
+        std::fs::write(dir.path().join("running"), "").unwrap();
+        let refused = claim_resume_origin(prior.path()).err().map(|e| e.to_string());
+        std::fs::remove_file(dir.path().join("running")).unwrap();
+        let allowed = claim_resume_origin(prior.path()).is_ok();
+        restore_path(prev_path);
+        let msg = refused.expect("refused while the container is up");
+        assert!(msg.contains("RESUME REFUSED") && msg.contains("darkmux-dispatch-orphan") && msg.contains("docker kill"), "{msg}");
+        assert!(allowed, "allowed once the container is gone");
+        let ps = std::fs::read_to_string(&record).unwrap();
+        assert!(ps.contains("name=^darkmux-dispatch-orphan$"), "asked docker about the recorded name: {ps}");
+    }
+
+    /// `record_origin_container` writes the dispatch's own container into its
+    /// origin record (the name a later resume asks docker about), and, for a
+    /// resume, appends it to the origin it resumed.
+    #[test]
+    fn the_containers_are_recorded_on_the_origin_record() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, resume, _) = origin_dir();
+        record_origin_container(origin.path(), "darkmux-dispatch-c0", None);
+        assert_eq!(origin_containers(origin.path()), vec!["darkmux-dispatch-c0"]);
+        record_origin_container(resume.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        record_origin_container(resume.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        assert_eq!(origin_containers(resume.path()), vec!["darkmux-dispatch-c1"], "its own record");
+        assert_eq!(
+            origin_containers(origin.path()),
+            vec!["darkmux-dispatch-c0", "darkmux-dispatch-c1"],
+            "the origin names the resume's container too, once"
+        );
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").unwrap()];
+        assert_eq!(
+            src.matches("record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());").count(),
+            1,
+            "dispatch() records its container, and on the origin when it resumes"
+        );
+    }
+
+    /// The exact sequence: resume R1 of O runs container C1, R1's darkmux is
+    /// SIGKILLed (its lock is gone, C1 runs on), and `--resume-from O` finds O's
+    /// lock free and its own container C0 stopped. It must still be refused,
+    /// because O's record names C1.
+    #[test]
+    #[serial]
+    fn a_resume_is_refused_while_a_previous_resumes_container_still_runs() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, r1, _) = origin_dir();
+        record_origin_container(origin.path(), "darkmux-dispatch-c0", None);
+        record_origin_container(r1.path(), "darkmux-dispatch-c1", Some(origin.path()));
+        let dir = TempDir::new().unwrap();
+        let (_record, prev_path) = install_scripted_docker(&dir);
+        std::fs::write(dir.path().join("running"), "darkmux-dispatch-c1").unwrap();
+        let refused = claim_resume_origin(origin.path()).err().map(|e| e.to_string());
+        std::fs::remove_file(dir.path().join("running")).unwrap();
+        let allowed = claim_resume_origin(origin.path()).is_ok();
+        restore_path(prev_path);
+        let msg = refused.expect("refused while C1 runs");
+        assert!(msg.contains("darkmux-dispatch-c1") && !msg.contains("darkmux-dispatch-c0"), "{msg}");
+        assert!(allowed, "allowed once C1 is gone");
+    }
+
+    /// A redirect means the endpoint processed nothing (curl does not follow
+    /// it): not charged, and the error says what to check. A non-JSON 2xx
+    /// stays charged, since the work may have happened.
+    #[test]
+    fn a_redirect_is_not_charged_but_a_non_json_success_is() {
+        for status in [301, 302, 307, 308] {
+            let e = classified_hosted_error(Some(status), "<html>moved</html>");
+            assert!(!call_may_have_spent(&e), "{status}");
+            assert!(e.to_string().contains("redirected") && e.to_string().contains("base URL"), "{e}");
+        }
+        let odd = classified_hosted_error(Some(100), "");
+        assert!(!call_may_have_spent(&odd) && odd.to_string().contains("unexpected HTTP status 100"), "{odd}");
+        assert!(call_may_have_spent(&classified_hosted_error(Some(200), "<html>ok?</html>")), "a non-JSON 200");
+        assert!(call_may_have_spent(&classified_hosted_error(Some(204), "")), "an empty 204");
+    }
+
+    /// A dispatch that has stamped its identity holds its out-dir's lock:
+    /// nobody else can take it, and `dispatch()` stamps through this one
+    /// function.
+    #[test]
+    fn a_running_dispatch_holds_its_out_dir_execution_lock() {
+        let out = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let out_dir = out.path().join("darkmux-out-held");
+        std::fs::create_dir(&out_dir).unwrap();
+        let lock_path = darkmux_types::paths::execution_lock_path(&out_dir).unwrap();
+        let mut held = ExecutionLock { _guards: Vec::new() };
+        stamp_own_execution(&mut held, &out_dir, (ws.path(), false, None), &ExecutionId::mint()).unwrap();
+        assert!(
+            darkmux_types::flock::try_lock_exclusive_owned(&lock_path).unwrap().is_none(),
+            "another try_lock on the running dispatch's lock fails"
+        );
+        assert!(read_resume_origin(&out_dir).is_ok(), "and its origin record was written");
+        drop(held);
+        assert!(darkmux_types::flock::try_lock_exclusive_owned(&lock_path).unwrap().is_some(), "released on drop");
+
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").expect("the test module declaration")];
+        assert_eq!(
+            src.matches("stamp_own_execution(\n        &mut execution_lock,").count(),
+            1,
+            "dispatch() stamps its identity and takes its lock through stamp_own_execution"
+        );
+    }
+
 
     /// Hosted-response classification (pure): the happy path passes through;
     /// object-shaped errors (Azure/OpenAI) and ARRAY-shaped errors (Google's
@@ -699,19 +997,19 @@
         // 503 code, UNAVAILABLE status, and Google's "high demand" message
         // inside an HTTP-200 body (observed live 2026-07-05).
         match parse_hosted_response(br#"{"error":{"code":503,"message":"overloaded"}}"#) {
-            Err(HostedCallError::RateLimited(_)) => {}
+            Err(HostedCallError::ServerShed(_)) => {}
             _ => panic!("503 must classify retryable"),
         }
         match parse_hosted_response(
             br#"[{"error":{"status":"UNAVAILABLE","message":"The service is currently unavailable."}}]"#,
         ) {
-            Err(HostedCallError::RateLimited(_)) => {}
+            Err(HostedCallError::ServerShed(_)) => {}
             _ => panic!("UNAVAILABLE must classify retryable"),
         }
         match parse_hosted_response(
             br#"{"error":{"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later."}}"#,
         ) {
-            Err(HostedCallError::RateLimited(m)) => assert!(m.contains("high demand")),
+            Err(HostedCallError::ServerShed(m)) => assert!(m.contains("high demand")),
             _ => panic!("high-demand shedding must classify retryable"),
         }
         match parse_hosted_response(br#"{"id":"x"}"#) {
@@ -3094,6 +3392,273 @@
         );
     }
 
+    /// The error the PRODUCTION mapping raises for a reply with HTTP `status`
+    /// and `body`: [`classify_hosted_response`], then, for a retried class,
+    /// the error [`exhausted_hosted_error`] gives once the retries ran out.
+    fn classified_hosted_error(status: Option<u16>, body: &str) -> anyhow::Error {
+        match classify_hosted_response(status, body.as_bytes()) {
+            Err(HostedCallError::Other(e)) => e,
+            Err(retried) => exhausted_hosted_error(Some(retried), 4),
+            Ok(_) => panic!("{status:?} {body} must be an error"),
+        }
+    }
+
+    const OPENAI_500: &str = r#"{"error":{"message":"The server had an error","type":"server_error","param":null,"code":null}}"#;
+    const AZURE_500: &str = r#"{"error":{"code":"InternalServerError","message":"Internal server error"}}"#;
+    const HTML_404: &str = "<html><body><h1>404 Not Found</h1></body></html>";
+    const HTML_502: &str = "<html><body><h1>502 Bad Gateway</h1></body></html>";
+
+    /// (#2925) The one charging policy, class by class, keyed on the HTTP
+    /// STATUS (what curl reports), never the body's `error.code`, which the
+    /// providers disagree on. Charged: a timeout or dropped reply after
+    /// sending, and any 5xx but 503. Not charged: a failure before sending,
+    /// every 4xx, a 429, and a 503 (shed load).
+    #[test]
+    fn call_may_have_spent_charges_only_calls_the_endpoint_may_have_processed() {
+        // Charged, by curl exit.
+        for exit in [28, 52, 56, 55, 18] {
+            let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
+            assert!(call_may_have_spent(&e), "curl exit {exit} came after the request went out");
+        }
+        // Charged, by status, whatever the body says (or does not).
+        for (status, body, what) in [
+            (500, OPENAI_500, "an OpenAI 500 (code null)"),
+            (500, AZURE_500, "an Azure 500 (code a string)"),
+            (502, HTML_502, "an HTML 502"),
+            (500, "", "an empty 500"),
+            (504, r#"{"error":{"code":401,"message":"body says 401"}}"#, "a 504 whose body claims 401"),
+        ] {
+            assert!(call_may_have_spent(&classified_hosted_error(Some(status), body)), "{what}");
+        }
+        // Not charged, by curl exit (nothing was sent).
+        for exit in [6, 7, 35, 60, 3] {
+            let e = failure(curl_failure_kind(exit), describe_curl_failure("u", exit, ""));
+            assert!(!call_may_have_spent(&e), "curl exit {exit} failed before the request went out");
+        }
+        // Not charged, by status.
+        for (status, body, what) in [
+            (404, HTML_404, "an HTML 404"),
+            (400, OPENAI_500, "a 400 whose body looks like a 500"),
+            (401, r#"{"error":{"code":500,"message":"body says 500"}}"#, "a 401 whose body claims 500"),
+            (403, "", "an empty 403"),
+            (429, r#"{"error":{"code":429,"message":"slow down"}}"#, "a 429"),
+            (429, HTML_404, "an HTML 429"),
+            (503, r#"{"error":{"code":503,"message":"overloaded"}}"#, "a 503 (shed load)"),
+            (503, HTML_502, "an HTML 503"),
+        ] {
+            assert!(!call_may_have_spent(&classified_hosted_error(Some(status), body)), "{what}");
+        }
+        // No status: the body's own shape decides, as before.
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":503,"message":"overloaded"}}"#)), "body 503");
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":429,"message":"slow"}}"#)), "body 429");
+        assert!(!call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":401,"message":"no"}}"#)), "body 401");
+        assert!(call_may_have_spent(&classified_hosted_error(None, r#"{"error":{"code":500,"message":"boom"}}"#)), "body 500");
+        assert!(call_may_have_spent(&classified_hosted_error(None, "<html>garbled</html>")), "an unreadable reply with no status");
+        assert!(!call_may_have_spent(&anyhow!("an error from nowhere near the hosted call")), "unclassed");
+        assert!(!call_may_have_spent(&failure(HostedFailure::NotSent, "x").context("wrapped")), "context keeps the class");
+        assert!(call_may_have_spent(&failure(HostedFailure::Unanswered, "x").context("wrapped")), "context keeps the class");
+    }
+
+    /// The exhausted-retries text names what actually ran out: a 503 is not
+    /// "rate-limited (429)", and each maps to its own uncharged class.
+    #[test]
+    fn exhausted_retries_name_their_own_cause() {
+        let shed = classified_hosted_error(Some(503), r#"{"error":{"message":"overloaded"}}"#);
+        let limited = classified_hosted_error(Some(429), r#"{"error":{"message":"slow down"}}"#);
+        assert!(shed.to_string().contains("unavailable (503") && !shed.to_string().contains("429"), "{shed}");
+        assert!(shed.to_string().contains("overloaded"), "{shed}");
+        assert!(limited.to_string().contains("rate-limited (429)") && limited.to_string().contains("slow down"), "{limited}");
+        let kind = |e: &anyhow::Error| e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind);
+        assert_eq!((kind(&shed), kind(&limited)), (Some(HostedFailure::Shed), Some(HostedFailure::RateLimited)));
+    }
+
+    /// The charge is the conservative no-usage charge for a possibly
+    /// processed call, and exactly 0 for one that was not.
+    #[test]
+    fn unanswered_hosted_spend_is_conservative_or_zero() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let charged = unanswered_hosted_spend(&failure(HostedFailure::Unanswered, "x"), 4096, &body);
+        assert_eq!(charged, crate::budget::conservative_hosted_spend(None, 4096, &body));
+        assert!(charged >= 4096);
+        assert_eq!(unanswered_hosted_spend(&failure(HostedFailure::Rejected, "x"), 4096, &body), 0);
+        assert_eq!(unanswered_hosted_spend(&failure(HostedFailure::NotSent, "x"), 4096, &body), 0);
+    }
+
+    use crate::budget::tests::status_http_mock;
+
+    /// End to end through the real curl path: a 500 charges, a 401 does not,
+    /// and a refused connection (nothing listening) does not.
+    #[test]
+    #[serial]
+    fn dispatch_unmanaged_charges_by_http_status_not_by_body_code() {
+        // Charged: provider 500 shapes whose `error.code` a body-keyed policy
+        // misses (null, a string), and an HTML 502.
+        for (status, body) in [
+            ("500 Internal Server Error", OPENAI_500),
+            ("500 Internal Server Error", AZURE_500),
+            ("502 Bad Gateway", HTML_502),
+            ("504 Gateway Timeout", r#"{"error":{"code":401,"message":"body says 401"}}"#),
+        ] {
+            let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&status_http_mock(status, body));
+            assert!(result.is_err());
+            assert_eq!(charged, Some(unreported), "{status} {body}: the endpoint may have processed it");
+            assert_eq!(sources, vec!["absent"], "{status} {body}");
+        }
+        // Not charged: an HTML 404, and a 401 whose body claims a 500.
+        for (status, body) in [
+            ("404 Not Found", HTML_404),
+            ("401 Unauthorized", r#"{"error":{"code":500,"message":"body says 500"}}"#),
+        ] {
+            let (result, charged, _, sources) = run_capped_hosted_dispatch(&status_http_mock(status, body));
+            assert!(result.is_err());
+            assert_eq!((charged, sources.len()), (None, 0), "{status}: rejected, not processed");
+        }
+        // Not charged: nothing listening, so nothing was sent.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/v1/chat/completions", l.local_addr().unwrap().port())
+        };
+        let (result, charged, _, sources) = run_capped_hosted_dispatch(&dead);
+        assert!(result.is_err());
+        assert_eq!((charged, sources.len()), (None, 0), "a refused connection never sent anything");
+    }
+
+    /// A loopback server that takes the request and never answers: the
+    /// hosted call is sent, then times out. Dropping the sender frees it.
+    fn silent_http_mock() -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let _ = held.recv_timeout(Duration::from_secs(20));
+        });
+        (format!("http://127.0.0.1:{port}/v1/chat/completions"), release)
+    }
+
+    /// Run `dispatch_unmanaged` against `base_url` with a per-dispatch cap of
+    /// one token, so ANY charge breaches it and reports what it charged.
+    /// Returns the dispatch's result, the `spent` figure of the cap breach it
+    /// reported, what an unreported call would be charged, and the
+    /// `token_source` of every usage record it wrote.
+    fn run_capped_hosted_dispatch(base_url: &str) -> (Result<DispatchResult>, Option<u64>, u64, Vec<String>) {
+        let flows_dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let session = crate::test_session("unanswered-call");
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = session.clone();
+        opts.json = false;
+        opts.timeout_seconds = 1;
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            Some(100000),
+            serde_json::json!({"url": base_url, "limits": {"tokens_per_dispatch": 1}}),
+        );
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_unmanaged(&opts, &ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target)
+        });
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let charged = env
+            .record(darkmux_flow::FlowAction::BudgetWarn)
+            .and_then(|r| r.payload_json()["spent"].as_u64());
+        let unreported = crate::budget::conservative_hosted_spend(
+            None,
+            single_shot_cap(opts.max_completion_tokens, None),
+            &single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None),
+        );
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(flows_dir.path()).unwrap().flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if v["action"] == "telemetry.tokens" {
+                    sources.push(v["payload"]["token_source"].as_str().unwrap_or("?").to_string());
+                }
+            }
+        }
+        (result, charged, unreported, sources)
+    }
+
+    /// (#2925) A hosted call that was sent and timed out is charged ONCE, the
+    /// conservative way a reply with no usage is: one `absent` usage record
+    /// (the endpoint's window counts it as a call) and the granted cap plus
+    /// the estimated prompt against the dispatch's cap.
+    #[test]
+    #[serial]
+    fn a_timed_out_hosted_call_is_charged_once() {
+        let (url, _held) = silent_http_mock();
+        let (result, charged, unreported, sources) = run_capped_hosted_dispatch(&url);
+        assert!(result.is_err(), "the unanswered call fails");
+        assert_eq!(charged, Some(unreported), "charged like a reply that reported no usage");
+        assert_eq!(sources, vec!["absent"], "one usage record, marked absent");
+    }
+
+    /// The per-dispatch cap is settled exactly once for an unanswered call,
+    /// however it is reached: the helper's charge is the whole charge.
+    #[test]
+    #[serial]
+    fn an_unanswered_call_settles_the_dispatch_cap_exactly_once() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            Some(100000),
+            serde_json::json!({"url": "http://127.0.0.1:1", "limits": {"tokens_per_dispatch": 1000000}}),
+        );
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let body = single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None);
+        let bucket = Mutex::new(crate::dispatch_budget::DispatchBudget::for_endpoint(&target.endpoint).unwrap());
+        let execution = ExecutionId::mint();
+        let caller = crate::budget::BudgetCaller {
+            role_id: Some(&opts.role_id),
+            session: &opts.session,
+            execution: &execution,
+            model: Some("gpt-remote"),
+            phase_id: None,
+            profiles_file: None,
+        };
+        charge_unanswered_hosted_call(&opts, &execution, &target, "label", &body, &bucket, &caller);
+        let expected = crate::budget::conservative_hosted_spend(None, single_shot_cap(opts.max_completion_tokens, None), &body);
+        assert_eq!(bucket.lock().unwrap().settled(), expected);
+        assert!(expected >= u64::from(single_shot_cap(opts.max_completion_tokens, None)), "at least the granted cap");
+    }
+
+    /// The inverse: a completed call still charges exactly once, by what the
+    /// provider reported, with a `provider` usage record and no second one.
+    #[test]
+    #[serial]
+    fn a_completed_hosted_call_still_charges_exactly_once() {
+        let (url, _rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+        );
+        let (result, charged, _, sources) = run_capped_hosted_dispatch(&url);
+        result.expect("the answered call succeeds");
+        assert_eq!(charged, Some(7), "charged by the reported total");
+        assert_eq!(sources, vec!["provider"], "one usage record");
+    }
+
     // ─── #2580 review finding: the SECOND unguarded route into
     //     `dispatch_unmanaged` — `dispatch_local_single_shot` ignored
     //     `resume_from` exactly as `dispatch()`'s pre-fix branch did ───────
@@ -5452,7 +6017,10 @@
         assert_eq!(args.first().map(String::as_str), Some("darkmux"));
         assert_eq!(args.get(1).map(String::as_str), Some("dispatch"));
         assert_eq!(args.get(2).map(String::as_str), Some("coder"));
-        assert_eq!(flag_value(&args, "--image"), Some("rust:latest"), "hint: {hint}");
+        assert!(
+            !args.iter().any(|a| a == "--image"),
+            "a resume with no --image runs on the origin's image, so the hint omits it: {hint}"
+        );
         assert!(!hint.contains("--phase-id"), "the flag was removed (#2954): {hint}");
 
         let resume_from = flag_value(&args, "--resume-from").expect("hint names --resume-from");
@@ -5467,6 +6035,173 @@
             read_only,
         )
         .expect("the hint darkmux prints must be a command darkmux accepts");
+    }
+
+    /// A resume runs on the origin's recorded image: with no `--image` it
+    /// inherits it, the same `--image` passes, and a different one (or one
+    /// named when the origin ran the default image) is refused like the
+    /// workspace gate refuses a different tree.
+    #[test]
+    fn a_resume_keeps_its_origins_image() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        let minted = darkmux_types::execution_id::ExecutionId::mint();
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &minted);
+
+        assert_eq!(
+            resume_effective_image(prior.path(), None).unwrap().as_deref(),
+            Some("rust:latest"),
+            "no --image: the resume runs on the origin's image"
+        );
+        assert_eq!(
+            resume_effective_image(prior.path(), Some("rust:latest")).unwrap().as_deref(),
+            Some("rust:latest"),
+            "the same --image passes"
+        );
+        let err = resume_effective_image(prior.path(), Some("python:3.12")).unwrap_err();
+        assert!(err.is::<ResumeRefusal>(), "a refusal, not a plain error: {err:#}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RESUME IMAGE MISMATCH") && msg.contains("rust:latest") && msg.contains("python:3.12"),
+            "{msg}"
+        );
+    }
+
+    /// An origin that ran the default image refuses a resume naming one, and
+    /// a resume naming none stays on the default (`None`).
+    #[test]
+    fn a_resume_of_a_default_image_run_refuses_an_explicit_image() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+
+        assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
+        let msg = resume_effective_image(prior.path(), Some("rust:latest")).unwrap_err().to_string();
+        assert!(msg.contains("RESUME IMAGE MISMATCH") && msg.contains("default runtime image"), "{msg}");
+    }
+
+    /// With no readable origin the image decision defers to the checkpoint
+    /// gate (RESUME ORIGIN UNKNOWN) rather than refusing twice.
+    #[test]
+    fn a_resume_without_an_origin_record_defers_the_image_decision() {
+        let prior = TempDir::new().unwrap();
+        assert_eq!(resume_effective_image(prior.path(), Some("rust:latest")).unwrap().as_deref(), Some("rust:latest"));
+        assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
+    }
+
+    /// An origin dir with a recorded execution, as a finished dispatch left it.
+    fn origin_dir() -> (TempDir, TempDir, ExecutionId) {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        let minted = ExecutionId::mint();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &minted);
+        (ws, prior, minted)
+    }
+
+    /// One live execution per origin: while the original dispatch (which
+    /// holds its own out-dir's lock) or another resume runs, a resume is
+    /// refused, naming the live execution.
+    #[test]
+    fn a_resume_is_refused_while_its_origin_is_live() {
+        let (_ws, prior, minted) = origin_dir();
+        // The original dispatch, still running: it holds its own lock.
+        let mut original = ExecutionLock { _guards: Vec::new() };
+        hold_own_execution_lock(&mut original, prior.path()).unwrap();
+        let err = claim_resume_origin(prior.path()).err().expect("refused while the original runs");
+        assert!(err.is::<ResumeRefusal>(), "{err:#}");
+        let msg = err.to_string();
+        assert!(msg.contains("RESUME REFUSED") && msg.contains("still running") && msg.contains(minted.as_str()), "{msg}");
+        drop(original);
+
+        // A first resume claims the origin; a second one is refused.
+        let first = claim_resume_origin(prior.path()).expect("free once the original ended");
+        assert!(claim_resume_origin(prior.path()).is_err(), "a second concurrent resume is refused");
+        drop(first);
+        claim_resume_origin(prior.path()).expect("sequential resumes stay allowed after the first ends");
+    }
+
+    /// A resume after an interrupted or failed run (no completion marker) is
+    /// allowed again and again; one after a success is refused.
+    #[test]
+    fn a_resume_of_a_completed_execution_is_refused() {
+        let (_ws, prior, minted) = origin_dir();
+        drop(claim_resume_origin(prior.path()).expect("an interrupted run can be resumed"));
+        drop(claim_resume_origin(prior.path()).expect("and resumed again"));
+
+        mark_execution_completed(&[prior.path()]);
+        let err = claim_resume_origin(prior.path()).err().expect("refused after success");
+        assert!(err.is::<ResumeRefusal>(), "{err:#}");
+        let msg = err.to_string();
+        assert!(msg.contains("RESUME ALREADY COMPLETED") && msg.contains(minted.as_str()), "{msg}");
+        // The marker rewrites the record in place: everything else survives.
+        let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(prior.path()).unwrap()).unwrap();
+        assert_eq!(origin["execution_id"].as_str(), Some(minted.as_str()));
+        assert!(origin["workspace"].is_string());
+    }
+
+    /// An execution completes only on a clean exit: a non-zero exit leaves
+    /// both the dispatch's own out-dir and the origin it resumed resumable;
+    /// exit 0 marks both, so neither can be resumed again.
+    #[test]
+    fn only_a_clean_exit_completes_an_execution() {
+        let (_ws, origin, _) = origin_dir();
+        let (_ws2, own, _) = origin_dir();
+        complete_execution_on_success(1, own.path(), Some(origin.path()));
+        complete_execution_on_success(137, own.path(), Some(origin.path()));
+        drop(claim_resume_origin(origin.path()).expect("a non-zero exit leaves the origin resumable"));
+        drop(claim_resume_origin(own.path()).expect("and the dispatch's own out-dir"));
+
+        complete_execution_on_success(0, own.path(), Some(origin.path()));
+        assert!(claim_resume_origin(origin.path()).is_err(), "exit 0 completes the origin it resumed");
+        assert!(claim_resume_origin(own.path()).is_err(), "and its own out-dir");
+    }
+
+    /// The lock file is a sibling of the out-dir, never inside it: the
+    /// container mounts the out-dir read-write, and a model must not be able
+    /// to delete the file whose lock keeps a second resume out.
+    #[test]
+    fn the_execution_lock_file_lives_beside_the_out_dir_not_in_it() {
+        let (_ws, prior, _) = origin_dir();
+        let _held = claim_resume_origin(prior.path()).unwrap();
+        let lock = darkmux_types::paths::execution_lock_path(prior.path()).unwrap();
+        assert!(lock.exists(), "{}", lock.display());
+        assert_eq!(lock.parent(), prior.path().parent());
+        assert_eq!(std::fs::read_dir(prior.path()).unwrap().count(), 0, "nothing written inside the out-dir");
+    }
+
+    /// `dispatch()` itself, not just the helpers, takes the origin's lock
+    /// and image decision: both refusals fire before any image, model or
+    /// workspace work, named as the resume gate's own.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_a_live_origin_and_a_different_image_before_any_work() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &ExecutionId::mint());
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        let run = |image: Option<&str>| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "coder".to_string();
+            opts.resume_from = Some(prior.path().to_path_buf());
+            opts.image = image.map(str::to_string);
+            format!("{:#}", dispatch(opts).expect_err("both cases refuse"))
+        };
+        let different_image = run(Some("python:3.12"));
+        let live = {
+            let _original = claim_resume_origin(prior.path()).unwrap();
+            run(None)
+        };
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(different_image.contains("RESUME IMAGE MISMATCH"), "{different_image}");
+        assert!(live.contains("RESUME REFUSED") && live.contains("still running"), "{live}");
     }
 
     /// (#2774 round-3 MF2) The F2 regression the round-2 fix did NOT
@@ -5553,6 +6288,28 @@
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+
+    /// The tier-4 hold's dispatch keeps its execution lock while it waits, so
+    /// the printed command is refused until that dispatch is stopped. The hint
+    /// must say to stop it first, and the claim must really hold: the same
+    /// command is refused while the lock is held and accepted once released.
+    #[test]
+    fn the_tier4_resume_hint_says_to_stop_the_held_dispatch_first() {
+        let workspace = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), workspace.path(), false, None, &ExecutionId::mint());
+        let hint = resume_hint_from_origin(prior.path(), "coder");
+        assert!(hint.contains("stop this dispatch with Ctrl-C"), "{hint}");
+        assert!(hint.contains("holds the execution lock"), "{hint}");
+        // The command part still parses as one command.
+        assert_eq!(parse_hint_args(&hint).first().map(String::as_str), Some("darkmux"), "{hint}");
+
+        let mut held = ExecutionLock { _guards: Vec::new() };
+        hold_own_execution_lock(&mut held, prior.path()).unwrap();
+        assert!(claim_resume_origin(prior.path()).is_err(), "refused while the held dispatch runs");
+        drop(held);
+        claim_resume_origin(prior.path()).expect("accepted once it was stopped");
+    }
 
     /// The crawl-unit case, which needs BOTH the right `--workdir` and
     /// `--workspace-read-only`: a read-only origin resumed read-write is
@@ -7563,6 +8320,7 @@
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
+                DispatchStop::new("test-container".into()),
             )
         });
 
@@ -8656,6 +9414,7 @@
             None,
             None,
             None,
+            DispatchStop::new("test-container".into()),
         );
         handle.join().expect("tailer thread");
 
@@ -11270,10 +12029,11 @@
 
     #[test]
     #[serial]
-    fn bookend_guard_disarmed_emits_nothing_on_drop() {
-        // The happy path (and container-ran-but-failed path) disarm after
-        // their own terminal record — the guard must then stay silent so the
-        // dispatch isn't double-counted.
+    fn bookend_guard_close_is_the_only_terminal() {
+        // The happy path (and container-ran-but-failed path) end through
+        // `close()`, which writes their own terminal record and disarms — the
+        // guard must then stay silent on drop so the dispatch isn't
+        // double-counted.
         let tmp = TempDir::new().unwrap();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
@@ -11302,7 +12062,14 @@
                 None,
                 darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
             ));
-            guard.disarm();
+            guard.close(crate::dispatch::build_dispatch_record(
+                darkmux_flow::Level::Info,
+                "coder",
+                &crate::test_session("sess-clean"), &darkmux_types::execution_id::ExecutionId::mint(),
+                Some("darkmux:qwen3.6"),
+                None,
+                darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::new(0)),
+            ));
         }
 
         unsafe {
@@ -11316,16 +12083,18 @@
             }
         }
 
-        let emitted = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-clean"))
+        let terminals: Vec<String> = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-clean"))
             .into_iter()
-            .any(|v| v["action"] == "dispatch.error");
-        assert!(!emitted, "disarmed guard must not emit any terminal record");
+            .filter_map(|v| v["action"].as_str().map(str::to_string))
+            .filter(|a| a == "dispatch.complete" || a == "dispatch.error")
+            .collect();
+        assert_eq!(terminals, vec!["dispatch.complete"], "close() is the one terminal; the Drop backstop adds none");
     }
 
     #[test]
     #[serial]
     fn bookend_guard_fires_on_panic_unwind() {
-        // The RAII headline: a panic between start and disarm still bookends
+        // The RAII headline: a panic between start and close still bookends
         // the start. Rust runs Drop on unwind, so the guard emits its
         // dispatch.error even when the dispatch panics mid-flight (#717).
         let tmp = TempDir::new().unwrap();
@@ -14815,6 +15584,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None, // (#3035) dispatch cap
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
+            DispatchStop::new("test-container".into()),
         );
         let elapsed = started.elapsed();
 
@@ -15181,6 +15951,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
+                DispatchStop::new("test-container".into()),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
@@ -15269,6 +16040,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
                 None, // (#2902 step 5) no endpoint budget
+                DispatchStop::new("test-container".into()),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -18781,6 +19553,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None, // dispatch cap
             None, // compactor endpoint
             None, // live sender
+            DispatchStop::new("test-container".into()),
         );
         assert_eq!(summary.fold.compactions(), 1, "the event at the end of a 20 MiB backlog was dropped");
     }

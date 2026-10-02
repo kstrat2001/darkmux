@@ -880,6 +880,60 @@ impl ExecutionBookends<'_> {
     }
 }
 
+/// (#2925) A hosted `dispatch.single_shot` call failed: under the one hosted
+/// error policy ([`crate::dispatch_internal::call_may_have_spent`]) a call the
+/// endpoint may have processed is counted (an `absent` usage record) and
+/// charged against the dispatch cap like a reply with no usage; any other
+/// failure spends nothing. `step_and_endpoint` is the step id and the
+/// endpoint label its records carry.
+fn charge_failed_hosted_step_call(
+    err: &anyhow::Error,
+    req: &crate::single_shot::HostedSingleShotRequest<'_>,
+    bucket: &Mutex<DispatchBudget>,
+    caller: &crate::budget::BudgetCaller<'_>,
+    ctx: Option<&StepRunCtx>,
+    step_and_endpoint: (&str, &str),
+) {
+    if !crate::dispatch_internal::call_may_have_spent(err) {
+        return;
+    }
+    let (step_id, endpoint_label) = step_and_endpoint;
+    let usage = crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        darkmux_flow::FlowSource::Tokens,
+        step_id,
+        caller.session,
+        caller.execution,
+        Some(req.model),
+        None,
+        darkmux_flow::Payload::TelemetryTokens(crate::usage::usage_payload(
+            &crate::usage::CallFacts {
+                call_kind: crate::usage::CallKind::SingleShot,
+                role_id: None,
+                requested_model: req.model,
+                reported_model: None,
+                endpoint: endpoint_label,
+                endpoint_id: req.endpoint.named_id(),
+            },
+            &darkmux_trajectory::UsageCounts::default(),
+        )),
+    );
+    match ctx {
+        Some(c) => c.emit(usage),
+        None => {
+            let _ = darkmux_flow::record(usage);
+        }
+    }
+    if let Ok(body) = req.body() {
+        crate::budget::settle_dispatch_live(
+            bucket,
+            crate::dispatch_internal::unanswered_hosted_spend(err, req.max_tokens, &body),
+            step_id,
+            caller,
+        );
+    }
+}
+
 impl StepKind for DispatchSingleShotStepKind {
     fn id(&self) -> &'static str {
         ConfigKind::DispatchSingleShot.id()
@@ -1059,8 +1113,20 @@ impl DispatchSingleShotStepKind {
                 max_tokens,
                 timeout_seconds,
             };
-            let reply = single_shot_chat_hosted(&req)
-                .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?;
+            let reply = match single_shot_chat_hosted(&req) {
+                Ok(reply) => reply,
+                Err(e) => {
+                    charge_failed_hosted_step_call(
+                        &e,
+                        &req,
+                        &dispatch_bucket,
+                        &budget_caller,
+                        ctx,
+                        (&step.id, endpoint_label.as_deref().unwrap_or_default()),
+                    );
+                    return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
+                }
+            };
             crate::budget::settle_dispatch_live(
                 &dispatch_bucket,
                 crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens, &req.body()?),
@@ -2537,9 +2603,19 @@ fn map_hosted_item(
             // retried only when `retry_on_error` opted in, with a short
             // backoff and `error_retries_used` tracking how many fired.
             Err(e) => {
-                // Release the reservation — a dispatch-level error spent
-                // nothing (the pre-reserve accounting billed 0 here too).
-                crate::budget::settle_dispatch_live(bucket, 0, dispatch_label, caller);
+                // The one hosted-error policy (`call_may_have_spent`): a call
+                // the endpoint may have processed is charged like a reply
+                // with no usage, and counted as a call; any other error
+                // spends nothing.
+                if crate::dispatch_internal::call_may_have_spent(&e) {
+                    calls.push(MapCall { counts: Default::default(), reported_model: None });
+                }
+                crate::budget::settle_dispatch_live(
+                    bucket,
+                    crate::dispatch_internal::unanswered_hosted_spend(&e, clamped, &body),
+                    dispatch_label,
+                    caller,
+                );
                 if error_budget == 0 {
                     return MapItemResult {
                         index,
@@ -4814,6 +4890,88 @@ mod tests {
         let err = out.error.unwrap_or_default();
         assert!(err.contains("mission `m-aborted` is aborted") && err.contains("nothing was sent"), "{err}");
         assert_eq!(*calls.lock().unwrap(), 0, "the transport is never called");
+    }
+
+    /// (#2925) One policy for a failed hosted call, on the map arm: a timeout
+    /// after sending or a 5xx charges the conservative no-usage amount and is
+    /// counted as a call; a failure before sending, a 4xx and a 429 spend
+    /// nothing and are not counted.
+    #[test]
+    fn a_failed_hosted_map_call_charges_only_when_the_endpoint_may_have_processed_it() {
+        use crate::dispatch_internal::{failure_for_test, HostedFailure};
+        let run = |kind: HostedFailure| {
+            let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
+            let ovr: MapDispatchOverride =
+                Arc::new(move |_c: &OverrideDispatchCall<'_>| Err(failure_for_test(kind, "failed")));
+            let mut calls = Vec::new();
+            let out = map_hosted_item(
+                0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
+                &mut calls, "s1", &crate::budget::tests::solo_caller(),
+            );
+            assert!(!out.ok, "{out:?}");
+            let settled = bucket.lock().unwrap().settled();
+            (settled, calls.len())
+        };
+        let prompt = (darkmux_trajectory::estimate_tokens("sys") + darkmux_trajectory::estimate_tokens("user")) as u64;
+        for kind in [HostedFailure::Unanswered, HostedFailure::ServerError] {
+            let (settled, calls) = run(kind);
+            assert!(settled >= 4_096 + prompt.min(1), "{kind:?} is charged the cap plus the prompt: {settled}");
+            assert_eq!(calls, 1, "{kind:?} is counted as a call");
+        }
+        for kind in [HostedFailure::NotSent, HostedFailure::Rejected, HostedFailure::RateLimited] {
+            assert_eq!(run(kind), (0, 0), "{kind:?} spends nothing and is not a call");
+        }
+    }
+
+    /// The same policy on the hosted `dispatch.single_shot` step, end to end
+    /// through the real curl path: a 500 breaches a one-token cap (charged),
+    /// a 401 does not (spent nothing).
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_hosted_single_shot_step_charges_only_when_the_endpoint_may_have_processed_it() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let actions = |status: &'static str, body: &'static str| {
+            let url = crate::budget::tests::status_http_mock(status, body);
+            let base = url.trim_end_matches("/v1/chat/completions").to_string();
+            let reg = tempfile::TempDir::new().unwrap();
+            let pf = reg.path().join("profiles.json");
+            std::fs::write(
+                &pf,
+                format!(
+                    r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":1}}]}}}},
+                        "endpoints":{{"azure":{{"url":"{base}","limits":{{"tokens_per_dispatch":1}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let s = step(
+                "s1",
+                "dispatch.single_shot",
+                json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf.to_str().unwrap(), "timeout_seconds": 5 }),
+            );
+            let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+            let err = crate::budget::with_test_env(env.clone(), || {
+                DispatchSingleShotStepKind
+                    .run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+                    .unwrap_err()
+            });
+            assert!(format!("{err:#}").contains("dispatch.single_shot (hosted)"), "{err:#}");
+            env.actions()
+        };
+        assert_eq!(
+            actions("500 Internal Server Error", r#"{"error":{"code":401,"message":"body says 401"}}"#),
+            vec![darkmux_flow::FlowAction::BudgetWarn],
+            "the 500 status decides, not the body's 401: charged against the cap"
+        );
+        assert!(
+            actions("401 Unauthorized", r#"{"error":{"code":500,"message":"body says 500"}}"#).is_empty(),
+            "the 401 status decides, not the body's 500: nothing charged"
+        );
+        assert_eq!(
+            actions("502 Bad Gateway", "<html>502</html>"),
+            vec![darkmux_flow::FlowAction::BudgetWarn],
+            "an HTML 502 is a 5xx: charged"
+        );
+        assert!(actions("404 Not Found", "<html>404</html>").is_empty(), "an HTML 404 is a 4xx: nothing charged");
     }
 
     /// (5th review C2) A hosted map item settles its REPLY's spend into

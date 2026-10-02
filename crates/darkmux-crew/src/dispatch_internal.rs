@@ -4,8 +4,8 @@
 //! `darkmux-runtime` docker container. Per-dispatch container, mounted
 //! workspace, structured output collected from stdout.
 //!
-//! The ONLY dispatch path as of 2.0 (#1405 removed the legacy `openclaw`
-//! shell-out runtime and its `--runtime` opt-in flag).
+//! The ONLY dispatch path as of 2.0 (#1405 removed the legacy shell-out
+//! runtime and its `--runtime` opt-in flag).
 //!
 //! No `--workdir` symlink injection (workspace is a fresh tempdir per
 //! dispatch); no model pin enforcement (probes whatever LMStudio currently
@@ -95,13 +95,13 @@ fn is_darkmux_runtime_image(tag: &str) -> bool {
     crate::runtime_image::is_darkmux_runtime_ref(tag)
 }
 
+/// The two effects image resolution needs: inspecting, and pulling.
+type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
+
 /// `docker pull` the version-pinned GHCR runtime image (#759). Streams docker's
 /// own progress to stderr so a multi-second first-dispatch pull isn't a silent
 /// hang. Bails with an actionable message (auth / network / build-locally) on
 /// failure.
-/// The two effects image resolution needs: inspecting, and pulling.
-type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
-
 #[cfg_attr(test, allow(dead_code))]
 fn pull_runtime_image(image: &str) -> Result<()> {
     eprintln!("darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759)…");
@@ -1229,6 +1229,234 @@ fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
     }
 }
 
+/// The image a resume runs on, and the refusal when `requested` (the
+/// `--image` the resume was given) names a different one than the origin
+/// recorded. The origin's `image` is the explicit `--image` its dispatch ran
+/// with (`null` for the default runtime image), so:
+///
+/// - no `--image` on the resume: it runs on the origin's recorded image;
+/// - the same `--image`: passes;
+/// - a different `--image`, or one named when the origin ran the default:
+///   RESUME IMAGE MISMATCH. A checkpoint continues a conversation whose tool
+///   results came from one environment; resuming it in another would let the
+///   model act on state its new toolchain does not have.
+///
+/// An unreadable or unparseable origin record returns `requested` unchanged:
+/// the checkpoint gate ([`validate_resume_checkpoint`]) refuses that case
+/// with RESUME ORIGIN UNKNOWN, and one refusal per cause is enough.
+pub(crate) fn resume_effective_image(
+    resume_from: &Path,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    let origin = read_resume_origin(resume_from)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(origin) = origin else {
+        return Ok(requested.map(str::to_string));
+    };
+    let recorded = origin.get("image").and_then(|v| v.as_str());
+    match (recorded, requested) {
+        (recorded, None) => Ok(recorded.map(str::to_string)),
+        (Some(r), Some(q)) if r == q => Ok(Some(q.to_string())),
+        (recorded, Some(q)) => {
+            let origin_image = recorded.map_or("the default runtime image".to_string(), |r| format!("`{r}`"));
+            bail_resume!(
+                "darkmux dispatch: RESUME IMAGE MISMATCH — the checkpoint at {} was written in \
+                 {origin_image}, but this dispatch's image is `{q}`; refusing to resume into a \
+                 different environment (drop --image to resume on the original)",
+                resume_from.join(CHECKPOINT_FILENAME).display()
+            )
+        }
+    }
+}
+
+/// A dispatch's own identity at start: its host-only resume-origin record and
+/// its out-dir's execution lock, held until `lock` drops. From here a resume of
+/// this out-dir is refused while the dispatch runs.
+fn stamp_own_execution(
+    lock: &mut ExecutionLock,
+    host_out: &Path,
+    workspace: (&Path, bool, Option<&str>),
+    execution: &ExecutionId,
+) -> Result<()> {
+    let (path, read_only, image) = workspace;
+    write_resume_origin_meta(host_out, path, read_only, image, execution);
+    hold_own_execution_lock(lock, host_out)
+}
+
+/// Record the container this dispatch runs in, in its resume-origin record, so
+/// a later resume can tell the container is still up after the darkmux
+/// process that started it (and held the lock) was killed. Best effort.
+fn record_origin_container(host_out: &Path, container_name: &str, resume_from: Option<&Path>) {
+    update_origin_field(host_out, "container", serde_json::Value::String(container_name.to_string()));
+    // A resume's container is also recorded on the origin it resumed, which a
+    // later `--resume-from` that origin reads: otherwise a resume whose darkmux
+    // process was killed leaves its container invisible to the next claim.
+    if let Some(origin) = resume_from {
+        let mut names = origin_resume_containers(origin);
+        if !names.iter().any(|n| n == container_name) {
+            names.push(container_name.to_string());
+        }
+        update_origin_field(
+            origin,
+            "containers",
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+}
+
+/// Set one key in `out_dir`'s host-only origin record, keeping the rest.
+fn update_origin_field(out_dir: &Path, key: &str, value: serde_json::Value) {
+    let Ok(raw) = read_resume_origin(out_dir) else { return };
+    let Ok(mut origin) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let Some(obj) = origin.as_object_mut() else { return };
+    obj.insert(key.to_string(), value);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&origin) {
+        let _ = write_private_no_follow(&resume_origin_path(out_dir), &bytes);
+    }
+}
+
+/// Holds one execution's exclusive lock for as long as it lives (released
+/// on drop, and by the kernel if the process dies).
+pub(crate) struct ExecutionLock {
+    _guards: Vec<darkmux_types::flock::FlockGuard>,
+}
+
+/// Take the non-blocking exclusive lock on `out_dir`'s execution lock file.
+/// `Ok(None)` when another live dispatch or resume holds it.
+fn try_lock_out_dir(out_dir: &Path) -> Result<Option<darkmux_types::flock::FlockGuard>> {
+    let path = darkmux_types::paths::execution_lock_path(out_dir)
+        .ok_or_else(|| anyhow!("{} has no name to derive an execution lock path from", out_dir.display()))?;
+    darkmux_types::flock::try_lock_exclusive_owned(&path)
+}
+
+/// One live execution per out-dir. A dispatch holds its own out-dir's lock
+/// for its whole life; a resume additionally holds its ORIGIN's, taken here
+/// before any image or model work. Without it, the original (or another
+/// resume) and a resume ran side by side on one execution id and one
+/// workspace. Refuses, naming the live execution, when the origin is held;
+/// refuses when the origin's execution already ended in success, since a
+/// completed execution has nothing to resume. A dispatch that ended any
+/// other way (interrupted, error, killed) released its lock and may be
+/// resumed again, in sequence.
+pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
+    let named = recorded_execution(resume_from)
+        .map_or("an execution".to_string(), |id| format!("execution {}", id.as_str()));
+    if resume_origin_completed(resume_from) {
+        bail_resume!(
+            "darkmux dispatch: RESUME ALREADY COMPLETED — {named} (out-dir {}) already ended in \
+             success; there is nothing left to resume",
+            resume_from.display()
+        );
+    }
+    let Some(guard) = try_lock_out_dir(resume_from).context("locking the resume origin")? else {
+        bail_resume!(
+            "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) is still running; a second \
+             run would share its execution id and workspace. Wait for it to end (or stop it), then \
+             resume",
+            resume_from.display()
+        );
+    };
+    // The lock lives only as long as the darkmux process: after a SIGKILL of
+    // it the container keeps running with no lock held. Ask docker too.
+    for name in origin_containers(resume_from) {
+        if probe_container_liveness(&name) == Liveness::Running {
+            bail_resume!(
+                "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its container `{name}` \
+                 running, though the darkmux process that started it is gone. Stop it \
+                 (`docker kill {name}`), then resume",
+                resume_from.display()
+            );
+        }
+    }
+    Ok(ExecutionLock { _guards: vec![guard] })
+}
+
+/// Take `host_out`'s own execution lock into `held`, so a resume of THIS
+/// dispatch is refused while it runs. The out-dir is fresh and named by this
+/// dispatch alone, so contention here means something else is wrong: refuse
+/// rather than run unlocked.
+pub(crate) fn hold_own_execution_lock(held: &mut ExecutionLock, host_out: &Path) -> Result<()> {
+    match try_lock_out_dir(host_out).context("locking this execution")? {
+        Some(guard) => {
+            held._guards.push(guard);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "darkmux dispatch: the execution lock for {} is already held by another process",
+            host_out.display()
+        )),
+    }
+}
+
+/// Record, in each of `out_dirs`' host-only origin records, that the
+/// execution ended in success: a later `--resume-from` any of them is
+/// refused ([`claim_resume_origin`]). Best effort: a record that cannot be
+/// read or rewritten leaves that dir resumable, which is the pre-existing
+/// behavior and never a wrong refusal.
+pub(crate) fn mark_execution_completed(out_dirs: &[&Path]) {
+    for dir in out_dirs {
+        update_origin_field(dir, "completed", serde_json::Value::Bool(true));
+    }
+}
+
+/// A clean exit completes the execution: `host_out`, and the origin it
+/// resumed, are marked so a later resume of either is refused
+/// ([`claim_resume_origin`]). Any other exit leaves them resumable.
+fn complete_execution_on_success(exit_code: i32, host_out: &Path, resume_from: Option<&Path>) {
+    if exit_code == 0 {
+        let origins: Vec<&Path> = std::iter::once(host_out).chain(resume_from).collect();
+        mark_execution_completed(&origins);
+    }
+}
+
+/// The containers of the resumes that continued `out_dir`'s dispatch, as its
+/// origin record names them (`containers`).
+fn origin_resume_containers(out_dir: &Path) -> Vec<String> {
+    let Some(origin) = read_resume_origin(out_dir).ok().and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+    else {
+        return Vec::new();
+    };
+    origin
+        .get("containers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Every container recorded in `out_dir`'s origin record: its own dispatch's
+/// (`container`) and those of the resumes that continued it.
+fn origin_containers(out_dir: &Path) -> Vec<String> {
+    let own = read_resume_origin(out_dir)
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|o| o.get("container").and_then(|v| v.as_str()).map(str::to_string));
+    own.into_iter().chain(origin_resume_containers(out_dir)).collect()
+}
+
+fn resume_origin_completed(out_dir: &Path) -> bool {
+    read_resume_origin(out_dir)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|origin| origin.get("completed").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// What a resume settles before any image, model or workspace work: the image
+/// it runs on ([`resume_effective_image`], refusing a different `--image`) and
+/// the origin's execution lock ([`claim_resume_origin`]). A dispatch that is
+/// not a resume keeps its own `--image` and takes no origin lock.
+fn resume_preflight(resume_from: Option<&Path>, image: Option<&str>) -> Result<(Option<String>, ExecutionLock)> {
+    let Some(resume_from) = resume_from else {
+        return Ok((image.map(str::to_string), ExecutionLock { _guards: Vec::new() }));
+    };
+    let image = resume_effective_image(resume_from, image).context("darkmux dispatch --resume-from")?;
+    let lock = claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?;
+    Ok((image, lock))
+}
+
 /// (#2774 review F2) Build tier 4's `resume_hint` — the command an
 /// operator reads at 3am and pastes — so that it is a command darkmux will
 /// actually ACCEPT.
@@ -1274,8 +1502,9 @@ pub(crate) fn resume_hint_from_origin(
         );
     };
     let read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool()).unwrap_or(false);
-    let image = origin.get("image").and_then(|v| v.as_str());
 
+    // No `--image`: a resume with none runs on the origin's recorded image
+    // ([`resume_effective_image`]), so naming it here would be noise.
     let mut cmd = format!(
         "darkmux dispatch {} --resume-from {} --workdir {}",
         shell_quote(role_id),
@@ -1285,11 +1514,13 @@ pub(crate) fn resume_hint_from_origin(
     if read_only {
         cmd.push_str(" --workspace-read-only");
     }
-    if let Some(image) = image {
-        cmd.push_str(" --image ");
-        cmd.push_str(&shell_quote(image));
-    }
-    format!("{cmd} (once conditions look better — this pause does not clear on its own)")
+    // The held dispatch still owns the execution lock, so this command is
+    // refused ("still running") until that dispatch is stopped: say so.
+    format!(
+        "{cmd} (once conditions look better, and only after you stop this dispatch with Ctrl-C: \
+         it holds the execution lock, so a resume is refused while it runs; \
+         this pause does not clear on its own)"
+    )
 }
 
 // (#2158 / #2456) `create_dir_exclusive_0700` and
@@ -1756,8 +1987,8 @@ fn apply_compaction_flags(
     // omitted ⇒ runtime uses the V0 baseline system prompt.
     // Schema-isolation doctrine: this comes from the typed
     // `profile.runtime.compaction.custom_instructions` only — never
-    // from `extras["customInstructions"]` (the dead-letter openclaw
-    // passthrough). See DESIGN.md "Schema isolation".
+    // from the untyped `extras["customInstructions"]` overflow. See
+    // DESIGN.md "Schema isolation".
     if let Some(text) = compaction.custom_instructions.as_deref() {
         args.push("--compactor-custom-instructions".to_string());
         args.push(text.to_string());
@@ -2582,10 +2813,11 @@ fn warn_if_unparseable_u32(var: &str) {
 /// leaves an orphaned start; since #714 stamped `mission_id` on it, the
 /// orphan now groups under its mission and would render as perpetually
 /// in-flight. This guard fires a `dispatch.error` terminal record on `Drop`
-/// unless `disarm`ed, so every start has a matching terminal event. The clean
-/// path (and the container-ran-but-failed path, which already emits its own
-/// `dispatch.error`) calls `disarm()` after that emit, so the guard never
-/// double-counts a dispatch that reached its own terminal record.
+/// unless the dispatch ended through [`close`](Self::close), so every start
+/// has a matching terminal event. The clean path (and the container-ran-but-
+/// failed path, which emits its own `dispatch.error`) ends in `close()`,
+/// which writes that record and disarms the guard, so a dispatch that
+/// reached its own terminal record is never counted twice.
 ///
 /// A thin wrapper: this is a flat, depth-≤1 case of the generic
 /// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
@@ -2598,8 +2830,7 @@ fn warn_if_unparseable_u32(var: &str) {
 /// and now relies on that outer wrap for liveness. Emits through the
 /// process-wide default sink (`darkmux_flow::record`) — same as every other
 /// record on this dispatch path — so, unlike the review bridge, there's no
-/// injected `ReviewEmitter` to bridge and no re-lending concern (see
-/// `darkmux_flow::bookend`'s module doc for why that matters elsewhere).
+/// injected `ReviewEmitter` to bridge and no re-lending concern.
 struct DispatchBookendGuard<'a> {
     inner: darkmux_flow::DynBookendGuard<'a>,
 }
@@ -2652,15 +2883,6 @@ impl<'a> DispatchBookendGuard<'a> {
     /// dispatch that reached this call.
     fn close(&mut self, finished: darkmux_flow::FlowRecord) {
         self.inner.close(DISPATCH_BOOKEND_UNIT, finished);
-    }
-
-    /// Silence the Drop backstop without emitting a terminal record. No
-    /// production call site needs it (`close()` disarms itself); the tests
-    /// use it to prove the disarm-suppresses-the-backstop behavior holds
-    /// through the wrapper.
-    #[cfg(test)]
-    fn disarm(&mut self) {
-        self.inner.disarm();
     }
 }
 
@@ -3282,8 +3504,100 @@ static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// error-shape corpus.
 #[derive(Debug)]
 pub(crate) enum HostedCallError {
+    /// 429 / RESOURCE_EXHAUSTED: the endpoint rejected the call, retryable.
     RateLimited(String),
+    /// 503 / UNAVAILABLE / "high demand": the endpoint shed load, retryable.
+    /// Kept apart from `RateLimited` only for the exhausted message: neither
+    /// is charged ([`call_may_have_spent`]).
+    ServerShed(String),
     Other(anyhow::Error),
+}
+
+/// How a failed hosted call failed, as far as the budget cares: whether the
+/// endpoint may have processed it. Carried inside the error as a
+/// [`HostedFailureError`]; read back by [`call_may_have_spent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedFailure {
+    /// Failed before the request was sent (config, spawn, DNS, connect, TLS).
+    NotSent,
+    /// Sent, and the answer never came whole: a timeout, a dropped or empty
+    /// reply, an unreadable body.
+    Unanswered,
+    /// The endpoint refused it: 4xx (400, 401, 403, ...), never processed.
+    Rejected,
+    /// 429: rejected for rate, never processed.
+    RateLimited,
+    /// 5xx other than 503: the endpoint failed after taking the call.
+    ServerError,
+    /// 503 / UNAVAILABLE / "high demand": the endpoint shed the load. Not
+    /// billed, and charging it can push the window into a false `wait` in an
+    /// outage, so it is never charged.
+    Shed,
+}
+
+/// A hosted-call error tagged with its [`HostedFailure`] class.
+#[derive(Debug)]
+pub(crate) struct HostedFailureError {
+    kind: HostedFailure,
+    message: String,
+}
+
+impl std::fmt::Display for HostedFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostedFailureError {}
+
+/// [`failure`] for another module's tests, which classify an error without a
+/// live endpoint.
+#[cfg(test)]
+pub(crate) fn failure_for_test(kind: HostedFailure, message: &str) -> anyhow::Error {
+    failure(kind, message)
+}
+
+/// An error carrying its [`HostedFailure`] class, with `message` as its text.
+fn failure(kind: HostedFailure, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(HostedFailureError { kind, message: message.into() })
+}
+
+/// (#2925) THE one policy for a hosted call that failed: did the endpoint
+/// possibly process it, so that it may have been billed? A timeout or dropped
+/// reply after the request was sent, and a 5xx other than 503, may have been;
+/// a failure before sending, a 4xx (400, 401, 403, ...), a 429 and a 503
+/// (shed load) never were. An error
+/// with no class (anything not raised by the hosted call itself) is not
+/// charged: a false budget wait costs more than one missed call. Every hosted
+/// path (`dispatch_unmanaged`, the `dispatch.single_shot` and `dispatch.map`
+/// steps) charges through [`unanswered_hosted_spend`], which asks this.
+pub(crate) fn call_may_have_spent(err: &anyhow::Error) -> bool {
+    let kind = err.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|e| e.kind);
+    matches!(kind, Some(HostedFailure::Unanswered | HostedFailure::ServerError))
+}
+
+/// What a failed hosted call charges: the conservative charge of a reply with
+/// no usage ([`crate::budget::conservative_hosted_spend`]) when the endpoint
+/// may have processed it, else nothing.
+pub(crate) fn unanswered_hosted_spend(err: &anyhow::Error, granted_max_tokens: u32, request: &serde_json::Value) -> u64 {
+    if call_may_have_spent(err) {
+        crate::budget::conservative_hosted_spend(None, granted_max_tokens, request)
+    } else {
+        0
+    }
+}
+
+/// curl exit codes that mean the request went out and no whole answer came
+/// back: 18 partial file, 28 timeout, 52 empty reply, 55 send failure, 56
+/// receive failure. Every other nonzero exit (DNS 6, connect 7, TLS 35/60, a
+/// bad URL 3, ...) failed before the endpoint could have processed anything.
+/// A 28 can also be a connect timeout, which curl does not distinguish here;
+/// it is charged, the conservative side.
+fn curl_failure_kind(exit: i32) -> HostedFailure {
+    match exit {
+        18 | 28 | 52 | 55 | 56 => HostedFailure::Unanswered,
+        _ => HostedFailure::NotSent,
+    }
 }
 
 /// Backoff ladder for endpoint rate limits (free tiers especially: Gemini's
@@ -3302,25 +3616,42 @@ pub(crate) fn remote_chat_completion(
     timeout_seconds: u32,
 ) -> Result<serde_json::Value> {
     let attempts = RATE_LIMIT_BACKOFF_SECONDS.len() + 1;
-    let mut last = String::new();
+    let mut last: Option<HostedCallError> = None;
     for (i, delay) in std::iter::once(0u64)
         .chain(RATE_LIMIT_BACKOFF_SECONDS.iter().copied())
         .enumerate()
     {
         if delay > 0 {
             eprintln!(
-                "darkmux: hosted endpoint rate-limited (429) — retry {i}/{} in {delay}s",
+                "darkmux: hosted endpoint rate-limited or unavailable, retry {i}/{} in {delay}s",
                 attempts - 1
             );
             std::thread::sleep(std::time::Duration::from_secs(delay));
         }
         match remote_chat_attempt(url, auth_header, body, timeout_seconds) {
             Ok(v) => return Ok(v),
-            Err(HostedCallError::RateLimited(msg)) => last = msg,
+            Err(e @ (HostedCallError::RateLimited(_) | HostedCallError::ServerShed(_))) => last = Some(e),
             Err(HostedCallError::Other(e)) => return Err(e),
         }
     }
-    bail!("hosted endpoint rate-limited (429) after {attempts} attempts: {last}")
+    Err(exhausted_hosted_error(last, attempts))
+}
+
+/// The error for a hosted call whose retries ran out on 429s or shed load,
+/// each with its own text and class (a 503 is not "rate-limited (429)").
+fn exhausted_hosted_error(last: Option<HostedCallError>, attempts: usize) -> anyhow::Error {
+    match last {
+        Some(HostedCallError::ServerShed(msg)) => failure(
+            HostedFailure::Shed,
+            format!("hosted endpoint unavailable (503 / UNAVAILABLE) after {attempts} attempts: {msg}"),
+        ),
+        Some(HostedCallError::RateLimited(msg)) => failure(
+            HostedFailure::RateLimited,
+            format!("hosted endpoint rate-limited (429) after {attempts} attempts: {msg}"),
+        ),
+        Some(HostedCallError::Other(e)) => e,
+        None => anyhow!("hosted endpoint call made no attempt"),
+    }
 }
 
 fn remote_chat_attempt(
@@ -3345,6 +3676,12 @@ fn remote_chat_attempt(
         cfg.push_str(&format!("header = \"{}: {}\"\n", esc(h), esc(v)));
     }
     cfg.push_str(&format!("data = \"{}\"\n", esc(&body.to_string())));
+    // The response body goes to its own 0600 file and curl's `%{http_code}`
+    // to stdout, so the status is read from a stream that never touches the
+    // body, and the charging policy keys on it (HTTP status first).
+    let body_path = cfg_path.with_extension("body");
+    cfg.push_str(&format!("output = \"{}\"\n", esc(&body_path.to_string_lossy())));
+    cfg.push_str("write-out = \"%{http_code}\"\n");
     // (#1177) Create the config 0600 ATOMICALLY (no world-readable window),
     // write the secret-bearing body, run curl — then ALWAYS remove the file,
     // even if the create/write/curl fails partway (a partial secret file must
@@ -3358,14 +3695,29 @@ fn remote_chat_attempt(
                 .create_new(true)
                 .mode(0o600)
                 .open(&cfg_path)
-                .context("creating curl config for hosted dispatch")?
+                .map_err(|e| failure(HostedFailure::NotSent, format!("creating curl config for hosted dispatch: {e}")))?
         };
         #[cfg(not(unix))]
-        let mut f =
-            std::fs::File::create(&cfg_path).context("creating curl config for hosted dispatch")?;
+        let mut f = std::fs::File::create(&cfg_path)
+            .map_err(|e| failure(HostedFailure::NotSent, format!("creating curl config for hosted dispatch: {e}")))?;
         f.write_all(cfg.as_bytes())
-            .context("writing curl config body")?;
+            .map_err(|e| failure(HostedFailure::NotSent, format!("writing curl config body: {e}")))?;
         drop(f);
+        // Pre-created 0600 so curl writes the response into a private file
+        // (curl keeps an existing file's mode).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&body_path)
+                .map_err(|e| failure(HostedFailure::NotSent, format!("creating the response file: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::File::create(&body_path)
+            .map_err(|e| failure(HostedFailure::NotSent, format!("creating the response file: {e}")))?;
         let child = Command::new("curl")
             .args([
                 "-sS",
@@ -3377,7 +3729,7 @@ fn remote_chat_attempt(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("spawning curl for hosted dispatch")?;
+            .map_err(|e| failure(HostedFailure::NotSent, format!("spawning curl for hosted dispatch: {e}")))?;
         // (#2124) Registered the moment the child exists — BEFORE the
         // blocking wait below — so a signal-interrupted launcher (any of
         // the three `mission launch` launchers share this guard as of
@@ -3393,12 +3745,16 @@ fn remote_chat_attempt(
         // delivery to the launcher in a real invocation shape).
         let child_pid = child.id();
         darkmux_types::child_registry::register(child_pid);
-        let wait_result = child.wait_with_output().context("running curl for hosted dispatch");
+        let wait_result = child.wait_with_output().map_err(|e| {
+            failure(HostedFailure::Unanswered, format!("running curl for hosted dispatch: {e}"))
+        });
         darkmux_types::child_registry::deregister(child_pid);
         wait_result
     };
     let result = run();
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
+    let response = std::fs::read(&body_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&body_path);
     let out = result.map_err(HostedCallError::Other)?;
     // (#2462) Gated on `!success()`, never overriding a clean exit — and
     // written as the SAME conjunction the docker container path's NEW-4
@@ -3425,13 +3781,72 @@ fn remote_chat_attempt(
         )));
     }
     if !out.status.success() {
-        return Err(HostedCallError::Other(anyhow!(describe_curl_failure(
-            url,
-            out.status.code().unwrap_or(-1),
-            &String::from_utf8_lossy(&out.stderr)
-        ))));
+        let exit = out.status.code().unwrap_or(-1);
+        return Err(HostedCallError::Other(failure(
+            curl_failure_kind(exit),
+            describe_curl_failure(url, exit, &String::from_utf8_lossy(&out.stderr)),
+        )));
     }
-    parse_hosted_response(&out.stdout)
+    let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
+    classify_hosted_response(status, &response)
+}
+
+/// THE production mapping from a hosted reply to its result: the HTTP status
+/// first, the body only when there is no usable status.
+///
+/// curl runs without `--fail`, so a 4xx/5xx still exits 0 with the error in
+/// the body, and providers disagree on that body (OpenAI's 500 has
+/// `"code":null`, Azure's `"code":"InternalServerError"`, a gateway returns
+/// HTML). Keying the charge on `error.code` therefore missed real 500s and
+/// charged an HTML 404. The status decides instead: 429 is rate-limited, 503
+/// is shed load (both retried, neither charged), any other 5xx is a call the
+/// endpoint may have processed (charged), any other 4xx was rejected
+/// (not charged). A 2xx, or no status, falls through to the body's own shape
+/// ([`parse_hosted_response`]), which still catches an error object in a 200
+/// body (Google's "high demand").
+pub(crate) fn classify_hosted_response(
+    status: Option<u16>,
+    body: &[u8],
+) -> std::result::Result<serde_json::Value, HostedCallError> {
+    let status = match status {
+        // A 2xx, or no usable status: the body's own shape decides. A
+        // non-JSON 2xx stays charged (the work may have happened).
+        None | Some(200..=299) => return parse_hosted_response(body),
+        Some(s) => s,
+    };
+    if (300..=399).contains(&status) {
+        // curl does not follow redirects: nothing was processed.
+        return Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("the endpoint redirected (HTTP {status}); check the base URL"),
+        )));
+    }
+    if !(400..=599).contains(&status) {
+        return Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("the endpoint answered with an unexpected HTTP status {status}; check the base URL"),
+        )));
+    }
+    let message = || {
+        let text = String::from_utf8_lossy(body);
+        let from_body = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| {
+            let err = v.get("error").or_else(|| v.as_array().and_then(|a| a.first()).and_then(|f| f.get("error")))?;
+            Some(err.get("message")?.as_str()?.to_string())
+        });
+        from_body.unwrap_or_else(|| format!("HTTP {status}: {}", text.chars().take(200).collect::<String>()))
+    };
+    match status {
+        429 => Err(HostedCallError::RateLimited(message())),
+        503 => Err(HostedCallError::ServerShed(message())),
+        500..=599 => Err(HostedCallError::Other(failure(
+            HostedFailure::ServerError,
+            format!("hosted endpoint returned HTTP {status}: {}", message()),
+        ))),
+        _ => Err(HostedCallError::Other(failure(
+            HostedFailure::Rejected,
+            format!("hosted endpoint returned HTTP {status}: {}", message()),
+        ))),
+    }
 }
 
 /// Classify a hosted endpoint's response body. Pure — unit-testable.
@@ -3458,9 +3873,9 @@ pub(crate) fn parse_hosted_response(
             .collect::<String>()
     };
     let resp: serde_json::Value = serde_json::from_slice(stdout).map_err(|e| {
-        HostedCallError::Other(anyhow!(
-            "parsing hosted endpoint response as JSON: {e} (first 200 bytes: {:?})",
-            head()
+        HostedCallError::Other(failure(
+            HostedFailure::Unanswered,
+            format!("parsing hosted endpoint response as JSON: {e} (first 200 bytes: {:?})", head()),
         ))
     })?;
     let err_obj = resp.get("error").or_else(|| {
@@ -3481,17 +3896,14 @@ pub(crate) fn parse_hosted_response(
         // load with that message in a 200-status body, observed live
         // 2026-07-05 on the paid tier; it killed whole bench runs that a
         // 30s wait survives).
-        let transient = code == Some(429)
-            || code == Some(503)
-            || status == "RESOURCE_EXHAUSTED"
-            || status == "UNAVAILABLE"
-            || (msg.contains("high demand") && msg.contains("try again"));
-        if transient {
+        if code == Some(429) || status == "RESOURCE_EXHAUSTED" {
             return Err(HostedCallError::RateLimited(msg.to_string()));
         }
-        return Err(HostedCallError::Other(anyhow!(
-            "hosted endpoint returned an error: {msg}"
-        )));
+        if code == Some(503) || status == "UNAVAILABLE" || (msg.contains("high demand") && msg.contains("try again")) {
+            return Err(HostedCallError::ServerShed(msg.to_string()));
+        }
+        let kind = if code.is_some_and(|c| c >= 500) { HostedFailure::ServerError } else { HostedFailure::Rejected };
+        return Err(HostedCallError::Other(failure(kind, format!("hosted endpoint returned an error: {msg}"))));
     }
     // Require the MESSAGE object, not the content field (#1222 packet 2):
     // some OpenAI-compat reasoning backends omit `content` entirely on
@@ -3532,6 +3944,69 @@ fn emit_single_shot_usage(
         phase_id,
         darkmux_flow::Payload::TelemetryTokens(payload),
     ));
+}
+
+/// (#2925) A hosted call that was SENT and never answered (a timeout, a dropped
+/// connection, a provider error) still happened, and may have been billed
+/// before it failed, so it is charged like a reply that reported no usage:
+/// an `absent` usage record, which the endpoint's window counts as a call,
+/// and the conservative per-dispatch charge ([`crate::budget::conservative_hosted_spend`],
+/// the granted cap plus the estimated prompt). Charging nothing let an
+/// endpoint whose calls kept timing out run off the meter.
+fn charge_unanswered_hosted_call(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    target: &crate::target::Target,
+    label: &str,
+    req_body: &serde_json::Value,
+    bucket: &Mutex<crate::dispatch_budget::DispatchBudget>,
+    caller: &crate::budget::BudgetCaller<'_>,
+) {
+    let (ep, model) = (&target.endpoint, &target.model.id);
+    emit_single_shot_usage(
+        &opts.role_id,
+        &opts.session,
+        execution,
+        model,
+        opts.phase_id.as_deref(),
+        crate::usage::usage_payload(
+            &crate::usage::CallFacts {
+                call_kind: crate::usage::CallKind::SingleShot,
+                role_id: Some(&opts.role_id),
+                requested_model: model,
+                reported_model: None,
+                endpoint: label,
+                endpoint_id: ep.named_id(),
+            },
+            &darkmux_trajectory::UsageCounts::default(),
+        ),
+    );
+    crate::budget::settle_dispatch_live(
+        bucket,
+        crate::budget::conservative_hosted_spend(
+            None,
+            single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
+            req_body,
+        ),
+        &opts.role_id,
+        caller,
+    );
+}
+
+/// A one-call dispatch is over: stop the session's liveness beat so the live
+/// view drops it instead of waiting out the TTL (#2344), then write the
+/// terminal record through the bookend guard, which disarms it. One owner of
+/// the order, shared by the hosted and local single-shot paths, so a terminal
+/// is never written while the beat is still running.
+fn finish_single_call<S: darkmux_flow::BookendSink + ?Sized>(
+    session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
+    bookend: &mut darkmux_flow::BookendGuard<'_, S>,
+    terminal: darkmux_flow::FlowRecord,
+) {
+    if let Some(em) = session_emitter.take() {
+        em.stop();
+    }
+    bookend.close("dispatch", terminal);
 }
 
 /// Build a dispatch flow record for a hosted call (#1230 Packet 0: split out
@@ -3714,15 +4189,16 @@ fn dispatch_unmanaged(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
+            if call_may_have_spent(&e) {
+                charge_unanswered_hosted_call(opts, execution, target, &label, &req_body, &dispatch_bucket, &budget_caller);
+            }
             // (#2344) The one HTTP call is over — stop the beat before the
             // terminal record, so the live view drops the session instead of
             // waiting out the TTL. Same ordering as the container path's own
             // stop site.
-            if let Some(em) = session_emitter.take() {
-                em.stop();
-            }
-            bookend.close(
-                "dispatch",
+            finish_single_call(
+                &mut session_emitter,
+                &mut bookend,
                 build_unmanaged_record(
                     &opts.role_id,
                     session,
@@ -3785,11 +4261,9 @@ fn dispatch_unmanaged(
 
     // (#2344) See the error arm above — the call is done, so the session is
     // no longer running; stop the beat before the terminal record.
-    if let Some(em) = session_emitter.take() {
-        em.stop();
-    }
-    bookend.close(
-        "dispatch",
+    finish_single_call(
+        &mut session_emitter,
+        &mut bookend,
         build_unmanaged_record(
             &opts.role_id,
             session,
@@ -4098,11 +4572,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             // actually means before handing the raw error on.
             let e = with_residency_lost_context(&model_id, e);
             // (#2344) The call is over — stop the beat before the terminal.
-            if let Some(em) = session_emitter.take() {
-                em.stop();
-            }
-            bookend.close(
-                "dispatch",
+            finish_single_call(
+                &mut session_emitter,
+                &mut bookend,
                 build_unmanaged_record(
                     &opts.role_id,
                     session,
@@ -4157,11 +4629,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) See the error arm above — stop the beat before the terminal.
-    if let Some(em) = session_emitter.take() {
-        em.stop();
-    }
-    bookend.close(
-        "dispatch",
+    finish_single_call(
+        &mut session_emitter,
+        &mut bookend,
         build_unmanaged_record(
             &opts.role_id,
             session,
@@ -4281,6 +4751,126 @@ impl Drop for StopFlagGuard {
 /// (`dispatch`) still returns its own real error either way.
 fn docker_kill_by_name(container_name: &str) {
     let _ = Command::new("docker").args(["kill", container_name]).output();
+}
+
+/// (#2925) A stop that ends ONE dispatch: the budget pacer saw this run's
+/// own mission aborted or finalized, or its own phase abandoned
+/// (`budget::run_stop_reason`). Deliberately NOT `interrupt::mark_interrupted`:
+/// that flag is process-global and sticky, so a mission launch running steps
+/// of other phases concurrently had every dispatch killed when one phase was
+/// abandoned. The global flag stays for Ctrl-C and SIGTERM. The sampler
+/// requests the stop; the tailer kills this dispatch's container and the
+/// teardown after the wait reports it, exactly as an interrupt would, for
+/// this dispatch only.
+#[derive(Clone)]
+struct DispatchStop {
+    reason: Arc<Mutex<Option<String>>>,
+    container_name: String,
+    /// The watchdog's "main thread is gone, kill now" flag (its retried,
+    /// probe-confirmed kill). Set when this stop's own single `docker kill`
+    /// fails, so a stuck container is never left to the inactivity timeout,
+    /// which is off when the timeout is 0.
+    watchdog_handoff: Arc<AtomicBool>,
+}
+
+impl DispatchStop {
+    fn new(container_name: String) -> Self {
+        Self {
+            reason: Arc::new(Mutex::new(None)),
+            container_name,
+            watchdog_handoff: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Record why this dispatch must end. The first reason wins.
+    fn request(&self, reason: String) {
+        let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        slot.get_or_insert(reason);
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn is_requested(&self) -> bool {
+        self.reason().is_some()
+    }
+
+    /// Stop this dispatch's container, and only it. A failed `docker kill`
+    /// hands the container to the watchdog's retried kill at once.
+    fn kill_container(&self) {
+        let killed = Command::new("docker")
+            .args(["kill", &self.container_name])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !killed {
+            self.watchdog_handoff.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The flag the watchdog is built on, so [`Self::kill_container`] can wake it.
+    fn watchdog_handoff(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.watchdog_handoff)
+    }
+}
+
+/// The terminal record's payload and level for a container dispatch: a clean
+/// exit is a `dispatch.complete` at info, any other a `dispatch.error`.
+fn terminal_payload(exit_code: i32, payload: DispatchEndPayload) -> (darkmux_flow::Payload, darkmux_flow::Level) {
+    if exit_code == 0 {
+        (darkmux_flow::Payload::DispatchComplete(payload), darkmux_flow::Level::Info)
+    } else {
+        (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error)
+    }
+}
+
+/// Whether a container dispatch that did not exit cleanly was ended by a
+/// signal or by a stop scoped to it. Gated on a failed exit: both signals are
+/// sticky, so one that arrived at any point must not turn a genuinely clean
+/// exit-0 result into a discarded "interrupted" error (#2131 NEW-4).
+fn run_was_killed(local_stop: &DispatchStop, exited_cleanly: bool) -> bool {
+    !exited_cleanly && (darkmux_types::interrupt::is_set() || local_stop.is_requested())
+}
+
+/// The error for a container dispatch ended mid-run: by a signal (the
+/// launcher reads [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the
+/// whole run was interrupted"), or by a stop scoped to this dispatch, which is
+/// reported as itself, because a phase stop is not a run-wide interrupt.
+fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyhow::Error {
+    match (darkmux_types::interrupt::is_set(), local_stop.reason()) {
+        (false, Some(reason)) => anyhow!(
+            "darkmux-runtime container dispatch was stopped ({reason}) \
+             : the container `{container_name}` was killed mid-run"
+        ),
+        _ => anyhow!(
+            "darkmux-runtime container dispatch {} \
+             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
+            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
+        ),
+    }
+}
+
+/// (#889, #2131) The teardown both early exits of `dispatch()` share (the
+/// failed wait and the interrupted or stopped run): tell the watchdog the
+/// wait is over, kill the container by name, stop and join the watchdog and
+/// the sampler, then stop and join the tailer. The tailer needs `stop_flag`
+/// on the failed-wait path, where nothing else ends its loop.
+fn teardown_container_threads(
+    container_name: &str,
+    watchdog_done: &AtomicBool,
+    watchdog_handle: thread::JoinHandle<WatchdogWake>,
+    sampler_stop: &AtomicBool,
+    sampler_handle: thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>,
+    stop_flag: &AtomicBool,
+    tailer_handle: thread::JoinHandle<TrajectorySummary>,
+) {
+    watchdog_done.store(true, Ordering::SeqCst);
+    docker_kill_by_name(container_name);
+    let _ = watchdog_handle.join();
+    sampler_stop.store(true, Ordering::SeqCst);
+    let _ = sampler_handle.join();
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = tailer_handle.join();
 }
 
 // (#2232) The inactivity watchdog is the UNATTENDED safety net, and its kill
@@ -5249,6 +5839,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     }
 
     let limits_pm = agentic_pm.as_ref().or(managed_pm.as_ref());
+    // A resume runs on the image its origin recorded and is the only live
+    // execution of that origin; see [`resume_preflight`]. Settled BEFORE the
+    // budget gate: a resume that is going to be refused must not first sit in
+    // a `wait` on the endpoint's window, behind the very run it collides with.
+    // The lock is held, with this dispatch's own, until the function returns.
+    let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
     admit_container_start(&opts, &execution, limits_pm)?;
 
     // (#2294) PREFLIGHT: does this workdir's git directory live outside
@@ -5314,8 +5910,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // into it (bind-mount + entrypoint override) so the coder runs in the
     // operator's environment and can compile/test in-sandbox. The default path
     // runs a darkmux image directly (binary baked in, no injection).
-    let inject = opts
-        .image
+    let inject = image_arg
         .as_deref()
         .is_some_and(|img| !is_darkmux_runtime_image(img));
 
@@ -5337,7 +5932,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // image is resolved and version-checked either way: the gate is what
     // keeps a mismatched runtime from running, and a debug flag (or the
     // `skip_preflight` mission step key) must not open it.
-    let explicit_darkmux_image = opts.image.as_deref().filter(|_| !inject);
+    let explicit_darkmux_image = image_arg.as_deref().filter(|_| !inject);
     let darkmux_image = if opts.skip_preflight {
         ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
@@ -5349,8 +5944,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // by the content id that was checked, not by its tag, so a tag re-pointed
     // between the check and `docker run` cannot swap in an unchecked image.
     // `image` stays the human-readable ref for records and messages.
-    let image = opts
-        .image
+    let image = image_arg
         .clone()
         .unwrap_or_else(|| darkmux_image.reference.clone());
     let run_image = if inject {
@@ -5710,7 +6304,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace path/mount-mode into its own host_out, unconditionally —
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
-    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, opts.image.as_deref(), &execution);
+    stamp_own_execution(
+        &mut execution_lock,
+        &host_out,
+        (&workspace, opts.workspace_read_only, image_arg.as_deref()),
+        &execution,
+    )?;
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -5860,6 +6459,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             })
             .collect::<String>()
     );
+    record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());
 
     // Build the complete docker-run argv via the pure function (#842).
     // All inputs are resolved above; this is a single deterministic call.
@@ -6249,6 +6849,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // (#2925) This dispatch's own stop: see `DispatchStop`.
+    let local_stop = DispatchStop::new(container_name.clone());
     // (#threshold) Effective compaction threshold the runtime triggers at:
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
     // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
@@ -6313,6 +6915,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())),
         // (#2928) The live channel, unless this dispatch opted out (the lab).
         live_sender_for(opts.live_channel),
+        local_stop.clone(),
     );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
@@ -6344,7 +6947,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // `docker kill`. `watchdog_abandoned` means "the main thread is GONE
     // (panicked) — stop waiting on the deadline and kill now"; it can only
     // ever ADD urgency, never suppress a kill.
-    let watchdog_abandoned = Arc::new(AtomicBool::new(false));
+    let watchdog_abandoned = local_stop.watchdog_handoff();
     // (#2232) What the persistent kill established, as a `KillDisposition`
     // code. Read once, below, to decide what the timeout marker may claim —
     // only `Confirmed` licenses "was killed by the watchdog".
@@ -6432,6 +7035,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902 step 5) The in-run half of an agentic-remote brain's
         // endpoint budget (the pre-start half ran before `dispatch start`).
         pacer_for(limits_pm, opts.config_path.as_deref())?,
+        local_stop.clone(),
     );
 
     // (#2642) External, whole-`dispatch()`-level panic-injection hook for
@@ -6492,20 +7096,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // teardown the success path does — stop the watchdog + sampler
             // threads — plus a best-effort `docker kill` by the
             // deterministic container name, then surface the wait error.
-            watchdog_done.store(true, Ordering::SeqCst);
-            docker_kill_by_name(&container_name);
-            let _ = watchdog_handle.join();
-            sampler_stop.store(true, Ordering::SeqCst);
-            let _ = sampler_handle.join();
-            // (#2131 review round 2, F5) Same teardown the success path
-            // gives the tailer, further down — signal it to stop and
-            // join it before returning. Without this, a `wait_with_output`
-            // failure left the tailer thread leaked: its own loop only
-            // exits on `stop_flag` or a caught signal, neither of which
-            // this branch used to touch, so it polled `trajectory.jsonl`
-            // forever in the background.
-            stop_flag.store(true, Ordering::SeqCst);
-            let _ = tailer_handle.join();
+            //
+            // (#2131 review round 2, F5) The tailer gets the same teardown
+            // the success path gives it: signal it to stop and join it.
+            // Without this, a `wait_with_output` failure left the tailer
+            // thread leaked: its own loop only exits on `stop_flag` or a
+            // caught signal, neither of which this branch used to touch, so
+            // it polled `trajectory.jsonl` forever in the background.
+            teardown_container_threads(
+                &container_name,
+                &watchdog_done,
+                watchdog_handle,
+                &sampler_stop,
+                sampler_handle,
+                &stop_flag,
+                tailer_handle,
+            );
             // (#2131 review round 2, NEW-2) No explicit deregister here —
             // `container_child_registration` (declared at the spawn
             // site) deregisters on Drop, which fires when this early
@@ -6575,13 +7181,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // parsing below instead, and let the LAUNCHER decide what a
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
-    if darkmux_types::interrupt::is_set() && !output.status.success() {
-        watchdog_done.store(true, Ordering::SeqCst);
-        docker_kill_by_name(&container_name);
-        let _ = watchdog_handle.join();
-        sampler_stop.store(true, Ordering::SeqCst);
-        let _ = sampler_handle.join();
-        let _ = tailer_handle.join();
+    if run_was_killed(&local_stop, output.status.success()) {
+        teardown_container_threads(
+            &container_name,
+            &watchdog_done,
+            watchdog_handle,
+            &sampler_stop,
+            sampler_handle,
+            &stop_flag,
+            tailer_handle,
+        );
         if let Some(em) = session_emitter {
             em.stop();
         }
@@ -6590,11 +7199,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // after a SUCCESSFUL `wait_with_output`, which dropped it
         // explicitly in the `Ok` arm above (the child is dead either
         // way; there is nothing left to deregister here).
-        return Err(anyhow!(
-            "darkmux-runtime container dispatch {} \
-             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
-            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
-        ));
+        //
+        // (#2925) A stop scoped to this dispatch is reported as itself,
+        // not as a signal: the launcher reads the signal wording as "the
+        // whole run was interrupted", which a phase stop is not.
+        return Err(killed_mid_run_error(&container_name, &local_stop));
     }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
@@ -6717,11 +7326,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         opts.resume_from.as_deref(),
         thermal_ladder_summary,
     );
-    let (mut dispatch_complete_payload, level) = if exit_code == 0 {
-        (darkmux_flow::Payload::DispatchComplete(dispatch_complete_payload), darkmux_flow::Level::Info)
-    } else {
-        (darkmux_flow::Payload::DispatchError(dispatch_complete_payload), darkmux_flow::Level::Error)
-    };
+    let (mut dispatch_complete_payload, level) = terminal_payload(exit_code, dispatch_complete_payload);
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     // (#717, #1230 Packet 0) Emit the terminal record through the bookend
@@ -6742,6 +7347,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace for inspection (status quo). Only error/panic exits BEFORE
     // this point reclaim it.
     workspace_cleanup.disarm();
+    // A clean exit completes the execution: a resume of this out-dir, or of
+    // the one this resumed, is refused from here on.
+    complete_execution_on_success(exit_code, &host_out, opts.resume_from.as_deref());
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the
@@ -7526,6 +8134,7 @@ fn spawn_guarded_tailer(
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
+    local_stop: DispatchStop,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -7556,6 +8165,7 @@ fn spawn_guarded_tailer(
             dispatch_cap,
             compactor_endpoint,
             live,
+            local_stop,
         )
     });
     (guard, handle)
@@ -7607,6 +8217,7 @@ fn run_tailer(
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
+    local_stop: DispatchStop,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -7672,6 +8283,14 @@ fn run_tailer(
             // stale.
             state.drain_to_end();
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+            break;
+        }
+        // (#2925) A stop scoped to THIS dispatch (its phase abandoned, its
+        // mission aborted): same flush-then-kill as an interrupt, but only
+        // this container is touched, never another dispatch's child.
+        if local_stop.is_requested() {
+            state.drain_to_end();
+            local_stop.kill_container();
             break;
         }
         thread::sleep(TAILER_POLL_INTERVAL);
@@ -8269,6 +8888,7 @@ fn spawn_guarded_sampler(
     record_context: Option<darkmux_flow::payload::RecordContext>,
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     budget_pacer: Option<crate::budget::BudgetPacer>,
+    local_stop: DispatchStop,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -8287,6 +8907,7 @@ fn spawn_guarded_sampler(
             record_context,
             thermal_config,
             budget_pacer,
+            local_stop,
         )
     });
     (guard, handle)
@@ -8330,6 +8951,8 @@ fn run_telemetry_sampler(
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
     mut budget_pacer: Option<crate::budget::BudgetPacer>,
+    // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
+    local_stop: DispatchStop,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
@@ -8863,14 +9486,16 @@ fn run_telemetry_sampler(
                 Some(crate::budget::PacerEvent::Resumed { state }) => {
                     emit_rest(crate::budget::PACE_REASON, &state, false)
                 }
-                Some(crate::budget::PacerEvent::Stopped { .. }) => {
+                Some(crate::budget::PacerEvent::Stopped { reason }) => {
                     // (#2902 step 5 review MF1) The run was stopped while the
                     // pacer held it (`mission abort` writes only terminal state;
                     // this is where it reaches a paused container). End it
-                    // the way an interrupt does: the tailer kills the child on
-                    // the flag, and the launcher takes its abort path. The
+                    // the way an interrupt does, for THIS dispatch only (#2925): the
+                    // tailer kills this container on the stop, and the launcher
+                    // takes its abort path. The process-global interrupt flag is
+                    // not touched: it would end every other phase's dispatch. The
                     // pace file still says pause, so no turn goes out first.
-                    darkmux_types::interrupt::mark_interrupted();
+                    local_stop.request(reason);
                 }
                 None => {}
             }

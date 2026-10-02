@@ -454,6 +454,200 @@ fn real_container_dispatch_executes_a_scripted_multi_turn_tool_call_sequence() {
     );
 }
 
+/// (#2925) The lifecycle proof, on a real container and no model: a
+/// dispatch whose phase is abandoned mid-run ends alone (container killed,
+/// terminal `dispatch.error` written, lock released, no process-wide
+/// interrupt), and a resume of it is refused while it is still running.
+///
+/// The mock's first turn runs `sleep 300` in the container, which gives the
+/// host sampler time to see the managed endpoint's one-token window full after
+/// that turn and pause the run on the budget pacer; that held run is where
+/// `mission abort` / an abandoned phase reaches it.
+#[test]
+#[ignore = "requires Docker + a local darkmux-runtime:latest image"]
+#[serial_test::serial]
+fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume() {
+    let bin = build_mock_model_binary();
+    let script_dir = tempfile::tempdir().unwrap();
+    let script_path = script_dir.path().join("read-then-stop.json");
+    let turn = |id: &str, message: Value, finish: &str| {
+        serde_json::json!({"id": id, "object": "chat.completion", "created": 0, "model": "mock-model",
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}})
+    };
+    let script = serde_json::json!([
+        {"trigger": "\"role\":\"tool\"", "response": turn("t2", serde_json::json!({"role": "assistant", "content": "done", "tool_calls": null}), "stop")},
+        {"response": turn("t1", serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"sleep 300\"}"}}]}), "tool_calls")},
+    ]);
+    std::fs::write(&script_path, script.to_string()).unwrap();
+
+    let port = free_port();
+    let mut mock = spawn_mock_model(&bin, port, Some(&script_path));
+    let home = tempfile::tempdir().unwrap();
+    let flows_dir = tempfile::tempdir().unwrap();
+    let out_root = tempfile::tempdir().unwrap();
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles = registry_dir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        serde_json::json!({
+            "schema_version": "1.5",
+            "default_profile": "mock",
+            "profiles": {"mock": {"models": [{"id": "mock-model", "n_ctx": 8192, "endpoint": "lms"}]}},
+            "endpoints": {"lms": {"managed": "lmstudio", "limits": {"policy": "wait", "window": {"period": "1d", "tokens": 1}}}},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let _home_guard = EnvVarGuard::set("DARKMUX_HOME", home.path());
+    let _flows_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", flows_dir.path());
+
+    let write_status = |path: PathBuf, status: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
+    };
+    write_status(darkmux_crew::lifecycle::mission_path("m-live-stop"), "active");
+    write_status(darkmux_crew::lifecycle::phase_path("m-live-stop", "p1"), "running");
+
+    let out_dir = out_root.path().join("darkmux-out-live-stop");
+    let session = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("m-live-stop").unwrap(),
+        "coder",
+        format!("live-stop-{}", std::process::id()),
+    );
+    let session_id = session.wire();
+    let opts = |session: darkmux_types::session_id::SessionId, resume: Option<PathBuf>, host_out: Option<PathBuf>| DispatchOpts {
+        finding_sites: None,
+        allow_utility_model: false,
+        remote_origin: None,
+        live_channel: true,
+        brief_refs: Vec::new(),
+        workspace_read_only: false,
+        record_context: None,
+        resume_from: resume,
+        host_out,
+        max_turns_override: None,
+        timeout_override_seconds: None,
+        role_id: "coder".to_string(),
+        message: "Read a file, then say you are done. Lifecycle proof.".to_string(),
+        session,
+        timeout_seconds: 120,
+        skip_preflight: true,
+        json: true,
+        workdir: None,
+        phase_id: Some("p1".to_string()),
+        machine: None,
+        wait: true,
+        compaction: CompactionDispatchArgs::default(),
+        profile_name: Some("mock".to_string()),
+        config_path: Some(profiles.to_string_lossy().to_string()),
+        force_container: false,
+        max_completion_tokens: None,
+        image: None,
+        model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
+        step_id: None,
+        system_prompt_override: None,
+    };
+
+    let running = opts(session.clone(), None, Some(out_dir.clone()));
+    let handle = std::thread::spawn(move || dispatch(running));
+
+    // Wait (bounded) for the budget pacer to hold the run after turn 1.
+    let held = wait_for(Duration::from_secs(120), || {
+        flow_actions(flows_dir.path(), &session_id).iter().any(|a| a == "dispatch.rest")
+    });
+    let live_containers = docker_names("darkmux-dispatch-");
+    // The origin record names the container docker is actually running, which
+    // is what a resume after a SIGKILL of darkmux asks docker about.
+    let origin_record: Value = serde_json::from_str(
+        &std::fs::read_to_string(darkmux_types::paths::resume_origin_record_path(&out_dir).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let recorded_container = origin_record.get("container").and_then(Value::as_str).unwrap_or_default().to_string();
+    // A resume of the running dispatch is refused while its lock is held.
+    let resume_err = dispatch(opts(
+        darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("m-live-stop").unwrap(),
+            "coder",
+            "live-stop-resume",
+        ),
+        Some(out_dir.clone()),
+        None,
+    ))
+    .map(|_| ())
+    .unwrap_err();
+    let lock_held_during = darkmux_types::flock::try_lock_exclusive(&darkmux_types::paths::execution_lock_path(&out_dir).unwrap())
+        .unwrap()
+        .is_none();
+
+    // Abandon the phase mid-run.
+    write_status(darkmux_crew::lifecycle::phase_path("m-live-stop", "p1"), "abandoned");
+    let ended = wait_for(Duration::from_secs(60), || handle.is_finished());
+    let _ = mock.kill();
+    let _ = mock.wait();
+    assert!(held, "the pacer never held the run; flow actions: {:?}", flow_actions(flows_dir.path(), &session_id));
+    assert!(ended, "the dispatch did not end after its phase was abandoned");
+    let stop_err = format!("{:#}", handle.join().unwrap().map(|_| ()).unwrap_err());
+
+    assert!(!live_containers.is_empty(), "a real container was running when the stop landed");
+    assert!(
+        live_containers.contains(&recorded_container),
+        "the origin record's `container` ({recorded_container:?}) must be the running docker container, not one of {live_containers:?}"
+    );
+    assert!(format!("{resume_err:#}").contains("still running"), "{resume_err:#}");
+    assert!(lock_held_during, "the running dispatch held its execution lock");
+    assert!(stop_err.contains("was stopped") && stop_err.contains("phase `p1`"), "{stop_err}");
+    assert!(
+        live_containers.iter().all(|n| !docker_names("darkmux-dispatch-").contains(n)),
+        "the container was killed, not left running"
+    );
+    assert!(flow_actions(flows_dir.path(), &session_id).iter().any(|a| a == "dispatch.error"), "terminal bookend emitted");
+    assert!(!darkmux_types::interrupt::is_set(), "a phase stop must not raise the process-wide interrupt");
+    assert!(
+        darkmux_types::flock::try_lock_exclusive(&darkmux_types::paths::execution_lock_path(&out_dir).unwrap())
+            .unwrap()
+            .is_some(),
+        "the lock is released once the dispatch ended"
+    );
+}
+
+/// Poll `cond` every 250 ms until it holds or `limit` elapses.
+fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    cond()
+}
+
+/// Every flow `action` recorded for `session_id` under `flows_dir`.
+fn flow_actions(flows_dir: &Path, session_id: &str) -> Vec<String> {
+    let mut actions = Vec::new();
+    let Ok(entries) = std::fs::read_dir(flows_dir) else { return actions };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            if v.get("session_id").and_then(Value::as_str) == Some(session_id) {
+                if let Some(a) = v.get("action").and_then(Value::as_str) {
+                    actions.push(a.to_string());
+                }
+            }
+        }
+    }
+    actions
+}
+
+/// Names of running containers whose name starts with `prefix`.
+fn docker_names(prefix: &str) -> Vec<String> {
+    let out = Command::new("docker").args(["ps", "--format", "{{.Names}}"]).output().expect("docker ps");
+    String::from_utf8_lossy(&out.stdout).lines().filter(|n| n.starts_with(prefix)).map(str::to_string).collect()
+}
+
 fn tail(s: &str, max: usize) -> &str {
     let n = s.len();
     if n <= max {

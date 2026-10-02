@@ -1167,3 +1167,21 @@ fn human_duration_reads_naturally() {
     assert_eq!(human_duration(200), "3m 20s");
     assert_eq!(human_duration(3_840), "1h 4m");
 }
+
+/// A loopback server that answers with a fixed HTTP status and error body.
+pub(crate) fn status_http_mock(status_line: &'static str, body: &'static str) -> String {
+    use std::io::{Read, Write as IoWrite};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut chunk = [0u8; 8192];
+        let _ = stream.read(&mut chunk);
+        let resp = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    });
+    format!("http://127.0.0.1:{port}/v1/chat/completions")
+}

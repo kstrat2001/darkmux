@@ -1529,6 +1529,34 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
+  aborting a mission, while a run waited on its endpoint budget raised the
+  process-wide interrupt flag, so a mission launch running other phases'
+  dispatches had every one of them killed. The stop now lands on the one
+  dispatch it names; Ctrl-C and SIGTERM still end everything.
+- **A resume keeps its origin's image and has one live execution** (5.0).
+  `--resume-from` with no `--image` runs on the image the original ran on; a
+  different `--image` is refused as `RESUME IMAGE MISMATCH`. A resume while the
+  original (or another resume) still runs is refused naming that execution, and
+  one after the execution ended in success is refused as `RESUME ALREADY
+  COMPLETED`; resuming again after an interrupted or failed run (any non-zero
+  exit) still works. A run that stops at `max_turns` exits 0, so it counts as
+  completed and cannot be resumed.
+  The lock is `<out-dir>.execution.lock`, beside the out-dir like the resume
+  origin record (opened without following symlinks, and only if this user owns
+  it), and `doctor`'s orphan count covers it. Because a lock dies with the
+  darkmux process, a resume also asks docker and is refused while the origin's
+  recorded container is still running (including the container of an earlier
+  resume, which is recorded on the origin too). If a phase stop's `docker kill` fails, the
+  watchdog's retried kill takes over at once.
+- **A hosted call the endpoint may have processed is charged, once, one way** (5.0).
+  A timeout or dropped reply after the request was sent, an unreadable reply,
+  and a 5xx write an `absent` usage record (the endpoint's window counts it as
+  a call) and charge the per-dispatch cap what a reply with no usage is charged:
+  the granted cap plus the estimated prompt. A failure before sending, a redirect (3xx), a 4xx
+  (400, 401, 403) and a 429 charge nothing. `dispatch`, `dispatch.single_shot`
+  and `dispatch.map` share the rule; the last two used to charge nothing on any
+  error.
 - **A fleet seat frees only the claim that took it** (5.0). A retried or
   repeated sender session shares one receiver session id; dropping one of two
   claims under it used to free both, so a cap of 2 could run 3. Each claim now
