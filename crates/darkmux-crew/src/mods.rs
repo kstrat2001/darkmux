@@ -244,13 +244,13 @@ fn site_of(context: &ModContext) -> Option<ModSite> {
 
 fn site_of_finding(f: &ForFinding) -> Option<ModSite> {
     let ctx = f.context.as_ref()?;
-    let site = ctx.get("site")?;
+    let site = ctx.site.as_ref()?;
     Some(ModSite {
-        source: ctx.get("source")?.as_str()?.to_string(),
-        sha: ctx.get("sha")?.as_str()?.to_string(),
-        file: site.get("file")?.as_str()?.to_string(),
-        start_line: site.get("start")?.as_u64()?,
-        end_line: site.get("end")?.as_u64()?,
+        source: ctx.source.clone()?,
+        sha: ctx.sha.clone()?,
+        file: site.file.clone(),
+        start_line: site.start,
+        end_line: site.end,
     })
 }
 
@@ -284,9 +284,9 @@ pub struct ForFinding {
     /// The finding's own `mission_id`, when it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
-    /// The finding's `context` verbatim (the launcher's blob).
+    /// The finding's `context` (the launcher's provenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<serde_json::Value>,
+    pub context: Option<darkmux_flow::payload::RecordContext>,
     /// The finding's `emitted` verbatim (the model's own arguments). Copied,
     /// never read: darkmux does not interpret an emission here either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,7 +787,7 @@ pub fn finding_context(findings_root: &Path, for_keys: &[String]) -> Result<ModC
             Some(f) => ForFinding {
                 key: key.clone(),
                 mission_id: f.mission_id.clone(),
-                context: Some(f.context.clone()),
+                context: f.context.clone(),
                 emitted: Some(f.emitted.clone()),
                 missing: false,
             },
@@ -1592,6 +1592,7 @@ pub fn names_mission(record: &ModRecord, mission: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ctx;
     use crate::findings;
     use tempfile::TempDir;
 
@@ -1847,7 +1848,7 @@ mod tests {
                 phase_id: None,
                 step_id: None,
             },
-            Some(serde_json::json!({"rule": "unnamed-predicate", "unit": "u1"})),
+            Some(ctx(serde_json::json!({"rule": "unnamed-predicate", "unit": "u1"}))),
             serde_json::json!({"file": "a.ts", "line": 4}),
         );
         findings::materialize(root, &rec).unwrap();
@@ -2099,7 +2100,7 @@ mod tests {
         assert_eq!(stored.emitted, Some(serde_json::json!({"file": "a.ts", "line": 4})));
         assert_eq!(
             stored.context,
-            Some(serde_json::json!({"rule": "unnamed-predicate", "unit": "u1"}))
+            Some(ctx(serde_json::json!({"rule": "unnamed-predicate", "unit": "u1"})))
         );
 
         // It round-trips through disk with the same shape.
@@ -3000,7 +3001,7 @@ mod tests {
             "create_finding",
             findings::Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
             findings::Scope::default(),
-            Some(ctx),
+            Some(crate::ctx(ctx)),
             emitted,
         );
         findings::materialize(root, &rec).unwrap();

@@ -49,6 +49,7 @@ use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindReg
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
 use darkmux_types::session_id::{RunId, SessionId};
+use darkmux_flow::payload::{RecordContext, RuleRef};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -953,14 +954,11 @@ pub fn unit_rules(u: &Unit) -> Vec<String> {
 }
 
 /// (#1959) A payload's `rule`: ONE id when the unit has exactly one rule
-/// (site and edge units always do) so a receiver can key on it; `null` for
+/// (site and edge units always do) so a receiver can key on it; absent for
 /// a multi-rule read unit, whose `rules` array lists them and whose
 /// findings name their own `pattern`.
-fn single_rule(rule_ids: &[String]) -> Value {
-    match single_rule_id(rule_ids) {
-        Some(only) => json!(only),
-        None => Value::Null,
-    }
+fn single_rule(rule_ids: &[String]) -> Option<RuleRef> {
+    single_rule_id(rule_ids).map(RuleRef::One)
 }
 
 /// The typed twin of [`single_rule`], for [`UnitOutcome::rule`].
@@ -1007,26 +1005,27 @@ fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> Result<String> 
     Ok(dir)
 }
 
-/// (#2310 P4c) Same "one id or null" shape as [`single_rule`], but the
+/// (#2310 P4c) Same "one id or none" shape as [`single_rule`], but the
 /// resolved rule's `confirm` form (`"mod"`/`"search"`/`"question"`) rather
 /// than its id — stamped into `record_context` (host-known, never
 /// model-supplied) so a downstream reader of a finding this unit produced
 /// knows which of the three ways it was meant to be confirmed WITHOUT
-/// re-resolving the rule registry itself. `null` for a multi-rule read
+/// re-resolving the rule registry itself. `None` for a multi-rule read
 /// unit (ambiguous which rule a given finding answers to without the
 /// finding's own `pattern`, same reasoning `single_rule` already carries)
 /// or when the single rule id names nothing in `rules_by_id` (the
 /// `missing` rule case `build_message` already refuses loudly before this
 /// is ever reached in practice).
-fn single_confirm(rules_by_id: &BTreeMap<String, Rule>, rule_ids: &[String]) -> Value {
-    match single_rule_id(rule_ids).and_then(|id| rules_by_id.get(&id)) {
-        Some(rule) => json!(match rule.confirm {
+fn single_confirm(rules_by_id: &BTreeMap<String, Rule>, rule_ids: &[String]) -> Option<String> {
+    let rule = single_rule_id(rule_ids).and_then(|id| rules_by_id.get(&id))?;
+    Some(
+        match rule.confirm {
             darkmux_crew::rules::ConfirmForm::Mod => "mod",
             darkmux_crew::rules::ConfirmForm::Search => "search",
             darkmux_crew::rules::ConfirmForm::Question => "question",
-        }),
-        None => Value::Null,
-    }
+        }
+        .to_string(),
+    )
 }
 
 impl StepKind for DispatchUnitStepKind {
@@ -1162,7 +1161,11 @@ impl StepKind for DispatchUnitStepKind {
         // Never re-joins the path itself (#2157 — a reader that re-derives
         // independently reintroduces the traversal vector the shared
         // function closed).
-        let stop_probe_ctx = json!({"workspace": ctx.workspace, "unit": ctx.unit_id});
+        let stop_probe_ctx = RecordContext {
+            workspace: Some(ctx.workspace.clone()),
+            unit: Some(ctx.unit_id.clone()),
+            ..RecordContext::default()
+        };
         if let Some(stop_path) = thermal_governor::stop_file_path_from_record_context(Some(&stop_probe_ctx)) {
             // (#2454) Scoped to the RUN that wrote it, not to the workspace
             // the file sits under: nothing has ever removed this file, so a
@@ -1413,12 +1416,12 @@ impl StepKind for DispatchUnitStepKind {
                 // Provenance the runtime cannot know — merged by the host
                 // tailer under `payload.context` on every record this unit's
                 // dispatch produces.
-                record_context: Some(json!({
-                    "workspace": ctx.workspace,
-                    "source": ctx.source,
-                    "sha": ctx.sha,
-                    "rule": single_rule(&ctx.rule_ids),
-                    "rules": ctx.rule_ids,
+                record_context: Some(RecordContext {
+                    workspace: Some(ctx.workspace.clone()),
+                    source: Some(ctx.source.clone()),
+                    sha: Some(ctx.sha.clone()),
+                    rule: single_rule(&ctx.rule_ids),
+                    rules: Some(ctx.rule_ids.clone()),
                     // (#2310 P4c review round 2, item (g) — stated precisely
                     // for the PR: `crawl.json`'s DISPATCHED MESSAGE
                     // (`build_message`'s own output) is byte-identical to
@@ -1433,12 +1436,13 @@ impl StepKind for DispatchUnitStepKind {
                     // form rides in `context.confirm` rather than a
                     // `create_finding` tool argument). No other `context` key
                     // changes shape or value.
-                    "confirm": single_confirm(&rules_by_id, &ctx.rule_ids),
-                    "unit": ctx.unit_id,
-                    "model": seat.model.clone(),
-                    "locality": seat.locality,
-                    "profile": seat.profile_name.clone(),
-                })),
+                    confirm: single_confirm(&rules_by_id, &ctx.rule_ids),
+                    unit: Some(ctx.unit_id.clone()),
+                    model: seat.model.clone(),
+                    locality: Some(seat.locality.to_string()),
+                    profile: seat.profile_name.clone(),
+                    ..RecordContext::default()
+                }),
             };
 
             let outcome = (self.dispatch)(opts);

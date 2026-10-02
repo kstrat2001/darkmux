@@ -522,7 +522,7 @@ fn finding_store_is_owner_only_mode() {
         mission_id: None,
         phase_id: None,
         step_id: None,
-        context: serde_json::Value::Null,
+        context: None,
         emitted: serde_json::json!({"evidence": "let secret = std::env::var(\"API_KEY\");"}),
         source: None,
         schema_version: darkmux_crew::findings::FINDING_SCHEMA_VERSION.to_string(),

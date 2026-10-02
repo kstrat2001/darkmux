@@ -347,6 +347,8 @@ pub struct MissionInput {
     /// show`. Only inputs that are not [`Self::ignored`] are defaulted (an
     /// ignored input's warning keys on the operator having supplied it, so
     /// a default there would make every launch warn).
+    /// Free-form JSON by contract (#3035): the same shape an operator supplies for
+    /// the input with `--input`, which is whatever the step that interpolates it expects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
     /// (#2310 P4c-2 item 4) `true` when this input is accepted for

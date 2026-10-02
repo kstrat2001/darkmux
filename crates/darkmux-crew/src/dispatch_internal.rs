@@ -20,7 +20,7 @@ use darkmux_flow::payload::{
     DispatchCheckpointPayload, DispatchCompactionPayload, DispatchDegeneracyWarningPayload, DispatchEndPayload,
     DispatchFeedbackPayload, DispatchHeartbeatPayload, DispatchReasoningPayload, DispatchRestPayload, DispatchStartPayload,
     DispatchToolPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, EjectFailure, EjectedModel, GitCheckout,
-    GitdirKind, HostWindow, Knob, KnobSource, LmsRole, MetricWindow, ResultClass, RuntimeBounds, StreamPhase,
+    GitdirKind, HostWindow, Knob, KnobSource, KnobValue, LmsRole, MetricWindow, ResultClass, RuntimeBounds, StreamPhase,
     TelemetryCompactionPayload, TelemetryContextPayload, TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
     ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
 };
@@ -2621,7 +2621,7 @@ impl<'a> DispatchBookendGuard<'a> {
         // dispatch's flow-record surface emits — see `merge_record_context`'s
         // doc. `None` for every caller that doesn't set
         // `DispatchOpts::record_context`.
-        record_context: Option<serde_json::Value>,
+        record_context: Option<darkmux_flow::payload::RecordContext>,
     ) -> Self {
         let on_abort = move |_id: &str, _kind: &str| {
             // Best-effort, same as every other emit on this path: a
@@ -6788,7 +6788,7 @@ fn resolved_runtime_bounds(
     max_turns_override: Option<u32>,
     timeout_override_seconds: Option<u32>,
 ) -> Result<RuntimeBounds, darkmux_types::config_enum::BadEnumValue> {
-    let vs = |value: Option<serde_json::Value>, source: darkmux_types::config_access::Source| {
+    let vs = |value: Option<KnobValue>, source: darkmux_types::config_access::Source| {
         Knob::new(value, source.into())
     };
     let (max_tokens_per_call, s_mtpc) = darkmux_types::config_access::max_tokens_per_call_with_source();
@@ -7366,7 +7366,7 @@ fn spawn_guarded_tailer(
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
     compactor_model: Option<String>,
-    record_context: Option<serde_json::Value>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
     endpoint: Option<String>,
     endpoint_id: Option<String>,
     compactor_endpoint: Option<String>,
@@ -7445,7 +7445,7 @@ fn run_tailer(
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
     compactor_model: Option<String>,
-    record_context: Option<serde_json::Value>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
     endpoint: Option<String>,
     endpoint_id: Option<String>,
     compactor_endpoint: Option<String>,
@@ -8108,7 +8108,7 @@ fn spawn_guarded_sampler(
     utility_model: Option<String>,
     phase_id: Option<String>,
     host_out: PathBuf,
-    record_context: Option<serde_json::Value>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     budget_pacer: Option<crate::budget::BudgetPacer>,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
@@ -8164,7 +8164,7 @@ fn run_telemetry_sampler(
     utility_model: Option<String>,
     phase_id: Option<String>,
     host_out: PathBuf,
-    record_context: Option<serde_json::Value>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
     // (#2947) Resolved by the caller, where a bad `pause_at`/`resume_at` is
     // an error the dispatch returns, rather than on this thread, which has
     // no way to refuse.
@@ -8907,10 +8907,10 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
 /// every `TailerState`-emitted record (`dispatch.tool`, `dispatch.turn`,
 /// `dispatch.checkpoint`, `telemetry.*`, …, via `emit`/`emit_telemetry`).
 /// One nested key so it can never collide with a record's own top-level
-/// fields. A `None` context, a non-object context, or a non-object payload
-/// are each a no-op — never a partial/corrupted merge.
-fn merge_record_context(payload: &mut darkmux_flow::Payload, record_context: &Option<serde_json::Value>) {
-    if let Some(serde_json::Value::Object(ctx)) = record_context {
+/// fields. A `None` context, or a payload type with no `context` field, is a
+/// no-op — never a partial/corrupted merge.
+fn merge_record_context(payload: &mut darkmux_flow::Payload, record_context: &Option<darkmux_flow::payload::RecordContext>) {
+    if let Some(ctx) = record_context {
         payload.attribute_context(ctx);
     }
 }
@@ -9045,7 +9045,7 @@ struct TailerState {
     /// merged under `payload.context` on every record this dispatch's
     /// tailer emits. `None` for every caller that doesn't set
     /// `DispatchOpts::record_context` — a complete no-op.
-    record_context: Option<serde_json::Value>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
     /// (#2928) The live channel for this execution: the sampler and the
     /// sender to the local daemon. `None` when the channel is off
     /// (`runtime.live_sample_ms: 0`) and in every test that does not opt in.
@@ -9222,7 +9222,7 @@ impl TailerState {
         self
     }
 
-    fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
+    fn with_record_context(mut self, record_context: Option<darkmux_flow::payload::RecordContext>) -> Self {
         self.record_context = record_context;
         self
     }
@@ -10048,10 +10048,7 @@ impl TailerState {
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
-            // `merge_record_context` drops a NON-object context, so the flow
-            // record has none and `sync` stores null. Make the same judgment
-            // here, or the two producers disagree about the same dispatch.
-            self.record_context.as_ref().filter(|c| c.is_object()).cloned(),
+            self.record_context.clone(),
             emitted,
         );
         if let Some(sites) = &self.finding_sites {

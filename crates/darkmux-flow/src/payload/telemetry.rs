@@ -3,7 +3,7 @@
 //! findings). Model-call usage is in [`super::usage`].
 
 use super::dispatch::BoundRef;
-use super::Attribution;
+use super::{Attribution, RecordContext};
 use serde::{Deserialize, Serialize};
 
 /// A model became resident or stopped being.
@@ -120,10 +120,10 @@ pub struct TelemetryContextPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for TelemetryContextPayload {
@@ -133,7 +133,7 @@ impl Attribution for TelemetryContextPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }
@@ -156,10 +156,10 @@ pub struct TelemetryCompactionPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for TelemetryCompactionPayload {
@@ -169,7 +169,7 @@ impl Attribution for TelemetryCompactionPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }
@@ -186,10 +186,10 @@ pub struct TelemetryRuntimePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for TelemetryRuntimePayload {
@@ -199,7 +199,7 @@ impl Attribution for TelemetryRuntimePayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }
@@ -229,10 +229,10 @@ pub struct TelemetryLmsPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for TelemetryLmsPayload {
@@ -242,7 +242,7 @@ impl Attribution for TelemetryLmsPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }
@@ -341,10 +341,10 @@ pub struct TelemetryDetectorPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for TelemetryDetectorPayload {
@@ -354,7 +354,7 @@ impl Attribution for TelemetryDetectorPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }

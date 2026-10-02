@@ -3,6 +3,7 @@ import type { BoundRef } from "./BoundRef";
 import type { DetectorArea } from "./DetectorArea";
 import type { DetectorKind } from "./DetectorKind";
 import type { DetectorSeverity } from "./DetectorSeverity";
+import type { RecordContext } from "./RecordContext";
 
 /**
  * A detector finding: the payload of `telemetry.detector`. The same finding goes to the envelope,
@@ -83,6 +84,6 @@ bound?: BoundRef,
  */
 step_id?: string, 
 /**
- * The provenance a dispatch caller supplied, carried verbatim.
+ * The provenance a dispatch caller supplied, a [`RecordContext`].
  */
-context?: Record<string, unknown>, };
+context?: RecordContext, };

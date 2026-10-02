@@ -3,7 +3,7 @@
 //! `gh.verb.executed` and the endpoint budget's `budget.*`.
 
 use super::dispatch::ResultClass;
-use super::Attribution;
+use super::{Attribution, RecordContext};
 use serde::{Deserialize, Serialize};
 
 /// What a step consumes: the model seat it claims.
@@ -764,10 +764,10 @@ pub struct BudgetPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for BudgetPayload {
@@ -777,7 +777,7 @@ impl Attribution for BudgetPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }

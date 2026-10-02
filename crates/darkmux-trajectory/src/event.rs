@@ -419,7 +419,7 @@ pub struct ToolCompleted {
     pub args: String,
     pub args_chars: u64,
     /// An accepted `create_finding`'s emission, verbatim; `None` for every
-    /// other call.
+    /// other call. Free-form JSON by contract (#3035): the model's own arguments.
     pub emitted: Option<serde_json::Value>,
     /// The emission's 1-based ordinal in this execution.
     pub emit_seq: Option<u64>,

@@ -3,6 +3,7 @@ import type { BreachLevel } from "./BreachLevel";
 import type { BudgetMetric } from "./BudgetMetric";
 import type { BudgetPolicyKind } from "./BudgetPolicyKind";
 import type { BudgetScope } from "./BudgetScope";
+import type { RecordContext } from "./RecordContext";
 
 /**
  * An endpoint budget or a per-step cap acted: the payload of `budget.warn`, `budget.wait`,
@@ -63,6 +64,6 @@ pid?: number,
  */
 step_id?: string, 
 /**
- * The provenance a dispatch caller supplied, carried verbatim.
+ * The provenance a dispatch caller supplied, a [`RecordContext`].
  */
-context?: Record<string, unknown>, };
+context?: RecordContext, };

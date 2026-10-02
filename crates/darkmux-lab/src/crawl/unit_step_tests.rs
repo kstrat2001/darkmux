@@ -272,14 +272,14 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     );
     assert_eq!(opts.max_turns_override, Some(12), "a 1-site unit floors at MIN_UNIT_MAX_TURNS");
     let ctx = opts.record_context.expect("provenance the runtime cannot know");
-    assert_eq!(ctx["unit"], serde_json::json!("u-0001"));
-    assert_eq!(ctx["source"], serde_json::json!("app"));
-    assert_eq!(ctx["sha"], serde_json::json!("a".repeat(40)));
-    assert_eq!(ctx["rule"], serde_json::json!("unnamed-predicate"));
+    assert_eq!(ctx.unit.as_deref(), Some("u-0001"));
+    assert_eq!(ctx.source.as_deref(), Some("app"));
+    assert_eq!(ctx.sha, Some("a".repeat(40)));
+    assert_eq!(ctx.rule, Some(darkmux_flow::payload::RuleRef::One("unnamed-predicate".into())));
     // (#2265, 5.0) The planned spans reach the dispatch for the findings
     // only: they must NOT ride `record_context`, which every flow record of
     // the dispatch copies.
-    assert!(ctx.get("sites").is_none(), "spans in the per-event context: {ctx}");
+    assert!(ctx.extras.get("sites").is_none(), "spans in the per-event context: {ctx:?}");
     assert_eq!(opts.finding_sites, Some(serde_json::json!([{"file": "src/a.ts", "start": 1, "end": 5}])));
 
     // The findings the crawl stamps land beside the run, rule-namespaced
@@ -796,8 +796,10 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
         let rule = opts
             .record_context
             .as_ref()
-            .and_then(|c| c.get("rule"))
-            .and_then(Value::as_str)
+            .and_then(|c| match &c.rule {
+                Some(darkmux_flow::payload::RuleRef::One(id)) => Some(id.as_str()),
+                _ => None,
+            })
             .unwrap_or("unknown")
             .to_string();
         fs::write(
@@ -1023,9 +1025,9 @@ fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm
     assert_eq!(opts.role_id, "reviewer", "the Task's own role_id, not the hardcoded default");
     let ctx = opts.record_context.expect("provenance the runtime cannot know");
     assert_eq!(
-        ctx["confirm"],
-        serde_json::json!("mod"),
-        "swallowed-error's built-in confirm form, stamped from the resolved rule: {ctx}"
+        ctx.confirm.as_deref(),
+        Some("mod"),
+        "swallowed-error's built-in confirm form, stamped from the resolved rule: {ctx:?}"
     );
 }
 
@@ -2630,7 +2632,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
                 mission_id: Some(MISSION.into()),
                 phase_id: Some(PHASE.into()),
                 step_id: Some("unit-step".into()),
-                context: serde_json::json!({"unit": "u-0001"}),
+                context: Some(serde_json::from_value(serde_json::json!({"unit": "u-0001"})).unwrap()),
                 emitted: serde_json::json!({"why": "w"}),
                 source: None,
                 schema_version: darkmux_crew::findings::FINDING_SCHEMA_VERSION.into(),

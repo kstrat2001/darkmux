@@ -62,6 +62,17 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **Loose JSON fields are typed (#3035).** Typing, not a wire change: every value
+  already written still reads, and a typed field writes back the JSON it was read from. A flow payload's `context` is a `RecordContext` (`workspace`, `source`,
+  `sha`, `rule`, `rules`, `confirm`, `unit`, `model`, `locality`, `profile`, and on a
+  finding `site`; a key it does not name is kept), so the generated TypeScript
+  changes from `Record<string, unknown>` to `RecordContext`, and `FindingRecord.context`
+  and `ForFinding.context` change from `any` to it. A knob's `value` is a `KnobValue`
+  (`boolean | number | string`, or `null`) instead of `any`. The lab run
+  `manifest.json` is one `RunManifest` type that the three providers, the fixture
+  and work-gate enrichers and every reader share. The free-form fields that stay
+  `any` (a finding's `emitted`, a mission input's `default`, `Profile.use_when`)
+  are listed in `DESIGN.md` with a reason each.
 - **Additive-only schema changes are enforced, not hoped for** (#3035). These
   authored and persisted shapes carry a `schema_version` (role, skill, crew,
   rule, workload and lab-fixture manifests; `mission.json` and each phase, task

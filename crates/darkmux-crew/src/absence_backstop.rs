@@ -567,6 +567,7 @@ pub fn run_backstop(mission_id: &str, findings: &[FindingRecord]) -> BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ctx;
 
     // ── detect_absence_claim / check_absence_claim: the pure lint ──────
 
@@ -1110,7 +1111,7 @@ mod tests {
             "create_finding",
             crate::findings::Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
             crate::findings::Scope { mission_id: Some(mission.to_string()), phase_id: None, step_id: None },
-            Some(serde_json::json!({"rule": rule, "source": source})),
+            Some(ctx(serde_json::json!({"rule": rule, "source": source}))),
             serde_json::json!({"file": file, "line": 2, "pattern": rule, "evidence": "e", "why": why}),
         )
     }

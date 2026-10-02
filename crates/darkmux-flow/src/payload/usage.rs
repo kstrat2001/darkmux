@@ -1,7 +1,7 @@
 //! Payloads of the usage accounting records: `telemetry.tokens` (one per model
 //! call) and the utility-job markers `utility.start` / `utility.error`.
 
-use super::Attribution;
+use super::{Attribution, RecordContext};
 use serde::{Deserialize, Serialize};
 
 /// Which kind of model call a usage record accounts for. Serialized into the
@@ -175,10 +175,10 @@ pub struct UsagePayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied (the crawl launcher's workspace, source, sha,
-    /// rule, unit), carried verbatim.
+    /// rule, unit), a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for UsagePayload {
@@ -188,7 +188,7 @@ impl Attribution for UsagePayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }
@@ -226,10 +226,10 @@ pub struct UtilityStartPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
-    /// The provenance a dispatch caller supplied, carried verbatim.
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
 }
 
 impl Attribution for UtilityStartPayload {
@@ -239,7 +239,7 @@ impl Attribution for UtilityStartPayload {
     fn step(&self) -> Option<&str> {
         self.step_id.as_deref()
     }
-    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
 }

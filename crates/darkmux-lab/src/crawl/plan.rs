@@ -3739,7 +3739,7 @@ line two
                 "create_finding",
                 darkmux_crew::findings::Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
                 darkmux_crew::findings::Scope { mission_id: Some(MISSION.into()), phase_id: Some(PHASE.into()), step_id: None },
-                Some(context),
+                Some(serde_json::from_value(context).unwrap()),
                 serde_json::json!({ "file": file, "line": line, "pattern": rule, "evidence": evidence, "why": why }),
             );
             darkmux_crew::findings::materialize(&findings_root, &rec).unwrap();
