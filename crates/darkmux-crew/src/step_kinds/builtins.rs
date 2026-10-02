@@ -2482,14 +2482,10 @@ fn map_hosted_item(
         }
     };
     loop {
-        // (#2902 step 5, #3035) The endpoint's window, then the item's own
-        // token cap (which RESERVES this attempt's cap). The endpoint budget may warn or,
+        // (#2902 step 5, #3035) The endpoint's window gate. It may warn or,
         // under `wait`, hold; only a run stopped during a wait (or limits
         // that cannot be used) returns here, and then nothing is sent.
-        let admitted = crate::budget::admit_endpoint(endpoint, caller);
-        if admitted.is_ok() {
-        }
-        if let Err(e) = admitted {
+        if let Err(e) = crate::budget::admit_endpoint(endpoint, caller) {
             return MapItemResult {
                 index,
                 ok: false,
