@@ -280,14 +280,14 @@ CREATE TABLE IF NOT EXISTS meta_kv (
     value TEXT NOT NULL
 );
 
--- (#994) cautions — DERIVED from the flow stream (a row per detector firing).
+-- (#994) cautions: DERIVED from the flow stream (a row per detector firing).
 -- The mistakes the local crew has already made, keyed (when known) to the file
 -- they happened in, so the retrieve slice can feed the relevant ones into the
 -- next dispatch's brief. In REBUILD_TABLES → dropped + re-derived every rebuild
 -- (the flow JSONL is the source of truth; this is a queryable index of it).
 -- `file` is NULL for engagement-level firings (turn-level detectors, or a
 -- cycle on a non-file tool). `code_hash` is the firing-time file hash for
--- staleness ranking — NULL until the runtime-side capture slice 2 emits it.
+-- staleness ranking: NULL until the runtime-side capture slice 2 emits it.
 CREATE TABLE IF NOT EXISTS cautions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     file        TEXT,
@@ -639,7 +639,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
         dangling_pairs(&roles, &skills).into_iter().collect();
     for (role_id, skill_id) in &dangling_pairs(&roles, &skills) {
         eprintln!(
-            "warning: role '{role_id}' names skill '{skill_id}', which no skill manifest defines — \
+            "warning: role '{role_id}' names skill '{skill_id}', which no skill manifest defines: \
              link skipped; `darkmux doctor` names the file to fix"
         );
     }
@@ -1350,7 +1350,7 @@ mod tests {
                     darkmux_flow::FlowSource::Detector,
                     finding(
                         DetectorKind::Repetition,
-                        "observation 17: tail_ratio=0.242 over 68000 characters — \
+                        "observation 17: tail_ratio=0.242 over 68000 characters: \
                          the degeneracy gate judged this repeating (#2836)",
                         None,
                     ),

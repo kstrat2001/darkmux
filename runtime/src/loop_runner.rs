@@ -1399,10 +1399,10 @@ fn recover_intra_turn_stall(
 ///
 /// (#2114) No longer `main.rs`'s entry point — production now calls
 /// [`run_resumable`], which takes the out-dir root and an optional
-/// checkpoint explicitly. This one is `#[allow(dead_code)]` because
-/// nothing in the non-test binary calls it anymore, but it stays public
-/// and exercised because the bulk of this file's test suite still calls
-/// it and shouldn't have to care about a feature it isn't testing.
+/// checkpoint explicitly. This one is `#[cfg(test)]` because nothing in
+/// the non-test binary calls it anymore, but the bulk of this file's test
+/// suite still calls it and shouldn't have to care about a feature it
+/// isn't testing.
 ///
 /// (#2114 finding 3) Each call gets its OWN fresh host tempdir as its
 /// out-dir rather than a hardcoded path: this fn only ever runs on the
@@ -1425,7 +1425,7 @@ fn recover_intra_turn_stall(
 /// dispatch's out-dir is kept ON PURPOSE (it holds the run's prompt,
 /// trajectory and checkpoint for the operator to read afterward), so it is
 /// not a tradeoff this test-only wrapper shares.
-#[allow(dead_code)]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     client: &LmStudioClient,

@@ -296,8 +296,8 @@
         let brief = coder_brief(
             &p,
             &m,
-            &["Always run the linter — CI enforces it.".to_string()],
-            &["Do not rename the config field — downstream parses it.".to_string()],
+            &["Always run the linter: CI enforces it.".to_string()],
+            &["Do not rename the config field: downstream parses it.".to_string()],
             &["edit loop detected on src/widget.rs in an earlier dispatch".to_string()],
         );
         let golden = r#"desc s1
@@ -309,19 +309,19 @@ Original operator request: make widgets faster.
 </operator-source-input>
 
 <lessons>
-The user recorded these conventions and decisions for this codebase — the rules the team actually follows and the reasoning behind them. Treat them as authoritative: follow them, and prefer them over a generic default when they conflict. If one is clearly stale against the current code, say so in your final message rather than silently ignoring it:
+The user recorded these conventions and decisions for this codebase: the rules the team actually follows and the reasoning behind them. Treat them as authoritative: follow them, and prefer them over a generic default when they conflict. If one is clearly stale against the current code, say so in your final message rather than silently ignoring it:
 
-Always run the linter — CI enforces it.
+Always run the linter: CI enforces it.
 </lessons>
 
 <prior-adjudication-corrections>
 The user's reviewer recorded these corrections while reviewing earlier dispatches in this mission. Treat each as a finding from an earlier context, not a fact about your current workspace. If a correction names a concrete change (a renamed field, a config key, a command, an exact string), check it against the code or by running the command it names, and apply it if it holds. If it names a diagnosis (a race condition, a broken invariant, a failing test), reproduce the specific claim before changing anything: run the test or trace the code path it names. If a correction does not hold against your current workspace, say so in your final message and re-diagnose; if re-diagnosis does not converge quickly, surface the blocker and stop rather than looping:
 
-- Do not rename the config field — downstream parses it.
+- Do not rename the config field: downstream parses it.
 </prior-adjudication-corrections>
 
 <detected-cautions>
-darkmux's loop detectors flagged these patterns in earlier dispatches in this mission — repeated tool calls, looping reasoning, tool-failure cascades. They are signals from earlier contexts, not facts about your current workspace: a pattern that fired earlier may be irrelevant now. Use them to avoid walking back into a known dead end — if you notice yourself about to repeat one, stop and change your approach. None of these is a required action:
+darkmux's loop detectors flagged these patterns in earlier dispatches in this mission: repeated tool calls, looping reasoning, tool-failure cascades. They are signals from earlier contexts, not facts about your current workspace: a pattern that fired earlier may be irrelevant now. Use them to avoid walking back into a known dead end: if you notice yourself about to repeat one, stop and change your approach. None of these is a required action:
 
 edit loop detected on src/widget.rs in an earlier dispatch
 </detected-cautions>"#;
@@ -537,7 +537,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
                 r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters: the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -843,7 +843,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             flows.path().join("2026-06-22.jsonl"),
             concat!(
                 r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF — verify never ran"}"#, "\n",
+                r#"{"ts":"2026-06-22T10:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF: verify never ran"}"#, "\n",
                 // SIBLING mission session must NOT bleed in.
                 r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
             ),
@@ -890,7 +890,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         );
         assert_eq!(report.cautions.len(), 1, "one in-mission caution (sibling excluded): {:?}", report.cautions);
         assert!(report.cautions[0].contains("src/index.rs"), "{:?}", report.cautions);
-        assert_eq!(report.corrections, vec!["overrode SIGNOFF — verify never ran".to_string()]);
+        assert_eq!(report.corrections, vec!["overrode SIGNOFF: verify never ran".to_string()]);
         assert!(missing.is_err(), "an unknown mission errors");
     }
 
@@ -968,7 +968,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(
             p2.reason.as_deref(),
             Some("2 of 4 task(s) completed, 0 errored, 2 abandoned"),
-            "the counts were already recorded — the debrief just has to read them back"
+            "the counts were already recorded: the debrief just has to read them back"
         );
     }
 
@@ -987,7 +987,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Abandoned, Some(PhaseOutcomeKind::Degraded)),
             DebriefPhaseStatus::Abandoned,
-            "an operator's abort is the authoritative terminal — the envelope never overwrites it"
+            "an operator's abort is the authoritative terminal: the envelope never overwrites it"
         );
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Running, Some(PhaseOutcomeKind::Degraded)),
@@ -1077,12 +1077,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
     fn format_records_emitted_lines_names_the_gap_on_none_and_on_a_miss() {
         assert_eq!(
             format_records_emitted_lines(&None),
-            vec!["(not available — no envelope.json yet, or it predates #2421)".to_string()]
+            vec!["(not available: no envelope.json yet, or it predates #2421)".to_string()]
         );
         let miss = crew::records_emitted::RecordsEmitted::default();
         assert_eq!(
             format_records_emitted_lines(&Some(miss)),
-            vec!["(no flow records found for this mission — see the envelope's warnings)".to_string()]
+            vec!["(no flow records found for this mission: see the envelope's warnings)".to_string()]
         );
     }
 
@@ -1219,7 +1219,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             phase("s2", "m1", PhaseStatus::Planned),
         ];
         let chosen = select_phase(&phases, &ids(&["s1", "s2"]), "m1", None).unwrap();
-        assert_eq!(chosen.id, "s2", "s2's predecessor (s1) is Complete — it's ready");
+        assert_eq!(chosen.id, "s2", "s2's predecessor (s1) is Complete: it's ready");
     }
 
     /// Companion negative case: same shape, but the predecessor is only
@@ -1448,7 +1448,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     #[test]
     fn parse_failed_verifiers_extracts_entries() {
         let env = envelope_with(
-            r#"[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}]"#,
+            r#"[{"command":"cargo test","reason":"command not found (exit 127): the verifier never ran"}]"#,
         );
         let got = parse_failed_verifiers(&env);
         assert_eq!(got.len(), 1, "{got:?}");
@@ -1781,7 +1781,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert_eq!(
             actual, expected,
             "the run-time step's composed brief must be byte-identical to the retired \
-             pre-#1546 call site's own inline computation for the same inputs — that \
+             pre-#1546 call site's own inline computation for the same inputs: that \
              equality IS this packet's faithfulness claim"
         );
     }

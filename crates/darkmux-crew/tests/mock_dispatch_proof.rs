@@ -923,7 +923,7 @@ fn dispatch_i2596_start_record_and_container_budget_must_agree() {
         container_value,
         "dispatch.start's bounds.inactivity_timeout_seconds.value ({record_value}) must \
          equal what the container was ACTUALLY given \
-         (DARKMUX_INACTIVITY_TIMEOUT_SECONDS={container_value}) — #2596: these are \
+         (DARKMUX_INACTIVITY_TIMEOUT_SECONDS={container_value}): #2596: these are \
          resolved on two SEPARATE call sites (`resolved_runtime_bounds` for the \
          record, `effective_inactivity_timeout_seconds` for the container) that can \
          independently drift; a mismatch here means the record is lying about what \

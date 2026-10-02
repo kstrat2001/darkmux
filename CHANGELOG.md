@@ -66,6 +66,23 @@ darkmux release.
   check no longer treats a flow record without a `machine_uid` as a known name
   (a record with no uid names no machine), and the retired Redis-queue
   and mixed-version narration is gone from the fleet code and docs.
+- **One rule for a retired setting's leftover, on both channels** (5.0).
+  A leftover env var or `config.json` key is refused only when ignoring it is
+  unsafe (a spend cap); otherwise it warns. `dirs.notebook`, `radio.router_profile`,
+  `remote.step_budget_policy`, `runtime.log_level` and `machine_rollup.enabled`
+  used to warn as env vars but refuse as `config.json` keys; they warn in both.
+  A command with no preflight (a read such as `run list`) now prints a
+  `config.json` problem as a `warning:` instead of staying silent. `RENAMED_SETTINGS`
+  (always empty after 5.0) is gone; a rename is a `RETIRED_SETTINGS` entry.
+- **The older retired verbs say where they went** (5.0). `swap`, `status`,
+  `fleet`, `lessons`, `model`, `crew sync` and `mission run` are refused with a
+  pointer (`machine`, `memory`, `mission launch`) instead of clap's "similar
+  subcommand" guess (`model` used to suggest `mod`).
+- **One owner for an unmanaged endpoint's seat** (5.0). The key a call claims
+  (`ModelEndpoint::seat_key`) and how many calls run at once
+  (`concurrent_width`) are each derived once, shared by the scheduler and a
+  fleet receiver's seat book.
+
 - **Informational stderr lines stay out of an interactive terminal** (5.0).
   `[darkmux-liveness]` markers, the `flow: ... sink enabled` banners, and the
   dispatch progress headers print only when stderr is not a terminal (CI logs,
@@ -1024,6 +1041,17 @@ darkmux release.
     an envelope's `remote_budgets` is `dispatch_budgets` (the old key still
     reads, never written); `machine list` says `unmanaged N`; doctor's
     `remote endpoint credentials` row is `unmanaged endpoint credentials`.
+  - **The last `remote` wire names follow** (same unreleased versions, nothing
+    bumped): a `telemetry.tokens` or `step result` payload's `remote` flag is
+    `unmanaged`, a `dispatch.complete`'s `remote_tokens` is `unmanaged_tokens`,
+    a run record seat's `remote` is `unmanaged`, `--json` models report
+    `unmanaged` (not `remote`), and a role's `residency` of `remote` is
+    `unmanaged`. The flag means "the endpoint is not one darkmux manages",
+    decided from the endpoint's kind, so an unmanaged server on this machine
+    reads as unmanaged. An archived record or envelope's old key still reads,
+    and nothing writes it.
+  - A flow record read off the hub carries `hub_id`, now listed in the FLOW
+    history (it is never written to a flow file).
 
 - **`darkmux machine list --deep` is retired.** The card is the default content
   of `machine list`, so there is nothing to ask for; the flag is refused, naming
@@ -1484,6 +1512,17 @@ darkmux release.
   reason, instead of matching on the machine name.
 - **Busy and queued replies never carry an endpoint URL** (5.0). An inline
   endpoint is named "an inline endpoint" to a peer; a named one by its id.
+- **`config set` (and `machine trust` / `untrust`) refuse a `config.json` written by a
+  newer darkmux** instead of rewriting it with keys this binary cannot place.
+- **A malformed `bounds` block no longer drops a whole `dispatch.start` record**
+  (it costs the bounds, and a wrong-typed optional knob only itself), and a knob
+  `value` of a type no darkmux wrote reads as unknown (`KnobValue::Unrecognized`)
+  rather than as `null`, which means uncapped.
+- **`meta.cut.fleet` is true only for a Redis stream that was trimmed or hit the
+  read's `COUNT`**, not for a young stream whose first entry is simply newer than
+  the day (it said a complete day was cut).
+- **`profile list --machine <missing>` no longer prints a stray "machine card"
+  line first** in a terminal; the line prints for a log or under `--verbose`.
 - **Selecting text on a card or row never clicks it.** A drag that selects
   text, or a double-click that selects a word, no longer drills the fleet
   machine card, a run row, an event row, or a mission step; a plain click

@@ -30,9 +30,6 @@ impl WorkloadProvider for CodingTaskProvider {
     fn id(&self) -> &'static str {
         "coding-task"
     }
-    fn description(&self) -> &'static str {
-        "Coding workload: prompt + sandbox seed + verification command (e.g. npm test)."
-    }
     fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
         Some(pick_role(loaded))
     }
@@ -312,7 +309,6 @@ impl WorkloadProvider for CodingTaskProvider {
         // surfaced the methodology gap: per-run aggregator-side
         // analysis was reading the latest dispatch's data for every
         // historical run.
-        let mut trajectory_path: Option<PathBuf> = None;
         let refused_artifacts: Vec<RefusedArtifact>;
         {
             // Read from the dispatch's out-dir. `out_dir` is ALWAYS `Some`
@@ -340,9 +336,6 @@ impl WorkloadProvider for CodingTaskProvider {
                 run_dir,
                 &["trajectory.jsonl", "findings.jsonl"],
             );
-            if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
-                trajectory_path = Some(run_dir.join("trajectory.jsonl"));
-            }
             refused_artifacts = preserved.refused;
         }
         preserve.disarm();
@@ -421,7 +414,6 @@ impl WorkloadProvider for CodingTaskProvider {
                 sandbox_dir,
                 final_hash,
                 refused_artifacts: &refused_artifacts,
-                trajectory_path,
                 verify: verify_outcome,
             },
             &dispatched,
@@ -790,7 +782,7 @@ impl Drop for TrajectoryPreserver {
         let preserved = preserve_runtime_artifacts(&self.out_dir, &self.run_dir, &["trajectory.jsonl", "findings.jsonl"]);
         if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
             if let Err(e) = darkmux_trajectory::close_if_unterminated(&self.run_dir.join("trajectory.jsonl")) {
-                eprintln!("darkmux: warn — could not mark the preserved trajectory interrupted: {e}");
+                eprintln!("darkmux: warn: could not mark the preserved trajectory interrupted: {e}");
             }
         }
     }
@@ -1143,7 +1135,6 @@ pub(crate) struct FinishInputs<'a> {
     pub sandbox_dir: &'a Path,
     pub final_hash: Option<String>,
     pub refused_artifacts: &'a [RefusedArtifact],
-    pub trajectory_path: Option<PathBuf>,
     pub verify: Option<crate::workloads::types::VerifyOutcome>,
 }
 
@@ -1174,8 +1165,6 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
         escalation: end.escalation().map(str::to_string),
         ok: end.ok(),
         duration_ms: f.duration_ms,
-        payload_text: Some(extract_reply_text(&d.stdout)),
-        trajectory_path: f.trajectory_path,
         verify: f.verify,
         error: d.error(),
     })
@@ -1311,14 +1300,14 @@ pub(crate) fn preserve_runtime_artifacts(
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux: runtime {name} NOT copied into the run dir — {reason}; \
+                        "darkmux: runtime {name} NOT copied into the run dir: {reason}; \
                          recorded as refused_artifacts in the run manifest"
                     ))
                 );
                 out.refused.push(RefusedArtifact { file: (*name).to_string(), reason });
             }
             Err(ContainedFileError::Io(e)) => {
-                eprintln!("darkmux: warn — failed copying runtime {name} into run dir: {e}");
+                eprintln!("darkmux: warn: failed copying runtime {name} into run dir: {e}");
             }
         }
     }
@@ -1368,7 +1357,6 @@ mod tests {
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
-            manifest_path: base_dir.join("workload.json"),
             base_dir,
             source: WorkloadSource::OnDisk,
         }
@@ -1418,7 +1406,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], trajectory_path: None, verify: None }, &d).unwrap();
+            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], verify: None }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -1470,7 +1458,6 @@ mod tests {
     fn provider_metadata() {
         let p = CodingTaskProvider;
         assert_eq!(p.id(), "coding-task");
-        assert!(p.description().contains("sandbox"));
     }
 
     #[test]

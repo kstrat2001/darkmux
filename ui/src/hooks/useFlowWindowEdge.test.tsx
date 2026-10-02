@@ -22,7 +22,7 @@ function wrapper(queryClient: QueryClient) {
   );
 }
 
-describe("useFlowWindow — the window edge is coarse", () => {
+describe("useFlowWindow: the window edge is coarse", () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);

@@ -70,7 +70,7 @@
   "crates/darkmux-lab/src/lab/bundle/source.rs::FileSource::github_candidate_files": 18,
   "crates/darkmux-lab/src/lab/bundle/source.rs::parse_import_bindings": 16,
   "crates/darkmux-lab/src/lab/stats_render.rs::sets_text": 21,
-  "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::run": 17,
+  "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::run": 16,
   "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::setup": 24,
   "crates/darkmux-lab/src/providers/tool_bench.rs::WorkloadProvider for ToolBenchProvider::run": 28,
   "crates/darkmux-lab/src/providers/workspace_delta.rs::walk_dir": 18,

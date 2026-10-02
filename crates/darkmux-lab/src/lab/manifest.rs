@@ -13,6 +13,7 @@
 //! "predates the feature".
 
 use anyhow::{Context, Result};
+use darkmux_flow::payload::lenient;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
@@ -20,13 +21,6 @@ use std::path::Path;
 
 /// The file a run's manifest is written to.
 pub const MANIFEST_FILE: &str = "manifest.json";
-
-/// A field that reads as `T` or, when it is not one, as absent: leniency per FIELD, so one
-/// wrong-typed key costs that key and never the manifest (contract 7). The bad raw value is
-/// dropped, since a typed field has nowhere to keep it.
-fn lenient<'de, T: serde::de::DeserializeOwned, D: Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
-    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
-}
 
 /// [`lenient`] for a key whose `null` means something: `Some(None)` for an explicit `null`,
 /// `Some(Some(v))` for a value, and `None` (absent) for a key that is missing or wrong-typed.

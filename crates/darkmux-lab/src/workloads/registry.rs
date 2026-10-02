@@ -42,18 +42,6 @@ pub(crate) fn with_provider<R>(id: &str, f: impl FnOnce(&dyn WorkloadProvider) -
     Ok(f(p.as_ref()))
 }
 
-/// Snapshot of registered provider ids and descriptions, for
-/// `darkmux lab providers` (subcommand reserved — not wired in main.rs
-/// today; the registry surface is here so it can be added without
-/// touching this file).
-#[allow(dead_code)]
-pub fn list() -> Vec<(String, String)> {
-    let map = registry().lock().expect("registry poisoned");
-    map.iter()
-        .map(|(k, v)| (k.clone(), v.description().to_string()))
-        .collect()
-}
-
 fn list_inner(map: &HashMap<String, Box<dyn WorkloadProvider>>) -> String {
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
@@ -80,11 +68,7 @@ mod tests {
     impl WorkloadProvider for StubProvider {
         fn id(&self) -> &'static str {
             self.0
-        }
-        fn description(&self) -> &'static str {
-            "stub for tests"
-        }
-        fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
+        }        fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
             Ok(())
         }
         fn run(
@@ -103,8 +87,6 @@ mod tests {
                 escalation: None,
                 ok: true,
                 duration_ms: 1,
-                payload_text: Some("stub".into()),
-                trajectory_path: None,
                 verify: Some(VerifyOutcome {
                     passed: true,
                     details: "stub".into(),
@@ -121,8 +103,8 @@ mod tests {
     fn register_and_lookup_basic() {
         let id = "test-stub-basic";
         register(Box::new(StubProvider(id))).unwrap();
-        let desc = with_provider(id, |p| p.description().to_string()).unwrap();
-        assert_eq!(desc, "stub for tests");
+        let got = with_provider(id, |p| p.id()).unwrap();
+        assert_eq!(got, id);
     }
 
     #[test]
@@ -140,13 +122,5 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown workload provider"));
         assert!(msg.contains("Registered:"));
-    }
-
-    #[test]
-    fn list_returns_registered() {
-        let id = "test-stub-list-fn";
-        let _ = register(Box::new(StubProvider(id)));
-        let listed = list();
-        assert!(listed.iter().any(|(k, _)| k == id));
     }
 }

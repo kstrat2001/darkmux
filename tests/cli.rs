@@ -1200,9 +1200,7 @@ fn retired_lessons_family_is_unknown_entirely() {
         cmd.args(&args)
             .assert()
             .failure()
-            .stderr(predicate::str::contains("unrecognized subcommand").or(
-                predicate::str::contains("unexpected argument"),
-            ));
+            .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("memory lesson")));
     }
 }
 
@@ -1333,9 +1331,7 @@ fn retired_mission_run_subverb_is_unknown() {
     cmd.args(["mission", "run", "some-mission"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized subcommand").or(
-            predicate::str::contains("unexpected argument"),
-        ));
+        .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("mission launch")));
 }
 
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
@@ -1794,8 +1790,7 @@ fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
 fn retired_top_level_swap_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("swap").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
     );
 }
 
@@ -1803,8 +1798,7 @@ fn retired_top_level_swap_verb_is_unknown() {
 fn retired_top_level_status_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("status").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
     );
 }
 
@@ -1812,8 +1806,7 @@ fn retired_top_level_status_verb_is_unknown() {
 fn retired_top_level_model_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("model").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine eject")),
     );
 }
 
@@ -1821,8 +1814,7 @@ fn retired_top_level_model_verb_is_unknown() {
 fn retired_top_level_fleet_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("fleet").assert().failure().stderr(
-        predicate::str::contains("unrecognized subcommand")
-            .or(predicate::str::contains("unexpected argument")),
+        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine list")),
     );
 }
 
@@ -4321,7 +4313,7 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
 
     assert!(
         stub.wait_for_a_connection_to_close(FLEET_TEST_HANG_BOUND),
-        "no curl connection to the stub server was ever torn down — the submitted job's dispatch \
+        "no curl connection to the stub server was ever torn down: the submitted job's dispatch \
          child survived the daemon's own exit (#2476 review round 2 regression)"
     );
     assert_no_surviving_remote_curl(serve_pid, "serve");
@@ -6198,7 +6190,7 @@ fn radio_answers_at_once_that_the_answering_model_is_busy_instead_of_queueing() 
         stdout.contains(
             "darkmux found no live run on it in the last day of its records, and no darkmux process it can verify holds it"
         ),
-        "no lease and no live run name the occupant, so the copy says exactly that — and never claims whose \
+        "no lease and no live run name the occupant, so the copy says exactly that: and never claims whose \
          work it is:\n{stdout}"
     );
     assert!(stdout.contains("generating a reply"), "LM Studio's word in plain English:\n{stdout}");
@@ -6469,7 +6461,7 @@ fn radio_normal_run_returns_the_launched_childs_exit_code_unchanged() {
     assert!(
         status.success(),
         "an unsignalled `darkmux radio` whose launched child dispatched successfully must \
-         exit 0 (#2477 — the forwarding branch must never fire on a clean try_wait): {status:?}"
+         exit 0 (#2477: the forwarding branch must never fire on a clean try_wait): {status:?}"
     );
     let missions_dir = home.path().join("missions");
     let mission_id = fs::read_dir(&missions_dir)
@@ -6536,7 +6528,7 @@ fn mission_launch_outcome_from_unknown_task_refused_before_minting() {
     let missions_dir = home.path().join("missions");
     assert!(
         !missions_dir.is_dir() || fs::read_dir(&missions_dir).unwrap().next().is_none(),
-        "a refused outcome_from must never mint a mission — no missions/ entry may exist"
+        "a refused outcome_from must never mint a mission: no missions/ entry may exist"
     );
 }
 
@@ -6697,7 +6689,7 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
     let missions_dir = home.path().join("missions");
     assert!(
         !missions_dir.is_dir() || fs::read_dir(&missions_dir).unwrap().next().is_none(),
-        "a refused run_on must never mint a mission — no missions/ entry may exist"
+        "a refused run_on must never mint a mission: no missions/ entry may exist"
     );
 }
 
@@ -6796,7 +6788,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     );
     assert!(
         !stdout.contains("exit status stays 0"),
-        "the run exited 2 — it must not print a claim that the status stays 0; stdout:\n{stdout}"
+        "the run exited 2: it must not print a claim that the status stays 0; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("BROKEN"),
@@ -6822,7 +6814,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     );
     assert!(
         !stdout.contains("exit 3"),
-        "the run exited 2 — no line may name exit 3; stdout:\n{stdout}"
+        "the run exited 2: no line may name exit 3; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("takes precedence"),
@@ -7017,17 +7009,17 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // invisible and the comparison would pass by accident.
     assert!(
         direct_ids.iter().any(|s| s.starts_with("lab/")),
-        "fixture produced no lab run — the marker file is no longer recognized, and this test \
+        "fixture produced no lab run: the marker file is no longer recognized, and this test \
          would now pass vacuously on the lab axis: {direct_ids:?}"
     );
     assert!(
         direct_ids.iter().any(|s| s.starts_with("mission/")),
-        "fixture produced no mission run — the mission record shape or crew-dir layout changed, \
+        "fixture produced no mission run: the mission record shape or crew-dir layout changed, \
          and this test would now pass vacuously on the mission axis: {direct_ids:?}"
     );
     assert_eq!(
         verb_ids, direct_ids,
-        "`darkmux run list` and darkmux_serve::build_runs disagree on the SAME fixture — the \
+        "`darkmux run list` and darkmux_serve::build_runs disagree on the SAME fixture: the \
          \"one union\" contract (#1905) is broken: the verb is aggregating, filtering, or \
          reading different inputs instead of rendering what the shared union returned"
     );
@@ -10993,7 +10985,7 @@ fn forward_dep_task_runs_in_the_later_phases_pass() {
     }
     assert_eq!(steps.len(), 3, "steps: {steps:#?}");
     assert!(
-        stdout.contains("finished clean — 3 step(s) complete, 0 errored"),
+        stdout.contains("finished clean: 3 step(s) complete, 0 errored"),
         "the summary must count all three\n{stdout}"
     );
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
@@ -11549,7 +11541,7 @@ fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
     assert_eq!(
         input["default"],
         serde_json::json!("0"),
-        "the default must be 0 — a CI runner waiting per finding is pure wall-clock"
+        "the default must be 0: a CI runner waiting per finding is pure wall-clock"
     );
 
     let phase = doc["phases"]
@@ -11573,7 +11565,7 @@ fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
     assert_eq!(
         kinds,
         vec!["procedural.shell", "mods.gate"],
-        "wait then gate — no dispatch step: {task}"
+        "wait then gate: no dispatch step: {task}"
     );
     let command = task["grow"]["config"]["command"].as_str().unwrap();
     for needle in ["{{item.key}}", "{{mod_wait_seconds}}", "mod list --for", "DARKMUX_BIN"] {
@@ -11669,7 +11661,7 @@ fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bo
     );
     assert!(
         stdout.contains("\"waited\":true"),
-        "the wait DID run — `waited` reports that, `found` reports the outcome: {stdout}"
+        "the wait DID run: `waited` reports that, `found` reports the outcome: {stdout}"
     );
     assert!(stdout.contains("sess-never/9"), "naming the finding it waited for: {stdout}");
     assert!(stderr.contains("sess-never/9"), "the note names the finding: {stderr}");
@@ -11755,7 +11747,7 @@ fn the_wait_command_fails_fast_when_the_darkmux_binary_is_missing() {
     );
     assert!(
         elapsed < std::time::Duration::from_secs(10),
-        "a missing binary is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+        "a missing binary is diagnosable on the FIRST probe: it must not burn the 60s bound: {elapsed:?}"
     );
 }
 
@@ -11827,7 +11819,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     assert_eq!(
         out.status.code(),
         Some(42),
-        "the stub's distinctive exit code must reach here unmodified — a hardcoded `exit 1` \
+        "the stub's distinctive exit code must reach here unmodified: a hardcoded `exit 1` \
          regression would report 1, not 42, and this is the assertion that would catch it: \
          stdout {stdout}\nstderr {stderr}"
     );
@@ -11837,7 +11829,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     );
     assert!(
         elapsed < std::time::Duration::from_secs(10),
-        "a config/infra error is diagnosable on the FIRST probe — it must not burn the 60s bound: {elapsed:?}"
+        "a config/infra error is diagnosable on the FIRST probe: it must not burn the 60s bound: {elapsed:?}"
     );
 }
 
@@ -11885,7 +11877,7 @@ fn the_wait_command_does_not_false_positive_on_key_text_in_mod_list_stderr() {
     );
     assert!(
         !stdout.contains("\"found\":true"),
-        "nothing was generated — `\"key\"` landing on stderr must not read as a match: stdout {stdout}\nstderr {stderr}"
+        "nothing was generated: `\"key\"` landing on stderr must not read as a match: stdout {stdout}\nstderr {stderr}"
     );
     assert!(
         stdout.contains("\"found\":false"),
@@ -12071,7 +12063,7 @@ fn fail_probe_board_reports_the_mixed_phase_as_degraded_not_complete() {
     );
     assert_eq!(
         phases["complete"], 1,
-        "three phases: p1 abandoned, p2 degraded, p3 complete — so exactly ONE clean: {phases}"
+        "three phases: p1 abandoned, p2 degraded, p3 complete: so exactly ONE clean: {phases}"
     );
     assert_eq!(phases["abandoned"], 1, "{phases}");
     assert_eq!(phases["total"], 3, "{phases}");
@@ -12212,7 +12204,7 @@ fn mission_status_json_surfaces_a_peer_mission_seen_only_via_the_flow_stream() {
     assert_eq!(peer[0]["machine"], "peer-host");
     assert_eq!(peer[0]["tracked"], false, "an observed-not-owned row must say so on the wire");
     assert_eq!(peer[0]["status"], "complete", "a seen `mission close` must read as complete");
-    assert_eq!(board["fleet"]["state"], "off", "no DARKMUX_REDIS_URL was set — this is a real Off");
+    assert_eq!(board["fleet"]["state"], "off", "no DARKMUX_REDIS_URL was set: this is a real Off");
     assert_eq!(board["summary"]["fleet_complete"], true, "`Off` is a correct, complete answer");
 }
 
@@ -12340,7 +12332,7 @@ fn mission_status_is_byte_identical_on_a_standalone_machine_with_no_peers() {
         "a standalone board must show no fleet-scope warning:\n{text}"
     );
     assert!(
-        text.trim_end().ends_with("✓ board is clean — every mission's phases are reconciled"),
+        text.trim_end().ends_with("✓ board is clean: every mission's phases are reconciled"),
         "the exact pre-#1711 clean-board line must be unchanged:\n{text}"
     );
 
@@ -13328,7 +13320,7 @@ fn lab_loop_ab_with_nothing_to_inject_names_the_remedy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--ab: nothing to inject — no authored lessons for this repo. Record a lesson \
+            "--ab: nothing to inject: no authored lessons for this repo. Record a lesson \
              (`darkmux memory lesson add`) or pass --inject-from-mission <id> to add a \
              mission's cautions, then retry.",
         ));
@@ -13338,7 +13330,7 @@ fn lab_loop_ab_with_nothing_to_inject_names_the_remedy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--ab: nothing to inject — no authored lessons for this repo and no detected \
+            "--ab: nothing to inject: no authored lessons for this repo and no detected \
              cautions for mission `m-char`. Record a lesson (`darkmux memory lesson add`), \
              then retry.",
         ));
@@ -13429,7 +13421,7 @@ fn lab_run_dispatch_summary_and_exit_code() {
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
     let id = lab.run_ids().pop().unwrap();
-    assert!(stdout.contains(&format!("\n1 run(s): 1 completed, 0 errored\n  {id} — ")), "{stdout}");
+    assert!(stdout.contains(&format!("\n1 run(s): 1 completed, 0 errored\n  {id}: ")), "{stdout}");
 
     let out = lab
         .cmd()
@@ -13464,7 +13456,7 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
     for (w, verify) in [
         ("labchar", "verify:      not checked\n"),
         ("labchar-pass", "verify:      ok\n"),
-        ("labchar-fail", "verify:      FAILED — "),
+        ("labchar-fail", "verify:      FAILED: "),
     ] {
         let id = id_of(w);
         let out = lab.cmd().args(["run", "inspect", &id]).output().unwrap();
@@ -13539,7 +13531,7 @@ fn lab_characterize_and_tune_run_and_report() {
         .unwrap();
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
-    assert!(stdout.starts_with("darkmux characterize — workload `labchar`\n"), "{stdout}");
+    assert!(stdout.starts_with("darkmux characterize: workload `labchar`\n"), "{stdout}");
     let out = lab
         .cmd()
         .args(["lab", "tune", "labchar", "--profile", "stub", "-n", "2", "--profiles-file", lab.profiles()])

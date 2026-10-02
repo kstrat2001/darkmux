@@ -129,7 +129,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
         anyhow!(
             "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the conventional \
-             roles dir, and the embedded table) — a utility job requires one",
+             roles dir, and the embedded table): a utility job requires one",
             job.role_id,
             role.prompt_path
         )

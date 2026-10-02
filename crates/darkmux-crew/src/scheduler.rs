@@ -29,7 +29,7 @@
 //!   always has), never a hard error — but LOUDLY, via an `eprintln!` and a
 //!   `Warn` flow record naming the step and the reason.
 //!
-//! Packet 2 shipped this hardcoded to "remote" for every step (storage +
+//! Packet 2 shipped this hardcoded to "unmanaged" for every step (storage +
 //! scheduler only, no production caller wiring a real dispatch chain through
 //! the graph yet); Packet 3 resolved it for real; #2394 made it exhaustive
 //! and removed the default, after the two-valued shape swept every
@@ -40,7 +40,7 @@
 //! `MissionCoderStepKind`/`MissionVerifyStepKind` do the same for the
 //! `mission.coder`/`mission.verify` kinds. `dispatch.single_shot`'s
 //! residency (the review's probe/judge seats) is left at the default
-//! (`None` → `Remote`) — Packet 4's job, once real concurrent local
+//! (`None` → `Unmanaged`) — Packet 4's job, once real concurrent local
 //! seats exist to benefit from it; today's linear graphs (coder_phase's
 //! 3-step chain) never have more than one step ready per wave, so the
 //! classification is correctness/observability, not a measured speedup.
@@ -1003,7 +1003,7 @@ pub fn run_step_graph(
             if let crate::step_kinds::SeatClaim::LocalModelUnresolved { reason } = &seat {
                 eprintln!(
                     "darkmux: step `{}` (kind `{}`) claims a LOCAL model seat but its placement \
-                     could not be resolved ({reason}) — running it one at a time, with NO \
+                     could not be resolved ({reason}): running it one at a time, with NO \
                      wave load and NO #1487 residency lease. A concurrent darkmux command's \
                      reconcile could evict its model mid-generation.",
                     step_snapshot.id, step_snapshot.kind
@@ -4144,8 +4144,8 @@ mod tests {
         assert!(
             fast.wall_ms < 150,
             "the fast sibling slept 0ms and had to queue behind its sibling under \
-             one serial endpoint — its record must reflect ITS OWN near-zero dispatch \
-             duration, never the ~250ms it spent waiting for the shared slot — got {}ms",
+             one serial endpoint: its record must reflect ITS OWN near-zero dispatch \
+             duration, never the ~250ms it spent waiting for the shared slot: got {}ms",
             fast.wall_ms
         );
     }
@@ -4197,7 +4197,7 @@ mod tests {
         let b_start = steps["b-fast-step"].started_ts.expect("b-fast actually dispatched");
         assert!(
             b_start > a_start,
-            "b-fast queued ~1.5s behind a-slow on one serial endpoint — its started_ts must \
+            "b-fast queued ~1.5s behind a-slow on one serial endpoint: its started_ts must \
              reflect when IT actually dispatched, not the wave-admission instant it was \
              made ready alongside a-slow (got a_start={a_start} b_start={b_start})"
         );
@@ -4212,7 +4212,7 @@ mod tests {
     ///
     /// **Red before the fix**: `procedural.shell` had no seat class of its
     /// own, so the pre-#2394 `residency() -> None` default classified it
-    /// as a remote seat and `run_bounded` ran the four in one-at-a-time
+    /// as an unmanaged-endpoint seat and `run_bounded` ran the four in one-at-a-time
     /// batches. Measured ~12.0s against the
     /// ceiling of 8s below; ~3.0s after.
     #[test]
@@ -4264,7 +4264,7 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(SLEEP_SECS * 2 + 2),
             "{N} independent dispatch-free steps each sleeping {SLEEP_SECS}s must overlap \
-             (~{SLEEP_SECS}s total), never serialize behind a serial endpoint (~{}s) — got {elapsed:?}",
+             (~{SLEEP_SECS}s total), never serialize behind a serial endpoint (~{}s): got {elapsed:?}",
             SLEEP_SECS * N as u64
         );
     }
@@ -4489,8 +4489,8 @@ mod tests {
         impl StepKind for FailingSleepKind {
             /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
     /// exercising what they were written to exercise: an endpoint's concurrency
-    /// serializing genuinely remote dispatches. Before #2394 this kind
-    /// reached the remote track by SAYING NOTHING, which is precisely the
+    /// serializing genuinely unmanaged-endpoint dispatches. Before #2394 this kind
+    /// reached the unmanaged-endpoint track by SAYING NOTHING, which is precisely the
     /// silence that also swept every dispatch-free step onto that track.
             fn seat(
                 &self,
@@ -4792,7 +4792,7 @@ mod tests {
             assert_ne!(
                 model_key, self.forbidden,
                 "darkmux: the resume-checkpoint gate must run BEFORE \
-                 ensure_wave_loaded — this host must never be asked to load \
+                 ensure_wave_loaded: this host must never be asked to load \
                  the refused step's model (#2614)"
             );
             self.inner.load(model_key, identifier, min_ctx, deadline)

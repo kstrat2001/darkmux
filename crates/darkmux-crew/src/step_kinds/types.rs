@@ -36,7 +36,7 @@ pub struct OverrideDispatchCall<'a> {
 /// `ReviewStepContext::chat_override` (an `Arc<dyn Fn + Send + Sync>`
 /// field, `None` at every production call site). A thread-local seam
 /// cannot serve here: the scheduler executes steps on spawned scoped
-/// threads (`concurrent_dispatch::run_remote_batches` /
+/// threads (`concurrent_dispatch::run_capped_batches` /
 /// `run_local_waves`), where a test thread's thread-local is invisible.
 /// When present, `dispatch.map` routes every item's call through it INSTEAD
 /// of the real `single_shot_chat`/`single_shot_chat_hosted` transport —
@@ -444,25 +444,36 @@ pub struct StepOutcome {
 pub struct EndpointSlot {
     key: String,
     label: String,
+    kind: SlotKind,
     concurrent_calls: Option<u32>,
+}
+
+/// What an [`EndpointSlot`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    /// A real endpoint.
+    Endpoint,
+    /// A step whose endpoint could not be resolved (`run` refuses it).
+    Unresolved,
+    /// The unresolved-local-seat fail-open (#1509).
+    UnresolvedLocal,
 }
 
 impl EndpointSlot {
     /// A slot for the endpoint `key` with the declared `concurrent_calls`.
     pub fn new(key: impl Into<String>, concurrent_calls: Option<u32>) -> Self {
         let key = key.into();
-        Self { label: key.clone(), key, concurrent_calls }
+        Self { label: key.clone(), key, kind: SlotKind::Endpoint, concurrent_calls }
     }
 
-    /// The slot `ep` claims: keyed by its `endpoints` id (an inline endpoint,
-    /// which has none, by its URL), carrying its declared `concurrent_calls`.
-    /// Its [`label`](Self::label) is the id, or a fixed phrase for an inline
-    /// endpoint: a URL can carry userinfo or a key, so it is never shown.
+    /// The slot `ep` claims: keyed by [`darkmux_types::ModelEndpoint::seat_key`],
+    /// carrying its declared `concurrent_calls`. Its [`label`](Self::label) is
+    /// the endpoint's id, or a fixed phrase for an inline endpoint: a URL can
+    /// carry userinfo or a key, so it is never shown.
     pub fn of(ep: &darkmux_types::ModelEndpoint) -> Self {
-        let named = ep.named_id().map(str::to_string);
-        let key = named.clone().or_else(|| ep.url.clone()).unwrap_or_else(|| "(unnamed endpoint)".to_string());
-        let label = named.unwrap_or_else(|| "an inline endpoint".to_string());
-        Self { key, label, concurrent_calls: ep.known_limits().and_then(|l| l.concurrent_calls) }
+        let mut slot = Self::new(ep.seat_key(), ep.known_limits().and_then(|l| l.concurrent_calls));
+        slot.label = ep.named_id().map_or_else(|| "an inline endpoint".to_string(), str::to_string);
+        slot
     }
 
     /// The name that may be shown to a person or a peer: the endpoint's id,
@@ -471,21 +482,25 @@ impl EndpointSlot {
         &self.label
     }
 
+    fn fail_open(key: &str, kind: SlotKind) -> Self {
+        Self { key: key.to_string(), label: key.to_string(), kind, concurrent_calls: None }
+    }
+
     /// The slot of a step whose endpoint could not be resolved: `run` refuses
     /// it with the reason, and until then it waits its turn alone.
     pub fn unresolved() -> Self {
-        Self::new("(unresolved endpoint)", None)
+        Self::fail_open("(unresolved endpoint)", SlotKind::Unresolved)
     }
 
     /// The slot the unresolved-local-seat fail-open claims (#1509): one at a
     /// time, in a batch of its own. Not an endpoint, so it is never noted.
     pub fn unresolved_local() -> Self {
-        Self::new("(unresolved local seat)", None)
+        Self::fail_open("(unresolved local seat)", SlotKind::UnresolvedLocal)
     }
 
     /// True for a real endpoint's slot, false for the fail-open slots.
     pub fn is_endpoint(&self) -> bool {
-        !self.key.starts_with('(')
+        self.kind == SlotKind::Endpoint
     }
 
     /// The endpoint's id (or URL), for messages and grouping.
@@ -498,10 +513,10 @@ impl EndpointSlot {
         self.concurrent_calls
     }
 
-    /// How many of this endpoint's calls run at once: the declared number
-    /// (`0` is unbounded, the darkmux bound convention), else one.
+    /// How many of this endpoint's calls run at once
+    /// ([`darkmux_types::endpoint::concurrent_width`]).
     pub fn width(&self) -> usize {
-        self.concurrent_calls.map_or(1, |n| darkmux_types::config_access::jobs_at_once(n as usize))
+        darkmux_types::endpoint::concurrent_width(self.concurrent_calls)
     }
 }
 

@@ -129,7 +129,7 @@ fn verify_line(verify: Option<&workloads::types::VerifyReport>) -> String {
     match verify {
         Some(v) if v.passed => "ok".to_string(),
         Some(v) if v.details.is_empty() => "FAILED".to_string(),
-        Some(v) => format!("FAILED — {}", v.details),
+        Some(v) => format!("FAILED: {}", v.details),
         None => "not checked".to_string(),
     }
 }
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(verify_line(None), "not checked");
         assert_eq!(verify_line(Some(&v(true, "whatever"))), "ok");
         assert_eq!(verify_line(Some(&v(false, ""))), "FAILED");
-        assert_eq!(verify_line(Some(&v(false, "missing ack"))), "FAILED — missing ack");
+        assert_eq!(verify_line(Some(&v(false, "missing ack"))), "FAILED: missing ack");
     }
 
     /// A bare run id names a run under the lab dir; a directory of that name

@@ -607,19 +607,6 @@ fn locate_on_disk_skills_source() -> Option<PathBuf> {
     None
 }
 
-/// Backwards-compatible accessor that errors when no source is available.
-/// Currently unused at runtime (the embedded fallback removes the fail case)
-/// but retained for tests that exercise the on-disk-only contract.
-#[allow(dead_code)]
-fn locate_skills_source() -> Result<PathBuf> {
-    locate_on_disk_skills_source().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no on-disk darkmux skills/ directory found (set DARKMUX_SKILLS_DIR or run from \
-             the source tree). The embedded skills are still available via install_skills()."
-        )
-    })
-}
-
 /// Default install targets. Automatically detects `~/.claude/` and `~/.gemini/`
 /// and returns both if present, defaulting to Claude as a fallback.
 fn default_skills_targets() -> Result<Vec<PathBuf>> {
@@ -645,40 +632,6 @@ fn default_skills_targets() -> Result<Vec<PathBuf>> {
     Ok(targets)
 }
 
-// (#1426) The `skills list` CLI verb retired along with the whole `skills`
-// family (init is now the one setup/refresh verb). This enumerator survives —
-// its residual value is folding into the doctor freshness check's verbose
-// detail (round-8 spec), and its own tests still exercise it — but it has no
-// non-test caller in the binary today, so the bin-target build would flag it.
-#[allow(dead_code)]
-pub fn list_installed_skills(target: Option<&Path>) -> Result<Vec<String>> {
-    let targets = match target {
-        Some(p) => vec![p.to_path_buf()],
-        None => default_skills_targets()?,
-    };
-
-    let mut out: Vec<String> = Vec::new();
-    for dir in &targets {
-        if !dir.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.is_dir() && p.join("SKILL.md").exists() {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    let name_str = name.to_string();
-                    if !out.contains(&name_str) {
-                        out.push(name_str);
-                    }
-                }
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,7 +641,7 @@ mod tests {
         let dir = source.join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("SKILL.md"), body).unwrap();
-        // Ensure the sentinel exists so locate_skills_source() accepts the dir.
+        // Ensure the sentinel exists so locate_on_disk_skills_source() accepts the dir.
         let _ = fs::write(source.join(SENTINEL), "test fixture sentinel");
     }
 
@@ -1215,29 +1168,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_installed_returns_empty_on_missing_target() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("dest-missing");
-        let listed = list_installed_skills(Some(&target)).unwrap();
-        assert!(listed.is_empty());
-    }
-
-    #[test]
-    fn list_installed_returns_skill_names() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("dest");
-        fs::create_dir_all(target.join("alpha")).unwrap();
-        fs::write(target.join("alpha/SKILL.md"), "x").unwrap();
-        fs::create_dir_all(target.join("beta")).unwrap();
-        fs::write(target.join("beta/SKILL.md"), "y").unwrap();
-        // gamma has no SKILL.md
-        fs::create_dir_all(target.join("gamma")).unwrap();
-
-        let listed = list_installed_skills(Some(&target)).unwrap();
-        assert_eq!(listed, vec!["alpha", "beta"]);
-    }
-
     #[serial_test::serial]
     #[test]
     fn locate_rejects_dir_without_sentinel() {
@@ -1250,16 +1180,11 @@ mod tests {
         unsafe { env::set_var("DARKMUX_SKILLS_DIR", bad.to_str().unwrap()) };
         let prev = env::current_dir().unwrap();
         env::set_current_dir(tmp.path()).unwrap();
-        let result = locate_skills_source();
+        let result = locate_on_disk_skills_source();
         env::set_current_dir(prev).unwrap();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("no on-disk darkmux skills") || msg.contains("missing sentinel"), // drift-guard:allow darkmux skills — noun (the skills/ source directory), not the retired verb (#1469)
-            "unexpected error: {msg}"
-        );
+        assert_ne!(result.as_deref(), Some(bad.as_path()), "a dir without the sentinel is not a skills source");
     }
 
     #[serial_test::serial]
@@ -1271,10 +1196,10 @@ mod tests {
         fs::write(good.join(SENTINEL), "marker").unwrap();
 
         unsafe { env::set_var("DARKMUX_SKILLS_DIR", good.to_str().unwrap()) };
-        let result = locate_skills_source().unwrap();
+        let result = locate_on_disk_skills_source();
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
-        assert_eq!(result, good);
+        assert_eq!(result, Some(good));
     }
 
     // ─── (#1449) prune pass — retired darkmux-* skills removed on install ─────

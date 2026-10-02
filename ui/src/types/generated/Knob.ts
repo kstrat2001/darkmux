@@ -7,7 +7,8 @@ import type { KnobValue } from "./KnobValue";
  */
 export type Knob = { 
 /**
- * The resolved value; `null` for an uncapped knob.
+ * The resolved value; `null` for an uncapped knob. A value no darkmux wrote reads as
+ * [`KnobValue::Unrecognized`], never as `null`.
  */
 value: KnobValue | null, 
 /**

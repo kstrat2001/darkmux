@@ -1,7 +1,7 @@
 //! Fixture manifest format — `.fixture.json` lives inside every
 //! registered fixture directory.
 //!
-//! Phase 2 of the lab-reproducibility cluster (#487, #489). A fixture
+//! Part of the lab-reproducibility cluster (#487, #489). A fixture
 //! is a self-contained directory (definition + artifact merged). The
 //! manifest declares what the fixture is, what it satisfies, how to
 //! verify it, and what's load-bearing for hashing.
@@ -32,11 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Parsed `.fixture.json`. Field naming uses snake_case to match
-/// existing manifest conventions in `workloads::types`. Phase 2
-/// (#489) ships the type + parser; Phase 3 + 4 are the consumers
-/// (resolver + doctor), so most fields/methods read as dead-code
-/// until then.
-#[allow(dead_code)]
+/// existing manifest conventions in `workloads::types` (#489).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct FixtureManifest {
     /// (#3035) Data-shape version of this file (`darkmux_types::data_version::LAB_FIXTURE_SCHEMA_VERSION`).
@@ -54,8 +50,8 @@ pub(crate) struct FixtureManifest {
     pub version: String,
 
     /// What abstract fixture definition this artifact satisfies.
-    /// Format: `<definition-name>@<version>`. Phase 3 uses this for
-    /// the workload's `requires_fixture` resolution.
+    /// Format: `<definition-name>@<version>`. The resolver uses this
+    /// for the workload's `requires_fixture` resolution.
     #[serde(default)]
     pub satisfies: Option<String>,
 
@@ -67,7 +63,7 @@ pub(crate) struct FixtureManifest {
 
     /// Verify-command template. `{test_files}` and other `{fixture.*}`
     /// placeholders substituted at dispatch time by the workload's
-    /// verify-command template (Phase 3).
+    /// verify-command template.
     #[serde(default)]
     pub verify_command: Option<String>,
 
@@ -86,7 +82,6 @@ fn default_version() -> String {
     "1.0".to_string()
 }
 
-#[allow(dead_code)]
 impl FixtureManifest {
     /// Read + parse `.fixture.json` from inside a fixture dir.
     pub(crate) fn load_from_dir(dir: &Path) -> Result<Self> {
@@ -126,14 +121,6 @@ impl FixtureManifest {
             }
         }
         Ok(())
-    }
-
-    /// Returns (definition_name, version) split from `satisfies`.
-    /// Returns `None` when `satisfies` is unset.
-    pub(crate) fn satisfies_parts(&self) -> Option<(&str, &str)> {
-        self.satisfies
-            .as_deref()
-            .and_then(|s| s.split_once('@'))
     }
 
     /// Check whether on-disk fixture dir has all `required_files`
@@ -226,17 +213,6 @@ mod tests {
         write_manifest(tmp.path(), r#"{"name": "demo", "satisfies": "missing-at-sign"}"#);
         let err = FixtureManifest::load_from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("@"), "got: {err}");
-    }
-
-    #[test]
-    fn satisfies_parts_splits_correctly() {
-        let tmp = TempDir::new().unwrap();
-        write_manifest(
-            tmp.path(),
-            r#"{"name": "demo", "satisfies": "tiny-python-suite@1.0"}"#,
-        );
-        let m = FixtureManifest::load_from_dir(tmp.path()).unwrap();
-        assert_eq!(m.satisfies_parts(), Some(("tiny-python-suite", "1.0")));
     }
 
     #[test]

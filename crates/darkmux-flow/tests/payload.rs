@@ -3,7 +3,7 @@
 //! action's or that did not parse, and an archive reads into the type through
 //! the legacy upgrade, leniently.
 
-use darkmux_flow::payload::{HookDryRunPayload, HookFailedPayload, HookNoticePayload};
+use darkmux_flow::payload::{HookDryRunPayload, HookFailedPayload, HookNoticePayload, KnobValue};
 use darkmux_flow::{reader, Category, FlowAction, FlowRecord, FlowSinkWrite, Level, LocalFileSink, Payload, Stage};
 use darkmux_types::session_id::{RunId, SessionId};
 
@@ -346,9 +346,63 @@ fn a_wrong_typed_context_or_knob_costs_that_field_not_the_payload() {
         Payload::DispatchStart(p) => {
             assert_eq!(p.prompt_chars, Some(4));
             let b = p.bounds.expect("bounds");
-            assert_eq!(b.max_turns.value, None);
+            // A value no darkmux wrote is UNKNOWN, kept verbatim: it never reads as `null`,
+            // which means uncapped.
+            assert_eq!(b.max_turns.value, Some(KnobValue::Unrecognized(serde_json::json!([1]))));
+            assert_ne!(b.max_turns.value, None, "a wrong-typed knob must not read as uncapped");
             assert_eq!(b.max_tokens.value, Some(9_u64.into()));
+            assert_eq!(b.max_tokens_per_call.value, None, "an explicit null is uncapped");
         }
         other => panic!("a typed dispatch.start, got {other:?}"),
     }
+}
+
+/// (#3035, contract 7) A malformed `bounds` block costs the bounds, never the whole
+/// `dispatch.start` payload; a wrong-typed OPTIONAL knob costs that knob, never its siblings.
+#[test]
+fn a_malformed_bounds_block_costs_the_bounds_not_the_dispatch_start() {
+    let read = |payload: serde_json::Value| {
+        let line = serde_json::json!({"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch",
+            "action": "dispatch.start", "handle": "h", "payload": payload})
+        .to_string();
+        darkmux_flow::reader::parse_record(&line).expect("a record").payload.expect("a payload")
+    };
+    match read(serde_json::json!({"prompt_chars": 4, "bounds": "not an object"})) {
+        Payload::DispatchStart(p) => assert_eq!((p.prompt_chars, p.bounds), (Some(4), None)),
+        other => panic!("a typed dispatch.start, got {other:?}"),
+    }
+    match read(serde_json::json!({"prompt_chars": 4, "bounds": {"max_tokens_per_call": {"value": 1, "source": "env"}}})) {
+        Payload::DispatchStart(p) => assert_eq!((p.prompt_chars, p.bounds), (Some(4), None), "a missing required knob costs the bounds"),
+        other => panic!("a typed dispatch.start, got {other:?}"),
+    }
+    let knob = |v: serde_json::Value| serde_json::json!({"value": v, "source": "config"});
+    let bounds = serde_json::json!({"max_tokens_per_call": knob(1.into()), "inactivity_timeout_seconds": knob(2.into()),
+        "max_turns": knob(3.into()), "max_tokens": knob(4.into()),
+        "turn_delay_ms": "not a knob", "feedback_injection": knob(true.into())});
+    match read(serde_json::json!({"prompt_chars": 4, "bounds": bounds})) {
+        Payload::DispatchStart(p) => {
+            let b = p.bounds.expect("the good knobs survive");
+            assert!(b.turn_delay_ms.is_none(), "the malformed optional knob is dropped");
+            assert_eq!(b.feedback_injection.map(|k| k.value), Some(Some(true.into())));
+            assert_eq!(b.max_tokens.value, Some(4_u64.into()));
+        }
+        other => panic!("a typed dispatch.start, got {other:?}"),
+    }
+}
+
+/// (#3035) The unmanaged-endpoint flag and spend were spelled `remote` and
+/// `remote_tokens` before 5.0: an archived record still reads, and nothing
+/// writes the old key.
+#[test]
+fn an_archived_remote_key_reads_as_unmanaged_and_is_never_written() {
+    use darkmux_flow::payload::{DispatchEndPayload, StepResultPayload, UsagePayload};
+    let usage: UsagePayload = serde_json::from_str(r#"{"remote": true}"#).unwrap();
+    assert_eq!(usage.unmanaged, Some(true));
+    let step: StepResultPayload = serde_json::from_str(r#"{"step_id": "s", "kind": "dispatch.map", "remote": false}"#).unwrap();
+    assert_eq!(step.unmanaged, Some(false));
+    let end: DispatchEndPayload = serde_json::from_str(r#"{"wall_ms": 5, "remote_tokens": 9}"#).unwrap();
+    assert_eq!(end.unmanaged_tokens, Some(9));
+    let written = serde_json::to_string(&(usage, step, end)).unwrap();
+    assert!(written.contains("\"unmanaged\"") && written.contains("\"unmanaged_tokens\""), "{written}");
+    assert!(!written.contains("remote"), "{written}");
 }

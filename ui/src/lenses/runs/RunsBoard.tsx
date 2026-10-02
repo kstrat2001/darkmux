@@ -42,10 +42,8 @@ import { onIntentClick } from "../../lib/clickIntent";
 
 /**
  * The runs board — `#lens=runs` (kind filter over mission/dispatch/lab,
- * `tracked:false` "untracked" ghost rows). Pure port of `renderLabRunsList`/
- * `renderRunsBar`/`renderRunRow` in `viewer.html`'s `── the runs lens ──`
- * section — see `format.ts` for the ported pure functions this component
- * composes.
+ * `tracked:false` "untracked" ghost rows). See `format.ts` for the pure
+ * functions this component composes.
  *
  * (#2860 follow-up) The `◧ series` knob-diff sub-view (grouping lab runs by
  * review case ids and diffing their recorded staffing) was a port of the
@@ -66,15 +64,15 @@ import { onIntentClick } from "../../lib/clickIntent";
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
  * every mount — via `source.ts`'s `runsSrc()`/
  * `labRunsSrc()` rather than the two literal paths directly, so a
- * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas — #1801,
- * viewer.html:4077/4027) reads its committed fixture files instead of
+ * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas, #1801)
+ * reads its committed fixture files instead of
  * hitting a daemon that isn't there. A daemon-served page is unaffected:
  * both resolvers fall back to the exact literal paths this component always
  * used — matching `window.goRuns`'s `Promise.all([loadRuns(),
  * loadLabRuns()])`, not gated by which kind chip is selected (the chip is a
  * client-side re-filter of already-loaded data, never a new fetch — see
  * `window.setRunsKind`). `/missions` and `/phases` are deliberately NOT
- * fetched here: reading `viewer.html`, those two feed ONLY
+ * fetched here: those two feed ONLY
  * `renderMissionStatic()`, the daemon-less static fallback for `#mission=<id>`
  * that never runs when a daemon is present (this app always has one) — see
  * `tests/parity/README.md`'s lens inventory for why `#mission=<id>` itself is
@@ -143,12 +141,10 @@ import { onIntentClick } from "../../lib/clickIntent";
  * click, constructing the same `{kind:"runs", runsKind:k}` shape the route
  * parser would have produced had the operator arrived via a `kind=`
  * deep-link — so the address bar always names the filter actually on
- * screen, matching legacy's `setRunsKind`'s own `render()` (which calls
- * `syncLabHash` every time, chip clicks included).
+ * screen (the hash is synced on every filter change, chip clicks included).
  */
-/** `goMissionGraph(id)`'s daemon-less fallback (viewer.html:2733-2736:
- * `if(missionGraphReachable()){location.href=...;return;} state.level="mission";...`)
- * renders `renderMissionStatic()` — a whole separate static-summary render
+/** The daemon-less fallback for opening a mission graph would be a whole
+ * separate static-summary render
  * surface that only exists to serve the daemon-less GitHub Pages demo (see
  * `missionGraphReachable`'s own doc: real `/next` deployments, served by
  * `darkmux serve`, always inject `darkmux-mode` and never hit this branch).
@@ -196,7 +192,7 @@ export function RunsBoard({
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
   const [sel, setSel] = useState<FilterSel>(() => seedSel(initialFilters, initialMachineKey));
-  // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
+  // Which lab run (if any) this board is
   // showing the detail pane for. Seeded from `initialLab`, independent of
   // `kind` — a lab row (and so this drill-in) is reachable from BOTH
   // kind=all and kind=lab (every other kind filter excludes lab rows
@@ -213,26 +209,23 @@ export function RunsBoard({
     writeBoardHash(kind, labRunDir, next);
   }
 
-  // `drillLabRun(dir)` (viewer.html:4101-4131), reduced to the address-bar
-  // half — `LabRunDetail` itself owns the two real fetches (detail +
-  // events poll). An in-component state swap, NOT a route change: legacy's
-  // own mechanism here is a `render()` stage-swap + `history.replaceState`
-  // sync, never a real navigation — see this file's own module doc.
+  // Open a lab run's detail: the address-bar half only, since
+  // `LabRunDetail` itself owns the two real fetches (detail + events
+  // poll). An in-component state swap, NOT a route change: a stage swap
+  // plus a `history.replaceState` sync, never a real navigation (see this
+  // file's own module doc).
   // `runsKind: kind` (not hardcoded "lab") preserves whichever kind filter
-  // was actually active when the operator clicked in — matching legacy's
-  // own `syncLabHash`, which writes `kind=` from `state.runsKind` and `lab=`
-  // from `state.labRunDir` as two independent fields on the same hash.
+  // was actually active when the operator clicked in; `kind=` and `lab=`
+  // are two independent fields on the same hash.
   function openLabRun(dir: string) {
     setLabRunDir(dir);
     setRowClickNotice(null);
     writeBoardHash(kind, dir, sel);
   }
 
-  // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
-  // `data-act="runs"` → `window.goRuns`... except `goRuns` ALSO re-fetches;
-  // this board's `/runs`+`/lab/runs` queries are still live/cached from
-  // before the drill-in, so a bare state-clear is the faithful equivalent
-  // here, not a redundant re-fetch).
+  // The lab-run detail's own "‹ runs" back link. This board's
+  // `/runs`+`/lab/runs` queries are still live/cached from before the
+  // drill-in, so a bare state-clear is enough, not a re-fetch.
   function closeLabRun() {
     setLabRunDir(null);
     writeBoardHash(kind, null, sel);
@@ -280,15 +273,14 @@ export function RunsBoard({
     // "it may have been removed" claim about the operator's data.
     setRowClickNotice(
       getSource().kind === "static"
-        ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
-        : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
+        ? "run detail needs a running daemon: this static build lists runs without their per-run pipeline and event feed."
+        : `couldn't open run "${dir}": it may have been removed, or the link is stale. Showing the run list.`,
     );
     writeBoardHash(kind, null, sel);
   }
 
-  // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
-  // in `renderRunRow`'s own `data-act` choice) — the row-click dispatch
-  // every interactive `RunRow` funnels through.
+  // The row-click dispatch (lab-run detail or mission graph) every
+  // interactive `RunRow` funnels through.
   //
   // (#1900) `tracked` used to gate whether a row could be opened at all —
   // "an untracked ghost has nothing to open". That premise was false for a
@@ -632,7 +624,6 @@ export function RunsBoard({
     writeBoardHash(k, null, sel);
   }
 
-  // viewer.html: `labSourceNotice()`.
   const notice =
     kind === "lab"
       ? labSourceNotice({
@@ -696,7 +687,7 @@ export function RunsBoard({
   );
 }
 
-/** viewer.html: `labSourceNotice()`. The reasons the lab tab can be empty,
+/** The reasons the lab tab can be empty,
  * each with a different remedy: runs left in the pre-4.0 dir (move them),
  * no source wired, a dir not created yet, or a genuinely empty lab. A pending
  * move is named even when other runs are listed, since the old ones are not
@@ -714,13 +705,13 @@ function labSourceNotice(s: {
   if (s.hasLabRuns) return null;
   const at = s.dir ? ` (${s.dir})` : "";
   if (!s.configured) {
-    return "this daemon has no lab-run source wired — darkmux doctor shows the resolved dirs.lab and where it came from.";
+    return "this daemon has no lab-run source wired: darkmux doctor shows the resolved dirs.lab and where it came from.";
   }
-  if (s.dirExists === false) return `the configured lab dir does not exist yet${at} — it appears with the first run.`;
+  if (s.dirExists === false) return `the configured lab dir does not exist yet${at}: it appears with the first run.`;
   return `no lab runs found under the configured lab dir${at}.`;
 }
 
-/** viewer.html: `function renderRunsBar()`: the kind tabs, each with the count
+/** The kind tabs, each with the count
  * of runs it would show under the dimension filters (#2925). The machine pin's
  * old chip is gone: a machine is a filter chip now, under the filter bar. */
 function RunsBar({ counts, kind, onKind }: { counts: Record<string, number>; kind: RunsKind; onKind: (k: RunsKind) => void }) {
@@ -779,11 +770,10 @@ function writeBoardHash(kind: RunsKind, lab: string | null, sel: FilterSel) {
 /** No machine column: one machine on the board needs no label per row. */
 const NO_MACHINE_LABELS: ReadonlyMap<string, string> = new Map();
 
-/** viewer.html: `function runStatusBadge(r)` + `function renderRunRow(r,
- * showMachine)`. The `data-act="labrun"/"gomission"` click destinations
- * (drill-in packet: both real now — lab-run detail opens in-page,
- * mission/dispatch opens `/mission/<id>/graph` — see `RunsBoard`'s own
- * `activateRun` for the dispatch) — the row keeps its `role="button"`/
+/** One run row: its status badge and subtitle. The click destinations are
+ * both real: lab-run detail opens in-page, mission/dispatch opens
+ * `/mission/<id>/graph` (see `RunsBoard`'s own `activateRun` for the
+ * dispatch). The row keeps its `role="button"`/
  * `tabIndex` affordance for openable rows (see `interactive` below), and
  * `onActivate` is now the REAL per-row action, not a placeholder notice.
  *

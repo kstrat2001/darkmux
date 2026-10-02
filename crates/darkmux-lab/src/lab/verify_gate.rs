@@ -127,17 +127,17 @@ fn precondition_failure(input: &WorkGateInput) -> Option<String> {
         // (F2) A deliberate hand-off, not a transport error: the work is
         // unfinished, so the gate does not credit it, but it says why.
         (DispatchEnd::Escalated { reason }, _, _) => format!(
-            "dispatch escalated ({reason}) before finishing the work — the work gate does \
+            "dispatch escalated ({reason}) before finishing the work: the work gate does \
              not credit unfinished work"
         ),
         (DispatchEnd::Failed, _, _) => "dispatch did not complete cleanly (runtime/transport \
-             error) — cannot confirm any work was done"
+             error): cannot confirm any work was done"
             .to_string(),
         (DispatchEnd::Completed, Some(reason), _) => format!("verify command altered: {reason}"),
         (DispatchEnd::Completed, None, Some(false)) => "no work: the sandbox is unchanged from \
              the fixture's baseline (a no-op run cannot pass)"
             .to_string(),
-        (DispatchEnd::Completed, None, None) => "no baseline/final sandbox hash recorded — \
+        (DispatchEnd::Completed, None, None) => "no baseline/final sandbox hash recorded: \
              cannot confirm whether the sandbox changed"
             .to_string(),
         (DispatchEnd::Completed, None, Some(true)) => return None,

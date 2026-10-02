@@ -568,7 +568,7 @@ pub(crate) fn trust_at(
     roster_host: Option<&str>,
 ) -> Result<String> {
     fleet::validate_machine_name("machine name", req.name)?;
-    let mut root = crate::config_cmd::load_object(config_path)?;
+    let mut root = crate::config_cmd::load_object_for_write(config_path)?;
     let key = existing_key(&root, req.name);
     let existing = root.get("fleet").and_then(|f| f.get("accept_work")).and_then(|a| a.get(&key)).cloned();
     let name = key.as_str();
@@ -681,7 +681,7 @@ pub(crate) fn trust_at(
 /// The core of `machine untrust`: remove `fleet.accept_work.<name>` and
 /// nothing else. `Ok(false)` when there was no such entry.
 pub(crate) fn untrust_at(config_path: &std::path::Path, name: &str) -> Result<bool> {
-    let mut root = crate::config_cmd::load_object(config_path)?;
+    let mut root = crate::config_cmd::load_object_for_write(config_path)?;
     let key = existing_key(&root, name);
     let removed = root
         .get_mut("fleet")

@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 #[derive(clap::Args)]
 pub(crate) struct ProfilesFileArg {
     /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
-    /// and the default search locations. (renamed from --config, #661)
+    /// and the default search locations. (renamed from --config)
     #[arg(long = "profiles-file")]
     pub(crate) profiles: Option<String>,
 }
@@ -36,7 +36,7 @@ pub(crate) struct ProfilesFileArg {
 /// deliberately left un-flattened.
 #[derive(clap::Args)]
 pub(crate) struct JsonFlag {
-    /// Emit machine-readable JSON instead of styled text (#907).
+    /// Emit machine-readable JSON instead of styled text.
     #[arg(long)]
     pub(crate) json: bool,
 }
@@ -81,8 +81,8 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: LabCmd,
     },
-    /// Dispatch a single turn to the named role — the task-grain execution
-    /// entry point (#1426). Loads the role manifest + `.md` system prompt and
+    /// Dispatch a single turn to the named role: the task-grain execution
+    /// entry point. Loads the role manifest + `.md` system prompt and
     /// runs the role through the in-house container-bounded runtime (a
     /// per-dispatch `darkmux-runtime` Docker container) with the assembled
     /// message.
@@ -106,32 +106,32 @@ pub(crate) enum Cmd {
         /// message that begins with `-` needs the standard `--` separator:
         /// `darkmux dispatch coder -- -starts-with-dash`.
         message: Option<String>,
-        /// (#386) Read the message body from a file instead of the positional
-        /// argument or stdin — for substantial briefs that would exceed the
+        /// Read the message body from a file instead of the positional
+        /// argument or stdin: for substantial briefs that would exceed the
         /// shell's ARG_MAX or clutter `ps`/shell history. The brief is passed
         /// to the runtime via a bind-mounted file, so it never lands on the
         /// `docker run` argv either. Conflicts with the positional MESSAGE.
         #[arg(long = "message-from-file", value_name = "PATH", conflicts_with = "message")]
         message_from_file: Option<std::path::PathBuf>,
-        /// (#2265) Append a stored finding's record to the brief — repeatable.
+        /// Append a stored finding's record to the brief: repeatable.
         /// The finding is the WHAT (something an earlier dispatch observed);
         /// this hands the role that observation VERBATIM, so it can propose the
         /// HOW. Its `context` and `emitted` go in whole and unsummarized, and
         /// the block tells the model to record any change it produces with
         /// `create_mod`, naming this key in `for` (its palette decides whether
         /// it may). A key with no stored finding is refused loudly rather than
-        /// dispatched with a silently missing brief — `darkmux finding sync`
+        /// dispatched with a silently missing brief: `darkmux finding sync`
         /// replays the flow stream into the store.
         #[arg(long = "finding", value_name = "KEY")]
         finding: Vec<String>,
-        /// (#2295) Append a stored mod's record to the brief — repeatable.
+        /// Append a stored mod's record to the brief: repeatable.
         ///
         /// The help text is FORMATTED from `mods::CONTAINER_MODS_BASE` rather
-        /// than spelling the mount path by hand (#2295 review, NIT c), so the
+        /// than spelling the mount path by hand (review, NIT c), so the
         /// CLI cannot come to advertise a directory the mounts do not use.
         #[arg(long = "mod", value_name = "KEY", long_help = darkmux_crew::mods::dispatch_mod_flag_help())]
         mod_key: Vec<String>,
-        /// (#1054) Select a named profile from the machine's registry for this
+        /// Select a named profile from the machine's registry for this
         /// dispatch's model + context-window resolution, instead of the
         /// registry's `default_profile`. When the named profile isn't defined
         /// on this machine, the dispatch falls back to `default_profile` (with
@@ -139,7 +139,7 @@ pub(crate) enum Cmd {
         /// workflow) NAME the profile it wants while each machine owns which
         /// lab-validated model that profile maps to.
         ///
-        /// (#2916) `<profile>@<machine>` runs the dispatch on the machine
+        /// `<profile>@<machine>` runs the dispatch on the machine
         /// that owns the profile: it is submitted straight to that machine's
         /// fleet listener (the roster host on `fleet.listener.port`) with the
         /// fleet token (the serve token). That machine resolves `<profile>`
@@ -160,11 +160,11 @@ pub(crate) enum Cmd {
         /// context).
         #[arg(long)]
         name: Option<String>,
-        /// (#2480) Per-invocation timeout override, in seconds — what it
+        /// Per-invocation timeout override, in seconds: what it
         /// bounds depends on which dispatch path the role resolves to.
         ///
         /// Container path (a tool-granting role on a local profile, or any
-        /// role with --image — what `darkmux dispatch <role>` runs by
+        /// role with --image: what `darkmux dispatch <role>` runs by
         /// default): overrides this dispatch's INACTIVITY budget, normally
         /// resolved from DARKMUX_INACTIVITY_TIMEOUT_SECONDS or
         /// config.runtime.inactivity_timeout_seconds (default 600). The
@@ -215,20 +215,20 @@ pub(crate) enum Cmd {
         // open-ended dispatch) rather than drift from this flag's range.
         #[arg(long, verbatim_doc_comment, value_parser = clap::value_parser!(u32).range(1..))]
         timeout: Option<u32>,
-        /// Explicit working directory override (#143). When set, the
+        /// Explicit working directory override. When set, the
         /// internal runtime mounts this path into the container as the
         /// workspace, so the agent operates against the operator-named
         /// scope. When omitted, a fresh ephemeral tempdir is used.
         #[arg(long = "workdir", value_name = "PATH")]
         workdir: Option<std::path::PathBuf>,
-        /// (#2774 review F2) Mount the workspace READ-ONLY, as a crawl
+        /// Mount the workspace READ-ONLY, as a crawl
         /// unit does. Required to resume a checkpoint that was written
         /// under a read-only mount: darkmux refuses to grant a resumed
         /// dispatch write access the run that wrote the checkpoint never
         /// had (RESUME WORKSPACE MOUNT ESCALATION), so without this flag a
         /// crawl unit's `--resume-from` cannot be accepted at all.
         /// Mounting MORE restrictively is never an escalation, so this is
-        /// always accepted — but it is a real restriction: the agent
+        /// always accepted: but it is a real restriction: the agent
         /// cannot write into the workspace at all, including the ephemeral
         /// tempdir it gets when `--workdir` is omitted. `/darkmux-out`
         /// stays read-write either way.
@@ -249,16 +249,16 @@ pub(crate) enum Cmd {
         /// local dispatches (always synchronous).
         #[arg(long)]
         no_wait: bool,
-        /// (#703) Dispatch into a specific Docker image. Default: the
-        /// darkmux runtime image built for this version (slim — python +
+        /// Dispatch into a specific Docker image. Default: the
+        /// darkmux runtime image built for this version (slim: python +
         /// node): a local `darkmux-runtime:latest` whose version label
         /// matches, else `ghcr.io/kstrat2001/darkmux-runtime:<version>`,
-        /// pulled on first use (#2923). Naming a `darkmux-runtime:<tag>`
+        /// pulled on first use. Naming a `darkmux-runtime:<tag>`
         /// runs that image after the same version check, refusing a
         /// mismatch. Pass any OTHER Linux image (e.g. `rust:slim`, your
         /// project's own CI image) and darkmux
         /// injects its static runtime binary into it, so the coder runs in
-        /// that environment and can `cargo check`/`test` in-sandbox — the
+        /// that environment and can `cargo check`/`test` in-sandbox: the
         /// inner verify loop. No per-language darkmux images. The image needs
         /// `bash` + coreutils (debian/ubuntu-family have them; bare-alpine
         /// needs them added). On a `--profile <p>@<machine>` dispatch the
@@ -266,18 +266,18 @@ pub(crate) enum Cmd {
         /// allow-list entry for this machine lists it.
         #[arg(long, value_name = "TAG")]
         image: Option<String>,
-        /// (#1199) Cap the completion tokens of a single-shot hosted dispatch
+        /// Cap the completion tokens of a single-shot hosted dispatch
         /// (a tool-less role on a remote endpoint). Default 4096. Raise it
         /// when a long output (e.g. a many-finding review) would truncate.
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,
-        /// (#2114 follow-up) Resume a checkpointed dispatch from a prior out
+        /// Resume a checkpointed dispatch from a prior out
         /// dir (the `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-*`);
         /// at most one tool call is re-executed. The named dir must contain
         /// a `checkpoint.json` written by a prior, interrupted dispatch of
         /// this SAME role, with the SAME system prompt and workspace, and
-        /// (if the original was read-only) at least as read-only a mount —
+        /// (if the original was read-only) at least as read-only a mount:
         /// darkmux refuses to run (never silently starts fresh) on any
         /// mismatch. The prior dir is left untouched; this dispatch gets
         /// its own fresh out dir and its own run record. MESSAGE is not needed
@@ -285,10 +285,10 @@ pub(crate) enum Cmd {
         /// which already holds the original prompt, and any message given
         /// is ignored (darkmux says so on stderr).
         ///
-        /// IMPORTANT (operator sovereignty — know this before resuming): a
+        /// IMPORTANT (operator sovereignty: know this before resuming): a
         /// resume replays the checkpoint's recorded tool calls VERBATIM,
         /// including one that was only PARTWAY executed when the prior run
-        /// was interrupted — their arguments are not re-validated. This
+        /// was interrupted: their arguments are not re-validated. This
         /// only guards against a checkpoint from a DIFFERENT role/prompt/
         /// workspace; it is not a defense if the SAME role's own run was
         /// compromised (e.g. by content it read). Only resume a run you
@@ -303,9 +303,9 @@ pub(crate) enum Cmd {
         // (#1130) Default output is issues-only: the build identity line +
         // any warnings/failures, with the passing checks collapsed to a
         // count. The global `-v` / `--verbose` prints the full list.
-        /// (#1177) Live-probe each profile model's remote endpoint with ONE
+        /// Live-probe each profile model's remote endpoint with ONE
         /// minimal chat completion through the same URL/auth path a real
-        /// dispatch uses — verifies the credential actually WORKS (the
+        /// dispatch uses: verifies the credential actually WORKS (the
         /// default doctor only checks the Keychain item exists). Opt-in
         /// because each probe is a real API call: a paid endpoint bills a
         /// few tokens per probe (the probe's own token cost is shown in
@@ -313,22 +313,22 @@ pub(crate) enum Cmd {
         #[arg(long)]
         probe: bool,
     },
-    /// Profile registry — the declaration surface for named model stacks.
+    /// Profile registry: the declaration surface for named model stacks.
     /// `profile list` shows the configured profiles; `profile scan` finds
-    /// downloaded LMStudio models not yet in any profile; `profile draft`
-    /// emits a starter profile JSON (#1426 — top-level `profiles` and `scan`
+    /// downloaded LM Studio models not yet in any profile; `profile draft`
+    /// emits a starter profile JSON (top-level `profiles` and `scan`
     /// merged into this family).
     Profile {
         #[command(subcommand)]
         sub: ProfileCmd,
     },
-    /// This host's AI state — residents, live resources, roster (#1426).
+    /// This host's AI state: residents, live resources, roster.
     /// `machine` = is my host HEALTHY RIGHT NOW (live state, RAM truth);
     /// `doctor` = is my setup CORRECT (preflight, config). Bare `machine`
     /// routes to `machine status` (no separate overview render). Reads may
-    /// target a roster peer over its serve daemon; MUTATIONS STAY LOCAL —
+    /// target a roster peer over its serve daemon; MUTATIONS STAY LOCAL:
     /// `machine eject` only ever releases THIS host's `darkmux:` namespace.
-    /// (#1426 folded the retired top-level `model`, `status`, and `fleet`
+    /// (folded the retired top-level `model`, `status`, and `fleet`
     /// families into this one.)
     Machine {
         #[command(subcommand)]
@@ -339,33 +339,33 @@ pub(crate) enum Cmd {
     // crew REGISTRY dissolved with the crews map — a crew is now a DERIVED
     // VIEW of a mission's resourcing (`darkmux_crew::resourcing`), never a
     // declared entity, so the registry-read verbs (list/show/index) go too.
-    /// What darkmux knows — the durable memory that briefs future dispatches,
+    /// What darkmux knows: the durable memory that briefs future dispatches,
     /// one sub-noun per KIND. `memory lesson` is what the user authored
     /// (conventions, constraints, decisions + the reasoning behind them);
     /// `memory correction` is what their reviewer recorded when adjudicating a
     /// dispatch. Both surface to coder dispatches as injected brief blocks; new
-    /// kinds slot in here rather than growing a new top-level verb. (#1426 —
-    /// the `lessons` top-level verb retired into this family.)
+    /// kinds slot in here rather than growing a new top-level verb. (The `lessons`
+    /// top-level verb retired into this family.)
     Memory {
         #[command(subcommand)]
         sub: MemoryCmd,
     },
-    /// Role management — list and show role details from the SQLite index.
+    /// Role management: list and show role details from the SQLite index.
     Role {
         #[command(subcommand)]
         sub: RoleCmd,
     },
-    /// Findings (#2265) — what a role execution OBSERVED, keyed `<execution>/<seq>`.
+    /// Findings: what a role execution OBSERVED, keyed `<execution>/<seq>`.
     /// A finding is an event: written once when an accepted `create_finding`
     /// call streams past, never rewritten. The flow stream stays the audit
     /// trail; this store is the queryable copy the verbs read. darkmux never
-    /// interprets the emission — a record is metadata plus the model's own
+    /// interprets the emission: a record is metadata plus the model's own
     /// arguments verbatim.
     Finding {
         #[command(subcommand)]
         sub: FindingCmd,
     },
-    /// Mods (#2265) — how something COULD change. A mod is a KIT: instructions
+    /// Mods: how something COULD change. A mod is a KIT: instructions
     /// plus data, in whatever form the proposer chose, enough for an AI to
     /// make the change correctly later. darkmux never types a kit and never
     /// opens it. Its key is MINTED per mod, never derived from a finding, so
@@ -375,9 +375,9 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: ModCmd,
     },
-    /// Mission lifecycle — transition missions through their state machine.
+    /// Mission lifecycle: transition missions through their state machine.
     /// Mission status flows: Active → Finalized (success) or
-    /// Aborted (teardown — #1627: a teardown is not a success, and the two
+    /// Aborted (teardown: a teardown is not a success, and the two
     /// are distinct terminals on disk). All transitions are
     /// operator-explicit; nothing auto-decides a mission is done.
     /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
@@ -385,7 +385,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: MissionCmd,
     },
-    /// Runs (#1905): the umbrella over mission, dispatch, and lab runs.
+    /// Runs: the umbrella over mission, dispatch, and lab runs.
     /// `run list` is the flat cross-kind union `GET /runs` also serves, one
     /// row per run regardless of source; it is the CLI twin of the RUNS
     /// lens, and both call the SAME `darkmux_serve::build_runs` union, so
@@ -397,12 +397,12 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: RunFamilyCmd,
     },
-    /// Flow observability — record operator-facing flow events.
+    /// Flow observability: record operator-facing flow events.
     Flow {
         #[command(subcommand)]
         sub: crate::flow_cli::FlowCmd,
     },
-    /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
+    /// Read/write `~/.darkmux/config.json` settings. `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
     /// `profile` (the profiles registry).
     Config {
@@ -412,21 +412,21 @@ pub(crate) enum Cmd {
     /// Start an HTTP daemon for flow record retrieval.
     Serve {
         /// Port to listen on. Unset resolves `env(DARKMUX_SERVE_PORT) >
-        /// config.serve.port > 8765` (#2765); `darkmux doctor` prints the
+        /// config.serve.port > 8765`; `darkmux doctor` prints the
         /// resolved value with its provenance.
         #[arg(long)]
         port: Option<u16>,
         /// Address to bind. Unset resolves `env(DARKMUX_SERVE_BIND) >
-        /// config.serve.bind > 127.0.0.1` (#2765).
+        /// config.serve.bind > 127.0.0.1`.
         #[arg(long)]
         bind: Option<String>,
         /// Directory to serve flow records from (default: ~/.darkmux/flows/).
         #[arg(long = "flows-dir")]
         flows_dir: Option<std::path::PathBuf>,
-        /// (#1247 Part 3) Root directory the lab observer lens scans for run
+        /// Root directory the lab observer lens scans for run
         /// clusters (any dir containing funnels.json / funnel-events.jsonl /
         /// scores.json). Falls back to `DARKMUX_LAB_DIR` when unset; unset
-        /// entirely by default — no default scanning of arbitrary paths, the
+        /// entirely by default: no default scanning of arbitrary paths, the
         /// lab lens stays "not configured" until named. Machine-local by
         /// design: this daemon only ever reads ITS OWN machine's runs, never
         /// a remote path.
@@ -440,13 +440,13 @@ pub(crate) enum Cmd {
     /// `"command": "darkmux", "args": ["acp"]`. Guide: docs/guide/radio.html.
     Acp,
     /// Route free text onto ONE launchable mission config via a bounded local
-    /// classification dispatch, then execute it — the terminal twin of the
-    /// panel's no-slash channel (#1698 Packet A; the ACP wiring itself is
+    /// classification dispatch, then execute it: the terminal twin of the
+    /// panel's no-slash channel (the ACP wiring itself is
     /// Packet B). Single exchange by design: one routing call, one
-    /// execution, no loop, no REPL — precedent: `gh copilot suggest`.
-    /// Prints the resolved route ("routing to `mission launch <id>` — from your text")
-    /// before executing so the choice is never silent (issue #1698's
-    /// "provenance boxes invisibility" wall); a message that doesn't
+    /// execution, no loop, no REPL: precedent: `gh copilot suggest`.
+    /// Prints the resolved route ("routing to `mission launch <id>`: from your text")
+    /// before executing so the choice is never silent (no hidden
+    /// provenance); a message that doesn't
     /// clearly map onto exactly one launchable config REFUSES instead of
     /// guessing and lists the available commands.
     Radio {
@@ -459,8 +459,8 @@ pub(crate) enum Cmd {
     },
     /// One-command setup: install skills, optionally add session-start hook
     /// and CLAUDE.md integration so Claude Code knows about darkmux. Safe to
-    /// re-run; refreshes the bundled skills after a darkmux upgrade (#1426 —
-    /// `darkmux doctor` flags stale darkmux-* skills and points here).
+    /// re-run; refreshes the bundled skills after a darkmux upgrade (`darkmux doctor`
+    /// flags stale darkmux-* skills and points here).
     Init {
         /// Add a SessionStart hook to ~/.claude/settings.json that runs
         /// `darkmux machine status` so Claude sees the current stack at
@@ -476,9 +476,9 @@ pub(crate) enum Cmd {
         #[arg(long)]
         with_agents_md: Option<std::path::PathBuf>,
         /// Overwrite existing skills / hook entries, including a locally
-        /// edited darkmux-* skill (#1927). Without --force, an edited (or
+        /// edited darkmux-* skill. Without --force, an edited (or
         /// unrecognized-provenance) darkmux-* skill is left alone even on a
-        /// refresh — only an unmodified one refreshes silently.
+        /// refresh: only an unmodified one refreshes silently.
         #[arg(long, short = 'f')]
         force: bool,
         /// Show what would be installed without writing.
@@ -489,11 +489,11 @@ pub(crate) enum Cmd {
 
 #[derive(Subcommand)]
 pub(crate) enum ModCmd {
-    /// Record one mod. Every call MINTS A NEW KEY — idempotence is
+    /// Record one mod. Every call MINTS A NEW KEY: idempotence is
     /// deliberately not a goal, because two agents proposing for the same
     /// finding at different times are two mods.
     Create {
-        /// Who proposed it — a role handle plus model for a darkmux seat, or
+        /// Who proposed it: a role handle plus model for a darkmux seat, or
         /// a plain name (`sonnet`, `kain`) for an external actor.
         #[arg(long)]
         by: String,
@@ -502,28 +502,28 @@ pub(crate) enum ModCmd {
         /// missing rather than refused.
         #[arg(long = "for")]
         r#for: Vec<String>,
-        /// The kit — a file path, or `-` to read stdin. Stored as the raw
+        /// The kit: a file path, or `-` to read stdin. Stored as the raw
         /// text, byte for byte: always a string, never parsed, never
         /// reformatted, whatever it looks like. At least one of `--kit` /
         /// `--attach` is required.
         #[arg(long)]
         kit: Option<String>,
-        /// (#2310 P4b) An optional, proposer-declared hint at the kit's
-        /// shape — `unified-diff` is the one a consumer recognizes today
+        /// An optional, proposer-declared hint at the kit's
+        /// shape: `unified-diff` is the one a consumer recognizes today
         /// (`darkmux mission launch review`'s delivery kind renders a
         /// unified-diff kit as an inline GitHub suggestion when it lands
         /// inside the PR's own diff; anything else, or no hint at all,
-        /// renders as an opaque fenced patch). Never validated — darkmux
+        /// renders as an opaque fenced patch). Never validated: darkmux
         /// still never opens the kit.
         #[arg(long = "kit-kind")]
         kit_kind: Option<String>,
         /// A file to copy into the mod's own `attachments/`. Repeatable.
         #[arg(long)]
         attach: Vec<std::path::PathBuf>,
-        /// (#2386) Record a `--for` key even when no finding with that key is
+        /// Record a `--for` key even when no finding with that key is
         /// in the store. Off by default: such a key is a link nothing can
         /// follow, and the usual cause is a typo or a copied example. Pass
-        /// this for the deliberate case — a finding not synced into the store
+        /// this for the deliberate case: a finding not synced into the store
         /// yet (`darkmux finding sync` replays the flow stream), or one
         /// recorded on another machine.
         #[arg(long = "allow-missing-finding")]
@@ -546,7 +546,7 @@ pub(crate) enum ModCmd {
         json: JsonFlag,
     },
     /// Show one mod, whole, by its minted key. The kit is printed as its own
-    /// bytes, with nothing added — but this rendering is for reading. To get
+    /// bytes, with nothing added: but this rendering is for reading. To get
     /// the kit back byte for byte in a script, use the JSON channel:
     /// `darkmux mod show <key> --json | jq -j .kit`.
     Show {
@@ -559,7 +559,7 @@ pub(crate) enum ModCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum FindingCmd {
-    /// List findings in the store, ts-ascending. Reads the store only — it
+    /// List findings in the store, ts-ascending. Reads the store only: it
     /// never touches the flow stream (that's `sync`'s job). The preview it
     /// prints is the raw emission, truncated: darkmux does not interpret it.
     List {
@@ -583,7 +583,7 @@ pub(crate) enum FindingCmd {
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// Replay the flow stream into the store — the SECOND producer, for
+    /// Replay the flow stream into the store: the SECOND producer, for
     /// anything the live tailer missed (an older binary, a killed process).
     /// Idempotent: the store is write-once, so a second pass creates nothing.
     Sync {
@@ -613,16 +613,16 @@ pub(crate) enum RoleCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum MissionCmd {
-    /// Global mission-control read (#829): the whole board — every mission
+    /// Global mission-control read: the whole board: every mission
     /// grouped by status with phase progress, the inconsistencies that need
     /// attention (an open mission whose phases are all done; a stalled Active
     /// mission; a phase blocked forever by an abandoned one), and
     /// copy-pasteable reconcile commands.
-    /// READ-ONLY — surfaces and suggests, never mutates. The CLI twin of the
+    /// READ-ONLY: surfaces and suggests, never mutates. The CLI twin of the
     /// viewer's missions lens; run it as session-start housekeeping.
     Status {
         /// Emit the board as structured JSON (for the frontier orchestrator
-        /// or CI/cron) instead of the human-readable view. Never paginated —
+        /// or CI/cron) instead of the human-readable view. Never paginated:
         /// a machine reader gets the whole board.
         #[arg(long)]
         json: bool,
@@ -635,22 +635,22 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         limit: Option<usize>,
         /// Show every mission in every section, ignoring `--limit`. Combined
-        /// with `--named`, that means every NAMED mission — the filter
+        /// with `--named`, that means every NAMED mission: the filter
         /// still applies; `--all` controls pagination, not membership.
         #[arg(long)]
         all: bool,
-        /// Show only the missions you NAMED — hide machine-minted run
+        /// Show only the missions you NAMED: hide machine-minted run
         /// instances (a `review` launch, a `dispatch <role>` crew-of-one).
         ///
         /// The board's default answers "what's recent" across everything,
         /// because that is the question an operator brings to it. This flag
         /// is the other tab: the named-mission list, for when the run
-        /// instances are noise rather than the news. (Before #1709 the
-        /// filtered view WAS the default, which meant a day of real work
+        /// instances are noise rather than the news. (The
+        /// filtered view used to be the default, which meant a day of real work
         /// collapsed into a one-line footer while an 8-day-old finished
         /// mission held the top of the board.)
         ///
-        /// Ignored under `--json`, which always emits the whole board — a
+        /// Ignored under `--json`, which always emits the whole board: a
         /// machine reader filters for itself.
         #[arg(long)]
         named: bool,
@@ -667,15 +667,15 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Debrief a mission (#1000) — the post-mission review ceremony's raw
+    /// Debrief a mission: the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged
     /// across the mission's runs (cautions), the corrections the reviewer
-    /// recorded (#849), and the mission's phases + how each ended. READ-ONLY.
+    /// recorded, and the mission's phases + how each ended. READ-ONLY.
     /// Run it (or let the finalize nudge prompt it) at mission completion; the
     /// `darkmux-mission-debrief` skill consumes `--json` to distill durable
     /// `memory lesson`s (with the why) for the next dispatch. NASA vocabulary:
-    /// Mission · Debrief · Lessons (`Crew` was a derived view — the crew
-    /// registry retired in #1426; staffing now resolves per dispatch). (#1465)
+    /// Mission · Debrief · Lessons (`Crew` was a derived view: the crew
+    /// registry retired; staffing now resolves per dispatch).
     Debrief {
         /// Mission id (filename stem under ~/.darkmux/missions/).
         id: String,
@@ -684,15 +684,15 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Finalize a mission — the SUCCESS terminal (#1463). Drives every
+    /// Finalize a mission: the SUCCESS terminal. Drives every
     /// non-terminal phase to `Complete`, tears down each phase's worktree +
     /// branch, and transitions the mission to `Finalized` (stamps
     /// `finalized_ts=now()`). The frontier orchestrator does the git/gh work by
-    /// hand (commit/push/PR/merge — its native job), then calls this to close
+    /// hand (commit/push/PR/merge: its native job), then calls this to close
     /// out the darkmux-side state. The clear opposite of `abort` (which records
     /// `Abandoned` instead of `Complete`); both clean up whatever exists. Named
     /// to match the internal `finalize_mission` fn that graph/review runs call
-    /// to auto-close. (Renamed from `close` in #1463; the `ship` verb it
+    /// to auto-close. (Renamed from `close`; the `ship` verb it
     /// absorbs retired.)
     Finalize {
         id: String,
@@ -700,9 +700,8 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Launch a named mission CONFIG into a brand-new mission RUN (#1284
-    /// Packet 4a; run-identity fixed in #1503). Resolves `<config-id>`
-    /// through the mission-config registry (user → on-disk → embedded — see
+    /// Launch a named mission CONFIG into a brand-new mission RUN. Resolves `<config-id>`
+    /// through the mission-config registry (user → on-disk → embedded: see
     /// `darkmux doctor`'s mission-config-registry check), validates it
     /// loud, collects its declared runtime-only `inputs` from `--input` /
     /// `--param` (bailing with a copy-pasteable example if any required
@@ -711,42 +710,42 @@ pub(crate) enum MissionCmd {
     /// config alongside the run. A graph with no tasks anywhere (a
     /// freeform/manual config) mints the run and starts the mission; its
     /// phases stay Planned until `mission finalize` or `mission abort`
-    /// closes it (#2954: no verb moves a phase by hand). A coder-phase graph
+    /// closes it (no verb moves a phase by hand). A coder-phase graph
     /// executes worktree → coder → QA and then STOPS at an operator
-    /// sign-off gate — the phase stays Running. The frontier orchestrator
+    /// sign-off gate: the phase stays Running. The frontier orchestrator
     /// ships the git work by hand (commit/push/PR/merge), then `mission
-    /// finalize` closes it out; `mission abort` tears it down (#1463). Launch
-    /// never auto-closes past the gate. `review` (#1284 Packet 4b — the
+    /// finalize` closes it out; `mission abort` tears it down. Launch
+    /// never auto-closes past the gate. `review` (the
     /// retired `pr-review run`) runs through this SAME generic launcher,
-    /// not a launcher of its own — #2310 P4d deleted the bespoke launcher
+    /// not a launcher of its own: the bespoke launcher was deleted
     /// and its ten Tier-3 `review.*` step kinds. A `plan-<rule>` task
     /// mints one `plan.sites` task per enabled rule; a `unit-<rule>` task
     /// GROWS one `dispatch.unit` dispatch per planned site onto a single
     /// `reviewer` seat; `summarize` totals the run; `create-mods` waits
     /// (bounded) for a frontier-written mod per finding; `deliver` renders
-    /// the GitHub review payload. No operator sign-off gate — its
+    /// the GitHub review payload. No operator sign-off gate: its
     /// mission/phase envelope finalizes generically once the run
     /// completes, and the old CLI flags map one-to-one onto
     /// `--param key=value` (see
     /// `templates/builtin/mission-configs/review.json`'s own `inputs` doc
-    /// for the mapping table). The run id is ALWAYS minted fresh — never
-    /// derived from config+inputs (#1503): two launches of the same config
+    /// for the mapping table). The run id is ALWAYS minted fresh: never
+    /// derived from config+inputs: two launches of the same config
     /// with the same inputs are two DIFFERENT runs (AI work is
     /// non-deterministic), so relaunching with identical values mints a
     /// brand-new run rather than reusing or reopening a prior one. The
-    /// config+inputs pairing is still recorded — as `Mission.spec`, a
+    /// config+inputs pairing is still recorded: as `Mission.spec`, a
     /// grouping key for corpus analysis, never identity.
     ///
     /// Exit codes (coder-phase / gate-less generic graphs): `0` freeform
     /// mint, or coder ran with QA clean/flags-only (gate banner, phase
-    /// Running); `1` coder dispatch error; `2` QA found blocker(s) —
-    /// resolve before shipping; `3` QA could not run — manual review
+    /// Running); `1` coder dispatch error; `2` QA found blocker(s):
+    /// resolve before shipping; `3` QA could not run: manual review
     /// required; `4` instance minted but the graph references step
     /// kind(s) this launcher can't construct yet. `review` exits `0` on
-    /// any produced output (Clean/Degraded/Degenerate alike — CI-facing
+    /// any produced output (Clean/Degraded/Degenerate alike: CI-facing
     /// pass/fail comes from the rendered payload's `mode` field, not this
     /// code), propagating a hard failure for anything that fails before an
-    /// envelope was ever produced. (#2301) `crawl` has no exit codes of
+    /// envelope was ever produced. `crawl` has no exit codes of
     /// its own any more: it is an ordinary generic graph
     /// (`crawl.plan` → grown `dispatch.unit` tasks → `dispatch.summary`), so it
     /// exits `0` when the graph completes Clean/Degraded and `1` otherwise,
@@ -755,7 +754,7 @@ pub(crate) enum MissionCmd {
     /// SIGINT/SIGTERM/SIGHUP still exit `130` through this launcher's own
     /// shared guard.
     Launch {
-        /// Mission config id to launch — a built-in (e.g. `coder-phase`)
+        /// Mission config id to launch: a built-in (e.g. `coder-phase`)
         /// or a hand-written user-tier config.
         config_id: String,
         /// JSON file supplying the config's declared inputs (a flat
@@ -769,63 +768,63 @@ pub(crate) enum MissionCmd {
         /// Per-dispatch timeout (seconds), for a config whose graph
         /// executes a dispatch. For coder-phase, the default when omitted
         /// is `600` (`mission run`'s own default), stamped onto the coder
-        /// step unconditionally — that field bounds only the tool-less
+        /// step unconditionally: that field bounds only the tool-less
         /// single-call paths a container-agentic coder dispatch never
         /// takes, so collapsing an omitted flag to `600` there is always
-        /// safe. (#2595 review round 2) For `crawl`/`review`'s per-unit
+        /// safe. (review round 2) For `crawl`/`review`'s per-unit
         /// dispatch timeout, OMITTING this flag is different: it is NOT
         /// the same as `--timeout 600`. It stamps nothing onto a grown
         /// unit's config, so the operator's own standing
         /// `config.runtime.inactivity_timeout_seconds` /
         /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` / built-in-600 resolution
-        /// governs each unit instead — never a hardcoded 600 silently
+        /// governs each unit instead: never a hardcoded 600 silently
         /// overriding a configured budget. Passing this flag EXPLICITLY
         /// for `crawl`/`review` wins OUTRIGHT: it overwrites every unit's
         /// `timeout_seconds` unconditionally, even one a hand-authored
         /// per-rule override in the mission config's own
-        /// `grow.config`/`config` already declared — the same "CLI wins
+        /// `grow.config`/`config` already declared: the same "CLI wins
         /// outright, never merely fills a gap" rule the container-agentic
         /// dispatch path already applies to this exact flag one layer
         /// down (`dispatch_internal::effective_inactivity_timeout_seconds`).
         /// `review` no longer gets its own 3600s default: before the
-        /// funnel deletion (#2310 P4d) the retired `pr-review run`'s
+        /// funnel deletion (P4d) the retired `pr-review run`'s
         /// dedicated launcher resolved `None` -> 3600 so a long judge pass
-        /// wouldn't time out (#1284 Packet 4b review gate, must-fix 1);
+        /// wouldn't time out (review gate, must-fix 1);
         /// `review` now runs the same generic path as every other config.
         /// A review whose seats need longer than the standing default
         /// should pass `--timeout` explicitly, or raise
         /// `config.runtime.inactivity_timeout_seconds`.
         #[arg(long)]
         timeout: Option<u32>,
-        /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
-        /// records, dispatch NOTHING — print what would run and exit.
-        /// (#2301) `crawl` prints its task/step graph like any other
-        /// config — including which rule tracks `--param rules=` left out;
+        /// Resolve config + inputs, mint NOTHING, emit NO flow
+        /// records, dispatch NOTHING: print what would run and exit.
+        /// `crawl` prints its task/step graph like any other
+        /// config: including which rule tracks `--param rules=` left out;
         /// the retired launcher's in-process plan table and
-        /// `--param plan_out=` are gone with it. `review` (#2310 P4d)
-        /// prints the same way — resolved inputs, then its task/step
-        /// graph — with no bundle-count special case of its own any more:
+        /// `--param plan_out=` are gone with it. `review` (P4d)
+        /// prints the same way: resolved inputs, then its task/step
+        /// graph: with no bundle-count special case of its own any more:
         /// every config, `review` included, prints its task/step graph
         /// after the same input validation a real launch runs, so a
         /// missing required input still bails exactly as it would
         /// without `--dry-run`.
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// (#2112) Start anyway when the pre-flight power-posture check
-        /// finds the machine at `serious`/`critical` thermal state — the
+        /// Start anyway when the pre-flight power-posture check
+        /// finds the machine at `serious`/`critical` thermal state: the
         /// one condition that pre-flight refuses outright. Battery power
         /// and Low Power Mode only warn and never need this flag.
         #[arg(long)]
         force: bool,
     },
-    /// Abort a mission — the KILL terminal (#1463). By default the WHOLE
+    /// Abort a mission: the KILL terminal. By default the WHOLE
     /// mission: removes every phase's worktree + branch, flips all non-terminal
     /// phases to `Abandoned`, and closes the mission. The clear opposite of
     /// `finalize` (which records `Complete`); both clean up whatever exists.
     /// Ends a stuck mission in one command (the `doom-loop-m4` case that used to
     /// need `phase abandon`×N + `close`). Pass `--phase <id>` to scope the
     /// teardown to a SINGLE gate-held coder-phase run instead of the whole
-    /// mission. (Widened from single-phase in #1463; #782, #1426 ship-4.)
+    /// mission. (Widened from single-phase.)
     Abort {
         /// Mission id.
         mission_id: String,
@@ -837,7 +836,7 @@ pub(crate) enum MissionCmd {
     },
     /// Inspect the mission-config registry (list / show).
     ///
-    /// (#1860) A `role list`/`role show` equivalent for
+    /// A `role list`/`role show` equivalent for
     /// `templates/builtin/mission-configs/`. Distinct from every other
     /// `mission` verb: those act on a mission RUN (an instance under
     /// `~/.darkmux/missions/`); this reads the CONFIG a `mission launch
@@ -870,12 +869,12 @@ pub(crate) enum RunKindArg {
 /// the contract this shares with the daemon's `/runs` handler.
 #[derive(Subcommand)]
 pub(crate) enum RunFamilyCmd {
-    /// List runs across mission/dispatch/lab kinds — the same union
+    /// List runs across mission/dispatch/lab kinds: the same union
     /// `GET /runs` serves. `--limit` caps TOTAL rows, live rows first;
     /// live (Running) rows are never truncated, so more live runs than
     /// the limit prints all of them and no history. The footer discloses
     /// the real total whenever anything was hidden (never reports the cap
-    /// as the total — #1876, #1891).
+    /// as the total).
     List {
         /// Filter to one run kind. Defaults to `all`.
         #[arg(long, value_enum, default_value = "all")]
@@ -883,22 +882,22 @@ pub(crate) enum RunFamilyCmd {
         /// Max rows shown in total, live runs first. Live runs are never
         /// truncated, so a machine with more running than this prints all
         /// of them. `0` means no cap. Ignored by `--json`, which is never
-        /// paginated — a machine reader gets every run the kind filter
+        /// paginated: a machine reader gets every run the kind filter
         /// selected. Default 10.
         #[arg(long, default_value = "10")]
         limit: usize,
         /// Show every run, ignoring `--limit`.
         #[arg(long)]
         all: bool,
-        /// (#2902) Also print the token usage breakdown: by endpoint and
+        /// Also print the token usage breakdown: by endpoint and
         /// model (requested, and the served model when the reply named a
         /// different one), with input, cached (only where the endpoint
         /// reported it), generated, and darkmux's own utility calls split
-        /// out. A plain sum of the usage records in the window — the same
+        /// out. A plain sum of the usage records in the window: the same
         /// sum the TOKENS column and the viewer show.
         #[arg(long)]
         usage: bool,
-        /// (#2902) Only runs active, and usage records emitted, since this
+        /// Only runs active, and usage records emitted, since this
         /// bound: a duration back from now (`24h`, `7d`, `2w`; units s, m,
         /// h, d, w) or a UTC date (`YYYY-MM-DD`). Reaches past the default
         /// 14-day window when asked. Default: the 14-day window.
@@ -912,9 +911,9 @@ pub(crate) enum RunFamilyCmd {
     Inspect {
         run: String,
     },
-    /// (#2855) Derived metrics for a recorded lab run — active time,
+    /// Derived metrics for a recorded lab run: active time,
     /// throughput over the streams that were actually billed, both
-    /// degeneracy gates, busy-only power — each with the reconciliation check
+    /// degeneracy gates, busy-only power: each with the reconciliation check
     /// that says whether it may be quoted. Reads the run's existing
     /// artifacts; nothing is recomputed at dispatch time, so this applies to
     /// runs already on disk.
@@ -957,13 +956,13 @@ pub(crate) enum MissionConfigCmd {
     /// of being silently dropped, so one broken user-tier override never
     /// hides every other registered config. Read-only.
     ///
-    /// (#2301) `crawl` lists like any other config, and its counts are
+    /// `crawl` lists like any other config, and its counts are
     /// real: `templates/builtin/mission-configs/crawl.json` declares the
     /// whole crawl (a `crawl.plan` task per rule, a `dispatch.unit` GROW
     /// template per rule, one `dispatch.summary`), and editing it changes what
     /// a crawl launch does. The literal `config_id == "crawl"` routing to
     /// a bespoke launcher is gone. The per-unit tasks a real run executes
-    /// are GROWN from each plan's output at the phase boundary (#2300), so
+    /// are GROWN from each plan's output at the phase boundary, so
     /// the listed task count is the document's templates, not the run's
     /// units.
     List {
@@ -978,10 +977,10 @@ pub(crate) enum MissionConfigCmd {
     /// it); and, per task with a `role_id`, the profile and model that
     /// role resolves to right now, with the resolution's provenance (the
     /// `role_profiles` map or the `default_profile` fallback, so the
-    /// operator never has to wonder where a decision came from, #44) and
-    /// whether that model is currently loaded. (#2523: this sentence used
+    /// operator never has to wonder where a decision came from) and
+    /// whether that model is currently loaded. (An earlier version of this sentence used
     /// to list "a launch override" as a third provenance tier. There is no
-    /// such tier — `effective_overrides_and_warnings` returns an empty map
+    /// such tier: `effective_overrides_and_warnings` returns an empty map
     /// for every config, so `RoleProfileSource::Overridden` is
     /// production-unreachable. Leaving it here printed "a launch override"
     /// on the same screen as the `--param` doc calling itself dead.)
@@ -990,17 +989,17 @@ pub(crate) enum MissionConfigCmd {
     Show {
         /// Mission config id to show (e.g. `review`, `coder-phase`).
         id: String,
-        /// DEAD SURFACE — accepted, parsed, and then ignored on EVERY
+        /// DEAD SURFACE: accepted, parsed, and then ignored on EVERY
         /// config. A WELL-FORMED value is accepted and discarded so an
         /// existing invocation does not break; a malformed one still hard-
         /// fails at parse (`parse_role_overrides`), because a typo is worth
         /// surfacing even for a surface that does nothing.
         /// `show` prints a warning naming the override it discarded.
         ///
-        /// (#2523) An earlier version of this text said the override applied
+        /// An earlier version of this text said the override applied
         /// "ONLY on the review-route configs", which implied it still worked
         /// there. It does not: the bespoke review launcher that consumed
-        /// role->profile bindings was deleted in #2310 P4d, and
+        /// role->profile bindings was deleted, and
         /// `effective_overrides_and_warnings` now returns empty overrides for
         /// every config, `review` included.
         ///
@@ -1009,7 +1008,7 @@ pub(crate) enum MissionConfigCmd {
         /// <profile>`), with `default_profile` as the floor.
         ///
         /// Not to be confused with `mission launch --param <name>=<value>`,
-        /// which is a REAL mechanism for a config's declared INPUTS — a
+        /// which is a REAL mechanism for a config's declared INPUTS: a
         /// different thing that happens to share the flag name. Repeatable.
         #[arg(long = "param", value_name = "ROLE=PROFILE")]
         params: Vec<String>,
@@ -1022,10 +1021,10 @@ pub(crate) enum MissionConfigCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum MachineCmd {
-    /// Show models currently loaded in LMStudio, grouped by ownership:
+    /// Show models currently loaded in LM Studio, grouped by ownership:
     /// darkmux-managed (under the `darkmux:` namespace) vs user state
     /// (everything else), plus which registered profile(s) the loaded set
-    /// matches. Read-only. (#1426 — absorbs the retired top-level `status`
+    /// matches. Read-only. (absorbs the retired top-level `status`
     /// verb's profile-match dimension; the default when `machine` is run
     /// with no sub-verb.)
     ///
@@ -1041,16 +1040,16 @@ pub(crate) enum MachineCmd {
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// Live machine resources (#1286, renamed from `model ledger` in #1426
-    /// for vocabulary alignment — gestalt's port is `ResourceProbe`/`pools`,
+    /// Live machine resources (renamed from `model ledger`
+    /// for vocabulary alignment: gestalt's port is `ResourceProbe`/`pools`,
     /// and this panel shows what that arbiter sees): per resident model,
-    /// POTENTIAL (the commitment — weights + KV cache at the loaded ctx +
+    /// POTENTIAL (the commitment: weights + KV cache at the loaded ctx +
     /// transient margin) vs CURRENT (observed inference-worker footprint),
-    /// color-stated green / amber ("made it by luck" — under the limit only
+    /// color-stated green / amber ("made it by luck": under the limit only
     /// because lazy allocation hasn't materialized; names the config shrink
     /// to reach green) / red (over the limit or memory pressure active),
     /// plus machine pressure rows (swap, compressor, memory-pressure free%).
-    /// Read-only: kernel counters + lms metadata calls only — zero model
+    /// Read-only: kernel counters + lms metadata calls only: zero model
     /// dispatches; the output stamps the gather's own cost. The same data
     /// serves live at the daemon's GET /machine/resources (the viewer's
     /// machine lens).
@@ -1067,8 +1066,8 @@ pub(crate) enum MachineCmd {
     /// Eject all darkmux-managed model loads (anything in the `darkmux:`
     /// namespace) on THIS host. User-loaded models are never touched. Use
     /// this when you want to release darkmux's RAM footprint without
-    /// affecting other tools using LMStudio. MUTATION — local-only by
-    /// design: never takes a roster id, never touches a peer (#1426).
+    /// affecting other tools using LM Studio. MUTATION: local-only by
+    /// design: never takes a roster id, never touches a peer.
     Eject {
         /// Show what would be ejected without actually unloading.
         #[arg(long, short = 'n')]
@@ -1086,17 +1085,17 @@ pub(crate) enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Register a machine in the fleet roster (#1426 — absorbs the retired
-    /// `fleet add`). Idempotent — calling again with the same `<id>` updates
+    /// Register a machine in the fleet roster (absorbs the retired
+    /// `fleet add`). Idempotent: calling again with the same `<id>` updates
     /// fields but preserves the original `added_unix_ms` so the fleet-age
     /// signal stays honest.
     ///
-    /// (#2924) `<id>` must be the machine's own `machine_id` (the name its
+    /// `<id>` must be the machine's own `machine_id` (the name its
     /// `darkmux doctor` prints): that one name joins the roster to flow
     /// records and presence. When `<id>` is THIS machine's machine_id, the
     /// entry also records this host's stable hardware identity
-    /// (`IOPlatformUUID`, #2768), so the viewer can still join it after a
-    /// rename. A peer's identity cannot be resolved from here — `machine
+    /// (`IOPlatformUUID`), so the viewer can still join it after a
+    /// rename. A peer's identity cannot be resolved from here: `machine
     /// add` never makes a network call.
     ///
     /// A loopback `--address` (`127.0.0.1`, `::1`) is refused: other
@@ -1126,8 +1125,8 @@ pub(crate) enum MachineCmd {
         #[arg(long)]
         allow_loopback: bool,
     },
-    /// Remove a machine from the fleet roster (#1426 — absorbs the retired
-    /// `fleet remove`). Doesn't touch the actual remote machine — just
+    /// Remove a machine from the fleet roster (absorbs the retired
+    /// `fleet remove`). Doesn't touch the actual remote machine: just
     /// removes the local routing reference. Historical flow records from
     /// that machine remain in the audit chain and are still visible in the
     /// topology view.
@@ -1135,7 +1134,7 @@ pub(crate) enum MachineCmd {
         /// Logical machine id to remove.
         id: String,
     },
-    /// Let another machine submit work to THIS machine (#2916). Adds (or
+    /// Let another machine submit work to THIS machine. Adds (or
     /// updates) `fleet.accept_work.<name>` in this machine's own
     /// config.json and nothing else. The peer's node is looked up through
     /// the identity provider (`fleet.identity.provider`) by the name the
@@ -1178,12 +1177,12 @@ pub(crate) enum MachineCmd {
         /// to a machine you would give a shell. Default false; given again,
         /// it replaces the setting. `workspace` grants a receiver PATH only.
         /// It never authorizes a fetch, a checkout or a push. Git handoff
-        /// (#755) gets its own grant, and its checkouts live outside the
+        /// gets its own grant, and its checkouts live outside the
         /// worktrees base, so this grant cannot reach them.
         #[arg(long, value_name = "true|false")]
         workspace: Option<bool>,
     },
-    /// Stop accepting work from a machine (#2916): removes
+    /// Stop accepting work from a machine: removes
     /// `fleet.accept_work.<name>` from this machine's config.json. Takes
     /// effect on the next request, no restart.
     Untrust {
@@ -1194,7 +1193,7 @@ pub(crate) enum MachineCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum ProfileCmd {
-    /// List profiles in the registry. (#1426 — the retired top-level
+    /// List profiles in the registry. (the retired top-level
     /// `darkmux profiles` verb; now `darkmux profile list`.)
     ///
     /// `--machine <peer>` lists the profiles that roster peer lets THIS
@@ -1216,22 +1215,22 @@ pub(crate) enum ProfileCmd {
         #[arg(long, conflicts_with = "profiles")]
         remote: bool,
     },
-    /// Scan the LMStudio model catalog for downloaded models that aren't yet
+    /// Scan the LM Studio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class
-    /// and rough memory impact. Run after downloading a new model in LMStudio
-    /// to see whether you'd want to define a profile for it. (#1426 — the
+    /// and rough memory impact. Run after downloading a new model in LM Studio
+    /// to see whether you'd want to define a profile for it. (the
     /// retired top-level `darkmux scan` verb; now `darkmux profile scan`.)
     Scan {
         #[command(flatten)]
         profiles: ProfilesFileArg,
     },
     /// Generate a starter profile JSON for a model + task class. Output is
-    /// printed to stdout — copy-paste into your `~/.darkmux/profiles.json`
+    /// printed to stdout: copy-paste into your `~/.darkmux/profiles.json`
     /// (or pipe into a file) and tune from there.
     Draft {
         /// Profile name to use as the JSON key (e.g. "phi-fast").
         name: String,
-        /// LMStudio modelKey for the primary. Run `lms ls` to see ids.
+        /// LM Studio modelKey for the primary. Run `lms ls` to see ids.
         #[arg(long, short = 'm')]
         model: String,
         /// Task class: `fast` (single-turn), `mid` (balanced), `long` (deep agentic).
@@ -1256,22 +1255,22 @@ pub(crate) enum ProfileCmd {
 /// never a new top-level verb.
 #[derive(Subcommand)]
 pub(crate) enum MemoryCmd {
-    /// Engagement-context lessons the user AUTHORED — conventions,
+    /// Engagement-context lessons the user AUTHORED: conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
     /// to coder dispatches as a `<lessons>` block. Stored in a durable,
     /// concurrent-safe SQLite `lessons.db`. Per-repo by default
     /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
-    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
+    /// the cross-engagement `~/.darkmux/lessons.db`.
     Lesson {
         #[command(subcommand)]
         sub: LessonCmd,
     },
-    /// The adjudication corrections the user's reviewer RECORDED — the
+    /// The adjudication corrections the user's reviewer RECORDED: the
     /// verdicts and overrides they logged against a dispatch (`darkmux flow
     /// note --source adjudication`), carried forward into every later coder
     /// brief in the same mission so a correction made once is never re-derived.
     /// Read-only: corrections are recorded by the review path, never authored
-    /// as a memory entry, so there is no `add` here. (#849)
+    /// as a memory entry, so there is no `add` here.
     Correction {
         #[command(subcommand)]
         sub: CorrectionCmd,
@@ -1287,7 +1286,7 @@ pub(crate) enum CorrectionCmd {
     /// window; `--mission` scopes to one mission's dispatches (exactly as the
     /// coder brief does), `--execution` to a single role execution.
     List {
-        /// Scope to one mission's role executions — the same exact-set match
+        /// Scope to one mission's role executions: the same exact-set match
         /// the coder brief uses, so this shows precisely what that mission's
         /// next brief would carry. Conflicts with `--execution`.
         #[arg(long, conflicts_with = "execution")]
@@ -1310,7 +1309,7 @@ pub(crate) enum CorrectionCmd {
 /// `LessonCmd` — no wire change.
 #[derive(Subcommand)]
 pub(crate) enum LessonCmd {
-    /// Record an engagement-context lesson — a convention, constraint, or
+    /// Record an engagement-context lesson: a convention, constraint, or
     /// decision, WITH the reasoning behind it (explain the why, not just the
     /// rule). Appended to the durable `lessons.db`; surfaced to coder
     /// dispatches as a `<lessons>` block.
@@ -1318,10 +1317,10 @@ pub(crate) enum LessonCmd {
         /// Short statement of the rule / decision.
         #[arg(long)]
         title: String,
-        /// The detail — explain the WHY, not just the rule.
+        /// The detail: explain the WHY, not just the rule.
         #[arg(long)]
         body: String,
-        /// Optional file scope (default: engagement-level — applies everywhere
+        /// Optional file scope (default: engagement-level: applies everywhere
         /// in this repo).
         #[arg(long)]
         file: Option<String>,
@@ -1341,7 +1340,7 @@ pub(crate) enum LessonCmd {
     /// --json`).
     /// Only the flags you pass change; `created_ts` is preserved.
     Edit {
-        /// The lesson's rowid (ids are per-tier — pass `--global` to target the
+        /// The lesson's rowid (ids are per-tier: pass `--global` to target the
         /// user-global store's ids).
         id: i64,
         /// New rule statement.
@@ -1362,13 +1361,13 @@ pub(crate) enum LessonCmd {
     },
     /// Remove a recorded lesson by its id (from `memory lesson list --json`).
     Remove {
-        /// The lesson's rowid (per-tier — pass `--global` for the global store).
+        /// The lesson's rowid (per-tier: pass `--global` for the global store).
         id: i64,
         /// Target the user-global store instead of this repo's.
         #[arg(long)]
         global: bool,
     },
-    /// Export a tier's lessons to a self-describing JSON envelope on stdout —
+    /// Export a tier's lessons to a self-describing JSON envelope on stdout:
     /// for a hand-edit / git-commit / restore roundtrip.
     Export {
         /// Export the user-global store instead of this repo's.
@@ -1415,13 +1414,13 @@ pub(crate) enum WorkloadCmd {
 /// `lab register`/`lab unregister` leaves folded into one singular sub-noun.
 #[derive(Subcommand)]
 pub(crate) enum FixtureCmd {
-    /// List registered fixtures + their paths + hashes (#491).
+    /// List registered fixtures + their paths + hashes.
     /// (was: `lab fixtures`)
     List,
-    /// Register a fixture directory in the lab registry by name (#491).
+    /// Register a fixture directory in the lab registry by name.
     /// Reads `.fixture.json` from `<path>`, computes a BLAKE3 content
     /// hash, records the pointer in `~/.darkmux/lab-registry.json`.
-    /// The dir itself stays where it is — registry is just a lookup
+    /// The dir itself stays where it is: registry is just a lookup
     /// table. (was: `lab register`)
     Register {
         /// Path to the fixture directory (must contain `.fixture.json`).
@@ -1440,8 +1439,8 @@ pub(crate) enum FixtureCmd {
         #[arg(long = "if-absent")]
         if_absent: bool,
     },
-    /// Remove a fixture from the lab registry by name (#491).
-    /// NEVER touches the underlying directory — operator-sovereignty
+    /// Remove a fixture from the lab registry by name.
+    /// NEVER touches the underlying directory: operator-sovereignty
     /// preserved. (was: `lab unregister`)
     Unregister {
         /// Registry key (name from `.fixture.json` or `--name` at
@@ -1466,32 +1465,32 @@ pub(crate) enum LabCmd {
         #[arg(long, short = 'q')]
         quiet: bool,
     },
-    /// Workload registry (`lab workload list`). (#1465)
+    /// Workload registry (`lab workload list`).
     Workload {
         #[command(subcommand)]
         sub: WorkloadCmd,
     },
-    /// Lab fixtures (`lab fixture list|register|unregister`). (#1465, #491)
+    /// Lab fixtures (`lab fixture list|register|unregister`).
     Fixture {
         #[command(subcommand)]
         sub: FixtureCmd,
     },
-    /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
+    /// Loop lab: run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
-    /// / failed. The loop-engineering bench — vary the HARNESS (turn/token
+    /// / failed. The loop-engineering bench: vary the HARNESS (turn/token
     /// caps + compaction knobs) against a fixed model + fixture and see which
     /// loop config catches or survives the struggle. The model axis comes from
     /// the profile (`--profile` / `--profiles-file`); the loop axis from the
     /// override flags below.
     Loop {
-        /// Workload to dispatch (a coding-task / fixture-backed workload —
+        /// Workload to dispatch (a coding-task / fixture-backed workload:
         /// that's where loop behavior is interesting).
         workload: String,
-        /// Profile (the model axis) — defaults to the registry's default_profile.
+        /// Profile (the model axis): defaults to the registry's default_profile.
         #[arg(long, short = 'p')]
         profile: Option<String>,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
-        /// and the default search locations (#984 makes this reach the
+        /// and the default search locations (makes this reach the
         /// dispatch's model resolution).
         #[arg(long = "profiles-file")]
         profiles: Option<String>,
@@ -1527,9 +1526,9 @@ pub(crate) enum LabCmd {
         #[arg(long = "context-window")]
         context_window: Option<u32>,
         // ── (#1004) engagement-context A/B ──────────────────────────
-        /// Run the workload TWICE — once WITH the engagement-context blocks
+        /// Run the workload TWICE: once WITH the engagement-context blocks
         /// (lessons + detected cautions) injected into the prompt, once
-        /// WITHOUT — and report the verdict shift. Validates the doom-loop
+        /// WITHOUT: and report the verdict shift. Validates the doom-loop
         /// cure: does injected institutional memory change loop behavior?
         #[arg(long)]
         ab: bool,
@@ -1545,7 +1544,7 @@ pub(crate) enum LabCmd {
     },
     /// Run an opinionated single-command characterization of the local setup.
     /// Dispatches a single workload (default `quick-q`) on the active profile
-    /// and returns a one-screen verdict — wall clock, verify outcome, hint at
+    /// and returns a one-screen verdict: wall clock, verify outcome, hint at
     /// next steps. The "QA my Mac" entry point.
     Characterize {
         /// Workload to dispatch (default: quick-q smoke prompt).
@@ -1564,15 +1563,15 @@ pub(crate) enum LabCmd {
         workload: String,
         #[arg(long, short = 'p')]
         profile: Option<String>,
-        /// Number of dispatches (default 6 — enough for a meaningful bimodal
+        /// Number of dispatches (default 6: enough for a meaningful bimodal
         /// signal without burning hours on Apple Silicon).
         #[arg(long = "repeat", short = 'n', default_value = "6")]
         repeat: u32,
         #[command(flatten)]
         profiles: ProfilesFileArg,
     },
-    /// Lint the lab registry — schema check, path existence, content
-    /// hash recompute, required-files presence (#491). Cheap + offline:
+    /// Lint the lab registry: schema check, path existence, content
+    /// hash recompute, required-files presence. Cheap + offline:
     /// no dispatches, no network. Doctor is the discoverability layer
     /// for the lab subsystem.
     Doctor,

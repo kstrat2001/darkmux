@@ -244,10 +244,10 @@ pub struct StepResultPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub ok: Option<bool>,
-    /// On a `dispatch.map` item or aggregate: whether it ran on a hosted endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// On a `dispatch.map` item or aggregate: whether it ran on an unmanaged endpoint.
+    #[serde(default, alias = "remote", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub remote: Option<bool>,
+    pub unmanaged: Option<bool>,
     /// On a hosted `dispatch.map` item: the endpoint-reported served model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -353,7 +353,7 @@ impl StepResultPayload {
             cached_tokens: None,
             index: None,
             ok: None,
-            remote: None,
+            unmanaged: None,
             served_model: None,
             wall_ms: None,
             error: None,

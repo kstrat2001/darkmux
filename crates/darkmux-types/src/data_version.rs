@@ -17,7 +17,9 @@
 //! `lessons.db` through its `user_version` pragma; the lab run manifest, the
 //! trajectory (`darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION`, a leaf crate
 //! that cannot depend on this one) and `resume_origin` through their own
-//! loaders.
+//! loaders. The writers of `config.json` (`config set`, `machine trust` and
+//! `untrust`) refuse a newer file too, rather than rewrite what they cannot
+//! place (`config_cmd::load_object_for_write`).
 //!
 //! Bump discipline, the same for every constant here: additive field or
 //! variant is a minor bump, a rename / retype / removal is major.

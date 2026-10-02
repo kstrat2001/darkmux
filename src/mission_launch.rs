@@ -381,7 +381,7 @@ pub(crate) fn resolve_config(config_id: &str) -> Result<mission_config::LoadedMi
     preflight_launch()?;
     mission_config::load(config_id).with_context(|| {
         format!(
-            "loading mission config \"{config_id}\" — note: a user-tier copy \
+            "loading mission config \"{config_id}\": note: a user-tier copy \
              (~/.darkmux/mission-configs/{config_id}.json) or an on-disk template overrides \
              an embedded built-in; the failing file is named above if one was found"
         )
@@ -2559,7 +2559,7 @@ fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) 
 fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) -> String {
     let declared_names = config.inputs.iter().map(|i| i.name.as_str());
     let did_you_mean = darkmux_types::user_files::closest(key, declared_names)
-        .map(|near| format!(" — did you mean `{near}`?"))
+        .map(|near| format!(": did you mean `{near}`?"))
         .unwrap_or_default();
     format!(
         "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
@@ -4622,7 +4622,7 @@ fn run_summary_line(
     let (completed, errored, never_ran) = partition_step_outcomes(steps);
     let partial = if degraded > 0 { format!(" ({degraded} degraded)") } else { String::new() };
     format!(
-        "▶ mission `{mission_id}` finished {} — {} step(s) complete{partial}, {} errored, {} never ran",
+        "▶ mission `{mission_id}` finished {}: {} step(s) complete{partial}, {} errored, {} never ran",
         status.word(),
         completed.len(),
         errored.len(),
@@ -9803,7 +9803,7 @@ mod tests {
             assert!(
                 grown_step.config.get("timeout_seconds").is_none(),
                 "grow_phase must NOT stamp anything onto a grown dispatch.unit step when --timeout \
-                 was omitted (template `{}`) — the standing env/config/600 tier must decide; got \
+                 was omitted (template `{}`): the standing env/config/600 tier must decide; got \
                  config {:?}",
                 event.task_template,
                 grown_step.config
@@ -9863,7 +9863,7 @@ mod tests {
         assert_eq!(
             step.config.get("timeout_seconds").and_then(|v| v.as_u64()),
             Some(900),
-            "a statically-declared dispatch.unit step must be stamped the SAME way a grown one is — \
+            "a statically-declared dispatch.unit step must be stamped the SAME way a grown one is: \
              got config {:?}",
             step.config
         );
@@ -9889,7 +9889,7 @@ mod tests {
         assert!(
             step.config.get("timeout_seconds").is_none(),
             "an omitted --timeout must leave a statically-declared dispatch.unit step's config \
-             untouched too — got {:?}",
+             untouched too: got {:?}",
             step.config
         );
     }

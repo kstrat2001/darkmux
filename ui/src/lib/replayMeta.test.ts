@@ -101,7 +101,7 @@ describe("replayMetaLines", () => {
   });
 });
 
-describe("shapeRecords — the per-session runtime aggregate", () => {
+describe("shapeRecords: the per-session runtime aggregate", () => {
   // `flowToRenderModel` APPENDS one synthetic runtime telemetry record per
   // session that emitted any `dispatch.turn` (viewer.html:3223-3234). These
   // are counted in `DATA.length`, which is why the golden reads 2008 records

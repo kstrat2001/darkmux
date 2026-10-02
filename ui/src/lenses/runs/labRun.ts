@@ -1,13 +1,8 @@
 /**
  * Pure logic for the lab-run detail view ("run detail" for `kind=lab` rows)
- * — a TypeScript port of `viewer.html`'s `computeLabPipeline`/
- * `labStageMeta`/`labStageRow`/`renderLabPipeline`/`labShortId`/
- * `labFeedTs`/`labFeedRow`/`renderLabFeed`/`labBadge`
- * (viewer.html:4210-4847). This is a NEW render surface (`RunsBoard`'s row
- * click for `kind==="lab"` previously showed a `NOT_PORTED_NOTICE` — see
- * `LabRunDetail.tsx`'s own doc), so there is no existing parity golden to
- * hit byte-for-byte; these functions still track legacy's real derivation
- * logic line-for-line (not a redesign) per the drill-in packet's brief.
+ * — the pipeline fold (`computeLabPipeline`), its stage lines, and the
+ * event-feed lines and badge (see `LabRunDetail.tsx`'s own doc for the
+ * surface they feed).
  *
  * Output shape follows the same convention `lenses/machine/memoryLedgerLines.ts`
  * established: flat line arrays, one visible text
@@ -22,7 +17,7 @@ import { shortModel } from "../../lib/format";
 import type { LabReviewSummary } from "../../types/generated/LabReviewSummary";
 import { ACTION, CATEGORY, SOURCE, type NormRecord } from "../../lib/ingest";
 
-/** `computeLabPipeline()` — viewer.html:4756-4774. Folds the event feed
+/** `computeLabPipeline()`: folds the event feed
  * into per-`step_id` completion payloads (in first-seen order) plus a
  * provisional judge/verify ruling tally, read only when no terminal
  * envelope (`env`) has landed yet. */
@@ -58,7 +53,7 @@ export function computeLabPipeline(events: NormRecord[]): LabPipeline {
   return { steps, order, rulingTally };
 }
 
-/** `labStageMeta()` — viewer.html:4775-4783. */
+/** One stage's meta line. */
 export function labStageMeta(payload: Record<string, unknown> | null | undefined): string {
   if (!payload) return "not started";
   const bits: string[] = [];
@@ -83,7 +78,7 @@ function tallyStr(t: Record<string, number>): string {
   return entries.length ? entries.join(" ") : "—";
 }
 
-/** `renderLabPipeline()` — viewer.html:4791-4804, reduced to lines: two per
+/** `renderLabPipeline()`, reduced to lines: two per
  * stage (name, meta), in ARRIVAL order (the step_ids come straight from the
  * review graph / sequential driver, so this needs no hardcoded stage list),
  * plus a trailing synthesis stage. */
@@ -101,18 +96,18 @@ export function labPipelineLines(pipe: LabPipeline, env: LabReviewSummary | null
   return lines;
 }
 
-/** `labShortId()` — viewer.html:4805. */
+/** A run id shortened for display. */
 export function labShortId(id: unknown): string {
   const s = String(id ?? "");
   return s.length > 18 ? `${s.slice(0, 18)}…` : s;
 }
 
-/** `labFeedTs()` — viewer.html:4806. */
+/** A feed timestamp, without the ISO `T` and `Z`. */
 export function labFeedTs(ts: unknown): string {
   return String(ts ?? "").replace("T", " ").replace("Z", "");
 }
 
-/** `labFeedRow()` — viewer.html:4807-4825, reduced to its three visible
+/** `labFeedRow()`, reduced to its three visible
  * lines (ts, tag, text — `.labfeedrow` is `display:flex`, each span is its
  * own `innerText` line, same convention as `labPipelineLines` above). */
 export function labFeedRowLines(r: NormRecord): string[] {
@@ -140,10 +135,10 @@ export function labFeedRowLines(r: NormRecord): string[] {
 }
 
 /** The cap is NAMED so the header can disclose it — `LAB_FEED_CAP`,
- * viewer.html:4833. */
+ * `LAB_FEED_CAP`. */
 export const LAB_FEED_CAP = 500;
 
-/** `renderLabFeed()` — viewer.html:4834-4838. Newest at top (issue #1247's
+/** `renderLabFeed()`: newest at top (issue #1247's
  * "watch it think" narrative); flattens `labFeedRowLines` per surviving
  * event into one array (matching the div-per-line convention this module
  * uses throughout). */
@@ -156,7 +151,7 @@ export function labFeedLines(events: NormRecord[]): string[] {
     .flatMap((r) => labFeedRowLines(r));
 }
 
-/** The event-feed header's count disclosure (#1640, viewer.html:4866):
+/** The event-feed header's count disclosure (#1640):
  * `labFeedLines` above only ever returns the newest `LAB_FEED_CAP` events,
  * but the header must print the RAW total truncation happened against — a
  * 900-event run says "newest 500 of 900", not "900 records" above a list
@@ -181,8 +176,7 @@ export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): 
   return " — live, polling";
 }
 
-/** `labBadge()` — viewer.html:4210-4214, text-only. `unreachable` is new
- * relative to legacy (the events-poll consecutive-failure signal, see
+/** `labBadge()`, text-only. `unreachable` is the (events-poll consecutive-failure signal, see
  * `LabRunDetail.tsx`'s own doc) — defaulted so every existing caller/test
  * that only ever passed `finished` keeps its exact prior behavior. Ignored
  * once `finished`, same reasoning as `labFeedStatusSuffix` above. */

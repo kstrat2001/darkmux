@@ -177,7 +177,7 @@ fn evaluate(p: &power_posture::PowerPosture, force: bool) -> Result<()> {
         // `mission launch crawl` explicitly means the recovery instruction
         // is always real, regardless of which surface hit it.
         bail!(
-            "refusing to start: thermal state is \"{state_name}\" — this machine is already thermally \
+            "refusing to start: thermal state is \"{state_name}\": this machine is already thermally \
              stressed and a sustained mission would make it worse. Run `darkmux mission launch <config-id> \
              --force` (or `darkmux mission launch crawl --force`) to start anyway, or let the machine \
              cool first."

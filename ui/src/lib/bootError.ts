@@ -79,8 +79,8 @@ export function describeBootError(
   const appIsLive = options.appIsLive ?? false;
   return {
     title: appIsLive
-      ? `darkmux hit an unexpected error — ${context}`
-      : `darkmux failed to start — ${context}`,
+      ? `darkmux hit an unexpected error: ${context}`
+      : `darkmux failed to start: ${context}`,
     message,
     stack,
     buildLine,

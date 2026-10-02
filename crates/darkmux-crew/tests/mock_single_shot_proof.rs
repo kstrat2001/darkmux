@@ -367,7 +367,7 @@ fn a_refused_local_single_shot_ends_in_an_error_terminal_with_its_context() {
 
 /// (#1645) `dispatch_local_single_shot`'s hosted/local single-shot records
 /// (`dispatch start`/`dispatch complete`, built by `dispatch_internal.rs`'s
-/// `build_remote_record`) used to hardcode `mission_id: None` regardless of
+/// `build_unmanaged_record`) used to hardcode `mission_id: None` regardless of
 /// `opts.phase_id` — a #1177-era TODO ("resolved from phase in a follow-up")
 /// that never got its follow-up. A `dispatch.internal` step targeting a
 /// remote/hosted profile takes exactly this branch (`dispatch()` routes to

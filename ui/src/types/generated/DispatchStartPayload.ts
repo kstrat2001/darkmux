@@ -47,7 +47,8 @@ workspace?: string,
  */
 turn_delay_ms?: number, 
 /**
- * The resolved runtime knobs with provenance.
+ * The resolved runtime knobs with provenance. A malformed block costs the bounds, never the
+ * record around it.
  */
 bounds?: RuntimeBounds, 
 /**

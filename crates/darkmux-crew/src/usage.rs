@@ -228,7 +228,7 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
         reasoning_tokens: count(counts.reasoning),
         cached_tokens: count(counts.cached),
         turn_seq: None,
-        remote: None,
+        unmanaged: None,
         index: None,
         generation: None,
         parent_role_id: None,
@@ -437,6 +437,7 @@ pub fn has_any_token_counts(p: &serde_json::Value) -> bool {
     num(p.get("total_tokens")) > 0
         || num(p.get("prompt_tokens")) > 0
         || num(p.get("completion_tokens")) > 0
+        || num(p.get("unmanaged_tokens")) > 0
         || num(p.get("remote_tokens")) > 0
 }
 
@@ -448,9 +449,12 @@ pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
         total = prompt + completion;
     }
     if total == 0 {
-        // The retired review path's spelling of its own spend, on a legacy
-        // `dispatch complete` only.
-        total = num(p.get("remote_tokens"));
+        // A `dispatch.map` step's own spend on a `dispatch.complete`; an
+        // archived record spells the key `remote_tokens`.
+        total = num(p.get("unmanaged_tokens"));
+        if total == 0 {
+            total = num(p.get("remote_tokens"));
+        }
     }
     let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
     UsageAmount {

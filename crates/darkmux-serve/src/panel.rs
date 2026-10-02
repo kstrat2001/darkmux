@@ -487,7 +487,7 @@ fn resolve_opts(spec: &PanelSpec, requested: &HashMap<String, String>) -> Result
     for name in requested.keys() {
         if !spec.opts.iter().any(|o| o.name == name.as_str()) {
             return Err(format!(
-                "unknown option \"{name}\" for panel \"{}\" — legal options: {}\n",
+                "unknown option \"{name}\" for panel \"{}\": legal options: {}\n",
                 spec.id,
                 if legal_names.is_empty() { "(none)".to_string() } else { legal_names.join(", ") }
             ));
@@ -501,7 +501,7 @@ fn resolve_opts(spec: &PanelSpec, requested: &HashMap<String, String>) -> Result
         let Some(pv) = opt.values.iter().find(|v| v.value == selected) else {
             let legal: Vec<&'static str> = opt.values.iter().map(|v| v.value).collect();
             return Err(format!(
-                "unknown value \"{selected}\" for option \"{}\" on panel \"{}\" — legal values: {}\n",
+                "unknown value \"{selected}\" for option \"{}\" on panel \"{}\": legal values: {}\n",
                 opt.name,
                 spec.id,
                 legal.join(", ")
@@ -574,7 +574,7 @@ fn resolve_roster_opt(
     }
     let Some(id) = roster_ids.iter().find(|id| id.eq_ignore_ascii_case(&raw)) else {
         return Err(format!(
-            "unknown value \"{raw}\" for option \"{name}\" on panel \"{}\" — legal values: {}\n",
+            "unknown value \"{raw}\" for option \"{name}\" on panel \"{}\": legal values: {}\n",
             spec.id,
             if roster_ids.is_empty() { "(the roster is empty)".to_string() } else { roster_ids.join(", ") }
         ));
@@ -613,10 +613,6 @@ fn roster_machine_ids() -> Vec<String> {
     darkmux_fleet::load_roster().map(|r| r.machines.keys().cloned().collect()).unwrap_or_default()
 }
 
-/// Pull `opt.<name>=<value>` pairs out of the full raw query map, stripping
-/// the `opt.` prefix so [`resolve_opts`] sees bare names. Anything not
-/// prefixed with `opt.` (`cols`, or an unrelated param) is ignored here —
-/// `cols` is read separately by the caller.
 /// The `cols` param, lenient on read (#1911) — see the call site's comment
 /// for why this direction differs from `opt.*`'s fail-closed one. Split
 /// out so the leniency is pinnable by `cols_is_lenient_on_read` without
@@ -626,6 +622,10 @@ fn parse_cols(raw: &HashMap<String, String>) -> Option<u16> {
     raw.get("cols").and_then(|v| v.parse::<u16>().ok())
 }
 
+/// Pull `opt.<name>=<value>` pairs out of the full raw query map, stripping
+/// the `opt.` prefix so [`resolve_opts`] sees bare names. Anything not
+/// prefixed with `opt.` (`cols`, or an unrelated param) is ignored here —
+/// `cols` is read separately by the caller.
 fn extract_opt_params(raw: &HashMap<String, String>) -> HashMap<String, String> {
     raw.iter().filter_map(|(k, v)| k.strip_prefix("opt.").map(|name| (name.to_string(), v.clone()))).collect()
 }
@@ -805,7 +805,7 @@ async fn admit_manual_run_at(
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "panel \"{id}\" is manual-run only and was started {}s ago — it probes \
+                    "panel \"{id}\" is manual-run only and was started {}s ago: it probes \
                      the machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
                     since.as_secs(),
                     MANUAL_MIN_INTERVAL.as_secs()
@@ -893,7 +893,7 @@ fn admit_panel_request(
         return Err((
             StatusCode::FORBIDDEN,
             format!(
-                "panel requests require the `{PANEL_HEADER}` header — it forces a CORS \
+                "panel requests require the `{PANEL_HEADER}` header: it forces a CORS \
                  preflight so a foreign page cannot drive this endpoint from the \
                  operator's browser\n"
             ),
@@ -903,7 +903,7 @@ fn admit_panel_request(
     let Some(spec) = panel_spec(id) else {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("unknown panel \"{id}\" — panels are a fixed allowlist, not arbitrary commands\n"),
+            format!("unknown panel \"{id}\": panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
     admit_audience(&spec, peer, headers)?;
@@ -1061,7 +1061,7 @@ pub(crate) async fn panel_handler(
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
-                    "panel \"{id}\" timed out after {}s — the CLI verb is wedged; \
+                    "panel \"{id}\" timed out after {}s: the CLI verb is wedged; \
                      the daemon killed it (kill_on_drop)\n",
                     PANEL_SPAWN_TIMEOUT.as_secs()
                 ),
@@ -1212,7 +1212,7 @@ mod tests {
             let spec = panel_spec(id).unwrap();
             assert!(
                 spec.argv.iter().all(|t| !t.starts_with('-')),
-                "{id} bakes a flag into its argv — flags are opts, ids are verbs"
+                "{id} bakes a flag into its argv: flags are opts, ids are verbs"
             );
         }
     }
@@ -1220,7 +1220,7 @@ mod tests {
     #[test]
     fn doctor_is_manual_only_and_uncached() {
         let d = panel_spec("doctor").unwrap();
-        assert!(!d.auto_refresh, "doctor probes — auto-polling it is the observer joining the observed");
+        assert!(!d.auto_refresh, "doctor probes: auto-polling it is the observer joining the observed");
         assert!(d.cache_ttl.is_zero(), "an explicit doctor run must be a real run");
         // …and every other panel IS auto-refreshable with a real TTL.
         for id in
@@ -1268,7 +1268,7 @@ mod tests {
                 for v in &opt.values[1..] {
                     assert!(
                         !v.argv.is_empty(),
-                        "{id}'s opt \"{}\" non-default value \"{}\" carries empty argv — only \
+                        "{id}'s opt \"{}\" non-default value \"{}\" carries empty argv: only \
                          values[0] may, or it is a distinct selection that changes nothing",
                         opt.name,
                         v.value
@@ -1342,7 +1342,7 @@ mod tests {
         }
         assert!(
             total <= 27,
-            "variant cross-product grew to {total} — bumping the bound is a doctrine \
+            "variant cross-product grew to {total}: bumping the bound is a doctrine \
              decision (#1911), not a drive-by"
         );
     }
@@ -1590,7 +1590,7 @@ mod tests {
                 for v in opt.values {
                     assert!(
                         !v.value.contains(['?', '&', '=']),
-                        "{id}'s opt \"{}\" value {:?} contains a variant-key separator — two \
+                        "{id}'s opt \"{}\" value {:?} contains a variant-key separator: two \
                          different selections could canonicalize to one cache key",
                         opt.name,
                         v.value
@@ -1618,7 +1618,7 @@ mod tests {
             assert_eq!(
                 spec.auto_refresh,
                 !spec.cache_ttl.is_zero(),
-                "{id} disagrees with itself about being manual: auto_refresh={}, ttl={:?} — the \
+                "{id} disagrees with itself about being manual: auto_refresh={}, ttl={:?}: the \
                  floor gate reads auto_refresh and the floor CLOCK reads the ttl, so a mismatch \
                  means the floor never fires",
                 spec.auto_refresh,
@@ -1788,7 +1788,7 @@ mod tests {
         assert_eq!(
             admitted.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "the floor admitted more than one concurrent racer — check and claim are not atomic, \
+            "the floor admitted more than one concurrent racer: check and claim are not atomic, \
              so N browser tabs produce N real doctor probes (#1919)"
         );
     }
@@ -1836,7 +1836,7 @@ mod tests {
         assert_eq!(
             second.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "the second immediate request must be floored — if this passes with the call site \
+            "the second immediate request must be floored: if this passes with the call site \
              disabled, nothing pins that the floor runs at all (#1919)"
         );
     }
@@ -1896,7 +1896,7 @@ mod tests {
         assert!(
             admit_manual_run_at(&panels, "doctor", well_past_the_window).await.is_ok(),
             "the floor must open once MANUAL_MIN_INTERVAL of real elapsed time has passed, \
-             through the actual admission path a real request takes — an argument swap in the \
+             through the actual admission path a real request takes: an argument swap in the \
              manual_floor_wait call site would floor this forever"
         );
     }
@@ -1929,7 +1929,7 @@ mod tests {
             assert_eq!(
                 err.0,
                 StatusCode::TOO_MANY_REQUESTS,
-                "repeated checks against the SAME base id must stay floored — there is no \
+                "repeated checks against the SAME base id must stay floored: there is no \
                  variant key in scope that could reset it"
             );
         }
@@ -1960,7 +1960,7 @@ mod tests {
         assert_eq!(
             manual_floor_wait(prev, exactly_at, Duration::ZERO, min_interval),
             None,
-            "a gap exactly equal to min_interval must admit — the check is >=, not >"
+            "a gap exactly equal to min_interval must admit: the check is >=, not >"
         );
     }
 
@@ -1983,7 +1983,7 @@ mod tests {
         assert_eq!(
             manual_floor_wait(prev, four_hours_later, Duration::ZERO, Duration::from_secs(30)),
             None,
-            "a 4-hour real-time gap must admit outright, not report a remaining wait — the \
+            "a 4-hour real-time gap must admit outright, not report a remaining wait: the \
              defect this fix closes is exactly a deadline that stays 'in the future' across a \
              gap the operator's own clock has long since cleared"
         );
@@ -2040,7 +2040,7 @@ mod tests {
             manual_floor_wait(prev, now, monotonic_elapsed, min_interval),
             None,
             "35 real monotonic seconds since admission must open a 30s floor, even though the \
-             wall clock — having just jumped an hour backward — reads as no time having passed \
+             wall clock: having just jumped an hour backward: reads as no time having passed \
              at all"
         );
     }

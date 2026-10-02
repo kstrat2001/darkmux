@@ -118,6 +118,25 @@ pub enum RunStatus {
     Unparseable,
 }
 
+impl RunStatus {
+    /// The status word, exactly as it serializes on the wire and as the UI shows it
+    /// (the run board's `runStatusLabel` passes it through). The one place the words are
+    /// spelled for a non-serde reader (`darkmux run list`, `mission show`); a test pins it to the
+    /// serde name so the two cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Planned => "planned",
+            RunStatus::Running => "running",
+            RunStatus::Complete => "complete",
+            RunStatus::Degraded => "degraded",
+            RunStatus::Error => "error",
+            RunStatus::Escalated => "escalated",
+            RunStatus::Abandoned => "abandoned",
+            RunStatus::Unparseable => "unparseable",
+        }
+    }
+}
+
 /// (#1907) Which of two genuinely different situations produced a
 /// [`RunStatus::Abandoned`] row — see [`Run::abandoned_reason`]'s own doc
 /// for the wire contract and each construction site
@@ -387,14 +406,6 @@ pub struct Run {
     pub relay: Option<RunRelay>,
 }
 
-/// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
-/// (`GET /runs`, from a `spawn_blocking` task) and the root binary's
-/// `darkmux run list` verb (`src/run_list.rs`) call. `pub` since #1905:
-/// neither caller may compute its own union or filter at this layer — see
-/// the module doc's "Two callers, one union" section. Never panics on a
-/// missing/malformed source: `load_missions`/`load_phases` degrade to empty
-/// via `unwrap_or_default` (matching `missions_handler`'s own posture), and
-/// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
 /// (#2902 step 2b) The run union plus the usage breakdown over the same
 /// window — see [`build_runs_with_usage`].
 pub struct RunsWithUsage {
@@ -428,6 +439,14 @@ pub fn build_runs_with_usage(
     build_runs_in(flows_dir, lab_dir, fleet, &window)
 }
 
+/// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
+/// (`GET /runs`, from a `spawn_blocking` task) and the root binary's
+/// `darkmux run list` verb (`src/run_list.rs`) call. `pub` since #1905:
+/// neither caller may compute its own union or filter at this layer — see
+/// the module doc's "Two callers, one union" section. Never panics on a
+/// missing/malformed source: `load_missions`/`load_phases` degrade to empty
+/// via `unwrap_or_default` (matching `missions_handler`'s own posture), and
+/// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
 pub fn build_runs(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
@@ -1059,7 +1078,7 @@ fn mission_to_run(
     // filter as a result — `representative` already guarantees it.
     //
     // This pool is the single source for EVERY attribute and time on the
-    // row: `representative` (machine, start), `remote` (route, #2558),
+    // row: `representative` (machine, start), `routed` (route, #2558),
     // `sessions_by_start` (role, model), `terminal_ts_str` (completion, and
     // via `updated_ts` the row's first sort key) and `sessions_bare`
     // (status). Half-filtering was worse than not filtering: an
@@ -1078,12 +1097,11 @@ fn mission_to_run(
     let run_sessions: Vec<(&str, &SessionAgg)> =
         unambiguous_sessions.iter().copied().filter(|(_, s)| s.run_grain).collect();
     let representative = earliest_by_start(&run_sessions).or_else(|| earliest_by_start(&unambiguous_sessions));
-    // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
-    // endpoints (mixed local/remote seats across phases) collapses to one
-    // representative endpoint here — the Runs lens can't yet show per-seat
-    // routing. Picking the first remote session is a reasonable
-    // single-value summary for a flat row; don't overbuild this for a
-    // view-model step 4 will replace with a richer render.
+    // A mission whose dispatches span MULTIPLE distinct endpoints (mixed
+    // seats across phases) collapses to one representative endpoint here:
+    // the row shows one route. Picking the earliest session that names an
+    // endpoint is a reasonable single-value summary for a flat row; the run
+    // page, not the row, carries per-seat routing.
     //
     // (#2558, folded into #2487) Drawn from `unambiguous_sessions` for the
     // same reason every other attribute here is: `endpoint` sits on the
@@ -1094,7 +1112,7 @@ fn mission_to_run(
     // (ui/src/lenses/runs/format.ts) concatenates role · model · route ·
     // machine, so the row rendered `via <endpoint>` and nothing else: the
     // one attribute still sourced from the pool every sibling had refused.
-    let remote = earliest_by_start(
+    let routed = earliest_by_start(
         &unambiguous_sessions
             .iter()
             .copied()
@@ -1176,7 +1194,7 @@ fn mission_to_run(
         .clone()
         .or_else(|| representative.and_then(|(_, s)| s.machine.clone()));
     let machine_uid = mission_machine_uid(mission, representative.map(|(_, s)| s));
-    let route = remote.and_then(|(_, s)| s.endpoint.clone());
+    let route = routed.and_then(|(_, s)| s.endpoint.clone());
     let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
     // (#2487) Filtered too — and this one is the load-bearing half of the
     // ordering claim, not a tidying pass. `terminal_ts_str` feeds
@@ -1993,7 +2011,7 @@ fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
 /// Representative role/model/route for a lab run's `/runs` row, off its
 /// `StaffingSnapshot` — the judge seat (the load-bearing one) when present,
 /// else the first probe. `route` specifically prefers a REMOTE seat's
-/// endpoint (judge first, else the first remote probe); `None` when every
+/// endpoint (judge first, else the first unmanaged probe); `None` when every
 /// staffed seat is local.
 fn lab_staffing_role_model_route(
     staffing: Option<&darkmux_lab::lab::review::StaffingSnapshot>,
@@ -2007,8 +2025,8 @@ fn lab_staffing_role_model_route(
     let route = staffing
         .judge
         .as_ref()
-        .filter(|s| s.remote)
-        .or_else(|| staffing.probes.iter().find(|s| s.remote))
+        .filter(|s| s.unmanaged)
+        .or_else(|| staffing.probes.iter().find(|s| s.unmanaged))
         .and_then(|s| s.endpoint.clone());
     (role, model, route)
 }
@@ -2764,6 +2782,23 @@ mod tests {
     use darkmux_crew::types::{MissionSpec, NodeStatus, PhaseStatus};
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// The status word every non-serde reader prints is the wire word the UI shows.
+    #[test]
+    fn run_status_as_str_is_the_serde_name() {
+        for st in [
+            RunStatus::Planned,
+            RunStatus::Running,
+            RunStatus::Complete,
+            RunStatus::Degraded,
+            RunStatus::Error,
+            RunStatus::Escalated,
+            RunStatus::Abandoned,
+            RunStatus::Unparseable,
+        ] {
+            assert_eq!(serde_json::to_value(st).unwrap(), serde_json::json!(st.as_str()));
+        }
+    }
 
     // ── parse_flow_ts / civil calendar round-trip ───────────────────────
 
@@ -4953,7 +4988,7 @@ mod tests {
         assert_eq!(
             agg.last_activity_ts.as_deref(),
             Some("2026-07-24T10:30:00Z"),
-            "an older record arriving late must not rewind the liveness clock — \
+            "an older record arriving late must not rewind the liveness clock: \
              rewinding it would age a live session into Abandoned"
         );
     }
@@ -6546,7 +6581,7 @@ mod tests {
                     "mission_id": "ambig-bookend-mission",
                     "machine_id": "stale-bookend-machine",
                     // (#2558) An endpoint on the tainted session, EARLIER
-                    // than the coder's — `remote` is an `earliest_by_start`
+                    // than the coder's — `routed` is an `earliest_by_start`
                     // pick, so unfiltered this one wins `route`.
                     "payload": { "endpoint": "stale-bookend-endpoint" },
                 }),
@@ -6639,7 +6674,7 @@ mod tests {
         );
 
         // (#2558) Route recovers the same way — and does NOT keep the
-        // tainted session's earlier endpoint just because `remote` picks by
+        // tainted session's earlier endpoint just because `routed` picks by
         // earliest start.
         assert_eq!(
             row.route.as_deref(),

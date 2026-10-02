@@ -299,7 +299,7 @@ fn unminted_mission_id(session: &SessionId) -> Result<String> {
         .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission's own run, not in `{session}`"))?;
     if lifecycle::mission_path(mission_id).exists() {
         bail!(
-            "dispatch: run id `{mission_id}` already exists on disk — this should be \
+            "dispatch: run id `{mission_id}` already exists on disk: this should be \
              impossible (ids are minted uniquely per dispatch); if you're hitting this, it's \
              either a genuine id collision or a re-run against a copied/restored `.darkmux` \
              directory."

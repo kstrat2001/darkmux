@@ -1625,7 +1625,7 @@ fn prepare_or_report(
             return Ok(None);
         }
         Err(e) => {
-            let reply = format!("darkmux: `{}` cannot run here — {e:#}", plan.config_id);
+            let reply = format!("darkmux: `{}` cannot run here: {e:#}", plan.config_id);
             cx.send_notification(agent_chunk(session_id, reply))?;
             return Ok(None);
         }
@@ -1805,7 +1805,7 @@ async fn announce_and_confirm_route(
 ) -> Result<()> {
     cx.send_notification(agent_chunk(
         session_id,
-        format!("darkmux: routing to /mission launch {command} — from your text"),
+        format!("darkmux: routing to /mission launch {command}: from your text"),
     ))?;
     match crate::acp_panel::plan_launch(command, args) {
         Ok(plan) => confirm_then_execute(session_id, plan, cwd, cx, sessions).await,
@@ -1842,7 +1842,7 @@ async fn confirm_then_execute(
 ) -> Result<()> {
     let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
     let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &prepared.params);
-    let title = format!("darkmux — run this command chosen from your text? `{}`", plan.config_id);
+    let title = format!("darkmux: run this command chosen from your text? `{}`", plan.config_id);
     let answer = request_permission(cx, session_id, &plan.config_id, title, &fenced(&command_line)).await;
     match answer.refusal_reason("radio launch", "confirmation") {
         None => run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await,
@@ -2125,10 +2125,10 @@ impl PermissionAnswer {
     fn refusal_reason(&self, subject: &str, dialog: &str) -> Option<String> {
         match self {
             Self::Allowed => None,
-            Self::Rejected { option } => Some(format!("{subject} — operator selected `{option}` at the {dialog} dialog")),
-            Self::Cancelled => Some(format!("{subject} — the {dialog} request was cancelled")),
-            Self::Unrecognized => Some(format!("{subject} — the client returned an unrecognized {dialog} outcome")),
-            Self::Failed { error } => Some(format!("{subject} — the {dialog} request to the client failed: {error}")),
+            Self::Rejected { option } => Some(format!("{subject}: operator selected `{option}` at the {dialog} dialog")),
+            Self::Cancelled => Some(format!("{subject}: the {dialog} request was cancelled")),
+            Self::Unrecognized => Some(format!("{subject}: the client returned an unrecognized {dialog} outcome")),
+            Self::Failed { error } => Some(format!("{subject}: the {dialog} request to the client failed: {error}")),
         }
     }
 }
@@ -2194,7 +2194,7 @@ async fn request_operator_sign_off(
     step_id: &str,
     facts_text: &str,
 ) -> crate::crew::gate::GateDecision {
-    let title = format!("darkmux — operator sign-off required: `{step_id}`");
+    let title = format!("darkmux: operator sign-off required: `{step_id}`");
     let answer = request_permission(cx, session_id, step_id, title, facts_text).await;
     match answer.refusal_reason(&format!("step `{step_id}`"), "sign-off") {
         None => crate::crew::gate::GateDecision::Approved,

@@ -168,9 +168,15 @@ fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
     }
     // A retired `config.json` key at its old default warns the same way and
     // starts everything (#3057); a value ignoring which would change
-    // something is refused by the preflight instead.
+    // something is refused by the preflight of every command that starts work
+    // (dispatch, mission launch, lab run, fleet submission, serve). A command
+    // with no preflight (a read such as `run list`) is never refused over the
+    // file, so it prints the problem as a warning instead of staying silent.
     for leftover in darkmux_types::user_files::config_json_warnings() {
         eprintln!("warning: {leftover}");
+    }
+    if let Some(notice) = darkmux_types::user_files::config_json_notice() {
+        eprintln!("warning: {notice}");
     }
     Ok(())
 }
@@ -336,7 +342,7 @@ fn lessons_list(json: bool) -> Result<i32> {
             println!(
                 "{}",
                 darkmux_types::style::dim(
-                    "no lessons recorded yet — darkmux memory lesson add --title <t> --body <b>"
+                    "no lessons recorded yet: darkmux memory lesson add --title <t> --body <b>"
                 )
             );
             return Ok(0);
@@ -367,7 +373,7 @@ fn lessons_edit(
             eprintln!(
                 "{}",
                 darkmux_types::style::error(
-                    "nothing to edit — pass at least one of --title / --body / --file / --clear-file"
+                    "nothing to edit: pass at least one of --title / --body / --file / --clear-file"
                 )
             );
             return Ok(2);
@@ -391,7 +397,7 @@ fn lessons_edit(
             eprintln!(
                 "{}",
                 darkmux_types::style::error(&format!(
-                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    "no lesson #{id} in the {tier} store (ids are per-tier: try --global?)"
                 ))
             );
             Ok(1)
@@ -412,7 +418,7 @@ fn lessons_remove(id: i64, global: bool) -> Result<i32> {
             eprintln!(
                 "{}",
                 darkmux_types::style::error(&format!(
-                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    "no lesson #{id} in the {tier} store (ids are per-tier: try --global?)"
                 ))
             );
             Ok(1)
@@ -555,7 +561,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                     "{}",
                     darkmux_types::style::dim(&format!(
                         "no adjudication corrections recorded{scoped} in the last {days} day(s) \
-                         — your reviewer records them with darkmux flow note --execution <id> \
+                        : your reviewer records them with darkmux flow note --execution <id> \
                          --text \"<verdict · what you overrode · why>\" --source adjudication"
                     ))
                 );
@@ -856,14 +862,6 @@ fn derive_profile_name(model_id: &str, task: heuristics::TaskClass) -> String {
         trimmed
     };
     format!("{}-{}", safe_base, task.as_str())
-}
-
-/// True if the model id has a publisher prefix that gets stripped by
-/// `derive_profile_name`. Reserved for future per-model warnings; the
-/// scan currently catches collisions globally instead.
-#[allow(dead_code)]
-fn has_stripped_publisher(model_id: &str) -> bool {
-    model_id.contains('/')
 }
 
 fn cmd_role(sub: RoleCmd) -> Result<i32> {
@@ -1421,7 +1419,7 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
         } else {
             eprintln!(
                 "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
-                 failed there) — residents UNKNOWN, not empty. Check LMStudio + the \
+                 failed there): residents UNKNOWN, not empty. Check LMStudio + the \
                  `lms` CLI on `{id}`."
             );
         }
@@ -2223,11 +2221,5 @@ mod tests {
     fn derive_profile_name_strips_garbage_chars() {
         let n = derive_profile_name("publisher/some@weird*name!", heuristics::TaskClass::Mid);
         assert_eq!(n, "someweirdname-mid");
-    }
-
-    #[test]
-    fn has_stripped_publisher_true_for_pubprefixed() {
-        assert!(has_stripped_publisher("nousresearch/hermes"));
-        assert!(!has_stripped_publisher("hermes"));
     }
 }

@@ -2779,7 +2779,7 @@
         }
     }
 
-    // ─── #2561: --resume-from on the remote single-shot path must refuse
+    // ─── #2561: --resume-from on the unmanaged-endpoint single-shot path must refuse
     //     BEFORE the HTTP call, not silently ignore the flag ──────────────
 
     /// **This is the ORDER test, not just a refusal test** — the same
@@ -2844,7 +2844,7 @@
         opts.config_path = Some(pf.to_str().unwrap().to_string());
 
         let err = dispatch(opts).expect_err(
-            "--resume-from on a dispatch that resolves to the remote single-shot path must refuse",
+            "--resume-from on a dispatch that resolves to the unmanaged-endpoint single-shot path must refuse",
         );
         let msg = format!("{err:#}");
 
@@ -2855,12 +2855,12 @@
             }
         }
 
-        // POSITIVE: the refusal names the remote single-shot path as the
+        // POSITIVE: the refusal names the unmanaged-endpoint single-shot path as the
         // reason, and carries the same promise the container-path gate
         // states — this makes that promise true here too.
         assert!(
-            msg.contains("not supported on the remote single-shot dispatch path"),
-            "must name the remote single-shot path as the reason: {msg}"
+            msg.contains("not supported on the unmanaged-endpoint single-shot dispatch path"),
+            "must name the unmanaged-endpoint single-shot path as the reason: {msg}"
         );
         assert!(
             msg.contains(
@@ -2886,7 +2886,7 @@
 
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──
 
-    /// (#1645 fix-pass review) `build_remote_record_threads_mission_id_
+    /// (#1645 fix-pass review) `build_unmanaged_record_threads_mission_id_
     /// through` (above) proves the BUILDER threads `mission_id`; it does
     /// NOT prove `dispatch_unmanaged` — the arm actually reachable in
     /// production today — ever calls it with a real resolved mission_id.
@@ -3118,8 +3118,8 @@
         }
 
         assert!(
-            msg.contains("not supported on the remote single-shot dispatch path"),
-            "must name the remote single-shot path as the reason: {msg}"
+            msg.contains("not supported on the unmanaged-endpoint single-shot dispatch path"),
+            "must name the unmanaged-endpoint single-shot path as the reason: {msg}"
         );
         assert!(
             msg.contains(
@@ -3281,7 +3281,7 @@
             line_prefix,
             "",
             "`dispatch_unmanaged` must stay module-PRIVATE for this whole scan's premise to hold \
-             (see this test's own doc comment) — found `{line_prefix}fn dispatch_unmanaged(`, \
+             (see this test's own doc comment): found `{line_prefix}fn dispatch_unmanaged(`, \
              which reads as a widened visibility (`pub fn` / `pub(crate) fn`). Reviewer-proven \
              (#2580 round 2): flipping `fn` to `pub fn` here compiled and passed the pre-pin \
              version of this test green. If `dispatch_unmanaged` genuinely needs wider visibility, \
@@ -3299,7 +3299,7 @@
             mod_decls,
             vec!["mod tests;".to_string()],
             "this scan's premise requires this file to declare NO descendant module other than \
-             its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
+             its own `#[cfg(test)] mod tests`: found: {mod_decls:?}. A new `mod` here is a \
              place a call to `dispatch_unmanaged(` could live that this scan cannot see; if one is \
              genuinely needed, this test must grow to also scan that module's file."
         );
@@ -3311,7 +3311,7 @@
         let call_offsets = find_dispatch_unmanaged_calls(&src);
         assert!(
             !call_offsets.is_empty(),
-            "found zero calls to `dispatch_unmanaged(` — either the extractor regressed or the \
+            "found zero calls to `dispatch_unmanaged(`: either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
         );
 
@@ -3337,7 +3337,7 @@
             assert!(
                 resume_from_guard_precedes(body, call_at_in_body, &src),
                 "`{fn_name}` calls `dispatch_unmanaged(` at file offset {call_at} without a \
-                 `resume_from`-conditioned guard preceding it — this scan requires an `if` \
+                 `resume_from`-conditioned guard preceding it: this scan requires an `if` \
                  block whose condition mentions `resume_from`, closes BEFORE the call, contains \
                  a diverging bail!/return Err/panic!, and EITHER inlines the anchor \
                  {RESUME_FROM_GUARD_ANCHOR:?} directly OR calls the one named helper \
@@ -3345,10 +3345,10 @@
                  is the #2561/#2580 bypass class: a caller can silently spend real tokens under \
                  a --resume-from flag that was never honored. If the guard's message text is \
                  factored into some OTHER helper function instead of inlined at the \
-                 bail!/return site, that does not count here — inline it, route it through \
+                 bail!/return site, that does not count here: inline it, route it through \
                  `resume_from_bare_hosted_refusal` (matching both existing guards' shape), or \
                  point `RESUME_FROM_GUARD_ALLOWED_HELPER` at the new helper and update this \
-                 test — that constant names exactly one helper today (a single `&str`, not a \
+                 test: that constant names exactly one helper today (a single `&str`, not a \
                  collection), so a SECOND legitimately-factored helper needs this test widened \
                  to a set of allowed names before the constant can name both."
             );
@@ -3737,7 +3737,7 @@
     /// The refusal message every `dispatch_unmanaged` guard must contain,
     /// shared by `resume_from_guard_precedes` and the conformance test's
     /// own failure message.
-    const RESUME_FROM_GUARD_ANCHOR: &str = "not supported on the remote single-shot dispatch path";
+    const RESUME_FROM_GUARD_ANCHOR: &str = "not supported on the unmanaged-endpoint single-shot dispatch path";
 
     /// (#2614 review, Also-fix — duplication) The ONE helper function this
     /// scan chases the anchor into. `dispatch()`'s inline guard and
@@ -4893,7 +4893,7 @@
         // stops being transmitted is indistinguishable from the bug.
         assert!(
             argv.contains(&"DARKMUX_FEEDBACK_INJECTION=false".to_string()),
-            "the OFF state must be forwarded verbatim — the runtime only honors \
+            "the OFF state must be forwarded verbatim: the runtime only honors \
              `0|off|false|no`, so any other rendering silently re-enables it: {argv:?}"
         );
 
@@ -10512,7 +10512,7 @@
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
-    // ─── build_remote_record (#1645 fix-pass MUST FIX 1) ───────────────
+    // ─── build_unmanaged_record (#1645 fix-pass MUST FIX 1) ───────────────
 
     /// (#1645 fix-pass review) `dispatch_unmanaged` performs real HTTP and is
     /// therefore never executed by the ordinary suite — the SAME class of
@@ -10525,12 +10525,12 @@
     /// today (`dispatch()` routes any `dispatch.internal` step whose
     /// resolved profile is remote here, before the container path's own
     /// resolution ever runs). Proven: reverting `dispatch_unmanaged`'s three
-    /// live `build_remote_record` call sites back to a hardcoded `None`
+    /// live `build_unmanaged_record` call sites back to a hardcoded `None`
     /// (leaving the `on_abort` closure's `mission_id_for_abort` stamped, so
     /// nothing warns about an unused binding) left `cargo test -p
     /// darkmux-crew` fully green — 1630 passed, 0 failed.
     ///
-    /// `build_remote_record` is a pure function (no HTTP, no env, no
+    /// `build_unmanaged_record` is a pure function (no HTTP, no env, no
     /// filesystem) — this test calls it directly, so it kills that exact
     /// mutant in one assertion regardless of which caller reaches it.
     /// A hosted-endpoint execution's record names who wrote it (darkmux),
@@ -10538,7 +10538,7 @@
     /// this one included, which claimed a topology it did not have.
     #[test]
     fn a_hosted_executions_record_claims_no_local_tier() {
-        let rec = build_remote_record(
+        let rec = build_unmanaged_record(
             "coder",
             &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
@@ -10553,8 +10553,8 @@
     }
 
     #[test]
-    fn build_remote_record_threads_mission_id_through() {
-        let rec = build_remote_record(
+    fn build_unmanaged_record_threads_mission_id_through() {
+        let rec = build_unmanaged_record(
             "coder",
             &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
@@ -10570,7 +10570,7 @@
 
         // Inverted case, same discipline as #1645's own inverted test: no
         // mission resolved ⇒ no fabricated mission_id.
-        let bare = build_remote_record(
+        let bare = build_unmanaged_record(
             "coder",
             &crate::test_session("sess-2"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
@@ -15377,7 +15377,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             wake,
             WatchdogWake::Abandoned,
             "the watchdog must wake because the guard fired, not because the inactivity \
-             deadline passed — `DeadlineExpired` means the abandonment check inside \
+             deadline passed: `DeadlineExpired` means the abandonment check inside \
              run_watchdog / spawn_guarded_watchdog is not actually wired"
         );
         assert!(

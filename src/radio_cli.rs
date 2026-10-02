@@ -63,7 +63,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     };
     if catalog.is_empty() {
         println!(
-            "radio: no mission config is launchable — the merged registry (built-ins + \
+            "radio: no mission config is launchable: the merged registry (built-ins + \
              ~/.darkmux/mission-configs/) is empty."
         );
         return Ok(0);
@@ -136,7 +136,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             Ok(1)
         }
         RouteDecision::Route { command, args } => {
-            println!("radio: routing to `mission launch {command}` — from your text");
+            println!("radio: routing to `mission launch {command}`: from your text");
             if dry_run {
                 if args.trim().is_empty() {
                     println!("radio: --dry-run — would invoke `{command}` with no arguments");

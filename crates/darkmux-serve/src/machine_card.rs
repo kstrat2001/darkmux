@@ -56,8 +56,10 @@ use std::time::Duration;
 /// were the wrong axis), and its `cap` is gone. `cap` was the machine's
 /// `remote.concurrent_cap`; concurrency is per endpoint now
 /// (`endpoints.<id>.limits.concurrent_calls`), so there is no one number to
-/// report. A 1.2 reader reads an older card's `hosted` key and ignores its
-/// `cap`; 1.0 and 1.1 are unreleased, so no shipped reader meets a 1.2 card.
+/// report. 1.2 also adds `serves_radio` and `serves_profiles`, optional facts
+/// about what this machine serves to peers (absent when not stated). A 1.2
+/// reader reads an older card's `hosted` key and ignores its `cap`; 1.0 and
+/// 1.1 are unreleased, so no shipped reader meets a 1.2 card.
 pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
@@ -575,7 +577,11 @@ pub(crate) fn gather_local_card() -> MachineCard {
             (profiles, default, utility, None)
         }
         Err(e) => {
-            eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
+            // Informational: the card itself carries the failure (`REGISTRY_UNREADABLE`), and a
+            // CLI read of the fleet view (`profile list --machine <x>`) gathers this card on
+            // the way. Printed for a log (non-terminal stderr, the daemon) or `--verbose`, quiet
+            // in a terminal.
+            darkmux_types::diag_eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
             (Vec::new(), None, None, Some(REGISTRY_UNREADABLE.to_string()))
         }
     };

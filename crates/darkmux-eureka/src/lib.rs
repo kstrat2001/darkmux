@@ -211,7 +211,6 @@ pub enum Verdict {
     /// Rust-internal today. When verdicts start shipping on the flow
     /// telemetry stream (#657), this variant becomes part of the wire format
     /// and the `RULES_SCHEMA_VERSION` contract gates that bump.
-    #[allow(dead_code)]
     PassWith(String),
     /// Rule fired. Message describes the specific finding; severity comes
     /// from the rule def by default but may be downgraded at runtime.

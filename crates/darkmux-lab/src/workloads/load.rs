@@ -293,7 +293,6 @@ fn parse(path: &Path, source: WorkloadSource) -> Result<LoadedWorkload> {
         .to_path_buf();
     Ok(LoadedWorkload {
         manifest,
-        manifest_path: path.to_path_buf(),
         base_dir,
         source,
     })
@@ -338,7 +337,6 @@ fn parse_str(raw: &str, id: &str) -> Result<LoadedWorkload> {
     let base = PathBuf::from(format!("<embedded>/{id}"));
     Ok(LoadedWorkload {
         manifest,
-        manifest_path: base.join("workload.json"),
         base_dir: base,
         source: WorkloadSource::Embedded,
     })

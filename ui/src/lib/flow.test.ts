@@ -62,7 +62,7 @@ describe("firstRecordDate", () => {
     expect(firstRecordDate([])).toBeNull();
   });
 
-  it("is null when the first record has no ts — it reads the first record, not the earliest", () => {
+  it("is null when the first record has no ts: it reads the first record, not the earliest", () => {
     expect(firstRecordDate(normAll([{ action: "operator.note" }, { ts: "2026-08-07T00:00:00Z" }]))).toBeNull();
   });
 });
@@ -264,7 +264,7 @@ describe("missionReplayDate (header owns liveness — a RUNNING mission is live,
   });
 });
 
-describe("(#2911) runIndex — the per-window run index", () => {
+describe("(#2911) runIndex: the per-window run index", () => {
   const rec = (sid: unknown, action: string, ts: string) => norm({ ts, session_id: sid, action } as RawRecord);
   const dup = rec("b", "dispatch.turn", "2026-09-26T10:00:04Z");
   const data: NormRecord[] = [

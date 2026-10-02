@@ -3034,7 +3034,7 @@
             entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#),
             entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
         ]);
-        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap().records;
+        let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED).unwrap().records;
         assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
     }
 
@@ -3044,7 +3044,7 @@
     #[test]
     fn redis_backfill_stamps_each_record_with_its_hub_id() {
         let raw = redis::Value::Array(vec![xentry(2_000, "2026-05-14T09:00:05Z"), xentry(1_000, "2026-05-14T09:00:00Z")]);
-        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap().records;
+        let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED).unwrap().records;
         let ids: Vec<_> = records.iter().map(|r| r["hub_id"].as_str().unwrap_or("")).collect();
         assert_eq!(ids, vec!["1000-0", "2000-0"]);
     }
@@ -3069,6 +3069,9 @@
         ])
     }
 
+    /// A `redis.maxlen` of `0` (unbounded): the stream is never trimmed.
+    const UNTRIMMED: usize = 0;
+
     /// 2026-05-14T00:00:00Z in epoch milliseconds.
     const DAY_START_MS: u64 = 1_778_716_800_000;
 
@@ -3090,20 +3093,24 @@
             v.push(xentry(oldest_ms, "2026-05-14T09:00:00Z"));
             redis::Value::Array(v)
         };
-        let inside = super::records_from_xrevrange(full(DAY_START_MS + 1000), Some("2026-05-14")).unwrap();
+        let inside = super::records_from_xrevrange(full(DAY_START_MS + 1000), Some("2026-05-14"), UNTRIMMED).unwrap();
         assert!(inside.cut, "a full COUNT whose oldest entry is inside the date is cut");
-        let before = super::records_from_xrevrange(full(DAY_START_MS - 1000), Some("2026-05-14")).unwrap();
+        let before = super::records_from_xrevrange(full(DAY_START_MS - 1000), Some("2026-05-14"), UNTRIMMED).unwrap();
         assert!(!before.cut, "a full COUNT that reached back before the date holds all of it");
     }
 
-    /// A short read is the whole stream: the date is cut only if the stream's
-    /// first entry is newer than the date's start (the head was trimmed).
+    /// A short read is the whole stream: it is cut only when the stream is known to have been
+    /// trimmed (its length reached `redis.maxlen`) and its first entry is newer than the date's
+    /// start. A young or never-trimmed stream has lost nothing, so is NOT cut.
     #[test]
-    fn redis_day_read_is_cut_when_the_stream_starts_after_the_date_does() {
+    fn redis_day_read_is_cut_only_when_the_stream_was_trimmed_past_the_date() {
         let one = |ms| redis::Value::Array(vec![xentry(ms, "2026-05-14T09:00:00Z")]);
-        assert!(super::records_from_xrevrange(one(DAY_START_MS + 5000), Some("2026-05-14")).unwrap().cut);
-        assert!(!super::records_from_xrevrange(one(DAY_START_MS - 5000), Some("2026-05-14")).unwrap().cut);
-        assert!(!super::records_from_xrevrange(redis::Value::Array(vec![]), Some("2026-05-14")).unwrap().cut);
+        let cut = |raw, maxlen| super::records_from_xrevrange(raw, Some("2026-05-14"), maxlen).unwrap().cut;
+        assert!(!cut(one(DAY_START_MS + 5000), UNTRIMMED), "a young stream (no trim) is not cut");
+        assert!(!cut(one(DAY_START_MS + 5000), 100), "a stream shorter than maxlen was never trimmed");
+        assert!(cut(one(DAY_START_MS + 5000), 1), "a stream at maxlen, starting inside the date, was trimmed");
+        assert!(!cut(one(DAY_START_MS - 5000), 1), "a trimmed stream that still reaches back before the date holds it all");
+        assert!(!cut(redis::Value::Array(vec![]), UNTRIMMED));
     }
 
     /// The reverse lie: bookends kept outside the ring, and a union of two
@@ -4404,7 +4411,7 @@
                 "probes": [
                     {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
                 ],
-                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "remote": true, "endpoint": "provider.example", "passes": 2}
+                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "unmanaged": true, "endpoint": "provider.example", "passes": 2}
             }
         }]);
         fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
@@ -6248,7 +6255,7 @@
             .expect("STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject");
         let (body, _) = after
             .split_once("]);")
-            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts — the pin lost its subject");
+            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts: the pin lost its subject");
         body
     }
 
@@ -6303,7 +6310,7 @@
             assert!(
                 map.contains(&format!("[{key},")),
                 "ui/src/lenses/mission/graph.ts lost the {key} entry from its \
-                 STATUS_ACTIONS map — the SSE delta layer silently stops animating that transition"
+                 STATUS_ACTIONS map: the SSE delta layer silently stops animating that transition"
             );
         }
     }
@@ -6334,7 +6341,7 @@
             assert!(
                 map.contains(&format!("[{key},")),
                 "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
-                 STEP_LIFECYCLE_ACTIONS entry {key} — the graph lens would silently \
+                 STEP_LIFECYCLE_ACTIONS entry {key}: the graph lens would silently \
                  stop animating that step transition"
             );
         }

@@ -71,7 +71,7 @@ fn mock_ports_drive_a_full_acquire_then_release_round_trip() {
         model_key: "mock-model".to_string(),
         n_ctx: Some(8_000),
         identifier: None,
-        remote: false,
+        unmanaged: false,
         seat: "primary".to_string(),
     }];
     let (placements, quarantined) = desired::ingest(&desired_entries);

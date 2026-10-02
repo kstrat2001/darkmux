@@ -306,10 +306,7 @@ fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
 /// registry.
 ///
 /// `publisher` is read from `lms ls --json` (e.g. "Qwen", "google",
-/// "lmstudio-community"). Surfaced through this struct as public API
-/// for downstream tools; the current `scan` command consumes other
-/// fields, hence the dead-code lint.
-#[allow(dead_code)]
+/// "lmstudio-community").
 #[derive(Debug, Clone)]
 pub struct ModelMeta {
     pub model_key: String,

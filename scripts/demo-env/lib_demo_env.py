@@ -1,7 +1,7 @@
 """Ambient environment the demo harness must not inherit.
 
 darkmux refuses to start while a retired setting's env var is set
-(`darkmux_types::config::RETIRED_SETTINGS` / `RENAMED_SETTINGS`), and the
+(`darkmux_types::config::RETIRED_SETTINGS`), and the
 operator's own shell may still export one. The demo is isolated from the
 ambient shell by design, so it drops them instead of failing on them.
 """

@@ -49,7 +49,6 @@
 /// predicates below are written once against the final shape rather than
 /// widened later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum AbortReason {
     /// The degeneracy gate fired at an observation boundary: the reasoning
     /// is repeating and continuing would burn budget on it.
@@ -78,7 +77,6 @@ pub enum CutSource {
     /// `None` no `usage` arrived and the question cannot be answered.
     ServerLength { measured_at_cap: Option<bool> },
     /// The runtime ended the stream deliberately. Stage 1 onward.
-    #[allow(dead_code)]
     RuntimeAbort(AbortReason),
 }
 

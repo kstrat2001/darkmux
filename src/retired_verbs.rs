@@ -176,6 +176,54 @@ const RETIRED_5_0: &[RetiredVerb] = &[RetiredVerb {
              launch the `review` mission with `darkmux mission launch review`.",
 }];
 
+/// Spellings removed in 2.0 (the verb collapse into `machine` / `memory` /
+/// `mission launch`, #1426), before the table above began naming a release.
+const RETIRED_2_0: &[RetiredVerb] = &[
+    RetiredVerb {
+        words: &["swap"],
+        flag: None,
+        remedy: "Nothing loads a profile by hand any more: each dispatch loads what its staffing \
+                 declares. `darkmux machine status` shows what is loaded and `darkmux machine eject` \
+                 releases darkmux's models.",
+    },
+    RetiredVerb {
+        words: &["status"],
+        flag: None,
+        remedy: "Use `darkmux machine status` for what is loaded, or `darkmux mission status` for the \
+                 mission board.",
+    },
+    RetiredVerb {
+        words: &["fleet"],
+        flag: None,
+        remedy: "The roster is the `machine` family: `darkmux machine list`, `darkmux machine add <id>`, \
+                 `darkmux machine remove <id>`.",
+    },
+    RetiredVerb {
+        words: &["lessons"],
+        flag: None,
+        remedy: "Use `darkmux memory lesson ...` for the lessons you author and \
+                 `darkmux memory correction ...` for a reviewer's recorded corrections.",
+    },
+    RetiredVerb {
+        words: &["model"],
+        flag: None,
+        remedy: "Use the `machine` family: `darkmux machine status` (what is loaded), \
+                 `darkmux machine resources` (the memory ledger) and `darkmux machine eject`.",
+    },
+    RetiredVerb {
+        words: &["crew", "sync"],
+        flag: None,
+        remedy: "There is no replacement: the runtime reads role manifests directly, so there is no \
+                 registry to sync. To run a role, use `darkmux dispatch <role> \"<message>\"`.",
+    },
+    RetiredVerb {
+        words: &["mission", "run"],
+        flag: None,
+        remedy: "Use `darkmux mission launch <config>` (for the coder pipeline, \
+                 `darkmux mission launch coder-phase`).",
+    },
+];
+
 impl RetiredVerb {
     fn matches(&self, args: &[String]) -> bool {
         let leads = self.words.len() <= args.len()
@@ -204,7 +252,7 @@ impl RetiredVerb {
 /// The refusal for a command line (`args` without the program name) that
 /// names a retired spelling, or `None` when it names none.
 pub(crate) fn refusal(args: &[String]) -> Option<String> {
-    [("4.0", RETIRED), ("5.0", RETIRED_5_0)].into_iter().find_map(|(release, table)| {
+    [("2.0", RETIRED_2_0), ("4.0", RETIRED), ("5.0", RETIRED_5_0)].into_iter().find_map(|(release, table)| {
         table
             .iter()
             .find(|r| r.matches(args))
@@ -216,7 +264,7 @@ pub(crate) fn refusal(args: &[String]) -> Option<String> {
 /// assert a model-facing surface never offers one (F12).
 #[cfg(test)]
 pub(crate) fn retired_spellings() -> Vec<String> {
-    RETIRED.iter().chain(RETIRED_5_0).map(RetiredVerb::spelling).collect()
+    RETIRED.iter().chain(RETIRED_2_0).chain(RETIRED_5_0).map(RetiredVerb::spelling).collect()
 }
 
 #[cfg(test)]
@@ -238,6 +286,29 @@ mod tests {
             assert!(msg.contains(&format!("`darkmux mission {verb}` was removed")), "{msg}");
             assert!(msg.contains("darkmux mission launch <config>"), "{msg}");
         }
+    }
+
+    /// The verbs 2.0 removed each name that release and where the work went; none is left to clap's
+    /// "similar subcommand" guess (`model` suggested `mod`, `lessons` suggested `mission`).
+    #[test]
+    fn the_2_0_verbs_are_refused_with_a_pointer_not_a_guess() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["swap", "fast"], "darkmux swap", "darkmux machine status"),  // drift-guard:allow retired verb: asserts the refusal names it
+            (&["status"], "darkmux status", "darkmux machine status"),
+            (&["fleet", "list"], "darkmux fleet", "darkmux machine list"),  // drift-guard:allow retired verb: asserts the refusal names it
+            (&["lessons", "add", "x"], "darkmux lessons", "darkmux memory lesson"),
+            (&["model", "eject"], "darkmux model", "darkmux machine eject"),
+            (&["crew", "sync"], "darkmux crew sync", "no replacement"),  // drift-guard:allow retired verb: asserts the refusal names it
+            (&["mission", "run", "coder-phase"], "darkmux mission run", "darkmux mission launch"),  // drift-guard:allow retired verb: asserts the refusal names it
+        ];
+        for (argv, spelling, pointer) in cases {
+            let msg = refusal(&args(argv)).unwrap_or_else(|| panic!("{argv:?} was not refused"));
+            assert!(msg.contains(&format!("`{spelling}` was removed in 2.0")), "{msg}");
+            assert!(msg.contains(pointer), "{msg}");
+        }
+        assert!(refusal(&args(&["machine", "status"])).is_none());
+        assert!(refusal(&args(&["mission", "launch", "coder-phase"])).is_none());
+        assert!(refusal(&args(&["mod", "list"])).is_none());
     }
 
     #[test]

@@ -286,7 +286,7 @@ pub fn analyze_run(
 /// Why a `Failed` verdict failed, most fundamental cause first.
 fn failed_note(dispatch_ok: bool, verify: Option<bool>, tool_calls: u32) -> String {
     match (dispatch_ok, tool_calls, verify) {
-        (false, _, _) => "dispatch did not exit cleanly — runtime error or non-zero exit".into(),
+        (false, _, _) => "dispatch did not exit cleanly: runtime error or non-zero exit".into(),
         (true, 0, None) => {
             "model made 0 tool calls (inert), and the workload declares no verify to confirm success".into()
         }
