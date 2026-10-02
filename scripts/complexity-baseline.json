@@ -35,7 +35,7 @@
   "crates/darkmux-crew/src/scheduler.rs::run_step_graph": 41,
   "crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind::run_map": 17,
   "crates/darkmux-crew/src/step_kinds/builtins.rs::resolve_map_collection": 18,
-  "crates/darkmux-crew/src/step_kinds/deliver_github_review.rs::render_github_review": 23,
+  "crates/darkmux-crew/src/step_kinds/deliver_github_review.rs::render_github_review": 21,
   "crates/darkmux-crew/src/step_kinds/liveness_conformance.rs::block_from": 37,
   "crates/darkmux-crew/src/step_kinds/mods_gate.rs::gate_one_mod": 24,
   "crates/darkmux-crew/src/step_kinds/patterns/plan_sites.rs::plan_site_units": 16,

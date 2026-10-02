@@ -172,6 +172,15 @@ const STANDING_NARROWNESS: &str =
     "This review checks a fixed set of rules; it is not a full design review.";
 
 impl DeliverScope {
+    /// Whether this run LOOKED at everything and nothing broke: no error, no
+    /// unreadable input (#2425), and the diff's hunks covered.
+    /// `hunks_total == 0` is the honest zero (nothing to cover), not an
+    /// uncovered run.
+    fn is_clean(&self) -> bool {
+        let covered = self.hunks_total == 0 || self.hunks_covered >= self.hunks_total;
+        self.errored.is_empty() && self.unreadable.is_empty() && covered
+    }
+
     /// The denominator for "N of M rules reviewed". `rules_total` when the
     /// producer set it (never below the number that actually ran — a
     /// smaller declared count than run count is a bookkeeping error, and
@@ -698,8 +707,7 @@ pub fn render_github_review(
         // as MUST FIX D one line below, on the coverage axis instead of
         // the error axis. `hunks_total == 0` is the honest zero (nothing
         // to cover, e.g. an empty diff), not an uncovered run.
-        let covered = scope.hunks_total == 0 || scope.hunks_covered >= scope.hunks_total;
-        if scope.errored.is_empty() && scope.unreadable.is_empty() && covered {
+        if scope.is_clean() {
             // A genuinely CLEAN run — nothing to say because nothing went
             // wrong, nothing was found, and the whole diff was looked at.
             // The only `mode` this applies to.
