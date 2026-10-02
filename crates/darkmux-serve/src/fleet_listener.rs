@@ -923,7 +923,7 @@ async fn scope_submission(
     let (st, adm, job) = (state.clone(), admitted.clone(), sub.job.clone());
     let scoped = tokio::task::spawn_blocking(move || scope_job(&st, &adm, &job))
         .await
-        .unwrap_or_else(|e| Err(Refusal::BadConfig { detail: format!("profile resolution did not finish: {e}") }))?;
+        .unwrap_or_else(|e| Err(Refusal::ResolutionFailed { detail: format!("profile resolution did not finish: {e}") }))?;
     Ok((sub, scoped))
 }
 
@@ -1594,6 +1594,9 @@ mod tests {
             token: Arc::new(move || token_read.lock().unwrap().clone()),
             allow_list: Arc::new(move || Ok(allow_read.lock().unwrap().clone())),
             resolve_profile: Arc::new(move |_role, requested| {
+                if requested == Some("boom") {
+                    panic!("the test resolver panics on purpose");
+                }
                 if requested.is_none() && hosted_now.load(std::sync::atomic::Ordering::SeqCst) {
                     return ProfileResolution::Work {
                         profile: "host".into(),
@@ -1615,7 +1618,10 @@ mod tests {
             }),
             execute: Arc::new(move |job: WorkJob, profile: String, origin: String| {
                 origins_c.lock().unwrap().push(origin);
-                std::thread::sleep(Duration::from_millis(job_ms));
+                // A job whose message is "slow" runs ten times as long, so a test
+                // can end one job while another still runs.
+                let ms = if job.message == "slow" { job_ms * 10 } else { job_ms };
+                std::thread::sleep(Duration::from_millis(ms));
                 ran_c.lock().unwrap().push((job.session_id.wire(), profile.clone()));
                 Ok(DispatchResult {
                     exit_code: 0,
@@ -2047,12 +2053,41 @@ mod tests {
     /// id. Both hold a seat, and the cap still bounds them.
     #[test]
     fn a_repeated_sender_session_takes_two_seats_and_the_cap_holds() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Refuse, Some(2), WIDE);
+        let h = start_full(Some(laptop()), false, 300, Arc::new(|| Ok(())), BusyPolicy::Refuse, Some(2), WIDE);
         allow_profiles(&h, &["host", "small", "cloud"]);
+        let slow = |session: &str| {
+            let mut j = job(session, Some("cloud"));
+            j.message = "slow".into();
+            j
+        };
         assert_eq!(post(&h, TOKEN, job("dup", Some("cloud")), false).0, 202);
-        assert_eq!(post(&h, TOKEN, job("dup", Some("cloud")), false).0, 202, "same session id, second seat");
+        assert_eq!(post(&h, TOKEN, slow("dup"), false).0, 202, "same session id, second seat");
         assert_eq!(h.seats.running().len(), 2, "two claims, one session id");
-        assert_eq!(post(&h, TOKEN, job("other", Some("cloud")), true).0, 503, "the cap of 2 holds");
+        // The first dup finishes; the slow one still runs. Freeing by session
+        // id would free both seats here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while h.seats.running().len() > 1 {
+            assert!(std::time::Instant::now() < deadline, "the fast dup never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(post(&h, TOKEN, slow("o1"), false).0, 202, "one seat is free");
+        let (code, reply) = post(&h, TOKEN, slow("o2"), true);
+        assert_eq!(code, 503, "the cap of 2 holds while the other dup runs: {reply:?}");
+    }
+
+    /// (5.0) A resolver that panics on a new submission is a 503 the sender
+    /// can read, and the sentence does not send the operator to fix a config
+    /// that is not at fault.
+    #[test]
+    fn a_resolver_panic_is_a_503_that_does_not_blame_the_config() {
+        let h = start(Some(laptop()), false, 0);
+        let (code, reply) = post(&h, TOKEN, job("s-boom", Some("boom")), true);
+        assert_eq!(code, 503, "{reply:?}");
+        assert_eq!(reply.refusal, Some(darkmux_fleet::RefusalCode::BadConfig), "{reply:?}");
+        let reason = reply.reason.unwrap();
+        assert!(reason.contains("could not resolve a profile"), "{reason}");
+        assert!(!reason.contains("config is fixed"), "{reason}");
+        assert!(h.seats.running().is_empty() && h.ran.lock().unwrap().is_empty(), "nothing ran");
     }
 
     /// (#2916 stage 2) `queue`: a waited-on job hears it is queued at once,

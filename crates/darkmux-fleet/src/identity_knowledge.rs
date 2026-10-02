@@ -168,8 +168,9 @@ pub fn gather_identity_knowledge(
         let Ok(file) = std::fs::File::open(&path) else { continue };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             let Some((name, uid)) = record_identity(&line) else { continue };
-            // A record without a uid names no machine: every record this
-            // binary writes carries one.
+            // A record without a uid names no machine. The field is optional
+            // (a machine whose `machine_uid()` fails writes records without
+            // it), so such a record is skipped, not matched by name.
             let Some(uid) = uid else { continue };
             known.uids_by_name.entry(name.clone()).or_default().insert(uid.clone());
             known.current_name_by_uid.insert(uid, name);

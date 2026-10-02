@@ -296,6 +296,10 @@ pub enum Refusal {
     /// The job names a hardware uid and this machine cannot read its own, so
     /// it cannot confirm the job is its own; it does not fall back to the name.
     UidUnconfirmable { target: String },
+    /// Resolving the job's profile on this machine failed unexpectedly (the
+    /// resolver panicked). Not a config problem the sender or operator can
+    /// name; the code is still `bad_config`, the receiver-side class.
+    ResolutionFailed { detail: String },
     /// Part of the job is outside the peer's allow-list entry.
     OutOfScope { peer: String, item: OutOfScope },
     /// The connection came from THIS machine's own node.
@@ -443,6 +447,7 @@ impl Refusal {
             | Refusal::TooManyAtOnce { .. }
             | Refusal::NoTokenConfigured
             | Refusal::IdentityUnavailable { .. }
+            | Refusal::ResolutionFailed { .. }
             | Refusal::BadConfig { .. } => 503,
             Refusal::NotOnOverlay { .. }
             | Refusal::NotAllowed { .. }
@@ -462,7 +467,7 @@ impl Refusal {
             Refusal::NoTokenConfigured | Refusal::Token => RefusalCode::Token,
             Refusal::IdentityUnavailable { .. } | Refusal::NotOnOverlay { .. } => RefusalCode::Identity,
             Refusal::NotAllowed { .. } => RefusalCode::NotListed,
-            Refusal::AmbiguousEntry { .. } | Refusal::BadConfig { .. } => RefusalCode::BadConfig,
+            Refusal::AmbiguousEntry { .. } | Refusal::BadConfig { .. } | Refusal::ResolutionFailed { .. } => RefusalCode::BadConfig,
             Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => RefusalCode::Misaddressed,
             Refusal::OutOfScope { item, .. } => item.code(),
             Refusal::FromSelf => RefusalCode::FromSelf,
@@ -534,8 +539,8 @@ impl Refusal {
             ),
             Refusal::UidUnconfirmable { target } => format!(
                 "{receiver} cannot read its own hardware identity, so it cannot confirm this job for \
-                 {target} is its own, and it does not fall back to the name; fix this on {receiver} \
-                 (`darkmux doctor` reports the hardware identity), then send again"
+                 {target} is its own, and it does not fall back to the name; on {receiver}, the \
+                 `machine uid` row of `darkmux doctor` says why its uid is unreadable. Then send again"
             ),
             Refusal::OutOfScope { peer, item } => item.reason(receiver, peer),
             Refusal::UtilityProfile { profile } => format!(
@@ -589,6 +594,9 @@ impl Refusal {
                  major version on both machines, and the newer minor on the receiver"
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::ResolutionFailed { detail } => {
+                format!("{receiver} could not resolve a profile for this job ({detail}); retry, and if it repeats, look at {receiver}'s `darkmux serve` log")
+            }
             Refusal::BadConfig { detail } => format!(
                 "{receiver} cannot run work until its own config is fixed (on {receiver}: \
                  `darkmux doctor`, then restart `darkmux serve`, which reads config once at \
@@ -1926,6 +1934,7 @@ mod tests {
         assert_eq!(refusal.http_status(), 421);
         assert_eq!(refusal.code(), RefusalCode::Misaddressed);
         let sentence = refusal.reason("studio");
+        assert!(sentence.contains("`machine uid` row of `darkmux doctor`"), "{sentence}");
         assert!(sentence.contains("cannot read its own hardware identity") && !sentence.contains("SOME-UID"), "{sentence}");
     }
 
@@ -2123,6 +2132,7 @@ mod tests {
             (Refusal::BoundaryUnmanaged { profile: s() }, RefusalCode::Boundary),
             (Refusal::BoundaryUnknown, RefusalCode::Boundary),
             (Refusal::BadConfig { detail: s() }, RefusalCode::BadConfig),
+            (Refusal::ResolutionFailed { detail: s() }, RefusalCode::BadConfig),
         ];
         for (refusal, code) in all {
             assert_eq!(refusal.code(), code, "{refusal:?}");

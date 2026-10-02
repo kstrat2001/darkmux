@@ -1119,6 +1119,7 @@ mod tests {
             })
         };
         assert_eq!(learn("mini"), None, "`mini` is m2's learned name");
+        assert_eq!(learn("MINI"), None, "a case variant of m2's learned name is refused too");
         assert_eq!(learn("studio-now").as_deref(), Some("studio-now"), "a new name is learned");
     }
 }

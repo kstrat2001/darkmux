@@ -163,6 +163,7 @@ pub fn run() -> DoctorReport {
         check_rules_registry(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
+        machine_uid_check(hardware::machine_uid()),
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
@@ -2329,6 +2330,29 @@ fn check_machine_id_resolution() -> Check {
             message: "could not resolve a machine_id — flow records will lack machine provenance".into(),
             hint: Some(
                 "Set a logical fleet name with `darkmux config set machine_id <name>` (e.g. `studio`, `mini-1`), or install `hostname(1)` on PATH.".into(),
+            ),
+        },
+    }
+}
+
+/// (5.0) Whether this machine can read its own hardware uid. A job that names
+/// a hardware uid is refused here when it cannot (it never falls back to the
+/// machine name), so an unreadable uid is a warning with its consequence. The
+/// uid itself is never printed.
+fn machine_uid_check(uid: Option<&str>) -> Check {
+    match uid {
+        Some(_) => Check {
+            name: "machine uid".into(),
+            status: Status::Pass,
+            message: "this machine's hardware uid is readable".into(),
+            hint: None,
+        },
+        None => Check {
+            name: "machine uid".into(),
+            status: Status::Warn,
+            message: "this machine's own hardware uid is unreadable, so fleet jobs that name a hardware uid are refused here (misaddressed)".into(),
+            hint: Some(
+                "The uid is read from the platform (`ioreg` on macOS); check that it runs and reports IOPlatformUUID. Jobs addressed by machine name alone are still accepted.".into(),
             ),
         },
     }
@@ -12047,8 +12071,10 @@ mod tests {
         // (5.0, #3036) `check_machine_rollup` left with the `machine_rollup`
         // block, and (#2312) `check_mission_config_registry` moved out of
         // `run()`: the root crate appends it with the full step-kind catalog.
+        //
+        // (5.0) 69: `machine_uid_check` joined beside the machine_id row.
         let expected =
-            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -16911,6 +16937,21 @@ mod roster_identity_tests {
         let check = check_roster_addresses(&[entry("studio", None), entry("laptop", None)], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("2 roster"), "{}", check.message);
+    }
+}
+
+#[cfg(test)]
+mod machine_uid_row_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_uid_warns_with_its_consequence_and_a_readable_one_passes() {
+        let warn = machine_uid_check(None);
+        assert_eq!(warn.status, Status::Warn);
+        assert!(warn.message.contains("refused here") && warn.message.contains("unreadable"), "{}", warn.message);
+        let pass = machine_uid_check(Some("A1B2-SECRET-UID"));
+        assert_eq!(pass.status, Status::Pass);
+        assert!(!format!("{pass:?}{warn:?}").contains("SECRET-UID"), "the uid is never printed");
     }
 }
 
