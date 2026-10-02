@@ -1081,10 +1081,9 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
 
   /** The REAL producer shape for a `dispatch.map` step's completion:
    * `DispatchMapStepKind`'s bookend stamps `result_class`/`items_in`/
-   * `ok_count`/`failed_count` and adds `unmanaged_tokens` ONLY when the step
-   * is hosted (`stamp_remote_classification` is called `if
-   * endpoint_label.is_some()`). A LOCAL map step's completion therefore
-   * carries NO token total at all, fails `hasAnyTokenCounts`, and never
+   * `ok_count`/`failed_count` and names the `endpoint` ONLY when the step
+   * is hosted. A map step's completion carries no token total of its own
+   * (the tokens are on its usage records), fails `hasAnyTokenCounts`, and never
    * enters `dcTok` — it registers a verdict without ever contributing a
    * countable bookend. Every pre-existing test in this file gives its local
    * completions a `total_tokens`, which is exactly why none of them reached
