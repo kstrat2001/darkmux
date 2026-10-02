@@ -61,7 +61,7 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
+import { isSingleShotWorkUsage, sumUsage, usageContribution } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
@@ -439,14 +439,19 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
  *  (compaction, radio routing) named beside it as `utility` rather than left
  *  out: a page showing less than its row is two answers for one run. `null`
  *  when nothing was measured (the tile shows "—"). */
-function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number; utility: number } | null {
+function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number; total: number; utility: number; split: boolean } | null {
   const s = sumUsage(records);
-  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion, utility: s.utility } : null;
+  // No record carried a prompt or completion count: the split was not reported.
+  const split = records.some((r) => {
+    const a = usageContribution(r);
+    return a !== null && (a.prompt > 0 || a.completion > 0);
+  });
+  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion, total: s.total, utility: s.utility, split } : null;
 }
 
 /** The three token figures a tile reads, each `null` when nothing was measured. */
-function tokenFigures(tok: ReturnType<typeof executionTokens>): { tokIn: number | null; tokOut: number | null; tokUtility: number | null } {
-  return { tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, tokUtility: tok ? tok.utility : null };
+function tokenFigures(tok: ReturnType<typeof executionTokens>): { tokIn: number | null; tokOut: number | null; tokTotal: number | null; tokUtility: number | null } {
+  return { tokIn: tok?.split ? tok.prompt : null, tokOut: tok?.split ? tok.completion : null, tokTotal: tok ? tok.total : null, tokUtility: tok ? tok.utility : null };
 }
 
 interface MissionModelRollup {
@@ -454,6 +459,7 @@ interface MissionModelRollup {
   turns: number | null;
   tokIn: number | null;
   tokOut: number | null;
+  tokTotal: number | null;
   tokUtility: number | null;
   ctxPeak: number;
   ctxNow: number;
@@ -505,7 +511,7 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
  *  telemetry finding real numbers on its inner sessions), not per-seat
  *  breakdown. */
 function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRollup {
-  const acc: MissionModelRollup = { hasEvidence: false, turns: null, tokIn: null, tokOut: null, tokUtility: null, ctxPeak: 0, ctxNow: 0, nctx: 0, loadLines: [] };
+  const acc: MissionModelRollup = { hasEvidence: false, turns: null, tokIn: null, tokOut: null, tokTotal: null, tokUtility: null, ctxPeak: 0, ctxNow: 0, nctx: 0, loadLines: [] };
   for (const g of siblings) {
     const fig = executionFigures(g.records);
     if (fig) addFigures(acc, fig);
@@ -554,6 +560,7 @@ function addFigures(acc: MissionModelRollup, f: ModelFigures & { loads: NormReco
   acc.turns = addOpt(acc.turns, f.turns);
   acc.tokIn = addOpt(acc.tokIn, f.tokIn);
   acc.tokOut = addOpt(acc.tokOut, f.tokOut);
+  acc.tokTotal = addOpt(acc.tokTotal, f.tokTotal);
   acc.tokUtility = addOpt(acc.tokUtility, f.tokUtility);
   acc.ctxPeak = Math.max(acc.ctxPeak, f.ctxPeak);
   acc.ctxNow = Math.max(acc.ctxNow, f.ctxNow);
@@ -840,6 +847,9 @@ interface ModelFigures {
   turns: number | null;
   tokIn: number | null;
   tokOut: number | null;
+  /** The run's ALL TOKENS, the figure its row shows: INPUT + GENERATED can
+   *  fall short of it (a total-only record, reasoning counted apart). */
+  tokTotal: number | null;
   /** The utility part of `tokIn + tokOut` (compaction, radio routing), named
    *  rather than left out; `null` when nothing was measured. */
   tokUtility: number | null;
@@ -849,8 +859,16 @@ interface ModelFigures {
 }
 
 /** (#3067) The hover text naming the utility part of the token tiles. */
-function utilityHintOf(tokUtility: number | null): string | undefined {
-  return tokUtility ? `includes ${fmtC(tokUtility)} tokens of utility calls (compaction, radio routing)` : undefined;
+function tokenHintOf(f: Pick<ModelFigures, "tokIn" | "tokOut" | "tokTotal" | "tokUtility">): string | undefined {
+  const parts: string[] = [];
+  const split = (f.tokIn ?? 0) + (f.tokOut ?? 0);
+  if (f.tokTotal != null && f.tokTotal > split) {
+    parts.push(`${fmtC(f.tokTotal)} tokens in total, the run row's figure (not all of it is split into input and generated)`);
+  } else if (f.tokTotal != null && f.tokTotal < split) {
+    parts.push(`${fmtC(f.tokTotal)} tokens in total, the run row's figure (the provider's total is below input + generated)`);
+  }
+  if (f.tokUtility) parts.push(`includes ${fmtC(f.tokUtility)} tokens of utility calls (compaction, radio routing)`);
+  return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
 /** (#2759) The MODEL pane's numbers: this run's own when it has telemetry,
@@ -864,6 +882,7 @@ function effectiveFigures(own: ModelFigures, ownEvidence: boolean, rollup: Missi
     turns: rollup.turns ?? own.turns,
     tokIn: rollup.tokIn ?? own.tokIn,
     tokOut: rollup.tokOut ?? own.tokOut,
+    tokTotal: rollup.tokTotal ?? own.tokTotal,
     tokUtility: rollup.tokUtility ?? own.tokUtility,
     ctxPeak: ctx.ctxPeak,
     ctxNow: ctx.ctxNow,
@@ -1464,8 +1483,8 @@ function modelOf(d: NormRecord | null, endpoint: string | undefined, distinct: s
 /** (#2759) EVIDENCE of model work in a run's own telemetry: actual numbers,
  *  not a start record (a run-grain session has a start and nothing else, and
  *  is exactly the case the mission rollup exists for). */
-function hasTelemetryEvidence(f: { loads: NormRecord[]; turnsValue: number | null; tokIn: number | null; tokOut: number | null; ctxSamples: number; comps: NormRecord[] }): boolean {
-  return f.loads.length > 0 || f.turnsValue != null || f.tokIn != null || f.tokOut != null || f.ctxSamples > 0 || f.comps.length > 0;
+function hasTelemetryEvidence(f: { loads: NormRecord[]; turnsValue: number | null; tokIn: number | null; tokOut: number | null; tokTotal: number | null; ctxSamples: number; comps: NormRecord[] }): boolean {
+  return f.loads.length > 0 || f.turnsValue != null || f.tokIn != null || f.tokOut != null || f.tokTotal != null || f.ctxSamples > 0 || f.comps.length > 0;
 }
 
 type LiveTokScope = NonNullable<SessionRunView["liveTokScope"]>;
@@ -1622,7 +1641,7 @@ export function runRegions(
 
   // (#2902 step 2a, #3067) The plain sum of this attempt's usage records, all
   // purposes, the utility part named.
-  const { tokIn, tokOut, tokUtility } = tokenFigures(executionTokens(c ? [...tel, c] : tel));
+  const { tokIn, tokOut, tokTotal, tokUtility } = tokenFigures(executionTokens(c ? [...tel, c] : tel));
 
   // ── brief ──────────────────────────────────────────────────────────
   // (#2011) Same `runWallMs` the WALL CLOCK tile shows. The two lines report
@@ -1650,13 +1669,13 @@ export function runRegions(
   // session's shape: `d` exists, every other field is empty). Gating the
   // mission-wide rollup on `d != null` would never fire for the one case it
   // exists to fix, so this checks for actual numbers instead.
-  const ownHasTelemetryEvidence = hasTelemetryEvidence({ loads, turnsValue, tokIn, tokOut, ctxSamples, comps });
+  const ownHasTelemetryEvidence = hasTelemetryEvidence({ loads, turnsValue, tokIn, tokOut, tokTotal, ctxSamples, comps });
   const missionIdForRollup = run?.group.missionId ?? null;
   const missionRuns = missionIdForRollup ? runIndex(data).groupsOfMission(missionIdForRollup) : [];
   const rollup =
     !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(missionRuns.filter((g) => g !== run?.group)) : null;
-  const eff = effectiveFigures({ turns: turnsValue, tokIn, tokOut, tokUtility, ctxPeak, ctxNow, nctx }, ownHasTelemetryEvidence, rollup);
-  const { turns: effTurnsValue, tokIn: effTokIn, tokOut: effTokOut, tokUtility: effTokUtility } = eff;
+  const eff = effectiveFigures({ turns: turnsValue, tokIn, tokOut, tokTotal, tokUtility, ctxPeak, ctxNow, nctx }, ownHasTelemetryEvidence, rollup);
+  const { turns: effTurnsValue, tokIn: effTokIn, tokOut: effTokOut, tokTotal: effTokTotal, tokUtility: effTokUtility } = eff;
   const ctxTileFigures = ctxTile(eff, done);
 
   // (#1973) Did this unit do MODEL work at all?
@@ -1728,7 +1747,7 @@ export function runRegions(
   // (#3067) The tiles count every usage record of the run, the figure the runs
   // board shows; the part that is darkmux's own utility calls is named in the
   // tiles' hover text (no layout of its own).
-  const utilityHint = utilityHintOf(effTokUtility);
+  const utilityHint = tokenHintOf({ tokIn: effTokIn, tokOut: effTokOut, tokTotal: effTokTotal, tokUtility: effTokUtility });
   push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN", hintTitle: utilityHint });
   push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT", hintTitle: utilityHint });
   // A single-shot call records no `telemetry.context` sample and neither

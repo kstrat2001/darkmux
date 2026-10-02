@@ -58,6 +58,19 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
   );
 }
 
+type OffRow = { calls: number; tokens: number };
+
+/** (#3067) The hover text under the total: what it leaves out (machines not
+ *  streaming here) and what it includes that no run's row shows (calls with no
+ *  session, radio routing). A tooltip, so the hero keeps its height. */
+export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[]): string | undefined {
+  const parts: string[] = [];
+  if (notStreaming.length > 0) parts.push(`Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.`);
+  if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing and probes).`);
+  if (unlisted.calls > 0) parts.push(`Includes ${fmtC(unlisted.tokens)} tokens on runs not listed here.`);
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
 /**
  * `savingsHero()` (#783, #1186). Always renders,
  * even at zero — a fresh fleet with no dispatches yet shows "0", not a
@@ -173,7 +186,7 @@ const SavingsHero = memo(function SavingsHero({
           <div className="savlblwrap">
             <div
               className="savlbl"
-              title={notStreaming.length > 0 ? `Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.` : undefined}
+              title={totalHint(t.noRun, t.unlisted, notStreaming)}
             >
               {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
               {liveMode ? ` · last ${hours}h` : ""}
@@ -712,7 +725,13 @@ export function FleetLens({
     () => recordsAsOf(flowWindow.data, playhead ?? wallNow),
     [flowWindow.data, playhead, wallNow],
   );
-  const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
+  // (#3067) The listing the hero's `unlisted` is measured against: unknown (so
+  // never named) when `/runs` failed, is not asked, or came back empty.
+  const rowKeys = useMemo(() => {
+    if (!runsQuery.data?.ok || runs.length === 0) return undefined;
+    return new Set(runs.flatMap((r) => (r.dispatch_id ? [r.id, r.dispatch_id] : [r.id])));
+  }, [runsQuery.data, runs]);
+  const tokens = useMemo(() => tokensOffMeter(scopedData, rowKeys), [scopedData, rowKeys]);
 
   // (#2928) The live channel's overlay: at the live edge of a live route
   // only (`livePolling` is false on a static build, `playhead` is set on a

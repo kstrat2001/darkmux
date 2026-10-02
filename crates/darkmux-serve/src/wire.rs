@@ -238,10 +238,29 @@ pub struct CutSources {
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RunsResponse {
     pub runs: Vec<Run>,
+    /// (#3067) The usage records that name no session and no mission (radio
+    /// routing, a `doctor --probe`): in every token total, on no row's
+    /// `tokens`. The rows' `tokens` plus this are the total, the same fold
+    /// `darkmux run list` reads.
+    pub no_run: OffRowUsage,
+    /// (#3067) The usage that names a run with no row in this listing (a start
+    /// record outside the window). Rows + `no_run` + this are the total.
+    pub unlisted: OffRowUsage,
     #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
     pub meta: CoverageMeta,
     pub policy: RunsPolicy,
+}
+
+/// Calls and tokens no run row shows (see [`RunsResponse::no_run`] and `unlisted`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct OffRowUsage {
+    #[cfg_attr(test, ts(type = "number"))]
+    pub calls: u64,
+    #[cfg_attr(test, ts(type = "number"))]
+    pub tokens: u64,
 }
 
 /// `GET /missions`.

@@ -183,6 +183,10 @@ describe("usageContribution is sumUsage's per-record half (one arithmetic)", () 
     const amount = (payload: Record<string, unknown>) => usageContribution(usage("s", "h", payload))!;
     expect(amount({ prompt_tokens: 7, completion_tokens: 3, total_tokens: 12 }).total).toBe(12);
     expect(amount({ prompt_tokens: 7, completion_tokens: 3 }).total).toBe(10);
+    // (#3067) A reported total of 0 beside non-zero halves is unreported, the Rust `floor_tokens` rule.
+    expect(amount({ prompt_tokens: 900, completion_tokens: 40, total_tokens: 0 }).total).toBe(940);
+    expect(amount({ prompt_tokens: 900, total_tokens: 0 }).total).toBe(900);
+    expect(amount({ total_tokens: 0 }).total).toBe(0);
     expect(amount({ unmanaged_tokens: 5 }).total).toBe(0);
     expect(amount({ remote_tokens: 5 }).total).toBe(0);
   });
@@ -281,6 +285,37 @@ describe("the fleet hero (tokensOffMeter)", () => {
     expect(b.runs).toBe(a.runs);
   });
 
+  it("names the tokens on no run, so each run's tokens plus them are the total (#3067)", () => {
+    clock = 0;
+    const recs = [
+      usage("s1", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, prompt_tokens: 80, completion_tokens: 20, total_tokens: 100 }),
+      usage("s2", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 40 }, "m1"),
+      usage("", "radio-router", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.utility, prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 }),
+      usage("", "radio-router", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.utility, total_tokens: 4 }),
+      // A mission-only record is on the mission's row, so not on no run.
+      usage("", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 6 }, "m2"),
+    ];
+    const t = tokensOffMeter(recs);
+    expect(t.noRun).toEqual({ calls: 2, tokens: 13 });
+    const rows = sumUsage(recs.filter((x) => x.session_id || x.mission_id)).total;
+    expect(rows + t.noRun.tokens).toBe(t.total);
+    // With the listing: m1 (a row, claiming s2's record by mission) and s1 are
+    // listed; m2 has no row, so it is unlisted, and the rows, no run and
+    // unlisted are the total.
+    const listed = tokensOffMeter(recs, new Set(["s1", "m1"]));
+    expect(listed.unlisted).toEqual({ calls: 1, tokens: 6 });
+    const listedRows = sumUsage(recs.filter((x) => x.session_id === "s1" || x.mission_id === "m1")).total;
+    expect(listedRows + listed.noRun.tokens + listed.unlisted.tokens).toBe(listed.total);
+    expect(tokensOffMeter(recs).unlisted).toEqual({ calls: 0, tokens: 0 });
+    // A listed mission claims the sessions of its records (a task session
+    // shared with sessionless-owner usage), and a row's representative session
+    // (a lab row's `dispatch_id`) claims that session's usage.
+    const shared = [...recs, usage("s2", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 11 })];
+    expect(tokensOffMeter(shared, new Set(["s1", "m1"])).unlisted).toEqual({ calls: 1, tokens: 6 });
+    expect(tokensOffMeter(shared, new Set(["s1", "m1", "m2"])).unlisted).toEqual({ calls: 0, tokens: 0 });
+    expect(tokensOffMeter(shared, new Set(["s1", "s2"])).unlisted).toEqual({ calls: 1, tokens: 6 });
+  });
+
   it("a compactor call or a single-shot record alone never opens an in-flight dispatch", () => {
     clock = 0;
     const only = [
@@ -306,7 +341,7 @@ describe("the fleet hero (tokensOffMeter)", () => {
     const recs = [usage("rz", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, prompt_tokens: 100, completion_tokens: 20, total_tokens: 150, reasoning_tokens: 30 })];
     const t = tokensOffMeter(recs);
     expect(t).toMatchObject({ total: 150, input: 100, generated: 20 });
-    expect(Object.keys(t).sort()).toEqual(["cached", "generated", "input", "runs", "total", "utility"]);
+    expect(Object.keys(t).sort()).toEqual(["cached", "generated", "input", "noRun", "runs", "total", "unlisted", "utility"]);
   });
 
   it("CACHED sums only reporting records, and is absent (null) when none report", () => {
@@ -328,6 +363,36 @@ describe("the run page and the mission graph count utility and name it (#3067)",
     expect(tile(withU, "h1", "TOKENS IN")).toBe("2.54k");
     expect(tileHint(withU, "h1", "TOKENS IN")).toContain("700 tokens of utility calls");
     expect(tileHint(without, "h1", "TOKENS IN")).toBeUndefined();
+  });
+
+  it("a total-only record: the tiles name the row's total instead of showing a short split (#3067)", () => {
+    clock = 0;
+    const recs = [
+      r({ action: "dispatch.start", session_id: "to", handle: "analyst", payload: {} }),
+      usage("to", "analyst", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.work, total_tokens: 1200 }),
+    ];
+    expect(sumUsage(recs).total).toBe(1200);
+    // No record reports a split: a dash, never a measured 0.
+    expect(tile(recs, "to", "TOKENS IN")).toBe("—");
+    expect(tile(recs, "to", "TOKENS OUT")).toBe("—");
+    expect(tileHint(recs, "to", "TOKENS IN")).toContain("1.20k tokens in total");
+    expect(tileHint(recs, "to", "TOKENS OUT")).toContain("1.20k tokens in total");
+    // Only part split: the split part shows, the hover names the total.
+    const part = [
+      r({ action: "dispatch.start", session_id: "pt", handle: "coder", payload: {} }),
+      usage("pt", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 69 }),
+      usage("pt", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 100 }),
+    ];
+    expect(tile(part, "pt", "TOKENS IN")).toBe("60");
+    expect(tile(part, "pt", "TOKENS OUT")).toBe("9");
+    expect(tileHint(part, "pt", "TOKENS IN")).toContain("169 tokens in total");
+    // A split that adds up to the total says nothing extra.
+    const whole = [r({ action: "dispatch.start", session_id: "wh", handle: "analyst", payload: {} }), usage("wh", "analyst", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 69 })];
+    expect(tileHint(whole, "wh", "TOKENS IN")).toBeUndefined();
+    // A provider total BELOW the split gets its own wording, never "not all split".
+    const below = [r({ action: "dispatch.start", session_id: "bl", handle: "coder", payload: {} }), usage("bl", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 50 })];
+    expect(tileHint(below, "bl", "TOKENS IN")).toContain("below input + generated");
+    expect(tileHint(below, "bl", "TOKENS IN")).not.toContain("not all of it");
   });
 
   it("a session whose only calls are utility jobs (radio routing) IS that job: its page shows them", () => {

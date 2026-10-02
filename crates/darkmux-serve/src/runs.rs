@@ -590,6 +590,9 @@ fn build_runs_in(
         .collect();
 
     let mut runs: Vec<Run> = Vec::with_capacity(missions.len());
+    // (#3067) What each row may read of the usage index, by row position; the
+    // tokens are attributed once every row exists (see `UsageIndex::attribute`).
+    let mut claims: Vec<(usize, Option<String>, Vec<String>)> = Vec::new();
     // Dedup bookkeeping: a session already accounted for by a tracked run —
     // its `mission_id` matches a loaded mission, or it is a lab run's own
     // dispatch session — must never ALSO produce an untracked ghost for the
@@ -602,7 +605,10 @@ fn build_runs_in(
         let (kind, shape) = classify_mission(mission, &phases_by_id);
         let mut run = mission_to_run(mission, kind, shape.as_ref(), &mission_id_index, &flow_index, now_ms);
         // (#2902 step 2b) Its records carry its `mission_id`.
-        run.tokens = usage.tokens_for(Some(&mission.id), std::iter::empty());
+        // Its flow sessions too, as a peer's row of the same mission claims them, so
+        // which machine serves a mission never changes who reads a shared session.
+        let sessions = flow_missions.get(&mission.id).map(|a| a.session_ids.clone()).unwrap_or_default();
+        claims.push((runs.len(), Some(mission.id.clone()), sessions));
         // The same key a peer builds for this mission (`flow_mission_to_run`):
         // its newest record's receive key, so a mission sorts alike whichever
         // machine serves it. Local time only when no record names it.
@@ -641,13 +647,15 @@ fn build_runs_in(
                 .as_deref()
                 .and_then(|sid| flow_index.get(sid))
                 .map(|agg| session_is_live(agg, now_ms));
-            let mut run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
+            let run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
             // (#2902 step 2b) The session the run's provider recorded, read
             // whole. A finished tool-bench row publishes no `session_id`
             // (its trials each ran under their own session — see
             // `LabRunSummary::session_id`'s doc and `lab_summary_to_run`),
             // so it reads `-` by construction, not by omission.
-            run.tokens = summary.session_id.as_deref().and_then(|sid| usage.tokens_for_session(sid));
+            if let Some(sid) = &summary.session_id {
+                claims.push((runs.len(), None, vec![sid.clone()]));
+            }
             runs.push(run);
         }
     }
@@ -655,15 +663,15 @@ fn build_runs_in(
     // (#1705) Missions seen only in the record stream — i.e. executing on a
     // peer. Emitted BEFORE ghosts so their sessions are claimed and don't
     // also surface as loose dispatch rows.
-    let (mut peer_runs, remote_mission_ids) =
+    let (peer_runs, remote_mission_ids) =
         peer_runs_from_index(&flow_missions, &known_mission_ids, &flow_index, now_ms);
-    for run in &mut peer_runs {
-        let sessions = flow_missions.get(&run.id).map(|a| a.session_ids.as_slice()).unwrap_or(&[]);
-        run.tokens = usage.tokens_for(Some(&run.id), sessions.iter().map(String::as_str));
+    for (i, run) in peer_runs.iter().enumerate() {
+        let sessions = flow_missions.get(&run.id).map(|a| a.session_ids.clone()).unwrap_or_default();
+        claims.push((runs.len() + i, Some(run.id.clone()), sessions));
     }
     runs.extend(peer_runs);
 
-    let mut ghosts = ghost_runs(
+    let ghosts = ghost_runs(
         &flow_index,
         &known_mission_ids,
         &known_session_ids,
@@ -671,14 +679,35 @@ fn build_runs_in(
         now_ms,
     );
     // A ghost's `id` IS its session id (see `ghost_runs`).
-    for run in &mut ghosts {
-        run.tokens = usage.tokens_for_session(&run.id);
+    for (i, run) in ghosts.iter().enumerate() {
+        claims.push((runs.len() + i, None, vec![run.id.clone()]));
     }
     runs.extend(ghosts);
+    let rows: Vec<crate::usage_sum::RowClaim> = claims
+        .iter()
+        .map(|(i, mission_id, session_ids)| {
+            let r = &runs[*i];
+            crate::usage_sum::RowClaim {
+                mission_id: mission_id.clone(),
+                session_ids: session_ids.clone(),
+                started: r.started_ts,
+                ended: r.completed_ts,
+                receive_key: r.receive_key,
+                id: r.id.clone(),
+            }
+        })
+        .collect();
+    for ((i, _, _), tokens) in claims.iter().zip(usage.attribute(&rows)) {
+        runs[*i].tokens = tokens;
+    }
 
+    // (#3067) Whatever no listed row claimed: rows + no_run + unlisted are the
+    // overall, always.
+    let mut breakdown = usage.breakdown.clone();
+    breakdown.unlisted = usage.unlisted();
     RunsWithUsage {
         runs,
-        usage: usage.breakdown,
+        usage: breakdown,
         since: window.since_label(),
         default_window: window.since_iso.is_none(),
     }
@@ -1085,6 +1114,11 @@ fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<S
         if let Some(mid) = &agg.mission_id {
             idx.entry(mid.clone()).or_default().push(session_id.clone());
         }
+    }
+    // The map's iteration order is per-process; a mission's sessions are read in
+    // id order, so which one represents it never depends on it.
+    for sessions in idx.values_mut() {
+        sessions.sort();
     }
     idx
 }
@@ -2603,8 +2637,8 @@ fn earliest_by_start<'a>(sessions: &[(&'a str, &'a SessionAgg)]) -> Option<(&'a 
         .iter()
         .copied()
         .filter(|(_, s)| s.start_ts.is_some())
-        .min_by(|(_, a), (_, b)| a.start_ts.cmp(&b.start_ts))
-        .or_else(|| sessions.first().copied())
+        .min_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)))
+        .or_else(|| sessions.iter().copied().min_by_key(|(id, _)| *id))
 }
 
 /// Synthesize an untracked [`Run`] for every flow session that opened a
@@ -7508,6 +7542,120 @@ mod tests {
         let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
         assert_eq!(built.usage.no_run.total, 9);
         assert_eq!(rows + built.usage.no_run.total, built.usage.overall.total, "rows plus no-run are the overall");
+    }
+
+    /// (#3067) One usage entry is read by ONE row. Two peer missions share a
+    /// task-id session (#1918) and the usage on it names no mission: both rows
+    /// can read it, and counting it on both put the rows (200) above the total
+    /// (100). Exactly one row wins it, the same one on every build.
+    #[test]
+    #[serial_test::serial]
+    fn a_usage_entry_two_rows_could_read_is_counted_on_one_row_only() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let start = |mission: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-shared", "mission_id": mission, "handle": "coder" });
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[start("m-a"), start("m-b"), usage_record(&now, "s-shared", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }))],
+        );
+        for _ in 0..8 {
+            let built = build_runs_with_usage(flows.path(), None, &[], None);
+            let tokens = |id: &str| built.runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id}")).tokens;
+            let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+            let u = &built.usage;
+            assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total, "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
+            assert_eq!((tokens("m-a"), tokens("m-b")), (Some(100), None), "the lower id wins a tie, on every build");
+        }
+    }
+
+    /// (#3067) Which row reads a shared entry never depends on which machine is
+    /// serving: the same records, with m-a minted here (m-b a peer's) and with
+    /// m-b minted here, give the same tokens on the same rows. A local mission
+    /// claims the sessions of its records, as a peer's row of it does.
+    #[test]
+    #[serial_test::serial]
+    fn the_same_records_attribute_the_same_whichever_mission_is_local() {
+        let now = darkmux_flow::ts_utc_now();
+        let start = |mission: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-shared", "mission_id": mission, "handle": "coder" });
+        let records = [start("m-a"), start("m-b"), usage_record(&now, "s-shared", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }))];
+        let serve_with_local = |local: &str| {
+            let _g = CrewGuard::new();
+            darkmux_crew::lifecycle::save_mission(&minimal_mission(local, vec![], None)).unwrap();
+            let flows = TempDir::new().unwrap();
+            write_day_file(flows.path(), &today(), &records);
+            let built = build_runs_with_usage(flows.path(), None, &[], None);
+            let mut by_row: Vec<(String, Option<u64>)> = built.runs.iter().map(|r| (r.id.clone(), r.tokens)).collect();
+            by_row.sort();
+            let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+            assert_eq!(rows + built.usage.no_run.total + built.usage.unlisted.total, built.usage.overall.total);
+            by_row
+        };
+        let (a_local, b_local) = (serve_with_local("m-a"), serve_with_local("m-b"));
+        assert_eq!(a_local, b_local, "the assignment is a property of the records, not of the serving machine");
+    }
+
+    /// (#3067) Two sessions of one mission started in the same instant: the
+    /// row's `dispatch_id` (the representative session, which the client keys
+    /// on) is the lower session id on every build, never an input or hash order.
+    #[test]
+    #[serial_test::serial]
+    fn the_representative_session_of_a_tie_is_the_lower_id_on_every_build() {
+        let now = darkmux_flow::ts_utc_now();
+        let start = |sid: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": sid, "mission_id": "m-tie", "handle": "coder" });
+        for order in [["s-b", "s-a", "s-c"], ["s-c", "s-a", "s-b"], ["s-a", "s-b", "s-c"]] {
+            let _g = CrewGuard::new();
+            darkmux_crew::lifecycle::save_mission(&minimal_mission("m-tie", vec![], None)).unwrap();
+            let flows = TempDir::new().unwrap();
+            let recs: Vec<_> = order.iter().map(|s| start(s)).collect();
+            write_day_file(flows.path(), &today(), &recs);
+            for _ in 0..6 {
+                let built = build_runs_with_usage(flows.path(), None, &[], None);
+                let row = built.runs.iter().find(|r| r.id == "m-tie").expect("the mission row");
+                assert_eq!(row.dispatch_id.as_deref(), Some("s-a"), "input order {order:?}");
+            }
+        }
+    }
+
+    /// (#3067) The identity holds even for usage that names a run with no
+    /// row: a session whose start record is outside the window (no ghost row)
+    /// lands in `unlisted`, so rows + no_run + unlisted are the overall.
+    #[test]
+    #[serial_test::serial]
+    fn rows_plus_no_run_plus_unlisted_equal_the_total_even_for_a_session_with_no_row() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": total });
+        let sessionless = {
+            let mut r = usage_record(&now, "x", None, serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }));
+            r.as_object_mut().unwrap().remove("session_id");
+            r
+        };
+        let mission_only = {
+            let mut r = usage_record(&now, "x", Some("m-x"), provider(7));
+            r.as_object_mut().unwrap().remove("session_id");
+            r
+        };
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }),
+                usage_record(&now, "s-run", None, provider(100)),
+                // No start record: no row is built for this session.
+                usage_record(&now, "s-orphan", None, provider(50)),
+                mission_only,
+                sessionless,
+            ],
+        );
+        let built = build_runs_with_usage(flows.path(), None, &[], None);
+        let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+        let u = &built.usage;
+        assert_eq!((u.no_run.total, u.no_run.calls), (9, 1));
+        assert_eq!((u.unlisted.total, u.unlisted.calls), (50, 1), "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
+        assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total);
     }
 
     /// (#2902 step 2b) `build_runs_with_usage`'s breakdown is the same fold

@@ -1185,3 +1185,19 @@ pub(crate) fn status_http_mock(status_line: &'static str, body: &'static str) ->
     });
     format!("http://127.0.0.1:{port}/v1/chat/completions")
 }
+
+/// (#3067) A provider total of 0 is unreported. Beside both halves a step budget
+/// settles their sum (what the display shows); beside one half there is no
+/// total, so it is charged conservatively like a missing one, while the display
+/// still floors on the half.
+#[test]
+fn a_step_budget_settles_a_zero_total_like_a_missing_one() {
+    let both = darkmux_trajectory::UsageCounts { prompt: Some(900), completion: Some(40), total: Some(0), ..Default::default() };
+    assert_eq!(super::conservative_spend(both.total_tokens(), 4096, "p"), 940);
+    assert_eq!(both.floor_tokens(), 940);
+    let one = darkmux_trajectory::UsageCounts { prompt: Some(900), total: Some(0), ..Default::default() };
+    let missing = darkmux_trajectory::UsageCounts::default();
+    assert_eq!(super::conservative_spend(one.total_tokens(), 4096, "p"), super::conservative_spend(missing.total_tokens(), 4096, "p"));
+    assert!(super::conservative_spend(one.total_tokens(), 4096, "p") >= 4096);
+    assert_eq!(one.floor_tokens(), 900);
+}

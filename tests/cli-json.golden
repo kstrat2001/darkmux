@@ -1210,6 +1210,7 @@ UsageReport
   overall: UsageSum
   groups: UsageGroup[]
   no_run: UsageSplit
+  unlisted: UsageSplit
 UsageSplit
   calls: uint64
   total: uint64

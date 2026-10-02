@@ -87,6 +87,8 @@ MachineResourcesResponse.messages: Array<LedgerMessage>
 MissionsResponse.missions: Array<Mission>
 MissionsResponse.generated_at_ms: number
 RunsResponse.runs: Array<Run>
+RunsResponse.no_run: OffRowUsage
+RunsResponse.unlisted: OffRowUsage
 RunsResponse.generated_at_ms: number
 RunsResponse.meta: CoverageMeta
 RunsResponse.policy: RunsPolicy
