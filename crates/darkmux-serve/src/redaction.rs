@@ -1,14 +1,15 @@
 //! The ONE owner of what a caller that is neither this machine nor a token
 //! holder may not read (#3071 for the console panels, extended to every read
 //! route). A daemon's reads are open on the tailnet by design, so a response is
-//! filtered here before it leaves: roster addresses, tailnet names, IPv4
-//! literals, the fleet hub's host, and the daemon user's home directory are
-//! host facts that stay on this machine.
+//! filtered here before it leaves: roster addresses, tailnet names, private and
+//! addressing IPv4 literals, IPv6 literals, the fleet hub's host, and home
+//! directories are host facts that stay on this machine ([`redact_text`] is the
+//! rule set, one pass per string).
 //!
 //! Two entry points, one rule set ([`Redaction`]):
 //!
 //! - [`redact_reads`] is the layer every JSON route carries. For a remote
-//!   caller it parses the body and redacts each string value, so a field no
+//!   caller it parses the body and redacts each key and value, so a field no
 //!   one thought to list (an operator-authored profile description, a path in
 //!   an error line) is covered without naming it.
 //! - [`redact_stdout`] is for a console panel's terminal output, which needs
@@ -33,16 +34,35 @@ const MAX_REDACTED_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// What a non-local caller must not read in a response, derived from the
 /// daemon's own state when the request is served: every roster ADDRESS (and its
 /// host part) that is not itself a public machine name, the fleet hub's host,
-/// and the daemon user's home and `DARKMUX_HOME` directories. Any IPv4 literal
-/// and any `.ts.net` name is hidden whether or not the roster lists it
-/// ([`hide_literals`]). Machine ids and names are
+/// and the daemon user's home and `DARKMUX_HOME` directories. IP literals, any
+/// `.ts.net` name and any account's home are hidden whether or not the roster
+/// lists them ([`redact_text`]). Machine ids and names are
 /// public (a 400 for a bad opt lists them): only the address behind one is
 /// private.
 pub(crate) struct Redaction {
-    /// Longest first, so an address is replaced whole before its host part.
-    pub(crate) addresses: Vec<String>,
-    /// Directory prefixes and what each reads as, longest first.
-    pub(crate) dirs: Vec<(String, &'static str)>,
+    /// Roster addresses (and their hosts, and the hub's), then directory
+    /// prefixes, each longest first within its kind.
+    needles: Vec<Needle>,
+}
+
+/// One thing to find, lowercased once.
+struct Needle {
+    /// As given, for the tests' view of the set.
+    #[cfg(test)]
+    text: String,
+    lower: String,
+    with: &'static str,
+    /// A single label with no dot and no port (`studio`): not a host fact as a
+    /// free word, only where it addresses (`://studio`, `studio:8765`). A
+    /// roster address that is a name like "LM Studio" must not hide it.
+    bare: bool,
+}
+
+impl Needle {
+    fn address(a: &str) -> Self {
+        let bare = !a.contains(['.', ':']);
+        Self { #[cfg(test)] text: a.to_string(), lower: a.to_ascii_lowercase(), with: ADDRESS_HIDDEN, bare }
+    }
 }
 
 impl Redaction {
@@ -61,19 +81,26 @@ impl Redaction {
         let hub = darkmux_flow::redis_url().and_then(|u| url_host(u.expose_for_probe()));
         let home = std::env::var("HOME").ok();
         let darkmux_home = std::env::var("DARKMUX_HOME").ok();
-        let mut r = Self::from_parts(&machines, &public, home, darkmux_home);
-        if let Some(h) = hub.filter(|h| !public.iter().any(|p| p.eq_ignore_ascii_case(h))) {
-            r.addresses.push(h);
-            r.addresses.sort_by_key(|a| std::cmp::Reverse(a.len()));
-            r.addresses.dedup();
-        }
-        r
+        let hub = hub.filter(|h| !public.iter().any(|p| p.eq_ignore_ascii_case(h)));
+        Self::build(&machines, &public, hub, home, darkmux_home)
     }
 
     /// `machines` is `(id, address)`; `public` are further machine names.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         machines: &[(&str, &str)],
         public: &[String],
+        home: Option<String>,
+        darkmux_home: Option<String>,
+    ) -> Self {
+        Self::build(machines, public, None, home, darkmux_home)
+    }
+
+    /// [`Self::from_parts`] plus the fleet hub's host.
+    fn build(
+        machines: &[(&str, &str)],
+        public: &[String],
+        hub: Option<String>,
         home: Option<String>,
         darkmux_home: Option<String>,
     ) -> Self {
@@ -89,6 +116,7 @@ impl Redaction {
                 all.push(host.to_string());
             }
         }
+        all.extend(hub);
         all.sort_by_key(|a| std::cmp::Reverse(a.len()));
         all.dedup();
         // A directory as given and as the filesystem resolves it (`/tmp` is
@@ -117,7 +145,12 @@ impl Redaction {
         dirs.sort_by_key(|(d, _)| std::cmp::Reverse(d.len()));
         let mut seen = std::collections::HashSet::new();
         dirs.retain(|(d, _)| seen.insert(d.clone()));
-        Self { addresses: all, dirs }
+        let needles = all
+            .iter()
+            .map(|a| Needle::address(a))
+            .chain(dirs.into_iter().map(|(d, with)| Needle { lower: d.to_ascii_lowercase(), #[cfg(test)] text: d.clone(), with, bare: false }))
+            .collect();
+        Self { needles }
     }
 }
 
@@ -161,29 +194,6 @@ fn continues_backward(before: &str) -> bool {
     }
 }
 
-/// Replace each ASCII-case-insensitive occurrence of `needle` in `text` that
-/// is a whole token: neither side may continue a word.
-fn replace_token(text: &str, needle: &str, with: &str) -> String {
-    if needle.is_empty() {
-        return text.to_string();
-    }
-    let (hay, pat) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    let mut from = 0;
-    while let Some(rel) = hay[from..].find(&pat) {
-        let (start, end) = (from + rel, from + rel + pat.len());
-        if !continues_backward(&text[..start]) && !continues_forward(&text[end..]) {
-            out.push_str(&text[last..start]);
-            out.push_str(with);
-            last = end;
-        }
-        from = end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
 /// The host of a URL (`scheme://user:pw@host:port/path`), without userinfo,
 /// port or path.
 fn url_host(url: &str) -> Option<String> {
@@ -194,78 +204,241 @@ fn url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Whether a whole token is an IPv4 literal other than loopback.
-fn is_hidden_literal(tok: &str) -> bool {
-    let parts: Vec<&str> = tok.split('.').collect();
-    let ipv4 = parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n <= 255));
-    (ipv4 && parts[0] != "127") || tok.to_ascii_lowercase().ends_with(".ts.net")
+/// The start of each non-overlapping ASCII-case-insensitive occurrence of
+/// `needle` (already lowercase) in `text`, found without copying the text.
+fn find_ci(text: &str, needle: &str) -> Vec<usize> {
+    let (t, n) = (text.as_bytes(), needle.as_bytes());
+    let mut out = Vec::new();
+    let Some(&first) = n.first() else { return out };
+    let mut i = 0;
+    while i + n.len() <= t.len() {
+        if t[i].to_ascii_lowercase() == first && t[i..i + n.len()].eq_ignore_ascii_case(n) {
+            out.push(i);
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
-/// Replace every IPv4 literal (loopback excepted) and `.ts.net` name with
-/// [`ADDRESS_HIDDEN`], whether or not the roster lists it: the fleet hub's
-/// address, or one an operator wrote into a description by hand, is a host
-/// fact all the same. Tokens are maximal runs of `[A-Za-z0-9.-]`; a trailing
-/// `.` is punctuation.
-fn hide_literals(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// One byte range of a text and what it reads as.
+struct Span {
+    start: usize,
+    end: usize,
+    with: &'static str,
+}
+
+/// A character of a word for the IP-literal rules: unlike [`word_char`],
+/// `-` is a boundary (`ip-100.64.7.8`, `100.64.7.7-tail`).
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether the text from `at` on continues a word: a word byte, or a `.`
+/// followed by one (`.example` after `1.2.3.4`).
+fn word_continues_at(b: &[u8], at: usize) -> bool {
+    match b.get(at) {
+        Some(b'.') => b.get(at + 1).is_some_and(|c| word_byte(*c)),
+        Some(c) => word_byte(*c),
+        None => false,
+    }
+}
+
+/// An IPv4 literal's octets: exactly four numeric parts of at most three
+/// digits, each at most 255.
+fn parse_v4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in &mut out {
+        let p = parts.next().filter(|p| !p.is_empty() && p.len() <= 3)?;
+        *slot = p.parse().ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// Whether an IPv4 literal at `start..end` is a host fact: a private or
+/// tailnet address (10/8, 100.64/10, 172.16/12, 192.168/16, 169.254/16), or
+/// one in a URL authority or `host:port` position. Loopback and `0.x` never.
+fn v4_is_host_fact(o: [u8; 4], text: &str, start: usize, end: usize) -> bool {
+    if o[0] == 127 || o[0] == 0 {
+        return false;
+    }
+    let private = o[0] == 10
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 169 && o[1] == 254);
+    private || text[..start].ends_with("://") || text[..start].ends_with('@') || followed_by_port(&text[end..])
+}
+
+/// Whether the text begins `:<digit>`: a `host:port` position.
+fn followed_by_port(rest: &str) -> bool {
+    rest.strip_prefix(':').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn ipv4_spans(text: &str, out: &mut Vec<Span>) {
+    let b = text.as_bytes();
     let mut i = 0;
-    while i < text.len() {
-        let rest = &text[i..];
-        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')).unwrap_or(rest.len());
-        if end == 0 {
-            let ch = rest.chars().next().unwrap_or(' ');
-            out.push(ch);
-            i += ch.len_utf8();
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
             continue;
         }
-        let tok = &rest[..end];
-        let core = tok.trim_end_matches('.');
-        if is_hidden_literal(core) {
-            out.push_str(ADDRESS_HIDDEN);
-            out.push_str(&tok[core.len()..]);
-        } else {
-            out.push_str(tok);
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+            i += 1;
         }
-        i += end;
+        let mut end = i;
+        while end > start && b[end - 1] == b'.' {
+            end -= 1;
+        }
+        if (start > 0 && word_byte(b[start - 1])) || word_continues_at(b, end) {
+            continue;
+        }
+        if parse_v4(&text[start..end]).is_some_and(|o| v4_is_host_fact(o, text, start, end)) {
+            out.push(Span { start, end, with: ADDRESS_HIDDEN });
+        }
     }
-    out
 }
 
-/// Another account's home (`/Users/<name>`, `/home/<name>`) reads `~`, so a path
-/// an operator wrote into a description on another machine hides its account
-/// name too, not only this daemon's own `HOME`. Applied to JSON values and
-/// event lines; a panel's terminal output keeps [`redact_stdout`]'s exact
-/// boundary rules.
-fn hide_home_prefixes(text: &str) -> String {
+/// Whether an IPv6 literal is a host fact: tailnet and other unique-local
+/// (`fc00::/7`), global unicast (`2000::/3`) and link-local (`fe80::/10`).
+/// Loopback, unspecified and the rest stay visible.
+fn v6_is_host_fact(a: std::net::Ipv6Addr) -> bool {
+    let first = a.segments()[0];
+    (0xfc00..=0xfdff).contains(&first) || (0x2000..=0x3fff).contains(&first) || (0xfe80..=0xfebf).contains(&first)
+}
+
+fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
+    if !text.contains("::") && text.matches(':').count() < 7 {
+        return;
+    }
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !(b[i].is_ascii_hexdigit() || b[i] == b':') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_hexdigit() || b[i] == b':') {
+            i += 1;
+        }
+        if (start > 0 && word_byte(b[start - 1])) || b.get(i).is_some_and(|c| word_byte(*c)) {
+            continue;
+        }
+        let run = &text[start..i];
+        let parsed = run.parse::<std::net::Ipv6Addr>().map(|a| (a, i)).or_else(|_| {
+            let t = run.strip_suffix(':').unwrap_or(run);
+            t.parse::<std::net::Ipv6Addr>().map(|a| (a, start + t.len()))
+        });
+        if let Some((_, end)) = parsed.ok().filter(|(a, _)| v6_is_host_fact(*a)) {
+            out.push(Span { start, end, with: ADDRESS_HIDDEN });
+        }
+    }
+}
+
+/// Every `.ts.net` name, whole.
+fn tailnet_name_spans(text: &str, out: &mut Vec<Span>) {
+    for dot in find_ci(text, ".ts.net") {
+        let end = dot + ".ts.net".len();
+        if continues_forward(&text[end..]) {
+            continue;
+        }
+        let label = text.as_bytes()[..dot].iter().rev().take_while(|c| c.is_ascii_alphanumeric() || **c == b'.' || **c == b'-').count();
+        if label > 0 {
+            out.push(Span { start: dot - label, end, with: ADDRESS_HIDDEN });
+        }
+    }
+}
+
+/// Another account's home (`/Users/<name>`, `/home/<name>`,
+/// `/var/home/<name>`, `/root`) reads `~`, so a path written on another machine
+/// hides its account name too, not only this daemon's own `HOME`.
+fn home_spans(text: &str, out: &mut Vec<Span>) {
+    if !text.contains('/') {
+        return;
+    }
+    for prefix in ["/users/", "/var/home/", "/home/"] {
+        for i in find_ci(text, prefix) {
+            if continues_backward(&text[..i]) {
+                continue;
+            }
+            let from = i + prefix.len();
+            let name = text[from..].trim_end_matches('.').bytes().take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, b'.' | b'_' | b'-')).count();
+            let name = text[from..from + name].trim_end_matches('.').len();
+            if name > 0 {
+                out.push(Span { start: i, end: from + name, with: "~" });
+            }
+        }
+    }
+    for i in find_ci(text, "/root") {
+        if !continues_backward(&text[..i]) && !continues_forward(&text[i + 5..]) {
+            out.push(Span { start: i, end: i + 5, with: "~" });
+        }
+    }
+}
+
+/// Whole-token, ASCII-case-insensitive occurrences of one needle.
+fn needle_spans(text: &str, n: &Needle, out: &mut Vec<Span>) {
+    for start in find_ci(text, &n.lower) {
+        let end = start + n.lower.len();
+        if continues_backward(&text[..start]) || continues_forward(&text[end..]) {
+            continue;
+        }
+        // A bare host (no dot, no port) is only a host fact where it is
+        // addressing: `://studio`, `@studio`, `studio:8765`.
+        if n.bare && !(text[..start].ends_with("://") || text[..start].ends_with('@') || followed_by_port(&text[end..])) {
+            continue;
+        }
+        out.push(Span { start, end, with: n.with });
+    }
+}
+
+/// Apply the spans: earliest first, the longer of two starting together, and a
+/// span inside an earlier one dropped.
+fn apply_spans<'a>(text: &'a str, mut spans: Vec<Span>) -> std::borrow::Cow<'a, str> {
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = ["/Users/", "/home/"].iter().filter_map(|p| rest.find(p).map(|i| (i, p.len()))).min() {
-        let (i, plen) = at;
-        let name_len = rest[i + plen..].find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))).unwrap_or(rest.len() - i - plen);
-        let at_boundary = !continues_backward(&rest[..i]);
-        out.push_str(&rest[..i]);
-        if at_boundary && name_len > 0 {
-            out.push('~');
-        } else {
-            out.push_str(&rest[i..i + plen + name_len]);
+    let mut at = 0;
+    for s in spans.iter() {
+        if s.start < at {
+            continue;
         }
-        rest = &rest[i + plen + name_len..];
+        out.push_str(&text[at..s.start]);
+        out.push_str(s.with);
+        at = s.end;
     }
-    out.push_str(rest);
-    out
+    out.push_str(&text[at..]);
+    std::borrow::Cow::Owned(out)
 }
 
-/// Redact one run of plain text: literals, roster addresses, then this
-/// daemon's directories.
-pub(crate) fn redact_text(text: &str, r: &Redaction) -> String {
-    let mut out = hide_literals(text);
-    for addr in &r.addresses {
-        out = replace_token(&out, addr, ADDRESS_HIDDEN);
+/// Redact one run of plain text in a single pass: every span any rule finds is
+/// collected against the original text and applied together.
+/// Unchanged text is returned borrowed.
+pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<'a, str> {
+    // Every host fact has a `.`, a `:`, a `/` or an `@` in or beside it (a name
+    // that is only a word is a fact solely as `host:port` or `://host`).
+    if text.len() < 4 || !text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) {
+        return std::borrow::Cow::Borrowed(text);
     }
-    for (dir, reads_as) in &r.dirs {
-        out = replace_token(&out, dir, reads_as);
+    let mut spans = Vec::new();
+    if text.contains('.') {
+        ipv4_spans(text, &mut spans);
+        tailnet_name_spans(text, &mut spans);
     }
-    out
+    if text.contains(':') {
+        ipv6_spans(text, &mut spans);
+    }
+    home_spans(text, &mut spans);
+    for n in &r.needles {
+        needle_spans(text, n, &mut spans);
+    }
+    apply_spans(text, spans)
 }
 
 /// How many bytes of `rest` (which starts with an ESC or a C1 CSI, U+009B)
@@ -343,6 +516,19 @@ pub(crate) fn redact_stdout(text: &str, r: &Redaction) -> String {
     out
 }
 
+#[cfg(test)]
+impl Redaction {
+    /// The addresses it hides, longest first.
+    pub(crate) fn addresses(&self) -> Vec<&str> {
+        self.needles.iter().filter(|n| n.with == ADDRESS_HIDDEN).map(|n| n.text.as_str()).collect()
+    }
+
+    /// The directories it rewrites, with what each reads as.
+    pub(crate) fn dirs(&self) -> Vec<(&str, &str)> {
+        self.needles.iter().filter(|n| n.with != ADDRESS_HIDDEN).map(|n| (n.text.as_str(), n.with)).collect()
+    }
+}
+
 impl Redaction {
     /// An event line for the reader the stream was opened for: redacted when
     /// the reader is remote (`Some`), as built otherwise.
@@ -353,20 +539,37 @@ impl Redaction {
         }
     }
 
-    /// One event line (an SSE `data:` payload, a JSON record) for a remote
-    /// caller. A replacement carries no quote or backslash, so a JSON line
-    /// stays JSON.
+    /// One event line (an SSE `data:` payload, a JSON record) or any other
+    /// text for a remote caller. A replacement carries no quote or backslash,
+    /// so a JSON line stays JSON.
     pub(crate) fn line(&self, line: &str) -> String {
-        hide_home_prefixes(&redact_text(line, self))
+        redact_text(line, self).into_owned()
     }
 
-    /// Every string VALUE in a JSON document, redacted in place. Keys are
-    /// field names, never host facts.
+    /// Every string in a JSON document, keys and values, redacted in place.
     pub(crate) fn json(&self, v: &mut serde_json::Value) {
         match v {
-            serde_json::Value::String(s) => *s = hide_home_prefixes(&redact_text(s, self)),
+            serde_json::Value::String(s) => {
+                if let std::borrow::Cow::Owned(n) = redact_text(s, self) {
+                    *s = n;
+                }
+            }
             serde_json::Value::Array(a) => a.iter_mut().for_each(|x| self.json(x)),
-            serde_json::Value::Object(o) => o.values_mut().for_each(|x| self.json(x)),
+            serde_json::Value::Object(o) => {
+                o.values_mut().for_each(|x| self.json(x));
+                let renames: Vec<(String, String)> = o
+                    .keys()
+                    .filter_map(|k| match redact_text(k, self) {
+                        std::borrow::Cow::Owned(n) => Some((k.clone(), n)),
+                        std::borrow::Cow::Borrowed(_) => None,
+                    })
+                    .collect();
+                for (old, new) in renames {
+                    if let Some(val) = o.remove(&old) {
+                        o.insert(new, val);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -374,8 +577,9 @@ impl Redaction {
 
 /// The layer every JSON read route carries: a caller that is this machine or
 /// holds the token gets the response as built; anyone else gets it with host
-/// facts redacted ([`Redaction`]). A body it cannot parse or bound is withheld
-/// (500), never passed through.
+/// facts redacted ([`Redaction`]). A JSON body is redacted value by value, and
+/// anything else on a JSON route (a plain-text error) is redacted as text, so
+/// nothing passes through unfiltered. A body it cannot read is withheld (500).
 pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let full_view = crate::caller_is_local_or_holds_token(peer, req.headers());
@@ -384,18 +588,19 @@ pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
         return resp;
     }
     let is_json = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
-    if !is_json {
-        return resp;
-    }
-    let (parts, body) = resp.into_parts();
+    let (mut parts, body) = resp.into_parts();
     let withheld = || (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_REDACTED_BODY_BYTES).await else { return withheld() };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
-    let r = tokio::task::spawn_blocking(Redaction::derive).await;
-    let Ok(r) = r else { return withheld() };
-    r.json(&mut value);
-    let Ok(out) = serde_json::to_vec(&value) else { return withheld() };
-    let mut parts = parts;
+    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive).await else { return withheld() };
+    let out = if is_json {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
+        r.json(&mut value);
+        let Ok(out) = serde_json::to_vec(&value) else { return withheld() };
+        out
+    } else {
+        let Ok(text) = String::from_utf8(bytes.to_vec()) else { return withheld() };
+        r.line(&text).into_bytes()
+    };
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, axum::body::Body::from(out))
 }
@@ -513,25 +718,73 @@ mod tests {
         }
     }
 
-    /// Every JSON route without a path parameter, as a remote reader: the
-    /// table is the list, so a route added later is covered by being added.
+    /// Flow records carrying the host facts a real day carries: a working
+    /// directory, an endpoint URL, a peer address.
+    fn seed_flows() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let today = darkmux_flow::day_utc_now();
+        let rec = |action: &str, extra: serde_json::Value| {
+            let mut r = serde_json::json!({
+                "ts": format!("{today}T10:00:00Z"), "schema_version": "2.0.0", "action": action,
+                "machine_id": "laptop", "session_id": "s-1", "mission_id": "m-1", "source": "darkmux",
+                "cwd": format!("{HOME}/work"), "endpoint": format!("http://{HUB_IP}:1234/v1"),
+                "alt_endpoint": "http://[fd7a:115c:a1e0::53]:1234/v1", "peer": format!("{PEER_IP}:8765"),
+            });
+            r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            r.to_string()
+        };
+        let lines = [rec("dispatch.start", serde_json::json!({})), rec("dispatch.complete", serde_json::json!({"result": "stop"}))];
+        std::fs::write(dir.path().join(format!("{today}.jsonl")), lines.join("\n") + "\n").unwrap();
+        dir
+    }
+
+    const SECRETS_V6: &str = "fd7a";
+
+    /// Every JSON route as a remote reader, over SEEDED flows: the table is the
+    /// list, so a route added later is covered by being added. The routes with
+    /// a path parameter get an id the seed carries.
     #[tokio::test]
     #[serial_test::serial]
     async fn no_json_route_shows_a_remote_reader_a_host_fact() {
         let _facts = HostFacts::set();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let flows = seed_flows();
+        let today = darkmux_flow::day_utc_now();
         let mut covered = 0;
+        let mut flow_rows_seen = 0;
         for route in crate::routes::table() {
             let crate::routes::Reply::Json(_) = route.reply else { continue };
-            if route.path.contains(':') || route.path.starts_with("/panel/") {
+            if route.path.starts_with("/panel/") {
                 continue;
             }
-            let (_, body) = get(crate::build_router(PathBuf::new()), route.path, REMOTE).await;
-            for secret in SECRETS {
+            let id = if route.path.starts_with("/flow-dispatch/") { "s-1" } else { "m-1" };
+            let path = route.path.replace(":date", &today).replace(":id", id);
+            let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &path, REMOTE).await;
+            for secret in SECRETS.iter().chain([&SECRETS_V6]) {
                 assert!(!body.contains(secret), "{} showed a remote reader `{secret}`", route.path);
+            }
+            if body.contains("dispatch.complete") {
+                flow_rows_seen += 1;
+                assert!(body.contains(ADDRESS_HIDDEN), "{path}: the seeded rows read as hidden, not absent");
             }
             covered += 1;
         }
         assert!(covered >= 12, "the sweep must reach the daemon's JSON reads, reached {covered}");
+        assert_eq!(flow_rows_seen, 3, "/flow/:date, /flow-mission/:id and /flow-dispatch/:id must each have read the seeded records");
+    }
+
+    /// The seeded day answers a local reader in full: proof the sweep above is
+    /// looking at data that carries the facts.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_seeded_flow_day_carries_the_facts_for_this_machine() {
+        let _facts = HostFacts::set();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let flows = seed_flows();
+        let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &format!("/flow/{}", darkmux_flow::day_utc_now()), LOCAL).await;
+        for shown in [HUB_IP, "fd7a:115c:a1e0::53", HOME] {
+            assert!(body.contains(shown), "this machine reads `{shown}`: {body}");
+        }
     }
 
     #[tokio::test]
@@ -591,22 +844,183 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn the_hub_host_is_hidden_even_when_it_is_a_plain_name() {
+    fn a_plain_name_hub_host_is_hidden_where_it_addresses() {
         let _facts = HostFacts::set();
         unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://u:p@hubname:6379") };
         let r = Redaction::derive();
-        assert_eq!(r.line("redis at hubname now"), format!("redis at {ADDRESS_HIDDEN} now"));
+        assert_eq!(r.line("redis://hubname:6379 and hubname:7000"), format!("redis://{ADDRESS_HIDDEN}:6379 and {ADDRESS_HIDDEN}:7000"));
+        assert_eq!(r.line("the hubname word"), "the hubname word", "a bare name is not a host fact as a free word");
+    }
+
+    // ── the rules, unit by unit ────────────────────────────────────────
+
+    fn rules() -> Redaction {
+        Redaction::from_parts(&[], &[], None, None)
+    }
+
+    #[test]
+    fn ipv4_is_hidden_when_private_or_addressing_and_prose_versions_survive() {
+        let r = rules();
+        for hidden in ["100.64.7.7", "10.0.0.1", "172.16.0.1", "172.31.9.9", "192.168.1.5", "169.254.1.1"] {
+            assert_eq!(r.line(&format!("at {hidden} now")), format!("at {ADDRESS_HIDDEN} now"), "{hidden}");
+        }
+        assert_eq!(r.line("http://8.8.8.8/x and 8.8.8.8:53 and me@8.8.8.8"), format!("http://{ADDRESS_HIDDEN}/x and {ADDRESS_HIDDEN}:53 and me@{ADDRESS_HIDDEN}"));
+        // `-` is a boundary for an IP literal.
+        assert_eq!(r.line("100.64.7.7-tail and ip-100.64.7.8"), format!("{ADDRESS_HIDDEN}-tail and ip-{ADDRESS_HIDDEN}"));
+        for kept in ["LM Studio 0.3.30.1", "1.2.3.4 in prose", "172.32.0.1", "127.0.0.1", "v4.0.0.1x", "100.64.7.7.example", "1.2.3.4.5"] {
+            assert_eq!(r.line(kept), kept, "{kept}");
+        }
+    }
+
+    #[test]
+    fn ipv6_literals_are_hidden_except_loopback() {
+        let r = rules();
+        assert_eq!(r.line("http://[fd7a:115c:a1e0::53]:1234/v1"), format!("http://[{ADDRESS_HIDDEN}]:1234/v1"));
+        assert_eq!(r.line("at fd7a:115c:a1e0:ab12:4843:cd96:625b:1 now"), format!("at {ADDRESS_HIDDEN} now"));
+        assert_eq!(r.line("fd7a:115c:a1e0::53: refused"), format!("{ADDRESS_HIDDEN}: refused"));
+        for hidden in ["2001:db8::1", "fe80::1", "fc00::5"] {
+            assert_eq!(r.line(hidden), ADDRESS_HIDDEN, "{hidden}");
+        }
+        for kept in ["::1", "[::1]:8765", "at 12:34:56 today", "darkmux::fleet", "a::b", "::"] {
+            assert_eq!(r.line(kept), kept, "{kept}");
+        }
+    }
+
+    #[test]
+    fn linux_and_other_homes_read_as_a_tilde() {
+        let r = rules();
+        assert_eq!(
+            r.line("/Users/someone/a /home/ci-user/b /var/home/core/c /root/d /root"),
+            "~/a ~/b ~/c ~/d ~"
+        );
+        for kept in ["/rootfs/x", "/usr/home/x", "/Users/", "src/Users/x", "/home/"] {
+            assert_eq!(r.line(kept), kept, "{kept}");
+        }
+    }
+
+    #[test]
+    fn json_keys_are_redacted_with_the_values() {
+        let r = rules();
+        let mut v = serde_json::json!({"peer 100.64.7.7": "x", "ok": {"/Users/someone/k": ["at 10.0.0.1"]}});
+        r.json(&mut v);
+        assert_eq!(v, serde_json::json!({format!("peer {ADDRESS_HIDDEN}"): "x", "ok": {"~/k": [format!("at {ADDRESS_HIDDEN}")]}}));
+    }
+
+    #[tokio::test]
+    async fn a_non_json_reply_on_a_json_route_is_redacted_as_text_for_a_remote_reader() {
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(|| async { ([("content-type", "text/plain")], "failed at 100.64.7.7 in /Users/someone/x") }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (_, remote) = get(app.clone(), "/t", REMOTE).await;
+        assert_eq!(remote, format!("failed at {ADDRESS_HIDDEN} in ~/x"));
+        let (_, local) = get(app, "/t", LOCAL).await;
+        assert_eq!(local, "failed at 100.64.7.7 in /Users/someone/x");
+    }
+
+    /// A route registered anywhere but the route table escapes the layer. The
+    /// daemon's router is built from `routes::table()`; the fleet listener's
+    /// own router is the token-gated execution surface, not a read.
+    #[test]
+    fn every_route_is_registered_through_the_route_table() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || ["routes.rs", "fleet_listener.rs", "redaction.rs"].contains(&name.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // A file's test module comes last; only the code above it counts.
+            let code = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
+            if code.contains(".route(") || code.contains(".nest(") {
+                offenders.push(name);
+            }
+        }
+        assert!(offenders.is_empty(), "routes must be declared in routes.rs's table so they carry the redaction layer: {offenders:?}");
+    }
+
+    // ── the streams, at the handler ────────────────────────────────────
+
+    const LEAKY_LINE: &str = r#"{"cwd":"/Users/fixture-home/w","endpoint":"http://[fd7a:115c:a1e0::53]:1234/v1","peer":"100.64.7.7","marker":"end-of-line"}"#;
+
+    async fn open_stream(from: &str, flows: &std::path::Path) -> axum::body::BodyDataStream {
+        let date = darkmux_flow::day_utc_now();
+        std::fs::write(flows.join(format!("{date}.jsonl")), "").unwrap();
+        let app = crate::build_router(flows.to_path_buf());
+        let mut req = Request::builder().uri(format!("/flow/{date}/stream")).header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(from));
+        app.oneshot(req).await.unwrap().into_body().into_data_stream()
+    }
+
+    async fn read_until(mut body: axum::body::BodyDataStream, marker: &str) -> String {
+        use futures::StreamExt;
+        let mut seen = String::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(Ok(chunk)) = body.next().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if seen.contains(marker) {
+                    break;
+                }
+            }
+        })
+        .await;
+        seen
+    }
+
+    fn append_flow_line(flows: &std::path::Path, line: &str) {
+        use std::io::Write;
+        let date = darkmux_flow::day_utc_now();
+        let mut f = std::fs::OpenOptions::new().append(true).open(flows.join(format!("{date}.jsonl"))).unwrap();
+        writeln!(f, "{line}").unwrap();
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn the_event_stream_redacts_each_line_for_a_remote_reader() {
+    async fn the_flow_stream_redacts_each_line_for_a_remote_reader_and_not_for_this_machine() {
         let _facts = HostFacts::set();
-        let r = Redaction::derive();
-        let line = format!(r#"{{"cwd":"{HOME}/x","peer":"{PEER_IP}"}}"#);
-        let remote = Redaction::for_reader(Some(&r), line.clone());
-        assert!(serde_json::from_str::<serde_json::Value>(&remote).is_ok(), "{remote}");
-        assert!(!remote.contains("fixture-home") && !remote.contains(PEER_IP), "{remote}");
-        assert_eq!(Redaction::for_reader(None, line.clone()), line);
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        for (from, hidden) in [(REMOTE, true), (LOCAL, false)] {
+            let flows = tempfile::tempdir().unwrap();
+            let body = open_stream(from, flows.path()).await;
+            append_flow_line(flows.path(), LEAKY_LINE);
+            let seen = read_until(body, "end-of-line").await;
+            assert!(seen.contains("end-of-line"), "{from}: the line arrived: {seen}");
+            for secret in ["fixture-home", "fd7a", PEER_IP] {
+                assert_eq!(!seen.contains(secret), hidden, "{from}: `{secret}` in {seen}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_live_channel_redacts_each_sample_for_a_remote_reader() {
+        let _facts = HostFacts::set();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        for (from, hidden) in [(REMOTE, true), (LOCAL, false)] {
+            let flows = tempfile::tempdir().unwrap();
+            let body = open_stream(from, flows.path()).await;
+            crate::live_hub::hub().send(std::sync::Arc::from(LEAKY_LINE.replace("end-of-line", "live-marker").as_str())).ok();
+            let seen = read_until(body, "live-marker").await;
+            assert!(seen.contains("live-marker"), "{from}: the sample arrived: {seen}");
+            for secret in ["fixture-home", "fd7a", PEER_IP] {
+                assert_eq!(!seen.contains(secret), hidden, "{from}: `{secret}` in {seen}");
+            }
+        }
+    }
+
+    /// The Redis tail and the file tail meet a reader in `redacted_events`;
+    /// this feeds it the way the Redis tail does (lines, no file).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lines_from_any_source_are_redacted_at_the_one_join_point() {
+        use futures::StreamExt;
+        let _facts = HostFacts::set();
+        let lines = futures::stream::iter(vec![LEAKY_LINE.to_string()]).boxed();
+        let events = crate::redacted_events(lines, Some(Arc::new(Redaction::derive())));
+        let body = axum::response::sse::Sse::new(events);
+        let resp = axum::response::IntoResponse::into_response(body);
+        let seen = read_until(resp.into_body().into_data_stream(), "end-of-line").await;
+        assert!(seen.contains("end-of-line") && !seen.contains("fixture-home") && !seen.contains("fd7a") && !seen.contains(PEER_IP), "{seen}");
     }
 }

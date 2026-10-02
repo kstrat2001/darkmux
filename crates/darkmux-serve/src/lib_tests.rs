@@ -2885,9 +2885,9 @@
 
     // ─── SSE / tail_lines tests ─────────────────────────────────────────
     //
-    // Tests assert against `tail_lines` (the testable core of `build_tail_stream`)
-    // so they verify actual line content. The thin `Event::default().data(...)`
-    // wrapper in `build_tail_stream` is small enough that visual review suffices.
+    // Tests assert against `tail_lines` (the testable core of the file tail)
+    // so they verify actual line content. The `Event` wrapper (`redacted_events`)
+    // is covered at the handler by `redaction.rs`'s stream tests.
 
     use futures::StreamExt;
     use std::time::Duration;
@@ -4148,6 +4148,56 @@
                 !got.as_ref().unwrap().contains("pre-existing"),
                 "tail-from-now must NOT replay history; got {got:?}"
             );
+        }
+
+        /// The Redis tail reaches a remote reader through the handler with host
+        /// facts redacted, and this machine reads it unchanged. (The file tail
+        /// has the same test in `redaction.rs`; both meet `redacted_events`.)
+        #[tokio::test]
+        #[serial]
+        async fn the_redis_flow_stream_redacts_for_a_remote_reader_through_the_handler() {
+            use futures::StreamExt;
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            let prev = std::env::var_os("DARKMUX_REDIS_URL");
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+            let mut outcomes = Vec::new();
+            for from in ["10.0.0.9:5555", "127.0.0.1:5555"] {
+                let app = build_router_local(PathBuf::new());
+                let mut req = Request::builder().uri(format!("/flow/{today}/stream")).header("host", "localhost").body(Body::empty()).unwrap();
+                req.extensions_mut().insert(ConnectInfo(from.parse::<SocketAddr>().unwrap()));
+                let mut body = app.oneshot(req).await.unwrap().into_body().into_data_stream();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let record = format!(
+                    r#"{{"ts":"{today}T12:00:00Z","action":"x.y","cwd":"/Users/someone/w","endpoint":"http://[fd7a:115c:a1e0::53]:1234/v1","peer":"100.64.7.7","marker":"redis-marker"}}"#
+                );
+                xadd_flow_record(&redis.url, &record);
+                let mut seen = String::new();
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(Ok(chunk)) = body.next().await {
+                        seen.push_str(&String::from_utf8_lossy(&chunk));
+                        if seen.contains("redis-marker") {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                outcomes.push(seen);
+            }
+            match prev {
+                Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+                None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+            }
+            let (remote, local) = (&outcomes[0], &outcomes[1]);
+            assert!(remote.contains("redis-marker"), "the record reached the remote reader: {remote}");
+            for secret in ["someone", "fd7a", "100.64.7.7"] {
+                assert!(!remote.contains(secret), "remote saw `{secret}`: {remote}");
+                assert!(local.contains(secret), "this machine reads `{secret}` unchanged: {local}");
+            }
         }
 
         /// (#1596) A consumer that disconnects during a QUIET period must

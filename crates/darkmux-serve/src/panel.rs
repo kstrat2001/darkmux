@@ -2746,10 +2746,10 @@ mod tests {
             None,
         );
         for want in ["Peer.Example:8765", "Peer.Example", "[fd7a::1]:8765", "fd7a::1", "10.0.0.4"] {
-            assert!(r.addresses.iter().any(|a| a == want), "{want} in {:?}", r.addresses);
+            assert!(r.addresses().contains(&want), "{want} in {:?}", r.addresses());
         }
-        assert!(r.addresses.windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
-        assert!(r.dirs.is_empty(), "a bare / is not a home to rewrite");
+        assert!(r.addresses().windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
+        assert!(r.dirs().is_empty(), "a bare / is not a home to rewrite");
     }
 
     fn body_with(text: &str) -> PanelResponse {
@@ -2783,10 +2783,10 @@ mod tests {
     /// tokens go, never a substring of a word.
     #[test]
     fn a_short_address_is_hidden_only_as_a_whole_token() {
-        let r = Redaction::from_parts(&[("peerone", "mac"), ("peertwo", "ana")], &[], None, None);
+        let r = Redaction::from_parts(&[("peerone", "mac.local"), ("peertwo", "ana.local")], &[], None, None);
         assert_eq!(
-            filtered(&r, "mac is up; macos aarch64; analyst; lmstudio-community/mac-x ana, (mac)"),
-            "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac-x (address hidden), ((address hidden))"
+            filtered(&r, "mac.local is up; macos aarch64; analyst; lmstudio-community/mac.local-x ana.local, (mac.local)"),
+            "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac.local-x (address hidden), ((address hidden))"
         );
     }
 
@@ -2803,23 +2803,37 @@ mod tests {
 
     #[test]
     fn a_model_key_that_contains_a_host_as_a_substring_survives() {
-        let r = Redaction::from_parts(&[("peerone", "studio")], &[], None, None);
+        let r = Redaction::from_parts(&[("peerone", "studio.example")], &[], None, None);
         assert_eq!(
-            filtered(&r, "lmstudio-community/qwen3-4b studio"),
+            filtered(&r, "lmstudio-community/qwen3-4b studio.example"),
             "lmstudio-community/qwen3-4b (address hidden)"
+        );
+    }
+
+    /// A bare roster host (no dot) is a word in prose ("LM Studio", "the
+    /// Studio is busy"): it is a host fact only where it addresses.
+    #[test]
+    fn a_bare_roster_host_is_hidden_only_where_it_addresses() {
+        let r = Redaction::from_parts(&[("peerone", "studio:8765")], &[], None, None);
+        assert_eq!(filtered(&r, "LM Studio: the Studio is busy"), "LM Studio: the Studio is busy");
+        assert_eq!(
+            filtered(&r, "at studio:8765 and http://studio/x and studio:9000 and me@studio"),
+            "at (address hidden) and http://(address hidden)/x and (address hidden):9000 and me@(address hidden)"
         );
     }
 
     #[test]
     fn the_home_rewrite_respects_path_boundaries_and_covers_darkmux_home() {
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Volumes/x/dm".into()));
+        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/Volumes/x/dm".into()));
         assert_eq!(
-            filtered(&r, "/Users/kain/a /Users/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
-            "~/a /Users/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
+            filtered(&r, "/srv/kain/a /srv/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
+            "~/a /srv/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
         );
+        // Another account's home reads `~` whoever it is.
+        assert_eq!(filtered(&r, "/Users/kainx/b"), "~/b");
         // A DARKMUX_HOME inside HOME is covered by the HOME rewrite.
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Users/kain/.darkmux".into()));
-        assert_eq!(filtered(&r, "/Users/kain/.darkmux/x"), "~/.darkmux/x");
+        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/srv/kain/.darkmux".into()));
+        assert_eq!(filtered(&r, "/srv/kain/.darkmux/x"), "~/.darkmux/x");
     }
 
     fn app_state() -> AppState {
@@ -2930,16 +2944,19 @@ mod tests {
     async fn one_state_serves_a_remote_caller_then_this_machine_unredacted() {
         let dir = tempfile::tempdir().unwrap();
         let roster = dir.path().join("fleet.json");
-        // `echo role list` prints `role list`; "role" is the roster address.
+        // The child prints a line naming the roster's address.
+        let child = dir.path().join("child.sh");
+        std::fs::write(&child, "#!/bin/sh\necho peer at example-host.example:8765 role list\n").unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         std::fs::write(
             &roster,
-            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"role","added_unix_ms":1}}}"#,
+            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"example-host.example:8765","added_unix_ms":1}}}"#,
         )
         .unwrap();
         let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         let mut state = app_state();
-        state.panels.child_exe = Some(std::path::PathBuf::from("/bin/echo"));
+        state.panels.child_exe = Some(child);
         let serve = |peer: &str| {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(PANEL_HEADER, "1".parse().unwrap());
@@ -2959,15 +2976,15 @@ mod tests {
             Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
             None => std::env::remove_var("DARKMUX_FLEET_FILE"),
         }
-        assert_eq!(remote.ansi_text.trim(), "(address hidden) list");
-        assert_eq!(local.ansi_text.trim(), "role list", "the cache must hold the unfiltered body");
+        assert_eq!(remote.ansi_text.trim(), "peer at (address hidden) role list");
+        assert_eq!(local.ansi_text.trim(), "peer at example-host.example:8765 role list", "the cache must hold the unfiltered body");
     }
 
     // ── real panel output: colored, punctuated, linked ─────────────────
 
     fn real_redaction() -> Redaction {
         Redaction::from_parts(
-            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac")],
+            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac.local")],
             &[],
             Some("/Users/kain".into()),
             Some("/Users/kainx/dm".into()),
@@ -2984,7 +3001,7 @@ mod tests {
             ("\x1b[2mstudio.tailnet.example\x1b[0m", "\x1b[2m(address hidden)\x1b[0m"),
             ("\x1b[0mstudio.tailnet.example:8765", "\x1b[0m(address hidden)"),
             ("\x1b[2m100.64.1.2", "\x1b[2m(address hidden)"),
-            ("\x1b[1mmac", "\x1b[1m(address hidden)"),
+            ("\x1b[1mmac.local", "\x1b[1m(address hidden)"),
             ("\x1b[38;5;208m/Users/kain\x1b[39m", "\x1b[38;5;208m~\x1b[39m"),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
@@ -2999,12 +3016,12 @@ mod tests {
             ("is studio.tailnet.example.", "is (address hidden)."),
             ("at 100.64.1.2.", "at (address hidden)."),
             ("in /Users/kain.", "in ~."),
-            ("(100.64.1.2), mac.\n", "((address hidden)), (address hidden).\n"),
+            ("(100.64.1.2), mac.local.\n", "((address hidden)), (address hidden).\n"),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
         }
         // A dot followed by a word character still continues the name.
-        assert_eq!(filtered(&r, "100.64.1.2.5 mac.example"), "100.64.1.2.5 mac.example");
+        assert_eq!(filtered(&r, "100.64.1.2.5 mac.local.example"), "100.64.1.2.5 mac.local.example");
     }
 
     #[test]
@@ -3077,7 +3094,7 @@ mod tests {
         let (h, dm) = (home.to_string_lossy().to_string(), home.join("dm").to_string_lossy().to_string());
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(dm.clone()));
         assert_eq!(filtered(&r, &format!("{dm}/x")), "~/dm/x");
-        assert!(r.dirs.iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs);
+        assert!(r.dirs().iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs());
         // A sibling that merely shares the prefix is not inside it.
         std::fs::create_dir_all(format!("{h}x/dm")).ok();
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(format!("{h}x/dm")));
