@@ -1075,6 +1075,23 @@ pub fn config_check_text(path: &Path, text: &str) -> ConfigCheck {
     ConfigCheck { refusal: refused.then_some(found), warnings }
 }
 
+/// What a command that runs no preflight prints about a `config.json` that
+/// a work-starting command would refuse over (the file's problem, and that
+/// commands that start work refuse until it is fixed). `None` for a clean file
+/// or one with only harmless leftovers.
+pub fn config_notice_text(path: &Path, text: &str) -> Option<String> {
+    config_check_text(path, text).refusal.map(|p| {
+        format!("{p}\n  this command does not act on it, but a command that starts work refuses until it is fixed (`darkmux doctor` names the fix)")
+    })
+}
+
+/// [`config_notice_text`] of the resolved `config.json`.
+pub fn config_json_notice() -> Option<String> {
+    config_json_check().refusal.map(|p| {
+        format!("{p}\n  this command does not act on it, but a command that starts work refuses until it is fixed (`darkmux doctor` names the fix)")
+    })
+}
+
 /// [`config_check_text`] of the file at `path`; an absent file is clean.
 pub fn config_check_at(path: &Path) -> ConfigCheck {
     match read_user_file(UserFileKind::Config, path) {

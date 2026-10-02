@@ -26,8 +26,13 @@ still loads, so doctor always runs. A key darkmux 5.0 retired is judged by its
 value (#3057): a leftover at its old default (the value `darkmux init` wrote,
 or one whose loss changes nothing) warns on stderr once per command, shows as a
 warning in doctor, and every command still starts; it is safe to delete. A value
-you set (a token cap, `machine_rollup.enabled: true`) is refused like an unknown
-key until you move it. An unset or misspelled env var name, by contrast, is simply not read:
+you set whose loss would be unsafe (a token cap) is refused like an unknown
+key until you move it. The same rule governs the retired setting's env var: it
+refuses only when ignoring it would be unsafe, and warns otherwise. The refusal
+is made by the commands that start work (`dispatch`, `mission launch`, `lab run`,
+fleet submission, `serve`). A command with no preflight (a read such as
+`run list`) is never refused over the file: it prints the same problem as a
+`warning:` on stderr and runs. An unset or misspelled env var name, by contrast, is simply not read:
 the environment is shared with every other program, so darkmux cannot tell a
 typo from somebody else's variable.
 
@@ -241,7 +246,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_EXPECT_IOREPORT` (#2108 — test-only; gates the live `host_probe` tests' strict "IOReport resolved" assertions) | — (not read by any runtime code path; test-only) |
 | `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` (#2631 — test-only; gates which ceiling the live `host_probe` cost-budget assertion enforces) | — (not read by any runtime code path; test-only) |
 
-(Historical: `DARKMUX_NOTEBOOK_DIR` and `dirs.notebook` were removed in 4.0 along with the `lab notebook` verbs (#2913); the bundled `darkmux-lab-notebook` skill writes entries wherever your own instructions say, so no darkmux setting names the location any more. `DARKMUX_ACK_DIR` and `dirs.ack` were removed in 5.0 (#3036) along with the licensed-adjacent acknowledgment gate and the roles it guarded. A leftover env var of either only warns. A leftover `dirs.notebook` or `dirs.ack` key in `config.json` is refused at preflight by dispatch, mission launch, lab run, fleet work submission and serve until you remove it, and `darkmux doctor` fails it, naming the key and the fix.)
+(Historical: `DARKMUX_NOTEBOOK_DIR` and `dirs.notebook` were removed in 4.0 along with the `lab notebook` verbs (#2913); the bundled `darkmux-lab-notebook` skill writes entries wherever your own instructions say, so no darkmux setting names the location any more. `DARKMUX_ACK_DIR` and `dirs.ack` were removed in 5.0 (#3036) along with the licensed-adjacent acknowledgment gate and the roles it guarded. A leftover env var of either only warns, and so does a leftover `dirs.notebook` or `dirs.ack` key in `config.json` (one rule on both channels: refuse only when ignoring a setting would be unsafe, and ignoring these changes nothing). `darkmux doctor` warns on it, naming the key and the fix.)
 
 (Historical, 5.0 (#3035): the whole `remote{}` block is gone, because "remote" was the wrong axis (a local server on the same machine is an endpoint too). `remote.max_tokens_per_step` (and its pre-4.0 name `remote.max_tokens_per_execution`), `remote.step_budget_policy` and `remote.concurrent_cap`, with `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`, `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`, `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP`, moved to the endpoint: `endpoints.<id>.limits.tokens_per_dispatch`, `limits.policy` and `limits.concurrent_calls`. Nothing is carried over: limits are off until you set them per endpoint. A leftover `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` or `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` is refused by every command except `doctor` and `config` (silently ignoring a spend cap would remove the cap); a leftover `DARKMUX_REMOTE_CONCURRENT_CAP` or `DARKMUX_REMOTE_STEP_BUDGET_POLICY` only warns and is ignored. A leftover `remote` block in `config.json` at its old defaults only warns (#3057); one that sets a token cap is refused at preflight by every consuming entry point until you move it, and `darkmux doctor` fails it, naming the field that replaced it. `config set` refuses the old keys the same way. A `dispatch.map` step's `bucket_group` and `bucket_budget` are gone too: a config naming either is refused, pointing at the endpoint's rolling `limits.window`.)
 

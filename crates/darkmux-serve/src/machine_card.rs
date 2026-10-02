@@ -575,7 +575,11 @@ pub(crate) fn gather_local_card() -> MachineCard {
             (profiles, default, utility, None)
         }
         Err(e) => {
-            eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
+            // Informational: the card itself carries the failure (`REGISTRY_UNREADABLE`), and a
+            // CLI read of the fleet view (`profile list --machine <x>`) gathers this card on
+            // the way. Printed for a log (non-terminal stderr, the daemon) or `--verbose`, quiet
+            // in a terminal.
+            darkmux_types::diag_eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
             (Vec::new(), None, None, Some(REGISTRY_UNREADABLE.to_string()))
         }
     };

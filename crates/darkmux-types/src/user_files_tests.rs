@@ -614,6 +614,18 @@ fn warned(check: &ConfigCheck) -> Vec<&str> {
     check.warnings.iter().map(|w| w.key.as_str()).collect()
 }
 
+/// A command that does not preflight still hears about a `config.json` it would be refused over,
+/// and a clean or only-warned file says nothing extra.
+#[test]
+fn an_unscoped_command_is_told_about_a_config_that_would_be_refused() {
+    let notice = |doc: Value| config_notice_text(Path::new("config.json"), &doc.to_string());
+    let msg = notice(json!({"remote": {"max_tokens_per_step": 50000}})).expect("a spend cap leftover is noticed");
+    assert!(msg.contains("`remote`") && msg.contains("refuse"), "{msg}");
+    assert!(notice(json!({"redis": {"hots": "h"}})).is_some(), "an unknown key is noticed");
+    assert_eq!(notice(json!({"remote": {"concurrent_cap": 1}})), None, "a harmless leftover only warns");
+    assert_eq!(notice(json!({})), None);
+}
+
 /// A real 4.x install (darkbook): what `darkmux init` wrote, verbatim. 5.0
 /// retired every one of these keys, and none holds a value that ignoring
 /// changes, so the config must warn and refuse nothing.

@@ -168,9 +168,15 @@ fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
     }
     // A retired `config.json` key at its old default warns the same way and
     // starts everything (#3057); a value ignoring which would change
-    // something is refused by the preflight instead.
+    // something is refused by the preflight of every command that starts work
+    // (dispatch, mission launch, lab run, fleet submission, serve). A command
+    // with no preflight (a read such as `run list`) is never refused over the
+    // file, so it prints the problem as a warning instead of staying silent.
     for leftover in darkmux_types::user_files::config_json_warnings() {
         eprintln!("warning: {leftover}");
+    }
+    if let Some(notice) = darkmux_types::user_files::config_json_notice() {
+        eprintln!("warning: {notice}");
     }
     Ok(())
 }

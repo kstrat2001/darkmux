@@ -4505,19 +4505,23 @@ fn read_flow_records_from_redis(
         .arg(MAX_FLOW_FILE_RECORDS)
         .query(&mut conn)
         .with_context(|| format!("XREVRANGE on {stream}"))?;
-    records_from_xrevrange(raw, date)
+    records_from_xrevrange(raw, date, darkmux_types::config_access::redis_maxlen())
 }
 
 /// The records an `XREVRANGE` reply holds, read through the flow reader
 /// (so a pre-4.0 spelling comes back current), filtered to `date` when one
 /// is given, in chronological order.
 ///
-/// The read is cut (D5) when it may not hold the whole date: it returned a full
-/// `COUNT` or the stream's first entry is newer than the date's start, and in
-/// both cases its oldest entry is at or after the start of the date, so older
-/// records of that date are past the cap or were trimmed by `maxlen`. A read
-/// with no date asks for the whole stream and is never "cut" in this sense.
-fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<SourceRead> {
+/// The read is cut (D5) when it may not hold the whole date: its oldest entry
+/// is at or after the start of the date AND the read hit a bound that drops
+/// older entries, either the `COUNT` it asked for or the stream's own trim
+/// length (`maxlen`; `0` is unbounded, so never trimmed). A young or
+/// never-trimmed stream whose first entry is simply newer than the date's
+/// start has lost nothing, so a short read under both bounds is not cut. The
+/// trim length is this machine's own `redis.maxlen`, an approximation of what
+/// the hub's writers trim to. A read with no date asks for the whole stream
+/// and is never "cut" in this sense.
+fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) -> Result<SourceRead> {
     let entries = match raw {
         redis::Value::Array(v) => v,
         other => {
@@ -4526,9 +4530,12 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Sourc
             ));
         }
     };
-    let cut = date.and_then(day_start_ms).is_some_and(|start| {
-        entries.last().and_then(entry_id_ms).is_some_and(|oldest| oldest >= start)
-    });
+    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
+    let hit_a_bound = entries.len() >= bound;
+    let cut = hit_a_bound
+        && date.and_then(day_start_ms).is_some_and(|start| {
+            entries.last().and_then(entry_id_ms).is_some_and(|oldest| oldest >= start)
+        });
     // (#1715 review) The last bare `10000` on this path — the same cap the
     // XREVRANGE above already single-sources, so it follows that constant
     // rather than sitting beside it as a third copy.

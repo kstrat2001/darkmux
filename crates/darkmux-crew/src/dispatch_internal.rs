@@ -9814,7 +9814,16 @@ impl TailerState {
 
     /// (#3035) Settle one model call's spend into this dispatch's token cap,
     /// warning once when the dispatch's total reaches it. A call that
-    /// reported no usage adds nothing (the cap counts what the endpoint said).
+    /// reported no usage is charged the conservative stand-in
+    /// ([`crate::budget::conservative_spend`]: the granted per-call cap), so a
+    /// silent endpoint cannot run past the cap unseen.
+    ///
+    /// COMPACTOR calls are deliberately NOT settled here ([`Self::on_compaction_call`]):
+    /// the cap is `limits.tokens_per_dispatch` of the BRAIN's endpoint, and a
+    /// compactor call goes to the machine's LMStudio, never through that
+    /// endpoint. It is a sub-execution of its own role and model (contract 8),
+    /// so its spend rides its own usage record and is never blended into the
+    /// specialist's cap.
     fn settle_dispatch_cap(&self, m: &darkmux_trajectory::ModelCompleted) {
         let Some(bucket) = &self.dispatch_cap else { return };
         // The prompt the container sent is not visible here; the granted
@@ -9928,7 +9937,8 @@ impl TailerState {
     /// (#2902 step 1b) One COMPACTOR call, installed or refused: exactly one
     /// usage record, attributed to the compactor (record `handle` + `model`),
     /// never to the specialist (contract 8). Neither a turn nor a
-    /// compaction, so the fold does not count it.
+    /// compaction, so the fold does not count it. It is not settled into the
+    /// dispatch's token cap either: see [`Self::settle_dispatch_cap`].
     fn on_compaction_call(&mut self, c: &darkmux_trajectory::CompactionCall) {
         let mut payload = compaction_call_tokens_payload(
             c,

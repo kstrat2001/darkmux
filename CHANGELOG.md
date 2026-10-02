@@ -62,6 +62,23 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **One rule for a retired setting's leftover, on both channels** (5.0).
+  A leftover env var or `config.json` key is refused only when ignoring it is
+  unsafe (a spend cap); otherwise it warns. `dirs.notebook`, `radio.router_profile`,
+  `remote.step_budget_policy`, `runtime.log_level` and `machine_rollup.enabled`
+  used to warn as env vars but refuse as `config.json` keys; they warn in both.
+  A command with no preflight (a read such as `run list`) now prints a
+  `config.json` problem as a `warning:` instead of staying silent. `RENAMED_SETTINGS`
+  (always empty after 5.0) is gone; a rename is a `RETIRED_SETTINGS` entry.
+- **The older retired verbs say where they went** (5.0). `swap`, `status`,
+  `fleet`, `lessons`, `model`, `crew sync` and `mission run` are refused with a
+  pointer (`machine`, `memory`, `mission launch`) instead of clap's "similar
+  subcommand" guess (`model` used to suggest `mod`).
+- **One owner for an unmanaged endpoint's seat** (5.0). The key a call claims
+  (`ModelEndpoint::seat_key`) and how many calls run at once
+  (`concurrent_width`) are each derived once, shared by the scheduler and a
+  fleet receiver's seat book.
+
 - **Informational stderr lines stay out of an interactive terminal** (5.0).
   `[darkmux-liveness]` markers, the `flow: ... sink enabled` banners, and the
   dispatch progress headers print only when stderr is not a terminal (CI logs,
@@ -1468,6 +1485,17 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **`config set` (and `machine trust` / `untrust`) refuse a `config.json` written by a
+  newer darkmux** instead of rewriting it with keys this binary cannot place.
+- **A malformed `bounds` block no longer drops a whole `dispatch.start` record**
+  (it costs the bounds, and a wrong-typed optional knob only itself), and a knob
+  `value` of a type no darkmux wrote reads as unknown (`KnobValue::Unrecognized`)
+  rather than as `null`, which means uncapped.
+- **`meta.cut.fleet` is true only for a Redis stream that was trimmed or hit the
+  read's `COUNT`**, not for a young stream whose first entry is simply newer than
+  the day (it said a complete day was cut).
+- **`profile list --machine <missing>` no longer prints a stray "machine card"
+  line first** in a terminal; the line prints for a log or under `--verbose`.
 - **Selecting text on a card or row never clicks it.** A drag that selects
   text, or a double-click that selects a word, no longer drills the fleet
   machine card, a run row, an event row, or a mission step; a plain click
