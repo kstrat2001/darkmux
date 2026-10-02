@@ -134,9 +134,10 @@ pub enum FlowCmd {
     /// first divergence per file. A clean walk means no divergence
     /// was found at this check: not that the file is unaltered; see
     /// SECURITY.md for the chain's known gaps. Exits with status 2 when
-    /// any chain is broken so CI/cron can flag tampering; a file from before
-    /// 2.6.0 (no `hash_format` on its header) is reported as broken, since
-    /// nothing in it is verified: archive it.
+    /// any chain is broken so CI/cron can flag it. A file from before 2.6.0
+    /// (no `hash_format` on its header) is also reported as broken, at line
+    /// 1: nothing in it is verified, which is not evidence of editing.
+    /// Archive it.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the

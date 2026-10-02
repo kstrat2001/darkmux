@@ -5694,6 +5694,41 @@ mod tests {
         assert_eq!(crate::integrity::integrity_exit_code(&[]), 0);
     }
 
+    /// The write side of the same refusal: the audit sink will not extend a
+    /// multi-line file whose header is not in the byte-hash format, and leaves
+    /// its bytes untouched. (#1769)
+    #[test]
+    #[serial_test::serial]
+    fn the_sink_refuses_to_extend_a_file_without_the_hash_format_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        let old_header = crate::integrity::schema_header_line().unwrap();
+        let mut rec = minimal_record();
+        rec.hash = Some("deadbeef".repeat(8));
+        let old_line = serde_json::to_string(&rec).unwrap();
+        let before = format!("{old_header}\n{old_line}\n{old_line}\n");
+        std::fs::write(&path, &before).unwrap();
+
+        let err = crate::integrity::audit_record_at(&minimal_record(), &path).unwrap_err().to_string();
+        assert!(err.contains("not in the byte-hash format") && err.contains("archive"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "a refused write leaves the file alone");
+    }
+
+    /// A header naming ANOTHER hash_format gets its own reason, naming it.
+    #[test]
+    #[serial_test::serial]
+    fn a_header_naming_another_hash_format_is_reported_with_that_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        let header = serde_json::json!({"_type": "schema", "version": "2.0.0", "hash_format": "future-v9"});
+        std::fs::write(&path, format!("{header}\nanything\n")).unwrap();
+        let report = integrity_check_file(&path).unwrap();
+        assert!(!report.chain_valid);
+        assert_eq!((report.break_at_line, report.records_checked), (Some(1), 0));
+        let reason = report.break_reason.unwrap();
+        assert!(reason.contains("future-v9") && reason.contains("prefix-blake3-v1"), "{reason}");
+    }
+
     /// A file whose header lacks the `hash_format` marker (every file written
     /// before 2.6.0) is not verified, and must never read as verified: it is
     /// reported as a break at the header, naming what to do. (#1769)

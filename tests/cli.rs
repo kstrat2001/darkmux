@@ -6396,6 +6396,49 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // canned model call — see `src/radio.rs::tests` and
 // `src/radio_cli.rs::tests`.
 
+/// (#1769, 5.0) A day file whose header carries no `hash_format` marker (every
+/// file written before 2.6.0) is not verified: through the real binary,
+/// `flow integrity-check` exits 2 and names a break at line 1, and `--json`
+/// reports 0 records checked with none of the removed `legacy_format` / `note`
+/// fields.
+#[test]
+fn integrity_check_reports_a_header_without_the_marker_as_a_break_at_line_1() {
+    let audit = TempDir::new().unwrap();
+    let header = serde_json::json!({"_type": "schema", "version": "1.19.0", "darkmux_version": "2.5.0"});
+    fs::write(
+        audit.path().join("2024-01-01.jsonl"),
+        format!("{header}\n{{\"action\":\"x\",\"hash\":\"deadbeef\"}}\n"),
+    )
+    .unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_AUDIT_DIR", audit.path())
+        .args(["flow", "integrity-check"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert!(stdout.contains("BROKEN") && stdout.contains("line 1"), "{stdout}");
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_AUDIT_DIR", audit.path())
+        .args(["flow", "integrity-check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = &v["reports"][0];
+    assert_eq!(r["chain_valid"], false, "{v}");
+    assert_eq!(r["break_at_line"], 1, "{v}");
+    assert_eq!(r["records_checked"], 0, "{v}");
+    assert!(r.get("legacy_format").is_none() && r.get("note").is_none(), "{v}");
+
+    // The retired flag is rejected by clap.
+    let out = darkmux_cmd().env("DARKMUX_AUDIT_DIR", audit.path()).args(["flow", "integrity-check", "--strict"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--strict"));
+}
+
 /// (#2093, folded into `flow status` by #1959's flow-hooks-family
 /// retirement) `darkmux flow status` wires the hooks section end-to-end:
 /// parses, dispatches, and prints valid JSON naming the resolved

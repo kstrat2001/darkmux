@@ -480,14 +480,17 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
                 .clone()
                 .unwrap_or_else(|| "no reason captured".into()),
         );
+        let unrecognized = first.break_at_line == Some(1) && first.records_checked == 0;
+        let hint = if unrecognized {
+            "A file from before 2.6.0 (or in an unrecognized format), not verified: nothing in it was checked, and this is not evidence of editing. Archive it (move it aside) so a fresh chain starts. Run `darkmux flow integrity-check` for the full per-file breakdown."
+        } else {
+            "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; records before that line link consistently, which is evidence they are unmodified — not proof."
+        };
         return Check {
             name: "audit integrity".into(),
             status: Status::Fail,
             message: summary,
-            hint: Some(
-                "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; records before that line link consistently, which is evidence they are unmodified — not proof."
-                    .into(),
-            ),
+            hint: Some(hint.into()),
         };
     }
 
@@ -589,7 +592,7 @@ fn check_audit_write_drops() -> Check {
             name: "audit write integrity".into(),
             status: Status::Warn,
             message: format!(
-                "{n} audit write(s) FAILED today — the hash chain is INCOMPLETE for those records (the surviving chain still passes integrity-check)"
+                "{n} audit write(s) FAILED today — the hash chain is INCOMPLETE for those records (the records that were written still link)"
             ),
             hint: Some(
                 "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
@@ -9510,6 +9513,31 @@ mod tests {
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.starts_with("4 record(s)"), "{}", check.message);
         assert!(check.message.contains("dispatch start (1), future.thing (2), other.x (1)"), "{}", check.message);
+    }
+
+    #[test]
+    fn summarize_audit_reports_unrecognized_header_gets_a_neutral_hint() {
+        let old = darkmux_flow::IntegrityReport {
+            chain_valid: false,
+            break_at_line: Some(1),
+            break_reason: Some("the header names no `hash_format`".into()),
+            ..mk_clean_report(0)
+        };
+        let check = summarize_audit_reports(&[old]);
+        assert_eq!(check.status, Status::Fail);
+        let hint = check.hint.expect("a hint");
+        assert!(hint.contains("before 2.6.0") && hint.contains("Archive"), "{hint}");
+        assert!(!hint.contains("edited") || hint.contains("not evidence of editing"), "{hint}");
+        assert!(!hint.contains("tampering"), "{hint}");
+        // A real break keeps the editing hint.
+        let broken = darkmux_flow::IntegrityReport {
+            chain_valid: false,
+            break_at_line: Some(4),
+            break_reason: Some("hash mismatch".into()),
+            ..mk_clean_report(3)
+        };
+        let hint = summarize_audit_reports(&[broken]).hint.expect("a hint");
+        assert!(hint.contains("has been edited"), "{hint}");
     }
 
     #[test]

@@ -1,8 +1,7 @@
 /**
  * The fleet default view's machine-card row — `renderFleet()`'s `cards`
  * build, plus the two helpers it leans on:
- * `machActive()` and `specOf()`
- *.
+ * `machActive()` and `specOf()`.
  *
  * (Playback parity, Change A, 2026-09-24) The card used to branch on a
  * live/replay mode: replay counted ALL of the day's sessions and labeled them
