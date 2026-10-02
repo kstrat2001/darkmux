@@ -8,7 +8,7 @@ import type { FleetRosterResponse } from "../types/generated/FleetRosterResponse
 import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import type { RosterMachineEntry } from "../types/generated/RosterMachineEntry";
 
-/** `pollLiveMachines()` (viewer.html:3678) as a query hook — `LIVE_MACHINES`
+/** `pollLiveMachines()` as a query hook — `LIVE_MACHINES`
  * as a `Map<machine_uid, PresenceBeat>`, same key shape legacy builds. */
 /** `enabled` (#1800 P2): a REPLAY must not poll live presence. Passing the
  * result away is not enough — the query still fires, still polls on

@@ -1,5 +1,5 @@
 /**
- * `injectedMeta()` — viewer.html:3808-3811. Both `GET /` and `GET /next`
+ * `injectedMeta()`. Both `GET /` and `GET /next`
  * inject `darkmux-version`/`darkmux-flow-schema`/`darkmux-mode`/
  * `darkmux-flow-src` metas via the SAME `inject_mode_meta()`
  * (`crates/darkmux-serve/src/lib.rs`), so reading them here is the real,
@@ -13,7 +13,7 @@
  *
  * Extracted from `Masthead.tsx` (its original, still its only pre-drill-in
  * consumer) into this shared module so `RunsBoard.tsx`'s mission-graph
- * reachability check (`missionGraphReachable()`, viewer.html:2732) can read
+ * reachability check (`missionGraphReachable()`) can read
  * the SAME live mechanism rather than a second, drifting copy.
  */
 export function injectedMeta(name: string): string | null {

@@ -1023,15 +1023,17 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // answered whether the machine ever saturated; `avg` answers how hard it
     // was driven ON AVERAGE — the operator's own framing ("add the avg to
     // the card with the high").
-    const proc = (ts: string, cpu: number, mem: number, gpu: number) => ({
-      ts,
-      session_id: "s1",
-      category: "telemetry" as const,
-      source: "host",
-      fields: { cpu, mem, gpu },
-    });
+    const proc = (ts: string, cpu: number, mem: number, gpu: number) =>
+      ({
+        ts,
+        action: "machine.telemetry",
+        machine_uid: "m-1",
+        category: "machinery",
+        source: "host",
+        payload: { cpu_pct: cpu, mem_pct: mem, gpu_pct: gpu },
+      }) as unknown as RawRecord;
     const data: RawRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as RawRecord,
       proc("2026-01-01T00:00:10Z", 30, 60, 20),
       proc("2026-01-01T00:00:20Z", 39, 68, 97),
       // A LATER, lower sample — a "latest" reading would report 12% GPU on a

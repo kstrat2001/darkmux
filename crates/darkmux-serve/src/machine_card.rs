@@ -57,8 +57,7 @@ use std::time::Duration;
 /// `remote.concurrent_cap`; concurrency is per endpoint now
 /// (`endpoints.<id>.limits.concurrent_calls`), so there is no one number to
 /// report. 1.2 also adds `serves_radio` and `serves_profiles`, optional facts
-/// about what this machine serves to peers (absent when not stated). A 1.2
-/// reader reads an older card's `hosted` key and ignores its `cap`; 1.0 and
+/// about what this machine serves to peers (absent when not stated). 1.0 and
 /// 1.1 are unreleased, so no shipped reader meets a 1.2 card.
 pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
@@ -202,9 +201,7 @@ pub struct CardSeats {
     /// The local models a peer's job could seat, or does: each managed model
     /// in a work profile, and each model a peer job holds.
     pub local: Vec<CardLocalSeat>,
-    /// Seats on endpoints darkmux does not manage. Written as `unmanaged`; an
-    /// older peer's `hosted` key still reads.
-    #[serde(alias = "hosted")]
+    /// Seats on endpoints darkmux does not manage.
     pub unmanaged: CardUnmanagedSeats,
     /// Submitted jobs waiting for a seat.
     pub waiting: u32,
@@ -1159,24 +1156,6 @@ pub(crate) mod tests {
         assert_eq!(listener.card.profiles.len(), 2);
     }
 
-    /// A card from a peer on an older build. The 1.0 fixtures are what such a
-    /// peer sends, so they are frozen: never regenerated, only read. They parse
-    /// through today's parser, and a card that predates the fleet-role fields
-    /// states no role rather than a guessed one. (Live, 2026-10-01: with these
-    /// fields required, every peer still on the previous build read as
-    /// "unavailable / unparseable" on the fleet tab.)
-    #[test]
-    fn a_1_0_card_from_an_older_peer_still_parses() {
-        let read = |name: &str| std::fs::read_to_string(fixtures_dir().join(name)).unwrap();
-        let card: MachineCard = serde_json::from_str(&read("machine-card-1.0.json")).expect("a 1.0 card parses");
-        assert_eq!(card.card_schema_version, "1.0");
-        assert_eq!(card.fleet_mode, None, "a 1.0 card states no role");
-        assert_eq!(card.hosts_fleet_redis, None, "nor whether it hosts Redis");
-        assert!(card.hub_defaults().is_none());
-        let listener: ListenerCard = serde_json::from_str(&read("listener-card-1.0.json")).expect("a 1.0 listener card parses");
-        assert!(matches!(listener.grant, CardGrant::Listed { .. }));
-    }
-
     // ── serves_radio (card schema 1.2) ────────────────────────────────
 
     fn entry(roles: Option<Vec<&str>>) -> darkmux_types::config::AcceptWorkEntry {
@@ -1251,18 +1230,6 @@ pub(crate) mod tests {
         assert!(absent.get("serves_profiles").is_none(), "not stated is absent, never 0");
         let json = serde_json::to_value(MachineCard { serves_profiles: Some(3), ..sample_card() }).unwrap();
         assert_eq!(json["serves_profiles"], serde_json::json!(3));
-    }
-
-    /// A 1.1 card from a peer on the previous build states nothing about radio.
-    #[test]
-    fn a_1_1_card_still_parses_and_states_no_radio() {
-        let raw = std::fs::read_to_string(fixtures_dir().join("machine-card-1.1.json")).unwrap();
-        let card: MachineCard = serde_json::from_str(&raw).expect("a 1.1 card parses");
-        assert_eq!(card.card_schema_version, "1.1");
-        assert_eq!(card.serves_radio, None);
-        assert_eq!(card.serves_profiles, None, "a 1.1 card states no profile count");
-        let listener = std::fs::read_to_string(fixtures_dir().join("listener-card-1.1.json")).unwrap();
-        serde_json::from_str::<ListenerCard>(&listener).expect("a 1.1 listener card parses");
     }
 
     /// A schema with its object keys sorted, so its hash does not move with

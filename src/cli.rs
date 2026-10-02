@@ -6,7 +6,7 @@
 //! Extracted from `main.rs` (mechanical, zero behavior change) to keep the
 //! binary's entry point readable — this file is arg-surface-only, matching
 //! the pattern the smaller command modules (`flow_cli`, `config_cmd`,
-//! `phase_cli`) already established.
+//! `phase_review`) already established.
 
 use clap::{Parser, Subcommand};
 

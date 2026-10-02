@@ -450,26 +450,24 @@ describe("indexGraph / recordInMission / stepForRecord", () => {
 });
 
 describe("isAiKind", () => {
-  it("dispatch.* and review.probe/judge/verify kinds are AI-dispatching", () => {
+  it("dispatch.* and the coder-phase kinds are AI-dispatching", () => {
     expect(isAiKind("dispatch.internal")).toBe(true);
-    expect(isAiKind("review.probe:seat1")).toBe(true);
-    expect(isAiKind("review.judge")).toBe(true);
     expect(isAiKind("mission.coder")).toBe(true);
+    expect(isAiKind("mission.verify")).toBe(true);
   });
   it("procedural kinds are not", () => {
     expect(isAiKind("dispatch.unit")).toBe(true);
     // (#2430) The summary folds step records; it dispatches no model.
     expect(isAiKind("dispatch.summary")).toBe(false);
     expect(isAiKind("procedural.shell")).toBe(false);
-    expect(isAiKind("review.bundle")).toBe(false);
+    // A funnel kind that no longer exists gets no AI styling from its name.
+    expect(isAiKind("review.judge")).toBe(false);
   });
-  it("-render kinds are excluded even though they share a probe/verify prefix", () => {
-    expect(isAiKind("review.probe-render")).toBe(false);
-    expect(isAiKind("review.verify-render")).toBe(false);
-  });
-  it("-collect kinds are excluded too (#2310 P2 review finding I4) — the procedural fan-in step after a dispatch.map, never a dispatcher itself", () => {
-    expect(isAiKind("review.probe-collect")).toBe(false);
-    expect(isAiKind("review.verify-collect")).toBe(false);
+  it("-render and -collect kinds are excluded even under a dispatching prefix (#2310 P2 review finding I4)", () => {
+    // flow-action-guard:allow-start — step kinds, not flow actions
+    expect(isAiKind("dispatch.map-render")).toBe(false);
+    expect(isAiKind("dispatch.map-collect")).toBe(false);
+    // flow-action-guard:allow-end
   });
 });
 
@@ -733,9 +731,9 @@ describe("formatting helpers", () => {
   });
 
   it("stepLead falls back label -> kind -> 'step'; stepSeat pulls the colon suffix", () => {
-    expect(stepLead({ id: "s", label: "", kind: "review.probe", status: "planned" as const })).toBe("review.probe");
-    expect(stepSeat("review.probe:seat-1")).toBe("seat-1");
-    expect(stepSeat("review.judge")).toBe("");
+    expect(stepLead({ id: "s", label: "", kind: "dispatch.unit", status: "planned" as const })).toBe("dispatch.unit");
+    expect(stepSeat("dispatch.unit:seat-1")).toBe("seat-1");
+    expect(stepSeat("dispatch.summary")).toBe("");
   });
 });
 

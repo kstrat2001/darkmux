@@ -667,8 +667,8 @@ function closeFacts(close: Close | null): Pick<RunContext, "closeTs" | "skewedCl
 interface AttemptTelemetry {
   tel: NormRecord[];
   lms: NormRecord[];
-  /** Host cpu/ram/gpu samples: the retired per-session `telemetry.process`
-   *  and the machine's own `machine.telemetry` over the run's window. */
+  /** Host cpu/ram/gpu samples: the machine's own `machine.telemetry` over
+   *  the run's window. */
   procs: NormRecord[];
   dets: NormRecord[];
   loads: NormRecord[];
@@ -688,7 +688,7 @@ function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): Atte
   return {
     tel,
     lms,
-    procs: [...bySource(tel, SOURCE.Host), ...hostSamplesOf(visible, ctx)],
+    procs: hostSamplesOf(visible, ctx),
     dets: bySource(tel, SOURCE.Detector),
     loads,
     distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
@@ -696,12 +696,9 @@ function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): Atte
   };
 }
 
-/** (#2413 M4) The machine's host samples over this run's window. The
- * retired per-dispatch `telemetry.process` record rode this session's own
- * `session_id` (and still matches through `attemptTelemetry`'s `process`
- * source, for historical runs); its replacement, `machine.telemetry`, is
- * machine-scoped (`category: "machinery"`, no `session_id`), so it cannot
- * belong to an attempt. The server joins the samples covering the run's
+/** (#2413 M4) The machine's host samples over this run's window.
+ * `machine.telemetry` is machine-scoped (`category: "machinery"`, no
+ * `session_id`), so it cannot belong to an attempt. The server joins the samples covering the run's
  * window into the same record set (darkmux-serve's
  * `join_host_samples_into_session_records`, keyed on machine_uid and the
  * dispatch window), so here it is a plain time-window filter.
@@ -922,18 +919,16 @@ const finiteOrUndefined = (v: unknown): number | undefined => {
 /** (#1973, #2107) Host CPU / RAM / GPU over the run, average and peak,
  *  through the ONE aggregation the machine drawer also uses
  *  (`lib/hostStats.ts`'s `aggregateHostSamples`), so the two surfaces never
- *  report different numbers for overlapping samples. (#2413 M4) The retired
- *  `telemetry.process` payload names bare `cpu`/`mem`/`gpu`, the
- *  machine-scoped `machine.telemetry` names `cpu_pct`/`mem_pct`/`gpu_pct`;
- *  both read. */
+ *  report different numbers for overlapping samples. A `machine.telemetry`
+ *  payload names `cpu_pct`/`mem_pct`/`gpu_pct`. */
 function hostAggregate(procs: readonly NormRecord[]) {
   return aggregateHostSamples(
     procs.map((r) => {
       const f = r.fields as Record<string, unknown> | undefined;
       return {
-        cpu: finiteOrUndefined(f?.cpu ?? f?.cpu_pct),
-        mem: finiteOrUndefined(f?.mem ?? f?.mem_pct),
-        gpu: finiteOrUndefined(f?.gpu ?? f?.gpu_pct),
+        cpu: finiteOrUndefined(f?.cpu_pct),
+        mem: finiteOrUndefined(f?.mem_pct),
+        gpu: finiteOrUndefined(f?.gpu_pct),
       };
     }),
   );

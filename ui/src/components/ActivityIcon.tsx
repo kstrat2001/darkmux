@@ -3,7 +3,7 @@ import { MachineIcon } from "./MachineIcon";
 /**
  * The per-activity glyphs the event log shows inline on each row so the
  * operator can scan "what is the model doing" without reading every label
- * (`ICON` + `ACT_ICON`, viewer.html:948-968).
+ * (`ICON` + `ACT_ICON`).
  *
  * **Why this went missing and nothing caught it.** `MachineIcon`'s own doc
  * names the mechanism exactly: an inline SVG contributes no text to
@@ -69,7 +69,7 @@ const GLYPH: Record<IconKey, React.ReactNode> = {
   machine: null,
 };
 
-/** Activity label (`activityOf`) → glyph key. viewer.html:968, verbatim —
+/** Activity label (`activityOf`) → glyph key., verbatim —
  * anything unmapped renders no glyph, leaving a plain row. */
 export const ACT_ICON: Record<string, IconKey> = {
   reasoning: "brain",

@@ -105,7 +105,7 @@ export function machinePageRecords(
 /** The uid this daemon reports for itself, once `/machine/specs` has answered. */
 export const selfUidOf = (specs: SelfIdentity | null): string | null => specs?.machine_uid ?? null;
 
-/** `uidOf()` — viewer.html:1107. */
+/** `uidOf()`. */
 export const uidOf = (r: NormRecord): string => r.machine_uid || "unknown";
 
 /** (#2921) The label for a machine nothing has named. Never the hardware uid:
@@ -116,7 +116,7 @@ export const UNNAMED_MACHINE = "unnamed machine";
 export const isUnnamedMachineLabel = (name: string): boolean =>
   name === UNNAMED_MACHINE || /^unnamed machine \d+$/.test(name);
 
-/** `nameOf()` — viewer.html:1112. The newest `machine_id` a record carried
+/** `nameOf()`. The newest `machine_id` a record carried
  * for this uid, then the presence beat's `display_name`, then
  * `UNNAMED_MACHINE` — never the uid itself (#2921; legacy fell back to it). */
 export function nameOf(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
@@ -164,7 +164,7 @@ function beatOf(liveMachines: Map<string, PresenceBeat>, uid: string): PresenceB
   return key === null ? undefined : liveMachines.get(key);
 }
 
-/** `machines()` — viewer.html:1123. */
+/** `machines()`. */
 export function machineUids(data: NormRecord[], liveMachines: Map<string, PresenceBeat>): string[] {
   return [...directory(data, liveMachines).uids];
 }
@@ -418,7 +418,7 @@ function unnamedOrder(
     .map(([uid]) => uid);
 }
 
-/** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,
+/** `localMachineUid()`. Which uid IS this daemon,
  * for the nav-tab/deep-link entry into the machine page.
  *
  * Matches against EVERY alias a uid has used (`machineNames`), not just the one

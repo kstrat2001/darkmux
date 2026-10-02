@@ -24,7 +24,7 @@ function graphSnapshot() {
         status: 'running', depth: 0,
         steps: [
           { id: 'coder-1', kind: 'mission.coder', label: 'Coder', status: 'running', startedTs: STARTED_SECS, model: 'darkmux:qwen3-coder-next' },
-          { id: 'probe-1', kind: 'review.probe', label: 'Probe', status: 'running', startedTs: STARTED_SECS, model: 'darkmux:gpt-oss-120b' },
+          { id: 'probe-1', kind: 'dispatch.internal', label: 'Probe', status: 'running', startedTs: STARTED_SECS, model: 'darkmux:gpt-oss-120b' },
           { id: 'verify-1', kind: 'mission.verify', label: 'Verify', status: 'planned', model: 'darkmux:devstral-small-2-2512' },
         ],
       },

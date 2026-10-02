@@ -504,8 +504,6 @@ IntegrityReport
   chain_valid: boolean
   break_at_line?: uint64 | null
   break_reason?: string | null
-  legacy_format?: boolean
-  note?: string | null
   writer_schema_version?: string | null
   torn_tails?: string[]
 Knob

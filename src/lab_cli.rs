@@ -10,24 +10,7 @@ use anyhow::Result;
 use crate::cli::{FixtureCmd, LabCmd, ProfilesFileArg, WorkloadCmd};
 use crate::lab;
 
-/// Whether a lab verb reads or writes run records under the lab dir, and so
-/// must not run while the pre-4.0 runs are still un-moved. The workload
-/// catalog, the fixture registry and `lab doctor` (a fixture health check)
-/// never touch it.
-fn touches_lab_dir(sub: &LabCmd) -> bool {
-    match sub {
-        LabCmd::Workload { .. } | LabCmd::Fixture { .. } | LabCmd::Doctor => false,
-        LabCmd::Run { .. }
-        | LabCmd::Loop { .. }
-        | LabCmd::Characterize { .. }
-        | LabCmd::Tune { .. } => true,
-    }
-}
-
 pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
-    if touches_lab_dir(&sub) {
-        darkmux_types::config_access::require_current_lab_dir()?;
-    }
     match sub {
         LabCmd::Workload { sub } => cmd_lab_workload(sub),
         LabCmd::Run {
@@ -209,41 +192,4 @@ fn cmd_lab_doctor() -> Result<i32> {
         if report.fixture_count == 1 { "" } else { "s" }
     );
     Ok(if report.has_warnings() { 1 } else { 0 })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `lab doctor` is the fixture-registry health check and never touches
-    /// the lab dir, so a pending move must not make it refuse.
-    #[serial_test::serial]
-    #[test]
-    fn lab_doctor_runs_while_a_lab_dir_move_is_pending() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join("runs").join("quick-q-1")).unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let pending = darkmux_types::config_access::require_current_lab_dir();
-        let doctor = cmd_lab(LabCmd::Doctor);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert!(pending.is_err(), "premise: the move is pending in the scratch home");
-        assert!(doctor.is_ok(), "lab doctor must not be gated: {:?}", doctor.err());
-    }
-
-    #[test]
-    fn only_verbs_that_read_or_write_run_records_are_gated_on_the_lab_dir() {
-        let characterize = LabCmd::Characterize {
-            workload: "quick-q".into(),
-            profile: None,
-            profiles: ProfilesFileArg { profiles: None },
-        };
-        assert!(touches_lab_dir(&characterize), "a dispatching verb writes run records");
-        assert!(!touches_lab_dir(&LabCmd::Doctor), "fixture health check never touches the lab dir");
-    }
 }

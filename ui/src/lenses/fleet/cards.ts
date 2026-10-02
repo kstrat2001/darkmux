@@ -1,8 +1,7 @@
 /**
  * The fleet default view's machine-card row — `renderFleet()`'s `cards`
- * build (viewer.html:1675-1687), plus the two helpers it leans on:
- * `machActive()` (viewer.html:1315-1322) and `specOf()`
- * (viewer.html:1120-1125).
+ * build, plus the two helpers it leans on:
+ * `machActive()` and `specOf()`.
  *
  * (Playback parity, Change A, 2026-09-24) The card used to branch on a
  * live/replay mode: replay counted ALL of the day's sessions and labeled them
@@ -59,13 +58,13 @@ function runningRuns(data: NormRecord[], presence: Presence, m: string, t: numbe
     .filter((g) => g.grain !== "lifecycle" && isRunning(lifecycleAt(currentRun(g, t), t, policy, presence)));
 }
 
-/** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
+/** `machActive()`. A machine is "in flight" iff one
  * of its runs is running as of `t` (`runningRuns`). */
 export function machActive(data: NormRecord[], presence: Presence, m: string, t: number, policy: LifecyclePolicy = DEFAULT_POLICY): boolean {
   return runningRuns(data, presence, m, t, policy).length > 0;
 }
 
-/** `specOf()` — viewer.html:1120-1125. Returns a RAW string (JSX escapes at
+/** `specOf()`. Returns a RAW string (JSX escapes at
  * render time, same "escape at the template edge" discipline the legacy
  * comment names). `MACH_SPEC` (a static hardcoded lookup) is empty in the
  * live viewer — dropped here entirely, matching that source comment. */

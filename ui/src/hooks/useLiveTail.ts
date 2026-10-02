@@ -8,9 +8,8 @@ import { liveStore } from "../lib/liveChannel";
 import { ingest, latestByTime, type NormRecord } from "../lib/ingest";
 
 /**
- * Port of `viewer.html`'s live-tail wiring — `startLiveTail` (3587-3627),
- * `reconcileLiveWindow` (3758-3782), and `startLivePoll`'s date-rollover
- * detection (3783-3806) — as ONE hook, mounted once at `App.tsx`'s root
+ * The live-tail wiring — the SSE tail, the reconcile backstop, and the
+ * date-rollover detection — as ONE hook, mounted once at `App.tsx`'s root
  * (the same App-level scope `useFlowWindow`/`useLiveMachines` already run
  * at). Owns:
  *
@@ -58,7 +57,7 @@ import { ingest, latestByTime, type NormRecord } from "../lib/ingest";
  */
 export type LiveTailStatus = "live" | "reconnecting";
 
-/** `RECONCILE_OVERLAP_MS` — viewer.html:3385. Safety margin the reconcile
+/** `RECONCILE_OVERLAP_MS`. Safety margin the reconcile
  * backstop's `?since=` subtracts from the newest record already held, so a
  * brief reconnect gap is still caught without re-pulling the whole day. */
 const RECONCILE_OVERLAP_MS = 30 * 60 * 1000;
@@ -90,7 +89,7 @@ export interface UseLiveTailDeps {
   liveSink?: { ingest: (data: string) => unknown };
 }
 
-/** `nd!==LIVE_ES_DATE` viewer.html:3792's reload half —
+/** `nd!==LIVE_ES_DATE`'s reload half —
  * `loadLiveWindow(nd)`'s effect achieved here by INVALIDATING the two
  * `flowDate` queries `useFlowWindow` owns, rather than fetching here too and
  * risking a second, differently-shaped write into a cache slot this hook
@@ -100,7 +99,7 @@ function reloadWindowForNewDay(queryClient: QueryClient, newToday: string): void
   queryClient.invalidateQueries({ queryKey: queryKeys.flowDate(prevDateUTC(newToday)) });
 }
 
-/** `reconcileLiveWindow()` — viewer.html:3758-3782. Fetches
+/** `reconcileLiveWindow()`. Fetches
  * `/flow/<d>?since=<newest held - overlap>` for `[prevDate(date), date]`
  * and merges anything new into that day's `flowTail` cache slot, deduped +
  * windowed via `mergeTailRecords` (this hook's `SEEN_KEYS` analog). */
@@ -156,7 +155,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
 
   useEffect(() => {
     if (!enabled) return;
-    // `typeof EventSource==="undefined"` — viewer.html:3588's own guard.
+    // `typeof EventSource==="undefined"` guard.
     // jsdom (this app's unit-test environment) has no `EventSource` global;
     // a test-injected `eventSourceFactory` bypasses the check, same as
     // `sse.test.ts`'s own MockEventSource pattern.

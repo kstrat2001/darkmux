@@ -5,12 +5,11 @@ import { norm } from "../testing/records";
 
 const proc = (ts: string, cpu: number, machine_uid = "UID-A"): NormRecord => norm({
   ts,
-  category: "telemetry",
+  category: "machinery",
   source: "host",
-  // flow-action-guard:allow — a retired action, as an archive still holds it
-  action: "telemetry.process",
+  action: "machine.telemetry",
   machine_uid,
-  payload: { cpu, mem: cpu, gpu: cpu },
+  payload: { cpu_pct: cpu, mem_pct: cpu, gpu_pct: cpu },
 });
 
 describe("resolveDrawerScope (#2107)", () => {
@@ -200,20 +199,5 @@ describe("machine.telemetry recognition (#2413)", () => {
     ];
     const found = findLastKnownSample(rolling, "this-machine", now);
     expect(found?.point.cpu).toBe(40);
-  });
-
-  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a dispatch route", () => {
-    const routeRecords = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
-    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1", missionId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
-    expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
-  });
-
-  // (#2559) The same mixed-shape fold-in, but through the rolling-window
-  // path a mission route now takes.
-  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a mission route's rolling window", () => {
-    const now = Date.parse("2026-01-01T00:00:02Z");
-    const rolling = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, "UID-A", now);
-    expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
   });
 });

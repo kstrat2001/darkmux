@@ -221,7 +221,7 @@ describe("dialogManager — Escape closes the topmost dialog only (viewer-keyboa
    * which is the entire reason that global exists. Unguarded, an unknown id
    * set `openId` to an element that does not exist: nothing rendered, and the
    * next Escape anywhere on the page was silently swallowed closing it.
-   * Legacy no-ops on a missing element (viewer.html:2928). */
+   * Legacy no-ops on a missing element. */
   it("an unknown modal id is a no-op, and does not arm Escape against a dialog that isn't there", () => {
     // The untyped call IS the case under test — this is how the global is reached.
     (openModalEl as unknown as (id: string) => void)("bogus");

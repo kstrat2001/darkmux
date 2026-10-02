@@ -108,16 +108,12 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
 /// (cutting a release, syncing the tap), so a user who never clones the repo has
 /// no use for them, and the skill's own description says as much.
 ///
-/// The exclusion is NAMED rather than implicit, for two reasons (#1449's class:
-/// we guard the generator, but the user has the artifact):
-///   1. `embedded_covers_every_shipped_skill` asserts every `skills/darkmux-*`
-///      dir is either embedded or named here — so a new skill cannot go
-///      silently unshipped the way `darkmux-qa-review` and
-///      `darkmux-escalation-handler` did.
-///   2. `init`'s prune pass and the doctor's freshness check consult it, so a
-///      maintainer with the repo checked out is neither told their
-///      `darkmux-point-release` skill is "no longer bundled" nor has it pruned
-///      out from under them.
+/// The exclusion is NAMED rather than implicit (#1449's class: we guard the
+/// generator, but the user has the artifact):
+/// `embedded_covers_every_shipped_skill` asserts every `skills/darkmux-*`
+/// dir is either embedded or named here, so a new skill cannot go silently
+/// unshipped the way `darkmux-qa-review` and `darkmux-escalation-handler` did.
+#[cfg(test)]
 pub const MAINTAINER_ONLY_SKILLS: &[&str] = &["darkmux-point-release"];
 
 /// The skills compiled into this binary, as `(name, SKILL.md content)`. The
@@ -157,10 +153,6 @@ pub struct InstallReport {
     pub installed: Vec<String>,
     pub skipped: Vec<String>,
     pub overwritten: Vec<String>,
-    /// (#1449) Installed `darkmux-*` skills this binary no longer bundles,
-    /// removed by the prune pass. In `dry_run` these are the prospective
-    /// prunes — reported, not removed.
-    pub pruned: Vec<String>,
     /// (#1927) `darkmux-*` skills `refresh_darkmux` declined to touch because
     /// the installed copy is locally modified (or has no recorded provenance,
     /// which is treated the same — unknown means protect). Present only when
@@ -228,105 +220,7 @@ pub fn install_skills(opts: &InstallOptions) -> Result<InstallReport> {
         }
     }
 
-    // (#1449) Prune pass — remove installed `darkmux-*` skill dirs this binary
-    // no longer bundles, so an upgraded machine stops teaching retired verbs.
-    // The class this closes: the generator was fixed, but the ARTIFACT already
-    // installed on the user's machine (`darkmux-swap-stack` running `darkmux
-    // swap` + `darkmux status`) was never touched. `init` refreshes the bundled
-    // skills; without this pass it leaves the retired ones behind forever.
-    //
-    // STRICT SCOPE (the namespace contract): only `darkmux-*`-prefixed dirs are
-    // ever inspected or removed — a non-`darkmux-` dir is the operator's own
-    // state and is untouchable by construction. Maintainer-only skills (present
-    // on a source checkout, never embedded) are protected too, so a maintainer's
-    // `darkmux-point-release` is never pruned out from under them.
-    let bundled = bundled_skill_names(source.as_deref());
-    for target in &targets {
-        for name in retired_darkmux_skills(target, &bundled) {
-            if opts.dry_run {
-                if !report.pruned.contains(&name) {
-                    report.pruned.push(name);
-                }
-                continue;
-            }
-            let dir = target.join(&name);
-            fs::remove_dir_all(&dir)
-                .with_context(|| format!("pruning retired skill {}", dir.display()))?;
-            if !report.pruned.contains(&name) {
-                report.pruned.push(name);
-            }
-        }
-    }
-    report.pruned.sort();
-
     Ok(report)
-}
-
-/// The set of `darkmux-*` skill names this binary bundles, given the located
-/// on-disk source (or `None` for the embedded fallback). A skill installed on
-/// disk whose name is NOT in this set (and not maintainer-only) is a retired
-/// skill the prune pass removes. (#1449)
-fn bundled_skill_names(source: Option<&Path>) -> std::collections::HashSet<String> {
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    match source {
-        Some(src) => {
-            if let Ok(entries) = fs::read_dir(src) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() || !path.join("SKILL.md").exists() {
-                        continue;
-                    }
-                    if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
-                        if n.starts_with("darkmux-") {
-                            names.insert(n.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            for (name, _) in EMBEDDED_SKILLS {
-                names.insert((*name).to_string());
-            }
-        }
-    }
-    // Maintainer-only skills are legitimately bundled on a source checkout even
-    // when not embedded; never prune them.
-    for name in MAINTAINER_ONLY_SKILLS {
-        names.insert((*name).to_string());
-    }
-    names
-}
-
-/// Installed `darkmux-*` skill dirs in `target` that `bundled` no longer
-/// contains — the prune set. Filtered HARD to the `darkmux-*` namespace: a
-/// non-darkmux dir is never even read. (#1449)
-fn retired_darkmux_skills(
-    target: &Path,
-    bundled: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut retired: Vec<String> = Vec::new();
-    let Ok(entries) = fs::read_dir(target) else {
-        return retired;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // NEVER inspect non-`darkmux-*` entries — user state, off-limits.
-        if !name.starts_with("darkmux-") {
-            continue;
-        }
-        if !path.is_dir() || !path.join("SKILL.md").exists() {
-            continue;
-        }
-        if !bundled.contains(name) {
-            retired.push(name.to_string());
-        }
-    }
-    retired.sort();
-    retired
 }
 
 /// (#1927) Provenance sidecar filename, written alongside `SKILL.md` inside
@@ -1200,101 +1094,6 @@ mod tests {
         unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
 
         assert_eq!(result, Some(good));
-    }
-
-    // ─── (#1449) prune pass — retired darkmux-* skills removed on install ─────
-
-    #[serial_test::serial]
-    #[test]
-    fn install_prunes_retired_darkmux_skill_and_spares_user_state() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("skills");
-        // The binary bundles exactly darkmux-alpha this build.
-        write_skill(&src, "darkmux-alpha", "v1");
-
-        let target = tmp.path().join("dest");
-        // Pre-seed the install target with three dirs:
-        //   - darkmux-alpha:   bundled, survives (refreshed).
-        //   - darkmux-retired: darkmux-* but NOT bundled → pruned.
-        //   - my-skill:        non-darkmux user state → NEVER touched.
-        fs::create_dir_all(target.join("darkmux-alpha")).unwrap();
-        fs::write(target.join("darkmux-alpha/SKILL.md"), "old").unwrap();
-        fs::create_dir_all(target.join("darkmux-retired")).unwrap();
-        fs::write(target.join("darkmux-retired/SKILL.md"), "swap + status").unwrap();
-        fs::create_dir_all(target.join("my-skill")).unwrap();
-        fs::write(target.join("my-skill/SKILL.md"), "user-owned").unwrap();
-
-        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
-        let report = install_skills(&InstallOptions {
-            target: Some(target.clone()),
-            force: false,
-            dry_run: false,
-            refresh_darkmux: true,
-        })
-        .unwrap();
-        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
-
-        assert_eq!(report.pruned, vec!["darkmux-retired".to_string()]);
-        assert!(!target.join("darkmux-retired").exists(), "retired dir removed");
-        assert!(target.join("darkmux-alpha/SKILL.md").exists(), "bundled survives");
-        // User state is untouched — never inspected, never removed.
-        assert_eq!(
-            fs::read_to_string(target.join("my-skill/SKILL.md")).unwrap(),
-            "user-owned"
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn install_dry_run_lists_prospective_prunes_without_removing() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("skills");
-        write_skill(&src, "darkmux-alpha", "v1");
-
-        let target = tmp.path().join("dest");
-        fs::create_dir_all(target.join("darkmux-retired")).unwrap();
-        fs::write(target.join("darkmux-retired/SKILL.md"), "leftover").unwrap();
-
-        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
-        let report = install_skills(&InstallOptions {
-            target: Some(target.clone()),
-            force: false,
-            dry_run: true,
-            refresh_darkmux: true,
-        })
-        .unwrap();
-        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
-
-        assert_eq!(report.pruned, vec!["darkmux-retired".to_string()]);
-        // Dry run touches nothing.
-        assert!(target.join("darkmux-retired/SKILL.md").exists());
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn install_never_prunes_maintainer_only_skill() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("skills");
-        // Source bundles only darkmux-alpha (the maintainer skill is embedded-
-        // absent), but the maintainer has darkmux-point-release installed.
-        write_skill(&src, "darkmux-alpha", "v1");
-
-        let target = tmp.path().join("dest");
-        fs::create_dir_all(target.join("darkmux-point-release")).unwrap();
-        fs::write(target.join("darkmux-point-release/SKILL.md"), "maintainer").unwrap();
-
-        unsafe { env::set_var("DARKMUX_SKILLS_DIR", src.to_str().unwrap()) };
-        let report = install_skills(&InstallOptions {
-            target: Some(target.clone()),
-            force: false,
-            dry_run: false,
-            refresh_darkmux: true,
-        })
-        .unwrap();
-        unsafe { env::remove_var("DARKMUX_SKILLS_DIR") };
-
-        assert!(report.pruned.is_empty(), "maintainer skill never pruned");
-        assert!(target.join("darkmux-point-release/SKILL.md").exists());
     }
 
     /// (#1449) The drift that shipped `darkmux-qa-review` +

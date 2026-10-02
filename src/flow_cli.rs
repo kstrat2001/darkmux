@@ -134,8 +134,10 @@ pub enum FlowCmd {
     /// first divergence per file. A clean walk means no divergence
     /// was found at this check: not that the file is unaltered; see
     /// SECURITY.md for the chain's known gaps. Exits with status 2 when
-    /// any chain is broken so CI/cron can flag tampering, and with 3 under
-    /// `--strict` when a file could not be content-verified at all.
+    /// any chain is broken so CI/cron can flag it. A file from before 2.6.0
+    /// (no `hash_format` on its header) is also reported as broken, at line
+    /// 1: nothing in it is verified, which is not evidence of editing.
+    /// Archive it.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the
@@ -147,25 +149,6 @@ pub enum FlowCmd {
         /// summary.
         #[arg(long)]
         json: bool,
-        /// Exit 3 when a file PRESENT in the walk could not be
-        /// content-verified: a legacy pre-2.6.0 struct-hash file, one
-        /// whose `hash_format` header marker is missing, or one naming a
-        /// format this binary does not recognize. Without this the walk
-        /// reports those files honestly but still exits 0, so a tripwire
-        /// keyed on the exit code cannot tell "verified" from "never
-        /// checked".
-        ///
-        /// Scope: this is about files that ARE there. It says nothing
-        /// about records or files that are ABSENT: a truncated tail or a
-        /// deleted file still exits 0, because the chain records neither
-        /// how many records a file should hold nor which files should
-        /// exist (see SECURITY.md).
-        ///
-        /// Opt-in because a genuine read-only pre-2.6.0 archive is not a
-        /// failure. On a fleet already writing byte-hashed files, no NEW
-        /// legacy file should appear: use this there.
-        #[arg(long)]
-        strict: bool,
     },
     /// Tail flow records, optionally filtered to one role execution, following new
     /// appends live (like `tail -f`). Ctrl-C to stop.
@@ -224,8 +207,8 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
     // only sees write verbs.
     match cmd {
         FlowCmd::Status { json } => return print_status(json),
-        FlowCmd::IntegrityCheck { path, json, strict } => {
-            return print_integrity_check(path, json, strict)
+        FlowCmd::IntegrityCheck { path, json } => {
+            return print_integrity_check(path, json)
         }
         FlowCmd::Tail { execution, json } => return run_tail(execution.as_ref(), json),
         FlowCmd::Drain { file: Some(file), to: Some(to), json, .. } => return run_drain_file(&file, &to, json),
@@ -535,35 +518,19 @@ fn print_torn_tails(r: &flow::IntegrityReport) {
 
 /// Render `darkmux flow integrity-check` to stdout. Walks the audit dir
 /// (or a single `--path`), recomputes each file's hash chain, reports
-/// pass/break per file. Exits with status 2 when any chain is genuinely
-/// broken (`chain_valid == false`) so CI / cron / monitoring can flag
-/// tampering. (#1769) A legacy pre-2.6.0 file — struct-hash format, no
-/// `hash_format` marker on its header — is NOT a break: `chain_valid`
-/// stays `true`, the exit status stays 0, and the caveat prints as a
-/// warning (readable, never content-verified) rather than an error.
-///
-/// (#1775) `strict` promotes that caveat to exit 3, so a cron keyed on
-/// the exit code can tell "verified" from "could not verify". The status
-/// decision itself lives in `flow::integrity_exit_code`, which is unit
-/// tested — this belt used to be reachable only by review.
-fn print_integrity_check(
-    path: Option<std::path::PathBuf>,
-    json: bool,
-    strict: bool,
-) -> Result<()> {
+/// pass/break per file. Exits with status 2 when any chain is broken
+/// (`chain_valid == false`), including a file whose header is not in the
+/// byte-hash format (a file from before 2.6.0: nothing in it is verified),
+/// so CI / cron / monitoring can flag it. The status decision itself lives
+/// in `flow::integrity_exit_code`, which is unit tested.
+fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result<()> {
     let reports = if let Some(p) = path {
         vec![flow::integrity_check_file(&p)?]
     } else {
         flow::integrity_check_all()?
     };
 
-    // (#1775) Computed BEFORE rendering, because one of the lines below
-    // makes a factual claim ABOUT this value. Gating that claim on an
-    // input predicate instead ("are any files legacy?") printed "exit
-    // status stays 0" on a run that exited 2 — a legacy file and a broken
-    // file in the same directory — which is the same class of defect this
-    // command exists to catch, in the output of the command itself.
-    let exit_code = flow::integrity_exit_code(&reports, strict);
+    let exit_code = flow::integrity_exit_code(&reports);
 
     use darkmux_types::style;
     if json {
@@ -600,59 +567,7 @@ fn print_integrity_check(
                 if let Some(reason) = r.break_reason.as_ref() {
                     println!("{}", style::error(&format!("       reason: {reason}")));
                 }
-            } else if r.legacy_format {
-                // (#1769) Chain-valid in the sense that nothing was broken,
-                // but this file predates byte-hash verification and its
-                // content was NOT checked at all. Loud, not silent — exit
-                // status stays 0 (this is not tampering), but an operator
-                // watching the output must still see the caveat, or
-                // "valid" quietly becomes a stronger claim than the walk
-                // actually supports.
-                println!(
-                    "{}",
-                    style::warn(&format!(
-                        "       {} record(s) NOT content-verified — legacy pre-2.6.0 format",
-                        r.records_checked
-                    ))
-                );
-                if let Some(note) = r.note.as_ref() {
-                    println!("{}", style::warn(&format!("       {note}")));
-                }
-                if strict {
-                    // Same rule as the hint below: a line naming the exit
-                    // code is gated on the COMPUTED code, never on `strict`
-                    // alone. A chain break elsewhere in the walk outranks
-                    // this file, and saying "(exit 3)" on a run that exits
-                    // 2 is the defect this command exists to catch.
-                    println!(
-                        "{}",
-                        style::error(&format!(
-                            "       --strict: counted as a failure ({})",
-                            if exit_code == 3 {
-                                "exit 3".to_string()
-                            } else {
-                                format!("a chain break elsewhere takes precedence — exit {exit_code}")
-                            }
-                        ))
-                    );
-                }
             }
-        }
-        // (#1775) Without --strict the walk still exits 0 on an
-        // unverifiable file. Say so, so an operator reading the output
-        // knows the exit code they'd get from cron does NOT reflect the
-        // warning they can see here. Gated on the COMPUTED code, never on
-        // `!strict` alone: with a broken file also present the exit is 2,
-        // and claiming otherwise would be a false statement printed right
-        // beside a tamper signal.
-        if exit_code == 0 && reports.iter().any(|r| r.legacy_format) {
-            println!(
-                "{}",
-                style::dim(
-                    "       (exit status stays 0 — re-run with --strict to fail on files that \
-                     could not be content-verified)"
-                )
-            );
         }
     }
 
@@ -697,16 +612,15 @@ fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option
 }
 
 /// What a tailed record is about, for its last column: the role execution
-/// when it names one it was minted with, else the run its session belongs to
-/// (a pre-4.0 execution record's synthesized id is built from its session,
-/// so it reads as no execution), else `-`. The session itself never shows.
+/// when it names one it was minted with, else the run its session belongs to,
+/// else `-`. The session itself never shows.
 fn tail_origin(record: &serde_json::Value) -> String {
     let text = |key: &str| record.get(key).and_then(|v| v.as_str());
     if let Some(id) = text("execution_id").and_then(|wire| ExecutionId::parse_minted(wire).ok()) {
         return id.to_string();
     }
     text("session_id")
-        .and_then(|sid| darkmux_types::session_id::SessionId::parse_legacy(sid, text("mission_id")))
+        .and_then(|sid| darkmux_types::session_id::SessionId::parse(sid).ok())
         .map_or_else(|| "-".to_string(), |session| session.run_id().to_string())
 }
 
@@ -1436,13 +1350,12 @@ mod tests {
         assert!(shown.ends_with("m-auth"), "the run, not the phase session: {shown}");
         assert!(!shown.contains("phase"), "{shown}");
 
-        // A pre-4.0 execution record reads with a synthesized id, which is
-        // built from its session: it shows the run instead.
-        // flow-action-guard:allow — a pre-4.0 archive spelling, read leniently
+        // A pre-4.0 record's session is not in the session grammar: it names
+        // no run, so the column is empty and the session never shows.
+        // flow-action-guard:allow — a pre-4.0 archive spelling
         let old = r#"{"ts":"2025-01-01T00:00:00Z","action":"dispatch start","handle":"coder","session_id":"mission-run-auth-s1","mission_id":"auth"}"#;
         let shown = tail_match(old, None, false).unwrap();
-        assert!(shown.ends_with("auth"), "{shown}");
-        assert!(!shown.contains("legacy:") && !shown.contains("mission-run-auth-s1"), "{shown}");
+        assert!(shown.ends_with(" -") && !shown.contains("mission-run-auth-s1"), "{shown}");
 
         let neither = r#"{"ts":"2025-01-01T00:00:00Z","action":"operator.note","handle":"hi"}"#;
         assert!(tail_match(neither, None, false).unwrap().ends_with(" -"));

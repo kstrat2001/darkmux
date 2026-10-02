@@ -936,78 +936,6 @@ fn execution_flags_refuse_a_session_shaped_value() {
     }
 }
 
-/// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
-/// come only from mission configs (`mission launch`). Each old spelling is
-/// refused by name, exit 2, with the line naming its replacement; a wrong
-/// argument count or an unknown id never gets past the refusal, because the
-/// verb itself is gone.
-#[test]
-fn retired_mission_verbs_are_refused_naming_the_replacement() {
-    let cases: [(&[&str], &str, &[&str]); 6] = [
-        (
-            &["mission", "dispatch", "m1", "--role", "coder", "--machine", "studio"],
-            "darkmux mission dispatch",
-            &["--profile <profile>@<machine>", "darkmux mission launch <config>"],
-        ),
-        (
-            &["mission", "add-phase", "m1", "--phase-id", "p2", "--description", "x"],
-            "darkmux mission add-phase",
-            &["darkmux mission launch <config>"],
-        ),
-        (&["mission", "start", "m1"], "darkmux mission start", &["darkmux mission launch <config>"]),
-        (&["mission", "pause", "m1"], "darkmux mission pause", &["darkmux mission abort <id>"]),
-        (&["mission", "resume", "m1"], "darkmux mission resume", &["darkmux mission finalize <id>"]),
-        (
-            &["dispatch", "coder", "hello", "--phase-id", "p1"],
-            "darkmux dispatch --phase-id",
-            &["darkmux mission launch <config>"],
-        ),
-    ];
-    for (args, named, remedies) in cases {
-        let mut assert = darkmux_cmd()
-            .args(args)
-            .assert()
-            .code(2)
-            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")));
-        for remedy in remedies {
-            assert = assert.stderr(predicate::str::contains(*remedy));
-        }
-    }
-}
-
-/// (4.0) The retired flag spellings exit 2 through the real binary, naming the
-/// replacement; the replacement itself is never refused.
-#[test]
-fn retired_flag_spellings_are_refused_at_entry_naming_the_replacement() {
-    let cases: &[(&[&str], &str, &str)] = &[
-        (&["dispatch", "coder", "hello", "--session-id", "x"], "darkmux dispatch --session-id", "--name"),
-        (&["flow", "note", "--text", "t", "--session-id", "s"], "darkmux flow note --session-id", "--execution"),
-        (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),
-        (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),
-        (&["lab", "run", "quick-q", "--runs", "2"], "darkmux lab run --runs", "--repeat"),
-        (&["lab", "tune", "quick-q", "--runs", "2"], "darkmux lab tune --runs", "--repeat"),
-        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
-    ];
-    for (args, named, replacement) in cases {
-        darkmux_cmd()
-            .args(*args)
-            .assert()
-            .code(2)
-            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")))
-            .stderr(predicate::str::contains(*replacement));
-    }
-}
-
-/// (#2954) The `--phase-id=<id>` spelling is the same retired flag.
-#[test]
-fn retired_dispatch_phase_id_equals_spelling_is_refused() {
-    darkmux_cmd()
-        .args(["dispatch", "coder", "hello", "--phase-id=p1"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("`darkmux dispatch --phase-id` was removed in 4.0"));
-}
-
 /// (#2954) A non-UTF-8 argument alongside a bad flag is clap's usage error
 /// (exit 2), never a panic (101) from decoding argv.
 #[cfg(unix)]
@@ -1023,18 +951,6 @@ fn a_non_utf8_argument_with_a_bad_flag_is_a_usage_error_not_a_panic() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("panicked").not());
-}
-
-/// (#2954) The inverse: an unknown verb that was never darkmux's keeps clap's
-/// own error, so the refusal table never shadows a typo with a wrong remedy.
-#[test]
-fn an_unknown_mission_verb_that_was_never_retired_keeps_clap_s_error() {
-    darkmux_cmd()
-        .args(["mission", "frobnicate", "m1"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("unrecognized subcommand"))
-        .stderr(predicate::str::contains("was removed in 4.0").not());
 }
 
 #[test]
@@ -1108,41 +1024,6 @@ fn retired_mission_migrate_verb_is_unknown() {
         .stderr(predicate::str::contains("unrecognized subcommand 'migrate'"));
 }
 
-/// (#3036) `lab eval` is removed whole. Every spelling it ever took (a bare
-/// verb, its experimental `--mode`, and the `--k`, `--roster-profile`,
-/// `--exec-mode`, `--bundler`, `--funnel` and `--crew` flags retired earlier)
-/// exits 2 through the real binary, naming the 5.0 release and both
-/// replacements, never clap's "unrecognized subcommand".
-#[test]
-fn lab_eval_is_refused_whole_at_entry_naming_its_replacements() {
-    for args in [
-        vec!["lab", "eval"],
-        vec!["lab", "eval", "pr-reviewer", "--mode", "agentic", "--workdirs", "w"],
-        vec!["lab", "eval", "--k", "2", "--help"],
-        vec!["lab", "eval", "--funnel", "--crew", "review-funnel"],
-    ] {
-        darkmux_cmd()
-            .args(&args)
-            .assert()
-            .code(2)
-            .stderr(predicate::str::contains("`darkmux lab eval` was removed in 5.0"))
-            .stderr(predicate::str::contains("darkmux lab run <workload>"))
-            .stderr(predicate::str::contains("darkmux mission launch review"));
-    }
-}
-
-/// (4.0) `finding list --dispatch` became `--execution`. The old spelling is
-/// refused by name (`retired_verbs`), so an operator's script learns the
-/// replacement instead of reading clap's "unexpected argument".
-#[test]
-fn finding_list_dispatch_flag_is_refused_naming_execution() {
-    darkmux_cmd()
-        .args(["finding", "list", "--dispatch", "sess-abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("`darkmux finding list --dispatch` was removed").and(predicate::str::contains("--execution")));
-}
-
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
 /// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
 /// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,
@@ -1180,27 +1061,6 @@ fn retired_crew_family_is_unknown_entirely() {
             .stderr(predicate::str::contains("unrecognized subcommand").or(
                 predicate::str::contains("unexpected argument"),
             ));
-    }
-}
-
-/// (#1426, decision 17) The `lessons` top-level verb retired into the `memory`
-/// family — every spelling, the bare family and each old sub-verb, is now an
-/// unknown TOP-LEVEL verb with no compat alias (pre-2.0 clean removal). The
-/// surface moved to `memory lesson <sub>`; see the companion test below.
-#[test]
-fn retired_lessons_family_is_unknown_entirely() {
-    for args in [
-        vec!["lessons"],
-        vec!["lessons", "list"],
-        vec!["lessons", "add", "--title", "t", "--body", "b"],
-        vec!["lessons", "recall", "--term", "x"],
-        vec!["lessons", "export"],
-    ] {
-        let mut cmd = darkmux_cmd();
-        cmd.args(&args)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("memory lesson")));
     }
 }
 
@@ -1319,19 +1179,6 @@ fn lab_kind_families_carry_their_members() {
     for sub in ["list", "register", "unregister"] {
         assert!(fixture.contains(sub), "lab fixture --help keeps `{sub}`: {fixture}");
     }
-}
-
-/// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
-/// `mission launch coder-phase`. `mission` survives (launch/finalize/abort/…),
-/// so the error is an unknown SUB-verb WITHIN the surviving family. No compat
-/// alias (pre-2.0 clean removal).
-#[test]
-fn retired_mission_run_subverb_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.args(["mission", "run", "some-mission"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("was removed in 2.0").and(predicate::str::contains("mission launch")));
 }
 
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
@@ -1787,38 +1634,6 @@ fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
 // `swap` (the second residency writer) is gone entirely; `status`/`model`/
 // `fleet` folded into the `machine` family.
 #[test]
-fn retired_top_level_swap_verb_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.arg("swap").assert().failure().stderr(
-        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
-    );
-}
-
-#[test]
-fn retired_top_level_status_verb_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.arg("status").assert().failure().stderr(
-        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine status")),
-    );
-}
-
-#[test]
-fn retired_top_level_model_verb_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.arg("model").assert().failure().stderr(
-        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine eject")),
-    );
-}
-
-#[test]
-fn retired_top_level_fleet_verb_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.arg("fleet").assert().failure().stderr(
-        predicate::str::contains("was removed in 2.0").and(predicate::str::contains("machine list")),
-    );
-}
-
-#[test]
 fn retired_top_level_recommendations_verb_is_unknown() {
     let mut cmd = darkmux_cmd();
     cmd.arg("recommendations").assert().failure().stderr(
@@ -1998,15 +1813,6 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["card"]["state"], "available", "{row}");
     assert_eq!(row["card"]["card"]["card_schema_version"], "1.2");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
-}
-
-/// `--deep` is retired: the card is the default content.
-#[test]
-fn machine_list_deep_is_refused_naming_the_default() {
-    let out = darkmux_cmd().args(["machine", "list", "--deep"]).output().unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("`darkmux machine list --deep` was removed") && err.contains("by default"), "{err}");
 }
 
 /// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The
@@ -6590,105 +6396,47 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // canned model call — see `src/radio.rs::tests` and
 // `src/radio_cli.rs::tests`.
 
-/// (#1775) The exit-status belt and the sentence that describes it must
-/// agree. The pure `integrity_exit_code` is unit tested in `darkmux-flow`;
-/// what is NOT reachable from there is the human output, which is where
-/// the first version of this feature printed "exit status stays 0" on a
-/// run that exited 2 — a legacy file and a broken file in the same
-/// directory. Spawning the binary is the only way to catch that, and the
-/// belt previously carried a comment conceding it was review-only.
-///
-/// Deliberately covers the MIXED case, not the happy one: with only a
-/// legacy file present the buggy and fixed versions behave identically,
-/// so a single-file test proves nothing.
+/// (#1769, 5.0) A day file whose header carries no `hash_format` marker (every
+/// file written before 2.6.0) is not verified: through the real binary,
+/// `flow integrity-check` exits 2 and names a break at line 1, and `--json`
+/// reports 0 records checked with none of the removed `legacy_format` / `note`
+/// fields.
 #[test]
-fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
-    let tmp = tempfile::tempdir().unwrap();
-    let audit = tmp.path().join("audit");
-    std::fs::create_dir_all(&audit).unwrap();
-
-    // Build one legacy file (header marker stripped -> unverifiable) and
-    // one genuinely broken file (marker intact, record bytes mutated), by
-    // emitting real records and then editing them the way an attacker
-    // would rather than hand-rolling the chain format.
-    for (day, text) in [("2026-01-01", "alpha"), ("2026-01-02", "bravo")] {
-        let staging = tmp.path().join(format!("stage-{day}"));
-        std::fs::create_dir_all(&staging).unwrap();
-        darkmux_cmd()
-            .env("DARKMUX_AUDIT_DIR", &staging)
-            .args(["flow", "note", "--text", text])
-            .assert()
-            .success();
-        let produced = std::fs::read_dir(&staging)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .expect("flow note must write an audit file");
-        let body = std::fs::read_to_string(&produced).unwrap();
-        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
-        assert!(lines.len() >= 2, "need a header plus a record: {body}");
-
-        if day == "2026-01-01" {
-            // Strip the format marker -> the walk downgrades to legacy and
-            // content-verifies nothing.
-            lines[0] = lines[0].replace(",\"hash_format\":\"prefix-blake3-v1\"", "");
-            assert!(!lines[0].contains("hash_format"), "marker must be gone: {}", lines[0]);
-        } else {
-            // Mutate the record bytes AFTER the hash prefix -> a real break.
-            let sp = lines[1].find(' ').expect("record line is `<hash> <json>`");
-            let (hash, rec) = lines[1].split_at(sp);
-            lines[1] = format!("{hash}{}", rec.replace("bravo", "BRAVX"));
-        }
-        std::fs::write(audit.join(format!("{day}.jsonl")), lines.join("\n") + "\n").unwrap();
-    }
+fn integrity_check_reports_a_header_without_the_marker_as_a_break_at_line_1() {
+    let audit = TempDir::new().unwrap();
+    let header = serde_json::json!({"_type": "schema", "version": "1.19.0", "darkmux_version": "2.5.0"});
+    fs::write(
+        audit.path().join("2024-01-01.jsonl"),
+        format!("{header}\n{{\"action\":\"x\",\"hash\":\"deadbeef\"}}\n"),
+    )
+    .unwrap();
 
     let out = darkmux_cmd()
-        .env("DARKMUX_AUDIT_DIR", &audit)
+        .env("DARKMUX_AUDIT_DIR", audit.path())
         .args(["flow", "integrity-check"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert!(stdout.contains("BROKEN") && stdout.contains("line 1"), "{stdout}");
 
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a genuine break must exit 2 even beside an unverifiable file; stdout:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("exit status stays 0"),
-        "the run exited 2: it must not print a claim that the status stays 0; stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("BROKEN"),
-        "the break must still be reported; stdout:\n{stdout}"
-    );
-
-    // The SAME run under --strict. The first fix for this defect missed
-    // this branch: a per-file line claiming "(exit 3)" was gated on the
-    // `strict` flag rather than on the computed code, so it printed the
-    // wrong status beside the tamper signal while the process exited 2.
-    // Non-strict coverage alone does not reach it.
     let out = darkmux_cmd()
-        .env("DARKMUX_AUDIT_DIR", &audit)
-        .args(["flow", "integrity-check", "--strict"])
+        .env("DARKMUX_AUDIT_DIR", audit.path())
+        .args(["flow", "integrity-check", "--json"])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = &v["reports"][0];
+    assert_eq!(r["chain_valid"], false, "{v}");
+    assert_eq!(r["break_at_line"], 1, "{v}");
+    assert_eq!(r["records_checked"], 0, "{v}");
+    assert!(r.get("legacy_format").is_none() && r.get("note").is_none(), "{v}");
 
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a break outranks an unverifiable file under --strict too; stdout:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("exit 3"),
-        "the run exited 2: no line may name exit 3; stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("takes precedence"),
-        "the unverifiable file must still be called out, naming the real code; stdout:\n{stdout}"
-    );
+    // The retired flag is rejected by clap.
+    let out = darkmux_cmd().env("DARKMUX_AUDIT_DIR", audit.path()).args(["flow", "integrity-check", "--strict"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--strict"));
 }
 
 /// (#2093, folded into `flow status` by #1959's flow-hooks-family
@@ -9626,52 +9374,6 @@ fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) 
         .collect()
 }
 
-/// A `mission.json` an older binary left at `"status": "paused"` is an
-/// ordinary open mission now: `darkmux run list` and the board both read it
-/// as `Active`, so a recorded `session.end` on its dispatch reads
-/// `abandoned` and the board names it, exactly as for an `active` mission.
-#[test]
-fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let home = TempDir::new().unwrap();
-    let flows = TempDir::new().unwrap();
-    write_mission_with_phases(
-        home.path(),
-        "legacy-paused-e2e",
-        "paused",
-        &[("p1", "running")],
-        now - 25 * 60,
-    );
-    let day = darkmux_flow::day_utc_now();
-    fs::write(
-        flows.path().join(format!("{day}.jsonl")),
-        serde_json::json!({
-            "ts": "2024-01-01T09:00:00Z",
-            "action": "session.end",
-            "session_id": "legacy-paused-e2e-sess",
-            "mission_id": "legacy-paused-e2e",
-            "handle": "coder",
-        })
-        .to_string()
-            + "\n",
-    )
-    .unwrap();
-    assert_eq!(
-        run_list_status(home.path(), flows.path(), "legacy-paused-e2e"),
-        "abandoned",
-        "a legacy paused mission is Active, so its recorded session end reads abandoned"
-    );
-    assert!(
-        board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
-            .iter()
-            .any(|k| k == "running-phase-execution-dead"),
-        "and the board names the dead session as it does for an active mission"
-    );
-}
-
 /// (#2682 round 4) A CLOSED mission still holding a `Running` phase — ten
 /// of the disagreement rows. `run list` reads it `abandoned`; the board used
 /// to say nothing, on #1463's "no longer a reachable state" claim, which is
@@ -12485,57 +12187,6 @@ fn run_stats_json_shapes_are_pinned_by_golden() {
     assert_eq!(json(&[&a, &b], Some(&b)), golden(include_str!("fixtures/run-stats-set.golden.json")));
 }
 
-/// (4.0) The retired `lab run list|inspect|stats|compare` spellings fail
-/// naming their replacement, and never run (no alias).
-#[test]
-fn retired_lab_run_verbs_fail_naming_the_replacement() {
-    for (args, want) in [
-        (&["lab", "run", "list"][..], "darkmux run list --kind lab"),
-        (&["lab", "run", "inspect", "some-run"][..], "darkmux run inspect <run>"),
-        (&["lab", "run", "stats", "some-run"][..], "darkmux run stats <run>..."),
-        (&["lab", "run", "compare", "a", "b"][..], "darkmux run compare <a> <b>"),
-    ] {
-        darkmux_cmd()
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("was removed in 4.0").and(predicate::str::contains(want)));
-    }
-}
-
-/// (4.0) Lab runs moved from `<root>/runs` to `<root>/lab`. darkmux never
-/// moves them itself: every verb that reads or writes lab runs refuses,
-/// naming the `mv`, until the operator has run it; then the runs read.
-#[test]
-fn pre_4_0_lab_runs_dir_refuses_every_lab_verb_naming_the_mv_until_moved() {
-    let home = tempfile::TempDir::new().unwrap();
-    let old = home.path().join("runs");
-    let new = home.path().join("lab");
-    stats_run_dir(&old, "run-a");
-    let want = format!("mv -n {} {}", old.display(), new.display());
-    let cmd = || {
-        let mut c = darkmux_cmd();
-        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
-        c
-    };
-    for args in [
-        &["lab", "run", "quick-q"][..],
-        &["run", "list", "--kind", "lab"][..],
-        &["run", "inspect", "run-a"][..],
-        &["run", "stats", "run-a"][..],
-        &["run", "compare", "run-a", "run-a"][..],
-    ] {
-        cmd().args(args).assert().failure().stderr(predicate::str::contains(&want));
-    }
-    // The all-kinds list does not refuse: it says so and carries on.
-    cmd().args(["run", "list"]).assert().success().stderr(predicate::str::contains(&want));
-    assert!(!new.exists(), "darkmux never moves the data itself");
-
-    fs::rename(&old, &new).unwrap();
-    cmd().args(["run", "stats", "run-a"]).assert().success();
-    cmd().args(["run", "list", "--kind", "lab"]).assert().success();
-}
-
 /// A lab run dir the scanner recognizes: a lifecycle record (the marker) and a
 /// manifest carrying the given `verify`.
 fn lab_run_with_manifest(dir: &std::path::Path, workload: &str, verify: serde_json::Value) {
@@ -12550,33 +12201,6 @@ fn lab_run_with_manifest(dir: &std::path::Path, workload: &str, verify: serde_js
         "schema_version": 5, "run_id": id, "workload": workload, "ok": true, "verify": verify,
     });
     fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
-}
-
-/// (4.0) An EMPTY `lab/` beside a full `runs/` is a pending move, not a
-/// split: it used to skip the refusal and print "no recorded lab runs yet"
-/// with exit 0, hiding every old run. The command it prints removes the empty
-/// dir first, since a plain `mv` would nest the runs as `lab/runs`.
-#[test]
-fn an_empty_lab_dir_beside_a_full_runs_dir_still_refuses_and_the_printed_command_works() {
-    let home = tempfile::TempDir::new().unwrap();
-    let (old, new) = (home.path().join("runs"), home.path().join("lab"));
-    lab_run_with_manifest(&old.join("quick-q-1"), "quick-q", serde_json::Value::Null);
-    fs::create_dir_all(&new).unwrap();
-    let cmd = || {
-        let mut c = darkmux_cmd();
-        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
-        c
-    };
-    let want = format!("rmdir {} && mv -n {} {}", new.display(), old.display(), new.display());
-    cmd().args(["run", "list", "--kind", "lab"]).assert().failure().stderr(predicate::str::contains(&want));
-
-    let ran = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
-    assert!(ran.success());
-    assert!(new.join("quick-q-1").is_dir(), "the runs land at lab/<id>, not lab/runs/<id>");
-    cmd().args(["run", "list", "--kind", "lab"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("quick-q-1"));
 }
 
 /// (#2494) The verify outcome is visible in `run list` itself: a run that

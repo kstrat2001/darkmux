@@ -125,8 +125,8 @@ pub struct MemberRecord {
     /// endpoint: its `total_tokens` are not darkmux's own hardware's, which
     /// downstream savings surfaces must exclude (unmanaged work is never
     /// "off the meter"). Skipped when `false` so local-only envelopes
-    /// serialize unchanged. An archived envelope spells it `remote`.
-    #[serde(default, alias = "remote", skip_serializing_if = "std::ops::Not::not")]
+    /// serialize unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unmanaged: bool,
     /// (#1260) Endpoint HOST only (e.g. `myorg.cognitiveservices.azure.com`)
     /// — never credentials, never the full deployment path.
@@ -215,8 +215,8 @@ pub struct SeatStaffingSnapshot {
     pub model: String,
     /// (#1260) `true` when the staffing's model declares an unmanaged
     /// endpoint. Skipped when `false` so pre-#1260 snapshots round-trip
-    /// unchanged. An archived snapshot spells it `remote`.
-    #[serde(default, alias = "remote", skip_serializing_if = "std::ops::Not::not")]
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unmanaged: bool,
     /// (#1260) Endpoint HOST only — never credentials, never the full
     /// deployment path.
@@ -673,45 +673,11 @@ mod tests {
         assert_eq!(value["verify"]["model"], serde_json::json!(seat_identifier(&verify.pm)));
     }
 
-    /// (#2540) The READ-side twin every WRITE-side golden above is missing.
-    /// `member_record_serializes_with_the_pre_move_shape` and
-    /// `staffing_snapshot_serializes_with_the_pre_move_shape` both pin that
-    /// `MemberRecord::unmanaged` / `SeatStaffingSnapshot::unmanaged` /
-    /// `StaffingSnapshot::request_changes` are OMITTED at their default —
-    /// but neither, nor anything else in this module, ever deserializes a
-    /// document that omits them. All three pair `#[serde(default)]` with
-    /// `skip_serializing_if`, the exact shape #2540 names: the serializer
-    /// guarantees the field is USUALLY absent (every local-only run, every
-    /// non-blocking review), so a future edit dropping `default` while
-    /// keeping `skip_serializing_if` would leave every test in this file
-    /// green while a real recorded envelope — which also omits these
-    /// fields on the common path — failed to deserialize.
-    ///
-    /// **Proved failing first** (2026-09-09, this packet): commenting out
-    /// `default` on `MemberRecord::unmanaged`, `SeatStaffingSnapshot::unmanaged`,
-    /// and `StaffingSnapshot::request_changes` in turn, rebuilding
-    /// (`cargo build -p darkmux-crew --tests`, confirmed exit 0 each time),
-    /// and running `cargo test -p darkmux-crew --lib` left **every other
-    /// test in this crate green** — 1552 passed, 0 failed — proving those
-    /// three fields carried zero coverage of their own in the crate that
-    /// defines them. (A downstream crate's fixture — `darkmux-lab`'s
-    /// `lab::review` recorded-envelope tests — happened to catch all three
-    /// accidentally, which is what makes it easy to miss that the owning
-    /// crate has none.) Restored before writing this test.
-    /// (#3035) An envelope archived before 5.0 spells the flag `remote`; it
-    /// still reads as `unmanaged`, and the new spelling is what gets written.
-    #[test]
-    fn an_archived_remote_seat_flag_reads_as_unmanaged() {
-        let member: MemberRecord = serde_json::from_value(serde_json::json!({
-            "model": "m", "seat": "s", "draws": 1, "wall_ms": 1, "total_tokens": 1, "remote": true
-        }))
-        .unwrap();
-        assert!(member.unmanaged);
-        let written = serde_json::to_value(&member).unwrap();
-        assert_eq!(written["unmanaged"], true);
-        assert!(written.get("remote").is_none(), "{written}");
-    }
-
+    /// (#2540) The READ-side twin of the write-side goldens above: the three
+    /// fields that pair `#[serde(default)]` with `skip_serializing_if`
+    /// (`MemberRecord::unmanaged`, `SeatStaffingSnapshot::unmanaged`,
+    /// `StaffingSnapshot::request_changes`) are usually absent on disk, so a
+    /// document that omits them must still deserialize.
     #[test]
     fn member_record_and_staffing_snapshot_round_trip_through_every_omitted_default() {
         let local_member = MemberRecord {

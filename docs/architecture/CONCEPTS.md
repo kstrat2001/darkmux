@@ -130,10 +130,10 @@ A mission groups a body of work. Its fields
 (`crates/darkmux-crew/src/types.rs:267-318`):
 
 - `id`, `description`
-- `status`: `Active` / `Paused` / `Finalized` (default `Active`; renamed from
-  `Closed` for terminology consistency with the `mission finalize` verb, #1463)
+- `status`: `Active` / `Finalized` / `Aborted` (default `Active`; `Finalized`
+  was `Closed` before 4.0, named for the `mission finalize` verb)
 - `phase_ids: Vec<String>`
-- timestamps: `created_ts`, `started_ts`, `paused_ts`, `finalized_ts`
+- timestamps: `created_ts`, `started_ts`, `finalized_ts`
 
 There is **no `scope` field and no `goal` field**: a mission carries a
 `description`, not a separate goal/scope pair. "Scope" appears in the codebase

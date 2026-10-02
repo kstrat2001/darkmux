@@ -209,15 +209,6 @@
   "needs_check": 1,
   "raw_flags": 5,
   "refuted": 1,
-  "remote_budgets": [
-    {
-      "exhausted": false,
-      "max_tokens": 500000,
-      "skipped_calls": 0,
-      "stage": "verify",
-      "used_tokens": 2
-    }
-  ],
   "staffing": {
     "judge": {
       "k": 1,

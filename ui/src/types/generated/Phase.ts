@@ -32,7 +32,7 @@ display_name?: string, status: PhaseStatus, created_ts: number,
 /**
  * When the phase first transitioned to `Running` (or last transitioned
  * to `Running` after being `Abandoned` and restarted). None until
- * `darkmux phase start` runs. Wall-clock UI shows live elapsed when
+ * the phase's first step starts. Wall-clock UI shows live elapsed when
  * `status == Running` (now - started_ts).
  */
 started_ts?: number, 
@@ -44,8 +44,8 @@ started_ts?: number,
 completed_ts?: number, 
 /**
  * When the phase transitioned to `Abandoned`. Cleared when the
- * operator changes their mind and runs `phase start` again — the
- * state machine treats `Abandoned → Running` as a legal restart.
+ * phase restarts — the state machine treats `Abandoned → Running` as a
+ * legal restart.
  */
 abandoned_ts?: number, 
 /**

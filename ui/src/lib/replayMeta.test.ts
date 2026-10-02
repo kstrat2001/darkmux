@@ -64,7 +64,7 @@ describe("primaryReplayMission", () => {
 describe("replayDataSource", () => {
   it("is lowercase 'flow · <date>' — NOT the topbar's 'Flow · <date>'", () => {
     // Two strings, two places, deliberately not derived from each other:
-    // `DATA_SOURCE` (viewer.html:3465) goes inside the meta line, `#srcbadge`
+    // `DATA_SOURCE` goes inside the meta line, `#srcbadge`
     // (3472) is the topbar chip, and legacy capitalizes them differently.
     expect(replayDataSource("2026-08-07")).toBe("flow · 2026-08-07");
   });
@@ -103,7 +103,7 @@ describe("replayMetaLines", () => {
 
 describe("shapeRecords: the per-session runtime aggregate", () => {
   // `flowToRenderModel` APPENDS one synthetic runtime telemetry record per
-  // session that emitted any `dispatch.turn` (viewer.html:3223-3234). These
+  // session that emitted any `dispatch.turn`. These
   // are counted in `DATA.length`, which is why the golden reads 2008 records
   // against a fixture holding 1993 real ones plus 15 such sessions.
   const turns: NormRecord[] = [

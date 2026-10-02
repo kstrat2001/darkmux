@@ -57,7 +57,7 @@ export interface RouteRecords {
 
 /** Decodes BOTH wire shapes via the shared `ingest` (`lib/ingest.ts`), the
  * same boundary `useFlowWindow` uses and legacy's own decode at
- * viewer.html:3920.
+ *.
  *
  * Both endpoints answer the same `FlowRecordsResponse` envelope (D5, #3035):
  *
@@ -65,7 +65,7 @@ export interface RouteRecords {
  *   GET /flow-dispatch/<id>  -> { records, ... }    (`catalog_records_response`)
  *
  * (#1800) Then SHAPED through `shapeRecords`, as legacy's own playback boot
- * is `DATA=flowToRenderModel(RAW)` (viewer.html:3894/3922), so this hook and
+ * is `DATA=flowToRenderModel(RAW)`, so this hook and
  * `PlaybackLens` hand out the SAME record set from the same cache entry. The
  * meta line's census is what made a past gap between the two visible,
  * because it is the only surface that says the number out loud.

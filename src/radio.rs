@@ -1239,34 +1239,6 @@ mod tests {
         }
     }
 
-    /// (F12) A removed verb must not appear anywhere a model reads the command
-    /// surface: the router catalog message or the verb index the answering seat
-    /// is grounded in (the dogfood suggested the removed `lab eval`).
-    #[test]
-    #[serial_test::serial]
-    fn no_retired_verb_appears_in_the_router_catalog_or_the_verb_index() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-        let catalog = compile_catalog().expect("no stale user files in this fixture");
-        let index = crate::radio_index::render_verb_index(&crate::radio_index::build_verb_index(&<crate::cli::Cli as clap::CommandFactory>::command()));
-        let surface = format!("{}\n{index}", build_router_message("x", &catalog));
-        let retired = crate::retired_verbs::retired_spellings();
-        // drift-guard:allow lab eval — asserts the retired table names it
-        assert!(retired.iter().any(|s| s == "darkmux lab eval"), "the table must include lab eval: {retired:?}");
-        for spelling in retired {
-            assert!(!surface.contains(&spelling), "`{spelling}` is retired but the model-facing surface offers it");
-        }
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn compile_catalog_falls_back_to_the_configs_name_when_it_has_no_description() {

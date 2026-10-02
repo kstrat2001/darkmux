@@ -26,8 +26,8 @@ const GRAPH = {
     {
       id: 'task-1', kind: 'task', label: 'Judge', parentId: 'phase-a', status: 'running', depth: 0,
       steps: [
-        { id: 'judge-1', kind: 'review.judge', label: 'Judge', status: 'running' },
-        { id: 'judge-2', kind: 'review.judge', label: 'Judge 2', status: 'error' },
+        { id: 'judge-1', kind: 'dispatch.internal', label: 'Judge', status: 'running' },
+        { id: 'judge-2', kind: 'dispatch.internal', label: 'Judge 2', status: 'error' },
         { id: 'local-1', kind: 'dispatch.internal', label: 'Local', status: 'complete' },
       ],
     },
@@ -115,8 +115,8 @@ test('a page opened AFTER the run agrees with one watched live', async ({ page }
   const finished = JSON.parse(JSON.stringify(GRAPH));
   finished.nodes[1].steps = [
     { id: 'local-1', kind: 'dispatch.internal', label: 'Local', status: 'complete', startedTs: 1700000000, tokensFinal: 3000, localOk: true },
-    { id: 'judge-1', kind: 'review.judge', label: 'Judge', status: 'complete', startedTs: 1700000000, tokensFinal: 5000, cloud: true },
-    { id: 'judge-2', kind: 'review.judge', label: 'Judge 2', status: 'error', startedTs: 1700000000, tokensFinal: 7000 },
+    { id: 'judge-1', kind: 'dispatch.internal', label: 'Judge', status: 'complete', startedTs: 1700000000, tokensFinal: 5000, cloud: true },
+    { id: 'judge-2', kind: 'dispatch.internal', label: 'Judge 2', status: 'error', startedTs: 1700000000, tokensFinal: 7000 },
   ];
   await page.route(`**/mission/${MISSION_ID}/graph.json*`, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify(finished) }));
   await page.route(MISSION_RE, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ records: [], count: 0, truncated: false, generated_at_ms: 0 }) }));

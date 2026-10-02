@@ -149,7 +149,7 @@ describe("Scrubber", () => {
 
   // (#1869 code review) A zero-span day pins the thumb at the RIGHT edge
   // (100), not the left (0) — legacy's own rule (`span > 0 ? Math.round(...)
-  // : 100`, viewer.html:2618, named at #1640). A previous version of this
+  // : 100`,, named at #1640). A previous version of this
   // test pinned the WRONG value (0): with `tMin === tMax`, `t - tMin` is 0,
   // and the pre-fix code floored `span` to 1 before dividing, so `raw`
   // silently computed to 0 instead of following legacy's explicit `else

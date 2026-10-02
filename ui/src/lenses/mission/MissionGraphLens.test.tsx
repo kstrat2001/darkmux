@@ -45,7 +45,7 @@ function lastEventsCall(spy: ReturnType<typeof vi.fn>): [NormRecord[], boolean] 
 }
 
 /** Seeds the live-tail cache slot `useLiveTail` writes into — the SAME
- *  mechanism a real SSE `telemetry.process` message would use
+ *  mechanism a real SSE `machine.telemetry` message would use
  *  (`mergeTailRecords`/`setQueryData`), without standing up a real
  *  `EventSource` (this component has no injectable `eventSourceFactory`
  *  seam of its own). */
@@ -455,15 +455,14 @@ describe("MissionGraphLens", () => {
     expect(document.querySelector(".mproc")).toBeNull();
   });
 
-it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
+it("(#1483) shows the host-activity readout once a machine.telemetry sample lands on the live tail", async () => {
     mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(document.querySelector(".mproc")).toBeNull();
 
     seedLiveTail(queryClient, [
-      // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 41, gpu_pct: 72, mem_pct: 0.5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -476,38 +475,19 @@ it("(#1483) shows the host-activity readout once a telemetry.process sample land
     // class, matching legacy's own `proc.gpu >= 60 ? "hot" : ""`.
     expect(document.querySelector(".mproc b.hot")?.textContent).toBe("72%");
   });
-  it("(#2413) shows the host-activity readout from a machine-scoped machine.telemetry sample (cpu_pct/gpu_pct shape, no session_id)", async () => {
-    mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
-    const { queryClient } = renderLens();
-    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
-    expect(document.querySelector(".mproc")).toBeNull();
-
-    seedLiveTail(queryClient, [
-      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 41, gpu_pct: 72, mem_pct: 0.5, sampled_at_ms: Date.now(), interval_ms: 5000 } },
-    ]);
-
-    await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
-    const proc = document.querySelector(".mproc");
-    expect(proc?.textContent).toContain("gpu");
-    expect(proc?.textContent).toContain("72%");
-    expect(proc?.textContent).toContain("cpu");
-    expect(proc?.textContent).toContain("41%");
-  });
-
   it("(#2332) the host readout is for RUNNING missions only — a finalized mission shows none even with a fresh sample", async () => {
     mockFetch();
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     seedLiveTail(queryClient, [
-      // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 41, gpu: 72 } },
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 41, gpu_pct: 72 } },
     ]);
     await new Promise((r) => setTimeout(r, 50));
     expect(document.querySelector(".mproc")).toBeNull();
     expect(document.querySelector(".mstatus")?.textContent).toBe("finalized");
   });
 
-  it("(#1483) MACHINE-level, not mission-scoped — a telemetry.process sample with no mission_id still shows", async () => {
+  it("(#1483) MACHINE-level, not mission-scoped — a machine.telemetry sample with no mission_id still shows", async () => {
     // Host telemetry is never stamped with a mission_id (it's a whole-box
     // sample, not per-dispatch) — this proves the readout isn't accidentally
     // filtered through `recordInMission` the way the events pane is.
@@ -516,21 +496,20 @@ it("(#1483) shows the host-activity readout once a telemetry.process sample land
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
     seedLiveTail(queryClient, [
-      // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 10, gpu: 5 } },
+      { ts: new Date().toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 10, gpu_pct: 5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
   });
 
-  it("(#1483) the readout is absent when no telemetry.process sample has ever arrived", async () => {
+  it("(#1483) the readout is absent when no machine.telemetry sample has ever arrived", async () => {
     mockFetch();
     renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(document.querySelector(".mproc")).toBeNull();
   });
 
-  it("(#1483) a telemetry.process sample expires after the 12s freshness window, on the next render", async () => {
+  it("(#1483) a machine.telemetry sample expires after the 12s freshness window, on the next render", async () => {
     mockFetch({ graph: RUNNING_GRAPH, flowMissionRecords: [MISSION_REC] });
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
@@ -539,8 +518,7 @@ it("(#1483) shows the host-activity readout once a telemetry.process sample land
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(t0);
     try {
       seedLiveTail(queryClient, [
-        // flow-action-guard:allow — a retired action, as an archive still holds it
-        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "host", machine_uid: "UID-A", payload: { cpu: 10, gpu: 5 } },
+          { ts: new Date(t0).toISOString(), action: "machine.telemetry", category: "machinery", source: "host", machine_uid: "UID-A", payload: { cpu_pct: 10, gpu_pct: 5 } },
       ]);
       await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
 

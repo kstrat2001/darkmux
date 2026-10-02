@@ -7,9 +7,7 @@ import type { MissionStatus } from "./MissionStatus";
  */
 export type Mission = { id: string, description: string, status: MissionStatus, 
 /**
- * The mission's phases. A `mission.json` still using the pre-rename key
- * `sprint_ids` is refused by [`crate::retired_state`], never read as an
- * empty list.
+ * The mission's phases.
  */
 phase_ids: Array<string>, created_ts: number, 
 /**
@@ -20,8 +18,7 @@ started_ts?: number,
 /**
  * When the mission transitioned to `Finalized`. Finalized is
  * terminal — once set, lifecycle verbs can't move the mission
- * elsewhere. A `mission.json` still using the old key `closed_ts` is
- * refused by [`crate::retired_state`].
+ * elsewhere.
  */
 finalized_ts?: number, 
 /**

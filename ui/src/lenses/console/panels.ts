@@ -315,7 +315,7 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
   return `${id}?${pairs.map(([n, v]) => `${n}=${v}`).join("&")}`;
 }
 
-/** viewer.html: `const PANELS = [...]`. Order is the tab order.
+/** Legacy `const PANELS = [...]`. Order is the tab order.
  *
  * These are exactly the CLI-backed panels — the drift guard in
  * `panels.test.ts` pins `PANELS.map(p => p.id)` to `PANEL_IDS` from
@@ -389,7 +389,7 @@ export const PANELS: PanelDef[] = (
  * post-#1904 (see `hashSync.test.ts`'s own round-trip tests). */
 export const DEFAULT_PANEL_ID: PanelId = "run-list";
 
-/** viewer.html: `const MANUAL_PANELS = new Set(["doctor"])`. Panels the
+/** Legacy `const MANUAL_PANELS = new Set(["doctor"])`. Panels the
  * daemon marks `auto_refresh: false` — they PROBE the machine, so nothing
  * but an explicit user action may run them (#1286 — "the observer must not
  * join the observed"). Selecting the tab must NEVER auto-fetch; only the
@@ -400,7 +400,7 @@ export function isManualPanel(id: PanelId): boolean {
   return MANUAL_PANELS.has(id);
 }
 
-/** viewer.html: `function panelCols()`. Asks the daemon for a render width
+/** Legacy `function panelCols()`. Asks the daemon for a render width
  * that matches the space the panel actually has, so `mission status` sheds
  * its optional columns on a phone instead of overflowing — see that
  * function's own extensive comment in viewer.html for the 7.2px-advance-

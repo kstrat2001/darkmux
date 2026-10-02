@@ -55,7 +55,7 @@ export function flowWindowEdgeMs(nowMs: number): number {
   return Math.floor(nowMs / FLOW_WINDOW_EDGE_GRAIN_MS) * FLOW_WINDOW_EDGE_GRAIN_MS;
 }
 
-/** `loadLiveWindow()` (viewer.html:3497) as a query hook: fetches
+/** `loadLiveWindow()` as a query hook: fetches
  * `[prevDate, today]` (that exact order — see `lib/flow.ts`'s module doc
  * for the fetch-order subtlety that makes the two-day merge order
  * load-bearing) and folds the result through `buildFlowWindow`. A day that
@@ -104,7 +104,7 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   const yesterday = prevDateUTC(today);
 
   // (#1801) A daemon-less build has no `/flow/<date>` to fetch — legacy's
-  // flow-src branch never calls `loadLiveWindow` at all (viewer.html:3897).
+  // flow-src branch never calls `loadLiveWindow` at all.
   // Without this gate the demo issues two guaranteed-404 requests on its
   // landing page, before any lens is touched (measured:
   // `/flow/2026-08-12`, `/flow/2026-08-13` in the page's resource timings).

@@ -373,7 +373,7 @@ describe("MachineLens", () => {
     expect(resourcesCalled.value).toBe(false);
   });
 
-  it("(#1833) shows live CPU/GPU/MEM now/avg/max for this machine's own telemetry.process samples", async () => {
+  it("(#1833) shows live CPU/GPU/MEM now/avg/max for this machine's own machine.telemetry samples", async () => {
     // (rolling-window fix) The 10-minute window is measured against REAL
     // `Date.now()`, not the test's nominal "today" — a midnight-UTC
     // timestamp is routinely hours outside that window depending on when
@@ -386,12 +386,10 @@ describe("MachineLens", () => {
         { ts: newIso, machine_uid: "self-uid", machine_id: "MacBook-Pro" },
         // Distinct values per metric so each assertion below can only match
         // the ONE tile it names — cpu/mem/gpu never share an avg/now/max.
-        // flow-action-guard:allow-start — a retired action, as an archive still holds it
-        { ts: oldIso, machine_uid: "self-uid", category: "telemetry", source: "host", action: "telemetry.process", payload: { cpu: 40, mem: 20, gpu: 60 } },
-        { ts: newIso, machine_uid: "self-uid", category: "telemetry", source: "host", action: "telemetry.process", payload: { cpu: 80, mem: 50, gpu: 90 } },
+        { ts: oldIso, machine_uid: "self-uid", category: "machinery", source: "host", action: "machine.telemetry", payload: { cpu_pct: 40, mem_pct: 20, gpu_pct: 60 } },
+        { ts: newIso, machine_uid: "self-uid", category: "machinery", source: "host", action: "machine.telemetry", payload: { cpu_pct: 80, mem_pct: 50, gpu_pct: 90 } },
         // A peer's own sample, same window — must NOT be averaged in.
-        { ts: newIso, machine_uid: "peer-uid", category: "telemetry", source: "host", action: "telemetry.process", payload: { cpu: 999, mem: 999, gpu: 999 } },
-        // flow-action-guard:allow-end
+        { ts: newIso, machine_uid: "peer-uid", category: "machinery", source: "host", action: "machine.telemetry", payload: { cpu_pct: 999, mem_pct: 999, gpu_pct: 999 } },
       ],
     });
     renderMachine(null);

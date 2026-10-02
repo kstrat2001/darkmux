@@ -18,7 +18,7 @@ describe("computeLabPipeline", () => {
   it("folds step-result events into per-step-id payloads, in first-seen order", () => {
     const events: RawRecord[] = [
       { ts: "2026-01-01T00:00:00Z", action: "step.result", payload: { step_id: "bundle", items_out: 5 } },
-      { ts: "2026-01-01T00:00:01Z", action: "step.result", payload: { step_id: "probe", draws_total: 10, draws_done: 3 } },
+      { ts: "2026-01-01T00:00:01Z", action: "step.result", payload: { step_id: "probe", items_in: 10, items_out: 3 } },
       { ts: "2026-01-01T00:00:02Z", action: "step.result", payload: { step_id: "bundle", items_out: 8 } },
     ];
     const pipe = computeLabPipeline(normAll(events));
@@ -53,8 +53,7 @@ describe("labStageMeta", () => {
     expect(labStageMeta(null)).toBe("not started");
   });
 
-  it("prefers draws over items over a bare model", () => {
-    expect(labStageMeta({ draws_total: 10, draws_done: 4, model: "darkmux:foo" })).toBe("4/10 draws · foo");
+  it("prefers items over a bare model", () => {
     expect(labStageMeta({ items_in: 3, items_out: 2 })).toBe("3 → 2");
     expect(labStageMeta({ model: "darkmux:bar" })).toBe("bar");
   });

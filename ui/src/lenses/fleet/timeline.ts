@@ -1,6 +1,6 @@
 /**
  * The fleet default view's "recent activity" timeline — `renderFleet()`'s
- * `lanes`/`ax`/`winCtl`/`tl` build (viewer.html:1688-1741). One lane per
+ * `lanes`/`ax`/`winCtl`/`tl` build. One lane per
  * machine; each dispatch session is a bar positioned across the recorded
  * window.
  *
@@ -126,7 +126,7 @@ export interface ActivityTimeline {
   labelWidthPx: number;
 }
 
-/** `renderMachine()`'s lane-label width math (viewer.html:1733-1734) — sizes
+/** `renderMachine()`'s lane-label width math — sizes
  * the `.lname` column to the longest machine name so short names don't leave
  * a fixed gap. Visual-only (no text-parity effect). */
 function labelWidthPx(uids: string[], data: NormRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
@@ -251,7 +251,7 @@ export function buildActivityTimeline(
   });
 
   return {
-    // Legacy appended `· ${clkrange(tlMin,tlMax)}` here (viewer.html:1766);
+    // Legacy appended `· ${clkrange(tlMin,tlMax)}` here;
     // dropped 2026-09-01 — see `headerText`'s own doc. Deliberate divergence
     // from legacy, not drift.
     // (Playback parity, Change A, finding #8) Always "recent activity" now

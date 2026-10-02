@@ -20,7 +20,6 @@ import { canonicalMachineKeys, keyOfMachineValue, machineIndex, machineValueLabe
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
 import type { LabRunsResponse } from "../../types/generated/LabRunsResponse";
-import type { PendingMove } from "../../types/generated/PendingMove";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
@@ -589,7 +588,6 @@ export function RunsBoard({
   const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
   const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
-  const labPendingMove = labRunsQuery.data.ok ? labRunsQuery.data.data.pending_move : undefined;
 
   // The filter bar speaks in values; the hash carries machine KEYS. A value
   // that is already selected keeps the key it arrived with, so an unresolved
@@ -618,7 +616,6 @@ export function RunsBoard({
           configured: labConfigured,
           dir: labDir,
           dirExists: labDirExists,
-          pendingMove: labPendingMove,
         })
       : null;
 
@@ -675,20 +672,14 @@ export function RunsBoard({
 }
 
 /** The reasons the lab tab can be empty,
- * each with a different remedy: runs left in the pre-4.0 dir (move them),
- * no source wired, a dir not created yet, or a genuinely empty lab. A pending
- * move is named even when other runs are listed, since the old ones are not
- * being read. */
+ * each with a different remedy: no source wired, a dir not created yet, or a
+ * genuinely empty lab. */
 function labSourceNotice(s: {
   hasLabRuns: boolean;
   configured: boolean;
   dir: string | null;
   dirExists: boolean | null;
-  pendingMove: PendingMove | undefined;
 }): string | null {
-  if (s.pendingMove) {
-    return `lab runs are still in ${s.pendingMove.from} (the pre-4.0 location), and 4.0 reads ${s.pendingMove.to}. darkmux does not move them itself; run: ${s.pendingMove.command}`;
-  }
   if (s.hasLabRuns) return null;
   const at = s.dir ? ` (${s.dir})` : "";
   if (!s.configured) {

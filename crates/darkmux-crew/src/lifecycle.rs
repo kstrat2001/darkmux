@@ -59,7 +59,7 @@
 //! is the explicit "this mission is now being worked on" transition.
 
 use crate::loader::load_phases;
-use crate::retired_state::{parse_state, StateKind};
+use crate::state_file::{parse_state, StateKind};
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, OpenPayload, Stage, Tier};
@@ -213,10 +213,7 @@ pub fn save_phase(phase: &Phase) -> Result<()> {
     save_state(StateKind::Phase, &phase_path(&phase.mission_id, &phase.id), phase)
 }
 
-/// Directory holding the mission's phase JSONs. Only `phases/` is read: a
-/// mission directory still holding the pre-rename `sprints/` is reported by
-/// `darkmux doctor` ([`crate::retired_state::retired_phases_dir`]), and its
-/// phases are not read.
+/// Directory holding the mission's phase JSONs.
 pub fn phases_dir(mission_id: &str) -> PathBuf {
     mission_dir(mission_id).join("phases")
 }
@@ -879,9 +876,8 @@ pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, paylo
 /// and on paper this guard could too. It doesn't, for two concrete
 /// reasons rather than symmetry with that function (which is a dedicated
 /// close-time anomaly classifier, not a guard on a hot mutating call): a
-/// pre-rename legacy phase has no `mission.json` at all and must stay
-/// startable (`phase_lifecycle_operates_on_legacy_sprints_dir_data`
-/// below pins exactly this), and a corrupt/unreadable `mission.json`
+/// phase with no `mission.json` at all must stay startable, and a
+/// corrupt/unreadable `mission.json`
 /// blocking every phase under it forever is a worse failure than the one
 /// this guard exists to prevent. So: refused when the mission's
 /// terminality is OBSERVABLE, not exhaustively guaranteed.
@@ -1544,26 +1540,6 @@ mod tests {
         assert_eq!(step.status, crate::types::NodeStatus::Abandoned);
     }
 
-    /// (#2430) Reconciling an archived step re-saves it, and the kind id it
-    /// was stored with is not rewritten: history keeps the spelling it was
-    /// written under, and only `Step::kind_id` answers to the new one.
-    #[serial_test::serial]
-    #[test]
-    fn reconciling_an_archived_step_keeps_its_retired_kind_id_on_disk() {
-        let _g = CrewGuard::new();
-        seed_phase("p-old", PhaseStatus::Running);
-        let mut s = seed_step("test-mission", "p-old", "old-step", crate::types::NodeStatus::Running);
-        s.kind = "crawl.unit".to_string();
-        save_step("test-mission", "p-old", &s).unwrap();
-
-        phase_abandon("p-old").unwrap();
-
-        let step = load_step("test-mission", "p-old", "old-step").unwrap();
-        assert_eq!(step.status, crate::types::NodeStatus::Abandoned, "the reconcile did re-save it");
-        assert_eq!(step.kind, "crawl.unit", "the stored kind is byte-identical");
-        assert_eq!(step.kind_id(), "dispatch.unit");
-    }
-
     /// A step already terminal (Complete/Abandoned/Error) is left completely
     /// untouched by the reconcile — only live steps get rolled.
     #[serial_test::serial]
@@ -1760,79 +1736,6 @@ mod tests {
         let _ = phase_start("s-atomic").unwrap();
         let tmp_path = phase_path("test-mission", "s-atomic").with_extension("json.tmp");
         assert!(!tmp_path.exists(), "atomic save should rename, leaving no .tmp");
-    }
-
-    // ─── Retired spellings in operator state ───────────────────────────
-
-    /// A phase under the retired `sprints/` directory is not read: the
-    /// lifecycle verbs do not find it, and nothing is written next to it.
-    #[serial_test::serial]
-    #[test]
-    fn phases_under_the_retired_sprints_dir_are_not_read() {
-        let _g = CrewGuard::new();
-        let mission_dir = crate::loader::missions_dir().join("legacy-mission");
-        let legacy_dir = mission_dir.join("sprints");
-        fs::create_dir_all(&legacy_dir).unwrap();
-        let s = Phase {
-            id: "legacy-phase".to_string(),
-            mission_id: "legacy-mission".to_string(),
-            description: "pre-rename phase".to_string(),
-            display_name: None,
-            status: PhaseStatus::Planned,
-            created_ts: 1_700_000_000,
-            started_ts: None,
-            completed_ts: None,
-            abandoned_ts: None,
-            task_ids: Vec::new(),
-        };
-        save_json(&legacy_dir.join("legacy-phase.json"), &s).unwrap();
-
-        assert!(load_phase_by_id("legacy-phase").is_err(), "a phase in sprints/ is not found");
-        assert_eq!(phases_dir("legacy-mission"), mission_dir.join("phases"));
-        // Recovery: the rename doctor asks for makes the phase readable.
-        fs::rename(&legacy_dir, mission_dir.join("phases")).unwrap();
-        assert_eq!(load_phase_by_id("legacy-phase").unwrap().mission_id, "legacy-mission");
-    }
-
-    /// A `mission.json` using the retired `sprint_ids` key is refused by
-    /// name, never loaded as a mission with an empty phase list; the renamed
-    /// key loads.
-    #[serial_test::serial]
-    #[test]
-    fn mission_json_with_the_retired_sprint_ids_key_is_refused() {
-        let _g = CrewGuard::new();
-        let path = mission_path("legacy-mission-2");
-        let write = |key: &str| {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(
-                &path,
-                format!(
-                    r#"{{"id": "legacy-mission-2", "description": "d", "status": "active",
-                    "{key}": ["s1", "s2"], "created_ts": 1700000000}}"#
-                ),
-            )
-            .unwrap();
-        };
-        write("sprint_ids");
-        let err = format!("{:#}", load_mission("legacy-mission-2").unwrap_err());
-        assert!(err.contains("`sprint_ids` was renamed to `phase_ids`"), "{err}");
-        write("phase_ids");
-        assert_eq!(load_mission("legacy-mission-2").unwrap().phase_ids, ["s1", "s2"]);
-    }
-
-    /// A task file using the retired `sprint_id` key is refused when its
-    /// phase's tasks are loaded, not dropped from the list.
-    #[serial_test::serial]
-    #[test]
-    fn task_json_with_the_retired_sprint_id_key_is_refused() {
-        let _g = CrewGuard::new();
-        let dir = tasks_dir("m", "p");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("t.json"), r#"{"id": "t", "sprint_id": "p", "description": "d"}"#).unwrap();
-        let err = format!("{:#}", load_tasks_for_phase("m", "p").unwrap_err());
-        assert!(err.contains("`sprint_id` was renamed to `phase_id`"), "{err}");
-        let err = format!("{:#}", load_task("m", "p", "t").unwrap_err());
-        assert!(err.contains("`sprint_id` was renamed to `phase_id`"), "{err}");
     }
 
     // ─── (#1959) payload-carrying mission start/close ──────────────────

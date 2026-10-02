@@ -1,6 +1,6 @@
 /**
  * (#2107) Pure scope resolution for the global machine drawer/modal — which
- * `telemetry.process`/`machine.telemetry` samples the CPU/GPU/MEM meters
+ * `machine.telemetry` samples the CPU/GPU/MEM meters
  * aggregate, and what to call that window.
  *
  * Two windows, per the operator's own scope rule:
@@ -56,7 +56,7 @@
 import type { Route } from "./route";
 import { sameUid, uidOf } from "./machineIdentity";
 import type { ProcSamplePoint } from "./hostStats";
-import { ACTION, CATEGORY, SOURCE, byTime, payloadOf, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, byTime, payloadOf, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
@@ -67,27 +67,15 @@ export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
  * shouldn't be reported as if it just happened to be quiet. */
 const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-/** (#2413) Accepts BOTH the retired per-dispatch `telemetry.process` and the
- * new machine-scoped `machine.telemetry` (`source: "host"`, no session_id).
- * `telemetry.process` is fully retired as of `FLOW_SCHEMA_VERSION` 1.42.0 —
- * see its changelog entry — nothing in the current binary emits it any
- * more (the mission-launch/ACP `run_obs::HostTelemetrySampler` mechanism
- * that used to was deleted in the same round). A reader still needs both
- * arms for a pre-1.42.0 day file, which is lenient-on-read and un-migrated
- * by design, so old records keep showing SOMETHING rather than going
- * blank. The retired action is outside the flow vocabulary, so its arm
- * matches the shape it always carried (`category: "telemetry"`,
- * `source: "host"`). */
+/** (#2413) A machine-scoped `machine.telemetry` host sample (`source: "host"`,
+ * no session_id). The per-dispatch `telemetry.process` it replaced (flow
+ * schema 1.42.0) is not read: an archive's record of it is an unknown action
+ * and draws no host-load track (5.0). */
 export function isHostSampleRecord(r: NormRecord): boolean {
-  return (
-    r.action === ACTION.MachineTelemetry ||
-    (r.category === CATEGORY.Telemetry && r.source === SOURCE.Host)
-  );
+  return r.action === ACTION.MachineTelemetry;
 }
 
-/** A host sample's cpu/mem/gpu, from a `machine.telemetry` payload or, for a
- *  record an older archive holds, the retired `telemetry.process` shape
- *  (`source: "host"`, bare `cpu`/`mem`/`gpu`). */
+/** A host sample's cpu/mem/gpu, from a `machine.telemetry` payload. */
 export function toPoint(r: NormRecord): ProcSamplePoint {
   const num = (v: unknown): number | undefined => {
     if (v == null) return undefined;
@@ -95,11 +83,7 @@ export function toPoint(r: NormRecord): ProcSamplePoint {
     return Number.isFinite(n) ? n : undefined;
   };
   const sample = payloadOf(r, ACTION.MachineTelemetry);
-  if (sample) return { cpu: num(sample.cpu_pct), mem: num(sample.mem_pct), gpu: num(sample.gpu_pct) };
-  // Raw route/window records carry `payload`; a normalized render model
-  // (`flowToRenderModel`) renames it to `fields`: accept either.
-  const legacy = (r.payload ?? r.fields) as { cpu?: unknown; mem?: unknown; gpu?: unknown } | undefined;
-  return { cpu: num(legacy?.cpu), mem: num(legacy?.mem), gpu: num(legacy?.gpu) };
+  return { cpu: num(sample?.cpu_pct), mem: num(sample?.mem_pct), gpu: num(sample?.gpu_pct) };
 }
 
 export interface LastKnownSample {
@@ -145,7 +129,7 @@ export function rollingWindowSamples(records: NormRecord[], uid: string | null, 
     .map(toPoint);
 }
 
-/** The single most recent `telemetry.process` sample for `uid` anywhere in
+/** The single most recent `machine.telemetry` sample for `uid` anywhere in
  * `records`, regardless of the rolling window's 10-minute cutoff — the
  * sampler only runs DURING a dispatch (#557/#1064's own doc), so an idle
  * machine's rolling window is legitimately empty most of the time, and

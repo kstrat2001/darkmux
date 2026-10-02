@@ -761,8 +761,7 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 // (#2694) `last_error` is not all darkmux's own voice: the
                 // redirect-refusal producer embeds the `Location` header
                 // chosen by whatever the hooks target redirects to, and a
-                // `.last` sidecar written by an older binary holds that
-                // text raw. Rendered inline and unbounded — as this row
+                // `.last` sidecar holds that text raw. Rendered inline and unbounded — as this row
                 // was — a long value wraps and the remote party controls
                 // the first character of the continuation, which lands at
                 // column 0 where this renderer's EIGHT FLUSH-LEFT rows
@@ -835,16 +834,12 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                     // failed, the disclosure-destroying shape #2686
                     // named.
                     //
-                    // (#2694 fix round 2, CONSIDER C — the corrected
-                    // reason; the first version of this note said an
-                    // older binary could have written such a value, and
-                    // that is FALSE.) No producer can reach this arm, at
-                    // this commit or any earlier one: post-fix an
-                    // all-stripped `Location` still yields
-                    // `redirect refused: 302 to ""`, and at the base
-                    // commit all five pre-fix producers prefix darkmux's
-                    // own prose, so none of them can sanitize to empty
-                    // either. The arm is reachable only from a `.last`
+                    // (#2694 fix round 2, CONSIDER C) No darkmux producer
+                    // can reach this arm: an all-stripped `Location`
+                    // still yields `redirect refused: 302 to ""`, and
+                    // every producer prefixes darkmux's own prose, so
+                    // none of them can sanitize to empty. The arm is
+                    // reachable only from a `.last`
                     // sidecar darkmux did not write — a hand-edit, a
                     // third-party tool, a restored backup. That is still
                     // reason to keep and test it, because the sidecar is

@@ -48,12 +48,8 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: "operator.catch", source: "orchestrator" }))).toBe("operator.catch");
   });
 
-  it("(#2413) machine.telemetry maps to the same 'host telemetry' facet as the retired telemetry.process", () => {
+  it("(#2413) machine.telemetry maps to the 'host telemetry' facet", () => {
     expect(activityOf(rec({ action: "machine.telemetry", category: "machinery", source: "host" }))).toBe(
-      "host telemetry",
-    );
-    // flow-action-guard:allow — a retired action, as an archive still holds it
-    expect(activityOf(rec({ action: "telemetry.process", category: "telemetry", source: "host" }))).toBe(
       "host telemetry",
     );
   });

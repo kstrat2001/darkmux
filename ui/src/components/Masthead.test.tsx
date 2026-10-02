@@ -158,7 +158,7 @@ describe("Masthead — about modal (#1640)", () => {
  * fixtures for (out of scope per #1801's brief), so mounting the real
  * button there would 404 on click. Mirrors legacy's own gate:
  * `if(!flowSrc && mode!=="no-daemon"){ sb.dataset.act="catalog"; ... }`
- * (viewer.html:3936).
+ *.
  */
 describe("Masthead — static-build badge suppression (#1801)", () => {
   function injectMeta(name: string, content: string) {

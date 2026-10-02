@@ -5,7 +5,7 @@ import { canonicalOptPairs } from "../lenses/console/panels";
 
 /**
  * Hash write-back — the `/next` port of legacy's `syncLabHash()`
- * (`viewer.html:3279`). Reflects the CURRENT lens state into
+ *. Reflects the CURRENT lens state into
  * `location.hash` via `history.replaceState` (never `pushState` — a lens
  * state change must not spam browser history, matching legacy's own
  * comment: "lens hops must not spam history") so the address bar is

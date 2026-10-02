@@ -1960,7 +1960,7 @@ fn stamp_unit_timeout(steps: &mut BTreeMap<String, crew::types::Step>, timeout_s
         return;
     };
     for step in steps.values_mut() {
-        if step.kind_id() != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
+        if step.kind != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
             continue;
         }
         // An explicit --timeout wins OUTRIGHT — overwrite even a
@@ -3142,7 +3142,7 @@ fn precheck_coder_phase_inputs(
 /// except this handle.
 pub(crate) struct CoderPhaseHandles {
     coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>>,
-    verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>,
+    verify_slot: Arc<Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>>,
     context: Arc<coder_phase::CoderPhaseContext>,
     workdir: std::path::PathBuf,
     branch: String,
@@ -3287,7 +3287,7 @@ fn register_coder_phase_kinds(
     // already carries.
     let coder_slot: Arc<Mutex<Option<coder_phase::CoderStepResult>>> = Arc::new(Mutex::new(None));
     let verify_slot: Arc<
-        Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>,
+        Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>,
     > = Arc::new(Mutex::new(None));
 
     let repo_root = coder_phase::repo_root()?;
@@ -6736,14 +6736,14 @@ mod tests {
         (handles, steps)
     }
 
-    fn review_output(block: usize, flag: usize, verdict: ReviewVerdict) -> crate::phase_cli::PhaseReviewOutput {
-        crate::phase_cli::PhaseReviewOutput {
+    fn review_output(block: usize, flag: usize, verdict: ReviewVerdict) -> crate::phase_review::PhaseReviewOutput {
+        crate::phase_review::PhaseReviewOutput {
             branch: "gate-test-branch".to_string(),
             base: "main".to_string(),
             reviewer_session_id: None,
             diff_files_changed: 1,
             total_findings: block + flag,
-            by_severity: crate::phase_cli::SeverityCounts { block, flag, nit: 0 },
+            by_severity: crate::phase_review::SeverityCounts { block, flag, nit: 0 },
             findings: Vec::new(),
             verdict,
         }

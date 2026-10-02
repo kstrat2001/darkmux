@@ -2928,7 +2928,10 @@ mod tests {
         // A third from the same address is closed at once.
         let mut third = std::net::TcpStream::connect(v4).unwrap();
         let _ = third.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n");
-        third.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        // macOS answers EINVAL to setsockopt on a socket the peer already
+        // closed, which is exactly the outcome under test: ignore it, and the
+        // read below then sees the close.
+        let _ = third.set_read_timeout(Some(Duration::from_millis(400)));
         let mut b = [0u8; 64];
         let closed = match third.read(&mut b) {
             Ok(0) => true,

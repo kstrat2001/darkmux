@@ -129,7 +129,6 @@ LabRunsResponse.configured: boolean
 LabRunsResponse.dir: string | null
 LabRunsResponse.exists: boolean
 LabRunsResponse.runs: Array<LabRunSummary>
-LabRunsResponse.pending_move?: PendingMove
 LabRunDetailResponse.dir: string
 LabRunDetailResponse.reviews: Array<LabReviewSummary>
 LabRunDetailResponse.scores: LabScoresSummary | null

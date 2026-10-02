@@ -19,7 +19,7 @@ import type { ReactNode } from "react";
 import { PANEL_IDS, type PanelId } from "../../lib/route";
 import { sanitizeOptParams } from "./panels";
 
-/** viewer.html: `const ANSI_SGR_CLASS = {...}`. */
+/** Legacy `const ANSI_SGR_CLASS = {...}`. */
 export const ANSI_SGR_CLASS: Record<number, string> = {
   1: "a-bold",
   2: "a-dim",
@@ -58,7 +58,7 @@ export function isCsiFinalByte(ch: string): boolean {
 }
 
 /**
- * viewer.html: `function panelHref(raw)`. An OSC 8 target is safe to
+ * Legacy `function panelHref(raw)`. An OSC 8 target is safe to
  * linkify only when it is http(s). `mission status` bakes ABSOLUTE daemon
  * URLs (the CLI picks loopback on a standalone machine) — a loopback href
  * tapped from the phone would open the PHONE's own localhost, not this
@@ -83,7 +83,7 @@ export function panelHref(raw: string): string | null {
 }
 
 /**
- * viewer.html: `function panelSwitchId(href)`. A same-origin
+ * Legacy `function panelSwitchId(href)`. A same-origin
  * `#lens=console&panel=<id>` link whose id is one this build actually has —
  * the CLI emits these (`panel_deep_link` in `src/mission_status.rs`) so a
  * hint like "`--all` for every mission" stays actionable from inside a
@@ -136,7 +136,7 @@ export interface AnsiSegment {
 }
 
 /**
- * viewer.html: `function renderAnsi(text)`, minus the HTML-string assembly
+ * Legacy `function renderAnsi(text)`, minus the HTML-string assembly
  * (see module doc — this returns a flat segment list; `AnsiText` below turns
  * it into React nodes). Parses SGR (`ESC [ ... m`) and OSC 8
  * (`ESC ] 8 ; params ; URL ST`) escapes; every other escape sequence is

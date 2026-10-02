@@ -18,7 +18,7 @@
  *
  * (U3-7/U5-2) There were TWO: this one (`fmtElapsed`, from
  * `lenses/mission/graph.ts`, itself `mission-graph.html`'s own) and a
- * `fmtDuration` (`fmt()` — viewer.html:962) with NO hour rollover, which
+ * `fmtDuration` (`fmt()`) with NO hour rollover, which
  * rendered a 75-minute run as "75:23". `lenses/session/sessionRun.ts`
  * formatted a dispatch's WALL CLOCK with the latter, and a dispatch running
  * over an hour is ordinary (the operator's own #2346 run: 1h54m). One
@@ -50,7 +50,7 @@ export function fmtElapsed(ms: number): string {
   return m + ":" + ss;
 }
 
-/** `clk()` — viewer.html:968. Time-of-day in the browser's local timezone
+/** `clk()`. Time-of-day in the browser's local timezone
  * (the parity harness's Playwright context pins `timezoneId: 'UTC'`, same
  * as the legacy extraction, so both resolve identically under test). */
 export function clk(t: number): string {
@@ -63,13 +63,13 @@ export function clkAt(t: number | null): string {
   return t === null ? "--:--:--" : clk(t);
 }
 
-/** `clkhm()` — viewer.html:976. `HH:MM` local, no seconds — the fleet
+/** `clkhm()`. `HH:MM` local, no seconds — the fleet
  * activity-timeline axis labels. */
 export function clkhm(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-/** `lday()` — viewer.html:992. Local DATE, no time. Ported with #1800's
+/** `lday()`. Local DATE, no time. Ported with #1800's
  * replay meta line, the only surface that names a calendar day: a live view
  * says "LIVE" in the masthead pill (#2412), a replay states the actual date
  * its records came from. Same locale-dependence as `clk` above — the
@@ -78,12 +78,12 @@ export function lday(t: number): string {
   return new Date(t).toLocaleDateString();
 }
 
-/** `sameDay()` — viewer.html:982. */
+/** `sameDay()`. */
 function sameDay(a: number, b: number): boolean {
   return new Date(a).toDateString() === new Date(b).toDateString();
 }
 
-/** `clkrange()` — viewer.html:983-987 (#1530 dogfood). A time-only formatter
+/** `clkrange()` (#1530 dogfood). A time-only formatter
  * can't distinguish two instants exactly 24h apart, so a same-day range
  * stays bare `HH:MM:SS–HH:MM:SS`; a window straddling a day boundary
  * prefixes each end with its short date ("Aug 7 16:40:59–Aug 8 16:40:59"). */
@@ -93,7 +93,7 @@ export function clkrange(a: number, b: number): string {
   return `${d(a)} ${clk(a)}–${d(b)} ${clk(b)}`;
 }
 
-/** `relAgoFrom()` — viewer.html:987-989. Coarse past-only relative time.
+/** `relAgoFrom()`. Coarse past-only relative time.
  * `<5s` reads as "just now"; note this is NOT the same threshold as
  * `<60s` — 5-59s renders as "Ns ago", a real bucket the machine lens's own
  * "just now" row (`ref===t`) never hits but a future corpus could. */
@@ -109,7 +109,7 @@ export function relAgoFrom(ref: number, t: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-/** `fmtN()` — viewer.html:1526. Thousands-grouped integer. */
+/** `fmtN()`. Thousands-grouped integer. */
 export function fmtN(n: number): string {
   return Math.round(n)
     .toString()
@@ -206,7 +206,7 @@ export const KIB = 1024; // 2¹⁰
 /** `memBytes()` — **binary** GiB/MiB/KiB (`bytes / 2³⁰`, two decimals for the
  * GiB arm).
  *
- * Legacy (`viewer.html:4853`) was decimal — `bytes / 1e9`, labeled "GB" — and
+ * Legacy was decimal — `bytes / 1e9`, labeled "GB" — and
  * the port matched it byte-for-byte until #1811. The operator called it on the
  * live gauge: a machine that Apple, the box, and every operator on earth calls
  * "128 GB" was rendering its own ceiling as `137.44 GB`, and the one screen
@@ -236,7 +236,7 @@ export function memBytes(b: number | null | undefined): string {
   return n + " B";
 }
 
-/** `memStateCls()` — viewer.html:4866. Only green/amber/red pass through;
+/** `memStateCls()`. Only green/amber/red pass through;
  * anything else (missing, unrecognized) normalizes to "unknown". Ported
  * ahead of its first consumer; #1806 Stage 1 (then Stage 2/3's
  * `MachineHealthRegion.tsx`, `machineGauge.ts`) is that consumer — see this
@@ -246,7 +246,7 @@ export function memStateCls(s: string | null | undefined): "green" | "amber" | "
   return s === "green" || s === "amber" || s === "red" ? s : "unknown";
 }
 
-/** `memPct()` — viewer.html:4939-4940. Clamped 0-100 percent of `part`
+/** `memPct()`. Clamped 0-100 percent of `part`
  * against `scale`. Its one caller is `machineGauge.ts`'s
  * `computeGaugeGeometry` — the model ROWS inline their own clamp rather
  * than routing through here, so do not read this as their shared helper.

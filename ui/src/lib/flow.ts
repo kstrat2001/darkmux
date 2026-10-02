@@ -8,7 +8,7 @@
  * `tests/parity/goldens/machine.txt`'s runs section before this file was
  * written — see the packet report for the transcript. One bug surfaced by
  * that validation and is worth naming so a future port of another lens
- * doesn't repeat it: `loadLiveWindow()` (viewer.html:3497) fetches
+ * doesn't repeat it: `loadLiveWindow()` fetches
  * `[prevDate, today]` IN THAT ORDER and concatenates in that order — a
  * session_id that recurs across the day boundary must resolve its
  * "first-seen" record from the EARLIER day first, which only happens if the
@@ -31,17 +31,17 @@ import { runIndex } from "./runRef";
 import { findUid, sameUid, uidOf } from "./machineIdentity";
 import { ACTION, CATEGORY, SOURCE, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, payloadOf, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
-/** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
+/** `LIVE_WINDOW_MS`. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
 export const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 
-/** `todayUTC()` — viewer.html:3369. */
+/** `todayUTC()`. */
 export function todayUTC(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** `prevDateUTC()` — viewer.html:3379. */
+/** `prevDateUTC()`. */
 export function prevDateUTC(d: string): string {
   const dt = new Date(d + "T00:00:00Z");
   dt.setUTCDate(dt.getUTCDate() - 1);
@@ -72,7 +72,7 @@ export async function fetchStaticFlowRecords(src: string): Promise<NormRecord[]>
 }
 
 /** `if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;`
- * — viewer.html:3902, the flowSrc branch's own date derivation. Takes the
+ *, the flowSrc branch's own date derivation. Takes the
  * records in FILE order, deliberately `records[0]` rather than the earliest
  * record, matching legacy's un-sorted read, and reads its parsed time as a
  * UTC day. Returns `null` on an empty array or a first record with no usable
@@ -123,7 +123,7 @@ export function bodyTruncated(body: unknown): boolean {
  * `buildFlowWindow` itself ALSO dedups the final merged (day-fetch + tail)
  * result, so this isn't required for display correctness — it's what keeps
  * the underlying cache entry bounded across a long-lived tab, the same thing
- * `applyLive()`'s RAW age-out prunes for (viewer.html:3522-3539). */
+ * `applyLive()`'s RAW age-out prunes for. */
 export function mergeTailRecords(existing: readonly NormRecord[], incoming: readonly NormRecord[], cutMs: number): NormRecord[] {
   const seen = new Set(existing.map(recKey));
   const merged = existing.slice();
@@ -136,21 +136,21 @@ export function mergeTailRecords(existing: readonly NormRecord[], incoming: read
   return recordsSince(merged, cutMs);
 }
 
-/** The view-model half of `flowToRenderModel()` (viewer.html:3195-3234):
+/** The view-model half of `flowToRenderModel()`:
  * ingested records plus one synthesized runtime row per session, sorted by
  * time. Deliberately does NOT window or dedup: those belong to the LIVE
  * two-day merge (`buildFlowWindow`, below), not to reading a record set.
  *
  * (#1800 P2) A historical day is shaped the same way and windowed NOT AT
  * ALL — legacy's playback boot is literally `DATA=flowToRenderModel(RAW)`
- * with no window step (viewer.html:3922). Feeding a replayed day through
+ * with no window step. Feeding a replayed day through
  * `buildFlowWindow` instead would drop every record older than 24h, i.e. the
  * entire day. */
 export function shapeRecords(records: readonly NormRecord[]): NormRecord[] {
   return [...records, ...perSessionRuntimeRecords(records)].sort(byTime);
 }
 
-/** The APPEND half of `flowToRenderModel()` — viewer.html:3223-3234. One
+/** The APPEND half of `flowToRenderModel()`. One
  * synthetic `source:"runtime"` telemetry record per session that emitted any
  * `dispatch.turn`, carrying that session's max `turn_seq` as its TURNS
  * metric. The subsystem view reads the metric from here rather than
@@ -201,7 +201,7 @@ function perSessionRuntimeRecords(records: readonly NormRecord[]): NormRecord[] 
 }
 
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —
- * viewer.html:3497-3512 / 3161-3187. `yesterday`/`today` MUST be passed in
+ *. `yesterday`/`today` MUST be passed in
  * that fetch order (see the module doc above for why). */
 export function buildFlowWindow(yesterday: readonly NormRecord[], today: readonly NormRecord[], nowMs: number): NormRecord[] {
   const windowed = recordsSince(shapeRecords([...yesterday, ...today]), nowMs - LIVE_WINDOW_MS);
@@ -214,12 +214,12 @@ export function buildFlowWindow(yesterday: readonly NormRecord[], today: readonl
   });
 }
 
-/** `recompute()`'s tMax — viewer.html:1040-1041. */
+/** `recompute()`'s tMax. */
 export function computeTMax(data: readonly NormRecord[]): number {
   return latestByTime(data)?.tMs ?? Date.now();
 }
 
-/** `recompute()`'s tMin — viewer.html:1051. Unused while `/next` was
+/** `recompute()`'s tMin. Unused while `/next` was
  * live-only (the live timeline anchors on NOW and a fixed window); a REPLAY
  * spans `tMin..tMax`, which is what makes the axis describe the recorded day
  * rather than the last 24 hours of wall-clock. */
@@ -235,7 +235,7 @@ export interface RunState {
   abandonReason?: AbandonReason;
 }
 
-/** `machPresent()` — viewer.html:1321-1327. true=present, false=absent,
+/** `machPresent()`. true=present, false=absent,
  * null=unknown (no evidence either way). */
 export function machPresent(
   data: NormRecord[],
@@ -256,7 +256,7 @@ function compKey(sessionId: string | undefined, ts: string | undefined): string 
   return `${sessionId || ""}\x1f${ts || ""}`;
 }
 
-/** `flowToRenderModel()` — viewer.html:3171-3242. Shapes an ingested
+/** `flowToRenderModel()`. Shapes an ingested
  * record array (the `/flow-dispatch/<id>` or `/flow-mission/<id>` "replay this
  * thing" payload — the session drill-in's data source, `lenses/session/
  * sessionRun.ts`) into the shape `runRegions()` reads:

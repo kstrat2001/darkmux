@@ -28,8 +28,7 @@ counts_own_work: boolean,
  */
 local: Array<CardLocalSeat>, 
 /**
- * Seats on endpoints darkmux does not manage. Written as `unmanaged`; an
- * older peer's `hosted` key still reads.
+ * Seats on endpoints darkmux does not manage.
  */
 unmanaged: CardUnmanagedSeats, 
 /**

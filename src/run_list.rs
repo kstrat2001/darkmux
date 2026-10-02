@@ -32,7 +32,6 @@ pub(crate) fn run(
 ) -> Result<i32> {
     let flows_dir = darkmux_types::config_access::flows_dir();
     let lab_dir = darkmux_types::config_access::lab_dir();
-    lab_dir_guard(kind)?;
     let since_secs = match since {
         Some(spec) => Some(
             darkmux_serve::usage_sum::parse_since(spec, now_unix()).map_err(|e| anyhow::anyhow!(e))?,
@@ -72,22 +71,6 @@ pub(crate) fn run(
         }
     }
     Ok(0)
-}
-
-/// The lab runs of a pre-4.0 install sit in the old dir until the operator
-/// moves them. Asking for lab runs by name refuses (an empty list would read
-/// as "none"); the all-kinds list says so on stderr and carries on.
-fn lab_dir_guard(kind: RunKindArg) -> Result<()> {
-    match kind {
-        RunKindArg::Lab => darkmux_types::config_access::require_current_lab_dir(),
-        RunKindArg::All => {
-            if let Err(e) = darkmux_types::config_access::require_current_lab_dir() {
-                eprintln!("note: lab runs are missing from this list. {e}");
-            }
-            Ok(())
-        }
-        RunKindArg::Mission | RunKindArg::Dispatch => Ok(()),
-    }
 }
 
 /// (#2902) `--since`: keep the rows active at or after the bound — the

@@ -422,37 +422,6 @@ pub fn open_index(path: &Path) -> Result<Connection> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
-    // Migration: refactor 0 renamed `capability` → `skill` (#448). Drop
-    // the legacy tables / triggers / index / virtual table BEFORE
-    // applying the new schema so the IF-NOT-EXISTS in SCHEMA_SQL
-    // creates fresh `skill`-named state and the old ones don't linger.
-    // Idempotent + no-op on fresh DBs (DROP IF EXISTS).
-    let current_version: i32 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap_or(0);
-    if current_version < 2 {
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS capability_keywords_ai;
-             DROP TRIGGER IF EXISTS capability_keywords_ad;
-             DROP TRIGGER IF EXISTS capability_keywords_au;
-             DROP TABLE IF EXISTS capability_keywords_fts;
-             DROP TABLE IF EXISTS capability_keywords;
-             DROP INDEX IF EXISTS idx_role_capabilities_cap;
-             DROP TABLE IF EXISTS role_capabilities;
-             DROP TABLE IF EXISTS capabilities;",
-        )
-        .context("dropping pre-rename legacy tables (refactor 0, #448)")?;
-    }
-
-    // Migration (#999): the scaffolded `knowledge` table (#998) is superseded
-    // by the durable `lessons.db` store — authored lessons live there now, not
-    // in this derived crew index. Drop the vestigial table. Idempotent + a
-    // no-op on DBs that never had it (DROP IF EXISTS).
-    if current_version < 5 {
-        conn.execute_batch("DROP TABLE IF EXISTS knowledge;")
-            .context("dropping the vestigial index.db knowledge table (#999)")?;
-    }
-
     // Self-heal derived-table schema drift (#914): drop + recreate every
     // derived table on each rebuild so a column added to the DDL (e.g. the
     // #95 mission/phase timestamp columns) lands even on a pre-existing DB —
@@ -1878,7 +1847,7 @@ mod tests {
         // (4.0) The index resolves each kind through the loader's helpers,
         // which no longer fall back to the pre-Beat-33 `<root>/crew/<subdir>/`
         // layout. A role left there is invisible to the index, as it is to
-        // the loader; `darkmux doctor` fails on the leftover directory.
+        // the loader.
         let guard = CrewDirGuard::new();
         let legacy_roles = guard.path().join("crew").join("roles");
         std::fs::create_dir_all(&legacy_roles).unwrap();
@@ -1960,116 +1929,6 @@ mod tests {
         assert_eq!(report.modified[0].0, "role");
     }
 
-    /// (#448 refactor 0) Verifies the v1 → v2 schema migration: a DB
-    /// seeded with the legacy `capabilities` / `role_capabilities` /
-    /// `capability_keywords` / `capability_keywords_fts` tables +
-    /// triggers gets cleanly migrated to v2 when `init_schema` runs.
-    /// Asserts: legacy artifacts gone, new `skills`-named artifacts
-    /// present, `PRAGMA user_version = 2`. Then re-opens to confirm
-    /// idempotency (second init_schema on a v2 DB is a no-op).
-    #[serial_test::serial]
-    #[test]
-    fn migration_v1_to_v2_drops_legacy_capability_artifacts() {
-        let tmp = TempDir::new().unwrap();
-        let idx_path = tmp.path().join("v1.db");
-
-        // Seed a v1-shaped DB with the legacy artifacts populated.
-        {
-            let conn = Connection::open(&idx_path).unwrap();
-            conn.execute_batch(
-                "
-                PRAGMA user_version = 1;
-                CREATE TABLE capabilities (id TEXT PRIMARY KEY, description TEXT NOT NULL);
-                CREATE TABLE roles (id TEXT PRIMARY KEY, description TEXT NOT NULL);
-                CREATE TABLE role_capabilities (
-                    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
-                    PRIMARY KEY (role_id, capability_id)
-                );
-                CREATE INDEX idx_role_capabilities_cap ON role_capabilities(capability_id);
-                CREATE TABLE capability_keywords (
-                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
-                    keyword TEXT NOT NULL,
-                    weight REAL NOT NULL,
-                    PRIMARY KEY (capability_id, keyword)
-                );
-                CREATE VIRTUAL TABLE capability_keywords_fts USING fts5(
-                    keyword, capability_id UNINDEXED, weight UNINDEXED
-                );
-                CREATE TRIGGER capability_keywords_ai
-                AFTER INSERT ON capability_keywords
-                BEGIN
-                    INSERT INTO capability_keywords_fts(keyword, capability_id, weight)
-                    VALUES (NEW.keyword, NEW.capability_id, NEW.weight);
-                END;
-                INSERT INTO capabilities (id, description) VALUES ('coding','seed');
-                INSERT INTO roles (id, description) VALUES ('coder','seed');
-                INSERT INTO role_capabilities (role_id, capability_id) VALUES ('coder','coding');
-                INSERT INTO capability_keywords (capability_id, keyword, weight) VALUES ('coding','seed-kw',0.5);
-                ",
-            )
-            .unwrap();
-        }
-
-        // First open: triggers the v1 → v2 migration.
-        let conn = Connection::open(&idx_path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        init_schema(&conn).unwrap();
-
-        let table_exists = |name: &str| -> bool {
-            conn.query_row(
-                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
-                params![name],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap()
-            .is_some()
-        };
-
-        // Legacy artifacts dropped.
-        assert!(!table_exists("capabilities"), "legacy `capabilities` table must be dropped");
-        assert!(!table_exists("role_capabilities"), "legacy `role_capabilities` must be dropped");
-        assert!(!table_exists("capability_keywords"), "legacy `capability_keywords` must be dropped");
-        assert!(!table_exists("capability_keywords_fts"), "legacy FTS virtual must be dropped");
-
-        // New schema applied.
-        assert!(table_exists("skills"), "new `skills` table must exist");
-        assert!(table_exists("role_skills"), "new `role_skills` table must exist");
-        assert!(table_exists("skill_keywords"), "new `skill_keywords` table must exist");
-        assert!(table_exists("skill_keywords_fts"), "new `skill_keywords_fts` must exist");
-
-        // Version bumped.
-        let v: i32 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
-
-        drop(conn);
-
-        // Second open: idempotency check. The migration block must not
-        // re-run (DROP IF EXISTS is technically idempotent, but on a v2
-        // DB `current_version < 2` is false, so the block is skipped
-        // entirely). init_schema must complete cleanly.
-        let conn2 = Connection::open(&idx_path).unwrap();
-        conn2.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        init_schema(&conn2).unwrap();
-        let v2: i32 = conn2
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(v2, SCHEMA_VERSION);
-        let skills_exists: bool = conn2
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'skills'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap()
-            .is_some();
-        assert!(skills_exists);
-    }
-
     /// (#914) A pre-#95 index whose `missions` table predates the
     /// `started_ts`/`finalized_ts` columns. Pre-fix, the
     /// `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL skipped the existing table
@@ -2118,58 +1977,6 @@ mod tests {
             has_started_ts.is_some(),
             "rebuild must heal the stale missions table to include the #95 columns"
         );
-    }
-
-    /// (#999) A pre-#999 index (version 4) carrying the scaffolded `knowledge`
-    /// table must, on rebuild, drop that table (authored lessons live in
-    /// `lessons.db` now) and advance to version 5. The `< 5` migration block in
-    /// `init_schema` does this; assert the table is gone afterward.
-    #[serial_test::serial]
-    #[test]
-    fn rebuild_drops_vestigial_knowledge_table() {
-        // #2142: isolate from the live crew dir — see the sibling comment
-        // in `rebuild_heals_stale_table_missing_a_column`.
-        let _guard = CrewDirGuard::new();
-        let tmp = TempDir::new().unwrap();
-        let idx = tmp.path().join("vestigial.db");
-        {
-            let conn = Connection::open(&idx).unwrap();
-            conn.execute_batch(
-                "PRAGMA user_version = 4;
-                 CREATE TABLE knowledge (
-                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                     file        TEXT,
-                     title       TEXT NOT NULL,
-                     body        TEXT NOT NULL,
-                     source      TEXT,
-                     created_ts  INTEGER NOT NULL,
-                     updated_ts  INTEGER NOT NULL
-                 );
-                 INSERT INTO knowledge (title, body, created_ts, updated_ts)
-                   VALUES ('legacy', 'seed', 0, 0);",
-            )
-            .unwrap();
-        }
-
-        rebuild_at(&idx).unwrap();
-
-        let conn = open_index(&idx).unwrap();
-        let knowledge_exists: Option<()> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap();
-        assert!(
-            knowledge_exists.is_none(),
-            "the vestigial index.db knowledge table must be dropped on migration (#999)"
-        );
-        let version: i32 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION, "user_version advanced to current");
     }
 
     /// (#914, CONSIDER-1) A DB whose structural `user_version` is current but

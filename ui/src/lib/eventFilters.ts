@@ -16,7 +16,7 @@ import { isPlainObject } from "./guards";
 import { recordMachineKey, type RecordMachines } from "./machineIdentity";
 import { ACTION, CATEGORY, SOURCE, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
 
-/** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
+/** `activityOf()`, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
  * previous row-label-only subset omitted because nothing yet needed the
  * facet checkboxes those branches feed). */
@@ -30,13 +30,7 @@ export function activityOf(r: NormRecord): string {
   if (a === ACTION.MachineOnline) return "machine online";
   if (a === ACTION.MachineOffline) return "machine offline";
   if (a === ACTION.SessionEnd) return "session end";
-  // (#2413) `machine.telemetry` is the machine-scoped replacement for the
-  // retired per-dispatch `telemetry.process` — same friendly facet label
-  // as the `category: "telemetry", source: "host"` branch below, so a
-  // saved "host telemetry" filter keeps working across the schema change
-  // (and across the retired mechanism's continuing partial use — see
-  // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
-  // a second, differently-named facet.
+  // (#2413) `machine.telemetry` is the machine-scoped host sample.
   if (a === ACTION.MachineTelemetry) return "host telemetry";
   // (#2915) A utility job's start/error markers: their own facet, filed with
   // the machine (utility jobs are machine-level), not generic telemetry.
@@ -44,7 +38,6 @@ export function activityOf(r: NormRecord): string {
   if (r.category === CATEGORY.Telemetry) {
     if (r.source === SOURCE.Detector) return "detector";
     if (r.source === SOURCE.Tokens) return "tokens";
-    if (r.source === SOURCE.Host) return "host telemetry";
     if (r.source === SOURCE.Lms) return "lms";
     if (r.source === SOURCE.Runtime) return "runtime";
     // (#2902 step 5) budget.warn / budget.wait / budget.resume.
@@ -70,7 +63,7 @@ const ACTIVITY_NAMES: ReadonlyMap<NormAction, string> = new Map<NormAction, stri
   [ACTION.TierDecision, "routing"],
 ]);
 
-/** `ACT_ORDER` — viewer.html:1047. Preferred display order for the activity
+/** `ACT_ORDER`. Preferred display order for the activity
  * facet: model-doing activities first, then dispatch lifecycle, then fleet
  * lifecycle, then telemetry. */
 export const ACT_ORDER: string[] = [
@@ -462,7 +455,7 @@ export function groupActivitiesBySections(values: string[]): ActivitySectionGrou
   return ACTIVITY_SECTION_ORDER.map((title) => ({ title, values: buckets[title] })).filter((g) => g.values.length > 0);
 }
 
-/** `recompute()`'s facet derivation — viewer.html:1054-1058.
+/** `recompute()`'s facet derivation.
  *
  * One DELIBERATE divergence from legacy, named here because the file it
  * diverges from is about to be deleted and would otherwise stop being
@@ -474,7 +467,7 @@ export function groupActivitiesBySections(values: string[]): ActivitySectionGrou
  * changes nothing observable today; it is a blank checkbox nobody could name
  * being dropped rather than faithfully reproduced. */
 /** The namespace prefix of a raw activity string — `"mission.start"` →
- * `"mission"`, `"telemetry.process"` → `"telemetry"`, a prefix-less value
+ * `"mission"`, `"telemetry.tokens"` → `"telemetry"`, a prefix-less value
  * → itself. Used only to GROUP `sortUnmappedActivities`' output; never
  * shown — the checkbox label stays the full string. */
 function activityPrefixOf(a: string): string {
@@ -664,7 +657,7 @@ export function cloneFacetSeen(seen: FacetSeen): FacetSeen {
   return { act: new Set(seen.act), cat: new Set(seen.cat), tier: new Set(seen.tier), src: new Set(seen.src), mach: new Set(seen.mach) };
 }
 
-/** `absorbNewFilterValues()` — viewer.html:3451-3457, called after every
+/** `absorbNewFilterValues()`, called after every
  * `recompute()` (boot, `applyLive()`'s per-poll live-tail merge, and the
  * date-rollover reload). Mutates `seen` and returns a `filters` object
  * describing what a BRAND-NEW facet value (one `seen` has never recorded)

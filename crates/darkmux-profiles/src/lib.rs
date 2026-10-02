@@ -151,43 +151,6 @@ mod user_file_tests {
 }
 
 #[cfg(test)]
-mod retired_registry_key_tests {
-    use darkmux_types::user_files::Problem;
-
-    /// A registry written by an older darkmux carries keys since retired;
-    /// each is named with what replaced it, never guessed at.
-    #[test]
-    fn retired_registry_keys_name_what_replaced_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "crews": {}, "hooks": {},
-                "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1, "role": "primary"}],
-                    "runtime": {"config_path": "x", "compaction": {"mode": "default", "maxHistoryShare": 0.3}}}}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let p = crate::profiles::user_file_problem(&path).unwrap();
-        let Problem::Keys(keys) = &p.problem else { panic!("{p:?}") };
-        let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
-        for (key, says) in [
-            ("crews", "removed in 2.0 (#1426)"),
-            ("hooks", "removed with the `swap` verb"),
-            ("profiles.p.models[0].role", "removed in #590"),
-            ("profiles.p.runtime.config_path", "removed with the openclaw runtime"),
-            ("profiles.p.runtime.compaction.mode", "an openclaw compaction setting"),
-            ("profiles.p.runtime.compaction.maxHistoryShare", "an openclaw compaction setting"),
-        ] {
-            assert!(msgs.iter().any(|m| m.starts_with(&format!("unknown key `{key}`: {says}"))), "{key}: {msgs:#?}");
-        }
-        assert_eq!(keys.len(), 6, "{msgs:#?}");
-    }
-}
-
-#[cfg(test)]
 mod wrong_type_tests {
     /// A mistyped profile entry is quarantined (#1282), loudly, and the
     /// rest of the registry keeps working: the gate leaves it to that and
@@ -213,31 +176,6 @@ mod wrong_type_tests {
         std::fs::write(&path, with_typo).unwrap();
         let msg = crate::profiles::user_file_problem(&path).unwrap().to_string();
         assert!(msg.contains("unknown key `profiles.bad.models[0].n_ctxx`") && !msg.contains("must be"), "{msg}");
-    }
-}
-
-#[cfg(test)]
-mod historical_key_tests {
-    use darkmux_types::user_files::{Issue, Problem};
-
-    /// Every registry key a released darkmux had and this one does not, from
-    /// `git log`, is named as retired.
-    #[test]
-    fn every_historical_registry_key_is_named_as_retired() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let doc = serde_json::json!({
-            "crews": {}, "hooks": {"pre_swap": {"command": "x"}},
-            "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1, "role": "primary"}],
-                "runtime": {"configPath": "x", "config_path": "x", "contextTokens": 5}}},
-        });
-        std::fs::write(&path, doc.to_string()).unwrap();
-        let p = crate::profiles::user_file_problem(&path).unwrap();
-        let Problem::Keys(keys) = &p.problem else { panic!("{p:?}") };
-        assert_eq!(keys.len(), 6, "{keys:#?}");
-        let unnamed: Vec<String> = keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
-        assert!(unnamed.is_empty(), "{unnamed:#?}");
-        assert!(p.to_string().contains("`profiles.p.runtime.contextTokens`: renamed to `context_tokens`"), "{p}");
     }
 }
 
@@ -270,7 +208,7 @@ mod unloadable_registry_tests {
         let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
         for (at, says) in [
             ("internal.utility", r#""utility": { "id": "util-4b", "n_ctx": "#),
-            ("profiles.p.models[0].role", "removed in #590"),
+            ("profiles.p.models[0].role", "unknown key"),
             ("profiles.p.models[1].endpoint", "inline endpoint object was removed"),
         ] {
             assert!(msgs.iter().any(|m| m.contains(at) && m.contains(says)), "{at}: {msgs:#?}");

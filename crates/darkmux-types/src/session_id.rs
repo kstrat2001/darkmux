@@ -29,9 +29,9 @@
 //! the receiver's. Ids with no `_` or `.` read as written:
 //! `review-1790000000-ab12cd.task.probe`.
 //!
-//! Archives written before 4.0 carry the old free-form strings
-//! (`task-{t}-{m}`, `mission-run-{m}-{p}`, …). [`SessionId::parse_legacy`]
-//! is the ONE place that reads them; no consumer sniffs a prefix itself.
+//! A record whose `session_id` is not in this grammar (an archive from before
+//! 4.0 carries free-form strings such as `task-{t}-{m}`) names no session:
+//! [`SessionId::parse`] refuses it, and no consumer sniffs a prefix itself.
 
 use std::fmt;
 
@@ -333,42 +333,6 @@ impl SessionId {
             FixedKind::Step => SessionId::step(run, &f[0]),
             FixedKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
         })
-    }
-
-    /// Read a session id from a record of ANY age, for attribution: a
-    /// current wire string exactly as [`SessionId::parse`] does, else one of
-    /// the pre-4.0 free-form strings, placed by the record's own
-    /// `mission_id` (the only way to split an old string that embedded it):
-    ///
-    /// - `{m}` and `mission-{m}`: the run's own session.
-    /// - `mission-run-{m}-{p}`: phase `p`'s coder run.
-    /// - `task-{t}` and `task-{t}-{m}`: task `t`.
-    /// - `step-{s}` and `step-{s}-{m}`: step `s`.
-    /// - anything else under a mission: an ad-hoc dispatch of that run,
-    ///   whose nonce is the old string.
-    ///
-    /// `None` for an old string with no `mission_id` to place it in: a
-    /// pre-4.0 record of no run cannot be attributed to one.
-    pub fn parse_legacy(wire: &str, mission_id: Option<&str>) -> Option<Self> {
-        if let Ok(id) = SessionId::parse(wire) {
-            return Some(id);
-        }
-        let mid = mission_id?;
-        let run = RunId::mission(mid).ok()?;
-        let unscoped = |rest: &str| rest.strip_suffix(&format!("-{mid}")).unwrap_or(rest).to_string();
-        if wire == mid || wire.strip_prefix("mission-") == Some(mid) {
-            return Some(SessionId::run(run));
-        }
-        if let Some(phase) = wire.strip_prefix(&format!("mission-run-{mid}-")) {
-            return Some(SessionId::phase(run, phase));
-        }
-        if let Some(task) = wire.strip_prefix("task-") {
-            return Some(SessionId::task(run, unscoped(task)));
-        }
-        if let Some(step) = wire.strip_prefix("step-") {
-            return Some(SessionId::step(run, unscoped(step)));
-        }
-        Some(SessionId::adhoc(run, "", wire))
     }
 }
 
@@ -749,34 +713,6 @@ mod tests {
         ] {
             assert!(SessionId::parse(bad).is_err(), "{bad:?} must not parse");
         }
-    }
-
-    /// Pre-4.0 archive strings still attribute, given the record's own
-    /// `mission_id`.
-    #[test]
-    fn legacy_archive_strings_still_attribute() {
-        let mid = Some("m-1");
-        let run = m("m-1");
-        let cases = [
-            ("m-1", SessionId::run(run.clone())),
-            ("mission-m-1", SessionId::run(run.clone())),
-            ("mission-run-m-1-m-1-p1", SessionId::phase(run.clone(), "m-1-p1")),
-            ("task-build", SessionId::task(run.clone(), "build")),
-            ("task-build-m-1", SessionId::task(run.clone(), "build")),
-            ("task-m-1-task", SessionId::task(run.clone(), "m-1-task")),
-            ("step-s1", SessionId::step(run.clone(), "s1")),
-            ("step-s1-m-1", SessionId::step(run.clone(), "s1")),
-            (
-                "crew-dispatch-coder-1790000000000000-0",
-                SessionId::adhoc(run.clone(), "", "crew-dispatch-coder-1790000000000000-0"),
-            ),
-        ];
-        for (old, want) in cases {
-            assert_eq!(SessionId::parse_legacy(old, mid), Some(want), "{old}");
-        }
-        assert_eq!(SessionId::parse_legacy("step-s1", None), None, "no run to place it in");
-        let current = SessionId::step(m("m-2"), "s1");
-        assert_eq!(SessionId::parse_legacy(&current.wire(), mid), Some(current), "a current string reads as written");
     }
 
     #[test]

@@ -261,28 +261,6 @@ fn detector_firings_are_counted_and_promotions_summed() {
     assert_eq!(f.compactions(), 1);
 }
 
-/// (#3036) The openclaw trajectory reader is gone: a run of that retired
-/// runtime (#1405) still loads, without a panic, and reads as zero turns,
-/// zero compactions and zero tokens. Its `prompt.submitted` turns are an
-/// unknown event, and its own `model.completed` lines (string clock,
-/// `data.usage`) neither add a turn nor carry tokens.
-#[test]
-fn an_openclaw_run_reads_as_zero_turns() {
-    let raw = [
-        r#"{"traceSchema":"openclaw-trajectory","type":"session.started","ts":"2026-05-18T13:43:00.000Z","seq":1}"#,
-        r#"{"traceSchema":"openclaw-trajectory","type":"prompt.submitted","ts":"2026-05-18T13:43:11.589Z","seq":4,"data":{"messages":[{"role":"user","summary":null},{"role":"compactionSummary","summary":"s","tokensBefore":900}]}}"#,
-        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-05-18T13:43:11.589Z","seq":5,"data":{"usage":{"input":294041,"output":5684,"total":299725}}}"#,
-        // A numeric clock reads as a current `model.completed` unless the schema tag is honored.
-        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":1779111791000,"seq":6,"data":{"usage":{"input":100,"output":10}}}"#,
-    ]
-    .join("\n");
-    let f = TrajectoryFold::from_lines(&raw);
-    assert_eq!((f.turns(), f.compactions()), (0, 0));
-    assert_eq!((f.tokens.prompt, f.tokens.completion, f.tokens.total), (0, 0, 0));
-    assert_eq!(f.model_calls, 0);
-    assert_eq!(parse_line(r#"{"type":"prompt.submitted"}"#), Some(TrajectoryEvent::Unknown));
-}
-
 /// (#1959) A run that decayed and recovered must not read healthier than a
 /// clean one: the minimum is the running minimum, never the last value.
 #[test]

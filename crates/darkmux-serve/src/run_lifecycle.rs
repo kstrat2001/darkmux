@@ -12,8 +12,7 @@
 //!    start, `run.start` or `dispatch.start`; a `budget.wait`,
 //!    `mission.start` or `step.start`; or, when nothing of its mission
 //!    opened yet, a turn, heartbeat, tool call or rest). A record of an
-//!    execution (every execution-grain record carries its `execution_id`; a
-//!    pre-4.0 one reads as its session and mission) joins the latest attempt
+//!    execution (every execution-grain record carries its `execution_id`) joins the latest attempt
 //!    of that execution, so a session holding several (a map's items) keeps
 //!    each one's records and its own close apart. Any other record, and one
 //!    of an execution with no attempt yet, joins by mission: a record naming

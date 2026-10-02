@@ -389,17 +389,3 @@ fn a_malformed_bounds_block_costs_the_bounds_not_the_dispatch_start() {
         other => panic!("a typed dispatch.start, got {other:?}"),
     }
 }
-
-/// (#3035) The unmanaged-endpoint flag on a `step result` was spelled `remote`
-/// before 5.0: an archived record still reads, and nothing writes the old key.
-/// (A `telemetry.tokens` payload and a `dispatch.complete` carry no such flag
-/// or `remote_tokens` at all, #3067.)
-#[test]
-fn an_archived_remote_key_reads_as_unmanaged_and_is_never_written() {
-    use darkmux_flow::payload::StepResultPayload;
-    let step: StepResultPayload = serde_json::from_str(r#"{"step_id": "s", "kind": "dispatch.map", "remote": false}"#).unwrap();
-    assert_eq!(step.unmanaged, Some(false));
-    let written = serde_json::to_string(&step).unwrap();
-    assert!(written.contains("\"unmanaged\""), "{written}");
-    assert!(!written.contains("remote"), "{written}");
-}

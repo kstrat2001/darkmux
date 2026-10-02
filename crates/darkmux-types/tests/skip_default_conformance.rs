@@ -466,9 +466,8 @@
 //!     `lib.rs` itself for the direct backstop.
 //!   - `BundleSelector::fact_families` (`darkmux-types/src/lib.rs`) —
 //!     persisted on every review run record; same file, same backstop.
-//!   - `IntegrityReport::legacy_format` (`darkmux-flow/src/integrity.rs`)
-//!     — written by `flow integrity-check --json`; round-trip backstop in
-//!     that file.
+//!   - (A third, `IntegrityReport::legacy_format`, was removed in 5.0 with
+//!     the pre-2.6 audit format.)
 //!
 //! The fourth, `GraphNode::steps` (`darkmux-serve/src/mission_graph.rs`),
 //! is NOT one of these three — verified, not assumed (see "quoting vs

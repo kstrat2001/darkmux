@@ -83,7 +83,7 @@
           ],
           "_comment": [
             "This task names no role_id, and a config that adds one is refused. MissionVerifyStepKind (src/coder_phase.rs) hardcodes `code-reviewer` in two places -- resolve_local_placement's residency() call and phase_review_output_at's DispatchOpts -- so a role_id here changed NOTHING about which role dispatches (#2953).",
-            "Why hardcoded rather than wired: phase_review_output_at's USER-FACING PROMPT TEXT self-identifies as \"the darkmux `code-reviewer` role\" (src/phase_cli.rs) -- honoring a role_id would also require making that prompt text role-agnostic, a bigger change than this key alone. If you need a different QA reviewer role, dispatch it directly (`darkmux dispatch design-reviewer ...`)."
+            "Why hardcoded rather than wired: phase_review_output_at's USER-FACING PROMPT TEXT self-identifies as \"the darkmux `code-reviewer` role\" (src/phase_review.rs) -- honoring a role_id would also require making that prompt text role-agnostic, a bigger change than this key alone. If you need a different QA reviewer role, dispatch it directly (`darkmux dispatch design-reviewer ...`)."
           ]
         }
       ]
