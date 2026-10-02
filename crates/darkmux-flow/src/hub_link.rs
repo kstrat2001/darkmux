@@ -8,6 +8,7 @@
 //! backoff, and when the hub answers again publish the records written to the
 //! local day files while it was away).
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -174,4 +175,103 @@ impl Backfill<'_> {
             && crate::flow_record_identity(&v) != self.skip_identity;
         wanted.then(|| (ts.to_string(), v.to_string()))
     }
+}
+
+/// The earliest record `ts` that failed to reach the hub, kept in a small
+/// state file so the outage outlives the process that saw it.
+///
+/// Any process whose hub write fails calls [`record`](Self::record) (a
+/// one-shot CLI as much as the daemon), and keeps the earliest `ts` it has
+/// seen. The long-lived sink reads it when it starts and when the hub answers
+/// again, backfills from it, and [`clear_if`](Self::clear_if)s it once the
+/// backfill lands. Writes are atomic (temp file + rename) and serialized
+/// under an `flock` on a sibling lock file.
+///
+/// Each `record` bumps `seq`. A backfill clears only the `seq` it read, so a
+/// failure recorded while it ran keeps the watermark for the next recovery:
+/// delivery is at-least-once, and readers de-duplicate on record identity.
+#[derive(Debug, Clone)]
+pub(crate) struct OutageWatermark {
+    path: PathBuf,
+}
+
+/// What the state file holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Marked {
+    /// `ts` of the earliest record that failed to publish.
+    pub since: String,
+    /// Bumped by every `record`.
+    pub seq: u64,
+}
+
+impl OutageWatermark {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    /// The stored watermark; `None` when absent or unreadable.
+    pub(crate) fn load(&self) -> Option<Marked> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn store(&self, marked: &Marked) -> Result<()> {
+        let mut tmp_name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = self.path.with_file_name(tmp_name);
+        std::fs::write(&tmp, serde_json::to_vec(marked)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replacing {}", self.path.display()))
+    }
+
+    /// Note that the record stamped `ts` failed to publish. Keeps the earlier
+    /// of `ts` and what is stored.
+    pub(crate) fn record(&self, ts: &str) -> Result<()> {
+        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
+            let marked = match self.load() {
+                Some(old) => Marked { since: old.since.min(ts.to_string()), seq: old.seq + 1 },
+                None => Marked { since: ts.to_string(), seq: 1 },
+            };
+            self.store(&marked)
+        })
+    }
+
+    /// Remove the watermark if no `record` has run since `seq` was read.
+    pub(crate) fn clear_if(&self, seq: u64) -> Result<()> {
+        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
+            match self.load() {
+                Some(m) if m.seq == seq => std::fs::remove_file(&self.path)
+                    .with_context(|| format!("removing {}", self.path.display())),
+                _ => Ok(()),
+            }
+        })
+    }
+}
+
+/// Where the outage watermark lives: `<darkmux root>/state/hub-outage.json`.
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn default_watermark_path() -> PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
+        .root
+        .join("state")
+        .join("hub-outage.json")
+}
+
+/// Test builds never default onto the operator's real darkmux root (same
+/// discipline as `audit_dir_default`).
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn default_watermark_path() -> PathBuf {
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return darkmux_types::paths::test_isolated_dir("state").join("hub-outage.json");
+    }
+    resolved.root.join("state").join("hub-outage.json")
 }

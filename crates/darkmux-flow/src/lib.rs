@@ -999,6 +999,11 @@ pub struct RedisSink {
     backfill_dir: Option<PathBuf>,
     /// The link state and the probe schedule, behind one lock.
     link: std::sync::Mutex<hub_link::LinkState>,
+    /// The earliest unsent `ts`, persisted so a restart or another process's
+    /// failure is not forgotten.
+    watermark: hub_link::OutageWatermark,
+    /// Whether the persisted watermark has been read since this sink started.
+    watermark_read: AtomicBool,
 }
 
 /// (#388) Consecutive write failures before a `RedisSink` disables
@@ -1365,6 +1370,8 @@ impl RedisSink {
             probe_backoff: hub_link::ProbeBackoff::default(),
             backfill_dir: None,
             link: std::sync::Mutex::new(hub_link::LinkState::new()),
+            watermark: hub_link::OutageWatermark::new(hub_link::default_watermark_path()),
+            watermark_read: AtomicBool::new(false),
         })
     }
 
@@ -1378,6 +1385,7 @@ impl RedisSink {
     /// directory, and probe on `min..=max` instead of the default 2s..=60s.
     #[cfg(test)]
     fn with_test_recovery(mut self, dir: PathBuf, min: std::time::Duration, max: std::time::Duration) -> Self {
+        self.watermark = hub_link::OutageWatermark::new(dir.join("hub-outage.json"));
         self.backfill_dir = Some(dir);
         self.probe_backoff = hub_link::ProbeBackoff { min, max };
         self
@@ -1401,6 +1409,9 @@ impl RedisSink {
     /// call is the one that flipped the sink to disabled.
     fn note_failure(&self, err: &anyhow::Error, record_ts: &str) -> bool {
         let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Err(e) = self.watermark.record(record_ts) {
+            eprintln!("flow::RedisSink: could not persist the hub outage watermark: {e:#}");
+        }
         let mut link = self.link_state();
         link.record_failure(record_ts, err.root_cause().to_string());
         let flipped = n >= REDIS_DISABLE_THRESHOLD && !self.disabled.swap(true, Ordering::AcqRel);
@@ -1559,11 +1570,19 @@ impl RedisSink {
     }
 
     /// Re-send, oldest first in one pipeline, the records the local day files
-    /// hold from the start of the current outage, ahead of the record in `payload`
-    /// (which the caller publishes right after, so it is left out here). Reader-side de-duplication by
-    /// record identity absorbs any record the hub already holds.
+    /// hold from the start of the outage, ahead of the record in `payload`
+    /// (which the caller publishes right after, so it is left out here). The
+    /// start is the earlier of this process's own outage and the persisted
+    /// watermark, which any process's failed write may have lowered; the
+    /// watermark is read when the sink starts and while an outage is open, and
+    /// cleared once the re-send lands. Delivery is at-least-once: reader-side
+    /// de-duplication by record identity absorbs any record the hub already
+    /// holds.
     fn backfill(&self, conn: &mut redis::Connection, payload: &str) -> Result<()> {
-        let Some(since) = self.link_state().outage_since().map(str::to_string) else {
+        let own = self.link_state().outage_since().map(str::to_string);
+        let first = !self.watermark_read.swap(true, Ordering::AcqRel);
+        let marked = if own.is_some() || first { self.watermark.load() } else { None };
+        let Some(since) = own.into_iter().chain(marked.as_ref().map(|m| m.since.clone())).min() else {
             return Ok(());
         };
         let skip = reader::parse_value(payload).map(|v| flow_record_identity(&v)).unwrap_or_default();
@@ -1585,6 +1604,11 @@ impl RedisSink {
             }
             pipe.query::<()>(conn)
                 .with_context(|| format!("backfilling {} record(s) to Redis stream `{}`", lines.len(), self.stream))?;
+        }
+        if let Some(m) = marked {
+            if let Err(e) = self.watermark.clear_if(m.seq) {
+                eprintln!("flow::RedisSink: could not clear the hub outage watermark: {e:#}");
+            }
         }
         Ok(())
     }
