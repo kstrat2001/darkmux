@@ -247,6 +247,15 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   `--usage --json`; `no_run` joins it. The `remote` flag of a map item's
   usage record and the `remote_tokens` field of a `dispatch.complete` are
   removed.
+- **One half-reported rule, and the no-run tokens named everywhere** (#3067). A
+  call whose provider reported `total_tokens: 0` beside non-zero prompt or
+  completion counts is read as unreported, so every sum counts the halves
+  (the usage record's reader and the run total used to disagree on it). `GET
+  /runs` gains an additive `no_run` (`calls`, `tokens`): the usage that belongs
+  to no run, so the rows plus it equal the total. The fleet hero's hover says
+  how many tokens it includes with no run. The run page's token tiles name the
+  run's total on hover when INPUT + GENERATED fall short of it (a total-only
+  record), so the page and the row agree.
 - **`run list --usage` keys each row on the machine that executed the call**
   (#3067). `localhost` means a different machine to whoever made the call, so
   two machines' LM Studios serving the same model merged into one row (a relayed

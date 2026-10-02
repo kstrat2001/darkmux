@@ -449,10 +449,15 @@ pub fn has_any_token_counts(p: &serde_json::Value) -> bool {
 pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
     let prompt = num(p.get("prompt_tokens"));
     let completion = num(p.get("completion_tokens"));
-    let mut total = num(p.get("total_tokens"));
-    if total == 0 {
-        total = prompt + completion;
+    // The value-domain reads (`num`) feed the ONE token rule, so the reader
+    // cannot drift from the run total (#3067).
+    let total = darkmux_trajectory::UsageCounts {
+        prompt: Some(prompt),
+        completion: Some(completion),
+        total: Some(num(p.get("total_tokens"))),
+        ..Default::default()
     }
+    .floor_tokens();
     let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
     UsageAmount {
         total,
@@ -503,11 +508,11 @@ mod tests {
     fn the_record_reader_and_the_run_total_agree_on_every_shape_of_half_reported_call() {
         let facts = CallFacts { call_kind: CallKind::SingleShot, role_id: None, requested_model: "m", reported_model: None, endpoint: "h/m", endpoint_id: None };
         let opt = |on: bool, v: u64| on.then_some(v);
-        for mask in 0..8u8 {
+        for (mask, reported_total) in (0..8u8).flat_map(|m| [(m, 1000u64), (m, 0)]) {
             let counts = darkmux_trajectory::UsageCounts {
                 prompt: opt(mask & 1 != 0, 900),
                 completion: opt(mask & 2 != 0, 40),
-                total: opt(mask & 4 != 0, 1000),
+                total: opt(mask & 4 != 0, reported_total),
                 ..Default::default()
             };
             let record = serde_json::to_value(usage_payload(&facts, &counts)).unwrap();

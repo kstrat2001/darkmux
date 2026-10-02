@@ -58,6 +58,16 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
   );
 }
 
+/** (#3067) The hover text under the total: what it leaves out (machines not
+ *  streaming here) and what it includes that no run's row shows (calls with no
+ *  session, radio routing). A tooltip, so the hero keeps its height. */
+export function totalHint(noRun: { calls: number; tokens: number }, notStreaming: readonly string[]): string | undefined {
+  const parts: string[] = [];
+  if (notStreaming.length > 0) parts.push(`Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.`);
+  if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing).`);
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
 /**
  * `savingsHero()` (#783, #1186). Always renders,
  * even at zero — a fresh fleet with no dispatches yet shows "0", not a
@@ -173,7 +183,7 @@ const SavingsHero = memo(function SavingsHero({
           <div className="savlblwrap">
             <div
               className="savlbl"
-              title={notStreaming.length > 0 ? `Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.` : undefined}
+              title={totalHint(t.noRun, notStreaming)}
             >
               {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
               {liveMode ? ` · last ${hours}h` : ""}

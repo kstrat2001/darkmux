@@ -5598,6 +5598,39 @@
         assert_eq!(json["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
     }
 
+    /// (#3067) `/runs` names the tokens that belong to no run (radio routing,
+    /// a probe), so a reader can reconcile the rows to the total: the rows'
+    /// `tokens` plus `no_run.tokens` are everything the usage fold counted,
+    /// from the same fold `run list` reads.
+    #[tokio::test]
+    #[serial_test::serial] // pins HOME and DARKMUX_HOME
+    async fn runs_handler_names_the_tokens_on_no_run_so_rows_plus_it_reconcile() {
+        let _home = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let ts = darkmux_flow::ts_utc_now();
+        let usage = |sid: Option<&str>, total: u64| {
+            let mut r = serde_json::json!({
+                "ts": ts, "category": "telemetry", "source": "tokens", "action": "telemetry.tokens",
+                "payload": { "call_kind": "single_shot", "token_source": "provider", "total_tokens": total },
+            });
+            if let Some(sid) = sid {
+                r["session_id"] = serde_json::json!(sid);
+            }
+            r.to_string()
+        };
+        let start = serde_json::json!({ "ts": ts, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }).to_string();
+        let lines = [start, usage(Some("s-run"), 100), usage(None, 9), usage(None, 4)].join("\n");
+        fs::write(flows.path().join(format!("{}.jsonl", &ts[..10])), lines + "\n").unwrap();
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
+        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 262144).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["no_run"]["tokens"], 13, "{json}");
+        assert_eq!(json["no_run"]["calls"], 2);
+        let rows: u64 = json["runs"].as_array().unwrap().iter().filter_map(|r| r["tokens"].as_u64()).sum();
+        assert_eq!(rows + json["no_run"]["tokens"].as_u64().unwrap(), 113, "rows plus no_run are the total");
+    }
+
     /// 5.0: `/runs` applies the not-reporting overlay. A dispatch running on a
     /// peer the daemon's fleet view holds as down (no beat, card unreadable) is
     /// marked on its row; the same dispatch on a machine the view holds as up is

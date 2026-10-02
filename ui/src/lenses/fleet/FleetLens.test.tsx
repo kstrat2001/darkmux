@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
-import { FleetLens } from "./FleetLens";
+import { FleetLens, totalHint } from "./FleetLens";
 
 import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
@@ -3613,5 +3613,13 @@ describe("fleet card: the utility robot from the card alone", () => {
     const dark = Object.values(robots()).filter((x) => x.residency === "unknown");
     expect(dark).toHaveLength(1);
     expect(dark[0].dot).toBe("unknown");
+  });
+});
+
+describe("the hero total's hover text (#3067)", () => {
+  it("names the tokens with no run, and stays silent when there are none", () => {
+    expect(totalHint({ calls: 0, tokens: 0 }, [])).toBeUndefined();
+    expect(totalHint({ calls: 2, tokens: 1300 }, [])).toBe("Includes 1.30k tokens with no run (radio routing).");
+    expect(totalHint({ calls: 1, tokens: 9 }, ["studio"])).toBe("Counts only machines whose records reach this viewer. Not streaming here: studio. Includes 9 tokens with no run (radio routing).");
   });
 });

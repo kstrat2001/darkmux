@@ -39,11 +39,22 @@ export interface TokensOffMeter {
   cached: number | null;
   utility: number;
   runs: number;
+  /** (#3067) The part of `total` on no run: usage records naming no session
+   *  and no mission (radio routing, a probe). Every figure above counts them;
+   *  no run's TOKENS cell does. The twin of `/runs`' `no_run`. */
+  noRun: { calls: number; tokens: number };
 }
 
 export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
   const s = sumUsage(data);
-  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data) };
+  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data), noRun: noRunUsage(data) };
+}
+
+/** The usage records on no run: neither a session nor a mission named, the
+ *  rule `usage_sum`'s `no_run` applies. */
+export function noRunUsage(data: readonly NormRecord[]): { calls: number; tokens: number } {
+  const s = sumUsage(data.filter((r) => !r.session_id && !r.mission_id));
+  return { calls: s.usageRecords, tokens: s.total };
 }
 
 /**

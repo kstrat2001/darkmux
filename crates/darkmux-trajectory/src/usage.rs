@@ -139,16 +139,21 @@ impl UsageCounts {
     }
 
     /// THE total of one call: the provider's own total when it sent one,
-    /// else prompt + completion when it reported BOTH, else `None`: a split
+    /// (a total of 0 is unreported) else prompt + completion when it reported BOTH, else `None`: a split
     /// missing a half is not a total, and the prompt half is usually most
     /// of the spend. `None` means the call's spend is unknown, which a
     /// budget must never read as small. The usage record, every token sum
     /// and a step's budget settle all read this.
     pub fn total_tokens(&self) -> Option<u64> {
-        self.total.or(match (self.prompt, self.completion) {
+        let halves = match (self.prompt, self.completion) {
             (Some(p), Some(c)) => Some(p.saturating_add(c)),
             _ => None,
-        })
+        };
+        match self.total {
+            Some(t) if t > 0 => Some(t),
+            // A reported total of 0 beside non-zero halves is unreported (#3067).
+            reported => halves.or(reported),
+        }
     }
 
     /// What every DISPLAY sum and every run total counts for one call: its
@@ -159,7 +164,8 @@ impl UsageCounts {
     /// conservative charge for an unknown spend is a different question, and
     /// is answered by `darkmux_crew::budget::conservative_spend`.
     pub fn floor_tokens(&self) -> u64 {
-        self.total_tokens().unwrap_or_else(|| self.prompt.unwrap_or(0).saturating_add(self.completion.unwrap_or(0)))
+        let halves = self.prompt.unwrap_or(0).saturating_add(self.completion.unwrap_or(0));
+        self.total_tokens().filter(|t| *t > 0).unwrap_or(halves)
     }
 }
 
@@ -226,6 +232,9 @@ mod tests {
         assert_eq!(UsageCounts { prompt: Some(900), ..Default::default() }.floor_tokens(), 900);
         assert_eq!(UsageCounts::default().floor_tokens(), 0, "nothing reported adds nothing");
         assert_eq!(UsageCounts { total: Some(7), prompt: Some(900), ..Default::default() }.floor_tokens(), 7, "the provider's total still wins");
+        let zero_total = UsageCounts { prompt: Some(900), completion: Some(40), total: Some(0), ..Default::default() };
+        assert_eq!(zero_total.floor_tokens(), 940, "a total of 0 beside halves is unreported (#3067)");
+        assert_eq!(zero_total.total_tokens(), Some(940));
     }
 
     #[test]
