@@ -163,4 +163,13 @@ verify_passed?: boolean,
  * (#3016) Set when this row is relayed work: asked on another machine,
  * executed on `machine`. Absent for work that ran where it was asked.
  */
-relay?: RunRelay, };
+relay?: RunRelay, 
+/**
+ * (#3017) Where this row sits in the hub's receive order: the newest
+ * record's hub stream id as `ms * 1024 + seq` (the number the viewer's
+ * `receiveKey` reads), so a peer whose clock runs ahead cannot sit above
+ * work the hub received later. A row with no hub record (this machine's
+ * own work) carries this machine's receive time on the same scale, never
+ * an executor's `ts`. The board sorts on this field alone.
+ */
+receive_key: number, };

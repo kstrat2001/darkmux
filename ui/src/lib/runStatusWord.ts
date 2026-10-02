@@ -1,8 +1,8 @@
 // The ONE map from a run's status to the word a viewer shows for it. The board
 // row, the board filter, the run page's pill and the fleet timeline all read it,
 // so one status never wears two words (5.0). `darkmux run list` words the same
-// status in `src/run_list.rs::status_label`; its `abandoned` column keeps the
-// reason on the subtitle line instead (fixed-width column, #1907).
+// status in `src/run_list.rs::status_label`; `tests/fixtures/run-status-words.json`
+// holds the words both sides must give.
 import { NOT_REPORTING_STATUS } from "./machineAvailability";
 import type { AbandonReason } from "../types/generated/AbandonReason";
 import type { RunStatus } from "../types/generated/RunStatus";
@@ -17,7 +17,7 @@ export type RunBadgeStatus = RunStatus | typeof NOT_REPORTING_STATUS;
 export function runStatusWord(status: RunBadgeStatus, abandonReason?: AbandonReason): string {
   switch (status) {
     case "abandoned":
-      return abandonReason === "aborted" ? "aborted" : "no ending recorded";
+      return abandonReason === "aborted" ? "aborted" : "no ending";
     case NOT_REPORTING_STATUS:
       return "not reporting";
     case "planned":

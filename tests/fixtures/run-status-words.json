@@ -1,0 +1,50 @@
+{
+ "statuses": [
+  {
+   "status": "planned",
+   "word": "planned"
+  },
+  {
+   "status": "running",
+   "word": "running"
+  },
+  {
+   "status": "complete",
+   "word": "complete"
+  },
+  {
+   "status": "degraded",
+   "word": "degraded"
+  },
+  {
+   "status": "error",
+   "word": "error"
+  },
+  {
+   "status": "escalated",
+   "word": "escalated"
+  },
+  {
+   "status": "abandoned",
+   "abandoned_reason": "aborted",
+   "word": "aborted"
+  },
+  {
+   "status": "abandoned",
+   "abandoned_reason": "noterminal",
+   "word": "no ending"
+  },
+  {
+   "status": "abandoned",
+   "word": "no ending"
+  },
+  {
+   "status": "unparseable",
+   "word": "unparseable"
+  }
+ ],
+ "relay": {
+  "asked_on_machine": "MacBook-Pro",
+  "text": "from MacBook-Pro"
+ }
+}

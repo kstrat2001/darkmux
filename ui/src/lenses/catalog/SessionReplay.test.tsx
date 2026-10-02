@@ -781,7 +781,7 @@ describe("SessionReplay", () => {
     renderReplay("s-ended");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     const pillEl = document.querySelector(".session-run__header .pill");
-    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending recorded");
+    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending");
     expect(pillEl?.getAttribute("title")).toBe("finished");
   });
 
@@ -882,7 +882,7 @@ describe("SessionReplay", () => {
 
       const pillEl = document.querySelector(".session-run__header .pill");
       const pill = pillEl?.textContent ?? "";
-      expect(pill.toLowerCase()).toContain("no ending recorded");
+      expect(pill.toLowerCase()).toContain("no ending");
       expect(pill.toLowerCase()).not.toContain("running");
       // Not a running chip, so no pulse rides it; its description says the
       // run may be abandoned, never that it finished.

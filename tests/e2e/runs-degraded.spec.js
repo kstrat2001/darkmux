@@ -69,7 +69,7 @@ test('an abandoned run is visibly not a running one', async ({ page }) => {
   // carries no `abandoned_reason`, which is exactly the "no ending was ever
   // recorded" case — as opposed to a deliberate abort. The test's point is
   // unchanged: the two states must render distinguishably.
-  await expect(dead).toHaveText('no ending recorded');
+  await expect(dead).toHaveText('no ending');
   await expect(live).not.toHaveClass(await dead.getAttribute('class'));
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });

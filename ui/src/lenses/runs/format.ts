@@ -16,8 +16,6 @@
 
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../../lib/format";
-import { receiveKey, type NormRecord } from "../../lib/ingest";
-import { maxOf } from "../../lib/numbers";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { dispatchHash } from "../../lib/route";
@@ -179,49 +177,12 @@ export function runMachineLabels(runs: Run[]): Map<string, string> {
   return labels;
 }
 
-/** Each run's place in the hub's receive order (#3017), by run id: the newest
- * receive key among the window's records naming the run (as its mission or as
- * its session). A run no record in the window names keeps its own newest time
- * on the same scale (`receiveKey`'s ms x 1024), since a writer's clock is the
- * only order left for it. */
-export function runReceiveKeys(runs: readonly Run[], records: readonly NormRecord[]): Map<string, number> {
-  const newest = newestReceiveKeys(records);
-  const keys = new Map<string, number>();
-  for (const r of runs) {
-    const seen = [newest.get(r.id), r.dispatch_id ? newest.get(r.dispatch_id) : undefined].filter((k): k is number => k !== undefined);
-    keys.set(r.id, maxOf(seen) ?? runActivity(r) * 1000 * 1024);
-  }
-  return keys;
-}
-
-/** The newest receive key per mission id and per session id. Kept per records
- * array (the window keeps its identity between renders), so a board render does
- * not rescan thousands of records. */
-const newestByRecords = new WeakMap<readonly NormRecord[], Map<string, number>>();
-
-function newestReceiveKeys(records: readonly NormRecord[]): Map<string, number> {
-  const cached = newestByRecords.get(records);
-  if (cached) return cached;
-  const newest = new Map<string, number>();
-  const note = (id: string | undefined, key: number | null) => {
-    if (id && key !== null && key > (newest.get(id) ?? -Infinity)) newest.set(id, key);
-  };
-  for (const rec of records) {
-    const key = receiveKey(rec);
-    note(rec.mission_id, key);
-    note(rec.session_id, key);
-  }
-  newestByRecords.set(records, newest);
-  return newest;
-}
-
 /** viewer.html: `function runsFiltered()`, parameterized over `runs`/`kind`
  * rather than reading `state.runsKind`/`RUNS` off module globals. Newest first
- * by `keys` (`runReceiveKeys`) when given, else by each row's own activity time. */
-export function runsFiltered(runs: Run[], kind: string, keys?: ReadonlyMap<string, number>): Run[] {
+ * by the hub's receive order (`Run.receive_key`, #3017), never an executor's clock. */
+export function runsFiltered(runs: Run[], kind: string): Run[] {
   const rows = kind === "all" ? runs.slice() : runs.filter((r) => r.kind === kind);
-  const keyOf = (r: Run): number => keys?.get(r.id) ?? runActivity(r);
-  rows.sort((a, b) => keyOf(b) - keyOf(a));
+  rows.sort((a, b) => b.receive_key - a.receive_key);
   return rows;
 }
 

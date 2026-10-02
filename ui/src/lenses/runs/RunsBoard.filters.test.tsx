@@ -10,10 +10,10 @@ const NOW = Date.UTC(2026, 9, 1, 12, 0, 0);
 const NOW_S = NOW / 1000;
 
 const RUNS = [
-  { id: "a1", kind: "dispatch", status: "complete", tracked: true, updated_ts: NOW_S - 600, role: "coder", model: "darkmux:qwen", machine: "studio", machine_uid: "AA" },
-  { id: "a2", kind: "dispatch", status: "complete", tracked: true, updated_ts: NOW_S - 7200, role: "coder", model: "qwen", machine: "studio-renamed", machine_uid: "aa" },
-  { id: "b1", kind: "mission", status: "running", tracked: true, updated_ts: NOW_S - 100, role: "reviewer", model: "llama", machine: "laptop", machine_uid: "BB" },
-  { id: "l1", kind: "lab", status: "complete", tracked: true, updated_ts: NOW_S - 3 * 86400, workload: "w1", verify_passed: false, machine: "laptop", machine_uid: "BB" },
+  { id: "a1", kind: "dispatch", status: "complete", tracked: true, updated_ts: NOW_S - 600, receive_key: (NOW_S - 600) * 1000 * 1024, role: "coder", model: "darkmux:qwen", machine: "studio", machine_uid: "AA" },
+  { id: "a2", kind: "dispatch", status: "complete", tracked: true, updated_ts: NOW_S - 7200, receive_key: (NOW_S - 7200) * 1000 * 1024, role: "coder", model: "qwen", machine: "studio-renamed", machine_uid: "aa" },
+  { id: "b1", kind: "mission", status: "running", tracked: true, updated_ts: NOW_S - 100, receive_key: (NOW_S - 100) * 1000 * 1024, role: "reviewer", model: "llama", machine: "laptop", machine_uid: "BB" },
+  { id: "l1", kind: "lab", status: "complete", tracked: true, updated_ts: NOW_S - 3 * 86400, receive_key: (NOW_S - 3 * 86400) * 1000 * 1024, workload: "w1", verify_passed: false, machine: "laptop", machine_uid: "BB" },
 ];
 
 function mockFetch(runs: unknown[] = RUNS) {

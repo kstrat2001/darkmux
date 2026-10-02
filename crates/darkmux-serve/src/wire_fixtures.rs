@@ -187,6 +187,7 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
+            receive_key: 0,
         };
         golden("runs-row.json", &run);
     }

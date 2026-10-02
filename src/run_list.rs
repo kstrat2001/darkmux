@@ -235,8 +235,16 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
     }
 }
 
-pub(crate) fn status_label(status: RunStatus) -> &'static str {
-    status.as_str()
+/// The STATUS column's word: the same one the viewer's board and run page
+/// read (`ui/src/lib/runStatusWord.ts`). `tests/fixtures/run-status-words.json`
+/// holds the words both sides must give. An abandoned run says why in its own
+/// word, so the column needs no second line for it.
+pub(crate) fn status_label(r: &Run) -> &'static str {
+    match r.status {
+        RunStatus::Abandoned if r.abandoned_reason == Some(AbandonReason::Aborted) => "aborted",
+        RunStatus::Abandoned => "no ending",
+        status => status.as_str(),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -377,26 +385,22 @@ fn short_model(model: &str) -> &str {
 /// The narrow-pane subtitle: everything [`subtitle_for`] carries, plus the
 /// machine, for when the MACHINE column has been shed (#1929).
 fn subtitle_with_machine(r: &Run) -> String {
-    let base = subtitle_for(r);
-    match (&r.machine, base.is_empty()) {
-        (Some(m), true) => m.clone(),
-        (Some(m), false) => format!("{base} · {m}"),
-        (None, _) => base,
-    }
+    let mut bits = subtitle_bits(r);
+    bits.extend(r.machine.clone());
+    bits.extend(relay_text(r));
+    bits.join(" · ")
 }
 
-/// `[reason ·] [workload ·] [verify ·] role · model · via route` — the same fields, join and order
-/// as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
-/// `shortModel` treatment of the model id (see [`short_model`]).
-///
-/// (#1907) `abandoned_reason` leads the line when present. `STATUS_COLS` is
-/// fixed-width, pinned to `"unparseable"` (11 chars); widening it to fit
-/// "no ending recorded" would make every row carry that width even when
-/// the reason is absent. The subtitle is already free-width text, so the
-/// honest split is here: the STATUS column still reads `abandoned` (a
-/// caller scanning column-by-column sees the same six values
-/// `status_label` has always emitted) and the reason sits first on the
-/// line under it.
+/// A relayed run says where it was asked: "from <machine>", the same words as
+/// `ui/src/lib/relayWords.ts` (`tests/fixtures/run-status-words.json`).
+fn relay_text(r: &Run) -> Option<String> {
+    r.relay.as_ref().map(|relay| format!("from {}", relay.asked_on_machine))
+}
+
+/// `[workload ·] [verify ·] role · model · via route · [from machine]` — the
+/// same fields, join and order as `ui/src/lenses/runs/format.ts::runSubtitle`,
+/// including its `shortModel` treatment of the model id (see [`short_model`]).
+/// Why an abandoned run stopped is in its STATUS word, not here.
 ///
 /// (#1929) Machine is NOT here any more — it is a real headed column. It
 /// used to ride in this subtitle, which reads as prose on a mission row
@@ -406,17 +410,13 @@ fn subtitle_with_machine(r: &Run) -> String {
 /// See [`subtitle_with_machine`] for the narrow-pane case where the
 /// column is shed and machine rejoins the line.
 fn subtitle_for(r: &Run) -> String {
+    let mut bits = subtitle_bits(r);
+    bits.extend(relay_text(r));
+    bits.join(" · ")
+}
+
+fn subtitle_bits(r: &Run) -> Vec<String> {
     let mut bits: Vec<String> = Vec::new();
-    if let Some(reason) = r.abandoned_reason {
-        bits.push(
-            match reason {
-                AbandonReason::Aborted => "aborted",
-                AbandonReason::NoTerminal => "no ending recorded",
-                AbandonReason::Unknown => "reason not recognized",
-            }
-            .to_string(),
-        );
-    }
     if let Some(workload) = &r.workload {
         bits.push(workload.clone());
     }
@@ -432,7 +432,7 @@ fn subtitle_for(r: &Run) -> String {
     if let Some(route) = &r.route {
         bits.push(format!("via {route}"));
     }
-    bits.join(" · ")
+    bits
 }
 
 /// A lab row's verify outcome, in three states rather than two (#2494): what
@@ -614,7 +614,7 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
         "{:i$}{:<k$} {:<s$} {:<t$} {:<d$} {:>n$}{:g$}{}{}",
         "",
         kind_label(r.kind),
-        status_label(r.status),
+        status_label(r),
         started_cell(now, r),
         duration_cell(now, r),
         tokens_cell(r.tokens),
@@ -964,6 +964,7 @@ mod tests {
             workload: None,
             verify_passed: None,
             relay: None,
+            receive_key: 0,
         }
     }
 
@@ -1314,11 +1315,50 @@ mod tests {
         }
     }
 
-    /// (F10/F11) A degraded run is listed as `degraded`, never `complete`.
+    #[derive(serde::Deserialize)]
+    struct WordCase {
+        status: RunStatus,
+        #[serde(default)]
+        abandoned_reason: Option<AbandonReason>,
+        word: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct RelayCase {
+        asked_on_machine: String,
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Words {
+        statuses: Vec<WordCase>,
+        relay: RelayCase,
+    }
+    fn words() -> Words {
+        serde_json::from_str(include_str!("../tests/fixtures/run-status-words.json")).expect("the shared words parse")
+    }
+
+    /// 5.0: the STATUS column reads the word the viewer's board and run page
+    /// read, from one shared fixture (`runStatusWord.test.ts` reads it too).
+    /// A degraded run is `degraded`, never `complete` (F10/F11).
     #[test]
-    fn a_degraded_run_is_labeled_degraded_not_complete() {
-        assert_eq!(status_label(RunStatus::Degraded), "degraded");
-        assert_ne!(status_label(RunStatus::Degraded), status_label(RunStatus::Complete));
+    fn the_status_column_reads_the_words_the_board_reads() {
+        for c in words().statuses {
+            let mut r = mk_run("r", RunKind::Mission, c.status, 1);
+            r.abandoned_reason = c.abandoned_reason;
+            assert_eq!(status_label(&r), c.word, "{:?} {:?}", c.status, c.abandoned_reason);
+        }
+    }
+
+    /// A relayed run says "from <machine>", in the subtitle (and in the narrow
+    /// pane, after the machine), as the board does.
+    #[test]
+    fn a_relayed_run_reads_from_the_asking_machine() {
+        let w = words().relay;
+        let mut r = mk_run("r", RunKind::Dispatch, RunStatus::Complete, 1);
+        r.role = Some("coder".into());
+        r.machine = Some("studio".into());
+        r.relay = Some(darkmux_serve::RunRelay { asked_on_machine: w.asked_on_machine, sender_run: None });
+        assert_eq!(subtitle_for(&r), format!("coder · {}", w.text));
+        assert_eq!(subtitle_with_machine(&r), format!("coder · studio · {}", w.text));
     }
 
     /// Every label a column can emit must FIT that column, because
@@ -1327,17 +1367,8 @@ mod tests {
     /// is why `STATUS_COLS` is not 10.
     #[test]
     fn every_column_label_fits_its_width() {
-        for st in [
-            RunStatus::Planned,
-            RunStatus::Running,
-            RunStatus::Complete,
-            RunStatus::Degraded,
-            RunStatus::Error,
-            RunStatus::Escalated,
-            RunStatus::Abandoned,
-            RunStatus::Unparseable,
-        ] {
-            let label = status_label(st);
+        for c in words().statuses {
+            let label = c.word;
             assert!(
                 label.chars().count() <= STATUS_COLS,
                 "status label {label:?} is {} cols, STATUS_COLS is {STATUS_COLS}: every row \
@@ -1462,31 +1493,9 @@ mod tests {
         assert_eq!(subtitle_for(&r), "gpt-4o");
     }
 
-    /// (#1907) `abandoned_reason` leads the subtitle line — see that
-    /// field's own doc on `subtitle_for` for why it lives here rather than
-    /// widening the fixed-width STATUS column (`STATUS_COLS` is pinned to
-    /// `"unparseable"`'s width, and "no ending recorded" is longer).
+    /// An abandoned row's reason is its STATUS word, so the subtitle carries none.
     #[test]
-    fn subtitle_for_leads_with_the_abandoned_reason_when_present() {
-        let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Abandoned, 1);
-        r.abandoned_reason = Some(AbandonReason::Aborted);
-        assert_eq!(subtitle_for(&r), "aborted");
-
-        r.abandoned_reason = Some(AbandonReason::NoTerminal);
-        assert_eq!(subtitle_for(&r), "no ending recorded");
-
-        r.role = Some("coder".to_string());
-        assert_eq!(
-            subtitle_for(&r),
-            "no ending recorded · coder",
-            "the reason leads; the usual role/model/route/machine bits still follow"
-        );
-    }
-
-    /// A non-abandoned row (or an abandoned row from an older server with
-    /// no `abandoned_reason` on the wire) must not print a phantom reason.
-    #[test]
-    fn subtitle_for_omits_the_reason_when_absent() {
+    fn subtitle_for_carries_no_reason() {
         let r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
         assert_eq!(subtitle_for(&r), "");
     }

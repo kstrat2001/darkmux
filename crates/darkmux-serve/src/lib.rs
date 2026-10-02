@@ -60,7 +60,7 @@ mod runs;
 mod run_lifecycle;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
-    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
+    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
 /// The daemon's response bodies: one Rust type per JSON route, and the source

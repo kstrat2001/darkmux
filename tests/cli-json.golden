@@ -935,6 +935,7 @@ Run
   workload?: string | null
   verify_passed?: boolean | null
   relay?: RunRelay | null
+  receive_key: uint64
 RunChecks
   telemetry_covers_run: boolean
   policy_consistent: boolean | null

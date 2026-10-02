@@ -219,7 +219,7 @@ describe("RunsBoard", () => {
    *  `.labbadge.abandoned` styling is unchanged) but its TEXT now reads
    *  `abandoned_reason` — a deliberate `mission abort` renders "aborted";
    *  a run with no terminal record ever written (or an older server that
-   *  didn't send the field at all) renders "no ending recorded". Both
+   *  didn't send the field at all) renders "no ending". Both
    *  must be real, distinguishable text in the DOM, not the same word. */
   it("renders an abandoned row's badge text from abandoned_reason, not the bare status word", async () => {
     mockFetch(true, true, {}, [
@@ -232,7 +232,7 @@ describe("RunsBoard", () => {
     const abortedBadge = screen.getByText("aborted");
     expect(abortedBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");
 
-    const staleBadge = screen.getByText("no ending recorded");
+    const staleBadge = screen.getByText("no ending");
     expect(staleBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");
 
     expect(screen.queryByText("abandoned", { selector: ".labbadge" })).not.toBeInTheDocument();

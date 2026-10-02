@@ -75,7 +75,7 @@ describe("the status axis is the canonical one", () => {
       status: "abandoned",
       abandonReason,
     });
-    for (const [reason, word] of [["aborted", "aborted"], ["noterminal", "no ending recorded"], [undefined, "no ending recorded"]] as const) {
+    for (const [reason, word] of [["aborted", "aborted"], ["noterminal", "no ending"], [undefined, "no ending"]] as const) {
       const state = abandoned(reason);
       expect(runStatusWord(state.status, state.abandonReason)).toBe(word);
     }
@@ -99,10 +99,10 @@ describe("a lens may select a status, never invent one", () => {
     { name: "failed", l: at("closed", { kind: "error", killed: false, exitCode: 1 }), status: "error", label: "error" },
     { name: "killed / timed out", l: at("closed", { kind: "error", killed: true, exitCode: 137 }), status: "error", label: "error" },
     { name: "finished cleanly", l: at("closed", { kind: "complete" }), status: "complete", label: "complete" },
-    { name: "closed by the presence reconciler", l: at("closed", { kind: "session_end" }), status: "abandoned", label: "no ending recorded" },
+    { name: "closed by the presence reconciler", l: at("closed", { kind: "session_end" }), status: "abandoned", label: "no ending" },
     { name: "a wait the operator stopped", l: at("closed", { kind: "budget_stop", byOperator: true }), status: "abandoned", label: "aborted" },
     { name: "a mission aborted", l: at("closed", { kind: "mission_abort" }), status: "abandoned", label: "aborted" },
-    { name: "silent past the staleness window (the old `canceled`)", l: at("stale"), status: "abandoned", label: "no ending recorded" },
+    { name: "silent past the staleness window (the old `canceled`)", l: at("stale"), status: "abandoned", label: "no ending" },
   ];
 
   for (const c of cases) {

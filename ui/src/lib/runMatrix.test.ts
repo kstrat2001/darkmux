@@ -119,7 +119,7 @@ describe.each(CELLS.map((c) => [c.id, c] as const))("cell %s", (_id, cell: Matri
       // status renders as its own name, verbatim.
       expect(label).toBe(cell.status);
     } else {
-      expect(label).toBe(cell.abandonReason === "aborted" ? "aborted" : "no ending recorded");
+      expect(label).toBe(cell.abandonReason === "aborted" ? "aborted" : "no ending");
     }
   });
 
@@ -166,6 +166,7 @@ describe("ordering across the whole matrix", () => {
       status: "complete" as const,
       tracked: true,
       updated_ts: 1, // the oldest possible real timestamp
+      receive_key: 1 * 1000 * 1024,
     }));
     const liveButUnorderable = runForCell(
       { kind: "lab", status: "running", tracked: true, id: "live-no-timestamp" },

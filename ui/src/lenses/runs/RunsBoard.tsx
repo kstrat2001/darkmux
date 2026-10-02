@@ -28,7 +28,6 @@ import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
   runsFiltered,
-  runReceiveKeys,
   runMachineLabels,
   runsMultiMachine,
   runsAgo,
@@ -639,9 +638,7 @@ export function RunsBoard({
   const machineLabels = runsMultiMachine(filtered) ? runMachineLabels(filtered) : NO_MACHINE_LABELS;
   const bar = <RunsBar counts={kindCounts(filtered, RUNS_KINDS)} kind={kind} onKind={selectKind} />;
 
-  // The hub's receive order, not each executor's clock (#3017): a peer whose
-  // clock runs ahead must not sit above work received later.
-  const rows = runsFiltered(filtered, kind, runReceiveKeys(filtered, pinRecords));
+  const rows = runsFiltered(filtered, kind);
   const shown = showAll ? rows : rows.slice(0, RUNS_CAP);
   const more = rows.length - shown.length;
   const scope = kind === "all" ? "" : ` · ${kind}`;

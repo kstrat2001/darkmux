@@ -84,9 +84,12 @@ darkmux release.
   fleet receiver's seat book.
 - **A run status reads one word on every surface** (5.0). The run page pill, the
   runs board, its Status filter and the fleet timeline share one map: `error`
-  (no more `errored` or `killed` on the page), `unparseable`, and `not reporting`
-  for a run recorded as running on a machine that is not reporting (it used to
-  read `unknown`, the same word as a status that is not one).
+  (no more `errored` or `killed` on the page), `unparseable`, `aborted` or `no
+  ending` for an abandoned run, and `not reporting` for a run recorded as running
+  on a machine that is not reporting (it used to read `unknown`, the same word
+  as a status that is not one). `darkmux run list`'s STATUS column reads the same
+  words, from one shared fixture, and its subtitle no longer leads with the
+  abandon reason (the status word says it).
 - **`darkmux machine list` words a machine's status as its card does** (5.0).
   Under each row: `status: idle`, `dispatch in flight`, `online` (with `not
   streaming` on the next line), `not streaming` or `offline`, then `why:` and the
@@ -99,11 +102,13 @@ darkmux release.
 - **The panel accepts this machine's own name for `profile list --machine`**
   (5.0), as the CLI does: both resolve against the fleet view's own names
   (`FleetView::selector_names`), this machine's included.
-- **The runs board orders by the hub's receive order** (5.0), not each
-  executor's clock, so a peer whose clock runs ahead cannot sit above work the
-  hub received later.
-- **A relayed run reads `from <machine>` everywhere** (5.0): the board subtitle
-  and the run page header (it said `asked on`).
+- **The runs board orders by the hub's receive order** (5.0). `GET /runs` rows
+  gain `receive_key` (the newest record's hub stream id as `ms * 1024 + seq`; a
+  row with no hub record carries this machine's own receive time on the same
+  scale), and the board sorts on it alone, so a peer whose clock runs ahead
+  cannot sit above work the hub received later.
+- **A relayed run reads `from <machine>` everywhere** (5.0): the board subtitle,
+  the run page header (it said `asked on`) and `darkmux run list`'s subtitle.
 
 - **One token total, from usage records only** (#3067). Every surface sums the
   `telemetry.tokens` usage records and nothing else: a `dispatch.complete`

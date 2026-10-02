@@ -19,7 +19,7 @@ import type { NormRecord } from "../../lib/ingest";
 import { liveSampleToRecord, type LiveOverlay } from "../../lib/liveChannel";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
-  return { tracked: true, ...overrides };
+  return { tracked: true, receive_key: 0, ...overrides };
 }
 
 function rec(overrides: RawRecord): NormRecord {

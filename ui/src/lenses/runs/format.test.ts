@@ -7,18 +7,16 @@ import {
   runBadgeStatus, runStatusLabel,
   runsMultiMachine,
   runsFiltered,
-  runReceiveKeys,
   runsForMachine,
   runMachineLabels,
   runDestination,
 } from "./format";
 import type { Run } from "../../types/generated/Run";
-import { norm } from "../../testing/records";
 import { machineMatch } from "../../lib/machineIdentity";
 import { FLEET_UID as U, fleetRun, lower, machineFleet } from "../../testing/machineFleet";
 
 function run(over: Partial<Run> & Pick<Run, "id" | "kind" | "status" | "tracked">): Run {
-  return over;
+  return { receive_key: (over.updated_ts ?? 0) * 1000 * 1024, ...over };
 }
 
 describe("shortModel", () => {
@@ -144,13 +142,13 @@ describe("runStatusLabel", () => {
     const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "aborted" });
     expect(runStatusLabel(r)).toBe("aborted");
   });
-  it("reads a missing terminal record as 'no ending recorded'", () => {
+  it("reads a missing terminal record as 'no ending'", () => {
     const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "noterminal" });
-    expect(runStatusLabel(r)).toBe("no ending recorded");
+    expect(runStatusLabel(r)).toBe("no ending");
   });
-  it("falls back to 'no ending recorded' when abandoned but the reason is absent (an older server)", () => {
+  it("falls back to 'no ending' when abandoned but the reason is absent (an older server)", () => {
     const r = run({ id: "a", kind: "dispatch", status: "abandoned", tracked: false });
-    expect(runStatusLabel(r)).toBe("no ending recorded");
+    expect(runStatusLabel(r)).toBe("no ending");
   });
   // (5.0 R3) A running run on a machine that is not reporting has no live
   // evidence behind it, so it reads "not reporting", a word of its own that is
@@ -223,33 +221,19 @@ describe("runsFiltered", () => {
   });
 });
 
-// 5.0: the board orders by the hub's receive order (#3017), never a writer's
-// clock, so a peer whose clock runs ahead cannot sit above work received later.
-describe("runsFiltered by the hub's receive order", () => {
-  const skewed = run({ id: "peer-run", kind: "mission", status: "running", tracked: false, dispatch_id: "s-peer", updated_ts: 4_000_000_000 });
-  const honest = run({ id: "local-run", kind: "dispatch", status: "complete", tracked: true, dispatch_id: "s-local", updated_ts: 1_700_000_100 });
-  const records = [
-    // The peer's clock says 2096; the hub received it first (stream id 1.7e12 ms).
-    norm({ ts: "2096-01-01T00:00:00Z", session_id: "s-peer", mission_id: "peer-run", action: "dispatch.start", hub_id: "1700000000000-0" }),
-    // The local run was received later (1.7e12 + 100 s).
-    norm({ ts: "2023-11-14T22:15:00Z", session_id: "s-local", action: "dispatch.complete", hub_id: "1700000100000-0" }),
-  ];
+// 5.0: the board orders by the row's receive key (#3017), the hub's order,
+// never a writer's clock: a peer whose clock runs ahead cannot sit above work
+// received later.
+describe("runsFiltered by the receive key", () => {
+  const skewed = run({ id: "peer-run", kind: "mission", status: "running", tracked: false, updated_ts: 4_000_000_000, receive_key: 1_700_000_000_000 * 1024 });
+  const honest = run({ id: "local-run", kind: "dispatch", status: "complete", tracked: true, updated_ts: 1_700_000_100, receive_key: 1_700_000_100_000 * 1024 });
 
-  it("a run's key is the newest receive key among its records, by mission or by session", () => {
-    const keys = runReceiveKeys([skewed, honest], records);
-    expect(keys.get("peer-run")).toBeLessThan(keys.get("local-run")!);
+  it("puts the run the hub received last first, whatever the executor's clock says", () => {
+    expect(runsFiltered([skewed, honest], "all").map((r) => r.id)).toEqual(["local-run", "peer-run"]);
   });
-  it("puts the run the hub received last first, whatever the writers' clocks say", () => {
-    const keys = runReceiveKeys([skewed, honest], records);
-    expect(runsFiltered([skewed, honest], "all", keys).map((r) => r.id)).toEqual(["local-run", "peer-run"]);
-    // Without receive keys the skewed clock wins: the defect this fixes.
-    expect(runsFiltered([skewed, honest], "all").map((r) => r.id)).toEqual(["peer-run", "local-run"]);
-  });
-  it("a run with no record in the window keeps its own time on the same scale", () => {
-    const old = run({ id: "old", kind: "lab", status: "complete", tracked: true, updated_ts: 1_700_000_050 });
-    const keys = runReceiveKeys([skewed, honest, old], records);
-    expect(keys.get("old")).toBe(1_700_000_050 * 1000 * 1024);
-    expect(runsFiltered([skewed, honest, old], "all", keys).map((r) => r.id)).toEqual(["local-run", "old", "peer-run"]);
+  it("ignores the executor's updated_ts entirely", () => {
+    const flipped = { ...honest, updated_ts: 1 };
+    expect(runsFiltered([skewed, flipped], "all").map((r) => r.id)).toEqual(["local-run", "peer-run"]);
   });
 });
 
