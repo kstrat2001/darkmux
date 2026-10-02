@@ -4,8 +4,8 @@
 //! `darkmux-runtime` docker container. Per-dispatch container, mounted
 //! workspace, structured output collected from stdout.
 //!
-//! The ONLY dispatch path as of 2.0 (#1405 removed the legacy `openclaw`
-//! shell-out runtime and its `--runtime` opt-in flag).
+//! The ONLY dispatch path as of 2.0 (#1405 removed the legacy shell-out
+//! runtime and its `--runtime` opt-in flag).
 //!
 //! No `--workdir` symlink injection (workspace is a fresh tempdir per
 //! dispatch); no model pin enforcement (probes whatever LMStudio currently
@@ -95,13 +95,13 @@ fn is_darkmux_runtime_image(tag: &str) -> bool {
     crate::runtime_image::is_darkmux_runtime_ref(tag)
 }
 
+/// The two effects image resolution needs: inspecting, and pulling.
+type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
+
 /// `docker pull` the version-pinned GHCR runtime image (#759). Streams docker's
 /// own progress to stderr so a multi-second first-dispatch pull isn't a silent
 /// hang. Bails with an actionable message (auth / network / build-locally) on
 /// failure.
-/// The two effects image resolution needs: inspecting, and pulling.
-type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
-
 #[cfg_attr(test, allow(dead_code))]
 fn pull_runtime_image(image: &str) -> Result<()> {
     eprintln!("darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759)…");
@@ -1881,8 +1881,8 @@ fn apply_compaction_flags(
     // omitted ⇒ runtime uses the V0 baseline system prompt.
     // Schema-isolation doctrine: this comes from the typed
     // `profile.runtime.compaction.custom_instructions` only — never
-    // from `extras["customInstructions"]` (the dead-letter openclaw
-    // passthrough). See DESIGN.md "Schema isolation".
+    // from the untyped `extras["customInstructions"]` overflow. See
+    // DESIGN.md "Schema isolation".
     if let Some(text) = compaction.custom_instructions.as_deref() {
         args.push("--compactor-custom-instructions".to_string());
         args.push(text.to_string());
@@ -2707,10 +2707,11 @@ fn warn_if_unparseable_u32(var: &str) {
 /// leaves an orphaned start; since #714 stamped `mission_id` on it, the
 /// orphan now groups under its mission and would render as perpetually
 /// in-flight. This guard fires a `dispatch.error` terminal record on `Drop`
-/// unless `disarm`ed, so every start has a matching terminal event. The clean
-/// path (and the container-ran-but-failed path, which already emits its own
-/// `dispatch.error`) calls `disarm()` after that emit, so the guard never
-/// double-counts a dispatch that reached its own terminal record.
+/// unless the dispatch ended through [`close`](Self::close), so every start
+/// has a matching terminal event. The clean path (and the container-ran-but-
+/// failed path, which emits its own `dispatch.error`) ends in `close()`,
+/// which writes that record and disarms the guard, so a dispatch that
+/// reached its own terminal record is never counted twice.
 ///
 /// A thin wrapper: this is a flat, depth-≤1 case of the generic
 /// `darkmux_flow::BookendGuard` stack (one dispatch, one open unit) — the
@@ -2723,8 +2724,7 @@ fn warn_if_unparseable_u32(var: &str) {
 /// and now relies on that outer wrap for liveness. Emits through the
 /// process-wide default sink (`darkmux_flow::record`) — same as every other
 /// record on this dispatch path — so, unlike the review bridge, there's no
-/// injected `ReviewEmitter` to bridge and no re-lending concern (see
-/// `darkmux_flow::bookend`'s module doc for why that matters elsewhere).
+/// injected `ReviewEmitter` to bridge and no re-lending concern.
 struct DispatchBookendGuard<'a> {
     inner: darkmux_flow::DynBookendGuard<'a>,
 }
@@ -2777,15 +2777,6 @@ impl<'a> DispatchBookendGuard<'a> {
     /// dispatch that reached this call.
     fn close(&mut self, finished: darkmux_flow::FlowRecord) {
         self.inner.close(DISPATCH_BOOKEND_UNIT, finished);
-    }
-
-    /// Silence the Drop backstop without emitting a terminal record. No
-    /// production call site needs it (`close()` disarms itself); the tests
-    /// use it to prove the disarm-suppresses-the-backstop behavior holds
-    /// through the wrapper.
-    #[cfg(test)]
-    fn disarm(&mut self) {
-        self.inner.disarm();
     }
 }
 

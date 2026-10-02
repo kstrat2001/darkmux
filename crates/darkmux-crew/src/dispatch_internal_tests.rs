@@ -11634,10 +11634,11 @@
 
     #[test]
     #[serial]
-    fn bookend_guard_disarmed_emits_nothing_on_drop() {
-        // The happy path (and container-ran-but-failed path) disarm after
-        // their own terminal record — the guard must then stay silent so the
-        // dispatch isn't double-counted.
+    fn bookend_guard_close_is_the_only_terminal() {
+        // The happy path (and container-ran-but-failed path) end through
+        // `close()`, which writes their own terminal record and disarms — the
+        // guard must then stay silent on drop so the dispatch isn't
+        // double-counted.
         let tmp = TempDir::new().unwrap();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
@@ -11666,7 +11667,14 @@
                 None,
                 darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
             ));
-            guard.disarm();
+            guard.close(crate::dispatch::build_dispatch_record(
+                darkmux_flow::Level::Info,
+                "coder",
+                &crate::test_session("sess-clean"), &darkmux_types::execution_id::ExecutionId::mint(),
+                Some("darkmux:qwen3.6"),
+                None,
+                darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::new(0)),
+            ));
         }
 
         unsafe {
@@ -11680,16 +11688,18 @@
             }
         }
 
-        let emitted = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-clean"))
+        let terminals: Vec<String> = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-clean"))
             .into_iter()
-            .any(|v| v["action"] == "dispatch.error");
-        assert!(!emitted, "disarmed guard must not emit any terminal record");
+            .filter_map(|v| v["action"].as_str().map(str::to_string))
+            .filter(|a| a == "dispatch.complete" || a == "dispatch.error")
+            .collect();
+        assert_eq!(terminals, vec!["dispatch.complete"], "close() is the one terminal; the Drop backstop adds none");
     }
 
     #[test]
     #[serial]
     fn bookend_guard_fires_on_panic_unwind() {
-        // The RAII headline: a panic between start and disarm still bookends
+        // The RAII headline: a panic between start and close still bookends
         // the start. Rust runs Drop on unwind, so the guard emits its
         // dispatch.error even when the dispatch panics mid-flight (#717).
         let tmp = TempDir::new().unwrap();

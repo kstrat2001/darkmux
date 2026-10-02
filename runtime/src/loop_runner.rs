@@ -1411,9 +1411,8 @@ fn recover_intra_turn_stall(
 /// this, every turn-boundary checkpoint write inside a `run()`-based test
 /// failed and logged — 1,230 "failed to write checkpoint" lines across the
 /// 124 tests that exercise this wrapper, noise that could mask a real
-/// failure. Hand-rolled (no `tempfile` — that crate is dev-only, and this
-/// fn compiles in the release binary) with a PID+nanos+counter suffix so
-/// parallel test threads (same PID) never collide.
+/// failure. Hand-rolled with a PID+nanos+counter suffix so parallel test
+/// threads (same PID) never collide.
 ///
 /// (#2707) This paragraph used to end "the dir is left behind in the OS
 /// temp root rather than cleaned up, same tradeoff `dispatch_internal.rs`'s
