@@ -36,6 +36,34 @@ describe("parseAnsi", () => {
     }
   });
 
+  it("22 ends bold and dim, 24 ends underline, 39 ends the foreground color, 49 clears nothing", () => {
+    expect(parseAnsi("\x1b[1;2mx\x1b[22my")).toEqual([
+      { text: "x", classes: ["a-bold", "a-dim"], link: null, switchTo: null },
+      { text: "y", classes: [], link: null, switchTo: null },
+    ]);
+    expect(parseAnsi("\x1b[4mx\x1b[24my")[1].classes).toEqual([]);
+    expect(parseAnsi("\x1b[1;31mx\x1b[39my")[1].classes).toEqual(["a-bold"]);
+    expect(parseAnsi("\x1b[1mx\x1b[49my")[1].classes).toEqual(["a-bold"]);
+    expect(parseAnsi("\x1b[3mx\x1b[23my")[1].classes).toEqual([]);
+  });
+
+  it("a foreground with no class (truecolor, 256-color 16+) replaces the previous foreground, rendering unstyled", () => {
+    const segs = parseAnsi("\x1b[31mred\x1b[38;2;0;255;0mgreen\x1b[38;5;196mx\x1b[31my\x1b[38;5;2mz");
+    expect(segs.map((s) => s.classes)).toEqual([["a-fg1"], [], [], ["a-fg1"], ["a-fg2"]]);
+  });
+
+  it("an extended color is one whole sequence: its operands are never read as codes of their own", () => {
+    // 38;5;2 must not turn on dim (2) or italic (3), and must not leave a stray 5.
+    expect(parseAnsi("\x1b[38;5;2mx")[0].classes).toEqual(["a-fg2"]);
+    expect(parseAnsi("\x1b[38;5;196mx")[0].classes).toEqual([]);
+    expect(parseAnsi("\x1b[48;5;1mx")[0].classes).toEqual([]);
+    expect(parseAnsi("\x1b[38;2;1;2;3mx")[0].classes).toEqual([]);
+    expect(parseAnsi("\x1b[48;2;4;1;3mx")[0].classes).toEqual([]);
+    // Codes before and after the sequence still apply.
+    expect(parseAnsi("\x1b[1;38;2;4;4;4;4mx")[0].classes).toEqual(["a-bold", "a-underline"]);
+    expect(parseAnsi("\x1b[38;5mx")[0].classes).toEqual([]);
+  });
+
   it("an unrecognized SGR code is silently dropped (no class), not an error", () => {
     const segs = parseAnsi("\x1b[123mx");
     expect(segs).toEqual([{ text: "x", classes: [], link: null, switchTo: null }]);

@@ -124,6 +124,61 @@ function panelSwitchOpts(href: string, id: PanelId): Record<string, string> {
   return sanitizeOptParams(id, raw);
 }
 
+/** Classes cleared by each SGR reset: 22 ends bold and dim, 23 italic, 24
+ * underline, 39 the foreground color. 49 (default background) clears nothing,
+ * since no background class is ever set. */
+const SGR_RESETS: Record<number, (cls: string) => boolean> = {
+  22: (c) => c === "a-bold" || c === "a-dim",
+  23: (c) => c === "a-ital",
+  24: (c) => c === "a-underline",
+  39: (c) => /^a-fg\d+$/.test(c),
+  49: () => false,
+};
+
+/** The foreground class for an indexed color (`38;5;n`): the 16 palette
+ * entries darkmux styles keep their class; the rest of the 256 colors have no
+ * class and render unstyled. */
+function indexedForeground(n: number): string | null {
+  return n >= 0 && n < 16 ? `a-fg${n}` : null;
+}
+
+/** One extended color (`38`/`48` then `5;n` or `2;r;g;b`): the class list after
+ * it, and how many operand codes it consumed. A foreground set (`38`) replaces
+ * the previous one; a color with no class (256-color 16+, truecolor) therefore
+ * leaves the text unstyled, not still red. Backgrounds set no class. */
+function extendedColor(classes: string[], n: number, operands: number[]): [string[], number] {
+  const mode = operands[0];
+  const consumed = mode === 5 ? 2 : mode === 2 ? 4 : 0;
+  if (n !== 38) return [classes, consumed];
+  const cls = mode === 5 ? indexedForeground(operands[1]) : null;
+  return [[...classes.filter((c) => !/^a-fg\d+$/.test(c)), ...(cls === null ? [] : [cls])], consumed];
+}
+
+/** Apply one SGR parameter string (`1;38;5;196`) to the active class list.
+ * Extended colors are read as WHOLE sequences: `38;5;n`, `48;5;n` and
+ * `38;2;r;g;b` / `48;2;r;g;b` consume their operands, which are never read as
+ * stray codes of their own (a `5` or a `2` inside them is not "dim"). A
+ * truncated sequence consumes what is left. */
+function applySgr(active: string[], params: string): string[] {
+  const codes = params.split(";").filter((x) => x !== "").map((c) => parseInt(c, 10));
+  let classes = active;
+  for (let k = 0; k < (codes.length ? codes.length : 1); k++) {
+    const n = codes.length ? codes[k] : 0;
+    if (n === 38 || n === 48) {
+      const [next, consumed] = extendedColor(classes, n, codes.slice(k + 1));
+      classes = next;
+      k += consumed;
+    } else if (n === 0) {
+      classes = [];
+    } else if (SGR_RESETS[n]) {
+      classes = classes.filter((c) => !SGR_RESETS[n](c));
+    } else if (ANSI_SGR_CLASS[n] && !classes.includes(ANSI_SGR_CLASS[n])) {
+      classes = [...classes, ANSI_SGR_CLASS[n]];
+    }
+  }
+  return classes;
+}
+
 export interface AnsiSegment {
   text: string;
   classes: string[];
@@ -177,17 +232,7 @@ export function parseAnsi(text: string): AnsiSegment[] {
       const params = text.slice(i + 2, j);
       if (final === "m") {
         flush();
-        let codes = params.split(";").filter((x) => x !== "");
-        if (!codes.length) codes = ["0"]; // bare ESC[m == reset
-        codes.forEach((c) => {
-          const n = parseInt(c, 10);
-          if (n === 0) {
-            classes = [];
-            return;
-          }
-          const cls = ANSI_SGR_CLASS[n];
-          if (cls && classes.indexOf(cls) === -1) classes.push(cls);
-        });
+        classes = applySgr(classes, params);
       }
       i = j + 1;
       continue;

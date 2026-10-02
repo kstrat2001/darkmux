@@ -29,8 +29,11 @@
  * | `MACHINE_MEM_POLL_MS`        | 5000   | `MACHINE_MEM_POLL_MS` — the machine lens's client |
  * |                              |        | poll cadence for `/machine/resources`.            |
  * | `PANEL_CACHE_MS`             | 3000   | `PANEL_CACHE_TTL` in                              |
- * |                              |        | `crates/darkmux-serve/src/panel.rs` — server-side |
- * |                              |        | cache TTL for auto-refreshing console panels.     |
+ * |                              |        | `crates/darkmux-serve/src/panel.rs`, the short    |
+ * |                              |        | server-side TTL. NOT a mirror of every panel:     |
+ * |                              |        | `run-list` and `mission-status` cache longer      |
+ * |                              |        | (`FLEET_PANEL_CACHE_TTL`, 8s) and `doctor` is     |
+ * |                              |        | uncached. This is only the client's staleTime.    |
  *
  * Only `PRESENCE_POLL_MS` is wired to an actual query in this scaffold packet
  * (the fleet-machines strip, the packet's one proof region) — the rest are

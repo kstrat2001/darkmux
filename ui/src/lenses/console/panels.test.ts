@@ -1,10 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { PANEL_IDS } from "../../lib/route";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import panelTable from "./panel-table.generated.json";
 import {
   PANELS,
   PANEL_OPTS,
@@ -21,6 +18,7 @@ import {
   rosterOptName,
   machineOpt,
   reconcileOpts,
+  describeDroppedOpts,
   LOCAL_MACHINE,
 } from "./panels";
 
@@ -187,62 +185,48 @@ describe("panelOptGroups", () => {
   });
 });
 
-// ── Drift guard (#1911): the TS opts table pinned against the Rust one ──
+// ── Drift guard: the TS panel table pinned against the Rust one ─────────
 //
-// Mirrors the direction `src/run_list.rs`'s own
-// `run_kind_arg_vocabulary_matches_the_ui_runs_kinds_twin` test takes (a
-// text-pin via a raw file read), just reversed: that test reads a TS file
-// from Rust; this one reads the Rust file from TS, because darkmux-serve's
-// `panel.rs` is the frozen server half this client mirrors, not the other
-// way around. Extracts every `PanelOptValue { value: "...", argv: [...] }`
-// literal that appears in `RUN_LIST_KIND_OPT`/`ALL_OPT`'s declarations and
-// checks each `(panel, name, value)` triple this file declares has a match
-// on the Rust side — the failure message names the twin relationship so a
-// future edit to either table without the other explains itself instead of
-// failing mysteriously.
-describe("PANEL_OPTS pinned against crates/darkmux-serve/src/panel.rs (#1911)", () => {
-  const rustSrc = readFileSync(
-    path.join(__dirname, "../../../../crates/darkmux-serve/src/panel.rs"),
-    "utf8",
-  );
+// `panel-table.generated.json` is written by `panel.rs`'s own test
+// (`panel_table_matches_the_generated_fixture`) from the live `panel_spec`
+// table, and that test fails when the file is stale. This one reads it and
+// compares every field the client keeps, so neither side can change without a
+// red test on the other. It replaced a text search of `panel.rs` that only
+// checked that each value string appeared somewhere in the file.
+interface TableOpt {
+  name: string;
+  values: { value: string; argv: string[] }[];
+}
+interface TableRow {
+  id: string;
+  argv: string[];
+  auto_refresh: boolean;
+  audience: "read" | "local_or_token";
+  opts: TableOpt[];
+  roster_opt: { name: string; flag: string | null; argv_before_id: string[] } | null;
+}
+const rustTable = panelTable as TableRow[];
 
-  it("every (panel, opt name, value) triple this file declares also appears in the Rust source", () => {
-    for (const [panelId, entry] of Object.entries(PANEL_OPTS)) {
-      for (const opt of entry.opts) {
-        for (const v of opt.values) {
-          const needle = `value: "${v.value}"`;
-          expect(
-            rustSrc.includes(needle),
-            `PANEL_OPTS["${panelId}"].opts["${opt.name}"] declares value "${v.value}", which panel.rs's own ` +
-              `PanelOptValue literals don't contain — the client's opts table (ui/src/lenses/console/panels.ts) ` +
-              `and the server's (crates/darkmux-serve/src/panel.rs) are twins; update both together (#1911)`,
-          ).toBe(true);
-        }
-      }
-    }
+describe("PANEL_OPTS pinned against the table generated from panel.rs", () => {
+  it("lists exactly the panel ids the client routes", () => {
+    expect(rustTable.map((r) => r.id).sort()).toEqual([...PANEL_IDS].sort());
   });
 
-  it("panel.rs's own RUN_LIST_KIND_OPT vocabulary (all/mission/dispatch/lab) matches this file's run-list kind opt exactly", () => {
-    const kindOpt = panelOptGroups("run-list").find((o) => o.name === "kind");
-    expect(kindOpt, "run-list must declare a kind opt").toBeDefined();
-    const tsValues = kindOpt!.values.map((v) => v.value).sort();
-    expect(tsValues, "twin drift: ui panels.ts's run-list kind values vs panel.rs's RUN_LIST_KIND_OPT").toEqual(
-      ["all", "dispatch", "lab", "mission"].sort(),
-    );
-    expect(rustSrc, "RUN_LIST_KIND_OPT not found in panel.rs — the twin this test pins against was renamed (#1911)").toContain(
-      "const RUN_LIST_KIND_OPT: PanelOpt",
-    );
+  it.each(rustTable.map((r) => [r.id, r] as const))("%s: base argv, opts and values match", (_id, row) => {
+    const id = row.id as (typeof PANEL_IDS)[number];
+    expect(panelArgv(id)).toEqual(row.argv);
+    expect(panelOptGroups(id).map((o) => ({ name: o.name, values: o.values.map((v) => ({ value: v.value, argv: [...v.argv] })) }))).toEqual(row.opts);
   });
 
-  it("the ALL_OPT boolean (recent/all) matches every panel that declares it here", () => {
-    for (const id of ["mission-status", "run-list"] as const) {
-      const allOpt = panelOptGroups(id).find((o) => o.name === "all");
-      expect(allOpt, `${id} must declare an "all" opt`).toBeDefined();
-      expect(allOpt!.values.map((v) => v.value)).toEqual(["recent", "all"]);
-      expect(allOpt!.values[0].argv).toEqual([]);
-      expect(allOpt!.values[1].argv).toEqual(["--all"]);
+  it.each(rustTable.map((r) => [r.id, r] as const))("%s: manual-run and roster opt agree with the server", (_id, row) => {
+    const id = row.id as (typeof PANEL_IDS)[number];
+    expect(isManualPanel(id)).toBe(!row.auto_refresh);
+    expect(rosterOptName(id)).toBe(row.roster_opt?.name ?? null);
+    expect(PANEL_OPTS[id].rosterFlag ?? null).toBe(row.roster_opt?.flag ?? null);
+    // What precedes the machine id in argv (its flag, or the `--` separator).
+    if (row.roster_opt !== null) {
+      expect(machineOpt(id, ["studio"], undefined).values[1].argv).toEqual([...row.roster_opt.argv_before_id, "studio"]);
     }
-    expect(rustSrc).toContain("const ALL_OPT: PanelOpt");
   });
 });
 
@@ -252,20 +236,18 @@ describe("PANEL_OPTS pinned against crates/darkmux-serve/src/panel.rs (#1911)", 
 // know when it parses a hash: parse checks the SHAPE of the value, the server
 // checks membership against its roster and 400s on a stranger.
 describe("profile-list's roster-valued machine opt", () => {
-  it("exactly two panels take a roster machine, and the server twin declares it too", () => {
+  it("exactly two panels take a roster machine (the generated table above pins the server twin)", () => {
     expect(PANEL_IDS.filter((id) => rosterOptName(id) !== null).sort()).toEqual(["machine-status", "profile-list"]);
     expect(rosterOptName("profile-list")).toBe("machine");
-    const rustSrc = readFileSync(path.join(__dirname, "../../../../crates/darkmux-serve/src/panel.rs"), "utf8");
-    expect(rustSrc).toContain('const ROSTER_MACHINE_OPT: &str = "machine"');
-    expect(rustSrc).toContain('const ROSTER_MACHINE_FLAG: &str = "--machine"');
     expect(panelArgv("profile-list")).toEqual(["profile", "list"]);
   });
 
-  it("machine status takes the machine as its positional id, not a flag", () => {
-    expect(composeArgv("machine-status", { machine: "studio" })).toEqual(["machine", "status", "studio"]);
+  it("machine status takes the machine as its positional id after a `--`, so no id reads as a flag", () => {
+    expect(composeArgv("machine-status", { machine: "studio" })).toEqual(["machine", "status", "--", "studio"]);
+    expect(composeArgv("machine-status", { machine: "--all" })).toEqual(["machine", "status", "--", "--all"]);
     expect(composeArgv("machine-status", {})).toEqual(["machine", "status"]);
     expect(variantKey("machine-status", { machine: "studio" })).toBe("machine-status?machine=studio");
-    expect(machineOpt("machine-status", ["studio"], undefined).values[1].argv).toEqual(["studio"]);
+    expect(machineOpt("machine-status", ["studio"], undefined).values[1].argv).toEqual(["--", "studio"]);
     expect(sanitizeOptParams("machine-status", { machine: "studio" })).toEqual({ machine: "studio" });
     expect(composeArgv("machine-list", { machine: "studio" })).toEqual(["machine", "list"]);
   });
@@ -306,5 +288,25 @@ describe("profile-list's roster-valued machine opt", () => {
     expect(reconcileOpts("profile-list", { machine: "studio" }, "remote", "on")).toEqual({ remote: "on" });
     expect(reconcileOpts("profile-list", { machine: "studio" }, "machine", LOCAL_MACHINE)).toEqual({ machine: LOCAL_MACHINE });
     expect(reconcileOpts("run-list", { kind: "lab" }, "all", "all")).toEqual({ kind: "lab", all: "all" });
+  });
+});
+
+describe("describeDroppedOpts", () => {
+  it("names an unknown option, an unknown value and a malformed machine, each with its reason", () => {
+    expect(describeDroppedOpts("run-list", { bogus: "1", kind: "nope" })).toEqual([
+      "opt.bogus (run-list has no such option)",
+      "opt.kind=nope (not one of all, mission, dispatch, lab)",
+    ]);
+    expect(describeDroppedOpts("profile-list", { machine: "a\nb" })).toEqual(["opt.machine=a\nb (not a machine name)"]);
+  });
+
+  it("says nothing when everything is honored, including a machine and remote=off", () => {
+    expect(describeDroppedOpts("run-list", { kind: "lab", all: "all" })).toEqual([]);
+    expect(describeDroppedOpts("profile-list", { machine: "studio", remote: "off" })).toEqual([]);
+  });
+
+  it("clips a huge value so the note stays one line", () => {
+    const [msg] = describeDroppedOpts("run-list", { kind: "x".repeat(500) });
+    expect(msg.length).toBeLessThan(120);
   });
 });

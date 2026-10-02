@@ -229,6 +229,42 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   sorts alike on the machine that ran it and on a peer.
 - **A relayed run reads `from <machine>` everywhere** (5.0): the board subtitle,
   the run page header (it said `asked on`) and `darkmux run list`'s subtitle.
+- **Console panels fail gently and keep to their audience** (5.0).
+  - `doctor` gets its own 25s spawn bound (it measures 7s with unreachable
+    peers) and a timeout is worded "slow", not "wedged"; a timed-out run no
+    longer uses up the 30s manual-run wait (it releases only its own claim), so
+    an immediate retry works.
+  - A 429, a 504 or a network error keeps the last good output on screen and
+    says so in the header's meta slot (`failed: slow · 00:40:57`, the full message
+    in its tooltip), instead of replacing the output with the error.
+  - `flow-status` joins `doctor` and `config-list` as served only to this machine
+    or a token holder: it prints the flow directories, hook target URLs and the
+    Redis URL. `mission status` rendered in the console links root-relative.
+  - One output filter on every panel for a caller that is neither this machine
+    nor a token holder: `stderr_tail` is replaced by "diagnostics are shown on
+    this machine only", every roster address (and its host part) in stdout reads
+    "(address hidden)", and the daemon user's home prefix reads `~` (a
+    `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`). Matches are whole tokens
+    only (`mac` is not hidden inside `macos`; punctuation and color codes are
+    boundaries; an OSC 8 link to a hidden target loses the target, not its label; only SGR and OSC 8 escapes are sent, and `HOME` and `DARKMUX_HOME` are matched in their symlink-resolved form too), and a machine id or name is never
+    hidden: only the address behind it. The sets come from the roster and the
+    environment at request time.
+    This machine and token holders see the output unchanged.
+  - A console link that carried something unusable (an unknown panel, option or
+    value, a machine with `remote`, a repeated key) says what was not used in the
+    header (`2 unused`, the list in its tooltip). A repeated query key on `GET /panel/:id` is a 400 naming the key.
+  - `machine status` is run as `machine status -- <id>`, and a machine id may not
+    start with `-` (`machine add` and the roster refuse it, and an unknown
+    flag-shaped id is not suggested for adding), so no roster id can read as a
+    flag.
+  - `run-list` and `mission-status` cache for 8s (a cold fleet read is about 5s,
+    longer than the old 3s TTL); `stderr_tail` drops `[darkmux-liveness]` lines
+    and keeps error lines first; a panel's stdout is capped at 512 KiB with a
+    visible note; the console reads SGR 22/23/24/39/49 and 256-color and
+    truecolor sequences as whole sequences.
+  - The console's panel table is generated from `panel.rs` into
+    `ui/src/lenses/console/panel-table.generated.json` and the console's tests
+    read it, so the two cannot drift.
 
 - **One token total, from usage records only** (#3067). Every surface sums the
   `telemetry.tokens` usage records and nothing else: a `dispatch.complete`

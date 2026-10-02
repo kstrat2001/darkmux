@@ -215,6 +215,15 @@ fn panel_all_link(link_base: &str, unlimited: bool) -> Option<String> {
 /// and short-circuits without spawning `tailscale` when no link will be
 /// emitted.
 pub(crate) fn board_link_base() -> String {
+    // (5.0 console review) Rendering into the console: the output reaches
+    // whoever holds the panel, and an absolute base would name this host's
+    // tailnet hostname to a `Read` caller. A root-relative base resolves
+    // against the origin the page was loaded from, so the link still lands on
+    // the right daemon and no host name leaves the machine. It also skips the
+    // `tailscale` spawn below.
+    if std::env::var_os("DARKMUX_PANEL").is_some() {
+        return "/".to_string();
+    }
     darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_client_port())
 }
 
@@ -3258,6 +3267,17 @@ mod tests {
     /// reads as working right up until it is clicked, which is precisely
     /// the class of silence the issue was filed about — so it gets a test
     /// that fails when the literal comes back.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_PANEL, a process-global
+    fn board_link_base_in_a_panel_names_no_host() {
+        std::env::set_var("DARKMUX_PANEL", "mission-status");
+        let base = board_link_base();
+        let url = mission_url(&base, "m-1");
+        std::env::remove_var("DARKMUX_PANEL");
+        assert_eq!(base, "/", "a panel link is root-relative, never a host");
+        assert_eq!(url, "/#mission=m-1");
+    }
+
     #[test]
     #[serial_test::serial]
     fn board_link_base_follows_the_configured_serve_port() {

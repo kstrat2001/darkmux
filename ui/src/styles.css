@@ -3167,6 +3167,15 @@ body {
   color: var(--error);
   white-space: pre-wrap;
 }
+/* A failed refresh, stated in the header's meta slot where "captured …" sits. */
+.pc-refresh-failed {
+  color: var(--error);
+}
+/* The deep-link note: what a link asked for that this build could not honor,
+   in the chrome row (full list in its tooltip), never a row of its own. */
+.pc-dropped {
+  color: var(--dim);
+}
 /* (#1916) stderr on a ZERO exit is a diagnostic, not a failure — see
    `ConsolePanel.tsx`'s `PanelBody` doc. Same shape as `.panelerr` (same
    padding, font, wrapping) so only the color reads as different; `--dim`

@@ -412,6 +412,13 @@ pub fn add_machine(
     if id.trim().is_empty() {
         return Err(anyhow!("machine id must be non-empty"));
     }
+    // (5.0 console review) A roster id reaches argv (`machine status <id>`,
+    // `profile list --machine <id>`) from the console, so a flag-shaped id
+    // (`--all`) must never be storable. The one machine-name rule, not a
+    // second one.
+    if let Some(problem) = darkmux_types::profile_address::machine_name_problem(id) {
+        return Err(anyhow!("machine id {id:?} is not a legal machine name: {problem}"));
+    }
     if address.trim().is_empty() {
         return Err(anyhow!("machine address must be non-empty"));
     }
@@ -1059,5 +1066,24 @@ mod address_host_is_loopback_tests {
     fn trailing_dot_loopback_ip_is_still_loopback() {
         assert!(address_host_is_loopback("127.0.0.1."));
         assert!(address_host_is_loopback("127.0.0.1.:8765"));
+    }
+}
+
+#[cfg(test)]
+mod machine_id_shape_tests {
+    use super::*;
+
+    /// A roster id reaches argv from the console (5.0 console review), so a
+    /// flag-shaped or otherwise non-name id is refused at the door.
+    #[test]
+    fn add_machine_refuses_an_id_that_is_not_a_machine_name() {
+        for bad in ["--all", "-x", "a b", "studio.local", "a/b"] {
+            let mut r = FleetRoster::default();
+            let err = add_machine(&mut r, bad, "host.tailnet.example", None, None).unwrap_err();
+            assert!(format!("{err:#}").contains("not a legal machine name"), "{bad}: {err:#}");
+            assert!(r.machines.is_empty(), "{bad} must not be stored");
+        }
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "MacBook-Pro_2", "host.tailnet.example", None, None).unwrap();
     }
 }
