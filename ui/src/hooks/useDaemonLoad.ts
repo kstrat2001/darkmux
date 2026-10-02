@@ -4,7 +4,7 @@
  * dispatch, so the machine drawer/modal have a `now` reading (and, off a
  * mission/dispatch route, `avg`/`max` too) once OPENED, not only while a
  * dispatch happens to be running. Before this hook, the ONLY host samples
- * anywhere in the viewer were per-dispatch `telemetry.process` flow
+ * anywhere in the viewer were per-dispatch host-sample flow
  * records, so the drawer read "idle · no samples in the last 10 min"
  * between dispatches (`components/machineStatsContent.tsx`'s own doc).
  *

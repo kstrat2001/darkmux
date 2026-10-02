@@ -1006,7 +1006,7 @@ pub(crate) struct StepFinals {
 /// Which step id (if any) a flow record attributes to, using the SAME three
 /// correlation keys, in the SAME order, the page's `stepForRecord` uses:
 /// (1) `payload.step_id`; (2) a step session (`SessionKind::Step`, read by
-/// `SessionId::parse_legacy`, so a pre-4.0 `step-<id>` string reads too);
+/// `SessionId::parse`);
 /// (3) `handle == <step id>`. Returns
 /// the id only when it is one of THIS mission's steps (`step_ids`), so a
 /// scan over a shared per-day flow file attributes nothing foreign.
@@ -1049,12 +1049,11 @@ fn step_for_record<'a>(
 }
 
 /// The step a record's own session names, when that session is a step of
-/// `mission_id`. An unstamped pre-4.0 record is placed in this mission to
-/// read its old `step-<id>[-<mission>]` string; a current one names its own
-/// run, which must be this mission.
+/// `mission_id`: it names its own run, which must be this mission.
 fn session_step(rec: &serde_json::Value, mission_id: &str) -> Option<String> {
     let session = rec.get("session_id")?.as_str()?;
-    darkmux_types::session_id::SessionId::parse_legacy(session, Some(mission_id))
+    darkmux_types::session_id::SessionId::parse(session)
+        .ok()
         .filter(|s| s.mission_id() == Some(mission_id))?
         .step_id()
         .map(str::to_string)

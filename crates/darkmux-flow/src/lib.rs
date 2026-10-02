@@ -3840,7 +3840,8 @@ mod tests {
         //   1.65.0 — (#2902 step 5) `endpoint_id` on usage records and the
         //            `budget.warn` / `budget.wait` / `budget.resume` / `budget.stop` actions.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
-        //            write; retired spellings upgrade on read. Also drops
+        //            write; a retired spelling reads as an unknown action
+        //            (5.0, #3036). Also drops
         //            `dispatch.complete`'s `cumulative_prompt_tokens` /
         //            `cumulative_completion_tokens` (their source,
         //            `metrics.json`, is retired), `cumulative_turns` and

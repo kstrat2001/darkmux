@@ -324,24 +324,6 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
         return final_assistant.to_string();
     }
-    // Legacy openclaw-shaped envelope — kept for reading historical run
-    // artifacts from before the openclaw runtime was removed (#1405):
-    // `{"result": {"payloads": [{"text": "..."}], ...}}`.
-    if let Some(payloads) = parsed
-        .get("result")
-        .and_then(|r| r.get("payloads"))
-        .and_then(|p| p.as_array())
-    {
-        let parts: Vec<String> = payloads
-            .iter()
-            .filter_map(|p| {
-                p.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        return parts.join("\n\n");
-    }
     if let Some(reply) = parsed.get("reply").and_then(|v| v.as_str()) {
         return reply.to_string();
     }
@@ -601,31 +583,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_reply_handles_payloads_array() {
-        let json = r#"{"result":{"payloads":[{"text":"hello"},{"text":"world"}]}}"#;
-        assert_eq!(extract_reply_text(json), "hello\n\nworld");
-    }
-
-    #[test]
     fn extract_reply_handles_internal_runtime_envelope() {
-        // Phase-A's darkmux-runtime --json envelope. Beat 36: this
-        // branch should be checked FIRST in extract_reply_text so the
-        // DM-first parsing wins over the openclaw fallback chain.
+        // Phase-A's darkmux-runtime --json envelope.
         let json = r#"{"result":"stop","final_assistant":"hello from internal runtime","metrics":{"wall_ms":2135}}"#;
         assert_eq!(extract_reply_text(json), "hello from internal runtime");
-    }
-
-    #[test]
-    fn extract_reply_prefers_internal_envelope_over_openclaw_when_both_present() {
-        // Defensive: if a future envelope contains BOTH shapes (e.g.
-        // a translation layer that wraps openclaw output in the DM
-        // envelope), Beat 36 says DM concept wins — we read
-        // final_assistant first.
-        let json = r#"{
-            "final_assistant": "from DM envelope",
-            "result": {"payloads": [{"text": "from OC envelope"}]}
-        }"#;
-        assert_eq!(extract_reply_text(json), "from DM envelope");
     }
 
     #[test]

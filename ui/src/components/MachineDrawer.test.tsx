@@ -19,12 +19,11 @@ const proc = (
   mem: number,
 ): NormRecord => norm({
   ts,
-  category: "telemetry",
+  category: "machinery",
   source: "host",
   machine_uid: "UID-A",
-  // flow-action-guard:allow — a retired action, as an archive still holds it
-  action: "telemetry.process",
-  payload: { cpu, gpu, mem },
+  action: "machine.telemetry",
+  payload: { cpu_pct: cpu, gpu_pct: gpu, mem_pct: mem },
 });
 
 const NOW = Date.parse("2026-01-01T00:20:00Z");
@@ -510,12 +509,11 @@ describe("MachineDrawer — idle state (no samples)", () => {
   it("shows the last known reading and its age when the window is empty but something was seen earlier", () => {
     const oldSample: NormRecord = norm({
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
-      category: "telemetry",
+      category: "machinery",
       machine_uid: "UID-A",
       source: "host",
-      // flow-action-guard:allow — a retired action, as an archive still holds it
-      action: "telemetry.process",
-      payload: { cpu: 40, gpu: 55, mem: 30 },
+      action: "machine.telemetry",
+      payload: { cpu_pct: 40, gpu_pct: 55, mem_pct: 30 },
     });
     render(
       <MachineDrawer

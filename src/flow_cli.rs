@@ -697,16 +697,15 @@ fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option
 }
 
 /// What a tailed record is about, for its last column: the role execution
-/// when it names one it was minted with, else the run its session belongs to
-/// (a pre-4.0 execution record's synthesized id is built from its session,
-/// so it reads as no execution), else `-`. The session itself never shows.
+/// when it names one it was minted with, else the run its session belongs to,
+/// else `-`. The session itself never shows.
 fn tail_origin(record: &serde_json::Value) -> String {
     let text = |key: &str| record.get(key).and_then(|v| v.as_str());
     if let Some(id) = text("execution_id").and_then(|wire| ExecutionId::parse_minted(wire).ok()) {
         return id.to_string();
     }
     text("session_id")
-        .and_then(|sid| darkmux_types::session_id::SessionId::parse_legacy(sid, text("mission_id")))
+        .and_then(|sid| darkmux_types::session_id::SessionId::parse(sid).ok())
         .map_or_else(|| "-".to_string(), |session| session.run_id().to_string())
 }
 

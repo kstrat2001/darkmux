@@ -13,29 +13,16 @@ use std::path::{Path, PathBuf};
 /// recorded run's turns, tokens, rests and detector firings.
 ///
 /// The trajectory is `<run>/trajectory.jsonl`, copied there when the run
-/// finished (#364). A run recorded before that copy existed has it only in
-/// its sandbox, at `<sandbox>/.darkmux-runtime/trajectory.jsonl`, the
-/// sandbox its `manifest.json` names; that is the one legacy location, read
-/// only when the run's own copy is absent. A run directory's `metrics.json`
-/// (written until 4.0) is never read: its numbers are all in the trajectory,
-/// and where the two disagreed the file was the one that was wrong.
-///
-/// The sandbox is model-writable, so the legacy read goes through the
-/// contained out-dir reader (#2869): a planted symlink or FIFO there is
-/// refused, not followed. The run's own copy is host-written.
+/// finished (#364). A run directory without it folds to nothing; its
+/// sandbox is never read (it is model-writable). A run directory's
+/// `metrics.json` (written until 4.0) is never read: its numbers are all in
+/// the trajectory.
 pub fn run_trajectory(run_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
     let own = run_dir.join(darkmux_trajectory::TRAJECTORY_FILE);
     if own.exists() {
         return darkmux_trajectory::TrajectoryFold::from_path(&own);
     }
-    legacy_sandbox(run_dir)
-        .map(|sandbox| darkmux_crew::dispatch_internal::out_dir_trajectory(&sandbox))
-        .unwrap_or_default()
-}
-
-/// The sandbox a run's `manifest.json` names, if any.
-fn legacy_sandbox(run_dir: &Path) -> Option<PathBuf> {
-    crate::lab::manifest::RunManifest::read_lenient(run_dir)?.sandbox.map(PathBuf::from)
+    darkmux_trajectory::TrajectoryFold::default()
 }
 
 pub fn resolve_run_path(run_path: &str) -> PathBuf {
@@ -312,46 +299,24 @@ mod tests {
         assert!(err.to_string().contains("no run manifest"));
     }
 
-    /// The one legacy location: a run recorded before its trajectory was
-    /// copied into the run directory (#364) is read from the sandbox its
-    /// manifest names. The run's own copy wins when both exist. A
-    /// `metrics.json` in the run directory is never read.
+    /// A run directory without its own trajectory folds to nothing: the
+    /// sandbox its manifest names and a `metrics.json` are never read.
     #[test]
-    fn a_run_trajectory_is_its_own_copy_else_the_sandbox_its_manifest_names() {
+    fn a_run_without_its_own_trajectory_folds_to_nothing() {
         let run = TempDir::new().unwrap();
         let sandbox = TempDir::new().unwrap();
         let rt = sandbox.path().join(".darkmux-runtime");
         std::fs::create_dir_all(&rt).unwrap();
-        std::fs::write(rt.join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n{\"type\":\"model.completed\",\"seq\":2}\n").unwrap();
+        std::fs::write(rt.join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
         std::fs::write(
             run.path().join("manifest.json"),
             serde_json::json!({ "sandbox": sandbox.path() }).to_string(),
         )
         .unwrap();
         std::fs::write(run.path().join("metrics.json"), r#"{"turns":9,"total_prompt_tokens":175557}"#).unwrap();
-        assert_eq!(run_trajectory(run.path()).turns(), 2, "the sandbox copy, not metrics.json");
+        assert_eq!(run_trajectory(run.path()).turns(), 0, "neither the sandbox nor metrics.json is read");
 
         std::fs::write(run.path().join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
-        assert_eq!(run_trajectory(run.path()).turns(), 1, "the run's own copy wins");
+        assert_eq!(run_trajectory(run.path()).turns(), 1, "the run's own copy is the one read");
     }
-
-    /// (#2869) The sandbox is model-writable: a legacy sandbox trajectory
-    /// that is a symlink to a host file is refused, not folded.
-    #[test]
-    fn a_symlinked_legacy_sandbox_trajectory_is_refused() {
-        let run = TempDir::new().unwrap();
-        let sandbox = TempDir::new().unwrap();
-        let rt = sandbox.path().join(".darkmux-runtime");
-        std::fs::create_dir_all(&rt).unwrap();
-        let host = sandbox.path().join("host-trajectory.jsonl");
-        std::fs::write(&host, "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
-        std::os::unix::fs::symlink(&host, rt.join("trajectory.jsonl")).unwrap();
-        std::fs::write(
-            run.path().join("manifest.json"),
-            serde_json::json!({ "sandbox": sandbox.path() }).to_string(),
-        )
-        .unwrap();
-        assert_eq!(run_trajectory(run.path()).turns(), 0, "the symlinked host file was folded");
-    }
-
 }

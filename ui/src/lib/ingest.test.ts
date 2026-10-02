@@ -190,12 +190,12 @@ describe("vocabulary skew is loud", () => {
     expect(unknownActionCount(recs)).toBe(2);
   });
 
-  it("a retired action is unknown: counted, warned, still read by its other fields", () => {
+  it("a retired action is unknown: counted, warned, and draws no host sample", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const recs = ingest([
         // flow-action-guard:allow-start — a retired action, as an archive still holds it
-        raw("telemetry.process", 0, { category: "telemetry", source: "host", payload: { cpu: 12 } }),
+        raw("telemetry.process", 0),
         raw("mission.compile.error", 1),
         raw("mission reopen", 2),
         // flow-action-guard:allow-end
@@ -204,7 +204,7 @@ describe("vocabulary skew is loud", () => {
       expect(unknownActionCount(recs)).toBe(3);
       expect(warn).toHaveBeenCalledTimes(3);
       expect(recs.some((r) => r.action === ACTION.MachineTelemetry)).toBe(false);
-      expect(isHostSampleRecord(recs[0])).toBe(true);
+      expect(isHostSampleRecord(recs[0])).toBe(false);
     } finally {
       warn.mockRestore();
     }

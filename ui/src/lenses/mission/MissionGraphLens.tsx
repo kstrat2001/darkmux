@@ -139,7 +139,7 @@ function useNow(anyRunning: boolean): number {
   return now;
 }
 
-/** (#1483) How recent a `telemetry.process` sample must be (client receive
+/** (#1483) How recent a `machine.telemetry` sample must be (client receive
  * time) to still count as fresh — mission-graph.html's own literal `12000`. */
 const PROC_FRESH_MS = 12000;
 
@@ -162,9 +162,7 @@ function isHostSampleWithPayload(r: NormRecord): boolean {
 /** (#1868, #1483) The header's `.mproc` host-activity readout — the OFF-
  * MODEL corroboration that the box is actually working (host kernel
  * counters, zero model dispatches — observability doctrine), not chrome.
- * Ported from mission-graph.html's own `proc`/`setProc` state, which its
- * SSE `onMessage` stamps directly: `rec.action==="telemetry.process" ? setProc({...,
- * rx: Date.now()}) : ...`.
+ * It stamps the sample's receive time when a new one streams in.
  *
  * This port has no per-record `onMessage` callback (the pure-fold
  * architecture re-derives from the whole known record set on every change —
@@ -197,8 +195,7 @@ function useProcReadout(tail: NormRecord[] | undefined, machineUid: string | nul
   const [proc, setProc] = useState<ProcSample | null>(null);
   useEffect(() => {
     if (!latest || !latest.payload) return;
-    // (#2413) `toPoint` reads `machine.telemetry`'s payload, or the retired
-    // `telemetry.process` shape an older archive holds.
+    // (#2413) `toPoint` reads `machine.telemetry`'s payload.
     const point = toPoint(latest);
     setProc({
       cpu: point.cpu,

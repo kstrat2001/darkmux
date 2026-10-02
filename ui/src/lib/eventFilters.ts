@@ -30,13 +30,7 @@ export function activityOf(r: NormRecord): string {
   if (a === ACTION.MachineOnline) return "machine online";
   if (a === ACTION.MachineOffline) return "machine offline";
   if (a === ACTION.SessionEnd) return "session end";
-  // (#2413) `machine.telemetry` is the machine-scoped replacement for the
-  // retired per-dispatch `telemetry.process` — same friendly facet label
-  // as the `category: "telemetry", source: "host"` branch below, so a
-  // saved "host telemetry" filter keeps working across the schema change
-  // (and across the retired mechanism's continuing partial use — see
-  // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
-  // a second, differently-named facet.
+  // (#2413) `machine.telemetry` is the machine-scoped host sample.
   if (a === ACTION.MachineTelemetry) return "host telemetry";
   // (#2915) A utility job's start/error markers: their own facet, filed with
   // the machine (utility jobs are machine-level), not generic telemetry.
@@ -44,7 +38,6 @@ export function activityOf(r: NormRecord): string {
   if (r.category === CATEGORY.Telemetry) {
     if (r.source === SOURCE.Detector) return "detector";
     if (r.source === SOURCE.Tokens) return "tokens";
-    if (r.source === SOURCE.Host) return "host telemetry";
     if (r.source === SOURCE.Lms) return "lms";
     if (r.source === SOURCE.Runtime) return "runtime";
     // (#2902 step 5) budget.warn / budget.wait / budget.resume.
@@ -474,7 +467,7 @@ export function groupActivitiesBySections(values: string[]): ActivitySectionGrou
  * changes nothing observable today; it is a blank checkbox nobody could name
  * being dropped rather than faithfully reproduced. */
 /** The namespace prefix of a raw activity string — `"mission.start"` →
- * `"mission"`, `"telemetry.process"` → `"telemetry"`, a prefix-less value
+ * `"mission"`, `"telemetry.tokens"` → `"telemetry"`, a prefix-less value
  * → itself. Used only to GROUP `sortUnmappedActivities`' output; never
  * shown — the checkbox label stays the full string. */
 function activityPrefixOf(a: string): string {

@@ -1,7 +1,7 @@
 /**
  * (#2107) The ONE host-load aggregation both the session drill-in's SYSTEM
  * pane (`lenses/session/sessionRun.ts`) and the global machine drawer
- * (`components/MachineDrawer.tsx`) fold `telemetry.process` samples
+ * (`components/MachineDrawer.tsx`) fold `machine.telemetry` samples
  * through — one implementation so the two surfaces can never report
  * different numbers for the same window of samples.
  *
@@ -21,10 +21,10 @@
 
 import { maxOf } from "./numbers";
 
-/** The bare shape every `telemetry.process` record's `payload` carries —
- * see `run_telemetry_sampler`'s doc in `dispatch_internal.rs` for the
- * producer side. All three are independently optional (a failed host read
- * omits its own field for that tick, never the whole sample). */
+/** One host sample's readings (from a `machine.telemetry` record's
+ * `cpu_pct`/`mem_pct`/`gpu_pct`). All three are independently optional (a
+ * failed host read omits its own field for that tick, never the whole
+ * sample). */
 export interface ProcSamplePoint {
   cpu?: number;
   mem?: number;
@@ -70,7 +70,7 @@ function aggregateMetric(valuesInOrder: number[]): MetricAggregate {
 }
 
 /**
- * Fold a chronologically-ordered list of `telemetry.process` sample
+ * Fold a chronologically-ordered list of `machine.telemetry` sample
  * payloads into a per-metric aggregate. Order matters ONLY for `now` (the
  * latest reading) — callers pass samples in the same ascending-`ts` order
  * the flow stream / route records already carry them in.

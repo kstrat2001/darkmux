@@ -163,8 +163,8 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// start` with no matching terminal) at "now" rather than dropping it.
 ///
 /// Execution bookends (`dispatch.*`) pair by `execution_id`, matched on
-/// [`darkmux_flow::FlowAction`]; a pre-4.0 spaced spelling reads as the same
-/// action (#2425).
+/// [`darkmux_flow::FlowAction`]; a retired spaced spelling reads as an
+/// unknown action and never pairs.
 ///
 /// **The run's own bookend never pairs (#2426 round 2 MF1, contract 8).**
 /// `launch` opens `run.start` around the WHOLE run and
@@ -172,8 +172,8 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// open here; it is a run, not a seat's execution. It still counts toward
 /// `total_records`/`by_action`/the wall window/the machine_uid resolution.
 /// A pre-4.0 archive's whole-run `dispatch start` (`source: "mission"`)
-/// reads as `run.start` through [`darkmux_flow::reader`], so it never pairs
-/// either.
+/// reads as an unknown action through [`darkmux_flow::reader`], so it never
+/// pairs either.
 ///
 /// **A repeated `dispatch start` on the same `execution_id` with no terminal
 /// in between** does not silently overwrite the earlier one: the earlier

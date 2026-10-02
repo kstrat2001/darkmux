@@ -7,9 +7,9 @@
 //!
 //! **Reading.** A consumer reads flow records back through
 //! [`crate::reader`] (`parse_record`, `parse_value`), never by deserializing a
-//! `FlowRecord` itself: the reader upgrades retired spellings and keeps an
-//! action it does not know as `FlowAction::Other`, which is what lets a record
-//! a newer darkmux wrote read at all. `scripts/flow-reader-guard.py` fails CI
+//! `FlowRecord` itself: the reader maps nothing, and keeps an action it does
+//! not know (a retired spelling, or one a newer darkmux wrote) as
+//! `FlowAction::Other`, which is what lets such a record read at all. `scripts/flow-reader-guard.py` fails CI
 //! on a direct `serde_json::from_*::<FlowRecord>` in production code (#3035).
 
 use clap::ValueEnum;
@@ -119,9 +119,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           the fleet `<sender>-from-<peer>`). `session_id` and
 //           `mission_id` are stamped from the one session
 //           (`FlowRecord::for_session`): `mission_id` is the run when it is
-//           a mission, absent for a lab, standalone or relay run. A reader
-//           of an archive reads an old id through
-//           `SessionId::parse_legacy` only.
+//           a mission, absent for a lab, standalone or relay run. An old id
+//           is not read as a session (`SessionId::parse` refuses it).
 //
 //           Also (4.0, CLAUDE.md contract 8): the run grain has its own
 //           bookends. `run.start` / `run.complete` / `run.error` (category

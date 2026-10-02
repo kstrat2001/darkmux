@@ -331,8 +331,7 @@ const KNOWN_ACTIONS: ReadonlySet<string> = new Set(Object.values(ACTION_WIRE));
 /** Whether an action is one this build knows (`ACTION`). The one test of it;
  *  the vocabulary-skew tripwire counts the records that fail it. An action a
  *  release retired is not known: an archive's record of one reads as skew
- *  (#3036), and a surface that still reads one does so by its other fields
- *  (`telemetry.process` host samples, by `category` and `source`). */
+ *  (#3036) and no surface reads it as the action it was. */
 export function isKnownAction(a: NormAction | undefined): boolean {
   return a !== undefined && KNOWN_ACTIONS.has(tagText(a));
 }

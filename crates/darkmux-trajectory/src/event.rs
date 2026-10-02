@@ -113,22 +113,7 @@ pub fn parse_line(line: &str) -> Option<TrajectoryEvent> {
     if line.is_empty() {
         return None;
     }
-    if line.contains(OPENCLAW_TRACE_SCHEMA) && is_openclaw_line(line) {
-        return Some(TrajectoryEvent::Unknown);
-    }
     serde_json::from_str(line).ok().or_else(|| parse_tolerant(line))
-}
-
-/// The `traceSchema` every line of the retired openclaw runtime named (#1405).
-/// Nothing reads that format any more (#3036), and its lines share event
-/// types with current ones (`model.completed`), so they are told apart here
-/// and read as unknown rather than as a current event.
-const OPENCLAW_TRACE_SCHEMA: &str = "openclaw-trajectory";
-
-fn is_openclaw_line(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .is_some_and(|v| v.get("traceSchema").and_then(serde_json::Value::as_str) == Some(OPENCLAW_TRACE_SCHEMA))
 }
 
 /// The fields that identify an event: never dropped to rescue it.

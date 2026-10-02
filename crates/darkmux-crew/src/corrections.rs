@@ -70,13 +70,12 @@ impl PhaseSessions {
         self.phases.is_empty()
     }
 
-    /// Whether a record's `session_id` (in its current or its pre-4.0
-    /// spelling) is one of these phases' coder runs. An exact phase match,
+    /// Whether a record's `session_id` is one of these phases' coder runs. An exact phase match,
     /// never a prefix: a sibling mission whose id is a hyphen-extension of
     /// this one (`auth` and `auth-v2`) never bleeds in, the #849 regression
     /// the brief-injection path's tests pin.
     pub fn admits(&self, session_id: &str) -> bool {
-        SessionId::parse_legacy(session_id, Some(&self.mission)).is_some_and(|s| {
+        SessionId::parse(session_id).is_ok_and(|s| {
             s.mission_id() == Some(self.mission.as_str())
                 && matches!(s.kind(), SessionKind::Phase { phase } if self.phases.contains(phase))
         })
