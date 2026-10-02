@@ -43,7 +43,7 @@ import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 import { displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
 import type { RosterName } from "../../lib/machineIdentity";
 import type { Run } from "../../types/generated/Run";
-import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
+import { utilityReading, utilityStrip, type UtilityReading, type UtilityStrip } from "../../lib/utilityJobs";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
@@ -568,7 +568,7 @@ export interface FleetCardBase extends Omit<FleetCard, "liveTokRate" | "liveTokS
     policy: LifecyclePolicy;
     presence: Presence;
     self: boolean;
-    binding: { id: string; loaded: boolean } | null;
+    utility: UtilityReading;
   };
 }
 
@@ -681,7 +681,7 @@ export function buildFleetCardBase(
     // "running" (a gerund, not a count noun) never pluralizes.
     runsLabel: "running",
     runningSessionIds,
-    liveInputs: { data, runningSids, durableSets, policy, presence, self: id.self, binding: id.self ? (specs?.utility_model ?? null) : null },
+    liveInputs: { data, runningSids, durableSets, policy, presence, self: id.self, utility: row?.utility ?? utilityReading(false, null) },
   };
 }
 
@@ -850,7 +850,7 @@ export function withLiveReadings(
   lastContactMs: number | null = null,
   live: LiveOverlay | null = null,
 ): FleetCard {
-  const { data, runningSids, durableSets, policy, presence, self, binding } = base.liveInputs;
+  const { data, runningSids, durableSets, policy, presence, self, utility: reading } = base.liveInputs;
   const active = base.active;
   const m = base.uid;
   const liveTokRecordSets = runningSids.map((sid, i) => {
@@ -943,7 +943,7 @@ export function withLiveReadings(
     )
     .sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
   const defaultExecutionSessionId = busiestExecution(executions)?.sessionId ?? null;
-  const utility = utilityStrip(data, m, t, binding, self && live ? live.utility : []);
+  const utility = utilityStrip(data, m, t, reading, self && live ? live.utility : []);
   const { liveInputs: _inputs, ...rest } = base;
   return {
     ...rest,

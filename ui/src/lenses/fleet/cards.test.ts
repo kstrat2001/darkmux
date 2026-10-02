@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason, servesLine, servesParts, DISCONNECTED_LAMP, executionCountText } from "./cards";
 import { LampForm } from "../../lib/lamp";
+import { utilityReading, UtilityResidency } from "../../lib/utilityJobs";
 import { outcomeLine, rowStanding, type RowFacts } from "./viewRows";
 import { machineAvailability } from "../../lib/machineAvailability";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -29,7 +30,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, utility: utilityReading(false, null), ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -1020,14 +1021,23 @@ describe("(#2915) buildFleetCard's utility strip", () => {
     expect(card([r], tAt(1)).utility.job).toMatchObject({ job: "dream_job", visual: "generic" });
   });
 
-  it("the model and residency come from this machine's own /machine/specs", () => {
-    const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "util-4b", loaded: true, n_ctx: null } });
-    expect(card([], T_MAX, specs).utility).toMatchObject({ model: "util-4b", resident: true, job: null });
+  it("the model and residency are the row's own card's statement, on any machine", () => {
+    const utility = utilityReading(true, { id: "util-4b", loaded: true });
+    const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1" });
+    for (const isSelf of [true, false]) {
+      const c = buildFleetCard([], new Map(), specs, new Set(), false, "u1", true, T_MAX, rowFactsFor({ isSelf, utility }));
+      expect(c.utility, `isSelf ${isSelf}`).toMatchObject({ model: "util-4b", residency: UtilityResidency.Resident, job: null });
+    }
   });
 
-  it("a peer's model comes from its own utility records; its residency is unknown", () => {
-    expect(card([routeStart(0), routeEnd(1)], tAt(2)).utility).toMatchObject({ model: "util-4b", resident: null });
-    expect(card([], T_MAX).utility).toMatchObject({ model: null, resident: null, job: null });
+  it("a card that registers none has no model, whatever its old records name", () => {
+    const c = buildFleetCard([routeStart(0), routeEnd(1)], new Map(), null, new Set(), false, "u1", true, tAt(2), rowFactsFor({ utility: utilityReading(true, null) }));
+    expect(c.utility).toMatchObject({ model: null, residency: UtilityResidency.None });
+  });
+
+  it("with no card read, residency is unknown and the model comes from its utility records", () => {
+    expect(card([routeStart(0), routeEnd(1)], tAt(2)).utility).toMatchObject({ model: "util-4b", residency: UtilityResidency.Unknown });
+    expect(card([], T_MAX).utility).toMatchObject({ model: null, residency: UtilityResidency.Unknown, job: null });
   });
 
   it("a compaction on this machine shows as compacting, ended by its usage record", () => {

@@ -7,7 +7,7 @@
 // live status line got a smaller scope, a wider name row, and a robot in a
 // different place from its neighbors.
 const { test, expect } = require("@playwright/test");
-const { STATES, SELF_ROW, PEER_ROW, OFFLINE_ROW, installLayoutRoutes } = require("./lib/layout-fixture.js");
+const { STATES, SELF_ROW, PEER_ROW, OFFLINE_ROW, NO_ICON_ROW, viewRow, installLayoutRoutes } = require("./lib/layout-fixture.js");
 
 const PHONES = { "phone-390": { width: 390, height: 844 }, "phone-430": { width: 430, height: 932 } };
 
@@ -85,3 +85,37 @@ test("fleet card: the readout is centered on the tube's axis (desktop)", async (
   }
   await ctx.close();
 });
+
+// (5.0) A card whose machine registers no utility model draws NO robot, but
+// its slot stays: the name row and the card are the size they are with one,
+// so nothing shifts between a card with a robot and one without.
+const SIZES = { "desktop-1280": { width: 1280, height: 900 }, "phone-390": { width: 390, height: 844 } };
+for (const [name, viewport] of Object.entries(SIZES)) {
+  test(`fleet card: no robot keeps the name row and the card's height (${name})`, async ({ browser }) => {
+    const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+    const page = await ctx.newPage();
+    await page.clock.setFixedTime(STATES.find((s) => s.id === "finished").nowMs);
+    const notLoaded = viewRow({ machine_id: "layout-notloaded", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368, utility_model: { id: "darkmux:util-layout", loaded: false, n_ctx: null } }, { entry: { id: "layout-notloaded", address: "100.64.0.11:8765", added_unix_ms: 1 }, liveness: "no_beat" });
+    const resident = viewRow({ machine_id: "layout-resident", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368, utility_model: { id: "darkmux:util-layout", loaded: true, n_ctx: null } }, { entry: { id: "layout-resident", address: "100.64.0.12:8765", added_unix_ms: 1 }, liveness: "no_beat" });
+    await installLayoutRoutes(page, { fleetView: [resident, notLoaded, NO_ICON_ROW, OFFLINE_ROW] });
+    await page.goto("/index.html#lens=fleet");
+    await expect(page.locator(".mach")).toHaveCount(5);
+    await page.waitForTimeout(400);
+    const cards = await page.$$eval(".mach", (cs) =>
+      cs.map((c) => {
+        const u = c.querySelector(".mach-util");
+        const n = c.querySelector(".mach-name").parentElement.getBoundingClientRect();
+        return { residency: u.getAttribute("data-residency"), robot: u.querySelector("svg") !== null, slot: [u.getBoundingClientRect().width, u.getBoundingClientRect().height], nameRow: [Math.round(n.width), Math.round(n.height)], card: Math.round(c.getBoundingClientRect().height) };
+      }),
+    );
+    const states = Object.fromEntries(cards.map((c) => [c.residency, c]));
+    expect(Object.keys(states).sort()).toEqual(["none", "not_loaded", "resident", "unknown"]);
+    expect(states.none.robot).toBe(false);
+    for (const c of cards) {
+      expect(c.slot, "the slot is reserved in every state").toEqual([20, 18]);
+      expect(c.nameRow, `name row ${JSON.stringify(c)}`).toEqual(cards[0].nameRow);
+      expect(c.card, `card height ${JSON.stringify(c)}`).toBe(cards[0].card);
+    }
+    await ctx.close();
+  });
+}
