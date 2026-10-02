@@ -357,8 +357,20 @@ describe("the run page and the mission graph count utility and name it (#3067)",
       usage("to", "analyst", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.work, total_tokens: 1200 }),
     ];
     expect(sumUsage(recs).total).toBe(1200);
+    // No record reports a split: a dash, never a measured 0.
+    expect(tile(recs, "to", "TOKENS IN")).toBe("—");
+    expect(tile(recs, "to", "TOKENS OUT")).toBe("—");
     expect(tileHint(recs, "to", "TOKENS IN")).toContain("1.20k tokens in total");
     expect(tileHint(recs, "to", "TOKENS OUT")).toContain("1.20k tokens in total");
+    // Only part split: the split part shows, the hover names the total.
+    const part = [
+      r({ action: "dispatch.start", session_id: "pt", handle: "coder", payload: {} }),
+      usage("pt", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 69 }),
+      usage("pt", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, total_tokens: 100 }),
+    ];
+    expect(tile(part, "pt", "TOKENS IN")).toBe("60");
+    expect(tile(part, "pt", "TOKENS OUT")).toBe("9");
+    expect(tileHint(part, "pt", "TOKENS IN")).toContain("169 tokens in total");
     // A split that adds up to the total says nothing extra.
     const whole = [r({ action: "dispatch.start", session_id: "wh", handle: "analyst", payload: {} }), usage("wh", "analyst", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 69 })];
     expect(tileHint(whole, "wh", "TOKENS IN")).toBeUndefined();

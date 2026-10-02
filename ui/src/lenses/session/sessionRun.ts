@@ -61,7 +61,7 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { isSingleShotWorkUsage, sumUsage } from "../../lib/usageRecords";
+import { isSingleShotWorkUsage, sumUsage, usageContribution } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
@@ -439,14 +439,19 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
  *  (compaction, radio routing) named beside it as `utility` rather than left
  *  out: a page showing less than its row is two answers for one run. `null`
  *  when nothing was measured (the tile shows "—"). */
-function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number; total: number; utility: number } | null {
+function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number; total: number; utility: number; split: boolean } | null {
   const s = sumUsage(records);
-  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion, total: s.total, utility: s.utility } : null;
+  // No record carried a prompt or completion count: the split was not reported.
+  const split = records.some((r) => {
+    const a = usageContribution(r);
+    return a !== null && (a.prompt > 0 || a.completion > 0);
+  });
+  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion, total: s.total, utility: s.utility, split } : null;
 }
 
 /** The three token figures a tile reads, each `null` when nothing was measured. */
 function tokenFigures(tok: ReturnType<typeof executionTokens>): { tokIn: number | null; tokOut: number | null; tokTotal: number | null; tokUtility: number | null } {
-  return { tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, tokTotal: tok ? tok.total : null, tokUtility: tok ? tok.utility : null };
+  return { tokIn: tok?.split ? tok.prompt : null, tokOut: tok?.split ? tok.completion : null, tokTotal: tok ? tok.total : null, tokUtility: tok ? tok.utility : null };
 }
 
 interface MissionModelRollup {
@@ -1475,8 +1480,8 @@ function modelOf(d: NormRecord | null, endpoint: string | undefined, distinct: s
 /** (#2759) EVIDENCE of model work in a run's own telemetry: actual numbers,
  *  not a start record (a run-grain session has a start and nothing else, and
  *  is exactly the case the mission rollup exists for). */
-function hasTelemetryEvidence(f: { loads: NormRecord[]; turnsValue: number | null; tokIn: number | null; tokOut: number | null; ctxSamples: number; comps: NormRecord[] }): boolean {
-  return f.loads.length > 0 || f.turnsValue != null || f.tokIn != null || f.tokOut != null || f.ctxSamples > 0 || f.comps.length > 0;
+function hasTelemetryEvidence(f: { loads: NormRecord[]; turnsValue: number | null; tokIn: number | null; tokOut: number | null; tokTotal: number | null; ctxSamples: number; comps: NormRecord[] }): boolean {
+  return f.loads.length > 0 || f.turnsValue != null || f.tokIn != null || f.tokOut != null || f.tokTotal != null || f.ctxSamples > 0 || f.comps.length > 0;
 }
 
 type LiveTokScope = NonNullable<SessionRunView["liveTokScope"]>;
@@ -1661,7 +1666,7 @@ export function runRegions(
   // session's shape: `d` exists, every other field is empty). Gating the
   // mission-wide rollup on `d != null` would never fire for the one case it
   // exists to fix, so this checks for actual numbers instead.
-  const ownHasTelemetryEvidence = hasTelemetryEvidence({ loads, turnsValue, tokIn, tokOut, ctxSamples, comps });
+  const ownHasTelemetryEvidence = hasTelemetryEvidence({ loads, turnsValue, tokIn, tokOut, tokTotal, ctxSamples, comps });
   const missionIdForRollup = run?.group.missionId ?? null;
   const missionRuns = missionIdForRollup ? runIndex(data).groupsOfMission(missionIdForRollup) : [];
   const rollup =

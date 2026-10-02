@@ -255,7 +255,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   to no run, so the rows plus it equal the total. The fleet hero's hover says
   how many tokens it includes with no run. The run page's token tiles name the
   run's total on hover when INPUT + GENERATED fall short of it (a total-only
-  record), so the page and the row agree.
+  record), so the page and the row agree; with no split reported at all the tiles read a dash.
 - **`run list --usage` keys each row on the machine that executed the call**
   (#3067). `localhost` means a different machine to whoever made the call, so
   two machines' LM Studios serving the same model merged into one row (a relayed
