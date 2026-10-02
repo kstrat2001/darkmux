@@ -45,7 +45,7 @@ pub(crate) fn run(
     let fleet = darkmux_serve::fleet_records_for_runs();
     let mut built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
     overlay_not_reporting(&mut built.runs, || {
-        let view = darkmux_serve::fleet_view::fetch_local_daemon_view_within(&darkmux_types::config_access::serve_client_addr(), NOT_REPORTING_VIEW_WAIT)?;
+        let view = darkmux_serve::fleet_view::fetch_local_daemon_view_within(&darkmux_types::config_access::serve_client_addr(), darkmux_serve::fleet_view::LOCAL_VIEW_COLD_WAIT)?;
         Some((view, darkmux_serve::live_session_ids()))
     });
     let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
@@ -236,9 +236,6 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
     }
 }
 
-/// How long `run list` waits for its own daemon's fleet view when marking runs
-/// on a down machine. A daemon that does not answer in this time marks nothing.
-const NOT_REPORTING_VIEW_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Whether a running row executed on a machine other than this one: the only
 /// rows that can read "not reporting".
@@ -260,7 +257,9 @@ fn running_on_another_machine(r: &Run) -> bool {
 
 /// The overlay the daemon's `/runs` applies (`darkmux_serve::apply_not_reporting`,
 /// the one owner of "not reporting"). It gathers only when some running row is on
-/// ANOTHER machine, quietly and within a bound; a gather that fails marks nothing
+/// ANOTHER machine, quietly and within a bound (the view from its own local daemon,
+/// which on a cold cache waits up to one peer-card timeout; the live beats from
+/// Redis, read directly and bounded); a gather that fails marks nothing
 /// and says nothing.
 fn overlay_not_reporting(
     rows: &mut [Run],

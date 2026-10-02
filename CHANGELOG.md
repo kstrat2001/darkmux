@@ -93,7 +93,9 @@ darkmux release.
   agree. `run list`'s STATUS column (now 13 wide, so its narrowest pane grew by 2
   columns) reads the same words from one shared fixture, and its subtitle no
   longer leads with the abandon reason. `run list` looks at the fleet view only
-  when a row is running on another machine, quietly and within a short bound; if
+  when a row is running on another machine, quietly and within a bound (the fleet view from its local daemon, which on a cold
+  cache may wait out one peer-card timeout, and the live beats read directly from
+  Redis); if
   the view or the live beats cannot be read it marks nothing.
 - **`darkmux machine list` words a machine's status as its card does** (5.0).
   Under each row: `status: idle`, `dispatch in flight`, `online` (with `not

@@ -1068,6 +1068,17 @@ pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
     Some(beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
 }
 
+/// Log a failed live-beat read once per failure streak (the daemon's `/runs`,
+/// never the CLI), as `read_presence_beats` does: the next success re-arms it.
+fn log_beat_read_once(failed: bool) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !failed {
+        LOGGED.store(false, Ordering::Relaxed);
+    } else if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("darkmux serve: GET /runs — reading the live session beats failed; no run is marked not reporting until it succeeds");
+    }
+}
+
 /// Mark the running rows whose machine the view holds as down and whose session
 /// has no live beat ([`runs::mark_not_reporting`]), but only when BOTH facts
 /// were read: no view, or a failed beat read, marks nothing (never "not
@@ -1878,7 +1889,9 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
         let mut rows = runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records);
-        apply_not_reporting(&mut rows, view.as_ref(), live_session_ids().as_ref());
+        let live = live_session_ids();
+        log_beat_read_once(live.is_none());
+        apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
         (rows, fleet.state)
     })
     .await;

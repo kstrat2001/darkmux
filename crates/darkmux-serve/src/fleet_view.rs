@@ -819,6 +819,11 @@ pub fn fetch_local_daemon_view_within(daemon_addr: &str, timeout: Duration) -> O
 
 /// The longest a CLI waits for its own daemon's view: the daemon gathers
 /// every peer in parallel behind its own per-request bounds.
+/// How long a caller that must not wait long (`darkmux run list`) gives its own
+/// daemon's view: one cold gather waits up to `PEER_CARD_TIMEOUT` on a peer that
+/// is off, so the bound is that plus a margin for the round trip.
+pub const LOCAL_VIEW_COLD_WAIT: Duration = Duration::from_millis(PEER_CARD_TIMEOUT.as_millis() as u64 + 500);
+
 const LOCAL_VIEW_TIMEOUT: Duration = Duration::from_secs(12);
 
 // ─── asking one peer ───────────────────────────────────────────────────────

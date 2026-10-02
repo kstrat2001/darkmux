@@ -178,9 +178,8 @@ export function runMachineLabels(runs: Run[]): Map<string, string> {
   return labels;
 }
 
-/** viewer.html: `function runsFiltered()`, parameterized over `runs`/`kind`
- * rather than reading `state.runsKind`/`RUNS` off module globals. Newest first
- * by the hub's receive order (`Run.receive_key`, #3017), never an executor's clock. */
+/** The runs a kind tab shows, filtered by `kind`. Newest first by the hub's
+ * receive order (`Run.receive_key`, #3017), never an executor's clock. */
 export function runsFiltered(runs: Run[], kind: string): Run[] {
   const rows = kind === "all" ? runs.slice() : runs.filter((r) => r.kind === kind);
   rows.sort((a, b) => b.receive_key - a.receive_key);
