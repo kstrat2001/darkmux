@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "Quick coding-task workload. Self-contained — ships its own minimal Python sandbox via setupContent, so it runs out of the box with no external project setup. Pairs the chat-completion smoke (`quick-q`) with a tool-call smoke at the same scale. Verifies that the dispatched role can read a file, identify a bug, edit the file, and confirm via a test run. Uses Python's stdlib unittest so no pip install is required on a fresh Mac.",
 
   "workload": {

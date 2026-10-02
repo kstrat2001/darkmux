@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{key_issues, no_retired, open_objects, Reach};
+use darkmux_types::user_files::{key_issues, no_retired, open_objects, Reach, UserFileKind};
 use serde_json::{json, Value};
 
 fn quick_q() -> Value {
@@ -154,8 +154,10 @@ fn every_shipped_document_has_no_unknown_keys() {
     for (id, text) in crate::workloads::load::EMBEDDED_WORKLOADS {
         let doc: Value = serde_json::from_str(text).unwrap();
         assert_eq!(key_issues::<WorkloadManifest>(&doc, &no_retired), vec![], "builtin workload {id}");
+        assert_eq!(doc["schema_version"], UserFileKind::Workload.schema_version(), "builtin workload {id}");
     }
     assert_eq!(key_issues::<FixtureManifest>(&tiny_fixture(), &no_retired), vec![]);
+    assert_eq!(tiny_fixture()["schema_version"], UserFileKind::LabFixture.schema_version());
 }
 
 #[test]

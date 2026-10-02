@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#1959) Read-shaped rule: no prefilter is possible, so it rides the single read pass over each chunk alongside every other read rule. Chunks are whole files grouped up to `chunk_tokens`.",
   "id": "doc-contradicts-code",
   "kind": "read",

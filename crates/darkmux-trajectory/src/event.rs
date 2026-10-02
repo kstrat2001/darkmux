@@ -19,6 +19,12 @@ use crate::usage::Usage;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrajectoryEvent {
+    /// The first line of a trajectory (#3035): the file's data-shape
+    /// version. Not an execution event: the fold records the version and
+    /// counts nothing for it, so an otherwise empty trajectory still folds
+    /// empty.
+    #[serde(rename = "trajectory.header")]
+    Header(Header),
     #[serde(rename = "dispatch.start")]
     DispatchStart(DispatchStart),
     #[serde(rename = "dispatch.complete")]
@@ -156,7 +162,14 @@ fn parse_tolerant(line: &str) -> Option<TrajectoryEvent> {
     serde_json::from_value(serde_json::Value::Object(kept)).ok()
 }
 
-/// `dispatch.start`: the first event.
+/// `trajectory.header`: the version of the shape the rest of the file is in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Header {
+    pub schema_version: String,
+}
+
+/// `dispatch.start`: the first execution event.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DispatchStart {
@@ -242,6 +255,10 @@ pub enum StreamPhase {
     /// A tool call has been named and its arguments are being written. The
     /// viewer matches this spelling (`ui/src/lib/tokenRate.ts`).
     WritingToolCall,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `model.partial`: one streamed chunk. Stats only, never the chunk text.
@@ -383,6 +400,10 @@ pub enum ToolOutcomeKind {
     Reported,
     /// Did not run, or could not complete.
     Failed,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `tool.completed`: one executed tool call, with its arguments preview and
@@ -630,6 +651,10 @@ pub enum Verdict {
     Continue,
     /// Close the thought and ask for the answer.
     Conclude,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `dispatch.checkpoint`: the harness checked in on a turn at the reasoning
@@ -803,6 +828,10 @@ pub enum MalformedReason {
     NotATool,
     /// A real darkmux tool this execution's role was not granted.
     RealToolNotGranted,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `dispatch.tool.malformed_names`: one turn's calls whose names the
@@ -883,7 +912,8 @@ impl TrajectoryEvent {
             | E::CompactionSkipped(_)
             | E::CompactionUnproductive(_)
             | E::PreSendBound(_)
-            | E::Unknown => None,
+            | E::Header(_)
+                        | E::Unknown => None,
         }
     }
 
@@ -925,7 +955,7 @@ impl TrajectoryEvent {
             E::MalformedToolNames(e) => Some(e.ts),
             E::EscalationTriggered(e) => Some(e.ts),
             E::FeedbackInjected(e) => Some(e.ts),
-            E::Unknown => None,
+            E::Header(_) | E::Unknown => None,
         }
     }
 }

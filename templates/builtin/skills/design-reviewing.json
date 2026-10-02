@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "design-reviewing",
   "description": "Critiques design proposals for UX, architecture, and API shapes. Evaluates rather than writes.",
   "keywords": [

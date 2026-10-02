@@ -733,7 +733,7 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
             darkmux_types::config_access::lab_dir().display()
         );
     }
-    let fold = crate::lab::inspect::run_trajectory(run_dir);
+    let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
     if fold.events == 0 {
         anyhow::bail!(
             "no trajectory events in {}: a run without a trajectory has no derivable numbers",

@@ -10,4 +10,4 @@
  * `PhaseStatus` analog — a Phase either completes or is abandoned by
  * the operator; a Step can fail its own execution.
  */
-export type NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error";
+export type NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error" | "unknown";

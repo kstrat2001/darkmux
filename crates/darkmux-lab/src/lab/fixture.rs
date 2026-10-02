@@ -39,6 +39,11 @@ use std::path::Path;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct FixtureManifest {
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::LAB_FIXTURE_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     /// Logical name of the fixture. Used as the registry key. Operator
     /// can override at register-time via `--name <name>`.
     pub name: String,

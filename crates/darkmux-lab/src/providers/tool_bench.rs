@@ -1256,6 +1256,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 // v3 (4.0): a trial directory carries no `metrics.json`;
                 // its counts are in its `trajectory.jsonl`.
                 "schema_version": 3,
+                "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
                 "run_id": run_id,
                 "workload": wl.id,
                 "provider": self.id(),

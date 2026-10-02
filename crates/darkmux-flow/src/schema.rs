@@ -4,6 +4,13 @@
 //! `Stage`), the per-day file/timestamp helpers, and the env-driven
 //! machine-provenance resolver (`resolve_machine_id`).
 //! Split out of the crate's sink/record core (#508).
+//!
+//! **Reading.** A consumer reads flow records back through
+//! [`crate::reader`] (`parse_record`, `parse_value`), never by deserializing a
+//! `FlowRecord` itself: the reader upgrades retired spellings and keeps an
+//! action it does not know as `FlowAction::Other`, which is what lets a record
+//! a newer darkmux wrote read at all. `scripts/flow-reader-guard.py` fails CI
+//! on a direct `serde_json::from_*::<FlowRecord>` in production code (#3035).
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};

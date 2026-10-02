@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#1959) First crawler workload. Scans a bounded Rust scope for ONE named pattern and records each match via the create_finding tool. Read-only by role palette. (#1964) The match rule names operations that can REALLY fail, not merely ones that return a Result: in-memory writes and join-handle results are excluded explicitly, because two model families read the earlier wording opposite ways and one spent 78% of its budget on ~36 `writeln!`-into-a-String sites. The point of this workload is MEASUREMENT — finding rate, evidence validity, and whether a local model reliably calls a schema'd tool at all — not the findings themselves. Register the scope via `darkmux lab fixture register`; the ${SANDBOX_DIR} placeholder resolves to the per-run clone.",
   "workload": {
     "id": "crawl-error-discard",

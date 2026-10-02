@@ -4183,7 +4183,8 @@ fn partition_step_outcomes(
         match step.status {
             NodeStatus::Complete => completed.push(step.id.as_str()),
             NodeStatus::Error => errored.push(step.id.as_str()),
-            NodeStatus::Planned | NodeStatus::Running | NodeStatus::Abandoned => {
+            // (#3035) A status this build does not know is not a completion.
+            NodeStatus::Planned | NodeStatus::Running | NodeStatus::Abandoned | NodeStatus::Unknown => {
                 never_ran.push(step.id.as_str())
             }
         }

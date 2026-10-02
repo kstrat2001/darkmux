@@ -115,6 +115,10 @@ pub enum JudgeRuling {
     /// The dispatch itself failed (propagated up from `chat`, wrapped here
     /// rather than aborting the whole docket over one bad call).
     Error,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One judge call's outcome. `pass` is `1` or `2` (double-confirm); one
@@ -138,6 +142,10 @@ pub enum Tier {
     Confirmed,
     NeedsCheck,
     Archived,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// (#1260/#1177) The verify (adjudication) seat's ruling vocabulary — the
@@ -160,6 +168,10 @@ pub enum VerifyRuling {
     /// the stage's remote token budget was exhausted: the note names which;
     /// since #2902 step 5 no call is skipped for budget).
     Error,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// (#1260) One verify-seat adjudication outcome for a confirmed finding.
@@ -400,6 +412,10 @@ pub enum DegenerateKind {
     /// judge phase with no usable ruling. Stays the existing loud,
     /// never-a-silent-pass "degraded" treatment.
     Error,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Serde helper for the skip-if-zero count fields — keeps envelopes from
@@ -651,5 +667,19 @@ mod tests {
             matches!(review_mission_outcome(&env), RunOutcome::Complete),
             "a benign zero-bundle run must not fail the mission mapping"
         );
+    }
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<Tier>(), Tier::Unknown);
+        assert_eq!(read::<JudgeRuling>(), JudgeRuling::Unknown);
+        assert_eq!(read::<VerifyRuling>(), VerifyRuling::Unknown);
+        assert_eq!(read::<DegenerateKind>(), DegenerateKind::Unknown);
+        assert_eq!(read::<crate::lab::bundle::SkipReason>(), crate::lab::bundle::SkipReason::Unknown);
     }
 }

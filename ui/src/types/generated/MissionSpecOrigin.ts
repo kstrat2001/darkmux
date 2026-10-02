@@ -5,4 +5,4 @@
  * read (an unrecognized future value deserializes as if absent via the
  * field's `Option` + default — contract 5).
  */
-export type MissionSpecOrigin = "userconfig" | "builtin";
+export type MissionSpecOrigin = "userconfig" | "builtin" | "unknown";

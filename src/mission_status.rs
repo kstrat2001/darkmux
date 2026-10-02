@@ -1682,6 +1682,10 @@ fn section_groups<'v, 'a>(visible: &[&'v MissionView<'a>]) -> Vec<(MissionStatus
         // is NOT a success, and folding it under FINALIZED is what let 6 of
         // 51 phase-bearing missions read as finished work that never ran.
         MissionStatus::Aborted,
+        // (#3035) Last, and never merged into another group: a status a newer
+        // darkmux wrote is a mission this build cannot place, and dropping its
+        // section would make it vanish from the board.
+        MissionStatus::Unknown,
     ]
     .into_iter()
     .map(|group| (group, visible.iter().filter(|v| v.m.status == group).copied().collect::<Vec<_>>()))
@@ -2249,7 +2253,7 @@ fn default_limit(group: MissionStatus) -> usize {
         // lands — and when nothing is open it is the whole board, so a
         // 3-row budget answered "what's recent" with one day's tail.
         // Still well under ACTIVE's 10: open work outranks closed.
-        MissionStatus::Finalized | MissionStatus::Aborted => 8,
+        MissionStatus::Finalized | MissionStatus::Aborted | MissionStatus::Unknown => 8,
         MissionStatus::Active => 10,
     }
 }
@@ -2452,6 +2456,7 @@ fn status_word(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Finalized => "finalized",
         MissionStatus::Aborted => "aborted",
+        MissionStatus::Unknown => "unknown",
     }
 }
 

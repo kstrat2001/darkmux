@@ -165,6 +165,13 @@ fn hub_link_row(link: &darkmux_flow::HubLink) -> Check {
         HubLink::Unverified => {
             check("flow hub link", Status::Pass, "no write has been attempted yet".into(), None)
         }
+        // (#3035) A link state a newer darkmux reported: not a pass.
+        HubLink::Unknown => check(
+            "flow hub link",
+            Status::Warn,
+            "the daemon reported a hub link state this darkmux does not know".into(),
+            Some("Upgrade this darkmux to the version the daemon runs.".into()),
+        ),
         HubLink::Unreachable { since, reason } => check(
             "flow hub link",
             Status::Warn,

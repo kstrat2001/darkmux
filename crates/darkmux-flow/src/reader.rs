@@ -3,7 +3,8 @@
 //! Every consumer that reads flow records back (day files, the Redis stream,
 //! a peer's records, the audit substrate's JSON bodies) goes through this
 //! module, so a record reads with exactly one spelling per event whichever
-//! archive it came from.
+//! archive it came from. The rule is enforced in CI: `scripts/flow-reader-guard.py`
+//! fails on production code that deserializes a `FlowRecord` itself (#3035).
 //!
 //! * [`parse_record`] for a typed [`FlowRecord`].
 //! * [`parse_value`] for a consumer that keeps the record as JSON (the

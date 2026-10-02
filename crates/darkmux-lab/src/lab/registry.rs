@@ -140,7 +140,16 @@ impl LabRegistry {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let reg: LabRegistry = serde_json::from_str(&raw).with_context(|| {
+        let doc: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+            format!("parsing {} as lab registry — the file is not valid JSON", path.display())
+        })?;
+        // (#3035) A registry a newer darkmux wrote may name fixtures in a
+        // shape this build cannot place: refused, and never rewritten.
+        let known = darkmux_types::data_version::LAB_REGISTRY_SCHEMA_VERSION;
+        if let Some(v) = darkmux_types::data_version::newer(&doc, known) {
+            anyhow::bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("lab registry", &v, known));
+        }
+        let reg: LabRegistry = serde_json::from_value(doc).with_context(|| {
             format!(
                 "parsing {} as lab registry — the file appears corrupt. \
                  New writes are atomic (#543), so this is most likely a legacy \
@@ -214,8 +223,9 @@ impl LabRegistry {
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
         }
-        let json = serde_json::to_string_pretty(self)
-            .context("serializing lab registry")?;
+        let mut doc = serde_json::to_value(self).context("serializing lab registry")?;
+        darkmux_types::data_version::stamp(&mut doc, darkmux_types::data_version::LAB_REGISTRY_SCHEMA_VERSION);
+        let json = serde_json::to_string_pretty(&doc).context("serializing lab registry")?;
 
         // Write to a sibling temp file, then atomic rename onto `path`
         // (#543). `flock(2)` (#496) serializes writers, but a bare
@@ -365,6 +375,21 @@ mod tests {
         let reg_path = tmp.path().join("nonexistent.json");
         let reg = LabRegistry::load(&reg_path).unwrap();
         assert!(reg.fixtures.is_empty());
+    }
+
+    /// (#3035) The registry is stamped on save and a newer one is refused on
+    /// load (and so never rewritten by a read-modify-write).
+    #[test]
+    fn the_registry_is_stamped_and_a_newer_one_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        LabRegistry::default().save(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["schema_version"], darkmux_types::data_version::LAB_REGISTRY_SCHEMA_VERSION);
+        doc["schema_version"] = serde_json::json!("999.0");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let err = LabRegistry::load(&path).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (lab registry `999.0`") && err.contains("Upgrade darkmux."), "{err}");
     }
 
     #[test]

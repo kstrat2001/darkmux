@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "lab-running",
   "description": "Executes lab dispatches, records trajectories, and collects timing data from run harness.",
   "keywords": [

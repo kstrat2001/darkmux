@@ -462,3 +462,15 @@ fn backfill_skips_heartbeats_and_still_sends_the_rest() {
         lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
     assert_eq!(handles, ["tool", "turn"], "heartbeat skipped, the rest sent: {handles:?}");
 }
+
+/// (#3035) A link state or health value a newer darkmux wrote reads as
+/// `Unknown`, so the status that carries it still parses.
+#[test]
+fn a_state_from_a_newer_darkmux_reads_as_unknown() {
+    let link: HubLink = serde_json::from_str(r#"{"state":"from_the_future","detail":1}"#).unwrap();
+    assert_eq!(link, HubLink::Unknown);
+    let health: crate::status::HealthState = serde_json::from_str("\"from_the_future\"").unwrap();
+    assert_eq!(health, crate::status::HealthState::Unknown);
+    let known: HubLink = serde_json::from_str(r#"{"state":"connected"}"#).unwrap();
+    assert_eq!(known, HubLink::Connected);
+}

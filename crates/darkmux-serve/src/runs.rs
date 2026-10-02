@@ -141,6 +141,10 @@ pub enum AbandonReason {
     /// is the honest "no ending recorded" case, never a claim that the run
     /// gave up on purpose.
     NoTerminal,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// (#2682 fix-pass) Which of THREE genuinely different situations produced
@@ -1318,6 +1322,9 @@ fn mission_run_status_and_evidence(
     now_ms: u64,
 ) -> (RunStatus, Option<DispatchSessionEvidence>) {
     match mission.status {
+        // (#3035) A status a newer darkmux wrote: this binary cannot say how
+        // the run ended, and must not fold it into a green or a red one.
+        MissionStatus::Unknown => (RunStatus::Unparseable, None),
         MissionStatus::Active => {
             let Some(started_ts) = mission.started_ts else {
                 return (RunStatus::Planned, None);
@@ -3021,6 +3028,15 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
     }
 
+    /// (#3035) A mission status a newer darkmux wrote reads `unparseable`:
+    /// never a green or a red verdict this binary cannot back.
+    #[test]
+    fn mission_run_status_unknown_is_unparseable_not_a_verdict() {
+        let mut m = minimal_mission("m-unk", vec![], None);
+        m.status = MissionStatus::Unknown;
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Unparseable);
+    }
+
     #[test]
     fn mission_run_status_active_with_no_started_ts_is_planned() {
         // (#1523 gate CONSIDER 4) Minted but never actually started — the
@@ -3271,7 +3287,7 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Degraded);
     }
 
-    /// (#1892) `MissionStatus` has exactly four variants; no wildcard, so a
+    /// (#1892) `MissionStatus` has exactly five variants; no wildcard, so a
     /// fifth variant fails to compile HERE until a human decides whether it
     /// is terminal-abandon-shaped or terminal-success-shaped. This is the
     /// exact shape of bug #1627 fixed once already: `Aborted` used to fall
@@ -3282,7 +3298,7 @@ mod tests {
         match status {
             MissionStatus::Aborted => true,
             MissionStatus::Finalized => false,
-            MissionStatus::Active => {
+            MissionStatus::Active | MissionStatus::Unknown => {
                 panic!("not a terminal status; see mission_run_status_active_is_running")
             }
         }
@@ -8027,5 +8043,16 @@ mod tests {
         assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.started_ts, None, "no record, no claim");
+    }
+
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<AbandonReason>(), AbandonReason::Unknown);
     }
 }

@@ -436,7 +436,7 @@ impl WorkloadProvider for CodingTaskProvider {
         };
         // Every count is the fold of the run's trajectory: the one reading
         // `run stats` and the live tailer use too.
-        let fold = crate::lab::inspect::run_trajectory(run_dir);
+        let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
         let turns = fold.turns();
         let compactions = fold.compactions();
         let rest_ms = fold.rest_ms();
@@ -1238,6 +1238,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // through `lab::inspect::run_trajectory`. The enrichers only ever
         // RAISE the version, so a v7 run stays v7.
         "schema_version": 8,
+        "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": run_id,
         "workload": m.workload_id,
         "provider": CodingTaskProvider.id(),
@@ -1384,7 +1385,7 @@ mod tests {
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
-            manifest: WorkloadManifest { workload: spec },
+            manifest: WorkloadManifest { schema_version: None, workload: spec },
             manifest_path: base_dir.join("workload.json"),
             base_dir,
             source: WorkloadSource::OnDisk,
@@ -1442,6 +1443,7 @@ mod tests {
             let manifest: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(manifest["ok"], ok, "case {i}");
+            assert_eq!(manifest["manifest_schema_version"], darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION, "case {i}");
             assert_eq!(manifest.get("escalation").and_then(|e| e.as_str()), escalation, "case {i}");
         }
     }

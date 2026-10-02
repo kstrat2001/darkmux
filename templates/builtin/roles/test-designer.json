@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "test-designer",
   "role_family": "specialist",
   "description": "Plans test strategies, selects edge cases, and writes test fixtures. Implements tests using exec to run them.",

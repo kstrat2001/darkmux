@@ -2393,6 +2393,9 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
     match &p.problem {
         Problem::Unreadable(_) => format!("make it readable (and under the size cap); until then {unloaded}"),
         Problem::NotJson(_) => format!("fix the JSON syntax; until then {unloaded}"),
+        Problem::Newer { .. } => {
+            "upgrade darkmux to the version that wrote it; until then every command that starts work refuses it at preflight".to_string()
+        }
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
@@ -2432,7 +2435,9 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
                     )
                 ),
                 status: Status::Fail,
-                message: format!("{p}{consequence}"),
+                // A refusal sentence already ends in a period (`Upgrade
+                // darkmux.`), and the consequence starts with one.
+                message: format!("{}{consequence}", p.to_string().trim_end_matches('.')),
                 hint: Some(user_file_hint(p)),
             }
         })
@@ -4646,6 +4651,13 @@ fn check_flow_sink_health() -> Check {
             ),
             hint: None,
         },
+        // (#3035) A state a newer darkmux wrote: neither a pass nor a failure.
+        darkmux_flow::HealthState::Unknown => Check {
+            name: "flow sink health".into(),
+            status: Status::Warn,
+            message: format!("{composition} · the sink health state is one this darkmux does not know"),
+            hint: Some("Upgrade darkmux, then run `darkmux flow status` for full detail.".into()),
+        },
         darkmux_flow::HealthState::Warn => {
             let reasons = if status.warn_reasons.is_empty() {
                 "(no specific warn reasons captured)".to_string()
@@ -6286,8 +6298,6 @@ enum SchemaDrift {
     None,
     /// An older MAJOR: the 4.0 major broke old documents.
     OlderMajor { doc_major: u32 },
-    /// Same major, newer minor: a field minted after this build is inert.
-    NewerMinor(String),
     /// Same major, older minor: the number is stale, the document is fine.
     OlderMinor(String),
 }
@@ -6304,14 +6314,10 @@ fn user_schema_drift(declared: Option<&str>) -> SchemaDrift {
     if doc_major != bin_major {
         return SchemaDrift::None;
     }
-    if doc_minor > bin_minor {
-        SchemaDrift::NewerMinor(format!(
-            "declares schema {doc_major}.{doc_minor}, NEWER than this binary's \
-             {bin_major}.{bin_minor}, so any field minted after {bin_major}.{bin_minor} is \
-             swallowed by the lenient-on-read `extras` and silently does nothing here (a run \
-             would still complete green)"
-        ))
-    } else if doc_minor < bin_minor {
+    // (#3035) A NEWER minor is not judged here: the user-file gate refuses a
+    // document whose schema_version is newer than this binary reads (`mission
+    // launch` fails at preflight), and that check owns the message.
+    if doc_minor < bin_minor {
         SchemaDrift::OlderMinor(format!(
             "declares schema {doc_major}.{doc_minor}, older than this binary's \
              {bin_major}.{bin_minor}: every field it names is one this build understands, so \
@@ -6423,9 +6429,18 @@ fn check_mission_config_registry() -> Check {
                 let findings = loaded.config.validate(&known_kind_refs);
                 let errors: Vec<_> =
                     findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
+                // (#3035) A schema NEWER than this binary reads is refused by the
+                // user-file gate and reported by that check, once; this one
+                // keeps only the drift that gate does not own.
+                let is_newer = loaded.config.schema_version.as_deref().is_some_and(|v| {
+                    darkmux_types::data_version::is_newer(
+                        &serde_json::Value::String(v.to_string()),
+                        mission_config::MISSION_CONFIG_SCHEMA,
+                    )
+                });
                 let version_drift: Vec<_> = findings
                     .iter()
-                    .filter(|f| f.severity == FindingSeverity::Warning && f.path == "schema_version")
+                    .filter(|f| !is_newer && f.severity == FindingSeverity::Warning && f.path == "schema_version")
                     .collect();
                 let kind_warnings: Vec<_> = findings
                     .iter()
@@ -6465,22 +6480,12 @@ fn check_mission_config_registry() -> Check {
                 // direction is INFORMATIONAL only.
                 //
                 // LEADING (`doc_minor > bin_minor`) — the document is NEWER
-                // than the binary, so it may name fields this build has never
-                // heard of, and lenient-on-read means those fields are
-                // SILENTLY DISCARDED: the run completes green with zero
-                // findings and no surface says a thing. Nothing else in the
-                // stack catches it — `MissionConfig::validate()` flags
-                // exactly two SPECIFIC retired keys (`gh_verb`, `expand`);
-                // any unknown or future key is inert by construction, which
-                // is precisely the hazard. And the schema's own changelog
-                // refutes "additive means safely ignorable": `grow` (3.2)
-                // silently mints nothing for a template task, `outcome_from`
-                // (3.3) promotes the wrong payload, `reads` (1.4) is #1619's
-                // dropped cross-phase data. The live topology this protects
-                // is current: the laptop on `main` authors a user-tier config
-                // using a field a newer schema added; the Studio on
-                // brew-stable runs it with an older binary. So this direction
-                // stays a WARN.
+                // than the binary. Not judged here (#3035): the user-file
+                // gate refuses it ("written by a newer darkmux ... Upgrade
+                // darkmux."), `mission launch` fails at preflight, and the
+                // `user file keys` check carries that one message. This
+                // check used to warn that a run "would still complete
+                // green", which contradicted the refusal.
                 if loaded.source == mission_config::MissionConfigSource::User {
                     match user_schema_drift(loaded.config.schema_version.as_deref()) {
                         SchemaDrift::None => {}
@@ -6492,7 +6497,6 @@ fn check_mission_config_registry() -> Check {
                                 .unwrap_or_else(|| id.clone());
                             older_major.push((file, doc_major));
                         }
-                        SchemaDrift::NewerMinor(note) => blocking.push((id.clone(), note)),
                         SchemaDrift::OlderMinor(note) => minor_drift.push((id.clone(), note)),
                     }
                 }
@@ -6547,11 +6551,9 @@ fn check_mission_config_registry() -> Check {
                  an operator-pointed `DARKMUX_TEMPLATES_DIR`/`config.dirs.templates` override, its \
                  `templates/builtin/mission-configs/<id>.json`) — a \
                  dangling depends_on, an empty id, or a schema_version your darkmux build \
-                 doesn't recognize. A document declaring a schema_version NEWER than this \
-                 binary's is the one to look at hardest: it parses cleanly, so any field minted \
-                 after this build's schema lands in `extras` and does nothing — either upgrade \
-                 darkmux on this machine or drop the newer fields from the document. These \
-                 documents DO execute — `darkmux mission launch <id>` runs any config whose \
+                 doesn't recognize. (A document declaring a schema_version NEWER than this \
+                 binary's is refused at preflight and reported by the user-file check, not \
+                 here.) These documents DO execute — `darkmux mission launch <id>` runs any config whose \
                  graph names step kinds this build can construct, so a finding here is a config \
                  that MAY fail at launch, not a dormant one — an Error-tier finding bails the \
                  launch, a Warning-tier one (a schema_version drift, say) only prints."
@@ -14723,23 +14725,6 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_warns_on_schema_version_drift() {
-        let guard = CrewRootGuard::new();
-        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
-        std::fs::write(
-            guard.path().join("mission-configs").join("future.json"),
-            r#"{"id":"future","name":"Future","schema_version":"99.0"}"#,
-        )
-        .unwrap();
-
-        let check = check_mission_config_registry();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("future"), "{}", check.message);
-        assert!(check.message.contains("schema_version"), "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
     fn check_mission_config_registry_warns_on_malformed_json() {
         let guard = CrewRootGuard::new();
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
@@ -15052,53 +15037,58 @@ mod tests {
         );
     }
 
-    /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than
-    /// the binary. Parses cleanly (the flatten `extras` swallows unknown
-    /// fields), and THAT is the hazard: a field a newer schema minted is
-    /// silently discarded and the run completes green with zero findings.
-    /// #2428 downgraded the TRAILING direction (all 13 of its false issues
-    /// were trailing) but briefly collapsed both directions into one
-    /// informational note, which deleted this signal entirely. The leading
-    /// direction is a Warn again: nothing else in the stack catches it
-    /// (`MissionConfig::validate()` flags exactly two NAMED retired keys —
-    /// `gh_verb`, `expand`; any unknown or FUTURE key is inert by
-    /// construction), and the schema's own history says a swallowed field
-    /// changes behavior — `grow` (3.2) mints nothing for a template task,
-    /// `outcome_from` (3.3) promotes the wrong payload, `reads` (1.4) is
-    /// #1619 itself. The live topology this protects: the laptop on `main`
-    /// authors a user-tier config; the Studio on brew-stable runs it with an
-    /// older binary.
+    /// (#3035) A user-tier copy on a NEWER schema than the binary is refused
+    /// by the user-file gate, and that is the ONE message: the registry check
+    /// no longer claims the file parses cleanly and a run would complete
+    /// green (it is refused at preflight), for a newer minor or a newer
+    /// major alike.
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_warns_when_user_tier_minor_leads_the_binary() {
-        let guard = CrewRootGuard::new();
-        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
-        // Same major, minor AHEAD of whatever this binary ships — derived
-        // from the constant rather than hardcoded, so the test keeps meaning
-        // the same thing after the next minor bump.
+    fn a_newer_mission_config_is_refused_once_and_the_registry_check_does_not_contradict_it() {
         let (major, minor) =
             parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA).expect("valid constant");
-        let ahead = format!("{major}.{}", minor + 1);
-        std::fs::write(
-            guard.path().join("mission-configs").join("review.json"),
-            format!(
-                r#"{{"id":"review","name":"PR Review (from a newer darkmux)","schema_version":"{ahead}"}}"#
-            ),
-        )
-        .unwrap();
+        for ahead in [format!("{major}.{}", minor + 1), format!("{}.0", major + 1)] {
+            let guard = CrewRootGuard::new();
+            std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+            std::fs::write(
+                guard.path().join("mission-configs").join("review.json"),
+                format!(r#"{{"id":"review","name":"From a newer darkmux","schema_version":"{ahead}"}}"#),
+            )
+            .unwrap();
 
-        let check = check_mission_config_registry();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains(&format!("declares schema {ahead}")),
-            "the warning must name the document's own newer version: {}",
-            check.message
-        );
-        assert!(
-            check.message.contains("issue("),
-            "a minor LEAD is a real finding and must be counted as one: {}",
-            check.message
-        );
+            let registry = check_mission_config_registry();
+            let text = format!("{} {}", registry.message, registry.hint.clone().unwrap_or_default());
+            for claim in ["swallowed", "complete green", "parses cleanly", "lands in `extras`"] {
+                assert!(!text.contains(claim), "{ahead}: the registry check contradicts the refusal ({claim}): {text}");
+            }
+            assert!(!registry.message.contains(&format!("declares schema {ahead}")), "{ahead}: {}", registry.message);
+
+            let rows = check_user_file_keys();
+            let row = rows.iter().find(|r| r.name.contains("review.json")).expect("the gate reports the file");
+            assert_eq!(row.status, Status::Fail);
+            assert!(row.message.contains("written by a newer darkmux"), "{}", row.message);
+            assert!(row.message.contains("Upgrade darkmux. Refused at preflight by: mission launch"), "single period: {}", row.message);
+            assert!(!row.message.contains(".."), "{}", row.message);
+        }
+    }
+
+    /// (#3035) The remedy for a newer file says what actually happens: the
+    /// entry points refuse it. It does not claim the file fails to load or
+    /// that settings fall back to their defaults.
+    #[test]
+    fn the_hint_for_a_newer_file_does_not_claim_a_fallback_to_defaults() {
+        use darkmux_types::user_files::{FileProblem, Problem, UserFileKind};
+        for kind in UserFileKind::ALL {
+            let p = FileProblem {
+                kind,
+                path: "x.json".into(),
+                problem: Problem::Newer { file_version: "99.0".into(), known: "1.0".into() },
+                note: None,
+            };
+            let hint = user_file_hint(&p);
+            assert!(hint.contains("upgrade darkmux") && hint.contains("refuses it at preflight"), "{kind:?}: {hint}");
+            assert!(!hint.contains("falls back") && !hint.contains("fails to load"), "{kind:?}: {hint}");
+        }
     }
 
     /// The informational notes (the trailing-minor drift and the Tier 1

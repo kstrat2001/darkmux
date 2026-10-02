@@ -296,6 +296,7 @@ fn phase_status_to_node(s: PhaseStatus) -> NodeStatus {
         PhaseStatus::Running => NodeStatus::Running,
         PhaseStatus::Complete => NodeStatus::Complete,
         PhaseStatus::Abandoned => NodeStatus::Abandoned,
+        PhaseStatus::Unknown => NodeStatus::Unknown,
     }
 }
 
@@ -494,7 +495,10 @@ impl PhaseDisplayStatus {
     /// comes from here either.
     fn from_node_status(s: NodeStatus) -> Self {
         match s {
-            NodeStatus::Planned => PhaseDisplayStatus::Planned,
+            // (#3035) The lens has no word for a status a newer darkmux wrote:
+            // it reads as not started, never complete and never running, and
+            // the mission's own row reads `unparseable` on the runs board.
+            NodeStatus::Planned | NodeStatus::Unknown => PhaseDisplayStatus::Planned,
             NodeStatus::Running => PhaseDisplayStatus::Running,
             NodeStatus::Complete => PhaseDisplayStatus::Complete,
             NodeStatus::Abandoned => PhaseDisplayStatus::Abandoned,

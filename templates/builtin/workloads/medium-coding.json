@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "Phase B compaction workload. Self-contained Python audit-and-fill task designed to push context past the compaction threshold (~60K tokens) through tool-call accumulation when an agent walks through 4 source modules + 3 existing test files + iterates on filling gaps. Pairs with #342's mocked-LMStudio integration test: that one verifies the loop machinery, this one verifies the compactor produces useful output on real models. Used as the operationally-meaningful before-numbers source for grading future tier-2 compaction (structured-slot fact extraction, #352) against the current narrative-shape compactor.",
   "workload": {
     "id": "medium-coding",

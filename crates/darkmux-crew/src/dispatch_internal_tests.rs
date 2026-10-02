@@ -5202,6 +5202,24 @@
         assert_ne!(execution_for(Some(no_origin.path())), recorded);
     }
 
+    /// (#3035) The origin is stamped with its data-shape version, and a
+    /// resume from a dir whose origin names a newer one is refused with the
+    /// upgrade message instead of being read as if its shape were known.
+    #[test]
+    fn the_resume_origin_carries_its_schema_version_and_a_newer_one_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &ExecutionId::mint());
+        let raw = std::fs::read_to_string(resume_origin_path(dir.path())).unwrap();
+        let mut origin: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(origin["schema_version"], RESUME_ORIGIN_SCHEMA_VERSION);
+        origin["schema_version"] = serde_json::json!("999.0");
+        std::fs::write(resume_origin_path(dir.path()), origin.to_string()).unwrap();
+        std::fs::write(dir.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        let err = validate_resume_checkpoint(dir.path(), "coder", ws.path(), false).unwrap_err().to_string();
+        assert!(err.contains("RESUME ORIGIN NEWER") && err.contains("Upgrade darkmux."), "{err}");
+    }
+
     /// The recorded id is read from a file the model can write, so only the
     /// minted grammar is believed: a planted `legacy:` id, one with control
     /// characters and one with a slash each get a fresh execution.
@@ -5999,6 +6017,7 @@
     fn role_wants_agentic_remote_true_for_nonempty_allow() {
         use crate::types::{EscalationContract, Role, ToolPalette};
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "code-reviewer".into(),
             description: "test".into(),
@@ -6020,6 +6039,7 @@
     fn role_wants_agentic_remote_false_for_empty_allow() {
         use crate::types::{EscalationContract, Role, ToolPalette};
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "pr-reviewer".into(),
             description: "test".into(),
@@ -6531,6 +6551,7 @@
             ..Default::default()
         };
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "coder".into(),
             description: "test".into(),
@@ -6560,6 +6581,7 @@
             ..Default::default()
         };
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "coder".into(),
             description: "test".into(),
@@ -9638,6 +9660,34 @@
             detail.contains("dropped + recovered; request bound was"),
             "must use the non-causal '; request bound was' phrasing, got {detail:?}"
         );
+    }
+
+    /// (#3035) A verdict or malformed reason a newer runtime named is carried
+    /// as unknown: never reported as `continue`, never worded as "not a real
+    /// tool".
+    #[test]
+    fn an_unknown_verdict_or_reason_is_never_reported_as_a_known_value() {
+        let known = |v: &str| {
+            let c = match darkmux_trajectory::parse_line(&format!(r#"{{"type":"dispatch.checkpoint","seq":1,"verdict":"{v}"}}"#)) {
+                Some(darkmux_trajectory::TrajectoryEvent::Checkpoint(c)) => c,
+                other => panic!("{other:?}"),
+            };
+            checkpoint_payload(&c)
+        };
+        assert!(matches!(known("conclude").map(|p| p.verdict), Some(CheckpointVerdict::Conclude)));
+        assert!(matches!(known("continue").map(|p| p.verdict), Some(CheckpointVerdict::Continue)));
+        assert!(known("from_the_future").is_none(), "no checkpoint record claims a verdict nobody read");
+
+        let m = |r: &str| {
+            match darkmux_trajectory::parse_line(&format!(r#"{{"type":"dispatch.tool.malformed_names","count":2,"reason":"{r}"}}"#)) {
+                Some(darkmux_trajectory::TrajectoryEvent::MalformedToolNames(m)) => malformed_detail(&m),
+                other => panic!("{other:?}"),
+            }
+        };
+        let unknown = m("from_the_future");
+        assert!(unknown.contains("reason this darkmux does not know"), "{unknown}");
+        assert!(!unknown.contains("not a real tool") && !unknown.contains("REAL tool"), "{unknown}");
+        assert!(m("not_a_tool").contains("not a real tool"));
     }
 
     /// (#2190) The NEW `dispatch.empty_tool_calls.recovered` event type must

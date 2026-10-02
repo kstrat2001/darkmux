@@ -72,6 +72,10 @@ pub enum ScoreFamily {
     Capability,
     /// Property of the (artifact × machine) pairing; tier-relative.
     Fit,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Three-class outcome (#1113): infra failures are reruns, never zeros.
@@ -88,6 +92,10 @@ pub enum Outcome {
     /// naive `count(outcome == pass)` must not be polluted by aggregates
     /// (review-QA finding on #1200).
     NotApplicable,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What capability scores attach to. `backend` is part of the key — an MLX
@@ -1053,5 +1061,16 @@ mod tests {
         // Hardware fields come from darkmux_hardware::detect() which always
         // returns; the shell-out fields may be None — both are valid.
         assert!(fp.total_ram_gb.is_some());
+    }
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<Outcome>(), Outcome::Unknown);
+        assert_eq!(read::<ScoreFamily>(), ScoreFamily::Unknown);
     }
 }

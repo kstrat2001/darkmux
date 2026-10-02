@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#2310 P4c) DESIGN.md's \"the review-side neighbor check\": a change to a shared symbol is correct in intent, but which callers use it and do they still work? `search` has empty `patterns` because the term IS the changed symbol's own name, only known once the model reads the hunk — `note` carries the instruction instead. Delivered as a search: a list of every caller found, for the author to confirm each.",
   "id": "shared-symbol-callers",
   "kind": "site",

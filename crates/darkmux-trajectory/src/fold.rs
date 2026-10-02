@@ -115,6 +115,9 @@ pub struct TrajectoryFold {
     /// Parseable events applied, any type: zero means the trajectory said
     /// nothing at all.
     pub events: u64,
+    /// The `schema_version` of the `trajectory.header` line, when the file
+    /// has one (#3035). `None` is a trajectory written before the marker.
+    pub schema_version: Option<String>,
     pub start: Option<DispatchStart>,
     pub complete: Option<DispatchComplete>,
     /// The latest clock any event carried.
@@ -145,6 +148,11 @@ pub struct TrajectoryFold {
     pub tool_calls_invalid_name: u32,
     /// Structured calls that named a tool the role was not granted.
     pub tool_calls_ungranted: u32,
+    /// (#3035) Calls a newer runtime reported malformed for a reason this
+    /// build does not know. Counted in neither bucket above (that would claim
+    /// a cause nobody read) and not forwarded to the flow payload, which has
+    /// no field for them.
+    pub tool_calls_unclassified: u32,
     pub checkpoints: Vec<CheckpointRuling>,
     /// The degeneracy policy the latest checkpoint recorded.
     pub checkpoint_policy: Option<String>,
@@ -171,10 +179,11 @@ impl TrajectoryFold {
     /// Take one event into the fold.
     pub fn apply(&mut self, e: &TrajectoryEvent) {
         use TrajectoryEvent as E;
-        self.events = self.events.saturating_add(1);
-        if let Some(ts) = e.ts() {
-            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
+        if let E::Header(h) = e {
+            self.schema_version.get_or_insert_with(|| h.schema_version.clone());
+            return;
         }
+        self.count(e);
         match e {
             E::DispatchStart(s) => {
                 if self.start.is_none() {
@@ -214,14 +223,7 @@ impl TrajectoryFold {
                 ok: t.ok,
                 args: t.args.clone(),
             }),
-            E::MalformedToolNames(m) => {
-                let n = u32::try_from(m.count).unwrap_or(u32::MAX);
-                let bucket = match m.reason {
-                    MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
-                    MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
-                };
-                *bucket = bucket.saturating_add(n);
-            }
+            E::MalformedToolNames(m) => self.malformed_names(m),
             E::Compaction(_) => self.compaction_events = self.compaction_events.saturating_add(1),
             E::Rest(r) => self.rests.push(RestTaken {
                 ms: r.ms,
@@ -264,7 +266,28 @@ impl TrajectoryFold {
             | E::ReasoningBoundNotApplied(_)
             | E::ToolCallDiscarded(_)
             | E::EscalationTriggered(_)
+            | E::Header(_)
             | E::Unknown => {}
+        }
+    }
+
+    fn malformed_names(&mut self, m: &crate::event::MalformedToolNames) {
+        let n = u32::try_from(m.count).unwrap_or(u32::MAX);
+        let bucket = match m.reason {
+            MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
+            MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
+            // (#3035) A reason a newer runtime named: its own bucket, never
+            // one whose cause this build would be asserting.
+            MalformedReason::Unknown => &mut self.tool_calls_unclassified,
+        };
+        *bucket = bucket.saturating_add(n);
+    }
+
+    /// One more event, and the latest clock any event carried.
+    fn count(&mut self, e: &TrajectoryEvent) {
+        self.events = self.events.saturating_add(1);
+        if let Some(ts) = e.ts() {
+            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
         }
     }
 

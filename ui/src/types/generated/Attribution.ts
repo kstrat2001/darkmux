@@ -5,4 +5,4 @@
  * degraded attribution is visible in the output itself (#1286: never
  * silently precise).
  */
-export type Attribution = "per_process" | "estimated" | "unavailable";
+export type Attribution = "per_process" | "estimated" | "unavailable" | "unknown";

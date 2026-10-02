@@ -86,6 +86,14 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         .with_context(|| format!("reading {}", manifest_path.display()))?;
     let meta: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    // (#3035) A run recorded by a newer darkmux may carry fields this binary
+    // cannot place: refuse it rather than inspect a partial reading.
+    let known = darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION;
+    if let Some(file_version) = darkmux_types::data_version::newer_under(&meta, darkmux_types::data_version::RUN_MANIFEST_KEY, known) {
+        let why = darkmux_types::data_version::newer_refusal("run manifest", &file_version, known);
+        return Err(anyhow::anyhow!("{}: {why}", manifest_path.display()));
+    }
+    checked_run_trajectory(&run_dir)?;
     let workload_id = meta
         .get("workload")
         .and_then(|v| v.as_str())
@@ -102,6 +110,23 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
 
     let report = with_provider(provider_id, |p| p.inspect(&loaded, &run_dir))??;
     Ok(report)
+}
+
+/// (#3035) [`run_trajectory`], refused when the trajectory's header names a
+/// data shape newer than this binary reads: its counts could silently omit
+/// what the newer shape added. THE one check every strict trajectory reader
+/// (`lab inspect`, `run stats`, the loop report) goes through.
+pub fn checked_run_trajectory(run_dir: &Path) -> Result<darkmux_trajectory::TrajectoryFold> {
+    let fold = run_trajectory(run_dir);
+    let known = darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION;
+    if let Some(file_version) = &fold.schema_version {
+        let version = serde_json::Value::String(file_version.clone());
+        if darkmux_types::data_version::is_newer(&version, known) {
+            let why = darkmux_types::data_version::newer_refusal("trajectory", file_version, known);
+            return Err(anyhow::anyhow!("{}: {why}", run_dir.join(darkmux_trajectory::TRAJECTORY_FILE).display()));
+        }
+    }
+    Ok(fold)
 }
 
 /// A run named by a path (it contains a `/`) is that path; a bare id is a run
@@ -232,6 +257,33 @@ mod tests {
              inspecting a run — the user tier is forced home (#2590); \
              got: {err}"
         );
+    }
+
+    /// (#3035) A manifest naming a newer shared marker is refused with the
+    /// upgrade message; the same or an absent marker inspects as before.
+    #[test]
+    fn lab_inspect_refuses_a_run_manifest_from_a_newer_darkmux() {
+        let run_dir = TempDir::new().unwrap();
+        std::fs::write(
+            run_dir.path().join("manifest.json"),
+            r#"{"manifest_schema_version":"999.0","workload":"w","provider":"prompt"}"#,
+        )
+        .unwrap();
+        let err = lab_inspect(run_dir.path().to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (run manifest `999.0`") && err.contains("Upgrade darkmux."), "{err}");
+    }
+
+    #[test]
+    fn lab_inspect_refuses_a_trajectory_from_a_newer_darkmux() {
+        let run_dir = TempDir::new().unwrap();
+        std::fs::write(run_dir.path().join("manifest.json"), r#"{"workload":"w","provider":"prompt"}"#).unwrap();
+        std::fs::write(
+            run_dir.path().join(darkmux_trajectory::TRAJECTORY_FILE),
+            "{\"type\":\"trajectory.header\",\"schema_version\":\"999.0\"}\n",
+        )
+        .unwrap();
+        let err = lab_inspect(run_dir.path().to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (trajectory `999.0`") && err.contains("Upgrade darkmux."), "{err}");
     }
 
     #[test]

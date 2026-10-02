@@ -142,6 +142,10 @@ pub enum HealthState {
     Ok,
     Warn,
     Fail,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Build a status snapshot. Cheap: ~10ms when Redis is reachable, sub-ms
@@ -553,17 +557,22 @@ pub(crate) fn probe_disk() -> DiskStatus {
     }
 }
 
+fn health_marker(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Ok => "✓ ok",
+        HealthState::Warn => "⚠ warn",
+        HealthState::Fail => "✗ fail",
+        HealthState::Unknown => "? unknown",
+    }
+}
+
 /// Human-readable rendering of a `FlowStatus`. The CLI's default
 /// (non-`--json`) output.
 pub fn format_status_human(status: &FlowStatus) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
-    let state_marker = match status.overall_state {
-        HealthState::Ok => "✓ ok",
-        HealthState::Warn => "⚠ warn",
-        HealthState::Fail => "✗ fail",
-    };
+    let state_marker = health_marker(status.overall_state);
     let _ = writeln!(out, "darkmux flow status — {state_marker}");
     let _ = writeln!(out, "  schema:       {}", status.schema_version);
     let _ = writeln!(out, "  composition:  {}", status.sinks.composition);

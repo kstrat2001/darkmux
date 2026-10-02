@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#2310 P4c) DESIGN.md's second neighbor-check example: a new string-union type is introduced, does an enum with overlapping members already exist? `search` again has empty `patterns` (the union's own member literals are the search terms, known only from the hunk) — `note` carries the instruction. Delivered as a search: a list of candidate existing enums/unions for the author to confirm against.",
   "id": "union-vs-enum",
   "kind": "site",

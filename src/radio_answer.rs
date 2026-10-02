@@ -364,6 +364,7 @@ fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
         M::Active => "active",
         M::Finalized => "finalized",
         M::Aborted => "aborted",
+        M::Unknown => "unknown",
     }
 }
 

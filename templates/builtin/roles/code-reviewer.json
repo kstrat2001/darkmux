@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "code-reviewer",
   "role_family": "specialist",
   "description": "Senior reviewer who reads PR diffs, identifies issues, leaves substantive comments. Reads code but doesn't write it.",

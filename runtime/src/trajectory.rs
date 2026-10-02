@@ -176,11 +176,16 @@ impl Trajectory {
                     "darkmux-runtime: trajectory → {}",
                     trajectory_path.display()
                 );
-                Self {
+                let mut recorder = Self {
                     file: Some(file),
                     started: Instant::now(),
                     terminal_written: Arc::new(AtomicBool::new(false)),
-                }
+                };
+                // (#3035) The file opens with its data-shape version.
+                recorder.write_event(dt::TrajectoryEvent::Header(dt::Header {
+                    schema_version: dt::TRAJECTORY_SCHEMA_VERSION.to_string(),
+                }));
+                recorder
             }
             Err(e) => {
                 eprintln!(
@@ -1463,6 +1468,28 @@ mod tests {
     use crate::failure_rate::ToolOutcome;
     use darkmux_trajectory::{TRAJECTORY_FILE, TRAJECTORY_SUBDIR};
 
+    /// A trajectory's lines past its `trajectory.header` (#3035): the events.
+    fn events(body: &str) -> impl Iterator<Item = &str> {
+        body.lines().filter(|l| !l.contains("\"trajectory.header\""))
+    }
+
+    /// (#3035) The file opens with its data-shape version, once, first.
+    #[test]
+    fn open_writes_the_schema_version_header_first() {
+        let ws = tempfile::Builder::new().prefix("traj-test-header").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_dispatch_start("m", 1, 1, &[]);
+        drop(t);
+        let body = fs::read_to_string(dt::trajectory_path(ws.path())).unwrap();
+        let first: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(first["type"], "trajectory.header");
+        assert_eq!(first["schema_version"], dt::TRAJECTORY_SCHEMA_VERSION);
+        assert_eq!(body.matches("trajectory.header").count(), 1);
+        let fold = recorded(ws.path());
+        assert_eq!(fold.schema_version.as_deref(), Some(dt::TRAJECTORY_SCHEMA_VERSION));
+        assert_eq!(fold.events, 1, "the header is not an execution event");
+    }
+
     #[test]
     fn open_creates_dot_dir_and_file() {
         let ws = tempfile::Builder::new().prefix("traj-test").tempdir().unwrap();
@@ -1484,7 +1511,7 @@ mod tests {
         drop(t);
         let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
         let body = fs::read_to_string(&traj_file).unwrap();
-        let first: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let first: serde_json::Value = serde_json::from_str(events(&body).next().unwrap()).unwrap();
         assert_eq!(first["type"], "dispatch.start");
         assert_eq!(first["tools"], serde_json::json!(["search", "read", "bash", "create_finding"]));
     }
@@ -1502,7 +1529,7 @@ mod tests {
             .join(TRAJECTORY_SUBDIR)
             .join(TRAJECTORY_FILE);
         let body = fs::read_to_string(&traj_file).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
+        let lines: Vec<&str> = events(&body).collect();
         assert_eq!(lines.len(), 2);
         // Each line should parse as JSON
         for line in &lines {
@@ -1547,7 +1574,7 @@ mod tests {
 
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         assert!(!body.contains("SECRET-CONTENT"), "no argument but the path is recorded: {body}");
-        let ev: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(events(&body).next().unwrap()).unwrap();
         // (#2963) The host forwards each entry's `name` as `tool_names`.
         let names: Vec<&str> = ev["tool_calls"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["read", "bash", "write", "edit", "search", "write", "edit", "read", "not_a_tool"]);
@@ -1584,7 +1611,7 @@ mod tests {
         t.append_model_completed(2, "tool_calls", CallTokens::default(), Some(&calls), None, None);
         drop(t);
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
-        let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let lines: Vec<serde_json::Value> = events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines[0]["calls_planned"], true, "planned: {}", lines[0]);
         assert_eq!(lines[0]["tool_calls"][0]["runs"], false);
         assert!(lines[1].get("calls_planned").is_none(), "no plan, no marker: {}", lines[1]);
@@ -1618,7 +1645,7 @@ mod tests {
 
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
+        let lines: Vec<&str> = events(&body).collect();
         let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["type"], "model.completed");
         assert_eq!(
@@ -1649,7 +1676,7 @@ mod tests {
 
         let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
         let body = fs::read_to_string(&traj_file).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
+        let lines: Vec<&str> = events(&body).collect();
         assert_eq!(lines.len(), 2, "one runtime.rest event per rest");
         for line in &lines {
             let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -1678,7 +1705,7 @@ mod tests {
         let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
         let body = fs::read_to_string(&traj_file).unwrap();
         let lines: Vec<serde_json::Value> =
-            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["reason"], "thermal");
         assert_eq!(lines[0]["state"], "critical");
@@ -1706,7 +1733,7 @@ mod tests {
             ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
         )
         .unwrap();
-        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(events(&body).next().unwrap()).unwrap();
 
         assert_eq!(
             line["result"], serde_json::json!(failure),
@@ -1752,7 +1779,7 @@ mod tests {
         drop(t);
 
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
-        let mut lines = body.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap());
+        let mut lines = events(&body).map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap());
         let reported = lines.next().unwrap();
         let read = lines.next().unwrap();
 
@@ -1788,8 +1815,7 @@ mod tests {
             ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
         )
         .unwrap();
-        let lines: Vec<serde_json::Value> = body
-            .lines()
+        let lines: Vec<serde_json::Value> = events(&body)
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(lines.len(), 2);
@@ -1812,14 +1838,8 @@ mod tests {
         let big = "x".repeat(MAX_TOOL_ARGS_CHARS + 200);
         t.append_tool_completed(1, 0, "write", &big, "", &ToolOutcome::Ok, None, None);
         drop(t);
-        let line: serde_json::Value = serde_json::from_str(
-            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE))
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let line: serde_json::Value = serde_json::from_str(events(&body).next().unwrap()).unwrap();
         let recorded = line["args"].as_str().unwrap();
         assert_eq!(recorded.chars().count(), MAX_TOOL_ARGS_CHARS + 1); // cap + '…'
         assert!(recorded.ends_with('…'));
@@ -1841,7 +1861,7 @@ mod tests {
         )
         .unwrap();
         let line: serde_json::Value =
-            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            serde_json::from_str(events(&body).next().unwrap()).unwrap();
         assert_eq!(line["type"], "dispatch.context");
         assert_eq!(line["seq"], 3);
         assert_eq!(line["used"], 42000);
@@ -1864,7 +1884,7 @@ mod tests {
         )
         .unwrap();
         let line: serde_json::Value =
-            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            serde_json::from_str(events(&body).next().unwrap()).unwrap();
         assert_eq!(line["used"], 5000);
         assert!(line["max"].is_null(), "None max must serialize as JSON null");
     }
@@ -1881,7 +1901,7 @@ mod tests {
         t.append_dispatch_complete("error", 10, None);
         drop(t);
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
-        let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let lines: Vec<serde_json::Value> = events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 1, "{body}");
         assert_eq!(lines[0]["type"], "dispatch.complete");
         assert_eq!(lines[0]["turn_delay_effective_ms"], 500);
@@ -1891,7 +1911,7 @@ mod tests {
         errored.append_dispatch_complete("error", 10, None);
         drop(errored);
         let body = fs::read_to_string(ws2.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
-        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(events(&body).next().unwrap()).unwrap();
         assert!(line["turn_delay_effective_ms"].is_null(), "{line}");
     }
 
@@ -1918,7 +1938,7 @@ mod tests {
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         let lines: Vec<serde_json::Value> =
-            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines[0]["reported_model"], "served-a");
         assert!(lines[1].get("reported_model").is_none(), "{}", lines[1]);
     }
@@ -1937,7 +1957,7 @@ mod tests {
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         let lines: Vec<serde_json::Value> =
-            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["type"], "compaction.start");
         assert_eq!(lines[0]["generation"], 4);
@@ -1971,7 +1991,7 @@ mod tests {
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         let lines: Vec<serde_json::Value> =
-            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            events(&body).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 2);
         let e = &lines[0];
         assert_eq!(e["type"], "compaction.call");

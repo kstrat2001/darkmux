@@ -430,11 +430,14 @@ fn hooks_match_risks_observing_the_observer(m: &HookMatch) -> bool {
     // Each sample is tried at `info` and at `warn`, the level detector
     // firings are written at.
     telemetry_actions().flat_map(|action| ["info", "warn"].map(|level| (action, level))).any(|(action, level)| {
-        let record: darkmux_flow::FlowRecord = serde_json::from_value(serde_json::json!({
+        // (#3035) Read through the one flow reader, like every other consumer.
+        let line = serde_json::json!({
             "ts": "", "level": level, "category": "telemetry", "tier": "local",
             "stage": "dispatch", "action": action, "handle": ""
-        }))
-        .expect("a synthetic telemetry record is a valid FlowRecord");
+        })
+        .to_string();
+        let record = darkmux_flow::reader::parse_record(&line)
+            .expect("a synthetic telemetry record is a valid FlowRecord");
         darkmux_flow::hooks::hook_match(m, &record)
     })
 }

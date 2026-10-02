@@ -205,6 +205,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // from here to show a failed verify beside a good dispatch.
         // v6 (F2) may carry `escalation`, as in the coding-task manifest.
         "schema_version": 6,
+        "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": run_id,
         "workload": m.workload_id,
         "provider": PromptProvider.id(),
@@ -451,7 +452,7 @@ mod tests {
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
-            manifest: WorkloadManifest { workload: spec },
+            manifest: WorkloadManifest { schema_version: None, workload: spec },
             manifest_path: base_dir.join("workload.json"),
             base_dir,
             source: WorkloadSource::OnDisk,
@@ -509,6 +510,7 @@ mod tests {
             let manifest: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(manifest["ok"], ok, "case {i}");
+            assert_eq!(manifest["manifest_schema_version"], darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION, "case {i}");
             assert_eq!(manifest.get("escalation").and_then(|e| e.as_str()), escalation, "case {i}");
         }
     }

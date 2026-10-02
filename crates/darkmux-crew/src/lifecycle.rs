@@ -158,7 +158,11 @@ pub fn graph_report_path(mission_id: &str) -> PathBuf {
 }
 
 pub fn save_graph_report(mission_id: &str, report: &crate::mission_config::prune::PruneReport) -> Result<()> {
-    save_json(&graph_report_path(mission_id), report)
+    let path = graph_report_path(mission_id);
+    // (#3035) Stamped with its data-shape version on every save.
+    let mut doc = serde_json::to_value(report).with_context(|| format!("serializing to {}", path.display()))?;
+    darkmux_types::data_version::stamp(&mut doc, darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION);
+    save_value(&path, &doc)
 }
 
 /// `Ok(None)` when the run predates the report or was minted by a path
@@ -169,7 +173,12 @@ pub fn load_graph_report(mission_id: &str) -> Result<Option<crate::mission_confi
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let report = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let known = darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION;
+    if let Some(v) = darkmux_types::data_version::newer(&doc, known) {
+        bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("graph report", &v, known));
+    }
+    let report = serde_json::from_value(doc).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(report))
 }
 
@@ -195,13 +204,13 @@ pub fn load_config_snapshot(mission_id: &str) -> Result<Option<crate::mission_co
 /// gets the same crash-safety every subsequent lifecycle transition already
 /// has.
 pub fn save_mission(mission: &Mission) -> Result<()> {
-    save_json(&mission_path(&mission.id), mission)
+    save_state(StateKind::Mission, &mission_path(&mission.id), mission)
 }
 
 /// Persist a freshly-minted [`Phase`] (or overwrite an existing one) — see
 /// [`save_mission`]'s doc.
 pub fn save_phase(phase: &Phase) -> Result<()> {
-    save_json(&phase_path(&phase.mission_id, &phase.id), phase)
+    save_state(StateKind::Phase, &phase_path(&phase.mission_id, &phase.id), phase)
 }
 
 /// Directory holding the mission's phase JSONs. Only `phases/` is read: a
@@ -265,7 +274,7 @@ pub fn step_path(mission_id: &str, phase_id: &str, step_id: &str) -> PathBuf {
 /// Persist a Task via the same atomic-rename `save_json` every other
 /// entity uses.
 pub fn save_task(mission_id: &str, task: &crate::types::Task) -> Result<()> {
-    save_json(&task_path(mission_id, &task.phase_id, &task.id), task)
+    save_state(StateKind::Task, &task_path(mission_id, &task.phase_id, &task.id), task)
 }
 
 /// Load a single Task by its fully-qualified (mission, phase, task)
@@ -292,7 +301,7 @@ pub fn load_tasks_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crat
 /// belongs to) since `step_path` is scoped by phase, mirroring
 /// `task_path`.
 pub fn save_step(mission_id: &str, phase_id: &str, step: &crate::types::Step) -> Result<()> {
-    save_json(&step_path(mission_id, phase_id, &step.id), step)
+    save_state(StateKind::Step, &step_path(mission_id, phase_id, &step.id), step)
 }
 
 /// Load a single Step by its fully-qualified (mission, phase, step)
@@ -301,7 +310,7 @@ pub fn load_step(mission_id: &str, phase_id: &str, step_id: &str) -> Result<crat
     let path = step_path(mission_id, phase_id, step_id);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    parse_state(StateKind::Step, &path, &text)
 }
 
 /// Load every Step under a phase (across all of that phase's Tasks —
@@ -355,6 +364,19 @@ fn now_unix() -> u64 {
 /// failure; without them a crash between rename(2) and the next
 /// dirty-page flush could leave the directory entry inconsistent.
 fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    let doc = serde_json::to_value(value).with_context(|| format!("serializing to {}", path.display()))?;
+    save_value(path, &doc)
+}
+
+/// [`save_json`] for a state file, stamped with its data-shape marker
+/// (#3035) on every save, so the file always names the binary that wrote it.
+fn save_state<T: serde::Serialize>(kind: StateKind, path: &std::path::Path, value: &T) -> Result<()> {
+    let mut doc = serde_json::to_value(value).with_context(|| format!("serializing to {}", path.display()))?;
+    darkmux_types::data_version::stamp(&mut doc, kind.schema_version());
+    save_value(path, &doc)
+}
+
+fn save_value(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     let parent = path.parent().map(|p| p.to_path_buf());
     if let Some(parent) = parent.as_ref() {
         fs::create_dir_all(parent)
@@ -754,13 +776,28 @@ fn reconcile_mission_phases_terminal(mission_id: &str) {
     };
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         if !matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned) {
-            eprintln!(
-                "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
-                 Finalized — reconciled to Abandoned (#1504 defensive backstop)",
-                phase.id, phase.status
-            );
-            let _ = phase_abandon(&phase.id);
+            let outcome = phase_abandon(&phase.id);
+            eprintln!("{}", reconcile_phase_warning(mission_id, phase, outcome.as_ref().err()));
         }
+    }
+}
+
+/// The warning for a phase found live while its mission reached a terminal
+/// state. It says what happened to the phase: "reconciled" only when the
+/// abandon went through; a phase the abandon refused (a status a newer
+/// darkmux wrote, #3035) is said to be left as it is, with the refusal.
+fn reconcile_phase_warning(mission_id: &str, phase: &Phase, refused: Option<&anyhow::Error>) -> String {
+    match refused {
+        None => format!(
+            "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
+             Finalized — reconciled to Abandoned (#1504 defensive backstop)",
+            phase.id, phase.status
+        ),
+        Some(e) => format!(
+            "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
+             Finalized — NOT reconciled, left as it is: {e:#}",
+            phase.id, phase.status
+        ),
     }
 }
 
@@ -885,6 +922,7 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
         PhaseStatus::Planned | PhaseStatus::Abandoned => {}
         PhaseStatus::Running => bail!("phase `{id}` is already Running"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete (terminal) — create a new phase instead"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     if refuse_terminal_mission {
         if let Ok(mission) = load_mission_by_id(&phase.mission_id) {
@@ -896,13 +934,14 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
                     mission.status
                 ),
                 MissionStatus::Active => {}
+                MissionStatus::Unknown => return Err(unknown_status("mission", &phase.mission_id)),
             }
         }
     }
     phase.status = PhaseStatus::Running;
     phase.started_ts = Some(now_unix());
     phase.abandoned_ts = None; // restart clears the prior abandonment
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseStart);
     Ok(phase)
 }
@@ -920,6 +959,7 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
         PhaseStatus::Planned => bail!("phase `{id}` is Planned — it must be Running before it can complete (#1463)"),
         PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — restart it to Running before completing (#1463)"),
         PhaseStatus::Complete => bail!("phase `{id}` is already Complete"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     // (#1504) Reconcile the phase's own Steps BEFORE writing its terminal
     // status — a crash between the two writes then leaves disk in the LEGAL
@@ -930,7 +970,7 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
     reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Complete;
     phase.completed_ts = Some(now_unix());
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseComplete);
     Ok(phase)
 }
@@ -948,6 +988,7 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
         PhaseStatus::Planned | PhaseStatus::Running => {}
         PhaseStatus::Abandoned => bail!("phase `{id}` is already Abandoned"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete — can't abandon a finished phase"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     // (#1504) Reconcile BEFORE writing the phase's own terminal status — see
     // `phase_complete`'s matching comment for why (a crash mid-write leaves
@@ -955,9 +996,16 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
     reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Abandoned;
     phase.abandoned_ts = Some(now_unix());
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseAbandon);
     Ok(phase)
+}
+
+/// (#3035) The refusal for a mission or phase whose status a newer darkmux
+/// wrote and this build cannot place: no verb moves it, since a transition
+/// from a state this build does not know cannot be checked.
+fn unknown_status(what: &str, id: &str) -> anyhow::Error {
+    anyhow::anyhow!("{what} `{id}` has a status this darkmux does not know (written by a newer darkmux). Upgrade darkmux.")
 }
 
 // ─── Mission transitions ───────────────────────────────────────────────
@@ -986,11 +1034,12 @@ pub fn mission_start_with_reasoning_and_payload(
         MissionStatus::Finalized | MissionStatus::Aborted => {
             bail!("mission `{id}` is terminal ({:?}) — create a new mission instead", mission.status)
         }
+        MissionStatus::Unknown => return Err(unknown_status("mission", id)),
         MissionStatus::Active => {}
     }
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
-    save_json(&mission_path(id), &mission)?;
+    save_mission(&mission)?;
     emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
 }
@@ -1042,6 +1091,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
         MissionStatus::Active => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
         MissionStatus::Aborted => bail!("mission `{id}` is already Aborted"),
+        MissionStatus::Unknown => return Err(unknown_status("mission", id)),
     }
     reconcile_mission_phases_terminal(id);
     mission.status = terminal;
@@ -1049,7 +1099,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
     // the split and stays, because "when did this mission end" is the same
     // question either way. `status` is what says HOW it ended.
     mission.finalized_ts = Some(now_unix());
-    save_json(&mission_path(id), &mission)?;
+    save_mission(&mission)?;
     let action = if matches!(terminal, MissionStatus::Aborted) {
         darkmux_flow::FlowAction::MissionAbort
     } else {
@@ -1110,7 +1160,7 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         };
-        save_json(&phase_path("test-mission", id), &s).unwrap();
+        save_phase(&s).unwrap();
         s
     }
 
@@ -1128,7 +1178,7 @@ mod tests {
             spec: None,
             machine: None,
         };
-        save_json(&mission_path(id), &m).unwrap();
+        save_mission(&m).unwrap();
         m
     }
 
@@ -1172,7 +1222,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_phase("s4", PhaseStatus::Abandoned);
         s.abandoned_ts = Some(1_700_000_500);
-        save_json(&phase_path("test-mission", "s4"), &s).unwrap();
+        save_phase(&s).unwrap();
 
         let updated = phase_start("s4").unwrap();
         assert_eq!(updated.status, PhaseStatus::Running);
@@ -1240,7 +1290,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_phase("s5", PhaseStatus::Running);
         s.started_ts = Some(1_700_000_100);
-        save_json(&phase_path("test-mission", "s5"), &s).unwrap();
+        save_phase(&s).unwrap();
 
         let updated = phase_complete("s5").unwrap();
         assert_eq!(updated.status, PhaseStatus::Complete);
@@ -2038,5 +2088,131 @@ mod task_step_storage_tests {
         save_step("m1", "s1", &s).unwrap();
         let tmp_path = step_path("m1", "s1", "st1").with_extension("json.tmp");
         assert!(!tmp_path.exists());
+    }
+
+    // ─── Data-shape markers (#3035) ────────────────────────────────────
+
+    fn on_disk(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Every save of a state file writes the marker for its own kind.
+    #[test]
+    #[serial]
+    fn every_state_save_writes_its_schema_version() {
+        use darkmux_types::data_version as v;
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(serde_json::json!({"id": "m-ver", "description": "d", "created_ts": 1})).unwrap();
+        save_mission(&m).unwrap();
+        assert_eq!(on_disk(&mission_path("m-ver"))["schema_version"], v::MISSION_SCHEMA_VERSION);
+        let p: Phase =
+            serde_json::from_value(serde_json::json!({"id": "p-ver", "mission_id": "m-ver", "description": "d", "created_ts": 1})).unwrap();
+        save_phase(&p).unwrap();
+        assert_eq!(on_disk(&phase_path(&p.mission_id, &p.id))["schema_version"], v::PHASE_SCHEMA_VERSION);
+        save_task("m-ver", &task("t-ver", "p-ver")).unwrap();
+        assert_eq!(on_disk(&task_path("m-ver", "p-ver", "t-ver"))["schema_version"], v::TASK_SCHEMA_VERSION);
+        save_step("m-ver", "p-ver", &step("st-ver", "t-ver")).unwrap();
+        assert_eq!(on_disk(&step_path("m-ver", "p-ver", "st-ver"))["schema_version"], v::STEP_SCHEMA_VERSION);
+    }
+
+    /// A file with no marker predates it and loads; one written by a newer
+    /// darkmux is refused, for every state kind a loader reads.
+    #[test]
+    #[serial]
+    fn a_state_file_from_a_newer_darkmux_is_refused_and_an_unmarked_one_loads() {
+        let _g = CrewGuard::new();
+        save_task("m-new", &task("t-new", "p-new")).unwrap();
+        save_step("m-new", "p-new", &step("st-new", "t-new")).unwrap();
+        let (tp, sp) = (task_path("m-new", "p-new", "t-new"), step_path("m-new", "p-new", "st-new"));
+        for path in [&tp, &sp] {
+            let mut doc = on_disk(path);
+            doc.as_object_mut().unwrap().remove("schema_version");
+            std::fs::write(path, doc.to_string()).unwrap();
+        }
+        assert!(load_task("m-new", "p-new", "t-new").is_ok(), "pre-marker task loads");
+        assert!(load_step("m-new", "p-new", "st-new").is_ok(), "pre-marker step loads");
+        for path in [&tp, &sp] {
+            let mut doc = on_disk(path);
+            doc["schema_version"] = serde_json::json!("999.0");
+            doc["a_field_from_the_future"] = serde_json::json!(true);
+            std::fs::write(path, doc.to_string()).unwrap();
+        }
+        let err = load_task("m-new", "p-new", "t-new").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (task `999.0`") && err.contains("Upgrade darkmux."), "{err}");
+        let err = load_step("m-new", "p-new", "st-new").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (step `999.0`"), "{err}");
+        assert!(load_tasks_for_phase("m-new", "p-new").is_err());
+    }
+
+    /// (#3035) No verb moves a mission or phase whose status a newer darkmux
+    /// wrote: the transition cannot be checked, so it is refused with the
+    /// upgrade message and the file is left as it was.
+    #[test]
+    #[serial]
+    fn a_mission_or_phase_with_an_unknown_status_is_refused_by_every_transition() {
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(
+            serde_json::json!({"id": "m-unk", "description": "d", "status": "suspended", "created_ts": 1}),
+        )
+        .unwrap();
+        save_mission(&m).unwrap();
+        let p: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-unk", "mission_id": "m-unk", "description": "d", "status": "blocked", "created_ts": 1}),
+        )
+        .unwrap();
+        save_phase(&p).unwrap();
+        let errs = [
+            mission_start_with_reasoning("m-unk", None).unwrap_err(),
+            mission_terminal_with_reasoning("m-unk", MissionStatus::Finalized, None).unwrap_err(),
+            phase_start("p-unk").unwrap_err(),
+            phase_complete("p-unk").unwrap_err(),
+            phase_abandon("p-unk").unwrap_err(),
+        ];
+        for e in errs {
+            let e = e.to_string();
+            assert!(e.contains("status this darkmux does not know") && e.contains("Upgrade darkmux."), "{e}");
+        }
+        assert_eq!(load_mission("m-unk").unwrap().status, MissionStatus::Unknown, "nothing was rewritten");
+    }
+
+    /// (#3035) The graph report is stamped on save, and a newer one is refused.
+    #[test]
+    #[serial]
+    fn the_graph_report_is_stamped_and_a_newer_one_is_refused() {
+        let _g = CrewGuard::new();
+        save_graph_report("m-gr", &Default::default()).unwrap();
+        let path = graph_report_path("m-gr");
+        let mut doc = on_disk(&path);
+        assert_eq!(doc["schema_version"], darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION);
+        assert!(load_graph_report("m-gr").unwrap().is_some());
+        doc["schema_version"] = serde_json::json!("999.0");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let err = load_graph_report("m-gr").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (graph report `999.0`"), "{err}");
+    }
+
+    /// (#3035) The reconcile warning is true: an Unknown phase that
+    /// `phase_abandon` refuses is reported as left alone, not "reconciled to
+    /// Abandoned".
+    #[test]
+    #[serial]
+    fn the_reconcile_warning_does_not_claim_a_reconcile_that_was_refused() {
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(serde_json::json!({"id": "m-rw", "description": "d", "created_ts": 1})).unwrap();
+        save_mission(&m).unwrap();
+        let p: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-rw", "mission_id": "m-rw", "description": "d", "status": "blocked", "created_ts": 1}),
+        )
+        .unwrap();
+        save_phase(&p).unwrap();
+        let refused = phase_abandon("p-rw").unwrap_err();
+        let said = reconcile_phase_warning("m-rw", &p, Some(&refused));
+        assert!(said.contains("NOT reconciled") && !said.contains("reconciled to Abandoned"), "{said}");
+        assert_eq!(load_phase_by_id("p-rw").unwrap().status, PhaseStatus::Unknown, "left as it is");
+        let live: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-live", "mission_id": "m-rw", "description": "d", "status": "running", "created_ts": 1}),
+        )
+        .unwrap();
+        assert!(reconcile_phase_warning("m-rw", &live, None).contains("reconciled to Abandoned"));
     }
 }

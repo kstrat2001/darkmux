@@ -104,7 +104,8 @@ mod tests {
         std::fs::read_to_string(darkmux_trajectory::trajectory_path(dir))
             .unwrap()
             .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] != "trajectory.header")
             .collect()
     }
 

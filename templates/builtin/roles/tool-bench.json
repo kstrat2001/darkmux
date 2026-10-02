@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "tool-bench",
   "role_family": "specialist",
   "description": "Harness role for the tool-call bench (#1196): retrieves run-unique DMX- tokens from a generated workspace so the lab can score tool competence per axis (selection, arguments, chaining, recovery, termination). Wears the FULL runtime belt by an EXPLICIT allow-list — never an empty palette, which the dispatch path treats as 'expose the whole catalog' silently (#1197 bench-role rule). Deliberately has NO output_schema: a grammar-constrained output combined with tools makes the model skip tool-calling and fabricate (verified 2026-07-04); the ANSWER:/BLOCKED: line contract is the tool-compatible replacement, and fabrication under it is exactly what the bench measures.",

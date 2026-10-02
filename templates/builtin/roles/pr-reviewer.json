@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "pr-reviewer",
   "role_family": "specialist",
   "description": "Tool-less PR code reviewer for CI: reads a unified diff provided inline and emits a structured JSON review where each finding carries a verbatim quote (`anchor`) of the line it's about — the workflow resolves that quote to a line number and posts native inline pull-request comments. No repo, no shell, no tools — pure reasoning over the given diff.",

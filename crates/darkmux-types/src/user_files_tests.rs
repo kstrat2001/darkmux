@@ -24,6 +24,8 @@ enum Shape {
 #[allow(dead_code)]
 struct Probe {
     #[serde(default)]
+    schema_version: Option<String>,
+    #[serde(default)]
     redis: Option<Inner>,
     #[serde(default)]
     list: Vec<Inner>,
@@ -82,7 +84,7 @@ fn an_unknown_top_level_key_names_the_closest_valid_key() {
     assert_eq!(closest_of(&keys[0]), Some("redis"));
     let msg = keys[0].to_string();
     assert!(msg.contains("unknown key `rediss`") && msg.contains("did you mean `redis`?"), "{msg}");
-    assert!(msg.contains("valid keys here: anything, by_name, free, list, redis, shape, type"), "{msg}");
+    assert!(msg.contains("valid keys here: anything, by_name, free, list, redis, schema_version, shape, type"), "{msg}");
 }
 
 #[test]
@@ -551,4 +553,53 @@ fn an_oversized_file_is_reported_not_read() {
     f.set_len(MAX_USER_FILE_BYTES + 1).unwrap();
     let found = check_path::<Probe>(UserFileKind::Role, &path, &no_retired).unwrap();
     assert!(matches!(&found.problem, Problem::Unreadable(e) if e.contains("cap")), "{found:?}");
+}
+
+// ---- (#3035) version-aware gate ----
+
+#[test]
+fn a_newer_file_gets_the_upgrade_message_and_no_key_errors() {
+    let p = Path::new("/x/coder.json");
+    // Carries a key this binary does not know AND a newer marker: the key is
+    // not judged, the file is refused for its version.
+    let text = r#"{"schema_version": "99.0", "future_key": 1}"#;
+    let fp = check_text::<Probe>(UserFileKind::Role, p, text, &no_retired).unwrap();
+    let known = UserFileKind::Role.schema_version();
+    assert_eq!(fp.problem, Problem::Newer { file_version: "99.0".into(), known: known.into() });
+    let msg = fp.to_string();
+    assert!(msg.contains("written by a newer darkmux (role manifest `99.0`"), "{msg}");
+    assert!(msg.contains(&format!("this binary reads `{known}`")), "{msg}");
+    assert!(msg.contains("Upgrade darkmux."), "{msg}");
+    assert!(!msg.contains("future_key") && !msg.contains("unknown key"), "{msg}");
+}
+
+#[test]
+fn a_same_version_file_with_an_unknown_key_is_still_a_typo() {
+    let p = Path::new("/x/coder.json");
+    let known = UserFileKind::Role.schema_version();
+    let text = format!(r#"{{"schema_version": "{known}", "rediss": 1}}"#);
+    let fp = check_text::<Probe>(UserFileKind::Role, p, &text, &no_retired).unwrap();
+    let Problem::Keys(keys) = &fp.problem else { panic!("{fp:?}") };
+    assert_eq!(paths(keys), vec!["rediss"]);
+    // An older marker is no different.
+    let fp = check_text::<Probe>(UserFileKind::Role, p, r#"{"schema_version": "0.1", "rediss": 1}"#, &no_retired).unwrap();
+    assert!(matches!(fp.problem, Problem::Keys(_)));
+}
+
+#[test]
+fn every_user_file_kind_refuses_a_newer_marker() {
+    for kind in UserFileKind::ALL {
+        let fp = check_text::<Probe>(kind, Path::new("/x/f.json"), r#"{"schema_version": "999.0"}"#, &no_retired)
+            .unwrap_or_else(|| panic!("{kind:?} accepted a newer file"));
+        assert!(matches!(fp.problem, Problem::Newer { .. }), "{kind:?}");
+    }
+}
+
+#[test]
+fn config_json_with_a_newer_marker_is_refused_for_its_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{"schema_version": "99.0", "from_the_future": true}"#).unwrap();
+    let fp = config_json_problem_at(&path).expect("refused");
+    assert!(matches!(fp.problem, Problem::Newer { .. }), "{fp}");
 }

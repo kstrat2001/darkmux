@@ -395,6 +395,7 @@
         // (preventive: better to prepend an unneeded preamble than to
         // miss prepending a needed one).
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
@@ -412,6 +413,7 @@
     #[test]
     fn role_family_utility_opts_out_of_specialist() {
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
@@ -435,6 +437,7 @@
     #[test]
     fn legacy_admin_value_is_silently_specialist_at_matcher_layer() {
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
@@ -456,6 +459,7 @@
     #[test]
     fn role_family_explicit_specialist_matches_default() {
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
@@ -517,6 +521,7 @@
     #[test]
     fn validate_rejects_legacy_admin_role_family_user_source() {
         let legacy_role = Role {
+            schema_version: None,
             output_schema: None,
             id: "legacy-role".into(),
             description: "A role using the pre-rename admin value".into(),
@@ -545,6 +550,7 @@
     #[test]
     fn validate_rejects_legacy_admin_role_family_builtin_source() {
         let legacy_role = Role {
+            schema_version: None,
             output_schema: None,
             id: "broken-builtin".into(),
             description: "Simulates a builtin manifest that drifted back to admin".into(),
@@ -567,6 +573,7 @@
     #[test]
     fn validate_accepts_utility_specialist_and_none() {
         let mut r = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
@@ -594,6 +601,7 @@
     #[test]
     fn validate_rejects_unknown_role_family() {
         let r = Role {
+            schema_version: None,
             output_schema: None,
             id: "test-role".into(),
             description: "A role with a typo'd family".into(),

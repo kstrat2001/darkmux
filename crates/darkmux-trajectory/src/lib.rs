@@ -23,6 +23,14 @@ pub use usage::{estimate_tokens, TokenSum, Usage, UsageCounts, CHARS_PER_TOKEN};
 /// marks it as runtime metadata rather than agent content.
 pub const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 
+/// (#3035) The data-shape version of the trajectory, written in the
+/// `trajectory.header` event that opens every file. Independent of the
+/// release number; a minor bump adds a field or an event type, a major bump
+/// renames or retypes one. The host (which can compare versions through
+/// `darkmux_types::data_version`) refuses to inspect a trajectory whose
+/// header is newer than this; a file with no header predates the marker.
+pub const TRAJECTORY_SCHEMA_VERSION: &str = "1.0";
+
 /// The trajectory file inside [`TRAJECTORY_SUBDIR`].
 pub const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 

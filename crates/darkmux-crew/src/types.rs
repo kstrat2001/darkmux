@@ -27,6 +27,11 @@ pub use darkmux_types::{Capability, CapabilityProfile};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Skill {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::SKILL_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub keywords: Vec<KeywordWeight>,
@@ -108,6 +113,11 @@ impl EscalationKind {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Role {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::ROLE_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub skills: Vec<String>, // skill ids
@@ -267,6 +277,11 @@ pub struct CrewMember {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Crew {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::CREW_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub members: Vec<CrewMember>,
@@ -311,6 +326,12 @@ pub enum MissionStatus {
     /// Deliberately a distinct TERMINAL rather than a flavor of Finalized:
     /// both end the mission, but only one of them means the work happened.
     Aborted,
+    /// (#3035) A status a newer darkmux wrote that this build does not know.
+    /// Never written by this build, and never read as a success, a failure or
+    /// work to run: every consumer treats it as a mission it cannot reason
+    /// about, and no lifecycle verb moves it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A mission — a named objective tying phases together.
@@ -527,6 +548,10 @@ pub enum MissionSpecOrigin {
     UserConfig,
     /// Launched from a shipped built-in config.
     Builtin,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Status of a phase.
@@ -540,6 +565,10 @@ pub enum PhaseStatus {
     Running,
     Complete,
     Abandoned,
+    /// (#3035) A status a newer darkmux wrote that this build does not know.
+    /// Never written here; read as neither complete nor runnable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A phase — a time-boxed work unit within a mission. **Strictly linear
@@ -627,6 +656,11 @@ pub enum NodeStatus {
     Complete,
     Abandoned,
     Error,
+    /// (#3035) A status a newer darkmux wrote that this build does not know.
+    /// Never written here; neither terminal nor runnable, so the scheduler
+    /// neither runs the node nor counts it as a satisfied dependency.
+    #[serde(other)]
+    Unknown,
 }
 
 impl NodeStatus {
@@ -639,12 +673,13 @@ impl NodeStatus {
     /// `ALL.len() == variant_count()` assertion in this module's tests,
     /// where the expected count is walked off `next_variant`'s exhaustive
     /// chain rather than re-typed as a literal.
-    pub const ALL: [NodeStatus; 5] = [
+    pub const ALL: [NodeStatus; 6] = [
         NodeStatus::Planned,
         NodeStatus::Running,
         NodeStatus::Complete,
         NodeStatus::Abandoned,
         NodeStatus::Error,
+        NodeStatus::Unknown,
     ];
 
     /// The variant after `self` in declaration order, `None` at the end.
@@ -661,7 +696,8 @@ impl NodeStatus {
             NodeStatus::Running => Some(NodeStatus::Complete),
             NodeStatus::Complete => Some(NodeStatus::Abandoned),
             NodeStatus::Abandoned => Some(NodeStatus::Error),
-            NodeStatus::Error => None,
+            NodeStatus::Error => Some(NodeStatus::Unknown),
+            NodeStatus::Unknown => None,
         }
     }
 
@@ -703,6 +739,7 @@ impl NodeStatus {
             NodeStatus::Complete => "complete",
             NodeStatus::Abandoned => "abandoned",
             NodeStatus::Error => "error",
+            NodeStatus::Unknown => "unknown",
         }
     }
 }
@@ -918,6 +955,7 @@ mod tests {
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {
+            schema_version: None,
             id: id.into(),
             description: format!("test skill {id}"),
             keywords: vec![],
@@ -927,6 +965,7 @@ mod tests {
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {
+            schema_version: None,
             output_schema: None,
             id: id.into(),
             description: format!("test role {id}"),
@@ -1139,6 +1178,7 @@ mod tests {
     #[test]
     fn role_capabilities_skips_nan_infinity_and_negative_weights() {
         let bad_skill = Skill {
+            schema_version: None,
             id: "bad".into(),
             description: "test".into(),
             keywords: vec![],
@@ -1417,5 +1457,34 @@ mod tests {
             NodeStatus::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(listed, chained, "`ALL` and the variant chain must name the same statuses");
         assert_eq!(listed.len(), NodeStatus::ALL.len(), "two variants share one wire string");
+    }
+
+    /// (#3035) A status a newer darkmux wrote reads as `Unknown`, never an
+    /// error, in every persisted status enum; a known one still reads as
+    /// itself and `paused` still reads as `Active`.
+    #[test]
+    fn a_status_from_a_newer_darkmux_reads_as_unknown_not_an_error() {
+        let m: MissionStatus = serde_json::from_str("\"suspended\"").unwrap();
+        assert_eq!(m, MissionStatus::Unknown);
+        let p: PhaseStatus = serde_json::from_str("\"blocked\"").unwrap();
+        assert_eq!(p, PhaseStatus::Unknown);
+        let n: NodeStatus = serde_json::from_str("\"skipped\"").unwrap();
+        assert_eq!(n, NodeStatus::Unknown);
+        assert_eq!(serde_json::from_str::<MissionStatus>("\"paused\"").unwrap(), MissionStatus::Active);
+        assert_eq!(serde_json::from_str::<MissionStatus>("\"aborted\"").unwrap(), MissionStatus::Aborted);
+        assert_eq!(serde_json::from_str::<NodeStatus>("\"error\"").unwrap(), NodeStatus::Error);
+        // A whole mission file naming one still loads.
+        let doc = r#"{"id":"m","description":"d","status":"suspended","created_ts":1}"#;
+        assert_eq!(serde_json::from_str::<Mission>(doc).unwrap().status, MissionStatus::Unknown);
+    }
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<MissionSpecOrigin>(), MissionSpecOrigin::Unknown);
     }
 }

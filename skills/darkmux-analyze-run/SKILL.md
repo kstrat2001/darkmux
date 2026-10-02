@@ -70,9 +70,9 @@ Quick locator: `cat ~/.darkmux/lab/<run-id>/manifest.json | jq -r '.sandbox'` re
 
 ## Trajectory event-type reference
 
-Every line in `trajectory.jsonl` has a `type` field. Use `grep '"type":"<EVENT>"'` then `jq` for filtering. Here's the canonical schema for each event type, generated from `runtime/src/trajectory.rs`:
+The first line is a `trajectory.header` event carrying the file's `schema_version` (no `ts`; it is not an execution event, so skip it when you read the first line as `dispatch.start`). Every line in `trajectory.jsonl` has a `type` field. Use `grep '"type":"<EVENT>"'` then `jq` for filtering. Here's the canonical schema for each event type, generated from `runtime/src/trajectory.rs`:
 
-### `dispatch.start` (1 per dispatch, first event)
+### `dispatch.start` (1 per dispatch, first execution event)
 
 ```
 { "type": "dispatch.start", "ts": <unix_ms>, "model": <str>, "system_chars": <int>, "prompt_chars": <int> }

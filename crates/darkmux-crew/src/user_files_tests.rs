@@ -186,6 +186,22 @@ fn every_shipped_document_has_no_unknown_keys() {
     check::<Rule>(crate::rules::EMBEDDED_RULES);
 }
 
+/// (#3035) Every shipped document declares the data-shape version this
+/// binary reads, so a copy an operator makes carries the marker.
+#[test]
+fn every_shipped_document_declares_its_schema_version() {
+    fn check(kind: UserFileKind, table: &[(&str, &str)]) {
+        for (id, text) in table {
+            let doc: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(doc["schema_version"], kind.schema_version(), "builtin {kind:?} {id}");
+        }
+    }
+    check(UserFileKind::Role, crate::loader::BUILTIN_ROLES);
+    check(UserFileKind::Skill, crate::loader::BUILTIN_SKILLS);
+    check(UserFileKind::MissionConfig, crate::mission_config::load::EMBEDDED_MISSION_CONFIGS);
+    check(UserFileKind::Rule, crate::rules::EMBEDDED_RULES);
+}
+
 #[test]
 fn no_crew_file_object_accepts_keys_it_does_not_name() {
     assert_eq!(open_objects::<Role>(), Vec::<String>::new());

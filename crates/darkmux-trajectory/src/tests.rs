@@ -38,6 +38,21 @@ fn every_archive_line_parses_to_its_own_variant() {
     assert!(events.iter().all(|e| !matches!(e, E::Unknown)), "every archive type is known: {events:?}");
 }
 
+/// (#3035) The header names the file's shape; the fold records the version
+/// and counts nothing for it, so a trajectory with only a header is still
+/// the empty one and the wall clock is the events'.
+#[test]
+fn the_header_is_recorded_by_the_fold_and_never_counted() {
+    let header = format!(r#"{{"type":"trajectory.header","schema_version":"{TRAJECTORY_SCHEMA_VERSION}"}}"#);
+    assert!(matches!(parse_line(&header), Some(TrajectoryEvent::Header(h)) if h.schema_version == TRAJECTORY_SCHEMA_VERSION));
+    let only = TrajectoryFold::from_lines(&header);
+    assert_eq!(only.events, 0, "a header-only file said nothing about an execution");
+    assert_eq!(only.schema_version.as_deref(), Some(TRAJECTORY_SCHEMA_VERSION));
+    let both = TrajectoryFold::from_lines(&format!("{header}\n{{\"type\":\"dispatch.start\",\"ts\":5}}\n"));
+    assert_eq!((both.events, both.last_ts), (1, Some(5)));
+    assert_eq!(TrajectoryFold::from_lines(r#"{"type":"dispatch.start","ts":5}"#).schema_version, None, "pre-marker");
+}
+
 #[test]
 fn an_unknown_type_reads_as_unknown_and_a_broken_line_is_skipped() {
     assert_eq!(parse_line(r#"{"type":"from.the.future","x":1}"#), Some(TrajectoryEvent::Unknown));
@@ -63,7 +78,7 @@ fn the_wire_names_are_fixed() {
         "dispatch.intra_turn_stall.recovered", "dispatch.empty_tool_calls.recovered",
         "dispatch.per_turn_cap.salvaged", "dispatch.tool_call.discarded",
         "dispatch.tool.malformed_names", "dispatch.escalation.triggered",
-        "dispatch.feedback.injected",
+        "dispatch.feedback.injected", "trajectory.header",
     ];
     for name in names {
         let e = parse_line(&format!(r#"{{"type":"{name}"}}"#)).unwrap_or_else(|| panic!("{name} does not parse"));
@@ -425,4 +440,23 @@ fn terminal_result_types_every_runtime_result_and_every_escalation_reason() {
         assert_eq!(TerminalResult::parse(reason), TerminalResult::Escalated, "{reason}");
     }
     assert_eq!(TerminalResult::parse("something_new"), TerminalResult::Other);
+}
+
+/// (#3035) An enum value a newer runtime wrote reads as `Unknown`, so the one
+/// event still parses and every count it feeds survives.
+#[test]
+fn an_enum_value_from_a_newer_runtime_reads_as_unknown_not_a_dropped_event() {
+    use TrajectoryEvent as E;
+    let t = parse_line(r#"{"type":"tool.completed","seq":1,"ok":true,"outcome":"from_the_future"}"#);
+    assert!(matches!(t, Some(E::ToolCompleted(ref t)) if t.outcome == Some(ToolOutcomeKind::Unknown)), "{t:?}");
+    let m = parse_line(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
+    assert!(matches!(m, Some(E::MalformedToolNames(ref m)) if m.reason == MalformedReason::Unknown), "{m:?}");
+    let c = parse_line(r#"{"type":"dispatch.checkpoint","seq":1,"verdict":"from_the_future"}"#);
+    assert!(matches!(c, Some(E::Checkpoint(ref c)) if c.verdict == Verdict::Unknown), "{c:?}");
+    let w = parse_line(r#"{"type":"model.tool_call.writing","seq":1,"phase":"from_the_future"}"#);
+    assert!(matches!(w, Some(E::ToolCallWriting(ref w)) if w.phase == StreamPhase::Unknown), "{w:?}");
+    // The malformed calls still count, in a bucket of their own: neither
+    // "invalid name" nor "not granted" is claimed for a cause nobody read.
+    let fold = TrajectoryFold::from_lines(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
+    assert_eq!((fold.tool_calls_invalid_name, fold.tool_calls_ungranted, fold.tool_calls_unclassified), (0, 0, 2));
 }

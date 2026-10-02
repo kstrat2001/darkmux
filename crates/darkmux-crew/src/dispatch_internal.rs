@@ -937,6 +937,13 @@ pub(crate) fn validate_resume_checkpoint(
             origin_path.display()
         )
     })?;
+    if let Some(file_version) = darkmux_types::data_version::newer(&origin, RESUME_ORIGIN_SCHEMA_VERSION) {
+        bail_resume!(
+            "darkmux dispatch: RESUME ORIGIN NEWER — {}: {}",
+            origin_path.display(),
+            darkmux_types::data_version::newer_refusal("resume origin", &file_version, RESUME_ORIGIN_SCHEMA_VERSION)
+        );
+    }
     let origin_workspace = origin.get("workspace").and_then(|v| v.as_str());
     let origin_read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool());
     let (Some(origin_workspace), Some(origin_read_only)) = (origin_workspace, origin_read_only)
@@ -1122,6 +1129,10 @@ fn origin_record_exposed_by(out_dir: &Path, mounts: &[(&str, &Path)]) -> Result<
     Ok(())
 }
 
+/// (#3035) The data-shape version `write_resume_origin_meta` stamps and
+/// `validate_resume_checkpoint` reads: a file naming a newer one is refused.
+use darkmux_types::data_version::RESUME_ORIGIN_SCHEMA_VERSION;
+
 /// (Security audit, #2114 resume follow-up) Stamp this dispatch's
 /// workspace path + read-only mode into its own `host_out`, unconditionally
 /// — every dispatch writes this, not just ones that might later be resumed,
@@ -1169,6 +1180,7 @@ pub(crate) fn write_resume_origin_meta(
     let recorded_workspace =
         workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let body = serde_json::json!({
+        "schema_version": RESUME_ORIGIN_SCHEMA_VERSION,
         "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
         "image": image,
@@ -6999,6 +7011,44 @@ pub fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
     read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
 }
 
+/// The flow payload for a checkpoint event, `None` when its verdict is one
+/// this build does not know (#3035): the payload's verdict is `continue` or
+/// `conclude`, and neither may be claimed for a verdict nobody read.
+fn checkpoint_payload(c: &darkmux_trajectory::Checkpoint) -> Option<DispatchCheckpointPayload> {
+    let verdict = match c.verdict {
+        darkmux_trajectory::Verdict::Continue => CheckpointVerdict::Continue,
+        darkmux_trajectory::Verdict::Conclude => CheckpointVerdict::Conclude,
+        darkmux_trajectory::Verdict::Unknown => return None,
+    };
+    Some(DispatchCheckpointPayload {
+        turn_seq: c.seq,
+        checkpoint: c.checkpoint,
+        slice_tokens: c.slice_tokens,
+        tail_ratio: c.tail_ratio,
+        verdict,
+        bound: c.bound.as_ref().map(bound_ref),
+        policy: c.policy.clone(),
+        would_conclude: c.would_conclude,
+        step_id: None,
+        context: None,
+    })
+}
+
+/// (#3035) A trajectory header naming a newer data shape than this binary
+/// reads: the run keeps going (its events are read leniently, and an
+/// unknown one is skipped), but the operator is told the counts may be
+/// partial. `lab inspect` refuses such a file outright.
+fn warn_on_newer_trajectory(file_version: &str) {
+    let version = serde_json::Value::String(file_version.to_string());
+    let known = darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION;
+    if darkmux_types::data_version::is_newer(&version, known) {
+        eprintln!(
+            "darkmux dispatch: ⚠ {}",
+            darkmux_types::data_version::newer_refusal("trajectory", file_version, known)
+        );
+    }
+}
+
 /// A trajectory still in a model-writable out-dir, folded, through
 /// [`read_out_dir_text`] so a planted symlink or FIFO is refused, not
 /// followed. A missing or refused file folds empty. A live dispatch never
@@ -9473,12 +9523,7 @@ impl TailerState {
             E::Reasoning(r) => self.on_reasoning(r),
             E::FeedbackInjected(f) => self.on_feedback_injected(f),
             E::StreamingStart(s) => self.on_stream_start(s),
-            E::StreamingEnd(_) => {
-                // (#2928) The stream ended: the live sampler stops refreshing.
-                if let Some(live) = self.live.as_mut() {
-                    live.gate.end_stream();
-                }
-            }
+            E::StreamingEnd(_) => self.on_stream_end(),
             E::Partial(p) => self.on_stream_tick(Chunk::of_partial(p)),
             E::ToolCallWriting(w) => self.on_stream_tick(Chunk::of_writing(w)),
             E::GateObservation(g) => {
@@ -9510,6 +9555,7 @@ impl TailerState {
                 }));
             }
             E::Rest(r) => self.on_rest(r),
+            E::Header(h) => warn_on_newer_trajectory(&h.schema_version),
             // The runtime's own bookends (the host emits the canonical
             // dispatch bookends) and the events with no flow consumer are
             // counted by the fold above and forwarded nowhere.
@@ -9612,7 +9658,7 @@ impl TailerState {
             ok: Some(t.ok),
             // (#2008) The three-way outcome, forwarded as classified, so the
             // viewer can render "exit 1" rather than a bare cross.
-            outcome: t.outcome.map(tool_outcome),
+            outcome: t.outcome.and_then(tool_outcome),
             exit_code: t.exit_code,
             failure_reason: t.failure_reason.as_deref().map(|r| cap_str(r, MAX_TRAJ_FIELD_BYTES)),
             step_id: None,
@@ -9744,24 +9790,27 @@ impl TailerState {
     /// verbatim (#2165, #2887) so the surfaces can tell an enforced
     /// conclusion from a recorded finding.
     fn on_checkpoint(&mut self, c: &darkmux_trajectory::Checkpoint) {
-        let payload = DispatchCheckpointPayload {
-            turn_seq: c.seq,
-            checkpoint: c.checkpoint,
-            slice_tokens: c.slice_tokens,
-            tail_ratio: c.tail_ratio,
-            verdict: match c.verdict {
-                darkmux_trajectory::Verdict::Continue => CheckpointVerdict::Continue,
-                darkmux_trajectory::Verdict::Conclude => CheckpointVerdict::Conclude,
-            },
-            bound: c.bound.as_ref().map(bound_ref),
-            policy: c.policy.clone(),
-            would_conclude: c.would_conclude,
-            step_id: None,
-            context: None,
-        };
-        self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchCheckpoint(payload));
+        match checkpoint_payload(c) {
+            Some(payload) => {
+                self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchCheckpoint(payload))
+            }
+            // (#3035) A verdict a newer runtime named has no word in the flow
+            // vocabulary, and reporting it as `continue` would be a claim
+            // nobody observed: the record is left out, and said so.
+            None => eprintln!(
+                "darkmux dispatch: ⚠ a checkpoint carried a verdict this darkmux does not know (a newer \
+                 runtime wrote it); no checkpoint record is written for it"
+            ),
+        }
         if let Some(w) = checkpoint_degeneracy_warning(c) {
             self.surface_degeneracy_warning(w);
+        }
+    }
+
+    /// (#2928) The stream ended: the live sampler stops refreshing.
+    fn on_stream_end(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.gate.end_stream();
         }
     }
 
@@ -10247,8 +10296,10 @@ fn heartbeat_payload(c: &Chunk<'_>) -> DispatchHeartbeatPayload {
         sampled_at_ms: Some(c.ts),
         generated_chars: c.generated_chars,
         prompt_chars: None,
-        phase: c.phase.map(|phase| match phase {
-            darkmux_trajectory::StreamPhase::WritingToolCall => StreamPhase::WritingToolCall,
+        // (#3035) A phase a newer runtime named has no word here: absent.
+        phase: c.phase.and_then(|phase| match phase {
+            darkmux_trajectory::StreamPhase::WritingToolCall => Some(StreamPhase::WritingToolCall),
+            darkmux_trajectory::StreamPhase::Unknown => None,
         }),
         tool_name: c.tool_name.map(|name| cap_str(name, MAX_TRAJ_FIELD_BYTES)),
         step_id: None,
@@ -10500,7 +10551,8 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         | E::Checkpoint(_)
         | E::ReasoningBoundNotApplied(_)
         | E::FeedbackInjected(_)
-        | E::Unknown => None,
+        | E::Header(_)
+                | E::Unknown => None,
     }
 }
 
@@ -10519,6 +10571,12 @@ fn malformed_detail(e: &darkmux_trajectory::MalformedToolNames) -> String {
             "{count} tool call(s) this turn named a REAL tool this dispatch's role is not granted \
              (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
              message (#2169)"
+        ),
+        // (#3035) A reason a newer runtime named: say only what is known, that
+        // the calls never ran. Never "not a real tool", which is a claim.
+        darkmux_trajectory::MalformedReason::Unknown => format!(
+            "{count} tool call(s) this turn were malformed for a reason this darkmux does not know \
+             (model={model}, sample=\"{sample}\") — never dispatched (#2169)"
         ),
         darkmux_trajectory::MalformedReason::NotATool => format!(
             "{count} tool call(s) this turn carried a `name` that is not a real tool \
@@ -10756,12 +10814,15 @@ fn turn_usage(u: &darkmux_trajectory::Usage) -> TurnUsage {
     }
 }
 
-/// How a tool call ended, as the payload carries it.
-fn tool_outcome(o: darkmux_trajectory::ToolOutcomeKind) -> ToolOutcome {
+/// How a tool call ended, as the payload carries it. `None` for an outcome a
+/// newer runtime named (#3035): the payload has no word for it, and absent is
+/// what a record from before the field reads as.
+fn tool_outcome(o: darkmux_trajectory::ToolOutcomeKind) -> Option<ToolOutcome> {
     match o {
-        darkmux_trajectory::ToolOutcomeKind::Ok => ToolOutcome::Ok,
-        darkmux_trajectory::ToolOutcomeKind::Reported => ToolOutcome::Reported,
-        darkmux_trajectory::ToolOutcomeKind::Failed => ToolOutcome::Failed,
+        darkmux_trajectory::ToolOutcomeKind::Ok => Some(ToolOutcome::Ok),
+        darkmux_trajectory::ToolOutcomeKind::Reported => Some(ToolOutcome::Reported),
+        darkmux_trajectory::ToolOutcomeKind::Failed => Some(ToolOutcome::Failed),
+        darkmux_trajectory::ToolOutcomeKind::Unknown => None,
     }
 }
 

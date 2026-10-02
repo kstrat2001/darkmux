@@ -3,4 +3,4 @@
 /**
  * Status of a phase.
  */
-export type PhaseStatus = "planned" | "running" | "complete" | "abandoned";
+export type PhaseStatus = "planned" | "running" | "complete" | "abandoned" | "unknown";
