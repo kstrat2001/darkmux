@@ -30,6 +30,9 @@ struct Hub {
     stored: Arc<Mutex<Vec<Stored>>>,
     conns: Arc<Mutex<Vec<TcpStream>>>,
     stop: Arc<AtomicBool>,
+    /// While set, every `XADD` is answered with an error (a hub that accepts
+    /// the connection and refuses the write).
+    reject_xadd: Arc<AtomicBool>,
     acceptor: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +45,7 @@ impl Hub {
             stored: Arc::new(Mutex::new(Vec::new())),
             conns: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
+            reject_xadd: Arc::new(AtomicBool::new(false)),
             acceptor: None,
         };
         hub.serve(listener);
@@ -65,10 +69,11 @@ impl Hub {
             .expect("nonblocking listener");
         self.stored.lock().unwrap().clear();
         self.stop = Arc::new(AtomicBool::new(false));
-        let (stop, stored, conns) = (
+        let (stop, stored, conns, reject) = (
             Arc::clone(&self.stop),
             Arc::clone(&self.stored),
             Arc::clone(&self.conns),
+            Arc::clone(&self.reject_xadd),
         );
         self.acceptor = Some(std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
@@ -80,7 +85,8 @@ impl Hub {
                             conns.lock().unwrap().push(kept);
                         }
                         let stored = Arc::clone(&stored);
-                        std::thread::spawn(move || serve_connection(stream, &stored));
+                        let reject = Arc::clone(&reject);
+                        std::thread::spawn(move || serve_connection(stream, &stored, &reject));
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))
@@ -164,7 +170,7 @@ fn xadd_fields(args: &[String]) -> Option<Stored> {
     Some((record?, late))
 }
 
-fn serve_connection(stream: TcpStream, stored: &Mutex<Vec<Stored>>) {
+fn serve_connection(stream: TcpStream, stored: &Mutex<Vec<Stored>>, reject_xadd: &AtomicBool) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
@@ -173,6 +179,7 @@ fn serve_connection(stream: TcpStream, stored: &Mutex<Vec<Stored>>) {
         let reply = match args.first().map(|c| c.to_ascii_uppercase()).as_deref() {
             Some("CLIENT") => "+OK\r\n".to_string(),
             Some("PING") => "+PONG\r\n".to_string(),
+            Some("XADD") if reject_xadd.load(Ordering::SeqCst) => "-ERR hub refuses writes\r\n".to_string(),
             Some("XADD") => match xadd_fields(&args) {
                 Some(entry) => {
                     let mut stored = stored.lock().unwrap();
@@ -473,4 +480,149 @@ fn a_state_from_a_newer_darkmux_reads_as_unknown() {
     assert_eq!(health, crate::status::HealthState::Unknown);
     let known: HubLink = serde_json::from_str(r#"{"state":"connected"}"#).unwrap();
     assert_eq!(known, HubLink::Connected);
+}
+
+fn watermark_file(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("hub-outage.json")
+}
+
+/// A daemon that restarts mid-outage must still owe the hub what the previous
+/// process failed to send.
+#[test]
+fn a_restarted_sink_backfills_the_outage_its_predecessor_saw() {
+    let dir = TempDir::new().unwrap();
+    let mut hub = Hub::start();
+    let a = sink(&hub, &dir, SinkPolicy::LongLived);
+    outage(&mut hub, &dir, &a, &rec("b1", 50), &[rec("g1", 40), rec("g2", 30), rec("g3", 25)]);
+    drop(a);
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_some(), "the outage must be on disk before the process goes");
+    hub.up();
+    let b = sink(&hub, &dir, SinkPolicy::LongLived);
+    write(&b, &dir, &rec("after", 1));
+    assert_eq!(handles(&hub.entries()), ["g1", "g2", "g3", "after"]);
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none(), "a landed backfill clears the watermark");
+}
+
+/// Records a one-shot CLI wrote during an outage predate the daemon's own
+/// first failure; the daemon must still re-send them.
+#[test]
+fn a_one_shot_writers_outage_records_are_backfilled_by_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let mut hub = Hub::start();
+    let daemon = sink(&hub, &dir, SinkPolicy::LongLived);
+    write(&daemon, &dir, &rec("b1", 60));
+    hub.down();
+    let cli = sink(&hub, &dir, SinkPolicy::OneShot);
+    for r in [rec("cli1", 50), rec("cli2", 45), rec("cli3", 40)] {
+        write(&cli, &dir, &r);
+    }
+    assert!(cli.is_disabled());
+    for r in [rec("d1", 30), rec("d2", 25), rec("d3", 20)] {
+        write(&daemon, &dir, &r);
+    }
+    hub.up();
+    write(&daemon, &dir, &rec("after", 1));
+    assert_eq!(
+        handles(&hub.entries()),
+        ["cli1", "cli2", "cli3", "d1", "d2", "d3", "after"],
+        "the daemon's own outage began at d1, but the CLI's failures started earlier"
+    );
+}
+
+/// A healthy daemon must pick up an outage a one-shot writer recorded, on its
+/// periodic tick, without waiting for a restart or an outage of its own.
+#[test]
+fn a_healthy_daemons_tick_backfills_a_one_shot_writers_watermark() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let daemon = sink(&hub, &dir, SinkPolicy::LongLived);
+    write(&daemon, &dir, &rec("b1", 60));
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["b1"], "a tick with no watermark sends nothing");
+    // A one-shot CLI wrote while the hub was unreachable from where it ran.
+    let missed = rec("cli1", 30);
+    write_file_only(&dir, &missed);
+    hub_link::OutageWatermark::new(watermark_file(&dir)).record(&missed.ts).unwrap();
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["b1", "cli1"], "the tick backfills what the CLI missed");
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none(), "a landed backfill clears the watermark");
+    daemon.tick();
+    assert_eq!(hub.entries().len(), 2, "a tick after the clear sends nothing");
+}
+
+/// The real call site: the catch-up thread the daemon spawns drives the tick,
+/// so a healthy daemon backfills a one-shot writer's watermark with no
+/// manual `tick()` and no write of its own.
+#[test]
+fn the_catch_up_thread_backfills_a_watermark_without_a_manual_tick() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let daemon = Arc::new(sink(&hub, &dir, SinkPolicy::LongLived));
+    write(&daemon, &dir, &rec("b1", 60));
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = hub_link::spawn_tick_thread(daemon.clone(), Duration::from_millis(20), stop.clone());
+    let missed = rec("cli1", 30);
+    write_file_only(&dir, &missed);
+    hub_link::OutageWatermark::new(watermark_file(&dir)).record(&missed.ts).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while handles(&hub.entries()) != ["b1", "cli1"] && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(handles(&hub.entries()), ["b1", "cli1"]);
+}
+
+/// A backfill the hub refuses must leave the watermark for the next recovery.
+#[test]
+fn a_failed_backfill_keeps_the_persisted_watermark() {
+    let dir = TempDir::new().unwrap();
+    let mut hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::LongLived);
+    outage(&mut hub, &dir, &s, &rec("b1", 50), &[rec("g1", 40), rec("g2", 30), rec("g3", 25)]);
+    let owed = hub_link::OutageWatermark::new(watermark_file(&dir)).load().unwrap();
+    hub.up();
+    hub.reject_xadd.store(true, Ordering::SeqCst);
+    write(&s, &dir, &rec("g4", 20));
+    assert!(hub.entries().is_empty());
+    let w = hub_link::OutageWatermark::new(watermark_file(&dir));
+    let kept = w.load().unwrap();
+    let before = owed;
+    assert_eq!(kept.since, before.since, "the watermark keeps the earliest unsent ts");
+    hub.reject_xadd.store(false, Ordering::SeqCst);
+    write(&s, &dir, &rec("after", 1));
+    assert_eq!(handles(&hub.entries()), ["g1", "g2", "g3", "g4", "after"]);
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none());
+}
+
+/// A failure recorded while a backfill runs is not cleared by it.
+#[test]
+fn clearing_a_stale_generation_keeps_a_newer_watermark() {
+    let dir = TempDir::new().unwrap();
+    let w = hub_link::OutageWatermark::new(watermark_file(&dir));
+    w.record("2026-01-01T00:00:10Z").unwrap();
+    let read = w.load().unwrap();
+    w.record("2026-01-01T00:00:20Z").unwrap();
+    w.clear_if(read.seq).unwrap();
+    let kept = w.load().expect("a record landed after the read; the watermark stays");
+    assert_eq!(kept.since, "2026-01-01T00:00:10Z", "earliest ts wins");
+    w.clear_if(kept.seq).unwrap();
+    assert!(w.load().is_none());
+}
+
+/// The generation must survive a clear: a backfill that read an old
+/// generation, run after another backfill cleared and a CLI recorded a new
+/// outage, must not erase that newer outage.
+#[test]
+fn a_stale_clear_after_a_clear_and_a_new_record_keeps_the_newer_outage() {
+    let dir = TempDir::new().unwrap();
+    let w = hub_link::OutageWatermark::new(watermark_file(&dir));
+    w.record("2026-01-01T00:00:10Z").unwrap();
+    let tick_read = w.load().unwrap();
+    let write_read = w.load().unwrap();
+    w.clear_if(write_read.seq).unwrap();
+    w.record("2026-01-01T00:05:00Z").unwrap();
+    w.clear_if(tick_read.seq).unwrap();
+    let kept = w.load().expect("the newer outage must survive the stale clear");
+    assert_eq!(kept.since, "2026-01-01T00:05:00Z");
 }

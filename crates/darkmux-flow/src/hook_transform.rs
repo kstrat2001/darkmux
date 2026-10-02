@@ -152,7 +152,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -290,6 +290,7 @@ pub fn load_adapter(adapters_dir: &Path, name: &str) -> Result<LoadedAdapter> {
 }
 
 /// Outcome of running a transform against one record line.
+#[derive(Debug)]
 pub enum TransformOutcome {
     /// The request body the delivery should carry.
     Body(String),
@@ -429,50 +430,118 @@ pub fn apply_transform(
     max_output_bytes: usize,
     orphan_count: &Arc<AtomicU32>,
 ) -> TransformOutcome {
+    let source = source.to_string();
+    let record_line = record_line.to_string();
+    apply_with(
+        move || run_jq(&source, &record_line).and_then(|v| val_to_body(&v)),
+        timeout,
+        max_output_bytes,
+        orphan_count,
+        &|_| {},
+    )
+}
+
+/// The evaluation thread's lifecycle, shared with the caller.
+const WORKER_RUNNING: u8 = 0;
+/// The worker finished while the caller was still waiting.
+const WORKER_DONE: u8 = 1;
+/// The caller timed out first and counted the worker as orphaned.
+const WORKER_ORPHANED: u8 = 2;
+
+/// Dropped when the worker ends (return or panic). It settles the worker's
+/// lifecycle with ONE compare-exchange against the caller's: whichever of the
+/// two moves the state off `WORKER_RUNNING` first decides who owns the orphan
+/// counter. If the caller already orphaned the worker, the worker owns the
+/// decrement, so a worker that finishes in the window around the timeout can
+/// neither leave the counter raised nor lower it twice.
+struct WorkerEnd {
+    state: Arc<AtomicU8>,
+    orphans: Arc<AtomicU32>,
+}
+
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        let finished_first = self
+            .state
+            .compare_exchange(WORKER_RUNNING, WORKER_DONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if !finished_first {
+            self.orphans.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Count the worker as orphaned unless it has already finished. Returns
+/// `true` when the worker is now orphaned (it will decrement the counter
+/// itself); `false` when it finished first and its result is waiting.
+///
+/// The counter is raised BEFORE the state flips, so a worker that sees
+/// `WORKER_ORPHANED` always finds the increment it is about to undo.
+fn claim_orphan(state: &AtomicU8, orphans: &AtomicU32) -> bool {
+    orphans.fetch_add(1, Ordering::AcqRel);
+    let claimed = state
+        .compare_exchange(WORKER_RUNNING, WORKER_ORPHANED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if !claimed {
+        orphans.fetch_sub(1, Ordering::AcqRel);
+    }
+    claimed
+}
+
+fn settle_body(result: Result<String, String>, max_output_bytes: usize) -> TransformOutcome {
+    match result {
+        Ok(body) if body.len() > max_output_bytes => TransformOutcome::Error(format!(
+            "adapter output is {} bytes, over the {max_output_bytes}-byte cap",
+            body.len()
+        )),
+        Ok(body) => TransformOutcome::Body(body),
+        Err(e) => TransformOutcome::Error(bounded_excerpt(&e)),
+    }
+}
+
+/// [`apply_transform`] with the evaluation injected. `on_timeout` runs on the
+/// caller's thread after the wait expired and before the orphan claim; it
+/// exists so a test can finish the worker inside that window.
+fn apply_with<F>(
+    compute: F,
+    timeout: Duration,
+    max_output_bytes: usize,
+    orphan_count: &Arc<AtomicU32>,
+    on_timeout: &dyn Fn(&AtomicU8),
+) -> TransformOutcome
+where
+    F: FnOnce() -> Result<String, String> + Send + 'static,
+{
     if orphan_count.load(Ordering::Acquire) >= MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE {
         return TransformOutcome::Busy;
     }
-    let source = source.to_string();
-    let record_line = record_line.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
-    let thread_orphan_count = orphan_count.clone();
+    let state = Arc::new(AtomicU8::new(WORKER_RUNNING));
+    let end = WorkerEnd { state: state.clone(), orphans: orphan_count.clone() };
     let spawned = std::thread::Builder::new().name("hook-jq-transform".to_string()).spawn(move || {
-        let result = run_jq(&source, &record_line).and_then(|v| val_to_body(&v));
-        // `send` fails only when the receiver already gave up (the
-        // timeout branch below) — that's exactly the "this thread is now
-        // orphaned" case, and the ONLY case where the orphan counter was
-        // ever incremented for this call, so decrementing unconditionally
-        // on a failed send (and never otherwise) keeps the counter exact
-        // without a second channel/flag.
-        if tx.send(result).is_err() {
-            thread_orphan_count.fetch_sub(1, Ordering::AcqRel);
-        }
+        let _end = end;
+        // The receiver outlives a finished-first worker, so this send only
+        // fails after the caller has returned; the result is unwanted then.
+        let _ = tx.send(compute());
     });
     if spawned.is_err() {
         return TransformOutcome::Error("failed to spawn jq evaluation thread".to_string());
     }
+    let panicked = || TransformOutcome::Error("jq evaluation thread panicked".to_string());
     match rx.recv_timeout(timeout) {
-        Ok(Ok(body)) => {
-            if body.len() > max_output_bytes {
-                TransformOutcome::Error(format!(
-                    "adapter output is {} bytes, over the {max_output_bytes}-byte cap",
-                    body.len()
-                ))
-            } else {
-                TransformOutcome::Body(body)
-            }
-        }
-        Ok(Err(e)) => TransformOutcome::Error(bounded_excerpt(&e)),
+        Ok(result) => settle_body(result, max_output_bytes),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panicked(),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // The thread is now ORPHANED — still running, past our
-            // deadline, potentially still allocating (see this module's
-            // doc). Count it so a future call for this rule can refuse
-            // to pile on more of the same.
-            orphan_count.fetch_add(1, Ordering::AcqRel);
-            TransformOutcome::Error(format!("jq evaluation exceeded the {}ms wall-clock cap", timeout.as_millis()))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            TransformOutcome::Error("jq evaluation thread panicked".to_string())
+            on_timeout(&state);
+            // The thread is ORPHANED — still running, past our deadline,
+            // potentially still allocating (see this module's doc) — unless
+            // it finished in the window above, in which case its result is
+            // already in the channel.
+            if claim_orphan(&state, orphan_count) {
+                TransformOutcome::Error(format!("jq evaluation exceeded the {}ms wall-clock cap", timeout.as_millis()))
+            } else {
+                rx.try_recv().map_or_else(|_| panicked(), |result| settle_body(result, max_output_bytes))
+            }
         }
     }
 }
@@ -581,6 +650,71 @@ mod tests {
             TransformOutcome::Error(e) => assert!(e.contains("wall-clock"), "expected a wall-clock-cap error, got: {e}"),
             TransformOutcome::Body(b) => panic!("expected the wall-clock cap to fire, got body: {b}"),
             TransformOutcome::Busy => panic!("expected an error, got Busy"),
+        }
+    }
+
+    /// Block (bounded) until `cond` holds; a hang fails the test instead of
+    /// wedging the run.
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A worker that finishes inside the window between the caller's timeout
+    /// and its orphan claim must not leave the counter raised: the
+    /// old code incremented after the worker's `send` had already succeeded
+    /// into the still-open channel, so nothing ever decremented.
+    #[test]
+    fn a_worker_finishing_in_the_timeout_window_leaves_no_orphan() {
+        let orphans = no_orphans();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let out = apply_with(
+            move || {
+                go_rx.recv().unwrap();
+                Ok("late body".to_string())
+            },
+            Duration::from_millis(30),
+            1_048_576,
+            &orphans,
+            &|state| {
+                go_tx.send(()).unwrap();
+                wait_until("the worker to finish", || state.load(Ordering::Acquire) != WORKER_RUNNING);
+            },
+        );
+        assert!(
+            matches!(&out, TransformOutcome::Body(b) if b == "late body"),
+            "a worker that won the race delivers its result: {out:?}"
+        );
+        assert_eq!(orphans.load(Ordering::Acquire), 0, "no orphan was left counted");
+    }
+
+    /// The other side of the race: the caller claims first, so the worker owns
+    /// the decrement, whether it ends normally or by panic.
+    #[test]
+    fn an_orphaned_worker_decrements_for_itself_on_return_and_on_panic() {
+        for panics in [false, true] {
+            let orphans = no_orphans();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let out = apply_with(
+                move || {
+                    go_rx.recv().unwrap();
+                    if panics {
+                        panic!("injected worker panic");
+                    }
+                    Ok("unwanted".to_string())
+                },
+                Duration::from_millis(30),
+                1_048_576,
+                &orphans,
+                &|_| {},
+            );
+            assert!(matches!(out, TransformOutcome::Error(ref m) if m.contains("wall-clock cap")), "{out:?}");
+            assert_eq!(orphans.load(Ordering::Acquire), 1, "the orphan is counted while it runs");
+            go_tx.send(()).unwrap();
+            wait_until("the orphan to decrement itself", || orphans.load(Ordering::Acquire) == 0);
         }
     }
 

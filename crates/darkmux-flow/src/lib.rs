@@ -109,6 +109,10 @@ pub trait FlowSink: Send + Sync {
     fn hub_link(&self) -> Option<HubLink> {
         None
     }
+
+    /// Periodic housekeeping a long-lived process drives (the presence
+    /// reconciler's tick). A no-op unless the sink has deferred work.
+    fn tick(&self) {}
 }
 
 /// A record that passed the write check: its action is one darkmux writes
@@ -300,6 +304,11 @@ impl FlowSink for LocalFileSink {
 // silently skips it; the integrity-check verb + doctor check report
 // "audit sink is unix-only on this platform". Cross-platform support
 // would need `LockFileEx` and a separate code path — out of scope here.
+//
+// The chain check detects edits, reordering, and deletions from the head
+// or middle of a day file. It does NOT detect records removed from the END
+// of a day file: the shorter chain still verifies, because nothing records
+// how many records the file should hold.
 //
 // Edit-detecting, NOT tamper-proof. OS-level append-only flags
 // (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
@@ -999,6 +1008,14 @@ pub struct RedisSink {
     backfill_dir: Option<PathBuf>,
     /// The link state and the probe schedule, behind one lock.
     link: std::sync::Mutex<hub_link::LinkState>,
+    /// The earliest unsent `ts`, persisted so a restart or another process's
+    /// failure is not forgotten.
+    watermark: hub_link::OutageWatermark,
+    /// Whether the persisted watermark has been read since this sink started.
+    watermark_read: AtomicBool,
+    /// The watermark file's (mtime, length) as of the last tick that acted on
+    /// it, so a tick only reads and re-sends when the file changed.
+    watermark_seen: std::sync::Mutex<Option<(std::time::SystemTime, u64)>>,
 }
 
 /// (#388) Consecutive write failures before a `RedisSink` disables
@@ -1365,6 +1382,9 @@ impl RedisSink {
             probe_backoff: hub_link::ProbeBackoff::default(),
             backfill_dir: None,
             link: std::sync::Mutex::new(hub_link::LinkState::new()),
+            watermark: hub_link::OutageWatermark::new(hub_link::default_watermark_path()),
+            watermark_read: AtomicBool::new(false),
+            watermark_seen: std::sync::Mutex::new(None),
         })
     }
 
@@ -1378,6 +1398,7 @@ impl RedisSink {
     /// directory, and probe on `min..=max` instead of the default 2s..=60s.
     #[cfg(test)]
     fn with_test_recovery(mut self, dir: PathBuf, min: std::time::Duration, max: std::time::Duration) -> Self {
+        self.watermark = hub_link::OutageWatermark::new(dir.join("hub-outage.json"));
         self.backfill_dir = Some(dir);
         self.probe_backoff = hub_link::ProbeBackoff { min, max };
         self
@@ -1400,7 +1421,16 @@ impl RedisSink {
     /// a `LongLived` sink then schedules its next probe. Returns true iff this
     /// call is the one that flipped the sink to disabled.
     fn note_failure(&self, err: &anyhow::Error, record_ts: &str) -> bool {
+        self.note_failure_of(err, record_ts, "write")
+    }
+
+    /// [`Self::note_failure`] naming what failed (`write` or `backfill`) in
+    /// the one-time log line.
+    fn note_failure_of(&self, err: &anyhow::Error, record_ts: &str, what: &str) -> bool {
         let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Err(e) = self.watermark.record(record_ts) {
+            eprintln!("flow::RedisSink: could not persist the hub outage watermark: {e:#}");
+        }
         let mut link = self.link_state();
         link.record_failure(record_ts, err.root_cause().to_string());
         let flipped = n >= REDIS_DISABLE_THRESHOLD && !self.disabled.swap(true, Ordering::AcqRel);
@@ -1410,7 +1440,7 @@ impl RedisSink {
                 SinkPolicy::LongLived => "disabling Redis flow sink until the peer answers again",
             };
             eprintln!(
-                "flow::RedisSink: {} unreachable after {n} consecutive write failures \
+                "flow::RedisSink: {} unreachable after {n} consecutive {what} failures \
                  ({err:#}); {outlook}. LocalFileSink is unaffected.",
                 self.url
             );
@@ -1513,6 +1543,10 @@ impl FlowSink for RedisSink {
     fn hub_link(&self) -> Option<HubLink> {
         Some(self.link_state().link())
     }
+
+    fn tick(&self) {
+        self.catch_up_watermark();
+    }
 }
 
 impl RedisSink {
@@ -1530,11 +1564,42 @@ impl RedisSink {
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
         if self.policy == SinkPolicy::LongLived {
-            self.backfill(&mut conn, &payload)?;
+            self.backfill(&mut conn, &payload, false)?;
         }
         self.xadd(&payload, false).query::<String>(&mut conn)
             .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
         Ok(())
+    }
+
+    /// Tick work for a healthy long-lived sink: when the watermark file has
+    /// changed since the last tick (a one-shot writer's failed write recorded
+    /// one), re-send from it now rather than at the next restart or outage.
+    /// One `stat` when nothing changed; the file is read, and the hub
+    /// contacted, only when its (mtime, length) differs.
+    fn catch_up_watermark(&self) {
+        if self.policy != SinkPolicy::LongLived || self.is_disabled() {
+            return;
+        }
+        let sig = self.watermark.signature();
+        {
+            let mut seen = self.watermark_seen.lock().unwrap_or_else(|p| p.into_inner());
+            if *seen == sig {
+                return;
+            }
+            *seen = sig;
+        }
+        if self.watermark.load().is_none() {
+            return;
+        }
+        let result = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
+            .context("getting Redis connection")
+            .and_then(|mut conn| {
+                bound_redis_response(&conn);
+                self.backfill(&mut conn, "", true)
+            });
+        if let Err(e) = result {
+            self.note_failure_of(&e, &schema::ts_utc_now(), "backfill");
+        }
     }
 
     /// The XADD for one record. Two-field encoding: `schema` carries the
@@ -1559,11 +1624,19 @@ impl RedisSink {
     }
 
     /// Re-send, oldest first in one pipeline, the records the local day files
-    /// hold from the start of the current outage, ahead of the record in `payload`
-    /// (which the caller publishes right after, so it is left out here). Reader-side de-duplication by
-    /// record identity absorbs any record the hub already holds.
-    fn backfill(&self, conn: &mut redis::Connection, payload: &str) -> Result<()> {
-        let Some(since) = self.link_state().outage_since().map(str::to_string) else {
+    /// hold from the start of the outage, ahead of the record in `payload`
+    /// (which the caller publishes right after, so it is left out here). The
+    /// start is the earlier of this process's own outage and the persisted
+    /// watermark, which any process's failed write may have lowered; the
+    /// watermark is read when the sink starts and while an outage is open, and
+    /// cleared once the re-send lands. Delivery is at-least-once: reader-side
+    /// de-duplication by record identity absorbs any record the hub already
+    /// holds.
+    fn backfill(&self, conn: &mut redis::Connection, payload: &str, check_file: bool) -> Result<()> {
+        let own = self.link_state().outage_since().map(str::to_string);
+        let first = !self.watermark_read.swap(true, Ordering::AcqRel);
+        let marked = if own.is_some() || first || check_file { self.watermark.load() } else { None };
+        let Some(since) = own.into_iter().chain(marked.as_ref().map(|m| m.since.clone())).min() else {
             return Ok(());
         };
         let skip = reader::parse_value(payload).map(|v| flow_record_identity(&v)).unwrap_or_default();
@@ -1585,6 +1658,11 @@ impl RedisSink {
             }
             pipe.query::<()>(conn)
                 .with_context(|| format!("backfilling {} record(s) to Redis stream `{}`", lines.len(), self.stream))?;
+        }
+        if let Some(m) = marked {
+            if let Err(e) = self.watermark.clear_if(m.seq) {
+                eprintln!("flow::RedisSink: could not clear the hub outage watermark: {e:#}");
+            }
         }
         Ok(())
     }
@@ -1725,6 +1803,10 @@ impl FlowSink for TeeSink {
             children: self.sinks.iter().map(|s| s.info()).collect(),
             raw_url: None,
         }
+    }
+
+    fn tick(&self) {
+        self.sinks.iter().for_each(|s| s.tick());
     }
 
     fn hub_link(&self) -> Option<HubLink> {
@@ -1921,6 +2003,19 @@ pub fn set_sink_policy(policy: SinkPolicy) -> Result<()> {
             sink_policy().as_str()
         ),
     }
+}
+
+/// Start the daemon's hub catch-up thread: it drives the default sink's
+/// periodic housekeeping (the outage watermark check) on the presence
+/// reconciler's cadence, on its OWN thread so a slow hub cannot delay the
+/// reconciler's close-edges. `None` when no Redis hub is configured.
+pub fn spawn_hub_catch_up_thread() -> Option<std::thread::JoinHandle<()>> {
+    redis_url()?;
+    Some(hub_link::spawn_tick_thread(
+        default_sink(),
+        std::time::Duration::from_secs(presence_reconciler::RECONCILE_INTERVAL_SECS),
+        Arc::new(AtomicBool::new(false)),
+    ))
 }
 
 /// This process's link to the fleet hub's flow stream, read from the default
@@ -5383,6 +5478,134 @@ mod tests {
         }
     }
 
+    // Torn-tail recovery: a crash mid-append must not poison
+    // the chain for every later write. Each tear shape is built by
+    // truncating/extending the raw bytes of a real chain.
+
+    fn torn_chain(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..n {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}");
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        (tmp, path)
+    }
+
+    fn torn_sidecars(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{}.torn-", path.file_name().unwrap().to_string_lossy());
+        let mut v: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn append_one(path: &std::path::Path, handle: &str) {
+        let mut rec = minimal_record();
+        rec.handle = handle.to_string();
+        crate::integrity::audit_record_at(&rec, path).unwrap();
+    }
+
+    #[test]
+    fn torn_tail_half_record_is_set_aside_and_chain_continues() {
+        let (_t, path) = torn_chain(3);
+        let before = std::fs::read(&path).unwrap();
+        let mut torn = before.clone();
+        let half = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef {\"ts\":\"2025";
+        torn.extend_from_slice(half);
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "chain must verify after recovery: {report:?}");
+        assert_eq!(report.records_checked, 4);
+        let sidecars = torn_sidecars(&path);
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(std::fs::read(&sidecars[0]).unwrap(), half);
+        assert_eq!(report.torn_tails, vec![sidecars[0].display().to_string()]);
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before), "valid lines must be untouched");
+    }
+
+    #[test]
+    fn torn_tail_cut_inside_hash_prefix_is_set_aside() {
+        let (_t, path) = torn_chain(2);
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(b"0123456789abcdef0123");
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after-1");
+        append_one(&path, "after-2");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 4);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+    }
+
+    #[test]
+    fn torn_tail_full_record_missing_newline_is_kept_not_glued() {
+        let (_t, path) = torn_chain(3);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, &bytes).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "a glued tail would break here: {report:?}");
+        assert_eq!(report.records_checked, 4, "the complete record must survive");
+        assert!(torn_sidecars(&path).is_empty(), "nothing was torn, nothing set aside");
+        assert!(report.torn_tails.is_empty());
+    }
+
+    #[test]
+    fn torn_tail_half_header_is_set_aside_and_file_reseeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        std::fs::write(&path, b"{\"_type\":\"schema\",\"vers").unwrap();
+
+        append_one(&path, "first");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 1);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+    }
+
+    /// #899: a headerless file (record line, header removed) must keep
+    /// refusing to be extended, even when its trailing newline is gone too.
+    #[test]
+    fn headerless_record_without_newline_is_refused_not_set_aside() {
+        let (_t, path) = torn_chain(1);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let record_line = raw.lines().nth(1).unwrap().to_string();
+        std::fs::write(&path, record_line.as_bytes()).unwrap();
+        let mut rec = minimal_record();
+        rec.handle = "after".to_string();
+        assert!(crate::integrity::audit_record_at(&rec, &path).is_err(), "must refuse to re-seed a chain");
+        assert_eq!(std::fs::read(&path).unwrap(), record_line.as_bytes(), "file untouched");
+        assert!(torn_sidecars(&path).is_empty(), "nothing set aside");
+    }
+
+    #[test]
+    fn clean_tail_is_untouched_by_an_append() {
+        let (_t, path) = torn_chain(3);
+        let before = std::fs::read(&path).unwrap();
+        append_one(&path, "after");
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(torn_sidecars(&path).is_empty());
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && report.torn_tails.is_empty());
+    }
+
     // (#1775) The exit-status belt. "Verified" and "could not verify" are
     // DIFFERENT claims, and the automated consumer the docs name — a cron
     // keyed on the exit code — could previously only see the first one.
@@ -5402,6 +5625,7 @@ mod tests {
             legacy_format: legacy,
             note: None,
             writer_schema_version: None,
+            torn_tails: Vec::new(),
         }
     }
 

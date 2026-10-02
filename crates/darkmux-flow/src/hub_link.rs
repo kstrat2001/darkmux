@@ -8,6 +8,7 @@
 //! backoff, and when the hub answers again publish the records written to the
 //! local day files while it was away).
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -174,4 +175,142 @@ impl Backfill<'_> {
             && crate::flow_record_identity(&v) != self.skip_identity;
         wanted.then(|| (ts.to_string(), v.to_string()))
     }
+}
+
+/// The earliest record `ts` that failed to reach the hub, kept in a small
+/// state file so the outage outlives the process that saw it.
+///
+/// Any process whose hub write fails calls [`record`](Self::record) (a
+/// one-shot CLI as much as the daemon), and keeps the earliest `ts` it has
+/// seen. The long-lived sink reads it when it starts and when the hub answers
+/// again, backfills from it, and [`clear_if`](Self::clear_if)s it once the
+/// backfill lands. Writes are atomic (temp file + rename) and serialized
+/// under an `flock` on a sibling lock file.
+///
+/// Each `record` bumps `seq`, and a clear keeps the file with `since: null`
+/// and the counter intact, so a generation is never reused: a backfill clears
+/// only the `seq` it read, and a failure recorded while it ran (or after a
+/// concurrent backfill cleared) keeps the watermark for the next recovery.
+/// Delivery is at-least-once, and readers de-duplicate on record identity.
+#[derive(Debug, Clone)]
+pub(crate) struct OutageWatermark {
+    path: PathBuf,
+}
+
+/// What the state file holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stored {
+    /// `ts` of the earliest record that failed to publish; `None` once cleared.
+    since: Option<String>,
+    /// Bumped by every `record`; never reset by a clear.
+    seq: u64,
+}
+
+/// An outstanding watermark, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Marked {
+    pub since: String,
+    pub seq: u64,
+}
+
+impl OutageWatermark {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    /// The state file's (mtime, length): a cheap change detector for a
+    /// periodic check. `None` when the file is absent.
+    pub(crate) fn signature(&self) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(&self.path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    fn load_stored(&self) -> Option<Stored> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// The outstanding watermark; `None` when absent, unreadable, or cleared.
+    pub(crate) fn load(&self) -> Option<Marked> {
+        let stored = self.load_stored()?;
+        Some(Marked { since: stored.since?, seq: stored.seq })
+    }
+
+    fn store(&self, stored: &Stored) -> Result<()> {
+        let mut tmp_name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = self.path.with_file_name(tmp_name);
+        std::fs::write(&tmp, serde_json::to_vec(stored)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replacing {}", self.path.display()))
+    }
+
+    /// Note that the record stamped `ts` failed to publish. Keeps the earlier
+    /// of `ts` and any outstanding watermark.
+    pub(crate) fn record(&self, ts: &str) -> Result<()> {
+        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
+            let old = self.load_stored();
+            let seq = old.as_ref().map_or(0, |o| o.seq) + 1;
+            let since = match old.and_then(|o| o.since) {
+                Some(prev) => prev.min(ts.to_string()),
+                None => ts.to_string(),
+            };
+            self.store(&Stored { since: Some(since), seq })
+        })
+    }
+
+    /// Clear the watermark if no `record` has run since `seq` was read. The
+    /// counter survives, so no later generation repeats `seq`.
+    pub(crate) fn clear_if(&self, seq: u64) -> Result<()> {
+        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| match self.load_stored() {
+            Some(s) if s.seq == seq && s.since.is_some() => self.store(&Stored { since: None, seq }),
+            _ => Ok(()),
+        })
+    }
+}
+
+/// Where the outage watermark lives: `<darkmux root>/state/hub-outage.json`.
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn default_watermark_path() -> PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
+        .root
+        .join("state")
+        .join("hub-outage.json")
+}
+
+/// Test builds never default onto the operator's real darkmux root (same
+/// discipline as `audit_dir_default`).
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn default_watermark_path() -> PathBuf {
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return darkmux_types::paths::test_isolated_dir("state").join("hub-outage.json");
+    }
+    resolved.root.join("state").join("hub-outage.json")
+}
+
+/// Run `sink.tick()` every `interval` on a named thread until `stop` is set.
+/// The one place the periodic check is driven, for the daemon and the tests.
+pub(crate) fn spawn_tick_thread(
+    sink: std::sync::Arc<dyn crate::FlowSink>,
+    interval: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("darkmux-hub-catch-up".to_string())
+        .spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                sink.tick();
+                std::thread::sleep(interval);
+            }
+        })
+        .expect("spawning the hub catch-up thread")
 }

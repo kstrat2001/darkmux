@@ -523,6 +523,16 @@ fn print_status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// One line per sidecar a torn audit tail was set aside into.
+fn print_torn_tails(r: &flow::IntegrityReport) {
+    for sidecar in &r.torn_tails {
+        println!(
+            "{}",
+            darkmux_types::style::warn(&format!("       torn tail set aside after an interrupted write: {sidecar}"))
+        );
+    }
+}
+
 /// Render `darkmux flow integrity-check` to stdout. Walks the audit dir
 /// (or a single `--path`), recomputes each file's hash chain, reports
 /// pass/break per file. Exits with status 2 when any chain is genuinely
@@ -582,6 +592,7 @@ fn print_integrity_check(
                 r.path,
                 style::dim(&format!("({} record(s))", r.records_checked))
             );
+            print_torn_tails(r);
             if !r.chain_valid {
                 if let Some(line) = r.break_at_line {
                     println!("{}", style::error(&format!("       chain break at line {line}")));
