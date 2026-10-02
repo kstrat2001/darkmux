@@ -4267,6 +4267,69 @@ fn docker_kill_by_name(container_name: &str) {
     let _ = Command::new("docker").args(["kill", container_name]).output();
 }
 
+/// (5.0) A stop that ends ONE dispatch: the budget pacer saw this run's
+/// own mission aborted or finalized, or its own phase abandoned
+/// (`budget::run_stop_reason`). Deliberately NOT `interrupt::mark_interrupted`:
+/// that flag is process-global and sticky, so a mission launch running steps
+/// of other phases concurrently had every dispatch killed when one phase was
+/// abandoned. The global flag stays for Ctrl-C and SIGTERM. The sampler
+/// requests the stop; the tailer kills this dispatch's container and the
+/// teardown after the wait reports it, exactly as an interrupt would, for
+/// this dispatch only.
+#[derive(Clone)]
+struct DispatchStop {
+    reason: Arc<Mutex<Option<String>>>,
+    container_name: String,
+}
+
+impl DispatchStop {
+    fn new(container_name: String) -> Self {
+        Self { reason: Arc::new(Mutex::new(None)), container_name }
+    }
+
+    /// Record why this dispatch must end. The first reason wins.
+    fn request(&self, reason: String) {
+        let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        slot.get_or_insert(reason);
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn is_requested(&self) -> bool {
+        self.reason().is_some()
+    }
+
+    /// Stop this dispatch's container, and only it.
+    fn kill_container(&self) {
+        docker_kill_by_name(&self.container_name);
+    }
+}
+
+/// (#889, #2131) The teardown both early exits of `dispatch()` share (the
+/// failed wait and the interrupted or stopped run): tell the watchdog the
+/// wait is over, kill the container by name, stop and join the watchdog and
+/// the sampler, then stop and join the tailer. The tailer needs `stop_flag`
+/// on the failed-wait path, where nothing else ends its loop.
+fn teardown_container_threads(
+    container_name: &str,
+    watchdog_done: &AtomicBool,
+    watchdog_handle: thread::JoinHandle<WatchdogWake>,
+    sampler_stop: &AtomicBool,
+    sampler_handle: thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>,
+    stop_flag: &AtomicBool,
+    tailer_handle: thread::JoinHandle<TrajectorySummary>,
+) {
+    watchdog_done.store(true, Ordering::SeqCst);
+    docker_kill_by_name(container_name);
+    let _ = watchdog_handle.join();
+    sampler_stop.store(true, Ordering::SeqCst);
+    let _ = sampler_handle.join();
+    stop_flag.store(true, Ordering::SeqCst);
+    let _ = tailer_handle.join();
+}
+
 // (#2232) The inactivity watchdog is the UNATTENDED safety net, and its kill
 // used to be one fire-and-forget `docker kill` after which the thread
 // RETURNED. A single transient docker failure (dockerd busy or restarting, an
@@ -6233,6 +6296,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // (5.0) This dispatch's own stop: see `DispatchStop`.
+    let local_stop = DispatchStop::new(container_name.clone());
     // (#threshold) Effective compaction threshold the runtime triggers at:
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
     // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
@@ -6297,6 +6362,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())),
         // (#2928) The live channel, unless this dispatch opted out (the lab).
         live_sender_for(opts.live_channel),
+        local_stop.clone(),
     );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
@@ -6416,6 +6482,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902 step 5) The in-run half of an agentic-remote brain's
         // endpoint budget (the pre-start half ran before `dispatch start`).
         pacer_for(limits_pm, opts.config_path.as_deref())?,
+        local_stop.clone(),
     );
 
     // (#2642) External, whole-`dispatch()`-level panic-injection hook for
@@ -6476,20 +6543,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // teardown the success path does — stop the watchdog + sampler
             // threads — plus a best-effort `docker kill` by the
             // deterministic container name, then surface the wait error.
-            watchdog_done.store(true, Ordering::SeqCst);
-            docker_kill_by_name(&container_name);
-            let _ = watchdog_handle.join();
-            sampler_stop.store(true, Ordering::SeqCst);
-            let _ = sampler_handle.join();
-            // (#2131 review round 2, F5) Same teardown the success path
-            // gives the tailer, further down — signal it to stop and
-            // join it before returning. Without this, a `wait_with_output`
-            // failure left the tailer thread leaked: its own loop only
-            // exits on `stop_flag` or a caught signal, neither of which
-            // this branch used to touch, so it polled `trajectory.jsonl`
-            // forever in the background.
-            stop_flag.store(true, Ordering::SeqCst);
-            let _ = tailer_handle.join();
+            //
+            // (#2131 review round 2, F5) The tailer gets the same teardown
+            // the success path gives it: signal it to stop and join it.
+            // Without this, a `wait_with_output` failure left the tailer
+            // thread leaked: its own loop only exits on `stop_flag` or a
+            // caught signal, neither of which this branch used to touch, so
+            // it polled `trajectory.jsonl` forever in the background.
+            teardown_container_threads(
+                &container_name,
+                &watchdog_done,
+                watchdog_handle,
+                &sampler_stop,
+                sampler_handle,
+                &stop_flag,
+                tailer_handle,
+            );
             // (#2131 review round 2, NEW-2) No explicit deregister here —
             // `container_child_registration` (declared at the spawn
             // site) deregisters on Drop, which fires when this early
@@ -6559,13 +6628,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // parsing below instead, and let the LAUNCHER decide what a
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
-    if darkmux_types::interrupt::is_set() && !output.status.success() {
-        watchdog_done.store(true, Ordering::SeqCst);
-        docker_kill_by_name(&container_name);
-        let _ = watchdog_handle.join();
-        sampler_stop.store(true, Ordering::SeqCst);
-        let _ = sampler_handle.join();
-        let _ = tailer_handle.join();
+    let stop_reason = local_stop.reason();
+    if (darkmux_types::interrupt::is_set() || stop_reason.is_some()) && !output.status.success() {
+        teardown_container_threads(
+            &container_name,
+            &watchdog_done,
+            watchdog_handle,
+            &sampler_stop,
+            sampler_handle,
+            &stop_flag,
+            tailer_handle,
+        );
         if let Some(em) = session_emitter {
             em.stop();
         }
@@ -6574,11 +6647,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // after a SUCCESSFUL `wait_with_output`, which dropped it
         // explicitly in the `Ok` arm above (the child is dead either
         // way; there is nothing left to deregister here).
-        return Err(anyhow!(
-            "darkmux-runtime container dispatch {} \
-             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
-            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
-        ));
+        //
+        // (5.0) A stop scoped to this dispatch is reported as itself,
+        // not as a signal: the launcher reads the signal wording as "the
+        // whole run was interrupted", which a phase stop is not.
+        return Err(match (darkmux_types::interrupt::is_set(), stop_reason) {
+            (false, Some(reason)) => anyhow!(
+                "darkmux-runtime container dispatch was stopped ({reason}) \
+                : the container `{container_name}` was killed mid-run"
+            ),
+            _ => anyhow!(
+                "darkmux-runtime container dispatch {} \
+                 (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
+                darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
+            ),
+        });
     }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
@@ -7510,6 +7593,7 @@ fn spawn_guarded_tailer(
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
+    local_stop: DispatchStop,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -7540,6 +7624,7 @@ fn spawn_guarded_tailer(
             dispatch_cap,
             compactor_endpoint,
             live,
+            local_stop,
         )
     });
     (guard, handle)
@@ -7591,6 +7676,7 @@ fn run_tailer(
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
+    local_stop: DispatchStop,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -7656,6 +7742,14 @@ fn run_tailer(
             // stale.
             state.drain_to_end();
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+            break;
+        }
+        // (5.0) A stop scoped to THIS dispatch (its phase abandoned, its
+        // mission aborted): same flush-then-kill as an interrupt, but only
+        // this container is touched, never another dispatch's child.
+        if local_stop.is_requested() {
+            state.drain_to_end();
+            local_stop.kill_container();
             break;
         }
         thread::sleep(TAILER_POLL_INTERVAL);
@@ -8253,6 +8347,7 @@ fn spawn_guarded_sampler(
     record_context: Option<darkmux_flow::payload::RecordContext>,
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     budget_pacer: Option<crate::budget::BudgetPacer>,
+    local_stop: DispatchStop,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -8271,6 +8366,7 @@ fn spawn_guarded_sampler(
             record_context,
             thermal_config,
             budget_pacer,
+            local_stop,
         )
     });
     (guard, handle)
@@ -8314,6 +8410,8 @@ fn run_telemetry_sampler(
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
     mut budget_pacer: Option<crate::budget::BudgetPacer>,
+    // (5.0) Where a phase- or mission-scoped stop lands: this dispatch only.
+    local_stop: DispatchStop,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
@@ -8847,14 +8945,16 @@ fn run_telemetry_sampler(
                 Some(crate::budget::PacerEvent::Resumed { state }) => {
                     emit_rest(crate::budget::PACE_REASON, &state, false)
                 }
-                Some(crate::budget::PacerEvent::Stopped { .. }) => {
+                Some(crate::budget::PacerEvent::Stopped { reason }) => {
                     // (#2902 step 5 review MF1) The run was stopped while the
                     // pacer held it (`mission abort` writes only terminal state;
                     // this is where it reaches a paused container). End it
-                    // the way an interrupt does: the tailer kills the child on
-                    // the flag, and the launcher takes its abort path. The
+                    // the way an interrupt does, for THIS dispatch only (5.0): the
+                    // tailer kills this container on the stop, and the launcher
+                    // takes its abort path. The process-global interrupt flag is
+                    // not touched: it would end every other phase's dispatch. The
                     // pace file still says pause, so no turn goes out first.
-                    darkmux_types::interrupt::mark_interrupted();
+                    local_stop.request(reason);
                 }
                 None => {}
             }

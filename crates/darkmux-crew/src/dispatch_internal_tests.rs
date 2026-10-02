@@ -607,59 +607,167 @@
         assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
     }
 
-    /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
-    /// the real `run_telemetry_sampler`: a held run that was stopped is
-    /// never released; the pace file keeps `pause`, a `budget.stop` is
-    /// recorded, and the run is ended the way an interrupt ends it.
-    #[test]
-    #[serial]
-    fn the_sampler_pacer_ends_a_stopped_run_it_holds() {
-        let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the sampler's `machine.telemetry` goes to the real flow sink otherwise
-        darkmux_types::interrupt::reset_for_test();
-        let out = TempDir::new().unwrap();
+    /// A budget pacer over a full one-token window, so its first tick holds
+    /// the run (and, when the run is stopped, reports the stop).
+    fn full_window_pacer() -> crate::budget::BudgetPacer {
         let mut ep: darkmux_types::ModelEndpoint = serde_json::from_str(
             r#"{"url":"http://127.0.0.1:1","limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}"#,
         )
         .unwrap();
         ep.source = darkmux_types::EndpointSource::Named("azure".into());
-        let pacer = crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None);
-        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped("mission `m` is aborted"));
+        crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None)
+    }
+
+    /// (5.0) One real `run_telemetry_sampler` for a dispatch of `phase` in
+    /// `mission`, reading stops from disk the way production does. Returns
+    /// its stop flag and join handle; it runs until that flag is set.
+    fn spawn_paced_sampler(
+        mission: &'static str,
+        phase: &'static str,
+        local_stop: DispatchStop,
+    ) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
         let stop = Arc::new(AtomicBool::new(false));
-        let stopper = Arc::clone(&stop);
-        // End the sampler once the interrupt was raised (or after a bound),
-        // never on a fixed guess at how long its first tick takes.
-        let t = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !darkmux_types::interrupt::is_set() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-            stopper.store(true, Ordering::SeqCst);
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let out = TempDir::new().unwrap();
+            let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().reading_disk_for_stops());
+            crate::budget::with_test_env(env, || {
+                run_telemetry_sampler(
+                    stop_for_thread,
+                    "coder".into(),
+                    crate::mission_test_session(mission, phase),
+                    darkmux_types::execution_id::ExecutionId::mint(),
+                    "gpt-remote".into(),
+                    None,
+                    None,
+                    Some(phase.to_string()),
+                    out.path().to_path_buf(),
+                    None,
+                    crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                    Some(full_window_pacer()),
+                    local_stop,
+                )
+            });
         });
-        crate::budget::with_test_env(env.clone(), || {
-            run_telemetry_sampler(
-                stop,
-                "coder".into(),
-                crate::test_session("s-pacer"), darkmux_types::execution_id::ExecutionId::mint(),
-                "gpt-remote".into(),
-                None,
-                None,
-                None,
+        (stop, handle)
+    }
+
+    /// Write `status` into the mission or phase JSON `abort`/`abandon` would.
+    fn write_status(path: std::path::PathBuf, status: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
+    }
+
+    /// Wait (bounded) until every stop in `stops` has been requested.
+    fn wait_requested(stops: &[&DispatchStop]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !stops.iter().all(|s| s.is_requested()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        stops.iter().all(|s| s.is_requested())
+    }
+
+    /// (5.0) Abandoning ONE phase ends that phase's dispatch and no other:
+    /// the stop lands on the dispatch's own `DispatchStop`, never on the
+    /// process-global interrupt flag that a concurrent dispatch of another
+    /// phase (same mission) also reads. Real sampler threads, real disk read.
+    #[test]
+    #[serial]
+    fn abandoning_one_phase_ends_only_that_phases_dispatch() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        darkmux_types::interrupt::reset_for_test();
+        write_status(crate::lifecycle::mission_path("m-ph"), "active");
+        write_status(crate::lifecycle::phase_path("m-ph", "p1"), "abandoned");
+        write_status(crate::lifecycle::phase_path("m-ph", "p2"), "running");
+        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (flag_1, t1) = spawn_paced_sampler("m-ph", "p1", stop_1.clone());
+        let (flag_2, t2) = spawn_paced_sampler("m-ph", "p2", stop_2.clone());
+        let ended = wait_requested(&[&stop_1]);
+        // Give p2's sampler a few ticks to (wrongly) stop, were it going to.
+        thread::sleep(Duration::from_millis(2_500));
+        let (global, other) = (darkmux_types::interrupt::is_set(), stop_2.is_requested());
+        for f in [&flag_1, &flag_2] {
+            f.store(true, Ordering::SeqCst);
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(ended, "the abandoned phase's dispatch is ended");
+        assert!(stop_1.reason().unwrap().contains("phase `p1`"), "{:?}", stop_1.reason());
+        assert!(!global, "a phase stop must not raise the process-global interrupt");
+        assert!(!other, "the other phase's dispatch keeps running: {:?}", stop_2.reason());
+    }
+
+    /// (5.0) The inverse: a mission aborted on disk ends EVERY dispatch of
+    /// that mission, each through its own stop.
+    #[test]
+    #[serial]
+    fn aborting_the_mission_ends_every_dispatch_of_it() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        darkmux_types::interrupt::reset_for_test();
+        write_status(crate::lifecycle::mission_path("m-ab"), "aborted");
+        write_status(crate::lifecycle::phase_path("m-ab", "p1"), "running");
+        write_status(crate::lifecycle::phase_path("m-ab", "p2"), "running");
+        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (flag_1, t1) = spawn_paced_sampler("m-ab", "p1", stop_1.clone());
+        let (flag_2, t2) = spawn_paced_sampler("m-ab", "p2", stop_2.clone());
+        let ended = wait_requested(&[&stop_1, &stop_2]);
+        for f in [&flag_1, &flag_2] {
+            f.store(true, Ordering::SeqCst);
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let global = darkmux_types::interrupt::is_set();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(ended, "both dispatches of an aborted mission end");
+        assert!(stop_1.reason().unwrap().contains("m-ab"), "{:?}", stop_1.reason());
+        assert!(!global, "still no process-global interrupt");
+    }
+
+    /// (5.0) The tailer honors a dispatch-scoped stop like an interrupt:
+    /// it flushes and ends its loop (here with no container to kill) while
+    /// its own stop flag is never set. A tailer that ignored the stop would
+    /// hang this test past its bound.
+    #[test]
+    #[serial]
+    fn the_tailer_ends_on_its_dispatchs_own_stop() {
+        darkmux_types::interrupt::reset_for_test();
+        let out = TempDir::new().unwrap();
+        let local_stop = DispatchStop::new("darkmux-test-no-such-container".into());
+        local_stop.request("phase `p` of mission `m` is abandoned".into());
+        let started = Instant::now();
+        let handle = thread::spawn(move || {
+            run_tailer(
                 out.path().to_path_buf(),
+                crate::test_session("sess-local-stop"),
+                darkmux_types::execution_id::ExecutionId::mint(),
+                "coder".into(),
+                "darkmux:m".into(),
                 None,
-                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
-                Some(pacer),
+                None,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+                600,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                local_stop,
             )
         });
-        t.join().unwrap();
-        let interrupted = darkmux_types::interrupt::is_set();
-        darkmux_types::interrupt::reset_for_test();
-        assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
-        // (5th review C6) Stopped before any wait was announced: no orphan
-        // `budget.stop` (a stop record always follows its wait).
-        assert!(!env.actions().contains(&darkmux_flow::FlowAction::BudgetStop), "{:?}", env.actions());
-        let pace: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
-        assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(handle.is_finished(), "the tailer must end on a dispatch-scoped stop");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        handle.join().unwrap();
     }
 
     /// Hosted-response classification (pure): the happy path passes through;
@@ -7528,6 +7636,7 @@
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
+                DispatchStop::new("test-container".into()),
             )
         });
 
@@ -8621,6 +8730,7 @@
             None,
             None,
             None,
+            DispatchStop::new("test-container".into()),
         );
         handle.join().expect("tailer thread");
 
@@ -14780,6 +14890,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None, // (#3035) dispatch cap
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
+            DispatchStop::new("test-container".into()),
         );
         let elapsed = started.elapsed();
 
@@ -15146,6 +15257,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
+                DispatchStop::new("test-container".into()),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
@@ -15234,6 +15346,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
                 None, // (#2902 step 5) no endpoint budget
+                DispatchStop::new("test-container".into()),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -18746,6 +18859,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None, // dispatch cap
             None, // compactor endpoint
             None, // live sender
+            DispatchStop::new("test-container".into()),
         );
         assert_eq!(summary.fold.compactions(), 1, "the event at the end of a 20 MiB backlog was dropped");
     }
