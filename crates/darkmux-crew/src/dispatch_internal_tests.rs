@@ -5210,11 +5210,11 @@
         let dir = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         write_resume_origin_meta(dir.path(), ws.path(), false, None, &ExecutionId::mint());
-        let raw = std::fs::read_to_string(dir.path().join(RESUME_ORIGIN_FILENAME)).unwrap();
+        let raw = std::fs::read_to_string(resume_origin_path(dir.path())).unwrap();
         let mut origin: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(origin["schema_version"], RESUME_ORIGIN_SCHEMA_VERSION);
         origin["schema_version"] = serde_json::json!("999.0");
-        std::fs::write(dir.path().join(RESUME_ORIGIN_FILENAME), origin.to_string()).unwrap();
+        std::fs::write(resume_origin_path(dir.path()), origin.to_string()).unwrap();
         std::fs::write(dir.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         let err = validate_resume_checkpoint(dir.path(), "coder", ws.path(), false).unwrap_err().to_string();
         assert!(err.contains("RESUME ORIGIN NEWER") && err.contains("Upgrade darkmux."), "{err}");
