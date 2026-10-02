@@ -167,12 +167,12 @@ test('a retired #lens=lab bookmark opens the Unknown route page, not the runs le
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('deep link #lens=runs&run=<dir> boots into that run detail', async ({ page }) => {
+test('deep link #lens=runs&lab=<dir> boots into that run detail', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   await mockRunDetail(page);
 
-  await page.goto('/index-lab.html#lens=runs&run=demo-case%2Frun2');
+  await page.goto('/index-lab.html#lens=runs&lab=demo-case%2Frun2');
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
   await expect(page.locator('.labpipe .labstage').first()).toBeVisible();
   await expect(page.locator('#crumb')).toContainText('demo-case/run2');
@@ -189,12 +189,12 @@ test('drilling a lab row from the list opens its detail and updates the hash', a
   await page.locator('.labrunrow', { hasText: 'demo-case/run2' }).click();
   await expect(page.locator('#crumb')).toContainText('demo-case');
   await expect(page.locator('.labpipe .labstage').first()).toBeVisible();
-  await expect.poll(() => page.evaluate(() => location.hash)).toContain('run=demo-case%2Frun2');
+  await expect.poll(() => page.evaluate(() => location.hash)).toContain('lab=demo-case%2Frun2');
 
   // Navigating back to fleet clears the runs params from the hash.
   await page.click('#lens-fleet');
   await expect.poll(() => page.evaluate(() => location.hash)).not.toContain('lens=runs');
-  await expect.poll(() => page.evaluate(() => location.hash)).not.toContain('run=');
+  await expect.poll(() => page.evaluate(() => location.hash)).not.toContain('lab=');
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
@@ -216,7 +216,7 @@ test('deep link with an unresolvable run falls back to the run list with a notic
   // static harness would 404 — same fallback path either way).
   await page.route('**/lab/run/detail*', (r) => r.fulfill({ status: 400, body: 'bad dir' }));
 
-  await page.goto('/index-lab.html#lens=runs&run=no-such-run');
+  await page.goto('/index-lab.html#lens=runs&lab=no-such-run');
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
   // Falls back to the run LIST — never a stuck "loading…" pane polling a
   // failing request forever. That is the load-bearing behavior and it holds

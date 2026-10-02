@@ -215,11 +215,14 @@ def make_handler(inner, fx, hero, demo_uids, home):
             presence record carries no session_id and so mints no run.
             """
             try:
-                recs = json.loads(data)
+                body = json.loads(data)
             except Exception:                                 # noqa: BLE001
                 return data
-            if not isinstance(recs, list):
+            # `/flow/<date>` answers the `FlowRecordsResponse` envelope
+            # (D5, #3035); the filter rewrites its `records` and `count`.
+            if not isinstance(body, dict) or not isinstance(body.get("records"), list):
                 return data
+            recs = body["records"]
             # (#2850) Not only presence: the daemon's host sampler also writes
             # `machine.telemetry` and `machine.battery_health` for THIS host
             # (its real hardware uid, its real battery) into the demo flows
@@ -228,7 +231,9 @@ def make_handler(inner, fx, hero, demo_uids, home):
             kept = [r for r in recs
                     if not r.get("machine_uid")
                     or r.get("machine_uid") in demo_uids]
-            return json.dumps(kept).encode()
+            body["records"] = kept
+            body["count"] = len(kept)
+            return json.dumps(body).encode()
 
         def do_GET(self):
             # The viewer comes from the WORKING TREE, not the installed

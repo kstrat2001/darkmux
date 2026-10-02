@@ -59,9 +59,9 @@ export interface RouteRecords {
  * same boundary `useFlowWindow` uses and legacy's own decode at
  * viewer.html:3920.
  *
- * The two endpoints answer different shapes, which `ingest` accepts both of:
+ * Both endpoints answer the same `FlowRecordsResponse` envelope (D5, #3035):
  *
- *   GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs `flow_handler`)
+ *   GET /flow/<date>        -> { records, ... }    (lib.rs `flow_handler`)
  *   GET /flow-dispatch/<id>  -> { records, ... }    (`catalog_records_response`)
  *
  * (#1800) Then SHAPED through `shapeRecords`, as legacy's own playback boot

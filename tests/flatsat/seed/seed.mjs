@@ -125,15 +125,15 @@ async function main() {
   // darkmux_version}` schema-header line (crates/darkmux-serve/src/lib.rs's
   // `scan_flow_days` explicitly excludes it from record counts — "Schema-
   // header lines don't count as records") and the corpus's own captured
-  // `/flow/<date>` responses include one as their last element. It has no
+  // `/flow/<date>` responses (an envelope; the records are under `.records`) include one as their last element. It has no
   // `ts`/`machine_id` (would blow up `shiftIso`/the machine rewrite below),
   // so it's excluded from the per-record rewrite here — reproducing its
   // exact write-time semantics isn't load-bearing for any of this packet's
   // six scenarios, so this stays a straight filter rather than a faithful
   // re-synthesis.
   const isFlowRecord = (r) => r && typeof r === "object" && r._type !== "schema";
-  const flowToday = readCorpus("flow-today.json").filter(isFlowRecord);
-  const flowYesterday = readCorpus("flow-yesterday.json").filter(isFlowRecord);
+  const flowToday = readCorpus("flow-today.json").records.filter(isFlowRecord);
+  const flowYesterday = readCorpus("flow-yesterday.json").records.filter(isFlowRecord);
   const hubFlow = [...flowToday, ...flowYesterday].map((r) => ({
     ...r,
     ts: shiftIso(r.ts, deltaMs),

@@ -44,12 +44,12 @@ import { canonicalOptPairs } from "../lenses/console/panels";
  * the way `runs`' kind/run/machine params fold together, so there is
  * nothing for this function to add.
  *
- * `run` (the lab-run-detail deep link, drill-in packet): now WRITTEN, once
+ * `lab` (the lab-run-detail deep link, drill-in packet): now WRITTEN, once
  * `LabRunDetail` (`lenses/runs/LabRunDetail.tsx`) gave `run` a real
  * destination to point at — matching legacy's own `syncLabHash`, which
  * writes `run` only when `state.level==="lab-run"` (a `drillLabRun` that
  * actually resolved a dir). An earlier version of this doc (pre-drill-in)
- * recorded that `run` was dropped on purpose, reasoning that every `run=`
+ * recorded that `run` was dropped on purpose, reasoning that every `lab=`
  * this port could receive was structurally unresolvable since the
  * drill-down didn't exist yet — that reasoning no longer applies now that
  * it does; this paragraph replaces it rather than leaving a stale account
@@ -74,18 +74,18 @@ export function canonicalHash(route: Route): string | null {
       // detail view (`LabRunDetail`) — so it earns a place in the canonical
       // hash again, matching legacy's own `state.level==="lab-run"` write
       // (`if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",...)`
-      // in `syncLabHash`). Written whenever `route.run` is set, INDEPENDENT
+      // in `syncLabHash`). Written whenever `route.lab` is set, INDEPENDENT
       // of `runsKind` — legacy's own gate is `state.level==="lab-run"`, not
       // `state.runsKind==="lab"`: a lab row is visible (and clickable) under
       // BOTH kind=all and kind=lab (any OTHER kind filter excludes lab rows
       // entirely — see `runsFiltered`), so the reachable hash forms are
-      // `run=` alone (kind=all, no `kind=` param at all) and
-      // `kind=lab&run=`, both real. See this file's module doc for why this
+      // `lab=` alone (kind=all, no `kind=` param at all) and
+      // `kind=lab&lab=`, both real. See this file's module doc for why this
       // REVERSES the prior QA correction, now that the drill-in exists to
       // preserve `run` for.
-      if (route.run) p.set("run", route.run);
+      if (route.lab) p.set("lab", route.lab);
       // (#1809) The machine pin, written whenever set — composable with
-      // `kind`/`run` above, independent params on the same hash (matching
+      // `kind`/`lab` above, independent params on the same hash (matching
       // `route.ts`'s own doc: a pinned kind filter and a pinned lab-run
       // drill-in are both real, simultaneously reachable states).
       // (#2929) A machine KEY, never a uid: every writer encodes through
@@ -178,8 +178,8 @@ export function canonicalHash(route: Route): string | null {
  * `writeHash`-only navigation (no other App-level state happens to change
  * afterward) left `App.tsx`'s `route` — and everything derived from it,
  * `#crumb` in particular — permanently stale. Caught live: drilling a lab
- * run wrote `run=<dir>` to the address bar correctly, but `#crumb` (which
- * reads `route.run`) stayed blank for the rest of the session, not just a
+ * run wrote `lab=<dir>` to the address bar correctly, but `#crumb` (which
+ * reads `route.lab`) stayed blank for the rest of the session, not just a
  * render behind — probed directly against the running harness for 10s of
  * wall-clock with no App-level re-render ever landing to pick the new
  * `location.href` up. Firing a synthetic `hashchange` here closes that

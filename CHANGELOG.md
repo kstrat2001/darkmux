@@ -16,6 +16,11 @@ darkmux release.
 
 ### Added
 
+- **Wire contracts are additive-only from 5.0 (D2).** `route-table.golden` now lists
+  every JSON response type's fields and their types (read from the generated
+  TypeScript twins), and `scripts/contract-additive-guard.py` fails a PR that removes
+  or changes a line of it, of `tests/cli-json.golden` or of `ui/src/types/generated/*.ts`
+  unless the PR carries the `breaking-v6` label. It starts at the first `v5.*` tag.
 - **`step.error` says why** (FLOW 2.0.0, additive). A step's error
   record carries `{cause}`: the message on one line, control and invisible
   characters dropped, URL userinfo and token-looking query values redacted,
@@ -25,6 +30,17 @@ darkmux release.
   `tests/cli-json.golden` regenerated for the new field).
 
 ### Changed (breaking, 4.0)
+
+- **`GET /flow/:date` answers the `FlowRecordsResponse` envelope.** It returned a
+  bare `FlowRecord[]`; it now returns `{records, count, truncated, generated_at_ms, meta}`,
+  the shape `/flow-mission/:id` and `/flow-dispatch/:id` already had (`truncated` is
+  true when the day read hit its record cap; `meta.sources.fleet` is `ok`, `off` or
+  `unavailable` for the Redis half; `meta.cut` says per source, `local` and `fleet`, whether its read was cut short, and `truncated` is true when either was). The SSE stream `/flow/:date/stream` still sends
+  one record per event. **Migration:** read `.records` where you read the array
+  (`curl .../flow/$(date +%F) | jq .records`).
+- **A lab run's deep link is `#lens=runs&lab=<dir>`.** It was `run=<dir>`, which named
+  the umbrella, not the kind it opens (CLAUDE.md contract 8). There is no alias: an old
+  `run=` link lands on the runs board. **Migration:** rewrite bookmarks to `lab=`.
 
 - **`RunStatus` gains `degraded` and `escalated`** (`/runs`, `run list`, `run list --json`).
   A run whose envelope says `degraded` (a unit cut at its bound, a step that

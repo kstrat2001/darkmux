@@ -89,6 +89,10 @@ build`, verify by reloading the page rather than by running `cargo test`.
 - Conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
 - New external dependencies are scrutinized: darkmux deliberately keeps the dep surface small (see `Cargo.toml`). If a 10-line inline module avoids a crate, prefer that.
 
+## Wire contracts
+
+From 5.0 on, the daemon's HTTP routes and the `--json` shapes are semver contracts, pinned by `tests/cli-json.golden`, `crates/darkmux-serve/route-table.golden` (every route plus its response type's fields) and `ui/src/types/generated/*.ts`. A PR may add to those files; `scripts/contract-additive-guard.py` fails one that removes or changes a line, naming the file and line, unless the PR has the `breaking-v6` label (run `scripts/contract-additive-guard.py --self-test` after editing the guard). The gate switches on at the first `v5.*` tag, so it is a no-op until 5.0 ships.
+
 ## Tests
 
 - New features should include tests

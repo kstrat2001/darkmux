@@ -5,7 +5,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { getSource } from "../lib/source";
 import { fetchStaticFlowRecords, firstRecordDate, shapeRecords } from "../lib/flow";
 import { ingest, type NormRecord } from "../lib/ingest";
-import type { FlowRecord } from "../types/generated/FlowRecord";
+import type { FlowRecordsResponse } from "../types/generated/FlowRecordsResponse";
 
 /** (#2086) The loaded DAY this page can replay, from wherever it comes.
  *
@@ -61,7 +61,7 @@ export function useDay(requestedDate: string | null): Day {
   });
   const dayQuery = useQuery({
     queryKey: queryKeys.flowDate(daemonDate ?? ""),
-    queryFn: () => fetchJson<FlowRecord[]>(`/flow/${encodeURIComponent(daemonDate ?? "")}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${encodeURIComponent(daemonDate ?? "")}`),
     enabled: daemonDate !== null,
   });
 

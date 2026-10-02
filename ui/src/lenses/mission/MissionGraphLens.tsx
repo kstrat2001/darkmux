@@ -85,7 +85,6 @@ import {
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
 import { isHostSampleRecord, toPoint } from "../../lib/machineDrawerScope";
-import type { FlowRecord } from "../../types/generated/FlowRecord";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 import type { MissionGraph } from "../../types/generated/MissionGraph";
 
@@ -119,7 +118,7 @@ function recKey(r: NormRecord): string {
  * disk holds the mission, this daemon's flow stream still carries its
  * records with `machine_id` stamped). */
 async function lookupOwningMachine(missionId: string): Promise<string | null> {
-  const res = await fetchJson<FlowRecord[]>(`/flow/${todayUTC()}`);
+  const res = await fetchJson<FlowRecordsResponse>(`/flow/${todayUTC()}`);
   if (!res.ok) return null;
   const rows = ingest(res.data);
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -413,7 +412,7 @@ export function MissionGraphLens({
   });
   const flowTodayQuery = useQuery({
     queryKey: queryKeys.flowDate(today),
-    queryFn: () => fetchJson<FlowRecord[]>(`/flow/${today}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${today}`),
     enabled: daemonBacked,
   });
 

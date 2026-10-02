@@ -52,6 +52,9 @@ function wrapper(queryClient: QueryClient) {
 
 /** A `fetchJson`-shaped stub — records every call so tests can assert on
  * the `?since=` reconcile requests without a real network. */
+/** `GET /flow/<date>` answers the `FlowRecordsResponse` envelope (D5, #3035). */
+const envelope = (records: unknown[]) => ({ records, count: records.length, truncated: false, generated_at_ms: 0 });
+
 function makeFetchImpl(responder: (path: string) => { ok: true; data: unknown } | { ok: false; status: number | null; message: string }) {
   const calls: string[] = [];
   const impl = (async (path: string) => {
@@ -187,7 +190,7 @@ describe("useLiveTail", () => {
 
   it("does NOT reconcile on the very first connect, but DOES on every reconnect after (#1480 part 1)", async () => {
     const queryClient = new QueryClient();
-    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -214,7 +217,7 @@ describe("useLiveTail", () => {
 
   it("reconciles every 4th tick (~20s at the real 5s cadence) even without any reconnect", async () => {
     const queryClient = new QueryClient();
-    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -243,7 +246,7 @@ describe("useLiveTail", () => {
     const rec = { action: "dispatch.complete", ts: "2026-08-09T11:59:00Z", execution_id: "exec-1" };
     // The cache holds the record as ingested: its wire fields plus its parsed time.
     const ingested = { ...rec, tMs: Date.parse(rec.ts) };
-    const { impl } = makeFetchImpl((path) => (path.startsWith("/flow/2026-08-09?") ? { ok: true, data: [rec] } : { ok: true, data: [] }));
+    const { impl } = makeFetchImpl((path) => (path.startsWith("/flow/2026-08-09?") ? { ok: true, data: envelope([rec]) } : { ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -268,7 +271,7 @@ describe("useLiveTail", () => {
   it("UTC date rollover: closes the old stream, invalidates flowDate for the new day pair, and opens a new stream", async () => {
     const queryClient = new QueryClient();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-    const { impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -312,7 +315,7 @@ describe("useLiveTail", () => {
 
   it("when disabled, never opens a stream or starts the ticker", async () => {
     const queryClient = new QueryClient();
-    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(false, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -407,7 +410,7 @@ describe("useLiveTail", () => {
     const queryClient = new QueryClient();
     // Reconciles succeed and return NOTHING, which is exactly what a quiet
     // fleet looks like all day.
-    const { impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { result, unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
@@ -463,7 +466,7 @@ describe("useLiveTail", () => {
 
   it("unmount tears down the EventSource and clears the ticker (no further reconcile fetches)", async () => {
     const queryClient = new QueryClient();
-    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+    const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
 
     const { unmount } = renderHook(
       () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),

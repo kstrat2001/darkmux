@@ -700,7 +700,7 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   const meta = loadMeta();
   const yesterday = JSON.parse(readFileSync(path.join(CORPUS_DIR, "flow-yesterday.json"), "utf8"));
   let stamped = 0;
-  for (const r of yesterday) {
+  for (const r of yesterday.records) {
     if (r?.action !== "dispatch.complete") continue;
     if (!r.payload || typeof r.payload !== "object") continue;
     if (typeof r.payload.completion_tokens !== "number") continue;

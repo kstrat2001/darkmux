@@ -99,7 +99,7 @@ describe("resolveDrawerScope (#2107)", () => {
   it("with no known local uid, the rolling window does not filter by machine (best-effort default)", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");
     const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine")];
-    const s = resolveDrawerScope({ kind: "runs", runsKind: "all", run: null, machine: null }, [], rolling, null, now);
+    const s = resolveDrawerScope({ kind: "runs", runsKind: "all", lab: null, machine: null }, [], rolling, null, now);
     expect(s.samples.map((p) => p.cpu)).toEqual([99]);
   });
 });

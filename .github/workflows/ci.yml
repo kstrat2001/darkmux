@@ -606,6 +606,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The contract gate below diffs against the PR's merge-base and looks
+          # for a `v5.*` tag, so it needs history and tags.
+          fetch-depth: 0
+      # (D2, #3035) Wire contracts only grow from 5.0 on: the route golden, the
+      # `--json` golden and the generated TS types may gain lines, and a PR that
+      # removes or changes one needs the `breaking-v6` label. The script reads
+      # the label from the event payload, and is a no-op until a `v5.*` tag
+      # exists (this branch rewrites those files before 5.0 ships).
+      - name: Wire contracts only grow (5.0)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 scripts/contract-additive-guard.py --self-test
+          python3 scripts/contract-additive-guard.py
       # Turns "the docs silently drifted" into a blocked PR — CLAUDE.md's principle
       # that "doc drift is a bug, not a footnote." Grow this guard as the
       # observability-unification guide rewrites land (#556): add 'instruments.jsonl'

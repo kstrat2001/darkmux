@@ -214,7 +214,7 @@ describe("LabRunDetail", () => {
   });
 
   /**
-   * Secondary MUST FIX 1 finding: a garbage `run=` deep link renders the
+   * Secondary MUST FIX 1 finding: a garbage `lab=` deep link renders the
    * detail error page, but the events poll kept hitting
    * `/lab/run/events` every 3s indefinitely behind it. The poll must stop
    * once the detail fetch is known-bad.

@@ -15,7 +15,7 @@ function renderBoard(
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={initialKind} initialRun={initialRun} initialMachineKey={initialMachineKey} />
+      <RunsBoard initialKind={initialKind} initialLab={initialRun} initialMachineKey={initialMachineKey} />
     </QueryClientProvider>,
   );
 }
@@ -496,7 +496,7 @@ describe("RunsBoard", () => {
     expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
   });
 
-  // (#2860 review F2) A `run=<dir>` deep link used to open `LabRunDetail`
+  // (#2860 review F2) A `lab=<dir>` deep link used to open `LabRunDetail`
   // directly, skipping the rule list rows follow. A lab run with a
   // representative session opens the shared session view from EVERY entry
   // point; only a run without one (a bench run) keeps its own record page.
@@ -531,7 +531,7 @@ describe("RunsBoard", () => {
     expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
   });
 
-  it("(#2860) a run= deep link to a run with a session redirects to the shared session view", async () => {
+  it("(#2860) a lab= deep link to a run with a session redirects to the shared session view", async () => {
     mockLabBoard();
     renderBoard("lab", "coding-1");
     await waitFor(() => expect(window.location.hash).toBe("#dispatch=sess-c1"));
@@ -542,7 +542,7 @@ describe("RunsBoard", () => {
     expect(calls.some((u) => u.startsWith("/lab/run/detail"))).toBe(false);
   });
 
-  it("a deep-link into kind=lab with a run= param opens the lab-run detail pane directly, on first render", async () => {
+  it("a deep-link into kind=lab with a lab= param opens the lab-run detail pane directly, on first render", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -1135,7 +1135,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
 function AppLikeRunsHarness() {
   const route = useHashRoute();
   if (route.kind !== "runs") return null;
-  return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineKey={route.machine} />;
+  return <RunsBoard initialKind={route.runsKind} initialLab={route.lab} initialMachineKey={route.machine} />;
 }
 
 describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
@@ -1161,7 +1161,7 @@ describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
   // first appears — the same echo the guard exists to recognize.
   it("(#2065) on a static build that ships mission graphs, an unresolvable lab run still gets the daemon-less notice, not a 'removed or stale' claim", async () => {
     mockFetch(); // /lab/run/detail?dir=bad-dir 404s here exactly as a static host would
-    window.location.hash = "#lens=runs&kind=lab&run=bad-dir";
+    window.location.hash = "#lens=runs&kind=lab&lab=bad-dir";
     for (const [name, content] of [
       ["darkmux-flow-src", "./demo-flow.jsonl"],
       ["darkmux-graphs-src", "./demo-graphs.json"],
@@ -1188,7 +1188,7 @@ describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
 
   it("a deep link to an unresolvable lab run keeps its notice after the echoed re-render, not wiped back out", async () => {
     mockFetch(); // /runs, /lab/runs both ok; /lab/run/detail?dir=bad-dir falls through to this mock's 404 default
-    window.location.hash = "#lens=runs&kind=lab&run=bad-dir";
+    window.location.hash = "#lens=runs&kind=lab&lab=bad-dir";
 
     // No <meta name="darkmux-mode"> is injected by this test harness, so
     // `missionGraphReachable()` defaults false and the daemon-less-static
@@ -1211,7 +1211,7 @@ describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
     await waitFor(() => expect(screen.getByText(notice)).toBeInTheDocument());
 
     // `onLabRunUnresolvable`'s own `writeHash` (a `replaceState`, per
-    // `hashSync.ts`'s own doc) already moved `location.href` to `run=null`
+    // `hashSync.ts`'s own doc) already moved `location.href` to `lab=null`
     // without dispatching `hashchange`. Firing one now is the stand-in for
     // "the next unrelated App re-render" `RunsBoard.tsx`'s own comment
     // names as the real-world trigger — it forces `useHashRoute()` to
