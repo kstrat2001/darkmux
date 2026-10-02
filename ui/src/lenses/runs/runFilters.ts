@@ -27,7 +27,7 @@ export interface FilterEnv {
  * to the run (workload and verify are lab-only); such a run matches no
  * selection and is not counted under any value. */
 const GETTERS: Record<Exclude<FilterDim, "time">, (r: Run, env: FilterEnv) => string | null> = {
-  status: (r) => runStatusLabel(r),
+  status: (r) => runStatusLabel(r) || NOT_SET,
   machine: (r, env) => env.machineOf(r) ?? NOT_SET,
   model: (r) => shortModel(r.model) || NOT_SET,
   role: (r) => r.role || NOT_SET,

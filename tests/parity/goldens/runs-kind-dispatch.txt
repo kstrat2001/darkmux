@@ -18,7 +18,7 @@ github
 runs
 
 === stage ===
-runs · dispatch · newest 25 of 67
+runs · dispatch
 all 308
 mission 108
 dispatch 67
@@ -32,7 +32,7 @@ Workload
 Verify
 Route
 Tracked
-Showing 67 of 67 runs
+Showing newest 25 of 67 runs
 COMPLETE
 DISPATCH
 crew-dispatch-radio-router-1786199280181417-5

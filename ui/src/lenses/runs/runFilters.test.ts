@@ -48,6 +48,14 @@ describe("facet counts", () => {
     expect(applyFilters(RUNS, sel({ role: [NOT_SET] }), env).map((r) => r.id)).toEqual(["d"]);
   });
 
+  it("a run with no status is (not set), not a crash (#1622 degraded rows)", () => {
+    const rs = [run({ id: "ok" }), run({ id: "nostatus", status: undefined as unknown as Run["status"] })];
+    const env = envFor(rs);
+    expect(() => facetChoices(rs, sel({}), "status", env)).not.toThrow();
+    expect(counts(facetChoices(rs, sel({}), "status", env))).toEqual({ complete: 1, [NOT_SET]: 1 });
+    expect(applyFilters(rs, sel({ status: [NOT_SET] }), env).map((r) => r.id)).toEqual(["nostatus"]);
+  });
+
   it("strips the darkmux: prefix so one model is one value", () => {
     const env = envFor(RUNS);
     expect(counts(facetChoices(RUNS, sel({}), "model", env))).toEqual({ qwen: 2, llama: 1, [NOT_SET]: 1 });
