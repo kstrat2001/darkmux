@@ -551,10 +551,9 @@ describe("FleetLens", () => {
     expect(container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeNull();
   });
 
-  // The second inverted case: a REPLAY never reads `machineRuns` at all
-  // (`buildFleetCard` gates the lab count on `liveMode`), so a failed
-  // `/runs` costs a replayed day nothing and warning about it would be the
-  // bug — the same historical gate `FleetCoverageNotice` already carries.
+  // The second inverted case: a replayed day is drawn from its records, so a
+  // failed `/runs` costs it nothing and warning about it would be the bug —
+  // the same historical gate `FleetCoverageNotice` already carries.
   //
   // Both halves render against ONE `QueryClient` on purpose. A fresh client
   // makes the replay assertion vacuous: the absence is satisfied by the
@@ -1178,7 +1177,7 @@ describe("FleetLens", () => {
 
 // (#2881) The fleet card pager. Uses the `records`/`historical` render path
 // directly (same as the scrubbed-playhead test above), not `mockFleetFetch`
-// — the pager reads only `buildFleetCard`'s output, which this path drives
+// — the pager reads only the card's own executions, which this path drives
 // with no separate live/playback branch to mock around.
 // (W3) The tube is the pager: it carries the position in its name, the count
 // line carries it in words ("3 running · 1/3").

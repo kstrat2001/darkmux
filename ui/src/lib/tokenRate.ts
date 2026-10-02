@@ -575,7 +575,7 @@ function compactionEndMarker(r: NormRecord, atMs: number, startedAtMs: number): 
 }
 
 /** The single state derivation both the run page (`sessionRun.ts`'s
- * `liveTokScope`) and the fleet card (`cards.ts`'s `buildFleetCard`) read —
+ * `liveTokScope`) and the fleet card (`cards.ts`'s `withLiveReadings`) read —
  * one function, no live/playback branch, because both callers already pass
  * records already cut to the page's clock (`playhead ?? now`) the same way
  * `heartbeatSamples`/`isStalled` are called today. `nowMs` is still honored
@@ -1252,7 +1252,7 @@ export function executionTokenReading(
    *  test) skips the check exactly as before; a caller that has it passes
    *  `lastHeartbeatMs` as THIS EXECUTION's own last heartbeat (its own
    *  `lastHeartbeatMs([records])`, not the aggregate's machine-wide max —
-   *  see `cards.ts::buildFleetCard`'s own doc next to this call for why a
+   *  see `cards.ts::withLiveReadings`'s own doc next to this call for why a
    *  shared machine-wide deadline would be the wrong per-page evidence). */
   halfOpen?: { lastContactMs: number | null; lastHeartbeatMs: number | null },
 ): ExecutionTokenReading {

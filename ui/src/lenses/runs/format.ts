@@ -17,6 +17,7 @@
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../../lib/format";
 import { receiveKey, type NormRecord } from "../../lib/ingest";
+import { maxOf } from "../../lib/numbers";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { dispatchHash } from "../../lib/route";
@@ -188,7 +189,7 @@ export function runReceiveKeys(runs: readonly Run[], records: readonly NormRecor
   const keys = new Map<string, number>();
   for (const r of runs) {
     const seen = [newest.get(r.id), r.dispatch_id ? newest.get(r.dispatch_id) : undefined].filter((k): k is number => k !== undefined);
-    keys.set(r.id, seen.length ? Math.max(...seen) : runActivity(r) * 1000 * 1024);
+    keys.set(r.id, maxOf(seen) ?? runActivity(r) * 1000 * 1024);
   }
   return keys;
 }

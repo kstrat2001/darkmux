@@ -314,7 +314,7 @@ export interface FleetCard {
    * derive a rate from. (Playback parity, Change A) Computed the same way
    * in replay now too — a replayed instant where something was genuinely
    * generating shows the same rate a live viewer saw at that instant; see
-   * `buildFleetCard`'s own note. The card must render plain "idle" text and
+   * `withLiveReadings`' own note. The card must render plain "idle" text and
    * never mount a scope when this is `null` — an idle machine has zero
    * `TokenScope` instances, not one sitting at 0. */
   liveTokRate: number | null;
@@ -328,7 +328,7 @@ export interface FleetCard {
    *  case, so no separate rendering path was ever needed for it).
    *
    *  Kept anyway, deliberately, rather than deleted:
-   *  1. They are still a genuine part of `buildFleetCard`'s PURE snapshot —
+   *  1. They are still a genuine part of `withLiveReadings`' PURE snapshot —
    *     the machine-wide stall/state/carry answer, independent of which
    *     execution a pager happens to be showing, which is a reasonable
    *     thing for a card snapshot to expose even to a consumer that never
@@ -345,7 +345,7 @@ export interface FleetCard {
    *     would be churn for its own sake, not a fix. */
   /** (#2877) No fresh heartbeat from anything running on this machine —
    * the scope should decay to its flat-ring stall state. `liveTokRate` is
-   * already forced to `0` in this case (see `buildFleetCard`), so this is
+   * already forced to `0` in this case (see `withLiveReadings`), so this is
    * purely the VISUAL flag; the number is already honest either way.
    * (#2877 pass 2) Now DERIVED from `liveTokState` (`=== "stalled"`) — one
    * rule, not two that could disagree. */

@@ -395,7 +395,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
  * prop (below) and threads TWO numbers where it used to thread one:
  * `flowWindow.tMax` stays the fixed axis ceiling everywhere it already fed
  * `cards.ts`/`timeline.ts`'s ceiling-shaped arguments; `playheadT` (derived
- * below) is the actual bracketing value — `machPresent`, `buildFleetCard`'s
+ * below) is the actual bracketing value — `machPresent`, `buildFleetCardBase`'s
  * `t`, `buildActivityTimeline`'s new `playheadT` argument, and `scopedData`
  * (the token hero has no playhead argument of its own, so its "as of the
  * playhead" gate is applied to the array it's handed instead). See
@@ -437,7 +437,7 @@ export function FleetLens({
    * race") `App.tsx`'s `lastContactRef.current` — the last moment
    * `useLiveTail` confirmed contact with the daemon. `null` (the default)
    * on every call that doesn't pass it (a `historical` render, or a test),
-   * which skips the half-open check in `buildFleetCard` entirely and falls
+   * which skips the half-open check in `withLiveReadings` entirely and falls
    * back to the plain `connected` boolean — see that function's own doc. */
   lastContactMs?: number | null;
 } = {}) {
@@ -604,8 +604,7 @@ export function FleetLens({
   // `queryKey` this intentionally reuses so the two lenses share one cache
   // entry instead of two independent polls of the same data. Replay mode
   // still gets a value here (there is no reason to withhold it), but
-  // `buildFleetCard` only ever reads it in `liveMode` — see that
-  // parameter's own doc.
+  // the card's lab count (`buildFleetCardBase`'s `machineRuns`) reads it.
   // `enabled` on `runsReachable()`: a daemon-less static build that ships no
   // committed runs fixture has nothing to answer this, and `runsSrc()`'s
   // daemon fallback would fetch `/runs` off a page with no daemon (see that
@@ -635,9 +634,8 @@ export function FleetLens({
   // false and `data` is undefined, and both arms below stay quiet.
   //
   // LIVE MODE ONLY, for the same reason `FleetCoverageNotice` is historical-
-  // gated: replay never reads `machineRuns` at all (`buildFleetCard` gates
-  // the lab count on `liveMode`), so a failed `/runs` costs a replayed day
-  // nothing, and warning about it there would be the bug.
+  // gated: a replayed day is drawn from its records, so a failed `/runs` costs
+  // it nothing, and warning about it there would be the bug.
   const runsUnreadable = liveMode && (runsQuery.isError || runsQuery.data?.ok === false);
   const runsErrorMessage = runsQuery.data && !runsQuery.data.ok ? runsQuery.data.message : null;
 
