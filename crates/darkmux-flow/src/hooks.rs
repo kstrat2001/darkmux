@@ -7402,6 +7402,42 @@ mod tests {
         drop(sink);
     }
 
+    /// A reader that sees the `.last` status naming a delivery's rejection
+    /// must also see a `.rejected` total that includes it. Pinned at the
+    /// moment the status is about to land (the truncate-to-write seam inside
+    /// every `.last` write), where the counter is read; writing the status
+    /// before updating the counter makes this read 0.
+    #[test]
+    fn the_rejected_total_is_updated_before_the_last_status_lands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(r#"{"ok":true,"accepted":0,"rejected":1}"#);
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
+        let url = receiver.url("/events");
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = rule_key(&m, &url);
+        let last_path = last_status_path(tmp.path(), &key);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        set_last_status_truncate_hook(&last_path, tx);
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).expect("the delivery's status write must reach the seam");
+        let total_at_status = read_counter_sidecar(&receiver_rejected_path(tmp.path(), &key));
+        clear_last_status_truncate_hook(&last_path);
+        drop(rx);
+        assert_eq!(total_at_status, 1, "the status landed before the rejected total included its delivery");
+        drop(sink);
+    }
+
     // ─── (#2196) the receiver's own rejection REASON, not just the count ──
 
     /// (#2196) One of many: a receiver's `results[]` can carry both

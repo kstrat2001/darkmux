@@ -1421,6 +1421,12 @@ impl RedisSink {
     /// a `LongLived` sink then schedules its next probe. Returns true iff this
     /// call is the one that flipped the sink to disabled.
     fn note_failure(&self, err: &anyhow::Error, record_ts: &str) -> bool {
+        self.note_failure_of(err, record_ts, "write")
+    }
+
+    /// [`Self::note_failure`] naming what failed (`write` or `backfill`) in
+    /// the one-time log line.
+    fn note_failure_of(&self, err: &anyhow::Error, record_ts: &str, what: &str) -> bool {
         let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
         if let Err(e) = self.watermark.record(record_ts) {
             eprintln!("flow::RedisSink: could not persist the hub outage watermark: {e:#}");
@@ -1434,7 +1440,7 @@ impl RedisSink {
                 SinkPolicy::LongLived => "disabling Redis flow sink until the peer answers again",
             };
             eprintln!(
-                "flow::RedisSink: {} unreachable after {n} consecutive write failures \
+                "flow::RedisSink: {} unreachable after {n} consecutive {what} failures \
                  ({err:#}); {outlook}. LocalFileSink is unaffected.",
                 self.url
             );
@@ -1582,7 +1588,7 @@ impl RedisSink {
             }
             *seen = sig;
         }
-        if sig.is_none() {
+        if self.watermark.load().is_none() {
             return;
         }
         let result = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
@@ -1592,7 +1598,7 @@ impl RedisSink {
                 self.backfill(&mut conn, "", true)
             });
         if let Err(e) = result {
-            self.note_failure(&e, &schema::ts_utc_now());
+            self.note_failure_of(&e, &schema::ts_utc_now(), "backfill");
         }
     }
 
@@ -1999,10 +2005,17 @@ pub fn set_sink_policy(policy: SinkPolicy) -> Result<()> {
     }
 }
 
-/// Drive the default sink's periodic housekeeping (the daemon's presence
-/// reconciler calls this every few seconds).
-pub fn tick_default_sink() {
-    default_sink().tick();
+/// Start the daemon's hub catch-up thread: it drives the default sink's
+/// periodic housekeeping (the outage watermark check) on the presence
+/// reconciler's cadence, on its OWN thread so a slow hub cannot delay the
+/// reconciler's close-edges. `None` when no Redis hub is configured.
+pub fn spawn_hub_catch_up_thread() -> Option<std::thread::JoinHandle<()>> {
+    redis_url()?;
+    Some(hub_link::spawn_tick_thread(
+        default_sink(),
+        std::time::Duration::from_secs(presence_reconciler::RECONCILE_INTERVAL_SECS),
+        Arc::new(AtomicBool::new(false)),
+    ))
 }
 
 /// This process's link to the fleet hub's flow stream, read from the default
@@ -5564,6 +5577,21 @@ mod tests {
         assert!(report.chain_valid, "{report:?}");
         assert_eq!(report.records_checked, 1);
         assert_eq!(torn_sidecars(&path).len(), 1);
+    }
+
+    /// #899: a headerless file (record line, header removed) must keep
+    /// refusing to be extended, even when its trailing newline is gone too.
+    #[test]
+    fn headerless_record_without_newline_is_refused_not_set_aside() {
+        let (_t, path) = torn_chain(1);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let record_line = raw.lines().nth(1).unwrap().to_string();
+        std::fs::write(&path, record_line.as_bytes()).unwrap();
+        let mut rec = minimal_record();
+        rec.handle = "after".to_string();
+        assert!(crate::integrity::audit_record_at(&rec, &path).is_err(), "must refuse to re-seed a chain");
+        assert_eq!(std::fs::read(&path).unwrap(), record_line.as_bytes(), "file untouched");
+        assert!(torn_sidecars(&path).is_empty(), "nothing set aside");
     }
 
     #[test]

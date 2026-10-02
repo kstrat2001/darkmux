@@ -187,9 +187,11 @@ impl Backfill<'_> {
 /// backfill lands. Writes are atomic (temp file + rename) and serialized
 /// under an `flock` on a sibling lock file.
 ///
-/// Each `record` bumps `seq`. A backfill clears only the `seq` it read, so a
-/// failure recorded while it ran keeps the watermark for the next recovery:
-/// delivery is at-least-once, and readers de-duplicate on record identity.
+/// Each `record` bumps `seq`, and a clear keeps the file with `since: null`
+/// and the counter intact, so a generation is never reused: a backfill clears
+/// only the `seq` it read, and a failure recorded while it ran (or after a
+/// concurrent backfill cleared) keeps the watermark for the next recovery.
+/// Delivery is at-least-once, and readers de-duplicate on record identity.
 #[derive(Debug, Clone)]
 pub(crate) struct OutageWatermark {
     path: PathBuf,
@@ -197,10 +199,17 @@ pub(crate) struct OutageWatermark {
 
 /// What the state file holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stored {
+    /// `ts` of the earliest record that failed to publish; `None` once cleared.
+    since: Option<String>,
+    /// Bumped by every `record`; never reset by a clear.
+    seq: u64,
+}
+
+/// An outstanding watermark, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Marked {
-    /// `ts` of the earliest record that failed to publish.
     pub since: String,
-    /// Bumped by every `record`.
     pub seq: u64,
 }
 
@@ -222,42 +231,47 @@ impl OutageWatermark {
         Some((meta.modified().ok()?, meta.len()))
     }
 
-    /// The stored watermark; `None` when absent or unreadable.
-    pub(crate) fn load(&self) -> Option<Marked> {
+    fn load_stored(&self) -> Option<Stored> {
         let text = std::fs::read_to_string(&self.path).ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    fn store(&self, marked: &Marked) -> Result<()> {
+    /// The outstanding watermark; `None` when absent, unreadable, or cleared.
+    pub(crate) fn load(&self) -> Option<Marked> {
+        let stored = self.load_stored()?;
+        Some(Marked { since: stored.since?, seq: stored.seq })
+    }
+
+    fn store(&self, stored: &Stored) -> Result<()> {
         let mut tmp_name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         tmp_name.push(format!(".tmp-{}", std::process::id()));
         let tmp = self.path.with_file_name(tmp_name);
-        std::fs::write(&tmp, serde_json::to_vec(marked)?)
+        std::fs::write(&tmp, serde_json::to_vec(stored)?)
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replacing {}", self.path.display()))
     }
 
     /// Note that the record stamped `ts` failed to publish. Keeps the earlier
-    /// of `ts` and what is stored.
+    /// of `ts` and any outstanding watermark.
     pub(crate) fn record(&self, ts: &str) -> Result<()> {
         darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
-            let marked = match self.load() {
-                Some(old) => Marked { since: old.since.min(ts.to_string()), seq: old.seq + 1 },
-                None => Marked { since: ts.to_string(), seq: 1 },
+            let old = self.load_stored();
+            let seq = old.as_ref().map_or(0, |o| o.seq) + 1;
+            let since = match old.and_then(|o| o.since) {
+                Some(prev) => prev.min(ts.to_string()),
+                None => ts.to_string(),
             };
-            self.store(&marked)
+            self.store(&Stored { since: Some(since), seq })
         })
     }
 
-    /// Remove the watermark if no `record` has run since `seq` was read.
+    /// Clear the watermark if no `record` has run since `seq` was read. The
+    /// counter survives, so no later generation repeats `seq`.
     pub(crate) fn clear_if(&self, seq: u64) -> Result<()> {
-        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
-            match self.load() {
-                Some(m) if m.seq == seq => std::fs::remove_file(&self.path)
-                    .with_context(|| format!("removing {}", self.path.display())),
-                _ => Ok(()),
-            }
+        darkmux_types::flock::with_locked_file(&self.lock_path(), |_| match self.load_stored() {
+            Some(s) if s.seq == seq && s.since.is_some() => self.store(&Stored { since: None, seq }),
+            _ => Ok(()),
         })
     }
 }
@@ -281,4 +295,22 @@ pub(crate) fn default_watermark_path() -> PathBuf {
         return darkmux_types::paths::test_isolated_dir("state").join("hub-outage.json");
     }
     resolved.root.join("state").join("hub-outage.json")
+}
+
+/// Run `sink.tick()` every `interval` on a named thread until `stop` is set.
+/// The one place the periodic check is driven, for the daemon and the tests.
+pub(crate) fn spawn_tick_thread(
+    sink: std::sync::Arc<dyn crate::FlowSink>,
+    interval: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("darkmux-hub-catch-up".to_string())
+        .spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                sink.tick();
+                std::thread::sleep(interval);
+            }
+        })
+        .expect("spawning the hub catch-up thread")
 }

@@ -278,6 +278,13 @@ fn tail_is_whole_line(tail: &[u8], first_line: bool) -> bool {
     }
 }
 
+/// `true` when `tail` is the start of a schema header line, or a whole one:
+/// a header cut short by a crash, as opposed to a record line.
+fn header_shaped(tail: &[u8]) -> bool {
+    const HEADER_START: &[u8] = b"{\"_type\":\"schema\"";
+    tail.starts_with(HEADER_START) || HEADER_START.starts_with(tail)
+}
+
 /// Path of the sidecar a torn tail of `path` is moved into:
 /// `<day file>.torn-<unix millis>`, with a numeric suffix on collision.
 fn torn_sidecar_path(path: &Path) -> PathBuf {
@@ -316,6 +323,13 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
     if tail.is_empty() {
         return Ok(());
     }
+    // At offset 0 only a header-shaped tail may be set aside. Anything else is
+    // a headerless file (a record line with its header removed): refusing to
+    // extend it is the #899 guard against re-seeding a chain from content
+    // nobody verified, and set-aside would quietly undo it.
+    if tail_start == 0 && !header_shaped(tail) && !tail_is_whole_line(tail, true) {
+        return Ok(());
+    }
     if tail_is_whole_line(tail, tail_start == 0) {
         file.seek(SeekFrom::End(0))
             .with_context(|| format!("seek to end of {}", path.display()))?;
@@ -328,7 +342,9 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
     }
     if !tail.iter().all(|b| b.is_ascii_whitespace()) {
         let sidecar = torn_sidecar_path(path);
-        fs::write(&sidecar, tail)
+        // The sidecar is durable BEFORE the day file is truncated: a power
+        // loss must not keep the truncation and lose the bytes.
+        write_synced(&sidecar, tail)
             .with_context(|| format!("writing torn-tail sidecar {}", sidecar.display()))?;
     }
     file.set_len(tail_start as u64)
@@ -337,6 +353,14 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
         .with_context(|| format!("syncing audit log {}", path.display()))?;
     raw.truncate(tail_start);
     Ok(())
+}
+
+/// Write `bytes` to a new file at `path` and fsync it.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// Sidecars of torn tails set aside next to `path` (see

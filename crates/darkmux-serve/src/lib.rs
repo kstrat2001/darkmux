@@ -1565,6 +1565,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // heartbeat noise. Same DARKMUX_REDIS_URL self-disable as presence.
         darkmux_flow::presence_reconciler::emit_machine_online_edge();
         let _reconciler_handle = darkmux_flow::presence_reconciler::spawn_reconciler_thread();
+        // The hub catch-up check runs on its own thread: a slow hub must not delay
+        // the reconciler's close-edges.
+        let _hub_catch_up_handle = darkmux_flow::spawn_hub_catch_up_thread();
 
         // (#2107, #1833) Spawn the daemon-side continuous host sampler
         // feeding the machine stats drawer's live `/machine/resources`
