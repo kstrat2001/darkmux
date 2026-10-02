@@ -112,6 +112,11 @@ darkmux release.
 - **`darkmux doctor`'s one-line help says what it checks** (config, profiles,
   LM Studio and endpoints, runtime image, fleet, flow sinks, state files), so
   radio describes it correctly.
+- **A review whose records were partly unreadable says so** (#2425). The delivered
+  comment's scope line now names what `records.gather` could not read (a failed
+  phase or step listing, a unit whose output did not parse) under `Unreadable:`,
+  and a run with nothing else to say but an unreadable input is `degraded`, not a
+  clean no-op.
 
 ### Changed (breaking, 4.0)
 

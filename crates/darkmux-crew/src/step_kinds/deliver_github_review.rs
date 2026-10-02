@@ -122,6 +122,13 @@ pub struct DeliverScope {
     /// a clean `"noop"`, even when it produced zero findings.
     #[serde(default)]
     pub errored: Vec<String>,
+    /// (#2425) What `records.gather` could not read while building this
+    /// scope (a failed phase or step listing, a unit whose output failed to
+    /// parse): inputs the review never saw, so a run with any is never a
+    /// clean noop and the scope line names each. Copied from
+    /// `GatherOutput::unreadable` when this kind reads a gather envelope.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
 }
 
 /// (#2310 fix-loop E2, S1-6) The standing narrowness of EVERY run this kind
@@ -692,7 +699,7 @@ pub fn render_github_review(
         // the error axis. `hunks_total == 0` is the honest zero (nothing
         // to cover, e.g. an empty diff), not an uncovered run.
         let covered = scope.hunks_total == 0 || scope.hunks_covered >= scope.hunks_total;
-        if scope.errored.is_empty() && covered {
+        if scope.errored.is_empty() && scope.unreadable.is_empty() && covered {
             // A genuinely CLEAN run — nothing to say because nothing went
             // wrong, nothing was found, and the whole diff was looked at.
             // The only `mode` this applies to.
@@ -1040,6 +1047,11 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules
     // say) actually names what broke, not just that something did.
     if !scope.errored.is_empty() {
         line.push_str(&format!(" Errored: {}.", joined(&scope.errored)));
+    }
+    // (#2425) An input the gather step could not read: the review did not
+    // see it, so the comment says so instead of reading as complete.
+    if !scope.unreadable.is_empty() {
+        line.push_str(&format!(" Unreadable: {}.", joined(&scope.unreadable)));
     }
     // (#2310 delivery rewrite, rule 1) A heading that fell back to a bare
     // rule id says so here, rather than leaving a reader to wonder why one
@@ -1599,7 +1611,7 @@ impl DeliverConfig {
             findings: body.findings,
             mods: body.mods,
             diff: body.diff,
-            scope: body.scope,
+            scope: DeliverScope { unreadable: body.unreadable, ..body.scope },
             attribution,
             emit,
             head_sha,
@@ -2753,6 +2765,64 @@ mod tests {
         assert!(review.body.contains("Errored: unit \u{02cb}x\u{02cb} (Error)."), "{}", review.body);
     }
 
+    // ─── (#2425) an unreadable input is visible on the comment itself ───
+
+    /// (#2425) `records.gather` names what it could not read; a review whose
+    /// records were partly unreadable must say so in the payload, and with
+    /// nothing else to say it is never a clean noop.
+    #[test]
+    fn an_unreadable_input_with_nothing_to_say_is_degraded_and_named() {
+        let scope = DeliverScope { hunks_covered: 1, hunks_total: 1, unreadable: vec!["unit `u-1` output: bad json".to_string()], ..Default::default() };
+        let out = render(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded", "an unreadable input is not a clean run: {out:?}");
+        let body = out.review.expect("the scope line is the payload").body;
+        assert!(body.contains("Unreadable: unit \u{02cb}u-1\u{02cb} output: bad json."), "{body}");
+    }
+
+    #[test]
+    fn an_unreadable_input_is_named_on_the_scope_line_beside_findings_too() {
+        let scope = DeliverScope { hunks_covered: 1, hunks_total: 1, unreadable: vec!["phase records: gone".to_string()], ..Default::default() };
+        let line = scope_line(&scope, 0, &BTreeSet::new());
+        assert!(line.contains(" Unreadable: phase records: gone."), "{line}");
+        let clean = scope_line(&DeliverScope::default(), 0, &BTreeSet::new());
+        assert!(!clean.contains("Unreadable"), "{clean}");
+    }
+
+    /// The wire: the gather envelope's `unreadable` reaches the scope the
+    /// renderer reads, through the non-embedded path a real launch takes.
+    #[test]
+    fn the_gather_envelopes_unreadable_reaches_the_delivered_scope() {
+        let gathered = super::super::records_gather::GatherOutput {
+            schema_version: "1".into(),
+            findings: Vec::new(),
+            mods: Vec::new(),
+            diff: String::new(),
+            scope: DeliverScope::default(),
+            unreadable: vec!["unit `u-9` output: truncated".to_string()],
+            absence_backstop: BTreeMap::new(),
+        };
+        let raw = crate::step_output::Output::wrap(
+            super::super::records_gather::RECORDS_GATHER_OUTPUT_KIND,
+            gathered,
+            crate::step_output::Producer::of("m", "t", "gather"),
+        )
+        .to_output_string()
+        .unwrap();
+        let step = Step {
+            id: "deliver-step".into(),
+            task_id: "deliver-task".into(),
+            kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+            gate: None,
+            status: crate::types::NodeStatus::Planned,
+            config: serde_json::json!({}),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let cfg = DeliverConfig::from_step(&step, &BTreeMap::from([("gather".to_string(), raw)])).unwrap();
+        assert_eq!(cfg.scope.unreadable, vec!["unit `u-9` output: truncated".to_string()]);
+    }
+
     // ─── (#2310 fix loop A / S3-2) coverage is never discarded ──────────
 
     /// (#2310 fix loop A, S3-2 — PROVEN) A run that covered NONE of the
@@ -3692,6 +3762,7 @@ mod tests {
             refused: 2,
             not_attempted: vec!["architectural review".into()],
             errored: Vec::new(),
+            unreadable: Vec::new(),
         };
         (findings, mods, scope)
     }
