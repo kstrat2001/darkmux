@@ -98,6 +98,28 @@ describe("ConsolePanel", () => {
     expect(screen.getByText(/--machine darkbook/)).toBeInTheDocument();
   });
 
+  // `machine status <id>` takes the machine as its positional id: the request
+  // carries `opt.machine` and the command line shows the id with no flag name.
+  it("a machine-status deep link runs for its machine and shows the id as a positional", async () => {
+    const body = {
+      ...MISSION_STATUS_BODY,
+      panel: "machine-status",
+      argv: ["machine", "status", "studio"],
+      opts: { machine: "studio" },
+      ansi_text: "machine `studio` (remote):",
+    };
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/panel/machine-status") ? jsonResponse(body) : jsonResponse({ machines: [] }, 404)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("machine-status", { machine: "studio" });
+    await waitFor(() => expect(screen.getByText(/machine `studio` \(remote\)/)).toBeInTheDocument());
+    const panelCall = fetchMock.mock.calls.map(([u]) => String(u)).find((u) => u.startsWith("/panel/machine-status"));
+    expect(panelCall).toContain("opt.machine=studio");
+    expect(document.querySelector(".pc-cmd")!.textContent).toContain("darkmux machine status studio ▾");
+    expect(document.querySelector(".pc-cmd")!.textContent).not.toContain("--machine");
+  });
+
   // The roster names come from /fleet/view; picking one clears `--remote`,
   // because a machine and every peer are different asks.
   it("picking a machine from the roster token turns --remote off and asks for that machine", async () => {
@@ -431,7 +453,7 @@ describe("ConsolePanel", () => {
     // The command line switched to the new (not-yet-loaded) panel's own
     // command — `NotLoadedChrome`'s own `.pc-cmd`, distinct from
     // `LoadedChrome`'s (nothing has resolved for "machine status" yet)...
-    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux machine status");
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux machine status (this machine) ▾");
     // ...and the OLD panel's body text is gone, not left rendered underneath
     // the new command line.
     expect(screen.queryByText("mission status — 0 missions")).not.toBeInTheDocument();

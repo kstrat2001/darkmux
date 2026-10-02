@@ -2997,12 +2997,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
     // failure just yields `None`.
     // (#2915) With the binding's declared window (`n_ctx`, `null` when
     // none is declared), which the machine page's Utility section shows.
-    let utility_model = darkmux_profiles::profiles::load_registry(None)
-        .ok()
-        .and_then(|lr| {
-            lr.registry.utility_model_id().map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
-        })
-        .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
+    let utility_model = local_utility_model(&loaded_models);
 
     wire::MachineSpecsResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3019,6 +3014,16 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
         redis_url_redacted,
         generated_at_ms: current_millis(),
     }
+}
+
+/// This machine's configured utility model (`internal.utility`) and whether
+/// one of `loaded_models` is it, the ONE derivation behind the machine card's
+/// `utility_model` and `darkmux machine status`'s utility line. `None` when no
+/// utility model is registered or the registry cannot be read.
+pub fn local_utility_model(loaded_models: &[darkmux_types::LoadedModel]) -> Option<wire::UtilityModel> {
+    let lr = darkmux_profiles::profiles::load_registry(None).ok()?;
+    let id = lr.registry.utility_model_id()?;
+    Some(utility_model(id, lr.registry.utility_model_n_ctx(), loaded_models))
 }
 
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {

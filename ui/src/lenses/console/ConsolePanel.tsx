@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, rosterOptName, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
+import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, rosterOptName, rosterIsPositional, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
 import { useFleetView } from "../../hooks/useFleetView";
 import { fetchPanel } from "./fetchPanel";
 import { fetchJson } from "../../lib/fetcher";
@@ -575,7 +575,7 @@ function MachineToken({
   return (
     <span>
       {" "}
-      <EnumToken opt={machineOpt(roster, opts[name])} value={opts[name] ?? LOCAL_MACHINE} manual={manual} onChange={onChange} />
+      <EnumToken opt={machineOpt(id, roster, opts[name])} value={opts[name] ?? LOCAL_MACHINE} manual={manual} positional={rosterIsPositional(id)} onChange={onChange} />
     </span>
   );
 }
@@ -637,11 +637,14 @@ function EnumToken({
   opt,
   value,
   manual: _manual,
+  positional = false,
   onChange,
 }: {
   opt: PanelOpt;
   value: string;
   manual: boolean;
+  /** The value is the verb's positional argument, so no `--name` precedes it. */
+  positional?: boolean;
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -743,7 +746,7 @@ function EnumToken({
           }
         }}
       >
-        {`${flag} ${value} ▾`}
+        {positional ? `${value} ▾` : `${flag} ${value} ▾`}
       </span>
       {open && (
         <ul className="pc-tok-menu" role="listbox" aria-label={flag}>

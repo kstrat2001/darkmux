@@ -1,0 +1,588 @@
+[
+ {
+  "name": "this machine, idle",
+  "row": {
+   "entry": {
+    "id": "laptop",
+    "address": "laptop.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": true,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "live",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [
+       {
+        "identifier": "darkmux:qwen",
+        "model": "qwen",
+        "status": "idle",
+        "size": "20 GB",
+        "context": 65536
+       }
+      ],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "idle",
+   "reason": null
+  }
+ },
+ {
+  "name": "this machine, a model generating",
+  "row": {
+   "entry": {
+    "id": "laptop",
+    "address": "laptop.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": true,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "unknown",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [
+       {
+        "identifier": "darkmux:qwen",
+        "model": "qwen",
+        "status": "generating",
+        "size": "20 GB",
+        "context": 65536
+       }
+      ],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": true,
+  "expect": {
+   "status": "running",
+   "reason": null
+  }
+ },
+ {
+  "name": "peer, beating, idle",
+  "row": {
+   "entry": {
+    "id": "studio",
+    "address": "studio.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "live",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [
+       {
+        "identifier": "darkmux:qwen",
+        "model": "qwen",
+        "status": "idle",
+        "size": "20 GB",
+        "context": 65536
+       }
+      ],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "idle",
+   "reason": null
+  }
+ },
+ {
+  "name": "peer, beating, prompt processing",
+  "row": {
+   "entry": {
+    "id": "studio",
+    "address": "studio.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "live",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [
+       {
+        "identifier": "darkmux:qwen",
+        "model": "qwen",
+        "status": "processingPrompt",
+        "size": "20 GB",
+        "context": 65536
+       }
+      ],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": true,
+  "expect": {
+   "status": "running",
+   "reason": null
+  }
+ },
+ {
+  "name": "peer, card read, no beat",
+  "row": {
+   "entry": {
+    "id": "studio",
+    "address": "studio.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "no_beat",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [
+       {
+        "identifier": "darkmux:qwen",
+        "model": "qwen",
+        "status": "idle",
+        "size": "20 GB",
+        "context": 65536
+       }
+      ],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "online_not_streaming",
+   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+  }
+ },
+ {
+  "name": "peer, card read, presence unknown",
+  "row": {
+   "entry": {
+    "id": "studio",
+    "address": "studio.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "unknown",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "available",
+    "card": {
+     "card_schema_version": "1.2",
+     "work_job_schema_version": "8.0",
+     "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "m",
+      "machine_uid": null,
+      "os": "macos aarch64",
+      "ram_total_bytes": null,
+      "ram_free_for_ai_bytes": null,
+      "cpu_brand": null,
+      "loaded_models": [],
+      "lms_unreachable": false,
+      "utility_model": {
+       "id": "qwen3-4b",
+       "loaded": true,
+       "n_ctx": null
+      },
+      "redis_url_redacted": null,
+      "generated_at_ms": 1
+     },
+     "profiles": [],
+     "default_profile": null,
+     "profiles_error": null,
+     "seats": null,
+     "governor": {
+      "thermal": null,
+      "battery": null,
+      "battery_gate": {
+       "floor_pct": 50,
+       "refuse_start_below_min": true,
+       "pause_running_below_min": true,
+       "refusing_start": false
+      }
+     },
+     "fleet_mode": "peer",
+     "hosts_fleet_redis": false,
+     "generated_at_ms": 1,
+     "gather_ms": 2,
+     "cache_ttl_ms": 2000
+    },
+    "source": "listener"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "online_not_streaming",
+   "reason": "online \u00b7 not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here."
+  }
+ },
+ {
+  "name": "peer, no beat, listener off",
+  "row": {
+   "entry": {
+    "id": "mini",
+    "address": "mini.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "no_beat",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "unreachable",
+    "reason": "listener_off",
+    "detail": null
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "offline",
+   "reason": "offline: not listening"
+  }
+ },
+ {
+  "name": "peer, no beat, another machine answered",
+  "row": {
+   "entry": {
+    "id": "mini",
+    "address": "mini.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "no_beat",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "mismatch",
+    "answered_as": "x"
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "offline",
+   "reason": "offline: another machine answered"
+  }
+ },
+ {
+  "name": "peer, presence unknown, listener off",
+  "row": {
+   "entry": {
+    "id": "mini",
+    "address": "mini.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "unknown",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "unreachable",
+    "reason": "listener_off",
+    "detail": null
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "not_streaming",
+   "reason": "not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read."
+  }
+ },
+ {
+  "name": "peer, beating, older peer with no card",
+  "row": {
+   "entry": {
+    "id": "mini",
+    "address": "mini.example.invalid",
+    "added_unix_ms": 1
+   },
+   "is_this_machine": false,
+   "machine_uid": null,
+   "uid_source": null,
+   "liveness": "live",
+   "last_beat_ms": null,
+   "received_at_ms": null,
+   "fetch_ms": 1,
+   "card": {
+    "state": "unavailable",
+    "why": "no_card_route",
+    "peer_version": null,
+    "peer_version_source": null
+   },
+   "accepts": {
+    "state": "unknown"
+   }
+  },
+  "active": false,
+  "expect": {
+   "status": "idle",
+   "reason": null
+  }
+ }
+]

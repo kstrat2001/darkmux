@@ -291,9 +291,9 @@ pub(crate) enum Cmd {
         #[arg(long = "resume-from", value_name = "DIR")]
         resume_from: Option<std::path::PathBuf>,
     },
-    /// Run pre-flight diagnostic checks. Verifies the local setup (profile
-    /// registry, LMStudio, models, runtime, RAM, power) and reports
-    /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
+    /// Check this machine's darkmux setup: config, profiles, LM Studio and endpoints, runtime image, fleet roster and routes, flow sinks, and state files.
+    /// Also covers RAM and power. Reports pass/warn/fail with actionable
+    /// hints. Exit 0 if no failures, else 1.
     Doctor {
         /// (#1130) Print every check. Default output is issues-only — the
         /// build identity line + any warnings/failures, with the passing

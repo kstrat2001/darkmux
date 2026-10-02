@@ -212,6 +212,13 @@ pub(crate) fn refusal(args: &[String]) -> Option<String> {
     })
 }
 
+/// Every retired spelling, as the line a user would have typed, for tests that
+/// assert a model-facing surface never offers one (F12).
+#[cfg(test)]
+pub(crate) fn retired_spellings() -> Vec<String> {
+    RETIRED.iter().chain(RETIRED_5_0).map(RetiredVerb::spelling).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::refusal;

@@ -105,8 +105,11 @@ export interface PanelOptsEntry {
   readonly opts: readonly PanelOpt[];
   /** The name of this panel's roster-valued opt, when it has one: the client
    * twin of `panel.rs`'s `PanelSpec::roster_opt`. Its value is a roster
-   * machine name, driving `--machine <name>`; see [[machineOpt]]. */
+   * machine name; see [[machineOpt]]. */
   readonly rosterOpt?: string;
+  /** The flag that carries the roster machine into argv; absent when the
+   * machine is the verb's positional id (`machine status <id>`). */
+  readonly rosterFlag?: string;
 }
 
 /** `profile list`'s `--remote` toggle: every peer's profiles this machine may
@@ -134,7 +137,11 @@ export const LOCAL_MACHINE = "(this machine)";
 export const PANEL_OPTS: Record<PanelId, PanelOptsEntry> = {
   "mission-status": { argv: ["mission", "status"], opts: [ALL_OPT] },
   "role-list": { argv: ["role", "list"], opts: [] },
-  "machine-status": { argv: ["machine", "status"], opts: [] },
+  // Residents of this machine, or of one roster peer (`machine status <id>`).
+  "machine-status": { argv: ["machine", "status"], opts: [], rosterOpt: "machine" },
+  // The fleet view's rows: each machine's status and why, in the fleet card's
+  // words, so a phone (no tooltips) reaches what the card's tooltip says.
+  "machine-list": { argv: ["machine", "list"], opts: [] },
   "config-list": { argv: ["config", "list"], opts: [] },
   "flow-status": { argv: ["flow", "status"], opts: [] },
   "lab-fixture-list": { argv: ["lab", "fixture", "list"], opts: [] },
@@ -143,7 +150,7 @@ export const PANEL_OPTS: Record<PanelId, PanelOptsEntry> = {
   "run-list": { argv: ["run", "list"], opts: [RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT] },
   // The profiles THIS machine may use: its own, one roster peer's (`machine`),
   // or every peer's (`remote`). See `src/profile_remote.rs`.
-  "profile-list": { argv: ["profile", "list"], opts: [PROFILE_LIST_REMOTE_OPT], rosterOpt: "machine" },
+  "profile-list": { argv: ["profile", "list"], opts: [PROFILE_LIST_REMOTE_OPT], rosterOpt: "machine", rosterFlag: ROSTER_MACHINE_FLAG },
   doctor: { argv: ["doctor"], opts: [] },
 };
 
@@ -153,6 +160,12 @@ export function panelArgv(id: PanelId): readonly string[] {
 
 export function panelOptGroups(id: PanelId): readonly PanelOpt[] {
   return PANEL_OPTS[id].opts;
+}
+
+/** Whether the roster machine is the verb's positional id (`machine status
+ * <id>`) rather than a flag value; the command line then shows no flag name. */
+export function rosterIsPositional(id: PanelId): boolean {
+  return rosterOptName(id) !== null && PANEL_OPTS[id].rosterFlag === undefined;
 }
 
 /** The panel's roster-valued opt name, or `null` for a panel with none. */
@@ -168,16 +181,24 @@ function isMachineNameShape(v: string): boolean {
   return v.length > 0 && v.length <= 128 && v !== LOCAL_MACHINE && !/[\u0000-\u001f\u007f]/.test(v);
 }
 
+/** How a roster machine reaches argv for panel `id`: after its flag, or as the
+ * verb's positional id when it declares no flag. The twin of `panel.rs`'s
+ * `with_roster_choice`. */
+function rosterArgv(id: PanelId, machine: string): string[] {
+  const flag = PANEL_OPTS[id].rosterFlag;
+  return flag === undefined ? [machine] : [flag, machine];
+}
+
 /** The roster opt as a [[PanelOpt]] for the menu: this machine first (the
  * default, no flag), then each roster name. A name the roster does not have
  * but the link carries stays in the list, so the token reads what will be
  * asked and the server's 400 says why it fails. */
-export function machineOpt(roster: readonly string[], current: string | undefined): PanelOpt {
+export function machineOpt(id: PanelId, roster: readonly string[], current: string | undefined): PanelOpt {
   const names = [...roster];
   if (current !== undefined && current !== LOCAL_MACHINE && !names.includes(current)) names.push(current);
   return {
     name: "machine",
-    values: [{ value: LOCAL_MACHINE, argv: [] }, ...names.map((n) => ({ value: n, argv: [ROSTER_MACHINE_FLAG, n] }))],
+    values: [{ value: LOCAL_MACHINE, argv: [] }, ...names.map((n) => ({ value: n, argv: rosterArgv(id, n) }))],
   };
 }
 
@@ -240,7 +261,7 @@ export function composeArgv(id: PanelId, requested?: Readonly<Record<string, str
   const out = [...panelArgv(id)];
   for (const r of resolveOpts(id, requested)) out.push(...r.argv);
   const machine = chosenMachine(id, requested);
-  if (machine !== null) out.push(ROSTER_MACHINE_FLAG, machine);
+  if (machine !== null) out.push(...rosterArgv(id, machine));
   return out;
 }
 
@@ -299,8 +320,8 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
  * These are exactly the CLI-backed panels — the drift guard in
  * `panels.test.ts` pins `PANELS.map(p => p.id)` to `PANEL_IDS` from
  * `lib/route.ts`, which is itself the twin of the Rust-side allowlist
- * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 9 by its
- * own doctrine assertion). Nine pills, full stop — every tab the console
+ * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 10 by its
+ * own doctrine assertion). Ten pills, full stop — every tab the console
  * renders is one of these, addressable by its own explicit `panel=<id>`.
  *
  * (#1911) `all missions` is gone (folded into `mission-status`'s own `all`
@@ -336,7 +357,7 @@ export const PANELS: PanelDef[] = (
   // guard in `panels.test.ts` sorts both sides before comparing, so this
   // array is presentation only and `PANEL_IDS` stays a closed SET whose
   // own order carries no meaning.
-  ["run-list", "mission-status", "machine-status", "profile-list", "flow-status", "role-list", "config-list", "lab-fixture-list", "doctor"] as const
+  ["run-list", "mission-status", "machine-status", "machine-list", "profile-list", "flow-status", "role-list", "config-list", "lab-fixture-list", "doctor"] as const
 ).map((id) => ({ id, label: panelArgv(id).join(" ") }));
 
 /** (#1905 step 3) The console's landing panel when `panelId === ""` — no

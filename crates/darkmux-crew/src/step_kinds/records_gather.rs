@@ -96,23 +96,10 @@ pub struct GatherOutput {
     /// a failed `load_steps_for_phase` for one phase, or a `dispatch.unit`
     /// step whose own output failed to parse. Each of these previously
     /// vanished into a default/skip/zero with no trace; see
-    /// [`StepScan::unreadable`]. Deliberately NOT a field on
-    /// [`DeliverScope`] (`deliver_github_review.rs` is owned by another
-    /// concurrent change and is not touched by this fix) — sits beside
-    /// `scope` on the envelope instead. **Follow-up STILL owed** (#1748
-    /// review CONSIDER 9): wire this into `render_github_review`'s
-    /// scope-line rendering (or an adjacent line) so an unreadable input
-    /// is visible on the PR comment itself, not only in the raw envelope.
-    /// #1748's own fix pass DID touch `deliver_github_review.rs`, but its
-    /// scope was the absence-claim backstop's containment (`code_span`
-    /// on the caveat's `token`/`file`) and the token-binding fix
-    /// ([`crate::absence_backstop::detect_absence_claim`]) — wiring this
-    /// field in is a genuinely separate change (a new
-    /// `render_github_review` parameter, touching every call site in
-    /// that module including its ~30 test callers) that deserves its own
-    /// pass rather than riding along here. Recorded explicitly, again,
-    /// so the NEXT touch of this file does not have to rediscover that
-    /// the obligation is still open.
+    /// [`StepScan::unreadable`]. `deliver.github_review` folds it into
+    /// `DeliverScope::unreadable` when it reads this envelope (#2425), so the
+    /// rendered comment names each unreadable input and the run is never a
+    /// clean noop.
     #[serde(default)]
     pub unreadable: Vec<String>,
     /// (#1748) The mechanical absence-claim backstop's findings — one
@@ -253,6 +240,9 @@ impl StepKind for RecordsGatherStepKind {
             refused: scan.findings_rejected,
             not_attempted,
             errored: scan.errored,
+            // (#2425) Carried by `GatherOutput::unreadable` beside this scope;
+            // `deliver.github_review` folds it in when it reads the envelope.
+            unreadable: Vec::new(),
         };
         // (#1748) The mechanical absence-claim backstop — checks every
         // finding's own "X is missing"/"X is never called" claim against

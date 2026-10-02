@@ -119,6 +119,7 @@ const AUTO_PANELS: readonly (readonly [string, string])[] = [
   ["mission-status", "panel=mission-status"],
   ["mission-status-all", "panel=mission-status&opt.all=all"],
   ["machine-status", "panel=machine-status"],
+  ["machine-list", "panel=machine-list"],
   ["flow-status", "panel=flow-status"],
   ["role-list", "panel=role-list"],
   ["config-list", "panel=config-list"],
