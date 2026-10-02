@@ -97,6 +97,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+/// (#2717) The variable the leak sentinel sets, beside `DARKMUX_HOME`, to
+/// announce the root it pinned. A test build's flows default treats that root
+/// as NOT scoped by the test (nothing in the test made it), so records land in
+/// the per-process scratch dir instead of under the pinned root. A test that
+/// scopes its own `DARKMUX_HOME` (or uses `IsolatedState`) names a different
+/// path and is still honored.
+pub const SENTINEL_ROOT_VAR: &str = "DARKMUX_TEST_SENTINEL_ROOT";
+
 /// Variables that NAME a write destination and nothing more. The guard
 /// points each at a path under its own throwaway root.
 ///
@@ -601,6 +609,7 @@ impl StateLeakSentinel {
         cmd.env("HOME", self.home());
         cmd.env("TMPDIR", self.tmp.path().join("tmp"));
         cmd.env("DARKMUX_HOME", self.root());
+        cmd.env(SENTINEL_ROOT_VAR, self.root());
         for (var, _) in PINNED_STATE_VARS.iter().filter(|(v, _)| *v != "DARKMUX_HOME") {
             cmd.env_remove(var);
         }
