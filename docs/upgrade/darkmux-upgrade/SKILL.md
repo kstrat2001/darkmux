@@ -206,7 +206,7 @@ darkmux no longer refuses a mission file in an old spelling, so each of these go
 | `mission.json` | key `sprint_ids` | `phase_ids` |
 | `mission.json` | key `closed_ts` | `finalized_ts` |
 | `mission.json` | status value `closed` | `finalized` |
-| `mission.json` | status value `paused` (the no-op `mission pause` verb) | `active` |
+| `mission.json` | status value `paused` (the retired no-op pause) | `active` |
 | `tasks/<phase>/*.json` | key `sprint_id` | `phase_id` |
 | the mission directory | `sprints/` | `phases/` |
 
@@ -229,9 +229,13 @@ darkmux used to find and name these. It now ignores them, so check once by hand:
 - **Installed skills that darkmux no longer ships.** `darkmux init` used to delete retired `darkmux-*` skill directories; it now leaves them. A leftover can still teach an agent a dead verb. List `~/.claude/skills/darkmux-*` and the other agent skill directories `darkmux init` writes to, compare with `ls skills/` in the source tree (or the release's bundled list), and ask before deleting any. `darkmux doctor` still warns on an installed skill that differs from the bundled copy.
 - **Retired roles in the user tier.** `<root>/roles/mission-compiler.json` (and its `.md`), `scribe.json` and `scribe.md` retired with `mission propose` and `lab notebook`. Nothing dispatches them, though a leftover `.json` still shows in `darkmux role list`. Ask, then delete.
 - **A role manifest with `"role_family": "admin"`.** The value was renamed to `"utility"` long ago and a manifest still using it is now rejected as an unknown family. Set `"role_family": "utility"`.
+<!-- flow-action-guard:allow-start — names the retired spellings to say what they now read as -->
 - **Retired verbs.** A script that calls one now gets the usual unrecognized-subcommand error instead of a message naming the replacement. The replacements: `mission dispatch`, `mission add-phase`, `mission start`, `mission pause` and `mission resume` are gone (use `mission launch <config>`, `mission abort <id>` and `mission finalize <id>`); `lab run list|inspect|stats|compare` became `darkmux run list --kind lab`, `run inspect`, `run stats` and `run compare`; `lab eval` became `lab run <workload>` and `mission launch review`; `finding list --dispatch` is `--execution`; `--session-id` and `--session` on `dispatch`, `flow` and `memory correction list` are `--name` and `--execution`; `--runs` is `--repeat`; `mission status --missions` is `--named`; `dispatch --phase-id` is gone; `swap`, `status`, `model` and `fleet` folded into `machine` (`machine status`, `machine eject`, `machine list`); `lessons` is `memory lesson`.
+<!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
 - **Pre-2.6.0 audit files** (the struct-hash format) are not recognized as a chain: `darkmux flow integrity-check` reports them as unverifiable instead of "legacy, rotate it". Rotate them by moving the file aside so a new chain starts.
+<!-- flow-action-guard:allow-start — names the retired spellings to say what they now read as -->
 - **Pre-4.0 flow archives.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-4.0 `telemetry.process` record.
+<!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
 
 ## Step 8: Mission configs, workloads, fixtures
 

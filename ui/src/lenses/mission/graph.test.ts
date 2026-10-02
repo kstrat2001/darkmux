@@ -464,8 +464,10 @@ describe("isAiKind", () => {
     expect(isAiKind("review.judge")).toBe(false);
   });
   it("-render and -collect kinds are excluded even under a dispatching prefix (#2310 P2 review finding I4)", () => {
+    // flow-action-guard:allow-start — step kinds, not flow actions
     expect(isAiKind("dispatch.map-render")).toBe(false);
     expect(isAiKind("dispatch.map-collect")).toBe(false);
+    // flow-action-guard:allow-end
   });
 });
 
