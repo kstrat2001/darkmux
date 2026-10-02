@@ -8,10 +8,13 @@ import {
   SOURCE,
   STAGE,
   TIER,
+  byReceiveOrder,
   byTime,
+  parseHubId,
   byTimeNewestFirst,
   ingest,
   ingestJsonl,
+  ingestRecord,
   isAsOf,
   isExecutionAction,
   recordsAsOf,
@@ -367,5 +370,38 @@ describe("ingest: the execution a record is of", () => {
     expect(isExecutionAction(ACTION.StepStart)).toBe(false);
     expect(isExecutionAction(ACTION.DispatchRoute)).toBe(false);
     expect(isExecutionAction(undefined)).toBe(false);
+  });
+});
+
+// (#3017) The hub's receive order, never a writer's clock.
+describe("hub order", () => {
+  const at = (ts: string, hub?: string) => ingestRecord({ ts, action: "operator.note", ...(hub ? { hub_id: hub } : {}) })!;
+
+  it("reads a stream id as one comparable number and refuses anything else", () => {
+    expect(parseHubId("1000-1")).toBeGreaterThan(parseHubId("1000-0") as number);
+    expect(parseHubId("1001-0")).toBeGreaterThan(parseHubId("1000-1023") as number);
+    for (const bad of [undefined, null, 5, "", "1000", "a-b", "1-2-3"]) expect(parseHubId(bad)).toBeNull();
+  });
+
+  it("orders by receive order even when the clocks say the opposite", () => {
+    const first = at("2026-08-19T10:00:00Z", "1000-0");
+    const second = at("2026-08-19T09:50:00Z", "1001-0"); // a slow clock
+    expect([second, first].sort(byReceiveOrder)).toEqual([first, second]);
+    expect([second, first].sort(byTime)).toEqual([second, first]);
+  });
+
+  it("places a record the hub never saw by its own time on the hub's scale, in one total order", () => {
+    const ms = Date.parse("2026-08-19T10:00:00Z");
+    const stamped = (off: number) => at(new Date(ms + off).toISOString(), `${ms + off}-0`);
+    const local = at("2026-08-19T10:00:30Z");
+    const early = stamped(10_000);
+    const late = stamped(60_000);
+    expect([late, local, early].sort(byReceiveOrder)).toEqual([early, local, late]);
+    expect([local, late, early].sort(byReceiveOrder)).toEqual([early, local, late]);
+    const a = at("2026-08-19T10:00:00Z");
+    const b = at("2026-08-19T09:00:00Z");
+    expect([a, b].sort(byReceiveOrder)).toEqual([b, a]);
+    const keyless = ingestRecord({ action: "operator.note" })!;
+    expect([keyless, early].sort(byReceiveOrder)).toEqual([early, keyless]);
   });
 });

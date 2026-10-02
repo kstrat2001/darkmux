@@ -305,6 +305,14 @@ pub struct FleetMachine {
     /// `null` without a beat.
     #[cfg_attr(test, ts(type = "number | null"))]
     pub last_beat_ms: Option<u64>,
+    /// (#3017) This machine's clock against the hub's, in milliseconds
+    /// (negative = behind), from its newest presence beat read against the
+    /// hub's own clock. Absent without a beat or a readable hub clock. Shown
+    /// only by `machine list` and `doctor`, and only past
+    /// `darkmux_flow::presence::CLOCK_SKEW_THRESHOLD_MS`; never on a card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
+    pub clock_skew_ms: Option<i64>,
     /// When THIS machine got the peer's answer, on this machine's clock: an
     /// age is computed from it, never from the card's own timestamp. `null`
     /// when nothing answered.
@@ -442,6 +450,9 @@ pub(crate) trait FleetSources: Send + Sync {
     /// sentence for a roster file that exists and does not parse.
     fn roster(&self) -> Result<crate::ResolvedRoster, &'static str>;
     fn presence(&self) -> (Vec<PresenceBeat>, SourceState);
+    /// The hub's own clock in Unix milliseconds, when it can be read: the
+    /// reference a beat's timestamp is measured against (#3017).
+    fn hub_time_ms(&self) -> Option<u64>;
     fn local_card(&self) -> MachineCard;
     /// Verify the node behind a roster entry's address and aim at its fleet
     /// listener. Blocking (the identity lookup).
@@ -492,6 +503,7 @@ fn unfinished_row(entry: &MachineEntry) -> FleetMachine {
         uid_source: None,
         liveness: Liveness::Unknown,
         last_beat_ms: None,
+        clock_skew_ms: None,
         received_at_ms: None,
         fetch_ms: None,
         card: CardOutcome::Unreachable {
@@ -508,6 +520,8 @@ struct GatherCtx<'a> {
     local: LocalIdentity,
     beats: Vec<PresenceBeat>,
     presence: SourceState,
+    /// The hub's clock when `beats` were read (#3017).
+    hub_now_ms: Option<u64>,
     /// This machine's card, gathered once per view however many rows are it.
     local_card: std::sync::OnceLock<MachineCard>,
 }
@@ -531,10 +545,11 @@ impl GatherCtx<'_> {
     }
 
     /// The liveness and beat timestamp of a machine, from presence.
-    fn liveness(&self, uid: Option<&str>, name: &str, is_self: bool) -> (Liveness, Option<u64>) {
+    fn liveness(&self, uid: Option<&str>, name: &str, is_self: bool) -> (Liveness, Option<u64>, Option<i64>) {
         let beat = beat_for(uid, name, &self.beats);
         let liveness = if is_self { Liveness::Live } else { liveness_of(&self.presence, beat) };
-        (liveness, beat.map(|b| b.beat_ts_ms))
+        let skew = beat.zip(self.hub_now_ms).map(|(b, hub)| darkmux_flow::presence::clock_skew_ms(b.beat_ts_ms, hub));
+        (liveness, beat.map(|b| b.beat_ts_ms), skew)
     }
 
     /// This machine's row: its card, built here, with no HTTP.
@@ -542,7 +557,7 @@ impl GatherCtx<'_> {
         let outcome = CardOutcome::Available { card: Box::new(self.local_card()), source: CardSource::Local };
         let (machine_uid, uid_source) = Self::uid_of(&outcome, entry, from_history);
         let name = entry.map(|e| e.id.as_str()).or(self.local.machine_id.as_deref()).unwrap_or_default();
-        let (liveness, last_beat_ms) = self.liveness(machine_uid.as_deref(), name, true);
+        let (liveness, last_beat_ms, clock_skew_ms) = self.liveness(machine_uid.as_deref(), name, true);
         FleetMachine {
             entry: entry.map(RosterMachineEntry::from),
             is_this_machine: true,
@@ -550,6 +565,7 @@ impl GatherCtx<'_> {
             uid_source,
             liveness,
             last_beat_ms,
+            clock_skew_ms,
             received_at_ms: Some(crate::current_millis()),
             fetch_ms: Some(started.elapsed().as_millis() as u64),
             card: outcome,
@@ -575,7 +591,7 @@ impl GatherCtx<'_> {
             Err(reason) => (CardOutcome::Unreachable { reason, detail: None }, AcceptsState::Unknown),
         };
         let (machine_uid, uid_source) = Self::uid_of(&card, Some(entry), from_history);
-        let (liveness, last_beat_ms) = self.liveness(machine_uid.as_deref(), &entry.id, false);
+        let (liveness, last_beat_ms, clock_skew_ms) = self.liveness(machine_uid.as_deref(), &entry.id, false);
         let answered = matches!(
             card,
             CardOutcome::Available { .. } | CardOutcome::Unavailable { .. } | CardOutcome::Mismatch { .. }
@@ -587,6 +603,7 @@ impl GatherCtx<'_> {
             uid_source,
             liveness,
             last_beat_ms,
+            clock_skew_ms,
             received_at_ms: answered.then(crate::current_millis),
             fetch_ms: Some(started.elapsed().as_millis() as u64),
             card,
@@ -604,7 +621,8 @@ pub(crate) fn gather_view(src: &dyn FleetSources, ttl: Duration) -> FleetView {
         Err(sentence) => (crate::ResolvedRoster { machines: Vec::new(), uid_from_history: Default::default() }, Some(sentence.to_string())),
     };
     let (beats, presence) = src.presence();
-    let ctx = GatherCtx { src, local: src.local_identity(), beats, presence, local_card: Default::default() };
+    let hub_now_ms = if beats.is_empty() { None } else { src.hub_time_ms() };
+    let ctx = GatherCtx { src, local: src.local_identity(), beats, presence, hub_now_ms, local_card: Default::default() };
     let mut machines: Vec<FleetMachine> = std::thread::scope(|scope| {
         let handles: Vec<_> = roster
             .machines
@@ -717,6 +735,12 @@ impl FleetSources for ProcessSources {
             Some(url) => crate::read_presence_beats(&url, "machines", darkmux_flow::presence::read_live),
             None => (Vec::new(), SourceState::Off),
         }
+    }
+
+    fn hub_time_ms(&self) -> Option<u64> {
+        let url = darkmux_flow::redis_url()?;
+        let client = redis::Client::open(url.expose_for_probe()).ok()?;
+        darkmux_flow::presence::read_hub_time_ms(&client).ok()
     }
 
     fn local_card(&self) -> MachineCard {
@@ -1038,6 +1062,7 @@ pub(crate) mod tests {
         pub from_history: Vec<String>,
         pub beats: Vec<PresenceBeat>,
         pub presence_off: bool,
+        pub hub_now_ms: Option<u64>,
         pub roster_error: Option<&'static str>,
         /// Per peer id: the verified node, or why verification failed. A peer
         /// with no script verifies as node `n-<id>`.
@@ -1102,6 +1127,9 @@ pub(crate) mod tests {
             } else {
                 (self.beats.clone(), SourceState::Ok)
             }
+        }
+        fn hub_time_ms(&self) -> Option<u64> {
+            self.hub_now_ms
         }
         fn local_card(&self) -> MachineCard {
             self.local_cards.fetch_add(1, Ordering::SeqCst);
@@ -1172,6 +1200,37 @@ pub(crate) mod tests {
         assert!(!matches!(row(&view, "studio").card, CardOutcome::Unreachable { .. }), "no beat is not unreachable");
         let mini = row(&view, "mini");
         assert_eq!((mini.liveness, mini.last_beat_ms), (Liveness::Live, Some(1234)));
+    }
+
+    /// (#3017) A row carries its machine's clock against the hub's, from its
+    /// newest beat read against the hub clock. No hub clock, no beat: no number.
+    #[test]
+    fn a_row_carries_its_clock_against_the_hub() {
+        let beat_at = |uid: &str, name: &str, ts: u64| {
+            let mut b = beat(name, uid, None);
+            b.beat_ts_ms = ts;
+            b
+        };
+        let hub = 1_800_000_000_000u64;
+        let s = Scripted {
+            local: identity("laptop", None, Some("nLAPTOP")),
+            roster: vec![entry("laptop"), entry("studio"), entry("mini")],
+            beats: vec![beat_at("U1", "laptop", hub - 2_000), beat_at("U3", "mini", hub - 10 * 60 * 1000)],
+            hub_now_ms: Some(hub),
+            ..Default::default()
+        };
+        s.verify.lock().unwrap().insert("laptop".into(), Ok("nLAPTOP".into()));
+        peer_says(&s, "studio", 0, old("5.0.0"), AcceptsState::Unknown);
+        peer_says(&s, "mini", 0, old("5.0.0"), AcceptsState::Unknown);
+        let view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+        assert_eq!(row(&view, "mini").clock_skew_ms, Some(-600_000));
+        assert_eq!(row(&view, "laptop").clock_skew_ms, Some(-2_000));
+        assert_eq!(row(&view, "studio").clock_skew_ms, None, "no beat, no skew");
+        let blind = Scripted { hub_now_ms: None, beats: s.beats.clone(), roster: s.roster.clone(), local: s.local.clone(), ..Default::default() };
+        blind.verify.lock().unwrap().insert("laptop".into(), Ok("nLAPTOP".into()));
+        peer_says(&blind, "studio", 0, old("5.0.0"), AcceptsState::Unknown);
+        peer_says(&blind, "mini", 0, old("5.0.0"), AcceptsState::Unknown);
+        assert_eq!(row(&gather_view(&blind, FLEET_VIEW_CACHE_TTL), "mini").clock_skew_ms, None, "an unreadable hub clock states nothing");
     }
 
     /// Presence that is off or unreadable says nothing about a peer: it is

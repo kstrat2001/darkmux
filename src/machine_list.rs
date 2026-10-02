@@ -496,6 +496,11 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         );
         let reachable = matches!(m.card, CardOutcome::Available { .. } | CardOutcome::Unavailable { .. });
         out.push_str(&format!("{}\n", if reachable { row } else { style::dim(&row) }));
+        // (#3017) A clock the hub disagrees with, said here and in `doctor`
+        // only, past `CLOCK_SKEW_THRESHOLD_MS`; never on a fleet card.
+        if let Some(words) = m.clock_skew_ms.and_then(darkmux_flow::presence::clock_skew_words) {
+            out.push_str(&format!("{}\n", style::warn(&format!("  {}: {words}", row_name(view, m)))));
+        }
         if let CardOutcome::Available { card, .. } = &m.card {
             for line in detail_lines(card, &m.accepts) {
                 out.push_str(&format!("{}\n", style::dim(&line)));
@@ -569,6 +574,7 @@ pub(crate) mod tests {
             uid_source: None,
             liveness,
             last_beat_ms: None,
+            clock_skew_ms: None,
             received_at_ms: None,
             fetch_ms: Some(1),
             card: outcome,
@@ -647,6 +653,23 @@ pub(crate) mod tests {
         assert!(!out.contains("this machine"), "ambiguous wording in the grounding:\n{out}");
         for banned in ["ABCDEF000001", "example.invalid", "100.64.0.9", "8765", "token", "Bearer"] {
             assert!(!out.contains(banned), "{banned} leaked:\n{out}");
+        }
+    }
+
+    /// (#3017) `machine list` says a machine's clock differs from the hub's
+    /// only past the threshold, in `doctor`'s wording, and nothing under it.
+    #[test]
+    fn machine_list_states_a_clock_skew_only_past_the_threshold() {
+        let skewed = |ms: i64| {
+            let mut m = machine("studio", Liveness::Live, read(card("5.0.0")));
+            m.clock_skew_ms = Some(ms);
+            text(&view(vec![m]))
+        };
+        let past = skewed(-10 * 60 * 1000);
+        assert!(past.contains("studio: clock 10m behind the hub"), "{past}");
+        for under in [0, -5_000, darkmux_flow::presence::CLOCK_SKEW_THRESHOLD_MS as i64] {
+            let out = skewed(under);
+            assert!(!out.contains("the hub"), "a skew of {under}ms is under the threshold:\n{out}");
         }
     }
 

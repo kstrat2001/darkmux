@@ -186,6 +186,7 @@ mod tests {
             // lab shape is covered by the `/runs` lab-row tests.
             workload: None,
             verify_passed: None,
+            relay: None,
         };
         golden("runs-row.json", &run);
     }

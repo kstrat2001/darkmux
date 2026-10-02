@@ -3038,6 +3038,27 @@
         assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
     }
 
+    /// (#3017) A record read off the hub carries the hub's own stream id as
+    /// `hub_id`: the receive order the viewer orders cross-machine records
+    /// by, never each machine's own `ts`.
+    #[test]
+    fn redis_backfill_stamps_each_record_with_its_hub_id() {
+        let raw = redis::Value::Array(vec![xentry(2_000, "2026-05-14T09:00:05Z"), xentry(1_000, "2026-05-14T09:00:00Z")]);
+        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap().records;
+        let ids: Vec<_> = records.iter().map(|r| r["hub_id"].as_str().unwrap_or("")).collect();
+        assert_eq!(ids, vec!["1000-0", "2000-0"]);
+    }
+
+    #[test]
+    fn a_live_tail_line_carries_its_hub_id() {
+        let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, Some("1000-3"));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["hub_id"], "1000-3");
+        assert_eq!(v["action"], "operator.note");
+        // A line that is not a JSON object passes through untouched.
+        assert_eq!(super::stamp_hub_id_line("not json", Some("1-0")), "not json");
+    }
+
     fn xentry(ms: u64, ts: &str) -> redis::Value {
         redis::Value::Array(vec![
             redis::Value::BulkString(format!("{ms}-0").into_bytes()),

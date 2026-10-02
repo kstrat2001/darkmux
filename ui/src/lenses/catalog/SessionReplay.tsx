@@ -29,6 +29,8 @@ import { liveStateLabel, reasonForLine, toolReadout, type LiveStateReading } fro
 import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
+import type { RunRelay } from "../../types/generated/RunRelay";
+import { useRelayOrigin } from "../../hooks/useRelayOrigin";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
@@ -476,6 +478,11 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
+/** (#3017) ", asked on <machine>" for relayed work, else nothing. */
+function askedOnSuffix(relay: RunRelay | null): string {
+  return relay ? `, asked on ${relay.asked_on_machine}` : "";
+}
+
 export function SessionReplay({
   sessionId,
   missionId = null,
@@ -544,6 +551,7 @@ export function SessionReplay({
   // (`judgementAt`, below: the rule the event log beside this page reads).
   const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
   const policy = useLifecyclePolicy();
+  const relay = useRelayOrigin(sessionId);
 
   // (#2065) A static build has no `/flow-dispatch/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -836,7 +844,8 @@ export function SessionReplay({
             than replaced with a differently-wrong one. */}
         {view.header.role}{" "}
         <span className="session-run__meta">
-          ({view.header.sid} on {view.header.machineName})
+          ({view.header.sid} on {view.header.machineName}
+          {askedOnSuffix(relay)})
         </span>
       </h2>
 

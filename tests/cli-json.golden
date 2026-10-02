@@ -361,6 +361,7 @@ FleetMachine
   uid_source: UidSource | null
   liveness: Liveness
   last_beat_ms: uint64 | null
+  clock_skew_ms?: int64 | null
   received_at_ms: uint64 | null
   fetch_ms: uint64 | null
   card: CardOutcome
@@ -915,6 +916,7 @@ Run
   tokens?: uint64 | null
   workload?: string | null
   verify_passed?: boolean | null
+  relay?: RunRelay | null
 RunChecks
   telemetry_covers_run: boolean
   policy_consistent: boolean | null
@@ -934,6 +936,9 @@ RunListOutput
   fleet: SourceState
   since?: string | null
   usage?: UsageReport | null
+RunRelay
+  asked_on_machine: string
+  sender_run?: string | null
 RunSetStats
   runs: RunStats[]
   summary: SetSummary

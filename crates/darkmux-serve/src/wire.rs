@@ -326,14 +326,22 @@ pub struct FlowMissionsResponse {
 /// derivation keys on; a free-text `--source` or a retired `stage` such as
 /// `"estimate"` also survives), so those two fields can hold a value the
 /// closed `FlowSource` and `Stage` unions do not list. The viewer's ingest
-/// module normalizes them to open tags. Only a TypeScript name: the server
-/// sends the lines as JSON values and never builds one of these.
+/// module normalizes them to open tags.
+///
+/// `hub_id` (#3017) is added by the daemon to a record it read off the fleet
+/// hub (the Redis stream id, `<ms>-<seq>`, assigned in the hub's receive
+/// order) in `/flow/:date`, `/flow-mission/:id`, `/flow-dispatch/:id` and the
+/// SSE tail. A record read from this machine's own day file carries none.
+/// Cross-machine ordering reads it instead of `ts`.
+///
+/// Only a TypeScript name: the server sends the lines as JSON values and never
+/// builds one of these.
 #[cfg(test)]
 #[derive(ts_rs::TS)]
 #[ts(
     export,
     export_to = "../../../ui/src/types/generated/",
-    type = "Omit<import(\"./FlowRecord\").FlowRecord, \"source\" | \"stage\"> & { source?: import(\"./FlowSource\").FlowSource | string, stage: import(\"./Stage\").Stage | string }"
+    type = "Omit<import(\"./FlowRecord\").FlowRecord, \"source\" | \"stage\"> & { hub_id?: string, source?: import(\"./FlowSource\").FlowSource | string, stage: import(\"./Stage\").Stage | string }"
 )]
 pub struct ArchiveFlowRecord;
 

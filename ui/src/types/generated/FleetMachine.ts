@@ -35,6 +35,14 @@ uid_source: UidSource | null, liveness: Liveness,
  */
 last_beat_ms: number | null, 
 /**
+ * (#3017) This machine's clock against the hub's, in milliseconds
+ * (negative = behind), from its newest presence beat read against the
+ * hub's own clock. Absent without a beat or a readable hub clock. Shown
+ * only by `machine list` and `doctor`, and only past
+ * `darkmux_flow::presence::CLOCK_SKEW_THRESHOLD_MS`; never on a card.
+ */
+clock_skew_ms?: number, 
+/**
  * When THIS machine got the peer's answer, on this machine's clock: an
  * age is computed from it, never from the card's own timestamp. `null`
  * when nothing answered.

@@ -7,6 +7,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { queryKeys } from "../../lib/queryKeys";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
@@ -82,6 +83,41 @@ describe("SessionReplay", () => {
     ];
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
   }
+
+  it("(#3016) a relayed run's page names both ends: where it ran and where it was asked", async () => {
+    const sid = "radio-1.solo.relay.MacBook-Pro.radio-1.solo.adhoc.radio-host.n1";
+    const records = [
+      { ts: "2026-08-26T07:36:48Z", action: "dispatch.start", session_id: sid, machine_id: "darkbook", category: "work", source: "crew", payload: { role: "radio-host" } },
+    ];
+    const runs = [
+      { id: sid, kind: "dispatch", status: "running", tracked: false, dispatch_id: sid, machine: "darkbook", relay: { asked_on_machine: "MacBook-Pro", sender_run: "radio-1" } },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+    );
+    renderReplay(sid);
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, asked on MacBook-Pro/));
+  });
+
+  it("(#3017) reads the relay origin from the runs board's cached answer, without fetching /runs again", async () => {
+    const sid = "radio-1.solo.relay.MacBook-Pro.radio-1.solo.adhoc.radio-host.n1";
+    const records = [{ ts: "2026-08-26T07:36:48Z", action: "dispatch.start", session_id: sid, machine_id: "darkbook", category: "work", source: "crew", payload: { role: "radio-host" } }];
+    const fetchMock = vi.fn((_url: string) => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.runs(), {
+      ok: true,
+      data: { runs: [{ id: sid, kind: "dispatch", status: "running", tracked: false, dispatch_id: sid, relay: { asked_on_machine: "MacBook-Pro" } }] },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId={sid} viewerUid={null} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/asked on MacBook-Pro/));
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/runs"))).toHaveLength(0);
+  });
 
   it("(#1973) discloses the FULL prompt text, not just its length — the payload is reachable in the DOM", async () => {
     // The defect this guards: `sessionRun.ts` held `sp.prompt`, took its

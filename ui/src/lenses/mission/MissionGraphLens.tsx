@@ -83,7 +83,7 @@ import {
   type StepHeaderField,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
-import { byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
+import { byReceiveOrder, byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
 import { sameUid } from "../../lib/machineIdentity";
 import { isHostSampleRecord, toPoint } from "../../lib/machineDrawerScope";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
@@ -523,7 +523,9 @@ export function MissionGraphLens({
 
   const idx = useMemo(() => (baseGraph ? indexGraph(baseGraph) : null), [baseGraph]);
 
-  const ascendingRecords = useMemo(() => [...allRecords].sort(byTime), [allRecords]);
+  // Receive order (#3017): the records come from machines whose clocks can
+  // disagree, and the folds below read attempts in the order the hub saw them.
+  const ascendingRecords = useMemo(() => [...allRecords].sort(byReceiveOrder), [allRecords]);
 
   const graph = useMemo(() => {
     if (!baseGraph || !idx) return null;

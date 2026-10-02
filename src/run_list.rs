@@ -936,6 +936,7 @@ mod tests {
             tokens: None,
             workload: None,
             verify_passed: None,
+            relay: None,
         }
     }
 

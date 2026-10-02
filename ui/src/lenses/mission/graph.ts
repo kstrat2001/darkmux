@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, receiveKey, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
@@ -351,6 +351,14 @@ export interface StepMetrics {
    *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
    *  one execution's end (a map step holds one per item), not the step's. */
   stepBookended?: boolean;
+  /** (#3017) The receive key ({@link receiveKey}) of the newest terminal
+   *  folded: what tells a retry (a start received AFTER the step ended) from
+   *  a sibling start of the same attempt. */
+  endKey?: number | null;
+  /** Whether that newest terminal was a failure. Only a failed attempt is
+   *  retried, so only then does a later start restart the span; a step whose
+   *  dispatches ran one after another keeps its whole span. */
+  endFailed?: boolean;
 }
 
 const EMPTY_METRICS: StepMetrics = {
@@ -417,10 +425,16 @@ export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: strin
  *    not the most records: a looped-then-killed attempt emits hundreds of
  *    turn records while the successful retry emits a dozen, so frequency
  *    selects the failure; recency selects the attempt that represents the
- *    step's current state. Count breaks ts ties.
+ *    step's current state. Count breaks ties.
+ *
+ * "Latest" is the hub's receive order (#3017) when both sessions' records
+ * carry it, because a retry on another machine is stamped by THAT machine's
+ * clock, which can run minutes behind the first attempt's. A session with no
+ * hub-ordered record (a replay, a local-only line) is compared by its own
+ * time, and only against another such session.
  */
 export function stepDispatchSessions(records: NormRecord[], missionId: string): Record<string, string> {
-  type Tally = { n: number; lastTs: number; ours: boolean };
+  type Tally = { n: number; lastKey: number; ours: boolean };
   const tally: Record<string, Record<string, Tally>> = {};
   for (const rec of records) {
     // (#2223) Evidence that a dispatch actually ran under this session, as
@@ -432,9 +446,9 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     if (!stepId || !sid) continue;
     if (rec.mission_id && rec.mission_id !== missionId) continue;
     const forStep = (tally[stepId] ||= {});
-    const t = (forStep[sid] ||= { n: 0, lastTs: 0, ours: false });
+    const t = (forStep[sid] ||= { n: 0, lastKey: 0, ours: false });
     t.n += 1;
-    t.lastTs = Math.max(t.lastTs, rec.tMs ?? 0);
+    t.lastKey = Math.max(t.lastKey, receiveKey(rec) ?? 0);
     if (rec.mission_id === missionId) t.ours = true;
   }
   const out: Record<string, string> = {};
@@ -442,44 +456,31 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     let best = "";
     let bestT: Tally | null = null;
     for (const [sid, t] of Object.entries(seen)) {
-      if (!bestT) {
+      if (!bestT || attemptBeats(t, bestT)) {
         best = sid;
         bestT = t;
-        continue;
       }
-      if (t.ours !== bestT.ours) {
-        if (t.ours) { best = sid; bestT = t; }
-        continue;
-      }
-      if (t.lastTs !== bestT.lastTs) {
-        if (t.lastTs > bestT.lastTs) { best = sid; bestT = t; }
-        continue;
-      }
-      if (t.n > bestT.n) { best = sid; bestT = t; }
     }
     if (best) out[stepId] = best;
   }
   return out;
 }
 
-/** Whether folding a record left the step's accumulator unchanged. */
+/** Whether attempt `t` is the better representative of its step than `best`:
+ *  one positively tagged with this mission, else the more recent, else the
+ *  one with more records. */
+function attemptBeats(t: { n: number; lastKey: number; ours: boolean }, best: { n: number; lastKey: number; ours: boolean }): boolean {
+  if (t.ours !== best.ours) return t.ours;
+  return t.lastKey !== best.lastKey ? t.lastKey > best.lastKey : t.n > best.n;
+}
+
+const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
+  "tokRun", "tokFinal", "tokEnded", "tokResult", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
+  "usageSeen", "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
+];
+
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
-  return (
-    a.tokRun === b.tokRun &&
-    a.tokFinal === b.tokFinal &&
-    a.tokEnded === b.tokEnded &&
-    a.tokResult === b.tokResult &&
-    a.turnRun === b.turnRun &&
-    a.turnFinal === b.turnFinal &&
-    a.turnsEnded === b.turnsEnded &&
-    a.toolRun === b.toolRun &&
-    a.toolFinal === b.toolFinal &&
-    a.usageSeen === b.usageSeen &&
-    a.startTs === b.startTs &&
-    a.endTs === b.endTs &&
-    a.stepBookended === b.stepBookended &&
-    a.lastTs === b.lastTs
-  );
+  return METRIC_KEYS.every((k) => a[k] === b[k]);
 }
 
 /** The running and final counts one record carries, each read through its own
@@ -493,6 +494,38 @@ function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsS
     finalTok: count((end ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
     totalTurns: count(end?.total_turns),
   };
+}
+
+/** Fold a start or terminal into the step's span (start, end). Records must be
+ *  folded in the hub's receive order (`byReceiveOrder`), not by each writer's
+ *  clock (#3017): a start the hub received AFTER the step's last terminal is a
+ *  RETRY, so the span restarts at it and the step reads running. Without hub
+ *  ids the span is the earliest start to the latest terminal, as before. A
+ *  terminal with no usable time still ends the step, at the latest time the
+ *  step is known to have been alive (the bad-timestamp policy). */
+function foldSpan(
+  cur: StepMetrics,
+  next: StepMetrics,
+  ev: { isStart: boolean; isTerminal: boolean; failed: boolean; recMs: number; key: number | null },
+): void {
+  if (ev.isStart && ev.recMs) {
+    const retried = ev.key !== null && cur.endFailed === true && cur.endKey != null && ev.key > cur.endKey;
+    if (retried) {
+      next.startTs = ev.recMs;
+      next.endTs = 0;
+      next.endKey = null;
+      next.endFailed = false;
+    } else {
+      next.startTs = next.startTs ? Math.min(next.startTs, ev.recMs) : ev.recMs;
+    }
+  }
+  if (ev.isTerminal) {
+    next.endTs = Math.max(next.endTs, ev.recMs || next.lastTs || next.startTs);
+    if (ev.key !== null && ev.key >= (next.endKey ?? 0)) {
+      next.endKey = ev.key;
+      next.endFailed = ev.failed;
+    }
+  }
 }
 
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
@@ -520,10 +553,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   if (stepBookended) next.stepBookended = true;
   const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
-  if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
-  // A terminal with no usable time still ends the step, at the latest time
-  // the step is known to have been alive (the bad-timestamp policy).
-  if (isTerminal) next.endTs = Math.max(next.endTs, recMs || next.lastTs || next.startTs);
+  foldSpan(cur, next, { isStart, isTerminal, failed: action === ACTION.StepError || action === ACTION.DispatchError, recMs, key: receiveKey(rec) });
 
   const fig = recordFigures(rec);
   const finalTok = fig.finalTok;

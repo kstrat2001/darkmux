@@ -40,7 +40,7 @@ import {
   type MetricsMap,
   type MissionGraph,
 } from "./graph";
-import { isDispatchFamily, type NormRecord } from "../../lib/ingest";
+import { byReceiveOrder, isDispatchFamily, type NormRecord } from "../../lib/ingest";
 import { norm, type RawRecord } from "../../testing/records";
 
 function rec(over: RawRecord = {}): NormRecord {
@@ -853,6 +853,89 @@ describe("drawnEdges / phaseOrderEdges", () => {
       ["p1", "p2"],
       ["p2", "p3"],
     ]);
+  });
+});
+
+// (#3017) Cross-machine order is the hub's receive order, never a writer's own
+// clock. darkbook's clock runs 10 minutes slow: its live retry carries EARLIER
+// timestamps than the failed attempt on the studio, but the hub received it
+// later (a higher `hub_id`).
+describe("a slow-clock peer's retry (#3017)", () => {
+  const M = "m1";
+  const studio = (ts: string, action: string, hub: string) =>
+    rec({ ts, hub_id: hub, machine_id: "studio", session_id: "sS", action, payload: { step_id: "s1" } });
+  const darkbook = (ts: string, action: string, hub: string) =>
+    rec({ ts, hub_id: hub, machine_id: "darkbook", session_id: "sD", action, payload: { step_id: "s1" } });
+  const records = () => [
+    studio("2026-08-19T10:00:00Z", "dispatch.start", "1000-0"),
+    studio("2026-08-19T10:00:05Z", "dispatch.error", "1001-0"),
+    darkbook("2026-08-19T09:50:30Z", "dispatch.start", "1002-0"),
+    darkbook("2026-08-19T09:51:00Z", "dispatch.turn", "1003-0"),
+  ];
+
+  it("the live retry is the step's session, not the failed attempt the studio's clock favors", () => {
+    expect(stepDispatchSessions(records(), M).s1).toBe("sD");
+  });
+
+  it("without hub ids the same records fall back to each record's own time", () => {
+    const bare = records().map((r) => rec({ ...r, hub_id: undefined, hub: undefined, payload: r.payload }));
+    expect(stepDispatchSessions(bare, M).s1).toBe("sS");
+  });
+
+  it("the step shows the retry running, not a ~9.5 minute span stitched across two clocks", () => {
+    const g = baseGraph();
+    const idx = indexGraph({ ...g });
+    let m: MetricsMap = {};
+    for (const r of [...records()].sort(byReceiveOrder)) {
+      m = applyRecordToMetrics(m, { ...r, handle: "a-step", payload: {} } as NormRecord, idx, M);
+    }
+    const s = m["a-step"];
+    expect(s.endTs, "the retry has not ended").toBe(0);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T09:50:30Z"));
+  });
+});
+
+// (#3017 review) /flow-mission mixes hub-stamped records with this machine's
+// unstamped day-file ones. Every record has ONE receive key (its hub id, else
+// its own time), so the order stays total and a step still folds start-first.
+describe("a window mixing stamped and unstamped records (#3017)", () => {
+  const M = "m1";
+  const idx = indexGraph(baseGraph());
+  const fold = (rs: NormRecord[]) => {
+    let m: MetricsMap = {};
+    for (const r of [...rs].sort(byReceiveOrder)) m = applyRecordToMetrics(m, r, idx, M);
+    return m["a-step"];
+  };
+
+  it("an unstamped start older than a stamped turn still folds first, so the turns count", () => {
+    const start = rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" });
+    const turns = [1, 2, 3].map((n) =>
+      rec({ ts: `2026-08-19T10:3${n}:00Z`, hub_id: `${Date.parse("2026-08-19T10:30:00Z") + n * 1000}-0`, handle: "a-step", action: "dispatch.turn", payload: { turns_so_far: n } }),
+    );
+    expect(fold([...turns, start]).turnRun).toBe(3);
+  });
+
+  it("a stamped live retry after an UNSTAMPED failed attempt is still recognized as the retry", () => {
+    const failed = [
+      rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:05Z", handle: "a-step", action: "dispatch.error" }),
+    ];
+    // darkbook's clock is 10 minutes slow; the hub received this AFTER the failure.
+    const retry = rec({ ts: "2026-08-19T09:50:30Z", hub_id: `${Date.parse("2026-08-19T10:01:00Z")}-0`, handle: "a-step", action: "dispatch.start" });
+    const s = fold([retry, ...failed]);
+    expect(s.endTs, "the retry has not ended").toBe(0);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T09:50:30Z"));
+  });
+
+  it("an older step whose dispatches ran one after another keeps its whole span", () => {
+    const s = fold([
+      rec({ ts: "2026-08-19T10:00:00Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:10Z", handle: "a-step", action: "dispatch.complete" }),
+      rec({ ts: "2026-08-19T10:00:20Z", handle: "a-step", action: "dispatch.start" }),
+      rec({ ts: "2026-08-19T10:00:40Z", handle: "a-step", action: "dispatch.complete" }),
+    ]);
+    expect(s.startTs).toBe(Date.parse("2026-08-19T10:00:00Z"));
+    expect(s.endTs).toBe(Date.parse("2026-08-19T10:00:40Z"));
   });
 });
 
