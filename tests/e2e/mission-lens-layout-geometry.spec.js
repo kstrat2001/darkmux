@@ -13,7 +13,7 @@ function graphSnapshot() {
   const two = (id, label, parentId, depth) => ({
     id, kind: 'task', label, parentId, status: 'complete', depth,
     steps: [
-      { id: `${id}-prompts`, kind: 'review.probe_prompts', label: 'Probe prompts', status: 'complete' },
+      { id: `${id}-prompts`, kind: 'procedural.shell', label: 'Probe prompts', status: 'complete' },
       { id: `${id}-dispatch`, kind: 'dispatch.map', label: 'Dispatch (map)', status: 'complete', model: 'darkmux:qwen3.6-35b-a3b' },
     ],
   });
@@ -31,7 +31,7 @@ function graphSnapshot() {
         steps: [{ id: 'dedup-1', kind: 'review.dedup', label: 'Dedup', status: 'complete' }] },
       { id: 'phase-adjudicate', kind: 'phase', label: 'Adjudicate', status: 'complete', depth: 1, steps: [] },
       { id: 'judge', kind: 'task', label: 'Judge', parentId: 'phase-adjudicate', status: 'complete', depth: 0,
-        steps: [{ id: 'judge-1', kind: 'review.judge', label: 'Judge', status: 'complete' }] },
+        steps: [{ id: 'judge-1', kind: 'dispatch.internal', label: 'Judge', status: 'complete' }] },
       { id: 'phase-report', kind: 'phase', label: 'Report', status: 'complete', depth: 2, steps: [] },
       two('verify', 'Verify', 'phase-report', 0),
       { id: 'synthesis', kind: 'task', label: 'Synthesis', parentId: 'phase-report', status: 'complete', depth: 1,

@@ -40,8 +40,8 @@ function graphSnapshot() {
       {
         id: 'task-1', kind: 'task', label: 'Judge Wave', parentId: 'phase-a', status: 'running', depth: 0,
         steps: [
-          { id: 'judge-1', kind: 'review.judge', label: 'Judge', status: 'running', startedTs: STARTED_SECS, model: 'darkmux:gpt-oss-120b' },
-          { id: 'verify-1', kind: 'review.verify', label: 'Verify', status: 'planned', model: 'darkmux:devstral-small-2-2512' },
+          { id: 'judge-1', kind: 'dispatch.internal', label: 'Judge', status: 'running', startedTs: STARTED_SECS, model: 'darkmux:gpt-oss-120b' },
+          { id: 'verify-1', kind: 'dispatch.internal', label: 'Verify', status: 'planned', model: 'darkmux:devstral-small-2-2512' },
         ],
       },
     ],
