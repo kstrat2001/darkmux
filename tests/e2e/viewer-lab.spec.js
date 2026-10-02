@@ -251,19 +251,19 @@ const HOSTILE_RUNS = {
   runs: [
     {
       id: XSS_HTML, kind: 'lab', status: 'running',
-      machine: XSS_ATTR, role: XSS_JS, updated_ts: 1893456500, tracked: true,
+      machine: XSS_ATTR, role: XSS_JS, updated_ts: 1893456500, receive_key: 1938899456000000, tracked: true,
     },
     {
       id: XSS_ATTR, kind: 'mission', status: 'complete',
       machine: XSS_HTML, model: XSS_HTML, route: XSS_ATTR,
-      completed_ts: 1893456000, updated_ts: 1893456000, tracked: true,
+      completed_ts: 1893456000, updated_ts: 1893456000, receive_key: 1938898944000000, tracked: true,
     },
     {
       // Untracked -> the non-clickable branch, which assembles attributes
       // differently and so must be walked separately.
       id: XSS_JS, kind: 'dispatch', status: 'error',
       machine: XSS_HTML, role: XSS_ATTR, model: XSS_JS,
-      updated_ts: 1893450000, tracked: false,
+      updated_ts: 1893450000, receive_key: 1938892800000000, tracked: false,
     },
   ],
 };
@@ -323,7 +323,7 @@ test('an empty lab slice explains WHERE it scanned, and only when empty', async 
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({ runs: [
-        { id: 'm1', kind: 'mission', status: 'complete', updated_ts: 1893456000, tracked: true },
+        { id: 'm1', kind: 'mission', status: 'complete', updated_ts: 1893456000, receive_key: 1938898944000000, tracked: true },
       ] }),
     })
   );

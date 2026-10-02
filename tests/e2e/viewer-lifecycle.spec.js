@@ -138,14 +138,14 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   // `RunStatus`: `canceled` was never a status the system had, only a label
   // the pre-React viewer invented for `abandoned` with no ending recorded.
   // `runStatusLabel` in the runs lens had been rendering that same state as
-  // "no ending recorded" all along, so the session lens now agrees with it.
+  // "no ending" all along, so the session lens now agrees with it.
   // The element's class moved with it (`s-canceled` → `s-abandoned`); the
   // state is unchanged, which is why this is a rename and not a behavior
   // change.
   //
   // This gate caught the rename when 1,800 unit tests did not — it is the
   // only check that reads the rendered page.
-  await expect(page.locator('.session-run .pill')).toHaveText('NO ENDING RECORDED');
+  await expect(page.locator('.session-run .pill')).toHaveText('NO ENDING');
   await expect(page.locator('.session-run .pill')).not.toHaveText('COMPLETE');
 
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);
