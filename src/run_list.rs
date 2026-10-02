@@ -44,8 +44,10 @@ pub(crate) fn run(
     // standalone install (no `DARKMUX_REDIS_URL`), same as the handler.
     let fleet = darkmux_serve::fleet_records_for_runs();
     let mut built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
-    // The same overlay the daemon's `/runs` applies: one owner for "not reporting".
-    darkmux_serve::mark_not_reporting(&mut built.runs, &crate::machine_list::local_fleet_view(), &darkmux_serve::live_session_ids());
+    overlay_not_reporting(&mut built.runs, || {
+        let view = darkmux_serve::fleet_view::fetch_local_daemon_view_within(&darkmux_types::config_access::serve_client_addr(), NOT_REPORTING_VIEW_WAIT)?;
+        Some((view, darkmux_serve::live_session_ids()))
+    });
     let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
     let report = usage.then(|| UsageReport {
         since: built.since.clone(),
@@ -231,6 +233,44 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
         RunKindArg::Mission => "mission",
         RunKindArg::Dispatch => "dispatch",
         RunKindArg::Lab => "lab",
+    }
+}
+
+/// How long `run list` waits for its own daemon's fleet view when marking runs
+/// on a down machine. A daemon that does not answer in this time marks nothing.
+const NOT_REPORTING_VIEW_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Whether a running row executed on a machine other than this one: the only
+/// rows that can read "not reporting".
+fn running_on_another_machine(r: &Run) -> bool {
+    if r.status != RunStatus::Running {
+        return false;
+    }
+    match (&r.machine_uid, darkmux_hardware::machine_uid()) {
+        (Some(uid), Some(mine)) => !uid.eq_ignore_ascii_case(mine),
+        // No uid to compare: by name. A machine whose own name is unknown cannot rule
+        // a row out, and a needless look costs only time (the view never marks this machine).
+        _ => match (&r.machine, darkmux_types::config_access::machine_id()) {
+            (Some(name), Some(mine)) => !name.eq_ignore_ascii_case(&mine),
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+    }
+}
+
+/// The overlay the daemon's `/runs` applies (`darkmux_serve::apply_not_reporting`,
+/// the one owner of "not reporting"). It gathers only when some running row is on
+/// ANOTHER machine, quietly and within a bound; a gather that fails marks nothing
+/// and says nothing.
+fn overlay_not_reporting(
+    rows: &mut [Run],
+    gather: impl FnOnce() -> Option<(darkmux_serve::fleet_view::FleetView, Option<std::collections::HashSet<String>>)>,
+) {
+    if !rows.iter().any(running_on_another_machine) {
+        return;
+    }
+    if let Some((view, live)) = gather() {
+        darkmux_serve::apply_not_reporting(rows, Some(&view), live.as_ref());
     }
 }
 
@@ -1352,6 +1392,48 @@ mod tests {
         }
     }
 
+    fn running_on(machine: &str) -> Run {
+        let mut r = mk_run("r", RunKind::Dispatch, RunStatus::Running, 1);
+        r.machine = Some(machine.to_string());
+        r
+    }
+
+    fn down_peer_view() -> darkmux_serve::fleet_view::FleetView {
+        use crate::machine_list::tests::{machine, own_row, view};
+        use darkmux_serve::fleet_view::{CardOutcome, Liveness, UnreachableReason};
+        view(vec![
+            own_row(),
+            machine("far-peer", Liveness::NoBeat, CardOutcome::Unreachable { reason: UnreachableReason::ListenerOff, detail: None }),
+        ])
+    }
+
+    /// 5.0: `run list` pays for no gather unless a row is running on ANOTHER machine.
+    #[test]
+    fn the_overlay_gathers_nothing_when_no_row_runs_on_another_machine() {
+        let mut done_elsewhere = running_on("far-peer");
+        done_elsewhere.status = RunStatus::Complete;
+        let mut rows = vec![done_elsewhere, mk_run("local", RunKind::Dispatch, RunStatus::Running, 1)];
+        overlay_not_reporting(&mut rows, || panic!("a gather happened with no running remote row"));
+        assert!(rows.iter().all(|r| !r.not_reporting));
+    }
+
+    /// The overlay is wired at this call site: a running row on a down peer reads
+    /// not reporting; a gather that fails, or a failed beat read, marks nothing.
+    #[test]
+    fn the_overlay_marks_a_running_row_on_a_down_peer_and_nothing_on_a_failed_read() {
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || Some((down_peer_view(), Some(Default::default()))));
+        assert!(rows[0].not_reporting, "the down peer's running row is marked");
+
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || None);
+        assert!(!rows[0].not_reporting, "no view: nothing is marked");
+
+        let mut rows = vec![running_on("far-peer")];
+        overlay_not_reporting(&mut rows, || Some((down_peer_view(), None)));
+        assert!(!rows[0].not_reporting, "a failed beat read: nothing is marked");
+    }
+
     /// 5.0 (#3017): `run list` orders by the hub's receive order like the board,
     /// never by an executor's clock.
     #[test]
@@ -1439,13 +1521,15 @@ mod tests {
     /// when it cannot fit the known width.
     #[test]
     fn an_overlong_subtitle_is_dropped_whole_not_wrapped() {
+        // The narrowest pane the table supports (`MIN_ROW_COLS`). The STATUS column grew to
+        // 13 for "not reporting", so this floor is 2 columns wider than it was at 60.
         let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
         r.role = Some("a-role-name-far-too-long-to-fit-in-this-narrow-pane".to_string());
         let rows = vec![r];
-        let id_w = id_width(&rows, Some(64));
-        let line = format_row(2, &rows[0], id_w, Some(64), show_machine_column(Some(64)));
+        let id_w = id_width(&rows, Some(MIN_ROW_COLS));
+        let line = format_row(2, &rows[0], id_w, Some(MIN_ROW_COLS), show_machine_column(Some(MIN_ROW_COLS)));
         assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
-        assert!(line.chars().count() <= 64);
+        assert!(line.chars().count() <= MIN_ROW_COLS);
         assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
     }
 

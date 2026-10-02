@@ -836,6 +836,24 @@ describe("SessionReplay", () => {
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("complete"));
     });
 
+    // A mission row carries only its earliest session as `dispatch_id`; a later
+    // step's page finds the row by its mission id, or it ticks "running" for a
+    // mission on a machine that is down.
+    it("a later step of a running mission on a not-reporting machine reads NOT REPORTING", async () => {
+      const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+      const records = [
+        { ts: at(30_000), action: "dispatch.start", session_id: "s-step2", mission_id: "m-peer", machine_id: "studio", machine_uid: "u-studio", payload: { role: "coder" } },
+      ];
+      const runs = [{ id: "m-peer", kind: "mission", status: "running", tracked: false, dispatch_id: "s-step1", machine: "studio", machine_uid: "u-studio", not_reporting: true }];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+      );
+      renderReplay("s-step2");
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent).toBe("NOT REPORTING"));
+      expect(document.querySelector(".session-run__header .pill")?.getAttribute("data-live")).toBeNull();
+    });
+
     it("keeps reading RUNNING when the row is not marked", async () => {
       const pill = await mount(false);
       await waitFor(() => expect(pill()?.textContent?.toLowerCase()).toBe("running"));

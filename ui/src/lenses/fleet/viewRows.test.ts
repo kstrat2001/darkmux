@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import { UtilityResidency } from "../../lib/utilityJobs";
-import { machineIsHub, machineNotReporting, rowUtility, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { machineIsHub, rowUtility, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -268,37 +268,6 @@ describe("rowServesProfiles: only the row's own card says it", () => {
 // (5.0 R3) Whether the machine a run executes on is saying anything: a run on
 // a peer the view holds as down cannot be called running (the caller adds the
 // check that no live session beat says otherwise).
-describe("machineNotReporting", () => {
-  const offlineCardless = row({ card: { state: "unreachable", reason: "listener_off", detail: null }, liveness: "no_beat" });
-
-  it("a peer the view holds as offline is not reporting, matched by uid", () => {
-    expect(machineNotReporting([offlineCardless], { uid: "uid-studio" })).toBe(true);
-  });
-
-  it("a peer is matched by its roster id when the run carries only a name", () => {
-    expect(machineNotReporting([offlineCardless], { name: "STUDIO" })).toBe(true);
-  });
-
-  it("a peer whose card answered, or whose beat is live, is reporting", () => {
-    expect(machineNotReporting([row({ liveness: "no_beat" })], { uid: "UID-STUDIO" })).toBe(false);
-    expect(machineNotReporting([row({ card: offlineCardless.card, liveness: "live" })], { uid: "UID-STUDIO" })).toBe(false);
-  });
-
-  it("this machine is never silent, whatever its row says", () => {
-    expect(machineNotReporting([{ ...offlineCardless, is_this_machine: true }], { uid: "UID-STUDIO" })).toBe(false);
-  });
-
-  it("a machine the view does not hold, or no view at all, claims nothing", () => {
-    expect(machineNotReporting([offlineCardless], { uid: "UID-OTHER" })).toBe(false);
-    expect(machineNotReporting(null, { uid: "UID-STUDIO" })).toBe(false);
-    expect(machineNotReporting([offlineCardless], {})).toBe(false);
-  });
-
-  it("a different uid is a different machine even when the names agree", () => {
-    expect(machineNotReporting([offlineCardless], { uid: "UID-OTHER", name: "studio" })).toBe(false);
-  });
-});
-
 // (5.0) The utility robot reads the row's OWN card, for every machine: the
 // same fleet reads the same from any serving machine.
 describe("rowUtility: the card's own statement of its utility model", () => {

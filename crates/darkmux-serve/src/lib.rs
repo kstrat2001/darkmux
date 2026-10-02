@@ -60,7 +60,7 @@ mod runs;
 mod run_lifecycle;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
-    AbandonReason, DispatchSessionEvidence, mark_not_reporting, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
+    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunRelay, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
 /// The daemon's response bodies: one Rust type per JSON route, and the source
@@ -1056,13 +1056,31 @@ where
 }
 
 /// The session and mission ids with a live beat right now (a mission's own
-/// session never beats, so any beat naming its mission counts). Empty when
-/// presence is off or unreadable: [`runs::mark_not_reporting`] then claims
-/// nothing about a run on a machine the view holds as up.
-pub fn live_session_ids() -> std::collections::HashSet<String> {
-    let Some(url) = darkmux_flow::redis_url() else { return Default::default() };
-    let (beats, _) = read_presence_beats(&url, "sessions", darkmux_flow::session_presence::read_live_sessions);
-    beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect()
+/// session never beats, so any beat naming its mission counts). Quiet: it logs
+/// nothing, since a CLI calls it. `Some(empty)` when presence is off (then no
+/// view row reads `no_beat` either); `None` when presence is configured and the
+/// read failed, so [`apply_not_reporting`] marks nothing rather than marking a
+/// beating run on an empty set.
+pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
+    let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
+    let client = redis::Client::open(url.expose_for_probe()).ok()?;
+    let beats = darkmux_flow::session_presence::read_live_sessions(&client).ok()?;
+    Some(beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
+}
+
+/// Mark the running rows whose machine the view holds as down and whose session
+/// has no live beat ([`runs::mark_not_reporting`]), but only when BOTH facts
+/// were read: no view, or a failed beat read, marks nothing (never "not
+/// reporting" by default). The ONE call both `GET /runs` and `darkmux run list`
+/// make.
+pub fn apply_not_reporting(
+    rows: &mut [Run],
+    view: Option<&fleet_view::FleetView>,
+    live: Option<&std::collections::HashSet<String>>,
+) {
+    if let (Some(view), Some(live)) = (view, live) {
+        runs::mark_not_reporting(rows, view, live);
+    }
 }
 
 /// GET /fleet/dispatches/live — the dispatches with a live heartbeat right now
@@ -1860,9 +1878,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
         let mut rows = runs::build_runs(&flows_dir, lab_dir.as_deref(), &fleet.records);
-        if let Some(view) = &view {
-            runs::mark_not_reporting(&mut rows, view, &live_session_ids());
-        }
+        apply_not_reporting(&mut rows, view.as_ref(), live_session_ids().as_ref());
         (rows, fleet.state)
     })
     .await;

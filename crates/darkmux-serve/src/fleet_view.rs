@@ -796,6 +796,12 @@ pub fn gather_fleet_view_now() -> FleetView {
 /// machine's seats and governor readings. `None` when no daemon answers, or
 /// it answers with something that is not a view (an older darkmux).
 pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
+    fetch_local_daemon_view_within(daemon_addr, LOCAL_VIEW_TIMEOUT)
+}
+
+/// [`fetch_local_daemon_view`] with its own bound, for a caller that must not
+/// wait (`darkmux run list`): a daemon that is absent or slow reads `None`.
+pub fn fetch_local_daemon_view_within(daemon_addr: &str, timeout: Duration) -> Option<FleetView> {
     let provider = darkmux_fleet::configured_provider_or_unavailable();
     let target = darkmux_fleet::local_daemon_target(
         daemon_addr,
@@ -805,7 +811,7 @@ pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
     .ok()?
     .already_settled()
     .ok()?;
-    let resp = darkmux_fleet::fleet_get(&target, "/fleet/view", LOCAL_VIEW_TIMEOUT, &[]).ok()?;
+    let resp = darkmux_fleet::fleet_get(&target, "/fleet/view", timeout, &[]).ok()?;
     let mut v = read_json(resp)?;
     darkmux_fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
     serde_json::from_value(v).ok()
@@ -1185,7 +1191,7 @@ pub(crate) mod tests {
         v
     }
 
-    fn peer_says(s: &Scripted, id: &str, delay_ms: u64, outcome: CardOutcome, accepts: AcceptsState) {
+    pub(crate) fn peer_says(s: &Scripted, id: &str, delay_ms: u64, outcome: CardOutcome, accepts: AcceptsState) {
         s.fetches.lock().unwrap().insert(id.to_string(), (delay_ms, Fetched { outcome, accepts }));
     }
 

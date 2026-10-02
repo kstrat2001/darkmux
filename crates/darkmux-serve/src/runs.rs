@@ -421,6 +421,33 @@ pub struct Run {
     pub not_reporting: bool,
 }
 
+/// A bare running dispatch row, for tests in sibling modules.
+#[cfg(test)]
+pub(crate) fn tests_support_run(id: &str) -> Run {
+    Run {
+        id: id.to_string(),
+        kind: RunKind::Dispatch,
+        status: RunStatus::Running,
+        machine: None,
+        machine_uid: None,
+        route: None,
+        role: None,
+        model: None,
+        started_ts: None,
+        completed_ts: None,
+        updated_ts: None,
+        tracked: false,
+        dispatch_id: None,
+        abandoned_reason: None,
+        tokens: None,
+        workload: None,
+        verify_passed: None,
+        relay: None,
+        receive_key: 0,
+        not_reporting: false,
+    }
+}
+
 /// Mark every running run whose machine the view holds as down and whose
 /// session (or mission) has no live beat in `live` (session and mission ids
 /// of the beats now alive). A machine the view does not hold, this machine,
@@ -7569,13 +7596,24 @@ mod tests {
         use crate::fleet_view::{gather_view, tests as fv, FLEET_VIEW_CACHE_TTL};
         let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
         let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
-        // A rostered peer nothing could read and no beat was found for.
-        let mut studio = view.machines[0].clone();
-        studio.is_this_machine = false;
-        studio.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("studio")));
-        studio.liveness = crate::fleet_view::Liveness::NoBeat;
-        studio.card = crate::fleet_view::CardOutcome::Unknown;
-        view.machines.push(studio);
+        // Three rostered peers: one nothing could read with no beat found (down),
+        // one whose presence could not say (unknown), one whose card WAS read
+        // though no beat was found (a peer that answered is up).
+        let peer = |name: &str, liveness: crate::fleet_view::Liveness, card: crate::fleet_view::CardOutcome| {
+            let mut m = view.machines[0].clone();
+            m.is_this_machine = false;
+            m.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry(name)));
+            m.liveness = liveness;
+            m.card = card;
+            m
+        };
+        let read_card = view.machines[0].card.clone();
+        let extra = vec![
+            peer("studio", crate::fleet_view::Liveness::NoBeat, crate::fleet_view::CardOutcome::Unknown),
+            peer("mystery", crate::fleet_view::Liveness::Unknown, crate::fleet_view::CardOutcome::Unknown),
+            peer("answered", crate::fleet_view::Liveness::NoBeat, read_card),
+        ];
+        view.machines.extend(extra);
         let row = |id: &str, machine: &str, status: RunStatus| Run {
             id: id.to_string(),
             kind: RunKind::Dispatch,
@@ -7604,11 +7642,13 @@ mod tests {
             row("done", "studio", RunStatus::Complete),
             row("here", "laptop", RunStatus::Running),
             row("unknown-machine", "elsewhere", RunStatus::Running),
+            row("liveness-unknown", "mystery", RunStatus::Running),
+            row("card-read", "answered", RunStatus::Running),
         ];
         let live: HashSet<String> = ["d-beating".to_string()].into();
         mark_not_reporting(&mut runs, &view, &live);
         let flags: Vec<(&str, bool)> = runs.iter().map(|r| (r.id.as_str(), r.not_reporting)).collect();
-        assert_eq!(flags, [("down", true), ("beating", false), ("done", false), ("here", false), ("unknown-machine", false)]);
+        assert_eq!(flags, [("down", true), ("beating", false), ("done", false), ("here", false), ("unknown-machine", false), ("liveness-unknown", false), ("card-read", false)]);
     }
 
     #[test]

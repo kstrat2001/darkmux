@@ -90,8 +90,11 @@ darkmux release.
   read `unknown`, the same word as a status that is not one). The daemon decides
   that once, on the row (`GET /runs` rows gain an additive `not_reporting`), so
   the board, its filter, the run page, the fleet timeline and `darkmux run list`
-  agree. `run list`'s STATUS column (now 13 wide) reads the same words from one
-  shared fixture, and its subtitle no longer leads with the abandon reason.
+  agree. `run list`'s STATUS column (now 13 wide, so its narrowest pane grew by 2
+  columns) reads the same words from one shared fixture, and its subtitle no
+  longer leads with the abandon reason. `run list` looks at the fleet view only
+  when a row is running on another machine, quietly and within a short bound; if
+  the view or the live beats cannot be read it marks nothing.
 - **`darkmux machine list` words a machine's status as its card does** (5.0).
   Under each row: `status: idle`, `dispatch in flight`, `online` (with `not
   streaming` on the next line), `not streaming` or `offline`, then `why:` and the

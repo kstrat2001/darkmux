@@ -569,8 +569,6 @@ export function SessionReplay({
   // (`judgementAt`, below: the rule the event log beside this page reads).
   const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
   const policy = useLifecyclePolicy();
-  const runRow = useRunRow(sessionId, playhead === null);
-  const relay = relayOf(runRow);
 
   // (#2065) A static build has no `/flow-dispatch/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -629,6 +627,9 @@ export function SessionReplay({
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId, missionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
+  // The run's row on the board: a later step of a mission is found by its mission id.
+  const runRow = useRunRow(sessionId, ownMissionId, playhead === null);
+  const relay = relayOf(runRow);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
     [ownRaw, sessionId],
