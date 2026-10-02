@@ -737,6 +737,7 @@ mod tests {
             \n\
             - `command` MUST be copied EXACTLY from the list of available command ids you were given — never invent one, never guess at a close spelling, never combine two.\n\
             - Match on MEANING, not wording. A description states what a command does in one phrasing; the user asks in their own. A message asking for what a description describes — in ordinary synonyms, a paraphrase, or a shorter or longer form of the same request — names that command, and should be routed to it.\n\
+            - A message that names a listed command by its id or its title (for example \"launch the review mission on my branch\") asks for that command. Extra words around the name, such as a branch, a file, or a place, are not a reason to refuse.\n\
             - When in doubt, refuse. A wrong refusal costs the user one extra step; a wrong route runs the wrong command. Refusing is always the safer answer. \"In doubt\" means you cannot tell which command is being asked for, or whether any is — it does not mean the user's words differ from the description's.\n\
             - `args` is free text — copy the user's own words that follow the command's intent, don't paraphrase or summarize them. Use an empty string when there is nothing left to carry over.\n\
             - Choose at most ONE command. Never chain commands, never describe a sequence of steps, never answer the message yourself — you are only choosing one existing command or declining, nothing else.\n";
@@ -1199,6 +1200,63 @@ mod tests {
         );
         assert!(!entry.accepts_args, "`machine status` takes no arguments");
 
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+    }
+
+    /// (F12) The router's whole view of the built-in commands: a phrase that
+    /// names a mission by its id or title must find that mission's line, and
+    /// the line must say what the mission does in plain words (not clipped
+    /// before the point, not leading with graph internals).
+    #[test]
+    #[serial_test::serial]
+    fn the_router_message_names_each_builtin_mission_by_id_and_in_plain_words() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let catalog = compile_catalog().expect("no stale user files in this fixture");
+        let message = build_router_message("launch the review mission on my branch", &catalog);
+        let line = |id: &str| {
+            let prefix = format!("- {id}: ");
+            message.lines().find(|l| l.starts_with(&prefix)).unwrap_or_else(|| panic!("no `{id}` line: {message}")).to_ascii_lowercase()
+        };
+        assert!(line("review").contains("review"), "{}", line("review"));
+        let coder = line("coder-phase");
+        assert!(coder.contains("failing test") && coder.contains("code"), "a fix-the-test request must find coder-phase: {coder}");
+        assert!(!coder.contains("3-task") && !coder.contains('\u{2026}'), "no graph internals, not clipped: {coder}");
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+    }
+
+    /// (F12) A removed verb must not appear anywhere a model reads the command
+    /// surface: the router catalog message or the verb index the answering seat
+    /// is grounded in (the dogfood suggested the removed `lab eval`).
+    #[test]
+    #[serial_test::serial]
+    fn no_retired_verb_appears_in_the_router_catalog_or_the_verb_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let catalog = compile_catalog().expect("no stale user files in this fixture");
+        let index = crate::radio_index::render_verb_index(&crate::radio_index::build_verb_index(&<crate::cli::Cli as clap::CommandFactory>::command()));
+        let surface = format!("{}\n{index}", build_router_message("x", &catalog));
+        let retired = crate::retired_verbs::retired_spellings();
+        assert!(retired.iter().any(|s| s == "darkmux lab eval"), "the table must include lab eval: {retired:?}");
+        for spelling in retired {
+            assert!(!surface.contains(&spelling), "`{spelling}` is retired but the model-facing surface offers it");
+        }
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {

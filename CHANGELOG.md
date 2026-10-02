@@ -103,6 +103,12 @@ darkmux release.
   a pin and an identity update, as a machine entry already did.
 - **CI: production code reads flow records through `darkmux_flow::reader`**
   (`scripts/flow-reader-guard.py`).
+- **Radio routes a phrase that names a mission** (F12). "Launch the review mission
+  on my branch" was refused although `review` was in the catalog: the router
+  prompt now says that naming a listed command, with extra words around it, asks
+  for that command, and `coder-phase` leads with a plain sentence ("fixing a
+  failing test") so a fix-the-test request finds it. Tests pin that no retired
+  verb, `lab eval` included, appears in the router catalog or the verb index.
 
 ### Changed (breaking, 4.0)
 
