@@ -312,7 +312,7 @@ mod tests {
 
     fn card(mode: DeclaredFleetMode, hosts_redis: bool, profile: Option<&str>) -> MachineCard {
         let mut card: MachineCard =
-            serde_json::from_str(include_str!("../crates/darkmux-serve/tests/fixtures/machine-card-1.0.json")).unwrap();
+            serde_json::from_str(include_str!("../crates/darkmux-serve/tests/fixtures/machine-card-1.2.json")).unwrap();
         card.fleet_mode = Some(mode);
         card.hosts_fleet_redis = Some(hosts_redis);
         card.fleet_defaults = Some(defaults(profile));

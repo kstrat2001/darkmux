@@ -26,10 +26,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           field is `dispatch`; `step start` `seat_class` `remote_endpoint`
 //           is `unmanaged_endpoint`; `step result` `remote_max_tokens_per_execution`
 //           is `tokens_per_dispatch`; the `remote` flag on a `step result`
-//           payload is `unmanaged`, the old key read from an archive and
-//           never written (a `telemetry.tokens` payload and a
-//           `dispatch.complete` carry neither flag nor `remote_tokens` at all,
-//           #3067); `hub_id`, the Redis stream id the
+//           payload is `unmanaged`, the old key is not read (a
+//           `telemetry.tokens` payload and a `dispatch.complete` carry
+//           neither flag nor `remote_tokens` at all, #3067); `hub_id`, the Redis stream id the
 //           daemon adds to a record it reads off the fleet hub, is not a
 //           stored field: no flow file holds it)
 //           per event. Every action is a `FlowAction` variant (`action.rs`),

@@ -346,7 +346,7 @@ pub struct ReviewEnvelope {
     /// one REMOTE call. Empty (and unserialized) on local-only runs. Since
     /// #2902 step 5 a bucket is a dispatch cap that never skips a call, so a
     /// new row's `skipped_calls` is 0; old envelopes still read.
-    #[serde(default, alias = "remote_budgets", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatch_budgets: Vec<DispatchBudgetRecord>,
     /// (#1299) The `needs_check` tier clustered by `(file, mechanism-family)`
     /// when it exceeded [`NEEDS_CHECK_CLUSTER_THRESHOLD`] — a renderer emits

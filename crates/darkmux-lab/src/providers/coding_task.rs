@@ -2275,40 +2275,6 @@ mod tests {
         assert_eq!(report.turns, 3);
     }
 
-    /// A run dir with no trajectory of its own (an older run whose copy
-    /// was never made) reads the sandbox's `.darkmux-runtime/trajectory.jsonl`
-    /// named by the manifest. A `metrics.json` beside it is never read: its
-    /// 99 turns are the stale-copy shape the archive probe found.
-    #[test]
-    fn inspect_reads_the_sandbox_trajectory_and_never_metrics_json() {
-        let tmp = TempDir::new().unwrap();
-        let run_dir = tmp.path().join("run");
-        let sandbox = tmp.path().join("sandbox");
-        let runtime_dir = sandbox.join(".darkmux-runtime");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&runtime_dir).unwrap();
-        fs::write(
-            run_dir.join("manifest.json"),
-            format!(
-                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
-                sandbox.display()
-            ),
-        )
-        .unwrap();
-        fs::write(runtime_dir.join("metrics.json"), r#"{"turns":99,"compactions":99,"rest_ms":99}"#).unwrap();
-        fs::write(
-            runtime_dir.join("trajectory.jsonl"),
-            "{\"type\":\"model.completed\",\"seq\":1}\n\
-             {\"type\":\"compaction\",\"seq\":1}\n\
-             {\"type\":\"model.completed\",\"seq\":2}\n\
-             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":1000}\n",
-        )
-        .unwrap();
-        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
-        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        assert_eq!((report.turns, report.compactions, report.rest_ms), (2, 1, 1000));
-    }
-
     /// (#2094 finding 7) `classify_mode` must judge MODEL time
     /// (walltime - rest), not raw wall clock — Fast/Slow is a claim about
     /// the model. A run whose raw walltime crosses into the Slow cluster

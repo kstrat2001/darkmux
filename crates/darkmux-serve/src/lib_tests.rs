@@ -1424,15 +1424,15 @@
         assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
     }
 
-    /// A pre-4.0 mission's records reach the viewer with their step named
-    /// as `payload.step_id`, read from the old session string here, since
-    /// the viewer never parses a session id.
+    /// A mission's records reach the viewer with their step named as
+    /// `payload.step_id`, read from the session string here, since the
+    /// viewer never parses a session id.
     #[tokio::test]
-    async fn flow_mission_names_the_step_an_archived_session_meant() {
+    async fn flow_mission_names_the_step_a_session_meant() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("2026-05-12.jsonl"),
-            "{\"session_id\":\"step-judge-1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\",\"payload\":{\"total_tokens\":5}}\n",
+            "{\"session_id\":\"m1.step.judge-1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\",\"payload\":{\"total_tokens\":5}}\n",
         ).unwrap();
         let json = get_json(&tmp, "/flow-mission/m1").await;
         assert_eq!(json["records"][0]["payload"]["step_id"], "judge-1", "{json}");
@@ -6806,14 +6806,14 @@
         let flows = TempDir::new().unwrap();
         let complete = serde_json::json!({
             "action": "dispatch.complete",
-            "session_id": "step-ran-step",
+            "session_id": format!("{mission_id}.step.ran-step"),
             "payload": { "total_tokens": 99999, "total_turns": 7 }
         });
         // The step's tokens are its usage records' sum: the terminal's own
         // `total_tokens` (99999) is never read.
         let usage = serde_json::json!({
             "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
-            "session_id": "step-ran-step",
+            "session_id": format!("{mission_id}.step.ran-step"),
             "payload": { "call_kind": "turn", "token_source": "provider", "total_tokens": 12345 }
         });
         let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);

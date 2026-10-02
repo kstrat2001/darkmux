@@ -533,9 +533,7 @@ pub struct MissionEnvelope {
     /// run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// Written as `dispatch_budgets`; an archived envelope's `remote_budgets`
-    /// key still reads (never written).
-    #[serde(default, alias = "remote_budgets", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatch_budgets: Vec<DispatchBudgetRow>,
     /// Mission-type-specific payload — `ReviewEnvelope` (or any future
     /// mission type's own envelope) maps INTO this field rather than being
@@ -1312,18 +1310,14 @@ mod tests {
             "reason": "remote judge token budget exhausted",
             "phases": [],
             "warnings": ["remote judge token budget exhausted"],
-            "remote_budgets": [{"stage": "judge-pass1", "max_tokens": 10, "used_tokens": 12, "exhausted": true, "skipped_calls": 0}]
+            "dispatch_budgets": [{"stage": "judge-pass1", "max_tokens": 10, "used_tokens": 12, "exhausted": true, "skipped_calls": 0}]
         }"#;
         let envelope: MissionEnvelope =
             serde_json::from_str(old_json).expect("a pre-#1877 envelope must still deserialize");
         assert_eq!(envelope.mission_id, "m-old");
         assert_eq!(envelope.status, MissionOutcomeStatus::Degraded);
         assert_eq!(envelope.warnings, vec!["remote judge token budget exhausted".to_string()]);
-        // (#3035) The archived `remote_budgets` key still reads, and is written
-        // back as `dispatch_budgets`, never under the old name.
         assert_eq!(envelope.dispatch_budgets.len(), 1);
-        let written = serde_json::to_string(&envelope).unwrap();
-        assert!(written.contains("\"dispatch_budgets\"") && !written.contains("remote_budgets"), "{written}");
         // The sensible default for a document that predates the field:
         // `None`, never a guessed `RunOutcome`.
         assert!(envelope.outcome.is_none());
