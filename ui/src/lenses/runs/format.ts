@@ -97,6 +97,10 @@ export function runSubtitleParts(r: Run, machine: string | null): SubtitlePart[]
   if (r.model) parts.push({ text: shortModel(r.model) });
   if (r.route) parts.push({ text: `via ${r.route}` });
   if (machine) parts.push({ text: machine });
+  // (#3016) The machine above is the one that RAN it; a relayed run also says
+  // where it was asked. The same words from any serving machine: both names
+  // come from the row, never from who is looking.
+  if (r.relay) parts.push({ text: `from ${r.relay.asked_on_machine}` });
   return parts;
 }
 

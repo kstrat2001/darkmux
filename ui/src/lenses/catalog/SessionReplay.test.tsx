@@ -83,6 +83,22 @@ describe("SessionReplay", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
   }
 
+  it("(#3016) a relayed run's page names both ends: where it ran and where it was asked", async () => {
+    const sid = "radio-1.solo.relay.MacBook-Pro.radio-1.solo.adhoc.radio-host.n1";
+    const records = [
+      { ts: "2026-08-26T07:36:48Z", action: "dispatch.start", session_id: sid, machine_id: "darkbook", category: "work", source: "crew", payload: { role: "radio-host" } },
+    ];
+    const runs = [
+      { id: sid, kind: "dispatch", status: "running", tracked: false, dispatch_id: sid, machine: "darkbook", relay: { asked_on_machine: "MacBook-Pro", sender_run: "radio-1" } },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+    );
+    renderReplay(sid);
+    await waitFor(() => expect(document.querySelector(".session-run__meta")?.textContent).toMatch(/on darkbook, asked on MacBook-Pro/));
+  });
+
   it("(#1973) discloses the FULL prompt text, not just its length — the payload is reachable in the DOM", async () => {
     // The defect this guards: `sessionRun.ts` held `sp.prompt`, took its
     // `.length`, rendered `prompt · N chars`, and dropped the string. That is

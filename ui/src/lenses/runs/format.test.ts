@@ -55,6 +55,37 @@ describe("runsAgo", () => {
   });
 });
 
+// (#3016) A relayed run is one row owned by its executor; its subtitle names
+// where it was asked, and the machine pin matches the executor, not the asker.
+describe("relayed run", () => {
+  const relayed = (): Run => ({
+    ...fleetRun("radio-1.solo.relay.MacBook-Pro.radio-1.solo.adhoc.radio-host.n1", "darkbook", U.darkbook),
+    kind: "dispatch",
+    status: "complete",
+    tracked: false,
+    role: "radio-host",
+    model: "phi4",
+    relay: { asked_on_machine: "MacBook-Pro", sender_run: "radio-1" },
+  });
+
+  it("says where it was asked, after the machine that ran it", () => {
+    expect(runSubtitle(relayed(), "darkbook")).toBe("radio-host · phi4 · darkbook · from MacBook-Pro");
+  });
+
+  it("a run that ran where it was asked says nothing extra", () => {
+    const { relay: _drop, ...plain } = relayed();
+    expect(runSubtitle(plain, "darkbook")).toBe("radio-host · phi4 · darkbook");
+  });
+
+  it("the machine pin matches the executor and not the asker", () => {
+    const fleet = machineFleet();
+    const matchOf = (id: string) => machineMatch(fleet.data, fleet.liveMachines, fleet.specs, fleet.roster, id);
+    const r = relayed();
+    expect(runsForMachine([r], matchOf(U.darkbook))).toEqual([r]);
+    expect(runsForMachine([r], matchOf(U.mbp))).toEqual([]);
+  });
+});
+
 describe("runSubtitle", () => {
   it("joins role/model/route/machine with the middle-dot separator", () => {
     const r = run({
