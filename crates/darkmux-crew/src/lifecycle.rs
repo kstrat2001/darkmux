@@ -813,12 +813,11 @@ fn reconcile_phase_warning(mission_id: &str, phase: &Phase, refused: Option<&any
 /// existing is the signal this function uses to no-op cleanly rather than
 /// erroring on a missing mission.
 ///
-/// Closes the mission as `Aborted` (#3074: it used to close `Finalized`, the
-/// success terminal, so a mint that died before any phase existed read
-/// `Complete` on the runs board). The #1504 reconcile rolls any
-/// Planned/Running phases — and, transitively, their steps — to `Abandoned`
-/// first, so the mission reaches an honest terminal state with no live
-/// children left behind.
+/// Closes the mission through an `Error` envelope (#3074 review: `Aborted`
+/// means a human tore the run down, which a mint failure is not). The #1504
+/// reconcile rolls any Planned/Running phases — and, transitively, their
+/// steps — to `Abandoned` first, so the mission reaches an honest terminal
+/// state with no live children left behind.
 /// Best-effort: a terminal-transition refusal is swallowed
 /// (mirrors `finalize_mission`'s own discipline) — the caller's original
 /// error is what propagates; this is defensive cleanup, never the primary
@@ -839,18 +838,18 @@ pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, paylo
         return; // never minted — nothing on disk to reconcile
     }
     // This is the strand-fix helper itself — it must never strand silently.
-    // A swallowed `let _ =` here would leave the mission Active with ZERO
-    // signal that reconcile was even attempted, defeating the entire point
-    // of this function.
-    if let Err(e) =
-        mission_terminal_with_reasoning_and_payload(mission_id, MissionStatus::Aborted, Some(reason), payload)
-    {
-        eprintln!(
-            "warning: mission `{mission_id}` errored during mint AND could not be reconciled to \
-             terminal ({e:#}) — it is STRANDED Active. Run `darkmux mission abort {mission_id}` by \
-             hand to close it out (#1504)."
-        );
-    }
+    // `finalize_mission_with_payload` reports a refused close loudly itself.
+    let phase_ids: Vec<String> = load_mission(mission_id)
+        .map(|m| m.phase_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| load_phase_by_id(id).is_ok())
+        .collect();
+    let phase_refs: Vec<&str> = phase_ids.iter().map(String::as_str).collect();
+    let mut envelope =
+        crate::envelope::MissionEnvelope::new(mission_id, crate::envelope::MissionOutcomeStatus::Error, &phase_refs);
+    envelope.reason = Some(reason.to_string());
+    crate::envelope::finalize_mission_with_payload(&envelope, payload);
 }
 
 // ─── Phase transitions ─────────────────────────────────────────────────
@@ -1696,11 +1695,14 @@ mod tests {
         reconcile_mint_failure("test-mission", "mission launch errored during mint: disk full");
 
         let mission = load_mission("test-mission").unwrap();
+        assert_eq!(mission.status, MissionStatus::Finalized, "closed, never left stranded Active");
+        let envelope = load_envelope("test-mission").unwrap().expect("a mint failure writes an envelope");
         assert_eq!(
-            mission.status,
-            MissionStatus::Aborted,
-            "a partial mint is closed out as Aborted (#3074), never Finalized (the success terminal) and never left stranded Active"
+            envelope.status,
+            crate::envelope::MissionOutcomeStatus::Error,
+            "a mint failure is an Error outcome, never Aborted (a human teardown) and never a clean finish (#3074)"
         );
+        assert!(envelope.reason.as_deref().unwrap_or_default().contains("disk full"));
         assert_eq!(load_phase("test-mission", "p1").unwrap().status, PhaseStatus::Abandoned);
     }
 

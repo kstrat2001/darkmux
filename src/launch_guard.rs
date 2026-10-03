@@ -315,6 +315,17 @@ pub(crate) fn wall_clock_exceeded() -> bool {
     WALL_CLOCK_EXCEEDED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// (#2678, #3074) Bail when an OPERATOR signal was observed, never when the
+/// run's own wall-clock bound fired: the bound sets the same interrupt flag
+/// by design, but its outcome is `Degraded` with the bound named, not an
+/// error.
+pub(crate) fn bail_if_operator_signal(context: &str) -> anyhow::Result<()> {
+    if wall_clock_exceeded() {
+        return Ok(());
+    }
+    darkmux_types::interrupt::bail_if_set(context)
+}
+
 /// Test-only: reset [`WALL_CLOCK_EXCEEDED`] between tests in the same
 /// process — mirrors `darkmux_types::interrupt::reset_for_test`'s own
 /// reasoning (a process-wide flag would otherwise contaminate whichever
