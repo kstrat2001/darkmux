@@ -5206,8 +5206,8 @@ mod tests {
     /// connect-phase test above while reading as #2227 coverage.
     #[test]
     fn redis_sink_xadd_against_silent_peer_errs_and_trips_the_disable_threshold() {
-        // Every `try_write` opens its own connection, so the four writes below
-        // need four accepted sockets.
+        // A failed write drops the cached connection, so each of the writes
+        // below opens its own and needs its own accepted socket.
         let port = spawn_silent_redis_peer(6);
 
         let url = format!("redis://127.0.0.1:{port}");
@@ -5832,6 +5832,19 @@ mod tests {
         assert!(report.chain_valid, "{report:?}");
         assert_eq!(report.records_checked, 1);
         assert_eq!(torn_sidecars(&path).len(), 1);
+        assert!(report.chain_restarted, "a chain reseeded over set-aside bytes says so (#3074): {report:?}");
+    }
+
+    /// (#3074) A torn tail at the end of a longer chain is not a restart.
+    #[test]
+    fn torn_tail_after_records_is_not_a_chain_restart() {
+        let (_t, path) = torn_chain(2);
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(b"0123456789abcdef0123");
+        std::fs::write(&path, &torn).unwrap();
+        append_one(&path, "after");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && !report.chain_restarted, "{report:?}");
     }
 
     /// #899: a headerless file (record line, header removed) must keep
@@ -5873,6 +5886,7 @@ mod tests {
             break_reason: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
+            chain_restarted: false,
         }
     }
 

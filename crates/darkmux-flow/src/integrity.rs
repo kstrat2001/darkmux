@@ -281,14 +281,20 @@ fn header_shaped(tail: &[u8]) -> bool {
     tail.starts_with(HEADER_START) || HEADER_START.starts_with(tail)
 }
 
+/// Sidecar-name marker for bytes set aside from offset 0: the whole file went,
+/// so the chain restarts (#3074).
+const RESTART_SIDECAR_MARK: &str = ".torn-restart-";
+
 /// Path of the sidecar a torn tail of `path` is moved into:
-/// `<day file>.torn-<unix millis>`, with a numeric suffix on collision.
-fn torn_sidecar_path(path: &Path) -> PathBuf {
+/// `<day file>.torn-<unix millis>` (`.torn-restart-<millis>` when the file's
+/// first line was set aside), with a numeric suffix on collision.
+fn torn_sidecar_path(path: &Path, restart: bool) -> PathBuf {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let base = format!("{}.torn-{millis}", path.display());
+    let infix = if restart { "restart-" } else { "" };
+    let base = format!("{}.torn-{infix}{millis}", path.display());
     let mut candidate = PathBuf::from(&base);
     let mut n = 1u32;
     while candidate.exists() {
@@ -337,7 +343,7 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
         return Ok(());
     }
     if !tail.iter().all(|b| b.is_ascii_whitespace()) {
-        let sidecar = torn_sidecar_path(path);
+        let sidecar = torn_sidecar_path(path, tail_start == 0);
         // The sidecar is durable BEFORE the day file is truncated: a power
         // loss must not keep the truncation and lose the bytes.
         write_synced(&sidecar, tail)
@@ -459,6 +465,7 @@ fn header_schema_version(header_line: &str) -> Option<String> {
 pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
     let mut report = walk_chain(path)?;
     report.torn_tails = torn_sidecars_of(path);
+    report.chain_restarted = report.torn_tails.iter().any(|t| t.contains(RESTART_SIDECAR_MARK));
     Ok(report)
 }
 
@@ -476,6 +483,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             break_reason: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
+            chain_restarted: false,
         });
     }
 
@@ -508,6 +516,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             break_reason: Some(reason),
             writer_schema_version,
             torn_tails: Vec::new(),
+            chain_restarted: false,
         });
     }
 
@@ -532,6 +541,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 ),
                 writer_schema_version,
                 torn_tails: Vec::new(),
+                chain_restarted: false,
             });
         };
 
@@ -548,6 +558,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 ),
                 writer_schema_version,
                 torn_tails: Vec::new(),
+                chain_restarted: false,
             });
         }
 
@@ -564,6 +575,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                     break_reason: Some(format!("unparseable JSON: {e}")),
                     writer_schema_version,
                     torn_tails: Vec::new(),
+                    chain_restarted: false,
                 });
             }
         };
@@ -583,6 +595,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 )),
                 writer_schema_version,
                 torn_tails: Vec::new(),
+                chain_restarted: false,
             });
         }
 
@@ -602,6 +615,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
                 )),
                 writer_schema_version,
                 torn_tails: Vec::new(),
+                chain_restarted: false,
             });
         }
 
@@ -616,6 +630,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
         break_reason: None,
         writer_schema_version,
         torn_tails: Vec::new(),
+        chain_restarted: false,
     })
 }
 
@@ -697,4 +712,13 @@ pub struct IntegrityReport {
     /// can inspect it. Empty (and omitted) when nothing was set aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub torn_tails: Vec<String>,
+    /// (#3074) A non-empty day file was set aside whole and reseeded, so its
+    /// chain starts over: `chain_valid` covers only what was written after the
+    /// restart. The chain has no external anchor, so a day file cut to a
+    /// header-shaped prefix is indistinguishable from a crash during the first
+    /// write; this makes the restart visible instead of reading as plain valid.
+    /// A file cut to exactly its whole header line leaves no bytes to set
+    /// aside and is not flagged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chain_restarted: bool,
 }

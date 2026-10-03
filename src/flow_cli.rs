@@ -560,6 +560,12 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
                 style::dim(&format!("({} record(s))", r.records_checked))
             );
             print_torn_tails(r);
+            if r.chain_restarted {
+                println!(
+                    "{}",
+                    style::warn("       chain restarted: the file's first line was set aside, so the chain above covers only what was written after")
+                );
+            }
             if !r.chain_valid {
                 if let Some(line) = r.break_at_line {
                     println!("{}", style::error(&format!("       chain break at line {line}")));
