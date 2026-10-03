@@ -152,6 +152,22 @@ pub struct Materialized {
     pub lock: Option<WorkspaceLock>,
 }
 
+/// (#3074) Refuse a symlink standing where darkmux's own `mirror` or `tree`
+/// directory belongs. Everything below deletes and checks out under these
+/// two paths, and the containment checks canonicalize both sides, so a link
+/// would send that work into its target.
+fn refuse_symlinked_dir(dir: &Path) -> Result<()> {
+    let is_link = fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link {
+        bail!(
+            "workspace dir {} is a symlink; darkmux deletes and checks out under it, so it must be \
+             a real directory — remove the link, or point the workspace `root:` at the volume instead",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Resolve every source in the spec, then walk + filter each tree.
 pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Materialized> {
     // (#2455 review) Fallible since the workspace name is CONTAINED at
@@ -163,6 +179,8 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     let root = spec.resolved_root()?;
     let mirror_root = root.join("mirror");
     let tree_root = root.join("tree");
+    refuse_symlinked_dir(&mirror_root)?;
+    refuse_symlinked_dir(&tree_root)?;
     fs::create_dir_all(&mirror_root)
         .with_context(|| format!("creating mirror dir {}", mirror_root.display()))?;
     fs::create_dir_all(&tree_root)
@@ -1222,6 +1240,31 @@ mod tests {
 
     const RW: MaterializeOptions = MaterializeOptions { fetch: true, read_only: false };
     const RO: MaterializeOptions = MaterializeOptions { fetch: true, read_only: true };
+
+    /// (#3074) `<root>/tree` and `<root>/mirror` are darkmux's own directories
+    /// under the workspace root. A symlink in either place sends the later
+    /// `remove_dir_all` of `<tree>/<id>` and the worktree checkout into
+    /// whatever it points at (both sides of the containment check are
+    /// canonicalized, so the target's own `<id>` passes as a direct child).
+    /// Refused before anything is created or deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_tree_or_mirror_dir_is_refused_before_anything_is_touched() {
+        for linked in ["tree", "mirror"] {
+            let source = init_source_repo();
+            let workdir = TempDir::new().unwrap();
+            let victim = TempDir::new().unwrap();
+            fs::create_dir_all(victim.path().join("app")).unwrap();
+            fs::write(victim.path().join("app/precious.txt"), "keep\n").unwrap();
+            std::os::unix::fs::symlink(victim.path(), workdir.path().join(linked)).unwrap();
+
+            let spec = spec_for("symlinked", workdir.path(), source.path(), "main");
+            let err = materialize(&spec, RO).err().unwrap_or_else(|| panic!("{linked}: materialize accepted a symlink"));
+            assert!(format!("{err:#}").contains("symlink"), "{linked}: {err:#}");
+            assert!(victim.path().join("app/precious.txt").exists(), "{linked}: the link target was deleted into");
+            assert_eq!(fs::read_dir(victim.path()).unwrap().count(), 1, "{linked}: the link target was written into");
+        }
+    }
 
     /// Mirrors `step_kinds::builtins`'s own `CwdGuard` (see that struct's
     /// doc for the full origin) — enter a directory, restore the previous
