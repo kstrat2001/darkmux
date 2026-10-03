@@ -2351,6 +2351,7 @@ fn map_local_item(
     let mut empty_budget = retry_on_empty;
     let mut error_budget = retry_on_error;
     let mut error_retries_used = 0u32;
+    let mut last_error: Option<String> = None;
     loop {
         // (#3035) A managed endpoint's window gate, then this item's dispatch
         // cap reservation, before every attempt. Only a run stopped during a
@@ -2451,18 +2452,23 @@ fn map_local_item(
                 }
                 error_budget -= 1;
                 error_retries_used += 1;
+                last_error = Some(format!("{e:#}"));
                 std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
     }
-    // Every attempt came back empty — the item DISPATCHED (ok), produced no
-    // usable content, and its whole spend is billed (the reasoning-guillotine
-    // case the probe stage's retry loop already handled).
+    // (#3074) Reaching here means no attempt produced content. When no
+    // attempt errored, every one came back empty: the item DISPATCHED (ok),
+    // produced no usable content, and its whole spend is billed (the
+    // reasoning-guillotine case the probe stage's retry loop already
+    // handled). When an earlier attempt errored and the retry came back
+    // empty, `ok` is a claim about what happened, so the item reports that
+    // error instead of an empty success (the hosted sibling's rule, #1605).
     MapItemResult {
         index,
-        ok: true,
+        ok: last_error.is_none(),
         content: String::new(),
-        error: None,
+        error: last_error,
         served_model: None,
         wall_ms,
         retried: error_retries_used,
@@ -4875,6 +4881,46 @@ mod tests {
         assert!(!out.ok, "{out:?}");
         assert!(out.error.as_deref().unwrap_or_default().contains("endpoint refused the draw"), "{out:?}");
         assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    /// (#3074) The LOCAL sibling of the test above: an item whose first
+    /// dispatch errored and whose retry came back empty reports the error,
+    /// not an empty success that dropped it.
+    #[test]
+    fn a_local_item_that_errored_then_came_back_empty_reports_the_error() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                anyhow::bail!("local endpoint refused the draw")
+            }
+            Ok(crate::single_shot::SingleShotReply {
+                content: String::new(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+            })
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
+        assert!(!out.ok, "{out:?}");
+        assert!(out.error.as_deref().unwrap_or_default().contains("local endpoint refused the draw"), "{out:?}");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    /// The inverted case: with no error anywhere, an all-empty item is still
+    /// the deliberate `ok: true, content: ""` ("dispatched, produced nothing").
+    #[test]
+    fn a_local_item_that_only_came_back_empty_stays_an_ok_empty_item() {
+        let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: String::new(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+            })
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
+        assert!(out.ok && out.error.is_none() && out.content.is_empty(), "{out:?}");
     }
 
     /// A named endpoint with a 1-token daily budget under `policy`.
