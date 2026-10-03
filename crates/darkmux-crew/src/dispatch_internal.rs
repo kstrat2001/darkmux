@@ -2106,6 +2106,20 @@ fn effective_inactivity_timeout_seconds(
     }
 }
 
+/// What a configured inactivity budget of `0` stands for: a hundred years,
+/// far past any dispatch and small enough that adding it to an `Instant`
+/// cannot overflow (the failure mode #2639 recorded for very large values).
+const UNBOUNDED_INACTIVITY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+/// The inactivity deadline `extra` past `now + secs`. A budget of `0` means
+/// UNBOUNDED, the reading every darkmux zero-knob has (#3074): it used to put
+/// the deadline at `now`, so the watchdog killed the container on its first
+/// poll.
+fn inactivity_deadline_after(secs: u64, extra: Duration) -> Instant {
+    let budget = if secs == 0 { UNBOUNDED_INACTIVITY } else { Duration::from_secs(secs) };
+    Instant::now() + budget + extra
+}
+
 /// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
 /// from, including the one tier `darkmux_types::config_access::Source`
 /// deliberately does not model: `darkmux dispatch --timeout <n>`, typed at
@@ -6844,9 +6858,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // to wall clock would fire the watchdog on a healthy dispatch the
     // instant the operator's laptop woke up from an afternoon nap.
     let inactivity_secs = inactivity_timeout_seconds;
-    let inactivity_deadline = Arc::new(Mutex::new(
-        Instant::now() + Duration::from_secs(inactivity_secs),
-    ));
+    let inactivity_deadline = Arc::new(Mutex::new(inactivity_deadline_after(inactivity_secs, Duration::ZERO)));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     // (#2925) This dispatch's own stop: see `DispatchStop`.
@@ -10784,7 +10796,7 @@ impl TailerState {
     /// extra`. `None` in test fixtures that do not exercise the watchdog.
     fn reset_deadline(&self, extra: Duration) {
         if let Some(deadline) = &self.inactivity_deadline {
-            *lock_deadline(deadline) = Instant::now() + Duration::from_secs(self.inactivity_secs) + extra;
+            *lock_deadline(deadline) = inactivity_deadline_after(self.inactivity_secs, extra);
         }
     }
 

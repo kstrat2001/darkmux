@@ -170,6 +170,7 @@ pub fn run() -> DoctorReport {
         check_removed_radio_router_staffing(),
         check_renamed_budget_settings(),
         check_role_skill_references(),
+        check_inactivity_timeout(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -2439,6 +2440,32 @@ fn check_step_command_timeout() -> Check {
     }
 }
 
+/// (#3074) Informational: the per-dispatch inactivity budget, resolved, with
+/// the tier that set it. `0` is UNBOUNDED (no watchdog deadline, no soft
+/// warning), the reading every darkmux zero-knob has; it used to kill the
+/// container on the first poll, so the row says which one the operator got.
+fn check_inactivity_timeout() -> Check {
+    let name = "runtime.inactivity_timeout_seconds";
+    let (seconds, source) = darkmux_types::config_access::inactivity_timeout_seconds_with_source();
+    let provenance = match source {
+        darkmux_types::config_access::Source::Env => "from DARKMUX_INACTIVITY_TIMEOUT_SECONDS env",
+        darkmux_types::config_access::Source::Config => "from config.json",
+        darkmux_types::config_access::Source::BuiltIn => "default",
+    };
+    let message = if seconds == 0 {
+        format!(
+            "0s ({provenance}) — unbounded; a dispatch runs until it finishes or darkmux is \
+             interrupted, and the runtime sends no inactivity warning"
+        )
+    } else {
+        format!(
+            "{seconds}s ({provenance}) — a dispatch with no proof-of-work signal for this long \
+             is killed by the host watchdog"
+        )
+    };
+    Check { name: name.into(), status: Status::Pass, message, hint: None }
+}
+
 /// (#2394) Informational: how many DISPATCH-FREE steps the scheduler runs
 /// at once — every step whose `StepKind::seat` claims `SeatClaim::NoModel`
 /// (`procedural.shell`, `procedural.noop`, `mods.gate`, `records.gather`,
@@ -2704,7 +2731,9 @@ fn check_turn_delay() -> Check {
             hint: None,
         };
     }
-    if ms.saturating_mul(2) >= timeout_ms {
+    // (#3074) `timeout_ms == 0` is an unbounded inactivity timeout: there is
+    // no deadline for a rest to approach, and the runtime does not clamp.
+    if timeout_ms != 0 && ms.saturating_mul(2) >= timeout_ms {
         let clamped = timeout_ms / 2;
         return Check {
             name: name.into(),
@@ -3129,7 +3158,8 @@ fn check_generation_checkpoint_interval() -> Check {
     }
     let inactivity_timeout_seconds = darkmux_types::config_access::inactivity_timeout_seconds();
     let seconds_to_generate = tokens as f64 / CONSERVATIVE_TOKENS_PER_SECOND;
-    if seconds_to_generate >= inactivity_timeout_seconds as f64 {
+    // (#3074) `0` is unbounded: no budget for a generation to outlast.
+    if inactivity_timeout_seconds != 0 && seconds_to_generate >= inactivity_timeout_seconds as f64 {
         let approx_seconds = seconds_to_generate.round() as u64;
         return Check {
             name: name.into(),
@@ -8608,6 +8638,78 @@ mod tests {
         assert!(!check.message.contains("killed at this bound"), "the old reading must be gone: {}", check.message);
     }
 
+    // ─── (#3074) inactivity timeout: 0 is unbounded, and doctor says so ───
+
+    /// Scopes `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (and optionally another
+    /// variable) around one closure, restoring both afterward.
+    fn with_inactivity_env<T>(inactivity: Option<&str>, other: Option<(&str, &str)>, f: impl FnOnce() -> T) -> T {
+        let k = "DARKMUX_INACTIVITY_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        let prev_other = other.map(|(name, _)| (name, std::env::var(name).ok()));
+        unsafe {
+            match inactivity {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+            if let Some((name, v)) = other {
+                std::env::set_var(name, v);
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+            if let Some((name, prev)) = prev_other {
+                match prev {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        out
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_inactivity_timeout_zero_is_pass_and_says_unbounded() {
+        let check = with_inactivity_env(Some("0"), None, check_inactivity_timeout);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("unbounded") && check.message.contains("env"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_inactivity_timeout_names_the_value_and_its_provenance() {
+        let default = with_inactivity_env(None, None, check_inactivity_timeout);
+        assert!(default.message.contains("600s") && default.message.contains("default"), "{}", default.message);
+        let env = with_inactivity_env(Some("45"), None, check_inactivity_timeout);
+        assert!(env.message.contains("45s") && env.message.contains("env"), "{}", env.message);
+    }
+
+    /// With no deadline there is nothing for a rest to approach, so the
+    /// "at or above half the inactivity timeout" warning must stay quiet.
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_does_not_warn_against_an_unbounded_inactivity_timeout() {
+        let check = with_inactivity_env(Some("0"), Some(("DARKMUX_TURN_DELAY_MS", "3000")), check_turn_delay);
+        unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_does_not_warn_against_an_unbounded_inactivity_timeout() {
+        let check = with_inactivity_env(
+            Some("0"),
+            Some(("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "6000")),
+            check_generation_checkpoint_interval,
+        );
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL") };
+        assert_ne!(check.status, Status::Warn, "{}", check.message);
+    }
+
     /// The middle tier the siblings above have no test for: the check sees
     /// `config.json` and SAYS so, with the env tier absent.
     ///
@@ -11600,8 +11702,10 @@ mod tests {
         // `run()`: the root crate appends it with the full step-kind catalog.
         //
         // (5.0) 69: `machine_uid_check` joined beside the machine_id row.
+        //
+        // (#3074) 66: `check_inactivity_timeout` joined beside the step-command row.
         let expected =
-            65 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -5759,6 +5759,11 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
 /// the hard kill at 100% is the unconditional safety net for the
 /// small-budget edge.
 fn inactivity_soft_threshold_secs(budget_secs: u64) -> u64 {
+    // (#3074) `0` is UNBOUNDED: the host sets no deadline, so there is no
+    // kill to warn about and the threshold can never be reached.
+    if budget_secs == 0 {
+        return u64::MAX;
+    }
     const RATIO: f64 = 0.75;
     let linear = ((budget_secs as f64) * RATIO) as u64;
     // clamp(low, high): never zero; never >= budget (always some headroom).
@@ -17639,6 +17644,13 @@ mod tests {
     }
 
     // ─── (#474) inactivity soft-threshold floor + headroom ───────────
+
+    /// (#3074) A budget of `0` means UNBOUNDED, so there is no kill to warn
+    /// about: the soft threshold can never be reached.
+    #[test]
+    fn soft_threshold_for_an_unbounded_budget_is_never_reached() {
+        assert_eq!(inactivity_soft_threshold_secs(0), u64::MAX);
+    }
 
     #[test]
     fn soft_threshold_default_budget_is_linear_75pct() {
