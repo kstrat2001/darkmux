@@ -1804,14 +1804,19 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   then close the run `run.complete` while the process exited 130. The scheduler
   now starts no wave after a signal, a shell step is not spawned after one, and
   a run that ends interrupted closes `run.error` with the mission in `Error`.
-  A mission whose mint died before its phases existed now closes `Aborted`
-  (it closed `Finalized`, which the runs board showed as `Complete`).
+  A mission whose mint died before its phases existed now closes with an
+  `Error` envelope (it closed `Finalized`, which the runs board showed as
+  `Complete`). A signal that lands after the last step, and before the run
+  closes, now also ends it as `run.error`. A run's own wall-clock bound is not
+  a signal: it still ends `Degraded` with the bound named.
 - **An inactivity timeout of `0` means unbounded** (5.0, #3074).
   `runtime.inactivity_timeout_seconds` / `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`
   set to `0` killed every dispatch's container on the watchdog's first poll.
   It now sets no deadline and no soft warning, like every other darkmux
   zero-knob, and `darkmux doctor` gains a `runtime.inactivity_timeout_seconds`
-  row showing the resolved reading and where it came from.
+  row showing the resolved reading and where it came from. The runs board and
+  the viewer no longer read a live run as abandoned under it: the staleness
+  window is unbounded too.
 - **A turn's checkpoint continuations are bounded** (5.0, #3074). Continuations
   do not count as turns and every streamed chunk resets the inactivity
   deadline, so a model that kept hitting a checkpoint was never stopped. A turn

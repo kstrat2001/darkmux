@@ -13601,3 +13601,60 @@ fn mission_launch_sigint_closes_the_run_as_an_error_and_starts_no_later_phase() 
     assert!(actions.iter().any(|a| a == "run.error"), "expected run.error in {actions:?}");
     assert!(!actions.iter().any(|a| a == "run.complete"), "an interrupted run must not complete: {actions:?}");
 }
+
+/// (#3074) A signal that lands just AFTER the only step exited 0 is still an
+/// interrupted run: it must close `run.error`, never `run.complete`. The step
+/// detaches a self-SIGINT that fires ~60ms after the step returns.
+#[test]
+fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "late-signal-test",
+        "name": "Late Signal Test",
+        "schema_version": "3.2",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "procedural.shell",
+                    "config": { "command": "( sleep 0.06; kill -INT $PPID ) >/dev/null 2>&1 &" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("late-signal-test.json"), config_json).unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "late-signal-test"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an interrupted run must not exit 0");
+
+    let mut all = String::new();
+    for e in walkdir_files(flows.path()) {
+        all.push_str(&fs::read_to_string(e).unwrap_or_default());
+    }
+    assert!(all.contains("\"run.error\""), "the interrupted run must close run.error: {all}");
+    assert!(!all.contains("\"run.complete\""), "an interrupted run must never close run.complete");
+}
+
+fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walkdir_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

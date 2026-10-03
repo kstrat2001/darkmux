@@ -1694,6 +1694,10 @@ pub fn launch(
     // mission to a terminal Error status BEFORE propagating the failure.
     // The failure is still surfaced to the caller (loud, non-zero exit); the
     // mission board just no longer lies about a dead run being active.
+    // (#3074) A signal that landed after the last pass returned (so no pass
+    // observed it) is still an interrupted run: it closes through this error
+    // path, never as `run.complete`.
+    graph_result = fail_if_interrupted(graph_result);
     if let Err(e) = graph_result {
         // (#1877) Explicit close, not the Drop backstop — a scheduler
         // error is a KNOWN outcome with real error text worth carrying,
@@ -1889,7 +1893,7 @@ fn fail_if_interrupted(
     result: Result<crew::scheduler::SchedulerReport>,
 ) -> Result<crew::scheduler::SchedulerReport> {
     let report = result?;
-    darkmux_types::interrupt::bail_if_set("mission launch observed a signal before finalizing")?;
+    crate::launch_guard::bail_if_operator_signal("mission launch observed a signal before finalizing")?;
     Ok(report)
 }
 
@@ -7963,9 +7967,14 @@ mod tests {
 
         assert_eq!(
             mission_status_on_disk(mission_id),
-            MissionStatus::Aborted,
-            "a partial mint must reconcile to a non-success terminal — one fresh mission, never an \
-             accumulating Active row (#1504) and never the Finalized success terminal (#3074)"
+            MissionStatus::Finalized,
+            "a partial mint must reconcile to a terminal — one fresh mission, never an accumulating \
+             Active row (#1504)"
+        );
+        assert_eq!(
+            crew::lifecycle::load_envelope(mission_id).unwrap().expect("envelope").status,
+            crew::envelope::MissionOutcomeStatus::Error,
+            "and it reads as an Error outcome, never Aborted (a human teardown, #3074)"
         );
     }
 
