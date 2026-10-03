@@ -60,6 +60,26 @@ darkmux release.
   `error` (additive, absent for a step that did not error;
   `tests/cli-json.golden` regenerated for the new field).
 
+### Fixed (5.0): isolation
+
+- **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
+  The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
+  the operator asked to protect. A `dispatch.internal` step reads it from the config key
+  `workspace_read_only`, and the hop that copies a dispatch into a step names every
+  field of the dispatch, so a new one cannot be dropped silently.
+- **`review`'s mod wait takes its values as environment variables** (#3074). The finding
+  key and `mod_wait_seconds` were spliced into a shell command, so a quote in the value
+  ran as shell. `procedural.shell` gains an `env` map; a mission input can declare
+  `whole_number`, and the launcher refuses anything but digits for `mod_wait_seconds`.
+  No shipped command splices a placeholder any more.
+- **A symlinked `tree` or `mirror` directory under a workspace root is refused** (#3074),
+  instead of being deleted into and checked out under.
+- **The agent's `bash` tool caps each stream at 256 KiB** (#3073). The rest is read and
+  dropped, and the result says how many bytes of stdout or stderr were not shown.
+- **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
+  and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
+  with an `@` after the host now masks up to the last `@`.
+
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
 5.0 is the compatibility break. Code whose only job was to read or report a
