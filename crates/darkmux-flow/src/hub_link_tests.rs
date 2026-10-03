@@ -416,8 +416,12 @@ fn a_failed_backfill_keeps_the_outage_so_the_next_probe_retries() {
     assert_eq!(handles(&hub.entries()), ["g1", "g2", "g3", "g4", "after"]);
 }
 
+fn since_a_day_ago(now: i64) -> String {
+    ts_utc_at(now - 86_400)
+}
+
 #[test]
-fn the_backfill_reads_two_days_and_keeps_only_the_newest_up_to_the_cap() {
+fn the_backfill_reads_every_day_from_the_outage_start_and_keeps_only_the_newest_up_to_the_cap() {
     let dir = TempDir::new().unwrap();
     let now = current_epoch_secs();
     let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
@@ -459,14 +463,55 @@ fn the_backfill_reads_two_days_and_keeps_only_the_newest_up_to_the_cap() {
     };
     assert_eq!(
         names(&all),
-        ["y", "a", "b", "c"],
-        "yesterday and today only, oldest first; the 3-day-old file is out of scope"
+        ["ancient", "y", "a", "b", "c"],
+        "every day file from the outage start (#3073), oldest first"
     );
+    let recent = since_a_day_ago(now);
+    let narrow = Backfill { dir: dir.path(), now_secs: now, since: &recent, own_uid: None, skip_identity: "", cap: None }.lines();
+    assert_eq!(names(&narrow), ["y", "a", "b", "c"], "a day file wholly before the outage start is not read");
     assert_eq!(
         names(&q(Some(2)).lines()),
         ["b", "c"],
         "a cap keeps the newest"
     );
+}
+
+/// (#3073) Only the day files from the outage start's day through today are
+/// opened: a multi-day outage reaches back, an older file stays unread.
+#[test]
+fn the_backfill_opens_day_files_from_the_outage_start_day_through_today() {
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let days: Vec<String> = (0..5).map(|n| day_utc_at(now - n * 86_400)).collect();
+    for d in &days {
+        std::fs::write(dir.path().join(format!("{d}.jsonl")), "").unwrap();
+    }
+    std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+    let since = ts_utc_at(now - 2 * 86_400);
+    let files = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.day_files();
+    let names: Vec<String> = files.iter().map(|p| p.file_stem().unwrap().to_string_lossy().to_string()).collect();
+    assert_eq!(names, [days[2].clone(), days[1].clone(), days[0].clone()]);
+}
+
+/// (#3074, contract 3) A lab run's records are in the local day file but
+/// never re-sent to the hub.
+#[test]
+fn backfill_skips_lab_session_records() {
+    use darkmux_types::session_id::{RunId, SessionId};
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
+    let line = |handle: &str, session: String| {
+        serde_json::json!({"ts": ts_utc_at(now - 10), "action": "dispatch.tool", "handle": handle, "session_id": session}).to_string()
+    };
+    let lab = SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n").wire();
+    let solo = SessionId::adhoc(RunId::standalone("s-1").unwrap(), "coder", "n").wire();
+    std::fs::write(&today, [line("lab", lab), line("solo", solo)].join("\n")).unwrap();
+    let since = ts_utc_at(now - 60);
+    let lines = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.lines();
+    let handles: Vec<String> =
+        lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
+    assert_eq!(handles, ["solo"]);
 }
 
 /// (#2101) Backfill re-sends the local day file's records, but never the

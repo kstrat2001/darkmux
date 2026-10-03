@@ -125,14 +125,15 @@ impl LinkState {
     }
 }
 
-/// Which records the backfill wants: this machine's records in the current and
-/// previous UTC day files with `ts >= since`, minus the record about to be
-/// written normally.
+/// Which records the backfill wants: this machine's records in every UTC day
+/// file from the day of `since` through today with `ts >= since`, minus the
+/// record about to be written normally.
 ///
-/// Two day files, because an outage that spans UTC midnight has records in
-/// both, and because anything older is past the stream's `MAXLEN ~` retention
-/// anyway: re-sending it would only be trimmed again. The scan cost is bounded
-/// by that too.
+/// The window follows the outage start (#3073), not a fixed couple of days: a
+/// multi-day outage has records in every file between, and an unbounded stream
+/// (`maxlen 0`) or a quiet one still holds them. The cap below trims to what
+/// the stream retains anyway. Day files are listed by name, so a `since` far in
+/// the past costs one directory read, not one probe per day.
 pub(crate) struct Backfill<'a> {
     pub dir: &'a Path,
     pub now_secs: i64,
@@ -148,10 +149,8 @@ impl Backfill<'_> {
     /// The lines to publish, oldest first (stable within a second, so records
     /// keep their write order).
     pub(crate) fn lines(&self) -> Vec<String> {
-        let days = [self.now_secs - 86_400, self.now_secs].map(crate::day_utc_at);
         let mut kept: Vec<(String, String)> = Vec::new();
-        for day in days {
-            let path: PathBuf = self.dir.join(format!("{day}.jsonl"));
+        for path in self.day_files() {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             kept.extend(text.lines().filter_map(|l| self.keep(l)));
         }
@@ -161,6 +160,23 @@ impl Backfill<'_> {
             kept.drain(..drop);
         }
         kept.into_iter().map(|(_, line)| line).collect()
+    }
+
+    /// The day files from `since`'s day through today, oldest first.
+    pub(crate) fn day_files(&self) -> Vec<PathBuf> {
+        let first = self.since.get(..10).unwrap_or_default();
+        let last = crate::day_utc_at(self.now_secs);
+        let Ok(entries) = std::fs::read_dir(self.dir) else { return Vec::new() };
+        let mut days: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let day = name.strip_suffix(".jsonl")?.to_string();
+                (day.as_str() >= first && day <= last).then(|| (day, e.path()))
+            })
+            .collect();
+        days.sort();
+        days.into_iter().map(|(_, path)| path).collect()
     }
 
     fn keep(&self, line: &str) -> Option<(String, String)> {
@@ -173,9 +189,12 @@ impl Backfill<'_> {
         let publishable = crate::reader::action_of(&v)
             .as_ref()
             .is_none_or(|a| a.hub_stream() == Some(crate::HubStream::Work));
+        // A lab run's records never reach the hub, live or re-sent (#3074).
+        let lab = crate::is_lab_session(v.get("session_id").and_then(|s| s.as_str()));
         let wanted = ts >= self.since
             && ours
             && publishable
+            && !lab
             && crate::flow_record_identity(&v) != self.skip_identity;
         wanted.then(|| (ts.to_string(), v.to_string()))
     }

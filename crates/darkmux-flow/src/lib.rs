@@ -1022,6 +1022,10 @@ pub struct RedisSink {
     /// Whether a disabled sink stays off (`OneShot`) or keeps probing (`LongLived`).
     policy: SinkPolicy,
     probe_backoff: hub_link::ProbeBackoff,
+    /// The one bounded connection every write rides (#3073). Opened on first
+    /// use, discarded on any error so the next write reconnects through the
+    /// bounded connect, and held across a write so records stay in order.
+    conn: std::sync::Mutex<Option<redis::Connection>>,
     /// Where the outage's records are re-read from; `None` = the live local
     /// flows directory (`local_sink_dir()`).
     backfill_dir: Option<PathBuf>,
@@ -1381,6 +1385,15 @@ pub(crate) fn assert_silent_peer_reaches_command_phase(port: u16) {
     );
 }
 
+/// Whether a record's `session_id` names a lab run: such a record stays off
+/// the fleet hub (#3074, contract 3). The one predicate both the live write
+/// ([`RedisSink`]'s `persist`) and the outage backfill use.
+pub(crate) fn is_lab_session(session_id: Option<&str>) -> bool {
+    session_id
+        .and_then(|wire| darkmux_types::session_id::SessionId::parse(wire).ok())
+        .is_some_and(|s| s.run_id().kind() == darkmux_types::session_id::RunIdKind::Lab)
+}
+
 impl RedisSink {
     /// Build a sink connecting to `url` and writing to `stream`. Connection
     /// is not established until the first `write` call (the redis client
@@ -1401,6 +1414,7 @@ impl RedisSink {
             disabled: AtomicBool::new(false),
             policy: SinkPolicy::OneShot,
             probe_backoff: hub_link::ProbeBackoff::default(),
+            conn: std::sync::Mutex::new(None),
             backfill_dir: None,
             link: std::sync::Mutex::new(hub_link::LinkState::new()),
             watermark: hub_link::OutageWatermark::new(hub_link::default_watermark_path()),
@@ -1540,6 +1554,11 @@ impl FlowSink for RedisSink {
         let Some(hub_stream) = record.action.hub_stream() else {
             return Ok(());
         };
+        // (#3074, contract 3) Lab runs write per-run-local artifacts; the
+        // fleet stream carries engagement work only.
+        if is_lab_session(record.session_id.as_deref()) {
+            return Ok(());
+        }
         // (#388) A sink that is not due to try skips silently: no connection
         // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -1578,21 +1597,40 @@ impl RedisSink {
     /// day files hold from an outage (`LongLived` only), then XADD `record`.
     /// The caller wraps it with the #388 accounting.
     fn deliver(&self, record: &FlowRecord, hub_stream: HubStream) -> Result<()> {
-        let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
-            .context("getting Redis connection")?;
-        // (#2227) The connect above is bounded; the XADD below was not. An
-        // accepts-but-never-answers peer (measured 2026-07-29 on a Tailscale
-        // peer) wedged this write indefinitely — and because a hang is not an
-        // `Err`, the #388 disable accounting never advanced.
-        bound_redis_response(&conn);
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
-        if self.policy == SinkPolicy::LongLived {
-            self.backfill(&mut conn, &payload, false)?;
+        self.with_connection(|conn| {
+            if self.policy == SinkPolicy::LongLived {
+                self.backfill(conn, &payload, false)?;
+            }
+            self.xadd(hub_stream, &payload, false).query::<String>(conn)
+                .with_context(|| format!("XADD to Redis stream `{}`", self.stream_for(hub_stream).0))?;
+            Ok(())
+        })
+    }
+
+    /// Run `f` on the sink's cached connection, opening it first when there is
+    /// none (#3073). The connect is bounded by [`REDIS_CONNECT_TIMEOUT`] and
+    /// the commands by [`REDIS_RESPONSE_TIMEOUT`] (#2227), so a peer that
+    /// accepts and goes silent still surfaces as an `Err` for the #388
+    /// accounting. A connection `f` fails on is dropped, never reused: the
+    /// next call reconnects.
+    fn with_connection<T>(&self, f: impl FnOnce(&mut redis::Connection) -> Result<T>) -> Result<T> {
+        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut conn = match slot.take() {
+            Some(conn) => conn,
+            None => {
+                let conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
+                    .context("getting Redis connection")?;
+                bound_redis_response(&conn);
+                conn
+            }
+        };
+        let out = f(&mut conn);
+        if out.is_ok() {
+            *slot = Some(conn);
         }
-        self.xadd(hub_stream, &payload, false).query::<String>(&mut conn)
-            .with_context(|| format!("XADD to Redis stream `{}`", self.stream_for(hub_stream).0))?;
-        Ok(())
+        out
     }
 
     /// Tick work for a healthy long-lived sink: when the watermark file has
@@ -1615,12 +1653,7 @@ impl RedisSink {
         if self.watermark.load().is_none() {
             return;
         }
-        let result = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
-            .context("getting Redis connection")
-            .and_then(|mut conn| {
-                bound_redis_response(&conn);
-                self.backfill(&mut conn, "", true)
-            });
+        let result = self.with_connection(|conn| self.backfill(conn, "", true));
         if let Err(e) = result {
             self.note_failure_of(&e, &schema::ts_utc_now(), "backfill");
         }
@@ -5288,6 +5321,134 @@ mod tests {
              expected bounded by REDIS_RESPONSE_TIMEOUT (1s). Unbounded before \
              #2227."
         );
+    }
+
+    /// What a [`spawn_recording_redis_peer`] saw: every command as its argument
+    /// words, and how many connections it accepted.
+    #[derive(Default)]
+    struct PeerLog {
+        commands: std::sync::Mutex<Vec<Vec<String>>>,
+        connections: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PeerLog {
+        fn xadds(&self) -> Vec<Vec<String>> {
+            self.commands.lock().unwrap().iter().filter(|c| c[0].eq_ignore_ascii_case("XADD")).cloned().collect()
+        }
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A loopback peer that answers every command (`+OK`, and `+1-0` to XADD)
+    /// and logs what it was sent. With `close_after_xadds`, it hangs up on the
+    /// connection after answering that many XADDs. Returns the port.
+    fn spawn_recording_redis_peer(log: std::sync::Arc<PeerLog>, close_after_xadds: Option<usize>) -> u16 {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                log.connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let mut out = stream.try_clone().unwrap();
+                    let mut input = std::io::BufReader::new(stream);
+                    let mut xadds = 0usize;
+                    loop {
+                        let mut head = String::new();
+                        if input.read_line(&mut head).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let n: usize = head.trim().trim_start_matches('*').parse().unwrap_or(0);
+                        let mut words = Vec::new();
+                        for _ in 0..n {
+                            let mut len = String::new();
+                            input.read_line(&mut len).unwrap();
+                            let len: usize = len.trim().trim_start_matches('$').parse().unwrap();
+                            let mut buf = vec![0u8; len + 2];
+                            input.read_exact(&mut buf).unwrap();
+                            words.push(String::from_utf8_lossy(&buf[..len]).to_string());
+                        }
+                        let is_xadd = words[0].eq_ignore_ascii_case("XADD");
+                        log.commands.lock().unwrap().push(words);
+                        let _ = out.write_all(if is_xadd { b"+1-0\r\n" } else { b"+OK\r\n" });
+                        if is_xadd {
+                            xadds += 1;
+                            if close_after_xadds == Some(xadds) {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        port
+    }
+
+    fn persist_record(sink: &RedisSink, rec: &FlowRecord) {
+        sink.persist(CheckedRecord::check(rec).expect("a valid record")).unwrap();
+    }
+
+    fn work_record(handle: &str, session: Option<String>) -> FlowRecord {
+        let mut r = silent_peer_test_record();
+        r.handle = handle.to_string();
+        r.action = crate::FlowAction::OperatorNote;
+        r.session_id = session;
+        r
+    }
+
+    /// (#3074, contract 3) A record whose session is a lab run never reaches
+    /// the fleet hub; an ordinary dispatch's record still does.
+    #[test]
+    fn redis_sink_never_publishes_a_lab_session_record() {
+        use darkmux_types::session_id::{RunId, SessionId};
+        let log = std::sync::Arc::new(PeerLog::default());
+        let port = spawn_recording_redis_peer(log.clone(), None);
+        let sink = RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:flow", None).unwrap();
+
+        let lab = SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n").wire();
+        let solo = SessionId::adhoc(RunId::standalone("s-1").unwrap(), "coder", "n").wire();
+        persist_record(&sink, &work_record("lab-one", Some(lab)));
+        persist_record(&sink, &work_record("solo-one", Some(solo)));
+
+        let xadds = log.xadds();
+        assert_eq!(xadds.len(), 1, "only the non-lab record is published: {xadds:?}");
+        assert!(xadds[0].iter().any(|w| w.contains("solo-one")));
+        assert!(!xadds.iter().flatten().any(|w| w.contains("lab-one")));
+    }
+
+    /// (#3073) Records ride one cached connection instead of a connection and
+    /// a thread each.
+    #[test]
+    fn redis_sink_reuses_one_connection_across_records() {
+        let log = std::sync::Arc::new(PeerLog::default());
+        let port = spawn_recording_redis_peer(log.clone(), None);
+        let sink = RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:flow", None).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..300 {
+            persist_record(&sink, &work_record(&format!("r{i}"), None));
+        }
+        eprintln!("300 records through the sink: {:?}", start.elapsed());
+        assert_eq!(log.xadds().len(), 300);
+        assert_eq!(log.connections(), 1, "one connection for all records");
+    }
+
+    /// (#3073) A connection the peer dropped is discarded on the failed write
+    /// and re-established for the next record; the failure is still counted.
+    #[test]
+    fn redis_sink_reconnects_after_the_cached_connection_breaks() {
+        let log = std::sync::Arc::new(PeerLog::default());
+        let port = spawn_recording_redis_peer(log.clone(), Some(1));
+        let sink = RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:flow", None).unwrap();
+        persist_record(&sink, &work_record("a", None));
+        persist_record(&sink, &work_record("b", None)); // rides the dead connection
+        persist_record(&sink, &work_record("c", None));
+        let handles: Vec<bool> = ["a", "c"].iter().map(|h| log.xadds().iter().any(|x| x.iter().any(|w| w.contains(h)))).collect();
+        assert_eq!(handles, [true, true], "records before and after the break are delivered");
+        assert_eq!(log.connections(), 2, "exactly one reconnect");
     }
 
     /// (#2227) Minimal FlowRecord for the silent-peer test — the field set is
