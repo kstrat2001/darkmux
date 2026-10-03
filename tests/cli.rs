@@ -13543,3 +13543,118 @@ fn sink_banners_stay_out_of_a_terminal_but_not_out_of_logs() {
     let screen = stderr_on_a_pty(build(&["--verbose"]));
     assert!(screen.contains("flow: AuditFileSink enabled"), "--verbose restores it: {screen}");
 }
+
+// ── (#3074) An interrupted launch never closes as a success ──────────────
+
+/// A real SIGINT lands while phase one's shell step runs. The run must end
+/// as an error (never `run.complete`), phase two must never start (its
+/// marker file stays absent), and the process exits 130.
+#[test]
+#[cfg(unix)]
+fn mission_launch_sigint_closes_the_run_as_an_error_and_starts_no_later_phase() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let marker = home.path().join("phase-two-ran");
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = format!(
+        r#"{{
+        "id": "sigint-test", "name": "Sigint Test", "schema_version": "3.2",
+        "phases": [
+          {{"id": "one", "tasks": [{{"id": "t1", "steps": [{{"id": "s1", "kind": "procedural.shell", "config": {{"command": "sleep 30"}}}}]}}]}},
+          {{"id": "two", "tasks": [{{"id": "t2", "steps": [{{"id": "s2", "kind": "procedural.shell", "config": {{"command": "touch {marker}"}}}}]}}]}}
+        ]
+    }}"#,
+        marker = marker.display()
+    );
+    fs::write(config_dir.join("sigint-test.json"), config).unwrap();
+
+    let mut child = darkmux_std_cmd();
+    let mut child = child
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "sigint-test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait until phase one's step is actually running before signaling.
+    let started = std::time::Instant::now();
+    while !flow_actions(&flows).iter().any(|r| r["action"] == "step.start") {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the step never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exit = child.wait().unwrap();
+
+    assert_eq!(exit.code(), Some(130), "exit: {exit:?}");
+    assert!(!marker.exists(), "phase two must not start after the signal");
+    let actions: Vec<String> =
+        flow_actions(&flows).iter().filter_map(|r| r["action"].as_str().map(str::to_string)).collect();
+    let step_starts = actions.iter().filter(|a| *a == "step.start").count();
+    assert_eq!(step_starts, 1, "no step may start after the signal: {actions:?}");
+    assert!(actions.iter().any(|a| a == "run.error"), "expected run.error in {actions:?}");
+    assert!(!actions.iter().any(|a| a == "run.complete"), "an interrupted run must not complete: {actions:?}");
+}
+
+/// (#3074) A signal that lands just AFTER the only step exited 0 is still an
+/// interrupted run: it must close `run.error`, never `run.complete`. The step
+/// detaches a self-SIGINT that fires ~60ms after the step returns.
+#[test]
+fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "late-signal-test",
+        "name": "Late Signal Test",
+        "schema_version": "3.2",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "procedural.shell",
+                    "config": { "command": "( sleep 0.06; kill -INT $PPID ) >/dev/null 2>&1 &" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("late-signal-test.json"), config_json).unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "late-signal-test"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an interrupted run must not exit 0");
+
+    let mut all = String::new();
+    for e in walkdir_files(flows.path()) {
+        all.push_str(&fs::read_to_string(e).unwrap_or_default());
+    }
+    assert!(all.contains("\"run.error\""), "the interrupted run must close run.error: {all}");
+    assert!(!all.contains("\"run.complete\""), "an interrupted run must never close run.complete");
+}
+
+fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walkdir_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

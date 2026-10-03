@@ -1669,17 +1669,12 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             //   phase to `Complete` before the mission ever reaches
             //   `Finalized`, and never writes an envelope — an intentional
             //   gap, documented at `finalize_mission_if_complete`'s own doc.
-            // - `reconcile_mint_failure` (`crates/darkmux-crew/src/
-            //   lifecycle.rs`, the ONLY other production path that leaves a
-            //   `Finalized` mission with no envelope) is a `mission launch`
-            //   MINT failure backstop: it closes straight to `Finalized` —
-            //   the SUCCESS terminal — after force-abandoning every phase
-            //   it managed to mint (`mission_close_with_reasoning` ->
-            //   `reconcile_mission_phases_terminal`). Before this fix, that
-            //   collapsed onto the exact same `Complete` the happy path
-            //   above gets — a mission that abandoned every phase read
-            //   identically to one that did nothing wrong, #1564's own
-            //   conflation, one layer under #2406's phase-level rollup.
+            // - A Finalized mission whose phases were all force-abandoned.
+            //   `reconcile_mint_failure` used to close that way; since #3074
+            //   it closes with an `Error` envelope, so this shape
+            //   now only appears in records an older binary wrote. Before
+            //   #1564 it collapsed onto the same `Complete` the happy path
+            //   above gets.
             //
             // Neither case has an envelope to consult, but both leave a
             // real signal on disk: `reconcile_mission_phases_terminal`
@@ -2015,9 +2010,22 @@ fn settled_lab_status(summary: &LabRunSummary) -> RunStatus {
 /// (#1621) How long a lab run's newest artifact may age before the run stops
 /// counting as live. Twice the runtime's inactivity budget — see
 /// [`lab_run_status`] for why that is the right anchor.
+///
+/// (#3074) A `0` inactivity budget means UNBOUNDED (the watchdog never
+/// fires), so no window can declare a run stale: it reads
+/// [`UNBOUNDED_STALE_AFTER_MS`] instead of a 0ms window that abandoned every
+/// live run. Every staleness decision derives its window here.
 pub(crate) fn stale_after_ms() -> u64 {
-    darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
+    match darkmux_types::config_access::inactivity_timeout_seconds() {
+        0 => UNBOUNDED_STALE_AFTER_MS,
+        seconds => seconds.saturating_mul(2_000),
+    }
 }
+
+/// The unbounded staleness window, `Number.MAX_SAFE_INTEGER` so the value
+/// survives the JSON wire to the viewer's `number` exactly (about 285,000
+/// years, far past any run).
+pub(crate) const UNBOUNDED_STALE_AFTER_MS: u64 = (1 << 53) - 1;
 
 /// (#2902 step 5) How long past its announced resume time a budget wait
 /// stays open with no further word from its waiter. A waiter still held at
@@ -3503,9 +3511,9 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
     }
 
-    /// (#1564) The mint-failure backstop's actual on-disk shape:
-    /// `reconcile_mint_failure` (`crates/darkmux-crew/src/lifecycle.rs`)
-    /// closes a mission straight to `Finalized` — the SUCCESS terminal —
+    /// (#1564) The legacy mint-failure on-disk shape (since #3074
+    /// `reconcile_mint_failure` closes with an `Error` envelope instead): a mission closed
+    /// straight to `Finalized` — the SUCCESS terminal —
     /// after force-abandoning every phase it managed to mint, and writes NO
     /// envelope at all. Before this fix, the `Ok(None)` arm's blanket
     /// `RunStatus::Complete` collapsed that onto the exact same status a
@@ -4723,6 +4731,28 @@ mod tests {
             "the shipped default inactivity budget"
         );
         assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
+    }
+
+    /// (#3074) `0` on the inactivity bound means UNBOUNDED, so no run is ever
+    /// judged stale by it: a live run reads `running` however old its newest
+    /// artifact is, instead of abandoned at a 0ms window.
+    #[test]
+    #[serial_test::serial]
+    fn an_unbounded_inactivity_budget_never_reads_a_live_run_abandoned() {
+        let _budget = InactivityBudgetGuard::seconds(0);
+        assert_eq!(stale_after_ms(), UNBOUNDED_STALE_AFTER_MS, "0 is the unbounded reading, not a 0ms window");
+        assert_eq!(runs_policy().stale_after_ms, UNBOUNDED_STALE_AFTER_MS);
+        let summary = minimal_lab_summary("live/unbounded", false, false);
+        assert_eq!(
+            lab_run_status(&summary, FIXTURE_NOW_MS + 1_000, None),
+            RunStatus::Running,
+            "a live run under an unbounded inactivity budget must read running"
+        );
+        assert_eq!(
+            lab_run_status(&summary, FIXTURE_NOW_MS + 30 * 86_400_000, None),
+            RunStatus::Running,
+            "nothing bounds the quiet period, so age alone never abandons it"
+        );
     }
 
     // ── the lifecycle corpus: one spec, two executors ────────────────────

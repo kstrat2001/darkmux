@@ -1637,6 +1637,12 @@ pub fn launch(
         &seed_artifacts,
         );
         collect_degraded(&graph_result, &mut degraded_steps);
+        // (#3074) A pass that returned `Ok` while a signal was observed (the
+        // scheduler starts no wave after one, and an interrupted step is only
+        // Degraded) is still an interrupted run: it ends here, so no later
+        // phase starts, and closes through the error path below rather than
+        // as a completed one.
+        graph_result = fail_if_interrupted(graph_result);
         if graph_result.is_err() {
             break;
         }
@@ -1688,6 +1694,10 @@ pub fn launch(
     // mission to a terminal Error status BEFORE propagating the failure.
     // The failure is still surfaced to the caller (loud, non-zero exit); the
     // mission board just no longer lies about a dead run being active.
+    // (#3074) A signal that landed after the last pass returned (so no pass
+    // observed it) is still an interrupted run: it closes through this error
+    // path, never as `run.complete`.
+    graph_result = fail_if_interrupted(graph_result);
     if let Err(e) = graph_result {
         // (#1877) Explicit close, not the Drop backstop — a scheduler
         // error is a KNOWN outcome with real error text worth carrying,
@@ -1874,6 +1884,17 @@ pub fn launch(
     drop(mission_presence);
     crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
+}
+
+/// (#3074) A graph pass that returned `Ok` while a signal was observed is
+/// still an interrupted run: it must close as an error, never as a completed
+/// one. An `Err` passes through untouched.
+fn fail_if_interrupted(
+    result: Result<crew::scheduler::SchedulerReport>,
+) -> Result<crew::scheduler::SchedulerReport> {
+    let report = result?;
+    crate::launch_guard::bail_if_operator_signal("mission launch observed a signal before finalizing")?;
+    Ok(report)
 }
 
 /// (#2300) Expand every `grow` template a phase declares, from the output
@@ -4809,6 +4830,22 @@ mod tests {
     use std::env;
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
+
+    /// (#3074) An `Ok` graph pass is turned into an interrupt error once a
+    /// signal was observed, and left alone before one. An `Err` is never
+    /// replaced.
+    #[test]
+    #[serial_test::serial]
+    fn fail_if_interrupted_turns_an_ok_pass_into_an_error_only_after_a_signal() {
+        darkmux_types::interrupt::reset_for_test();
+        assert!(fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).is_ok());
+        darkmux_types::interrupt::mark_interrupted();
+        let err = fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).unwrap_err();
+        assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
+        let own = fail_if_interrupted(Err(anyhow!("its own failure"))).unwrap_err();
+        assert_eq!(own.to_string(), "its own failure");
+        darkmux_types::interrupt::reset_for_test();
+    }
 
     // ─── #2914: a task never runs on the machine's utility model ───────
 
@@ -7931,8 +7968,13 @@ mod tests {
         assert_eq!(
             mission_status_on_disk(mission_id),
             MissionStatus::Finalized,
-            "a partial mint must reconcile to terminal — one fresh mission, terminal, never an \
-             accumulating Active row (#1504)"
+            "a partial mint must reconcile to a terminal — one fresh mission, never an accumulating \
+             Active row (#1504)"
+        );
+        assert_eq!(
+            crew::lifecycle::load_envelope(mission_id).unwrap().expect("envelope").status,
+            crew::envelope::MissionOutcomeStatus::Error,
+            "and it reads as an Error outcome, never Aborted (a human teardown, #3074)"
         );
     }
 

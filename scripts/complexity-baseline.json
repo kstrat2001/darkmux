@@ -1,6 +1,5 @@
 {
  "rust": {
-  "crates/darkmux-crew/src/bounded_command.rs::run_bounded": 19,
   "crates/darkmux-crew/src/budget.rs::BudgetPacer::on_tick": 22,
   "crates/darkmux-crew/src/budget.rs::evaluate": 18,
   "crates/darkmux-crew/src/concurrent_dispatch.rs::ensure_wave_loaded": 17,

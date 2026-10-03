@@ -40,7 +40,7 @@ cat $RUN_DIR/manifest.json | jq '.'
 What you're looking for in the manifest:
 
 - `ok: false` (escalation manifests as non-ok in the host layer for back-compat with consumers that grep on ok)
-- An error string containing one of `escalation_compaction_limit_reached`, `escalation_cumulative_tokens_exceeded`, `escalation_compaction_reread_loop` (#3013), `escalation_intra_turn_stall_exhausted`, `escalation_generation_checkpoint_budget_exhausted` (#2171), `escalation_malformed_tool_calls` (#2169), or `escalation_empty_tool_calls` (#2190)
+- An error string containing one of `escalation_compaction_limit_reached`, `escalation_cumulative_tokens_exceeded`, `escalation_compaction_reread_loop` (#3013), `escalation_intra_turn_stall_exhausted`, `escalation_turn_continuations_exhausted` (#3074: one turn generated as many tokens as the context window holds across its checkpoints), `escalation_generation_checkpoint_budget_exhausted` (#2171), `escalation_malformed_tool_calls` (#2169), or `escalation_empty_tool_calls` (#2190)
 - `sandbox` — the workspace path the agent was working in (this is your continuation workspace)
 - `workload` + `profile` — context for what was being attempted
 

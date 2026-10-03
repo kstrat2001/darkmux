@@ -573,6 +573,25 @@ pub struct SchedulerReport {
 /// `persist` for callers with no durable Step storage (most scheduler unit
 /// tests) — the bulk end-of-run save loops every production caller already
 /// runs stay in place as a cheap idempotent reconcile, not the only write.
+/// The ids ready to run in the next wave. (#3074) Once a signal was observed
+/// nothing is ready: the run ends here without starting another wave, the
+/// steps still `Planned` stay `Planned` (the launcher's phase-exit sweep
+/// abandons them), and the launcher, which sees the same signal, closes the
+/// run as an error rather than a completed one.
+fn next_wave_ready_ids(steps: &BTreeMap<String, Step>, tasks: &BTreeMap<String, Task>) -> Vec<String> {
+    if darkmux_types::interrupt::is_set() {
+        return Vec::new();
+    }
+    steps
+        .values()
+        .filter(|s| {
+            let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
+            step_is_ready(s, &task, tasks, steps)
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
     // The run this graph is: every record the scheduler emits, and every
@@ -748,14 +767,7 @@ pub fn run_step_graph(
     let bus = std::sync::Arc::new(bus);
 
     loop {
-        let ready_ids: Vec<String> = steps
-            .values()
-            .filter(|s| {
-                let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
-                step_is_ready(s, &task, tasks, steps)
-            })
-            .map(|s| s.id.clone())
-            .collect();
+        let ready_ids = next_wave_ready_ids(steps, tasks);
 
         if ready_ids.is_empty() {
             break;
@@ -2787,6 +2799,22 @@ mod tests {
             &[],
         )
         .unwrap()
+    }
+
+    /// (#3074) Once a signal was observed no further wave starts: the graph
+    /// returns with the ready step still `Planned` and nothing completed. (The
+    /// launcher, which sees the same signal, closes the run as an error.)
+    #[test]
+    #[serial_test::serial]
+    fn run_step_graph_starts_no_wave_after_a_signal() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let report = run_test_graph(&tasks, &mut steps);
+        darkmux_types::interrupt::reset_for_test();
+        assert!(report.completed.is_empty(), "no step may complete after the signal: {report:?}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Planned, "no step may start after the signal");
     }
 
     // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────
