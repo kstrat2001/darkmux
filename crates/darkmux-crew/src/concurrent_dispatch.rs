@@ -2997,13 +2997,16 @@ mod tests {
         let mut host = MockHost::new()
             .resident("darkmux:shared", "shared", 4_096, Some(1_000))
             .cataloged("shared", 1_000);
-        // Same model_key, DIFFERENT identifiers — `ensure_wave_loaded`'s
-        // own dedup only collapses an EXACT (model_key, identifier) match,
-        // so both placements reach `plan_acquire` in the same call.
+        // Same model_key, DIFFERENT identifiers, neither of them the
+        // resident's — `ensure_wave_loaded`'s own dedup only collapses an
+        // EXACT (model_key, identifier) match, so both placements reach
+        // `plan_acquire` in the same call and both resolve to replacing the
+        // one stale `darkmux:shared` (#3076: had a placement addressed it,
+        // it would be kept and the other would load beside it instead).
         let wave = vec![
             Placement {
                 model_key: "shared".into(),
-                identifier: "darkmux:shared".into(),
+                identifier: "custom-first".into(),
                 min_ctx: 8_000,
                 seat: "probe-a".into(),
             },

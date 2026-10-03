@@ -260,7 +260,10 @@ impl<'a> Acquisition<'a> {
                 push_reuse(&mut self.decisions, &mut self.warnings, identifier, resident_ctx, p.min_ctx);
             }
             ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
-                self.decide_reconcile(p, stale_identifier, stale_ctx)
+                self.decide_reconcile(p, stale_identifier, stale_ctx, Reason::InsufficientCtx)
+            }
+            ResidencyDecision::OtherOwnedCopy { other_identifier, other_ctx } => {
+                self.decide_other_owned_copy(p, other_identifier, other_ctx)
             }
             ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
                 self.decide_foreign_duplicate(p, foreign_identifier)
@@ -302,7 +305,13 @@ impl<'a> Acquisition<'a> {
     /// `facts.residents`, with no visibility into `claimed`, so the check
     /// lives here, before the stale is claimed a second time. The refusal
     /// is a `Block` naming the claimed instance, never an eviction.
-    fn decide_reconcile(&mut self, p: &Placement, stale_identifier: String, stale_ctx: u64) {
+    fn decide_reconcile(
+        &mut self,
+        p: &Placement,
+        stale_identifier: String,
+        stale_ctx: u64,
+        reason: Reason,
+    ) {
         if self.claimed.contains(&stale_identifier) {
             let clearable = !self.same_plan_claimed.contains(&stale_identifier);
             self.decisions.push(block(
@@ -324,14 +333,29 @@ impl<'a> Acquisition<'a> {
             stale: ReconcileStale::locate(self.facts, &stale_identifier, self.decisions.len()),
             unload: PlannedAction {
                 action: Action::Unload { target: stale_target },
-                reason: Reason::InsufficientCtx,
+                reason: reason.clone(),
                 precondition: Precondition::ResidentPresent {
                     identifier: stale_identifier,
                     at_ctx: Some(stale_ctx),
                 },
             },
         });
-        self.decisions.push(load_for(p, Reason::InsufficientCtx, no_owned_resident(p)));
+        self.decisions.push(load_for(p, reason, no_owned_resident(p)));
+    }
+
+    /// (#3076) Another darkmux-owned copy of the key is resident. When a
+    /// sibling placement in this wave addresses that very identifier it is
+    /// the sibling's copy: never unloaded (whatever the order the seats are
+    /// decided in), so this seat loads its own beside it and the budget arm
+    /// Blocks it, honestly, if the two do not fit. Otherwise the copy is
+    /// replaced as before, under a reason that does not blame its ctx.
+    fn decide_other_owned_copy(&mut self, p: &Placement, other: String, other_ctx: u64) {
+        let reason = Reason::OtherOwnedCopy { identifier: other.clone() };
+        if self.desired_idents.contains(other.as_str()) {
+            self.decisions.push(load_for(p, reason, no_owned_resident(p)));
+            return;
+        }
+        self.decide_reconcile(p, other, other_ctx, reason);
     }
 
     /// Absolute ownership (operator, 2026-07-10, #1274): the user-loaded
@@ -2000,6 +2024,90 @@ mod tests {
         );
     }
 
+    fn sibling_wave(m_first: bool) -> Vec<Placement> {
+        let m = placement("m", 32_000);
+        let other = aliased("m", 32_000, "darkmux:other");
+        if m_first { vec![m, other] } else { vec![other, m] }
+    }
+
+    fn assert_sibling_copy_kept(plan: &Plan) {
+        let acts = &plan.actions;
+        assert!(
+            !acts.iter().any(|a| matches!(a.action, Action::Unload { .. } | Action::Block { .. })),
+            "the sibling seat's copy is neither unloaded nor blocked on: {acts:?}"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(&a.action, Action::Load { identifier, .. } if identifier == "darkmux:m")
+                && a.reason == Reason::OtherOwnedCopy { identifier: "darkmux:other".into() }),
+            "this seat loads its own copy beside it: {acts:?}"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(&a.action, Action::Reuse { identifier, .. } if identifier == "darkmux:other")),
+            "the sibling reuses its copy: {acts:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_seats_copy_is_never_unloaded_whichever_seat_decides_first_3076() {
+        // One wave, same key m: darkmux:other@100k is resident and a sibling
+        // seat addresses it. Seat darkmux:m used to Unload it (then the
+        // sibling's Reuse pointed at nothing); in the reversed order the
+        // sibling claimed it first and darkmux:m Blocked with an
+        // "insufficient ctx" reason about a 100k copy.
+        let f = facts(vec![resident("darkmux:other", "m", 100_000, None)]);
+        for m_first in [true, false] {
+            let plan = plan_acquire(
+                &sibling_wave(m_first),
+                &f,
+                opts(CallerIntent::Auto, AcquireScope::Exclusive),
+                &no_est(),
+            );
+            assert_sibling_copy_kept(&plan);
+        }
+    }
+
+    #[test]
+    fn sibling_copy_beside_blocks_honestly_when_the_budget_cannot_hold_both_3076() {
+        let f = Facts {
+            residents: vec![resident("darkmux:other", "m", 100_000, Some(9 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(12 * GB) },
+            ..Default::default()
+        };
+        for m_first in [true, false] {
+            let plan = plan_acquire(
+                &sibling_wave(m_first),
+                &f,
+                opts(CallerIntent::Auto, AcquireScope::Exclusive),
+                &est_map(&[("m", 9 * GB)]),
+            );
+            assert!(
+                !plan.actions.iter().any(|a| matches!(a.action, Action::Unload { .. })),
+                "no sibling copy is unloaded to make room: {:?}",
+                plan.actions
+            );
+            assert!(
+                plan.actions.iter().any(|a| matches!(a.action, Action::Block { .. })
+                    && matches!(a.reason, Reason::BudgetRefuse { .. } | Reason::BudgetEvict { .. })),
+                "the load that does not fit is refused naming the budget: {:?}",
+                plan.actions
+            );
+        }
+    }
+
+    #[test]
+    fn unwanted_other_owned_copy_is_replaced_under_its_own_reason_3076() {
+        // Nobody addresses darkmux:other: it is replaced, and the reason
+        // (shown by `mission config show` and the plan) does not claim its
+        // ctx is below anything: it is ample.
+        let f = facts(vec![resident("darkmux:other", "m", 100_000, None)]);
+        let plan = plan_acquire(&[placement("m", 32_000)], &f, additive_auto(), &no_est());
+        let reason = Reason::OtherOwnedCopy { identifier: "darkmux:other".into() };
+        assert_eq!(plan.actions.len(), 2, "{:?}", plan.actions);
+        assert!(plan.actions.iter().all(|a| a.reason == reason), "{:?}", plan.actions);
+        assert!(matches!(plan.actions[0].action, Action::Unload { .. }));
+        assert!(matches!(plan.actions[1].action, Action::Load { .. }));
+    }
+
     #[test]
     fn empty_pinned_is_byte_identical_to_pre_1487() {
         // Regression guard: `pinned` defaulting empty via `AcquireOpts::new`
@@ -3023,6 +3131,7 @@ mod tests {
             Reason::NoResident => "NoResident",
             Reason::SufficientCtxResident => "SufficientCtxResident",
             Reason::InsufficientCtx => "InsufficientCtx",
+            Reason::OtherOwnedCopy { .. } => "OtherOwnedCopy",
             Reason::ForeignDuplicateLoadAlongside { .. } => "ForeignDuplicateLoadAlongside",
             Reason::ForeignDuplicateNoCapacity { .. } => "ForeignDuplicateNoCapacity",
             Reason::UnknownModelKey { .. } => "UnknownModelKey",

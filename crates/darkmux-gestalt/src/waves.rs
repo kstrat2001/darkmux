@@ -363,6 +363,14 @@ impl Priced {
                     priced.stales.push(ReconcileStale::locate(facts, &stale_identifier, i));
                     estimate(p)
                 }
+                ResidencyDecision::OtherOwnedCopy { other_identifier, .. } => {
+                    // A sibling seat addressing that copy keeps it (#3076):
+                    // no free to credit, the load sits beside it.
+                    if !placements.iter().any(|q| q.identifier == other_identifier) {
+                        priced.stales.push(ReconcileStale::locate(facts, &other_identifier, i));
+                    }
+                    estimate(p)
+                }
                 ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
                     let bytes = resident_bytes(facts, &foreign_identifier);
                     priced.foreign_dups.insert(i, (foreign_identifier, bytes));
@@ -1040,6 +1048,25 @@ mod tests {
                 warnings: vec![],
             }
         );
+    }
+
+    #[test]
+    fn sibling_seats_copy_earns_no_stale_credit_3076() {
+        // darkmux:other (18.75GB) is addressed by a sibling seat, so the
+        // planner keeps it and loads darkmux:devstral beside it. Crediting
+        // it as a freed stale would put base at 0 and let both fit a 24GB
+        // budget; honestly the base stays 18.75GB and the second copy
+        // (18.75GB) cannot fit.
+        let f = Facts {
+            residents: vec![resident("darkmux:other", "devstral", 32_768, Some(DEVSTRAL_32K))],
+            budget: Budget { max_darkmux_bytes: Some(24 * GB) },
+            ..Default::default()
+        };
+        let placements =
+            vec![placement("devstral", 32_768), aliased("devstral", 32_768, "darkmux:other")];
+        let schedule = plan_waves(&placements, &f, &probed(), WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert!(!schedule.refusals.is_empty(), "{schedule:?}");
     }
 
     #[test]

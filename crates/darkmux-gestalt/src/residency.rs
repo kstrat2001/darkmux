@@ -36,6 +36,12 @@ pub enum ResidencyDecision {
     /// option; attempting a second concurrent load of the same weights is
     /// the #1271 bug class (OOM) and isn't either.
     Reconcile { stale_identifier: String, stale_ctx: u64 },
+    /// No resident carries the placement's own identifier, but ANOTHER
+    /// darkmux-owned copy of the modelKey is resident (any ctx). The seat
+    /// addresses its own identifier, so that copy is never reusable by it
+    /// (#3074 B10); the plan replaces it, unless another seat in the same
+    /// plan addresses it, in which case it must stay (#3076).
+    OtherOwnedCopy { other_identifier: String, other_ctx: u64 },
     /// A foreign (user/operator) resident shares the modelKey and NO
     /// darkmux-owned/alias resident does. Under absolute ownership
     /// (operator decision 2026-07-10, #1274) this is a FACT, not a verdict:
@@ -91,9 +97,9 @@ pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyD
         };
     }
     if let Some(other) = other_owned {
-        return ResidencyDecision::Reconcile {
-            stale_identifier: other.identifier.clone(),
-            stale_ctx: other.ctx,
+        return ResidencyDecision::OtherOwnedCopy {
+            other_identifier: other.identifier.clone(),
+            other_ctx: other.ctx,
         };
     }
     match same_key().next() {
@@ -268,9 +274,9 @@ mod tests {
         let big_other = vec![resident("darkmux:other", "m", 100_000)];
         assert_eq!(
             decide_residency(&big_other, &p),
-            ResidencyDecision::Reconcile {
-                stale_identifier: "darkmux:other".into(),
-                stale_ctx: 100_000
+            ResidencyDecision::OtherOwnedCopy {
+                other_identifier: "darkmux:other".into(),
+                other_ctx: 100_000
             }
         );
         let both = vec![resident("darkmux:other", "m", 100_000), resident("darkmux:m", "m", 4_096)];

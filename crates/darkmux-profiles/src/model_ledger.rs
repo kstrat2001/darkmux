@@ -3227,6 +3227,15 @@ mod tests {
             "lms ps failure surfaces as an error-severity message: {:?}",
             ledger.messages
         );
+        // The failed `lms ps` reaches compute_ledger as residents_unknown
+        // (#3076): the ledger says so instead of painting an unattributed
+        // footprint as a known one. A real Red reading on the test host
+        // outranks Unknown, so only the non-Red case pins the state.
+        assert_eq!(ledger.attribution, Attribution::Unavailable);
+        assert!(ledger.attribution_note.contains("lms ps"), "{}", ledger.attribution_note);
+        if ledger.machine.state != LedgerState::Red {
+            assert_eq!(ledger.machine.state, LedgerState::Unknown);
+        }
         assert_eq!(ledger.schema_version, LEDGER_SCHEMA_VERSION);
         assert!(ledger.generated_at_ms > 1_700_000_000_000);
         // gather_ms is stamped (may legitimately be 0 ms on a fast box, so
