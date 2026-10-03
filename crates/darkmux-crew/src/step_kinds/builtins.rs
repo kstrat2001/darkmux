@@ -528,7 +528,10 @@ pub(crate) fn dispatch_opts_for(
         remote_origin: None,
         live_channel: true,
         brief_refs,
-        workspace_read_only: false,
+        // (#3074) Read back off the step config the crew-of-one graph wrote
+        // it into; a mission step that names no key mounts read-write, as
+        // every such step always has.
+        workspace_read_only: cfg.workspace_read_only.is_some_and(|f| f.0),
         record_context: None,
         role_id,
         message,

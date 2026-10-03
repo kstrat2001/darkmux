@@ -203,25 +203,11 @@ pub struct DispatchOpts {
     /// writes. `false` (the default) preserves every existing caller's
     /// read-write workspace exactly.
     ///
-    /// (#2614 review, "Also record") `step_kinds::builtins::
-    /// dispatch_opts_for` hardcodes this to `false` for every
-    /// `dispatch.internal` step — no step-config key threads a caller's
-    /// intent through yet. That is also what closes a latent divergence
-    /// #2614's review found in #2585's now-deleted CLI wrapper hoist: that
-    /// hoist read the CALLER's own `--workspace-read-only`-shaped value
-    /// (there wasn't one, so this was moot in practice) while `dispatch_
-    /// opts_for`'s reconstruction always used this hardcoded `false` — the
-    /// two could have disagreed the moment a real flag existed, letting a
-    /// read-only-intended resume pass an early gate but fail (or worse,
-    /// silently escalate) once the real, hardcoded value was checked
-    /// post-wave. Since the checkpoint gate no longer has a wrapper-side
-    /// copy at all (`StepKind::resume_precheck` validates checkpoint
-    /// CONTENT only, never the workspace/mount-mode half — see that
-    /// method's own doc), there is exactly one place this field's value is
-    /// checked against a checkpoint's origin (`dispatch_internal::dispatch`
-    /// itself), so no second copy can drift from it. If a step config ever
-    /// gains a way to request a read-only mount, wire it into `dispatch_
-    /// opts_for` here — not into a second, wrapper-side check.
+    /// (#3074) A `dispatch.internal` step reads this from its config key
+    /// `workspace_read_only`; the crew-of-one graph writes it from
+    /// `darkmux dispatch --workspace-read-only`. A resume's checkpoint gate
+    /// (`dispatch_internal::dispatch`) checks the value against the
+    /// checkpoint's origin in exactly one place.
     pub workspace_read_only: bool,
     /// (#1959 flow-record vocabulary retirement) Provenance the runtime
     /// itself has no concept of — merged under `payload.context` on EVERY

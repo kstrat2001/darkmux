@@ -71,6 +71,8 @@ pub struct DispatchInternalConfig {
     pub max_completion_tokens: Option<Count>,
     pub resume_from: Option<String>,
     pub timeout_override_seconds: Option<Count>,
+    /// Mount `/workspace` read-only (#3074).
+    pub workspace_read_only: Option<Flag>,
 }
 
 impl ConfigRules for DispatchInternalConfig {
