@@ -19753,3 +19753,35 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         PreflightDecision::Reuse { .. }
     ));
 }
+
+    // ─── (#3074) an inactivity budget of 0 means unbounded ───────────────
+
+    /// `0` must not read as "expire immediately": the deadline lands far
+    /// beyond any real dispatch, while a real budget stays `now + secs`.
+    #[test]
+    fn a_zero_inactivity_budget_yields_a_deadline_that_never_expires_in_practice() {
+        let now = Instant::now();
+        let unbounded = inactivity_deadline_after(0, Duration::ZERO);
+        assert!(unbounded > now + Duration::from_secs(365 * 24 * 3600), "0 must be unbounded");
+        let bounded = inactivity_deadline_after(600, Duration::ZERO);
+        assert!(bounded > now + Duration::from_secs(599) && bounded < now + Duration::from_secs(700));
+    }
+
+    /// The watchdog's wake loop, handed the deadline a `0` budget produces,
+    /// does not report an expiry: a done flag is the only thing that wakes it.
+    #[test]
+    fn the_watchdog_does_not_expire_on_a_zero_budget_deadline() {
+        let deadline = Mutex::new(inactivity_deadline_after(0, Duration::ZERO));
+        let done = AtomicBool::new(false);
+        let abandoned = AtomicBool::new(false);
+        let done_ref = &done;
+        let wake = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(1200));
+                done_ref.store(true, Ordering::SeqCst);
+            });
+            wait_for_watchdog_wake(&deadline, &done, &abandoned)
+        });
+        assert!(matches!(wake, WatchdogWake::Done), "a zero budget must never expire the deadline");
+    }
+

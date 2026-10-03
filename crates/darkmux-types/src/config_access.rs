@@ -956,6 +956,11 @@ pub fn format_client_addr(bind: &str, port: u16) -> String {
 }
 
 // ── Runtime behavior ──
+/// Seconds without a proof-of-work signal before the host watchdog kills a
+/// dispatch's container (default 600). **`0` means UNBOUNDED** (#3074): no
+/// deadline is set, the same reading every darkmux zero-knob has. The host
+/// watchdog, the in-container soft warning and `darkmux doctor` all read it
+/// that way.
 pub fn inactivity_timeout_seconds() -> u64 {
     inactivity_timeout_seconds_with_source().0
 }
