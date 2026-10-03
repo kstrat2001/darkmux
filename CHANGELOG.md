@@ -1799,6 +1799,35 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 
 ### Fixed (4.0)
 
+- **An interrupted launch never closes as a success** (5.0, #3074). A SIGINT,
+  SIGTERM or SIGHUP during `mission launch` used to let later phases start and
+  then close the run `run.complete` while the process exited 130. The scheduler
+  now starts no wave after a signal, a shell step is not spawned after one, and
+  a run that ends interrupted closes `run.error` with the mission in `Error`.
+  A mission whose mint died before its phases existed now closes `Aborted`
+  (it closed `Finalized`, which the runs board showed as `Complete`).
+- **An inactivity timeout of `0` means unbounded** (5.0, #3074).
+  `runtime.inactivity_timeout_seconds` / `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`
+  set to `0` killed every dispatch's container on the watchdog's first poll.
+  It now sets no deadline and no soft warning, like every other darkmux
+  zero-knob, and `darkmux doctor` gains a `runtime.inactivity_timeout_seconds`
+  row showing the resolved reading and where it came from.
+- **A turn's checkpoint continuations are bounded** (5.0, #3074). Continuations
+  do not count as turns and every streamed chunk resets the inactivity
+  deadline, so a model that kept hitting a checkpoint was never stopped. A turn
+  that has generated as many tokens as the context window holds now ends with
+  `escalation_turn_continuations_exhausted` and its banked work attached. With
+  no context window configured there is nothing to derive the bound from, so
+  none applies.
+- **A late container stays watched** (5.0, #2252). When the inactivity deadline
+  fired while `docker run` was still pulling a `--image`, the watchdog found no
+  container and retired, and the container then ran with nothing able to stop
+  it. The watchdog now re-arms for a full budget and keeps watching until the
+  dispatch ends.
+- **A local `dispatch.map` item that errored and then came back empty reports
+  the error** (5.0, #3074), as the hosted path already did, instead of an empty
+  success.
+
 - **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
   aborting a mission, while a run waited on its endpoint budget raised the
   process-wide interrupt flag, so a mission launch running other phases'

@@ -817,6 +817,7 @@
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+            600,
         );
         stop.kill_container(); // the shim fails this first kill
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -16141,6 +16142,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 watchdog_done_for_closure,
                 timeout_fired_for_closure,
                 kill_disposition_for_closure,
+                600,
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the watchdog's spawn and dispatch()'s own stores");
@@ -16555,9 +16557,10 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // existing yet, while `inactivity_deadline` is already armed. A pull
         // longer than the inactivity budget fires the watchdog against a
         // container that does not exist — and the watchdog retires. The pull
-        // then finishes and the dispatch runs UNWATCHED, with the main thread
-        // parked in `wait_with_output()` and nothing left that can kill it:
-        // #2232's own fail-open, reached through #2232's own fix.
+        // then finishes and the dispatch ran UNWATCHED, with the main thread
+        // parked in `wait_with_output()` and nothing left that could kill it:
+        // #2232's own fail-open, reached through #2232's own fix. (#2252: the
+        // watchdog now re-arms on an `Absent` kill instead of retiring.)
         //
         // `Confirmed` must mean "was observed running, now stopped". NEVER
         // OBSERVED is a different state, and its correct action is to keep
@@ -19783,5 +19786,59 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
             wait_for_watchdog_wake(&deadline, &done, &abandoned)
         });
         assert!(matches!(wake, WatchdogWake::Done), "a zero budget must never expire the deadline");
+    }
+
+    // ─── (#2252) a late container is never left unwatched ───────────────
+
+    /// A `docker` whose `kill` fails and whose `ps` never lists anything:
+    /// the watchdog's kill finds NO container (`Absent`), which is exactly
+    /// what an inline `--image` pull looks like from outside.
+    fn install_docker_that_never_shows_the_container(dir: &TempDir) -> Option<String> {
+        let path = dir.path().join("docker");
+        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = kill ] && exit 1\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::process::Command::new(&path).arg("warm-up").status().unwrap();
+        let prev = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        prev
+    }
+
+    /// The deadline fires while `docker run` is still pulling: the kill sees
+    /// no container. The watchdog must NOT return then (the container would
+    /// start unwatched): it re-arms, keeps watching, and ends only when the
+    /// main thread proves the wait is over.
+    #[test]
+    #[serial]
+    fn the_watchdog_keeps_watching_after_its_kill_found_no_container() {
+        let dir = TempDir::new().unwrap();
+        let prev_path = install_docker_that_never_shows_the_container(&dir);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let (_guard, handle) = spawn_guarded_watchdog(
+            &abandoned,
+            "darkmux-test-late-container".to_string(),
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::clone(&done),
+            Arc::clone(&timeout_fired),
+            Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+            600,
+        );
+        // The kill cycle (five attempts with backoff) takes ~4s; wait past it.
+        thread::sleep(Duration::from_secs(6));
+        let still_watching = !handle.is_finished();
+        let fired_while_waiting = timeout_fired.load(Ordering::SeqCst);
+        done.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        restore_path(prev_path);
+        assert!(still_watching, "the watchdog returned after an Absent kill and left a later container unwatched");
+        assert!(!fired_while_waiting, "a re-armed watchdog has not timed out the dispatch");
+        assert_eq!(handle.join().unwrap(), WatchdogWake::Done);
     }
 
