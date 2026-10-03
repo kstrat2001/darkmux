@@ -84,30 +84,14 @@ pub struct AcquireOpts {
     /// residency, it stays counted as occupied bytes in both passes — a
     /// desired load that cannot co-fit with the pinned set is refused
     /// honestly (the existing named `Block`), never satisfied by evicting
-    /// the pinned model. A pinned identifier that is not `is_darkmux_owned`
-    /// or not actually present in `facts.residents` is a no-op: this call
+    /// the pinned model. A pinned identifier is a no-op unless it is
+    /// `is_darkmux_owned` or equals a desired placement's own identifier (an
+    /// explicit alias, #3073), and it must be present in `facts.residents`: this call
     /// plans on residency, never fabricates occupancy for a lease naming a
     /// model that has since left (the lease ∩ `lms ps` intersection is the
     /// caller's job before calling in — see the #1487 design doc). Empty by
     /// default via [`AcquireOpts::new`] — every caller that predates #1487
     /// gets an identical plan.
-    ///
-    /// **Known residual gap (#2672 CONSIDER 6, inherited from earlier
-    /// work):** the `is_darkmux_owned` half of that no-op check is a bare
-    /// `darkmux:` PREFIX test — it has no visibility into any specific
-    /// placement's own identifier, so a pin naming a genuinely live
-    /// EXPLICIT ALIAS (a non-namespaced identifier a darkmux profile is
-    /// configured to use instead of the default namespace) never enters
-    /// `claimed` at all, even though `decide_residency` would treat that
-    /// same alias as darkmux-owned once a placement actually names it. The
-    /// #2669/#2672 Reconcile-arm protection above is therefore NOT closed
-    /// for aliased pins — only for `darkmux:*`-namespaced ones. Reproduced:
-    /// pinned `"custom"`, an aliased placement wanting more context for
-    /// the same model key, plans `Unload { "custom" }` — the live sibling
-    /// is unloaded mid-generation. Left un-widened for now (the fix would
-    /// change this field's documented "namespaced identifiers" contract, a
-    /// bigger decision than this qualifier); extend the seeding check in
-    /// `Acquisition::new` if aliased pins become a real operational pattern.
     pub pinned: Vec<String>,
 }
 
@@ -238,14 +222,18 @@ impl<'a> Acquisition<'a> {
     /// `Reconcile` arm) protects the pin too. A pinned resident is
     /// therefore never added to `removed` and stays counted as occupied in
     /// `resident_base`/`single_pool_headroom`: the occupancy half of the
-    /// contract falls out of the same mechanism. Only actually-resident,
-    /// darkmux-owned pins count: a lease naming a model that has since left
-    /// residency (or a non-namespaced identifier) is a no-op, never
+    /// contract falls out of the same mechanism. Only actually-resident
+    /// pins that are darkmux-owned or name a desired placement's alias count:
+    /// a lease naming a model that has since left residency (or an
+    /// un-named non-namespaced identifier) is a no-op, never
     /// fabricated occupancy — `facts.residents` (i.e. `lms ps`) is the truth.
     fn new(desired: &'a [Placement], facts: &'a Facts, pinned: &[String]) -> Self {
         let claimed = pinned
             .iter()
-            .filter(|id| is_darkmux_owned(id) && facts.residents.iter().any(|r| r.identifier == **id))
+            .filter(|id| {
+                (is_darkmux_owned(id) || desired.iter().any(|p| p.identifier == **id))
+                    && facts.residents.iter().any(|r| r.identifier == **id)
+            })
             .cloned()
             .collect();
         Acquisition {
@@ -1884,6 +1872,47 @@ mod tests {
             "the Block must name the STALE resident's own identifier, not the placement's: {:?}",
             plan.actions
         );
+    }
+
+    #[test]
+    fn pinned_alias_resident_is_claimed_when_a_placement_names_it_3073() {
+        // #3073 1.4 / #3074 B10 sibling: a live lease on an explicit alias
+        // (no `darkmux:` prefix) that a desired placement also names must
+        // claim it, so the Reconcile arm Blocks instead of unloading the
+        // alias mid-generation.
+        let f = facts(vec![resident("custom", "m", 20_000, None)]);
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["custom"]);
+        let aliased =
+            Placement { model_key: "m".into(), identifier: "custom".into(), min_ctx: 32_768, seat: "test".into() };
+
+        let plan = plan_acquire(&[aliased], &f, pinned, &no_est());
+
+        assert!(
+            plan.actions.iter().all(|a| !matches!(&a.action, Action::Unload { .. })),
+            "a leased alias must never be unloaded: {:?}",
+            plan.actions
+        );
+        assert!(
+            matches!(
+                plan.actions.first(),
+                Some(PlannedAction {
+                    reason: Reason::ClaimedResidentInsufficientCtx { identifier, .. },
+                    ..
+                }) if identifier == "custom"
+            ),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn pinned_alias_nobody_names_stays_unclaimed_3073() {
+        // The inverted case: a non-namespaced pin that no desired placement
+        // names is user state and still never enters `claimed`.
+        let f = facts(vec![resident("custom", "other", 20_000, None)]);
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["custom"]);
+        let plan = plan_acquire(&[placement("m", 32_768)], &f, pinned, &no_est());
+        assert_eq!(plan.actions, vec![load_action("m", 32_768)]);
     }
 
     #[test]

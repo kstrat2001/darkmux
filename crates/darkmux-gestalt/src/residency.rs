@@ -54,25 +54,30 @@ pub enum ResidencyDecision {
 /// same weights — the identifier-only check missed that collision and let a
 /// doomed second load reach the host's own OOM guardrail (#1271).
 ///
+/// A seat dispatches to its placement's own identifier, so only the resident
+/// whose identifier equals it is judged for Reuse (#3074 B10): judging a
+/// different `darkmux:` copy of the same modelKey would report Reuse for an
+/// instance the dispatch never reaches. With no exact copy, another
+/// darkmux-owned copy of the key is never reusable and is never left beside
+/// the new load (two full copies of the same weights are the #1271 OOM
+/// class), so it is reconciled: unloaded, then the placement loads its own
+/// identifier. The claimed-resident guard still refuses to unload one a live
+/// lease holds.
+///
 /// A resident counts as darkmux's own when its identifier is in the
 /// `darkmux:` namespace OR equals the exact identifier THIS placement loads
-/// under — the second arm covers an explicit alias, the documented namespace
-/// opt-out, whose resident must not misclassify as foreign user state.
+/// under, which covers an explicit alias, the documented namespace opt-out.
 ///
 /// Ownership partitions BEFORE matching (absolute ownership, 2026-07-10,
-/// #1274): the first darkmux-owned/alias resident sharing the modelKey (in
-/// host-reported order) decides Reuse vs Reconcile; foreign residents are
-/// never candidates, only facts. A foreign copy listed AHEAD of a darkmux
-/// copy therefore no longer shadows it (the review's first-match-across-
-/// ownership rule Blocked there — a named cutover behavior change; see the
-/// crate docs). Only when no owned resident shares the modelKey does a
-/// foreign one surface, as [`ResidencyDecision::ForeignDuplicate`].
+/// #1274): foreign residents are never candidates, only facts, and a foreign
+/// copy listed ahead of a darkmux copy does not shadow it. Only when no
+/// owned resident shares the modelKey does a foreign one surface, as
+/// [`ResidencyDecision::ForeignDuplicate`].
 pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyDecision {
-    let owned = residents.iter().find(|r| {
-        r.model_key == p.model_key
-            && (is_darkmux_owned(&r.identifier) || r.identifier == p.identifier)
-    });
-    if let Some(found) = owned {
+    let same_key = || residents.iter().filter(|r| r.model_key == p.model_key);
+    let exact = same_key().find(|r| r.identifier == p.identifier);
+    let other_owned = same_key().find(|r| is_darkmux_owned(&r.identifier));
+    if let Some(found) = exact {
         return if ctx_sufficient(found.ctx, p.min_ctx) {
             ResidencyDecision::Reuse {
                 identifier: found.identifier.clone(),
@@ -85,7 +90,13 @@ pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyD
             }
         };
     }
-    match residents.iter().find(|r| r.model_key == p.model_key) {
+    if let Some(other) = other_owned {
+        return ResidencyDecision::Reconcile {
+            stale_identifier: other.identifier.clone(),
+            stale_ctx: other.ctx,
+        };
+    }
+    match same_key().next() {
         Some(foreign) => {
             ResidencyDecision::ForeignDuplicate { foreign_identifier: foreign.identifier.clone() }
         }
@@ -245,6 +256,40 @@ mod tests {
                 stale_identifier: "darkmux:devstral".into(),
                 stale_ctx: 20_000,
             }
+        );
+    }
+
+    #[test]
+    fn other_darkmux_copy_is_not_a_reuse_candidate() {
+        // #3074 B10 S1/S3: a different darkmux: copy of the key is not the
+        // instance the seat addresses on the wire: it is replaced, never
+        // reused, even when its ctx would suffice.
+        let p = placement("m", 32_000, Some("darkmux:m"));
+        let big_other = vec![resident("darkmux:other", "m", 100_000)];
+        assert_eq!(
+            decide_residency(&big_other, &p),
+            ResidencyDecision::Reconcile {
+                stale_identifier: "darkmux:other".into(),
+                stale_ctx: 100_000
+            }
+        );
+        let both = vec![resident("darkmux:other", "m", 100_000), resident("darkmux:m", "m", 4_096)];
+        assert_eq!(
+            decide_residency(&both, &p),
+            ResidencyDecision::Reconcile { stale_identifier: "darkmux:m".into(), stale_ctx: 4_096 }
+        );
+    }
+
+    #[test]
+    fn exact_identifier_wins_over_earlier_darkmux_copy() {
+        // #3074 B10 S2: the placement's own copy is judged even when another
+        // darkmux: copy is listed first and is undersized.
+        let p = placement("m", 32_000, Some("darkmux:m"));
+        let residents =
+            vec![resident("darkmux:other", "m", 4_096), resident("darkmux:m", "m", 100_000)];
+        assert_eq!(
+            decide_residency(&residents, &p),
+            ResidencyDecision::Reuse { identifier: "darkmux:m".into(), resident_ctx: 100_000 }
         );
     }
 }

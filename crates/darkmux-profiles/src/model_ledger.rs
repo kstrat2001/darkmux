@@ -804,6 +804,11 @@ pub struct LedgerInputs {
     pub margin_percent: Option<u64>,
     /// `None` = enumeration failed; `Some(vec![])` = ran, found none.
     pub workers: Option<Vec<WorkerProc>>,
+    /// `true` when the `lms ps` probe itself failed, so `residents` is
+    /// "unknown", not "none" (#3074). Without this a failed probe reads as an
+    /// empty machine and the worker footprint is subtracted from used memory
+    /// as if it were not darkmux's, which paints the ledger green.
+    pub residents_unknown: bool,
     /// Pre-populated `error`-severity messages from the gather stage (probe
     /// failures) — `compute_ledger` appends its own `warn`/`info` entries
     /// on top (#1821).
@@ -916,6 +921,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         compressor_bytes,
         margin_percent,
         workers,
+        residents_unknown,
         mut messages,
     } = inputs;
 
@@ -1037,8 +1043,11 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
 
     // Current-footprint attribution (#1286: the degradation ladder is
     // documented in the output itself, never silently precise).
-    let (attribution, attribution_note, current_total) =
-        attribute_current(&mut rows, workers.as_deref());
+    let (attribution, attribution_note, current_total) = if residents_unknown {
+        unattributed_current(workers.as_deref())
+    } else {
+        attribute_current(&mut rows, workers.as_deref())
+    };
 
     // Limit: #1243 budget > physical pool capacity > none.
     let (limit_bytes, limit_source) = match (budget_bytes, pool) {
@@ -1137,9 +1146,9 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // Machine-total color per the #1286 semantics, updated by #1821: arms 3
     // and 4 now key on `projected_total`, not `sum_potential` alone.
     let mut machine_shrink: Option<String> = None;
-    let machine_state = match limit_bytes {
-        _ if pressure.red => LedgerState::Red,
-        Some(limit) if current_total.is_some_and(|c| c > limit) => LedgerState::Red,
+    let machine_state = match forced_machine_state(&pressure, current_total, limit_bytes, residents_unknown) {
+        Some(forced) => forced,
+        None => match limit_bytes {
         Some(limit) if projected_total_bytes.is_some_and(|p| p <= limit) && unpriced_models == 0 => {
             LedgerState::Green
         }
@@ -1165,6 +1174,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         // back to the darkmux-only comparison this cascade used to make.
         Some(_) => LedgerState::Unknown,
         None => LedgerState::Unknown,
+        },
     };
 
     // Per-model tint. Unified memory is ONE pool with shared fate, so the
@@ -1231,6 +1241,38 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
 /// threshold used to be for why neither is a trigger.
 fn pressure_red(margin_percent: Option<u64>) -> bool {
     margin_percent.is_some_and(|p| p < MARGIN_PERCENT_RED)
+}
+
+/// The machine verdicts that no projection can overrule: red pressure, a
+/// current footprint already over the limit, and (#3074) a failed `lms ps`,
+/// where the resident set and so the potential are unknown and no fit
+/// guarantee can be given however low the pool reads.
+fn forced_machine_state(
+    pressure: &PressureSnapshot,
+    current_total: Option<u64>,
+    limit_bytes: Option<u64>,
+    residents_unknown: bool,
+) -> Option<LedgerState> {
+    let over_limit = limit_bytes.zip(current_total).is_some_and(|(limit, c)| c > limit);
+    if pressure.red || over_limit {
+        Some(LedgerState::Red)
+    } else if residents_unknown {
+        Some(LedgerState::Unknown)
+    } else {
+        None
+    }
+}
+
+/// The attribution when `lms ps` failed (#3074): there are no rows to split
+/// the workers across, but their bytes are still the machine's current
+/// footprint, so the total stays and only the attribution is withheld.
+fn unattributed_current(workers: Option<&[WorkerProc]>) -> (Attribution, String, Option<u64>) {
+    let total = workers.map(|w| w.iter().map(WorkerProc::memory_bytes).sum());
+    (
+        Attribution::Unavailable,
+        "resident model list unavailable (`lms ps` failed); worker footprint not attributed".to_string(),
+        total,
+    )
 }
 
 /// Attribute worker footprints to model rows, filling `current_bytes`.
@@ -1535,9 +1577,11 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     let mut messages = Vec::new();
 
     let ps_rows = bounded_json_rows(lms_bin, &["ps", "--json"], "ps", &mut messages);
-    let ls_rows = bounded_json_rows(lms_bin, &["ls", "--json"], "ls", &mut messages);
+    let ls_rows =
+        bounded_json_rows(lms_bin, &["ls", "--json"], "ls", &mut messages).unwrap_or_default();
 
-    let residents: Vec<ResidentInput> = ps_rows.iter().map(resident_from_ps_json).collect();
+    let residents: Vec<ResidentInput> =
+        ps_rows.iter().flatten().map(resident_from_ps_json).collect();
     let catalog: Vec<CatalogFact> = ls_rows
         .iter()
         .filter_map(|v| {
@@ -1616,6 +1660,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
             compressor_bytes,
             margin_percent,
             workers,
+            residents_unknown: ps_rows.is_none(),
             messages,
         },
         now_ms(),
@@ -1741,25 +1786,24 @@ fn bin_label(bin: &str) -> &str {
     bin.rsplit(['/', '\\']).next().unwrap_or(bin)
 }
 
-/// `lms <args>` bounded → parsed JSON array rows (empty + warning on any
-/// failure — same leniency as the rest of the gather).
+/// `lms <args>` bounded → parsed JSON array rows. `None` (plus an `error`
+/// message) on any failure, so a caller can tell "the probe failed" from "the
+/// probe ran and found nothing" (#3074).
 fn bounded_json_rows(
     bin: &str,
     args: &[&str],
     phase: &'static str,
     messages: &mut Vec<LedgerMessage>,
-) -> Vec<serde_json::Value> {
-    let Some(out) = bounded_stdout(bin, args, phase, LMS_PROBE_BOUND, messages) else {
-        return Vec::new();
-    };
+) -> Option<Vec<serde_json::Value>> {
+    let out = bounded_stdout(bin, args, phase, LMS_PROBE_BOUND, messages)?;
     match serde_json::from_str::<serde_json::Value>(&out) {
-        Ok(serde_json::Value::Array(rows)) => rows,
+        Ok(serde_json::Value::Array(rows)) => Some(rows),
         _ => {
             messages.push(LedgerMessage::error(format!(
                 "`{bin} {}` output is not a JSON array",
                 args.join(" ")
             )));
-            Vec::new()
+            None
         }
     }
 }
@@ -2143,6 +2187,7 @@ mod tests {
                 WorkerProc { pid: 1, rss_bytes: 18_000_000_000, footprint_bytes: None },
                 WorkerProc { pid: 2, rss_bytes: 15_000_000_000, footprint_bytes: None },
             ]),
+            residents_unknown: false,
             messages: Vec::new(),
         }
     }
@@ -3995,4 +4040,39 @@ mod tests {
         assert_eq!(read::<LedgerState>(), LedgerState::Unknown);
         assert_eq!(serde_json::from_str::<Owner>("\"darkmux\"").unwrap(), Owner::Darkmux, "known values still read");
     }
+
+    #[test]
+    fn failed_ps_probe_never_paints_green_nor_drops_worker_bytes_3074() {
+        // #3074: `lms ps` failed, so residents is EMPTY BY IGNORANCE. The
+        // 60G worker is darkmux's own footprint; it must stay in the machine
+        // current, and the verdict must be Unknown, never Green.
+        let mut inputs = base_inputs();
+        inputs.residents = Vec::new();
+        inputs.residents_unknown = true;
+        inputs.workers =
+            Some(vec![WorkerProc { pid: 1, rss_bytes: 60_000_000_000, footprint_bytes: None }]);
+        inputs.pool = Some(PoolSnapshot {
+            capacity_bytes: 128_000_000_000,
+            used_bytes: Some(125_000_000_000),
+            ..base_inputs().pool.expect("base pool")
+        });
+        inputs.messages = vec![LedgerMessage::error("lms ps failed".to_string())];
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.attribution, Attribution::Unavailable);
+        assert_eq!(ledger.machine.current_bytes, Some(60_000_000_000));
+        assert_eq!(ledger.machine.state, LedgerState::Unknown);
+    }
+
+    #[test]
+    fn genuinely_empty_ps_with_workers_keeps_its_verdict_3074() {
+        // Inverted case: `lms ps` ran and found nothing, so the empty list is
+        // a fact and the existing no-residents reading is unchanged.
+        let mut inputs = base_inputs();
+        inputs.residents = Vec::new();
+        inputs.workers = Some(Vec::new());
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.attribution, Attribution::PerProcess);
+        assert_ne!(ledger.machine.state, LedgerState::Unknown);
+    }
+
 }
