@@ -813,11 +813,13 @@ fn reconcile_phase_warning(mission_id: &str, phase: &Phase, refused: Option<&any
 /// existing is the signal this function uses to no-op cleanly rather than
 /// erroring on a missing mission.
 ///
-/// Closes the mission via [`mission_close_with_reasoning`], whose own
-/// #1504 reconcile (above) rolls any Planned/Running phases — and,
-/// transitively, their steps — to `Abandoned` first, so the mission reaches
-/// an honest terminal `Finalized` state with no live children left behind.
-/// Best-effort: a `mission_close_with_reasoning` refusal is swallowed
+/// Closes the mission as `Aborted` (#3074: it used to close `Finalized`, the
+/// success terminal, so a mint that died before any phase existed read
+/// `Complete` on the runs board). The #1504 reconcile rolls any
+/// Planned/Running phases — and, transitively, their steps — to `Abandoned`
+/// first, so the mission reaches an honest terminal state with no live
+/// children left behind.
+/// Best-effort: a terminal-transition refusal is swallowed
 /// (mirrors `finalize_mission`'s own discipline) — the caller's original
 /// error is what propagates; this is defensive cleanup, never the primary
 /// failure signal.
@@ -841,7 +843,7 @@ pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, paylo
     // signal that reconcile was even attempted, defeating the entire point
     // of this function.
     if let Err(e) =
-        mission_terminal_with_reasoning_and_payload(mission_id, MissionStatus::Finalized, Some(reason), payload)
+        mission_terminal_with_reasoning_and_payload(mission_id, MissionStatus::Aborted, Some(reason), payload)
     {
         eprintln!(
             "warning: mission `{mission_id}` errored during mint AND could not be reconciled to \
@@ -1694,7 +1696,11 @@ mod tests {
         reconcile_mint_failure("test-mission", "mission launch errored during mint: disk full");
 
         let mission = load_mission("test-mission").unwrap();
-        assert_eq!(mission.status, MissionStatus::Finalized, "a partial mint is closed out, never left stranded Active");
+        assert_eq!(
+            mission.status,
+            MissionStatus::Aborted,
+            "a partial mint is closed out as Aborted (#3074), never Finalized (the success terminal) and never left stranded Active"
+        );
         assert_eq!(load_phase("test-mission", "p1").unwrap().status, PhaseStatus::Abandoned);
     }
 

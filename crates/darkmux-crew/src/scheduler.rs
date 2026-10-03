@@ -748,6 +748,11 @@ pub fn run_step_graph(
     let bus = std::sync::Arc::new(bus);
 
     loop {
+        // (#3074) A signal observed between waves ends the run here. The
+        // steps still `Planned` stay `Planned` (the launcher's phase-exit
+        // sweep abandons them) and the `Err` is what makes the launcher
+        // close the run as an error rather than a completed one.
+        darkmux_types::interrupt::bail_if_set("the scheduler stopped before starting the next wave")?;
         let ready_ids: Vec<String> = steps
             .values()
             .filter(|s| {
@@ -2787,6 +2792,38 @@ mod tests {
             &[],
         )
         .unwrap()
+    }
+
+    /// (#3074) Once a signal was observed no further wave starts: the graph
+    /// returns an interrupt `Err` and the ready step never leaves `Planned`.
+    #[test]
+    #[serial_test::serial]
+    fn run_step_graph_starts_no_wave_after_a_signal() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let result = run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        );
+        darkmux_types::interrupt::reset_for_test();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Planned, "no step may start after the signal");
     }
 
     // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────

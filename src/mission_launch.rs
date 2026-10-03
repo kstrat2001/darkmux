@@ -1682,6 +1682,11 @@ pub fn launch(
         }
     }
 
+    // (#3074) A signal can land after the last wave returned `Ok` (the
+    // interrupted step is only Degraded). The run is still interrupted, so it
+    // closes through the error path below instead of as a completed one.
+    let graph_result = fail_if_interrupted(graph_result);
+
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
     // here with NO finalize, stranding the mission Active with `Running`
     // phases + steps forever. Reconcile the stranded steps and drive the
@@ -1874,6 +1879,17 @@ pub fn launch(
     drop(mission_presence);
     crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
+}
+
+/// (#3074) A graph pass that returned `Ok` while a signal was observed is
+/// still an interrupted run: it must close as an error, never as a completed
+/// one. An `Err` passes through untouched.
+fn fail_if_interrupted(
+    result: Result<crew::scheduler::SchedulerReport>,
+) -> Result<crew::scheduler::SchedulerReport> {
+    let report = result?;
+    darkmux_types::interrupt::bail_if_set("mission launch observed a signal before finalizing")?;
+    Ok(report)
 }
 
 /// (#2300) Expand every `grow` template a phase declares, from the output
@@ -4809,6 +4825,22 @@ mod tests {
     use std::env;
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
+
+    /// (#3074) An `Ok` graph pass is turned into an interrupt error once a
+    /// signal was observed, and left alone before one. An `Err` is never
+    /// replaced.
+    #[test]
+    #[serial_test::serial]
+    fn fail_if_interrupted_turns_an_ok_pass_into_an_error_only_after_a_signal() {
+        darkmux_types::interrupt::reset_for_test();
+        assert!(fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).is_ok());
+        darkmux_types::interrupt::mark_interrupted();
+        let err = fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).unwrap_err();
+        assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
+        let own = fail_if_interrupted(Err(anyhow!("its own failure"))).unwrap_err();
+        assert_eq!(own.to_string(), "its own failure");
+        darkmux_types::interrupt::reset_for_test();
+    }
 
     // ─── #2914: a task never runs on the machine's utility model ───────
 
@@ -7930,9 +7962,9 @@ mod tests {
 
         assert_eq!(
             mission_status_on_disk(mission_id),
-            MissionStatus::Finalized,
-            "a partial mint must reconcile to terminal — one fresh mission, terminal, never an \
-             accumulating Active row (#1504)"
+            MissionStatus::Aborted,
+            "a partial mint must reconcile to a non-success terminal — one fresh mission, never an \
+             accumulating Active row (#1504) and never the Finalized success terminal (#3074)"
         );
     }
 

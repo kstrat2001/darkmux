@@ -1669,17 +1669,12 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             //   phase to `Complete` before the mission ever reaches
             //   `Finalized`, and never writes an envelope — an intentional
             //   gap, documented at `finalize_mission_if_complete`'s own doc.
-            // - `reconcile_mint_failure` (`crates/darkmux-crew/src/
-            //   lifecycle.rs`, the ONLY other production path that leaves a
-            //   `Finalized` mission with no envelope) is a `mission launch`
-            //   MINT failure backstop: it closes straight to `Finalized` —
-            //   the SUCCESS terminal — after force-abandoning every phase
-            //   it managed to mint (`mission_close_with_reasoning` ->
-            //   `reconcile_mission_phases_terminal`). Before this fix, that
-            //   collapsed onto the exact same `Complete` the happy path
-            //   above gets — a mission that abandoned every phase read
-            //   identically to one that did nothing wrong, #1564's own
-            //   conflation, one layer under #2406's phase-level rollup.
+            // - A Finalized mission whose phases were all force-abandoned.
+            //   `reconcile_mint_failure` used to close that way; since #3074
+            //   it closes `Aborted` (the `Aborted` arm below), so this shape
+            //   now only appears in records an older binary wrote. Before
+            //   #1564 it collapsed onto the same `Complete` the happy path
+            //   above gets.
             //
             // Neither case has an envelope to consult, but both leave a
             // real signal on disk: `reconcile_mission_phases_terminal`
@@ -3503,9 +3498,9 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
     }
 
-    /// (#1564) The mint-failure backstop's actual on-disk shape:
-    /// `reconcile_mint_failure` (`crates/darkmux-crew/src/lifecycle.rs`)
-    /// closes a mission straight to `Finalized` — the SUCCESS terminal —
+    /// (#1564) The legacy mint-failure on-disk shape (since #3074
+    /// `reconcile_mint_failure` closes `Aborted` instead): a mission closed
+    /// straight to `Finalized` — the SUCCESS terminal —
     /// after force-abandoning every phase it managed to mint, and writes NO
     /// envelope at all. Before this fix, the `Ok(None)` arm's blanket
     /// `RunStatus::Complete` collapsed that onto the exact same status a
