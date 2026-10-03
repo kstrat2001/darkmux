@@ -637,6 +637,34 @@ fn the_catch_up_thread_backfills_a_watermark_without_a_manual_tick() {
     assert_eq!(handles(&hub.entries()), ["b1", "cli1"]);
 }
 
+/// (#3075) The backfill rides a connection of its own: a writer stuck holding
+/// the live connection (a silent hub) does not hold the backfill up.
+#[test]
+fn the_backfill_does_not_wait_for_the_live_connection() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let daemon = sink(&hub, &dir, SinkPolicy::LongLived);
+    let missed = rec("cli1", 30);
+    write_file_only(&dir, &missed);
+    hub_link::OutageWatermark::new(watermark_file(&dir)).record(&missed.ts).unwrap();
+    let _held = daemon.conn.lock().unwrap();
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["cli1"], "the tick backfilled while the live connection was held");
+}
+
+/// (#3075) A writer that wins the connection after the sink disabled itself
+/// does not touch the hub.
+#[test]
+fn a_disabled_sink_skips_the_hub_after_taking_the_connection() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::OneShot);
+    s.disabled.store(true, Ordering::Release);
+    let delivery = s.deliver(&rec("late", 1), crate::HubStream::Work).unwrap();
+    assert!(matches!(delivery, Delivery::Skipped), "got {delivery:?}");
+    assert!(hub.entries().is_empty());
+}
+
 /// A backfill the hub refuses must leave the watermark for the next recovery.
 #[test]
 fn a_failed_backfill_keeps_the_persisted_watermark() {

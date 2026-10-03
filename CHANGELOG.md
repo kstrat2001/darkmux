@@ -176,7 +176,11 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   (the lab/fleet sink boundary now has a conformance test). The Redis sink keeps
   one bounded connection instead of opening a connection and a thread per record
   (300 records through the sink: 77 ms before, 11 ms after, on loopback), and
-  reconnects after any error. The outage backfill re-sends every day file from
+  reconnects after any error; the first record after a hub restart is retried on a
+  fresh connection instead of lost. A writer that finds the connection busy skips
+  the hub (its record is in the local file; the backfill re-sends it), so a silent
+  hub costs one writer a timeout, not each in turn (8 writers: waits grew 1 to 8 s
+  before, about 1 s after), and the backfill runs on its own connection. The outage backfill re-sends every day file from
   the outage start through today, so a multi-day outage is covered. Hook outbox
   compaction can no longer delete an undelivered line when the cursor reset
   fails or the process dies after the repack (a marker file makes the pending
