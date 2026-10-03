@@ -4660,9 +4660,7 @@ fn run_with_sleeper(
                     // kind of check-in: once this logical turn has generated as
                     // many tokens as the context window holds, no further
                     // continuation can fit the prefill it would resend.
-                    let window_filled = compaction_cfg
-                        .context_window
-                        .is_some_and(|window| turn_completion_tokens >= window);
+                    let window_filled = turn_fills_window(compaction_cfg.context_window, turn_completion_tokens);
                     // Only judge while the thought is still open. After the
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
@@ -4876,58 +4874,26 @@ fn run_with_sleeper(
                     //     THOUGHT on the exhausting call stops here, with the
                     //     checkpoint record above already carrying the
                     //     `conclude` verdict and the tail ratio that say why.
-                    if generation_budget_exhausted {
-                        eprintln!(
-                            "darkmux-runtime: escalation_triggered — turn {turns} hit the \
-                             generation check-in ({generation_interval} tokens) \
-                             {generation_continuations_this_turn} times, exceeding the \
-                             budget of {max_generation_continuations} continuations \
-                             (answer_max_tokens {answer_max_tokens} / \
-                             generation_checkpoint_interval_tokens {generation_interval}). \
-                             Emitting EscalationTriggered for frontier handoff with \
-                             everything banked so far ATTACHED. (#2171)"
-                        );
-                        trajectory.append_escalation_triggered(
-                            turns,
-                            escalation_reason_str(
-                                EscalationReason::GenerationCheckpointBudgetExhausted,
-                            ),
-                            model,
-                            latest_prompt_tokens,
-                        );
-                        return Ok(LoopOutcome {
-                            final_answer: turn.pending_answer(),
-                            terminal_reason: TerminalReason::EscalationTriggered(
-                                EscalationReason::GenerationCheckpointBudgetExhausted,
-                            ),
+                    if let Some(limit) = ContinuationLimit::reached(generation_budget_exhausted, window_filled) {
+                        return Ok(continuation_limit_outcome(
+                            trajectory,
+                            limit,
+                            ContinuationFacts {
+                                turns,
+                                turn_tokens: turn_completion_tokens,
+                                checkpoints: checkpoints_used,
+                                model,
+                                latest_prompt_tokens,
+                                turn_delay_ms,
+                                generation_interval,
+                                generation_continuations: generation_continuations_this_turn,
+                                max_generation_continuations,
+                                answer_max_tokens,
+                            },
+                            turn.pending_answer(),
                             messages,
-                            turn_delay_effective_ms: turn_delay_ms,
-                            failed_to_run: failed_to_run.clone(),
-                        });
-                    }
-                    if window_filled {
-                        eprintln!(
-                            "darkmux-runtime: escalation_triggered — turn {turns} generated \
-                             {turn_completion_tokens} tokens across {checkpoints_used} \
-                             checkpoints, as many as the context window holds, so it cannot be \
-                             resumed again. Emitting EscalationTriggered for frontier handoff \
-                             with everything banked so far ATTACHED. (#3074)"
-                        );
-                        trajectory.append_escalation_triggered(
-                            turns,
-                            escalation_reason_str(EscalationReason::TurnContinuationsExhausted),
-                            model,
-                            latest_prompt_tokens,
-                        );
-                        return Ok(LoopOutcome {
-                            final_answer: turn.pending_answer(),
-                            terminal_reason: TerminalReason::EscalationTriggered(
-                                EscalationReason::TurnContinuationsExhausted,
-                            ),
-                            messages,
-                            turn_delay_effective_ms: turn_delay_ms,
-                            failed_to_run: failed_to_run.clone(),
-                        });
+                            failed_to_run.clone(),
+                        ));
                     }
                     // Everything reaching here is either a clean continue or a
                     // degenerate THOUGHT. The old third branch — abandon the
@@ -5791,6 +5757,101 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
                 n
             }
         })
+}
+
+/// (#3074) Whether one logical turn has generated as many tokens as the
+/// context window holds. Without a configured window there is nothing to
+/// derive the bound from, so it never is.
+fn turn_fills_window(context_window: Option<u32>, turn_tokens: u32) -> bool {
+    context_window.is_some_and(|window| turn_tokens >= window)
+}
+
+/// Which bound ended a turn's run of checkpoint continuations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationLimit {
+    /// (#2171) The generation check-in's continuation count.
+    GenerationBudget,
+    /// (#3074) The turn generated as many tokens as the context window holds.
+    ContextWindow,
+}
+
+impl ContinuationLimit {
+    /// The bound that applies, the more specific count first.
+    fn reached(generation_budget_exhausted: bool, window_filled: bool) -> Option<Self> {
+        match (generation_budget_exhausted, window_filled) {
+            (true, _) => Some(Self::GenerationBudget),
+            (false, true) => Some(Self::ContextWindow),
+            (false, false) => None,
+        }
+    }
+
+    fn reason(self) -> EscalationReason {
+        match self {
+            Self::GenerationBudget => EscalationReason::GenerationCheckpointBudgetExhausted,
+            Self::ContextWindow => EscalationReason::TurnContinuationsExhausted,
+        }
+    }
+}
+
+/// The numbers [`continuation_limit_outcome`] reports.
+struct ContinuationFacts<'a> {
+    turns: u32,
+    turn_tokens: u32,
+    checkpoints: u32,
+    model: &'a str,
+    latest_prompt_tokens: u32,
+    turn_delay_ms: u64,
+    generation_interval: u32,
+    generation_continuations: u32,
+    max_generation_continuations: u32,
+    answer_max_tokens: u32,
+}
+
+/// The escalation for a turn that ran out of checkpoint continuations: say so
+/// on stderr, record it, and hand the banked work on.
+fn continuation_limit_outcome(
+    trajectory: &mut Trajectory,
+    limit: ContinuationLimit,
+    f: ContinuationFacts<'_>,
+    final_answer: Option<String>,
+    messages: Vec<Message>,
+    failed_to_run: Vec<FailedExec>,
+) -> LoopOutcome {
+    let detail = match limit {
+        ContinuationLimit::GenerationBudget => format!(
+            "hit the generation check-in ({} tokens) {} times, exceeding the budget of {} \
+             continuations (answer_max_tokens {} / generation_checkpoint_interval_tokens {}). \
+             (#2171)",
+            f.generation_interval,
+            f.generation_continuations,
+            f.max_generation_continuations,
+            f.answer_max_tokens,
+            f.generation_interval
+        ),
+        ContinuationLimit::ContextWindow => format!(
+            "generated {} tokens across {} checkpoints, as many as the context window holds, \
+             so it cannot be resumed again. (#3074)",
+            f.turn_tokens, f.checkpoints
+        ),
+    };
+    eprintln!(
+        "darkmux-runtime: escalation_triggered — turn {} {detail} Emitting EscalationTriggered \
+         for frontier handoff with everything banked so far ATTACHED.",
+        f.turns
+    );
+    trajectory.append_escalation_triggered(
+        f.turns,
+        escalation_reason_str(limit.reason()),
+        f.model,
+        f.latest_prompt_tokens,
+    );
+    LoopOutcome {
+        final_answer,
+        terminal_reason: TerminalReason::EscalationTriggered(limit.reason()),
+        messages,
+        turn_delay_effective_ms: f.turn_delay_ms,
+        failed_to_run,
+    }
 }
 
 /// Inactivity soft-warning threshold (seconds) for a given budget (#466,

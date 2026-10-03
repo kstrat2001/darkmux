@@ -1637,6 +1637,12 @@ pub fn launch(
         &seed_artifacts,
         );
         collect_degraded(&graph_result, &mut degraded_steps);
+        // (#3074) A pass that returned `Ok` while a signal was observed (the
+        // scheduler starts no wave after one, and an interrupted step is only
+        // Degraded) is still an interrupted run: it ends here, so no later
+        // phase starts, and closes through the error path below rather than
+        // as a completed one.
+        graph_result = fail_if_interrupted(graph_result);
         if graph_result.is_err() {
             break;
         }
@@ -1681,11 +1687,6 @@ pub fn launch(
             }
         }
     }
-
-    // (#3074) A signal can land after the last wave returned `Ok` (the
-    // interrupted step is only Degraded). The run is still interrupted, so it
-    // closes through the error path below instead of as a completed one.
-    let graph_result = fail_if_interrupted(graph_result);
 
     // (#1406, F4) A scheduler-level `Err` mid-run would otherwise `?`-return
     // here with NO finalize, stranding the mission Active with `Running`
