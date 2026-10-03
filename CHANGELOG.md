@@ -171,6 +171,24 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 
 ### Changed (5.0)
 
+- **Flow hub and hook outbox fixes** (5.0, #3073, #3074). A record whose session
+  is a lab run no longer reaches the fleet hub, live or in an outage backfill
+  (the lab/fleet sink boundary now has a conformance test). The Redis sink keeps
+  one bounded connection instead of opening a connection and a thread per record
+  (300 records through the sink: 77 ms before, 11 ms after, on loopback), and
+  reconnects after any error; the first record after a hub restart is retried on a
+  fresh connection instead of lost. A writer that finds the connection busy writes
+  on a connection of its own instead of queuing, so a silent hub costs each writer
+  at most one timeout, in parallel, not each in turn (8 writers: waits grew 1 to
+  8 s before, about 1 s after), and the backfill runs on its own connection. The outage backfill re-sends every day file from
+  the outage start through today, so a multi-day outage is covered. Hook outbox
+  compaction can no longer delete an undelivered line when the cursor reset
+  fails or the process dies after the repack (a marker file makes the pending
+  reset recoverable), and a non-UTF-8 outbox line is quarantined with
+  `hook.failed` instead of wedging its rule. `flow integrity-check` gains
+  `chain_restarted` and a warning line when a day file's first line was set aside
+  and the chain reseeded; `doctor` names it.
+
 - **Read routes never show host facts to a stranger** (5.0, #3072). A caller
   that is neither this machine nor a token holder no longer sees an address, a
   tailnet name or a home directory in any JSON read (`/fleet/view`,

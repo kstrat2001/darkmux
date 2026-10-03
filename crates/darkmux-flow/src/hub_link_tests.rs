@@ -416,8 +416,12 @@ fn a_failed_backfill_keeps_the_outage_so_the_next_probe_retries() {
     assert_eq!(handles(&hub.entries()), ["g1", "g2", "g3", "g4", "after"]);
 }
 
+fn since_a_day_ago(now: i64) -> String {
+    ts_utc_at(now - 86_400)
+}
+
 #[test]
-fn the_backfill_reads_two_days_and_keeps_only_the_newest_up_to_the_cap() {
+fn the_backfill_reads_every_day_from_the_outage_start_and_keeps_only_the_newest_up_to_the_cap() {
     let dir = TempDir::new().unwrap();
     let now = current_epoch_secs();
     let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
@@ -459,14 +463,55 @@ fn the_backfill_reads_two_days_and_keeps_only_the_newest_up_to_the_cap() {
     };
     assert_eq!(
         names(&all),
-        ["y", "a", "b", "c"],
-        "yesterday and today only, oldest first; the 3-day-old file is out of scope"
+        ["ancient", "y", "a", "b", "c"],
+        "every day file from the outage start (#3073), oldest first"
     );
+    let recent = since_a_day_ago(now);
+    let narrow = Backfill { dir: dir.path(), now_secs: now, since: &recent, own_uid: None, skip_identity: "", cap: None }.lines();
+    assert_eq!(names(&narrow), ["y", "a", "b", "c"], "a day file wholly before the outage start is not read");
     assert_eq!(
         names(&q(Some(2)).lines()),
         ["b", "c"],
         "a cap keeps the newest"
     );
+}
+
+/// (#3073) Only the day files from the outage start's day through today are
+/// opened: a multi-day outage reaches back, an older file stays unread.
+#[test]
+fn the_backfill_opens_day_files_from_the_outage_start_day_through_today() {
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let days: Vec<String> = (0..5).map(|n| day_utc_at(now - n * 86_400)).collect();
+    for d in &days {
+        std::fs::write(dir.path().join(format!("{d}.jsonl")), "").unwrap();
+    }
+    std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+    let since = ts_utc_at(now - 2 * 86_400);
+    let files = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.day_files();
+    let names: Vec<String> = files.iter().map(|p| p.file_stem().unwrap().to_string_lossy().to_string()).collect();
+    assert_eq!(names, [days[2].clone(), days[1].clone(), days[0].clone()]);
+}
+
+/// (#3074, contract 3) A lab run's records are in the local day file but
+/// never re-sent to the hub.
+#[test]
+fn backfill_skips_lab_session_records() {
+    use darkmux_types::session_id::{RunId, SessionId};
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
+    let line = |handle: &str, session: String| {
+        serde_json::json!({"ts": ts_utc_at(now - 10), "action": "dispatch.tool", "handle": handle, "session_id": session}).to_string()
+    };
+    let lab = SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n").wire();
+    let solo = SessionId::adhoc(RunId::standalone("s-1").unwrap(), "coder", "n").wire();
+    std::fs::write(&today, [line("lab", lab), line("solo", solo)].join("\n")).unwrap();
+    let since = ts_utc_at(now - 60);
+    let lines = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.lines();
+    let handles: Vec<String> =
+        lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
+    assert_eq!(handles, ["solo"]);
 }
 
 /// (#2101) Backfill re-sends the local day file's records, but never the
@@ -590,6 +635,77 @@ fn the_catch_up_thread_backfills_a_watermark_without_a_manual_tick() {
     stop.store(true, Ordering::Release);
     handle.join().unwrap();
     assert_eq!(handles(&hub.entries()), ["b1", "cli1"]);
+}
+
+/// (#3075) The backfill rides a connection of its own: a writer stuck holding
+/// the live connection (a silent hub) does not hold the backfill up.
+#[test]
+fn the_backfill_does_not_wait_for_the_live_connection() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let daemon = sink(&hub, &dir, SinkPolicy::LongLived);
+    let missed = rec("cli1", 30);
+    write_file_only(&dir, &missed);
+    hub_link::OutageWatermark::new(watermark_file(&dir)).record(&missed.ts).unwrap();
+    let _held = daemon.conn.lock().unwrap();
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["cli1"], "the tick backfilled while the live connection was held");
+}
+
+/// (#3075) A writer that finds the shared connection busy on a HEALTHY hub
+/// still lands live, at once, on a connection of its own: no watermark, no
+/// reliance on a daemon's backfill.
+#[test]
+fn a_writer_that_finds_the_connection_busy_lands_live_on_a_fresh_one() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::OneShot);
+    let held = s.conn.lock().unwrap();
+    s.write(&rec("busy", 1)).unwrap();
+    drop(held);
+    assert_eq!(handles(&hub.entries()), ["busy"], "landed while the connection was held");
+    assert!(
+        hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none(),
+        "a healthy hub leaves no outage watermark"
+    );
+}
+
+/// (#3075) Two concurrent writers on a healthy hub both land live, whichever
+/// one wins the shared connection.
+#[test]
+fn two_concurrent_writers_on_a_healthy_hub_both_land_live() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = Arc::new(sink(&hub, &dir, SinkPolicy::OneShot));
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|h| {
+            let (s, start) = (s.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                s.write(&rec(h, 1)).unwrap();
+            })
+        })
+        .collect();
+    threads.into_iter().for_each(|t| t.join().unwrap());
+    let mut landed = handles(&hub.entries());
+    landed.sort();
+    assert_eq!(landed, ["a", "b"]);
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none());
+}
+
+/// (#3075) A writer that wins the connection after the sink disabled itself
+/// does not touch the hub.
+#[test]
+fn a_disabled_sink_skips_the_hub_after_taking_the_connection() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::OneShot);
+    s.disabled.store(true, Ordering::Release);
+    let delivery = s.deliver(&rec("late", 1), crate::HubStream::Work).unwrap();
+    assert!(matches!(delivery, Delivery::Skipped), "got {delivery:?}");
+    assert!(hub.entries().is_empty());
 }
 
 /// A backfill the hub refuses must leave the watermark for the next recovery.

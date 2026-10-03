@@ -1508,7 +1508,7 @@ fn quarantine_path(outbox_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn quarantine_line(outbox_path: &Path, line: &str) {
+fn quarantine_line(outbox_path: &Path, line: &[u8]) {
     let path = quarantine_path(outbox_path);
     // (#2259) Owner-only on POSIX — a quarantined line is a raw copy of
     // whatever the outbox held (a torn write, potentially mid-record), so
@@ -1526,7 +1526,7 @@ fn quarantine_line(outbox_path: &Path, line: &str) {
     let opened = fs::OpenOptions::new().create(true).append(true).open(&path);
     match opened {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")) {
+            if let Err(e) = f.write_all(line).and_then(|_| f.write_all(b"\n")) {
                 eprintln!("flow::HookSink: failed to quarantine invalid outbox line into {}: {e:#}", path.display());
             }
         }
@@ -1670,7 +1670,7 @@ fn write_cursor(cursor_path: &Path, offset: u64) -> Result<()> {
 /// O(N × average-remaining-size) total work. `read_until` still only
 /// returns once it finds `\n` (or hits EOF), so this call is O(this one
 /// line's length), not O(everything left in the file).
-fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
+fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<PendingLine> {
     let mut file = fs::File::open(outbox_path).ok()?;
     file.seek(SeekFrom::Start(cursor)).ok()?;
     let mut reader = BufReader::new(file);
@@ -1682,8 +1682,29 @@ fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
         return None;
     }
     buf.pop(); // drop the trailing '\n' itself
-    let line = String::from_utf8(buf).ok()?;
-    Some((line, cursor + n as u64))
+    Some(PendingLine { raw: buf, next: cursor + n as u64 })
+}
+
+/// One newline-terminated outbox line, as bytes. A torn write cut inside a
+/// multibyte character is complete but not UTF-8; it still counts as pending
+/// so the caller can quarantine it (#3074) instead of reading it as "nothing
+/// pending" and wedging the rule.
+struct PendingLine {
+    raw: Vec<u8>,
+    /// Byte offset just past the line.
+    next: u64,
+}
+
+impl PendingLine {
+    /// The line as text, lossy for a non-UTF-8 line (only ever shown or
+    /// hashed, never POSTed: `is_utf8` gates delivery).
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.raw)
+    }
+
+    fn is_utf8(&self) -> bool {
+        std::str::from_utf8(&self.raw).is_ok()
+    }
 }
 
 /// Count of fully-committed (newline-terminated) lines at or after
@@ -1753,64 +1774,105 @@ const DEFAULT_COMPACTION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 /// interleave with the rewrite: write undelivered bytes to a sibling temp
 /// file, `rename` it atomically over the real outbox path (so a reader
 /// mid-open sees either the whole old file or the whole new one, never a
-/// partial rewrite), THEN reset the cursor — in that order, so a crash
-/// between the rename and the cursor reset is recovered by
-/// `undelivered_line_count`/`next_pending_line` simply reading from the
-/// (still-correct, non-zero) old cursor against the ALREADY-repacked
-/// file, which is a safe, if not immediately obvious, no-op: the
-/// undelivered tail is now at offset 0, so the stale cursor briefly
-/// overshoots and reports 0 pending until the next successful cycle
-/// re-derives it — never data loss, worst case a temporary stall.
-fn maybe_compact_outbox(outbox_path: &Path, cursor_path: &Path, threshold_bytes: u64) {
+/// partial rewrite), THEN reset the cursor. A marker file brackets the two
+/// steps (#3074): written before the rename, removed after the cursor reset.
+/// A crash or failed cursor write in between leaves the marker, and the next
+/// pass resets the cursor before anything else, because a stale cursor over
+/// the repacked file would otherwise seek past its content and compact the
+/// undelivered lines away. Returns `false` when the cursor cannot be trusted
+/// this cycle (the reset is still pending), so the drain skips it.
+fn maybe_compact_outbox(outbox_path: &Path, cursor_path: &Path, threshold_bytes: u64) -> bool {
+    if let Err(e) = recover_compaction(outbox_path, cursor_path) {
+        eprintln!("flow::HookSink: outbox compaction recovery failed for {}: {e:#}", outbox_path.display());
+        return false;
+    }
     let cursor = read_cursor(cursor_path);
     if cursor < threshold_bytes {
-        return;
+        return true;
     }
-    let result: Result<()> = (|| {
-        let mut guard = darkmux_types::flock::lock_exclusive(outbox_path)?;
-        // Re-check under the lock — another compaction (or a delivery
-        // that hadn't landed yet when we read `cursor` above) may have
-        // already moved the cursor since the caller's unlocked read.
-        let cursor = read_cursor(cursor_path);
-        if cursor < threshold_bytes {
-            return Ok(());
-        }
-        let file = guard.file();
-        file.seek(SeekFrom::Start(cursor)).with_context(|| format!("seeking {}", outbox_path.display()))?;
-        let mut remaining = Vec::new();
-        file.read_to_end(&mut remaining).with_context(|| format!("reading tail of {}", outbox_path.display()))?;
-        let tmp_path = PathBuf::from(format!("{}.compact.tmp", outbox_path.display()));
-        // (#2259) The temp file BECOMES the outbox — `rename` replaces the
-        // outbox's inode with this one, so the surviving mode is this
-        // file's, not the 0o600 the creator gave the original. Written
-        // owner-only so the undelivered records it holds are never
-        // world-readable, not even in the window between the write and the
-        // `set_permissions` below. That window is why this call is NOT
-        // redundant with it — but it is also not pinned by a test: a
-        // mode-at-rest assertion can only observe the file after both
-        // statements have run. Do not "simplify" it away on the strength of
-        // the tests staying green.
-        write_owner_only_file(&tmp_path, &remaining)?;
-        // `write_owner_only_file`'s `.mode()` only applies when it CREATES.
-        // A `.compact.tmp` left behind at 0o644 by a pre-#2259 binary (or by
-        // a crash between the write and the rename — the exact case this
-        // temp+rename shape exists to survive) is reused, not recreated, so
-        // set the mode explicitly too: otherwise one stale temp file
-        // reintroduces the world-readable outbox this fix removes.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("setting owner-only mode on {}", tmp_path.display()))?;
-        }
-        fs::rename(&tmp_path, outbox_path)
-            .with_context(|| format!("renaming {} to {}", tmp_path.display(), outbox_path.display()))?;
-        drop(guard);
-        write_cursor(cursor_path, 0)
-    })();
-    if let Err(e) = result {
+    if let Err(e) = compact_outbox(outbox_path, cursor_path, threshold_bytes) {
         eprintln!("flow::HookSink: outbox compaction failed for {}: {e:#}", outbox_path.display());
+        // A repack that landed before the failure leaves the marker behind, so
+        // the cursor is stale until recovery runs: do not read it this cycle.
+        return !compaction_marker_path(outbox_path).exists();
     }
+    true
+}
+
+/// The temp file a compaction writes the repacked outbox to.
+fn compaction_tmp_path(outbox_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.compact.tmp", outbox_path.display()))
+}
+
+/// Present from just before the rename until the cursor has been reset to 0.
+/// With the temp file gone, it means the outbox is repacked and the cursor
+/// still points into the old layout (#3074).
+fn compaction_marker_path(outbox_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.compacting", outbox_path.display()))
+}
+
+/// Finish (or discard) a compaction an earlier pass did not complete. A marker
+/// with the temp file still present means the rename never happened and the
+/// cursor is right; a marker without it means the outbox is repacked and the
+/// cursor must be 0. Either way the marker is removed only once that holds.
+fn recover_compaction(outbox_path: &Path, cursor_path: &Path) -> Result<()> {
+    let marker = compaction_marker_path(outbox_path);
+    if !marker.exists() {
+        return Ok(());
+    }
+    if !compaction_tmp_path(outbox_path).exists() {
+        write_cursor(cursor_path, 0)?;
+    }
+    fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))
+}
+
+fn compact_outbox(outbox_path: &Path, cursor_path: &Path, threshold_bytes: u64) -> Result<()> {
+    let mut guard = darkmux_types::flock::lock_exclusive(outbox_path)?;
+    // Re-check under the lock — another compaction (or a delivery
+    // that hadn't landed yet when the caller read the cursor) may have
+    // already moved the cursor since the caller's unlocked read.
+    let cursor = read_cursor(cursor_path);
+    if cursor < threshold_bytes {
+        return Ok(());
+    }
+    let file = guard.file();
+    file.seek(SeekFrom::Start(cursor)).with_context(|| format!("seeking {}", outbox_path.display()))?;
+    let mut remaining = Vec::new();
+    file.read_to_end(&mut remaining).with_context(|| format!("reading tail of {}", outbox_path.display()))?;
+    let tmp_path = compaction_tmp_path(outbox_path);
+    // (#2259) The temp file BECOMES the outbox — `rename` replaces the
+    // outbox's inode with this one, so the surviving mode is this
+    // file's, not the 0o600 the creator gave the original. Written
+    // owner-only so the undelivered records it holds are never
+    // world-readable, not even in the window between the write and the
+    // `set_permissions` below. That window is why this call is NOT
+    // redundant with it — but it is also not pinned by a test: a
+    // mode-at-rest assertion can only observe the file after both
+    // statements have run. Do not "simplify" it away on the strength of
+    // the tests staying green.
+    write_owner_only_file(&tmp_path, &remaining)?;
+    // `write_owner_only_file`'s `.mode()` only applies when it CREATES.
+    // A `.compact.tmp` left behind at 0o644 by a pre-#2259 binary (or by
+    // a crash between the write and the rename — the exact case this
+    // temp+rename shape exists to survive) is reused, not recreated, so
+    // set the mode explicitly too: otherwise one stale temp file
+    // reintroduces the world-readable outbox this fix removes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting owner-only mode on {}", tmp_path.display()))?;
+    }
+    // (#3074) The marker goes down BEFORE the rename: a crash or failed cursor
+    // write after it leaves "repacked outbox, stale cursor" detectable, so the
+    // next pass resets the cursor instead of compacting from the stale offset.
+    let marker = compaction_marker_path(outbox_path);
+    fs::write(&marker, b"").with_context(|| format!("writing {}", marker.display()))?;
+    fs::rename(&tmp_path, outbox_path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), outbox_path.display()))?;
+    drop(guard);
+    write_cursor(cursor_path, 0)?;
+    fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))
 }
 
 // ─── Delivery ───────────────────────────────────────────────────────────
@@ -3149,7 +3211,15 @@ pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainRe
     let cursor_path = outbox_path.with_file_name(format!("{key}.cursor"));
     let mut cursor = read_cursor(&cursor_path);
     let mut result = StrayDrainResult::default();
-    while let Some((line, new_cursor)) = next_pending_line(outbox_path, cursor) {
+    while let Some(pending) = next_pending_line(outbox_path, cursor) {
+        let (line, new_cursor) = (pending.text(), pending.next);
+        if !pending.is_utf8() {
+            quarantine_line(outbox_path, &pending.raw);
+            result.failed += 1;
+            cursor = new_cursor;
+            write_cursor(&cursor_path, cursor)?;
+            continue;
+        }
         let parsed: Option<serde_json::Value> = serde_json::from_str(&line).ok();
         // (#2135 option 2) No signing secret here — a stray file's
         // original rule (and whatever secret it named) no longer exists
@@ -3663,17 +3733,20 @@ fn drain_rule(rt: &RuleRuntime, report_sink: &dyn FlowSink) -> bool {
     // (#2093 merge-gate finding 5) Compaction runs under the SAME drain lock
     // this iteration already holds — checked (and, at most, performed) once
     // per poll cycle per rule.
-    maybe_compact_outbox(&rt.rule.outbox_path, &rt.rule.cursor_path, DEFAULT_COMPACTION_THRESHOLD_BYTES);
+    if !maybe_compact_outbox(&rt.rule.outbox_path, &rt.rule.cursor_path, DEFAULT_COMPACTION_THRESHOLD_BYTES) {
+        return false;
+    }
     let cursor = read_cursor(&rt.rule.cursor_path);
-    let Some((line, new_cursor)) = next_pending_line(&rt.rule.outbox_path, cursor) else {
+    let Some(pending) = next_pending_line(&rt.rule.outbox_path, cursor) else {
         return false;
     };
+    let (line, new_cursor) = (pending.text(), pending.next);
     // (#2135 option 2) Computed ONCE per line, deterministically from the
     // line's own bytes — every retry of THIS exact undelivered line reuses
     // the SAME delivery id (see `delivery_id_for_line`'s doc), and every
     // terminal outcome stamps it on the emitted `hook.fired`/`hook.failed`.
     let delivery_id = delivery_id_for_line(&line);
-    Pending { rt, report_sink, line: &line, new_cursor, delivery_id }.deliver();
+    Pending { rt, report_sink, line: &line, utf8: pending.is_utf8(), raw: &pending.raw, new_cursor, delivery_id }.deliver();
     true
 }
 
@@ -3716,6 +3789,10 @@ struct Pending<'a> {
     rt: &'a RuleRuntime,
     report_sink: &'a dyn FlowSink,
     line: &'a str,
+    /// False for a line that is not UTF-8: `line` is then lossy and the line
+    /// is quarantined from `raw`, never delivered.
+    utf8: bool,
+    raw: &'a [u8],
     new_cursor: u64,
     delivery_id: String,
 }
@@ -3737,7 +3814,7 @@ impl Pending<'_> {
 
     /// [`Self::give_up`] after preserving the raw line in the quarantine file.
     fn quarantine(&self, reason: &str) {
-        quarantine_line(&self.rt.rule.outbox_path, self.line);
+        quarantine_line(&self.rt.rule.outbox_path, self.raw);
         self.give_up(1, reason);
     }
 
@@ -3749,7 +3826,8 @@ impl Pending<'_> {
         // POSTed. Quarantine it (preserve the raw bytes, never silently drop
         // them), advance the cursor past it so it doesn't block every line
         // after it forever, and emit `hook.failed` naming the reason.
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(self.line) else {
+        let parsed = if self.utf8 { serde_json::from_str::<serde_json::Value>(self.line).ok() } else { None };
+        let Some(parsed) = parsed else {
             self.quarantine("invalid outbox line");
             return;
         };
@@ -6546,6 +6624,113 @@ mod tests {
 
         assert_eq!(read_cursor(&cursor_path), 8, "cursor untouched below threshold");
         assert_eq!(std::fs::read_to_string(&outbox_path).unwrap(), "{\"n\":0}\n{\"n\":1}\n", "file untouched below threshold");
+    }
+
+    /// (#3074) A cursor reset that fails (or a crash) between the rename and
+    /// the cursor write used to leave a stale cursor over the repacked file;
+    /// the next pass then seeked past the new content and rewrote the outbox
+    /// to nothing, deleting undelivered lines.
+    #[test]
+    fn compaction_never_deletes_undelivered_lines_when_the_cursor_reset_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+        let delivered = "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n";
+        let undelivered = "{\"n\":5}\n{\"n\":6}\n{\"n\":7}\n";
+        std::fs::write(&outbox_path, format!("{delivered}{undelivered}")).unwrap();
+        write_cursor(&cursor_path, delivered.len() as u64).unwrap();
+
+        set_force_cursor_write_failure(&cursor_path, true);
+        assert!(!maybe_compact_outbox(&outbox_path, &cursor_path, 10), "a failed cursor reset must stop the drain cycle");
+        append_outbox_line(&outbox_path, "{\"n\":8}").unwrap();
+        assert!(!maybe_compact_outbox(&outbox_path, &cursor_path, 10), "still unable to reset: still stopped");
+        assert_eq!(
+            std::fs::read_to_string(&outbox_path).unwrap(),
+            format!("{undelivered}{{\"n\":8}}\n"),
+            "no undelivered line is deleted while the reset is pending"
+        );
+
+        set_force_cursor_write_failure(&cursor_path, false);
+        assert!(maybe_compact_outbox(&outbox_path, &cursor_path, 10));
+        assert_eq!(read_cursor(&cursor_path), 0, "the pending reset is applied once the cursor is writable");
+        assert_eq!(undelivered_line_count(&outbox_path, 0), 4);
+    }
+
+    /// (#3074) The crash window itself: the outbox is already repacked, the
+    /// process died before the cursor write. Recovery on the next pass resets
+    /// the cursor instead of compacting again from the stale offset.
+    #[test]
+    fn compaction_recovers_from_a_crash_between_the_rename_and_the_cursor_reset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+        let repacked = "{\"n\":5}\n{\"n\":6}\n{\"n\":7}\n{\"n\":8}\n";
+        std::fs::write(&outbox_path, repacked).unwrap();
+        write_cursor(&cursor_path, 40).unwrap();
+        std::fs::write(compaction_marker_path(&outbox_path), b"").unwrap();
+
+        assert!(maybe_compact_outbox(&outbox_path, &cursor_path, 10));
+        assert_eq!(std::fs::read_to_string(&outbox_path).unwrap(), repacked, "nothing deleted");
+        assert_eq!(read_cursor(&cursor_path), 0);
+        assert!(!compaction_marker_path(&outbox_path).exists());
+    }
+
+    /// (#3074) A marker left by a crash BEFORE the rename (temp file still
+    /// present) means the outbox was never repacked: the cursor is still right
+    /// and must not be reset.
+    #[test]
+    fn compaction_marker_before_the_rename_is_discarded_without_touching_the_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+        let content = "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n";
+        std::fs::write(&outbox_path, content).unwrap();
+        write_cursor(&cursor_path, 8).unwrap();
+        std::fs::write(compaction_marker_path(&outbox_path), b"").unwrap();
+        std::fs::write(compaction_tmp_path(&outbox_path), b"{\"n\":1}\n").unwrap();
+
+        assert!(maybe_compact_outbox(&outbox_path, &cursor_path, 10_000_000));
+        assert_eq!(read_cursor(&cursor_path), 8);
+        assert_eq!(std::fs::read_to_string(&outbox_path).unwrap(), content);
+        assert!(!compaction_marker_path(&outbox_path).exists());
+    }
+
+    /// (#3074) A newline-terminated line that is not UTF-8 (a torn write cut
+    /// inside a multibyte character) was read as "nothing pending", wedging
+    /// the rule with no `hook.failed`.
+    #[test]
+    fn invalid_utf8_outbox_line_is_quarantined_with_hook_failed_and_does_not_wedge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
+        let (outbox_path, _cursor_path) = outbox_paths(tmp.path(), &key);
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&outbox_path, b"{\"a\":\"\xe2\x82").unwrap();
+
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(5)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(3)));
+        let guard = capture.0.lock().unwrap();
+        let failed: Vec<_> = guard.iter().filter(|r| r.action == crate::FlowAction::HookFailed).collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].payload_json()["error"], "invalid outbox line");
+        drop(guard);
+        let quarantined = std::fs::read(PathBuf::from(format!("{}.quarantine", outbox_path.display()))).unwrap();
+        assert!(quarantined.starts_with(b"{\"a\":\"\xe2\x82"), "the raw bytes are preserved, not lossily rewritten");
     }
 
     /// (#2259) Compaction must PRESERVE the outbox's owner-only mode.

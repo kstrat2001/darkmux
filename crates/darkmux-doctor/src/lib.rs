@@ -502,11 +502,17 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
         .flat_map(|r| r.torn_tails.iter().map(String::as_str))
         .collect();
     if !torn.is_empty() {
+        let restarted = reports.iter().filter(|r| r.chain_restarted).count();
+        let restart_note = if restarted == 0 {
+            String::new()
+        } else {
+            format!(" ({restarted} restarted its chain: the verified chain covers only what was written after)")
+        };
         return Check {
             name: "audit integrity".into(),
             status: Status::Warn,
             message: format!(
-                "{} torn audit tail(s) set aside after an interrupted write: {}",
+                "{} torn audit tail(s) set aside after an interrupted write{restart_note}: {}",
                 torn.len(),
                 torn.join(", ")
             ),
@@ -9481,6 +9487,7 @@ mod tests {
             break_reason: None,
             writer_schema_version: Some("1.19.0".into()),
             torn_tails: Vec::new(),
+            chain_restarted: false,
         }
     }
 
@@ -9488,6 +9495,7 @@ mod tests {
     fn summarize_audit_reports_torn_tail_is_warn_naming_the_sidecar() {
         let torn = darkmux_flow::IntegrityReport {
             torn_tails: vec!["/audit/2026-08-11.jsonl.torn-1790000000000".into()],
+            chain_restarted: false,
             ..mk_clean_report(3)
         };
         let check = summarize_audit_reports(&[torn]);

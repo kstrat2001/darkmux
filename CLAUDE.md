@@ -243,7 +243,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    none. Radio's ANSWERING seat (`radio-host`) is work and
    keeps its bookends and its run.
 3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
-   stream carries engagement work only. No crossings in either direction.
+   stream carries engagement work only. No crossings in either direction. Conformance:
+   `RedisSink::persist` and the outage backfill drop any record whose `session_id` is a
+   lab run, through the one `is_lab_session` predicate (#3074).
 4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux
    namespace; operations manage only the namespaced subset (see the namespace section).
    Formalized as ABSOLUTE for model lifecycle (operator, 2026-07-10, #1274): every darkmux

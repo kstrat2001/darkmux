@@ -506,6 +506,7 @@ IntegrityReport
   break_reason?: string | null
   writer_schema_version?: string | null
   torn_tails?: string[]
+  chain_restarted?: boolean
 Knob
   value: KnobValue | null
   source: KnobSource
