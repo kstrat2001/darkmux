@@ -652,6 +652,49 @@ fn the_backfill_does_not_wait_for_the_live_connection() {
     assert_eq!(handles(&hub.entries()), ["cli1"], "the tick backfilled while the live connection was held");
 }
 
+/// (#3075) A writer that finds the shared connection busy on a HEALTHY hub
+/// still lands live, at once, on a connection of its own: no watermark, no
+/// reliance on a daemon's backfill.
+#[test]
+fn a_writer_that_finds_the_connection_busy_lands_live_on_a_fresh_one() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = sink(&hub, &dir, SinkPolicy::OneShot);
+    let held = s.conn.lock().unwrap();
+    s.write(&rec("busy", 1)).unwrap();
+    drop(held);
+    assert_eq!(handles(&hub.entries()), ["busy"], "landed while the connection was held");
+    assert!(
+        hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none(),
+        "a healthy hub leaves no outage watermark"
+    );
+}
+
+/// (#3075) Two concurrent writers on a healthy hub both land live, whichever
+/// one wins the shared connection.
+#[test]
+fn two_concurrent_writers_on_a_healthy_hub_both_land_live() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let s = Arc::new(sink(&hub, &dir, SinkPolicy::OneShot));
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|h| {
+            let (s, start) = (s.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                s.write(&rec(h, 1)).unwrap();
+            })
+        })
+        .collect();
+    threads.into_iter().for_each(|t| t.join().unwrap());
+    let mut landed = handles(&hub.entries());
+    landed.sort();
+    assert_eq!(landed, ["a", "b"]);
+    assert!(hub_link::OutageWatermark::new(watermark_file(&dir)).load().is_none());
+}
+
 /// (#3075) A writer that wins the connection after the sink disabled itself
 /// does not touch the hub.
 #[test]

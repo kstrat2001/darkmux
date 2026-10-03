@@ -1402,8 +1402,8 @@ pub(crate) fn is_lab_session(session_id: Option<&str>) -> bool {
 enum Delivery {
     /// The record reached the hub.
     Sent,
-    /// The hub was not asked (another writer held the connection, or the sink
-    /// disabled itself meanwhile). Neither a success nor a failure.
+    /// The hub was not asked (the sink disabled itself while the writer
+    /// waited for the connection). Neither a success nor a failure.
     Skipped,
 }
 
@@ -1641,16 +1641,14 @@ impl RedisSink {
         if self.policy == SinkPolicy::LongLived {
             self.run_backfill(&payload, false)?;
         }
-        // A writer that finds the connection busy does not queue behind it
-        // (#3075): the writer holding it may be waiting out a timeout on a
-        // silent hub, and every queued writer would wait one more. Its record
-        // is already in the local file, so the watermark makes the backfill
-        // re-send it.
+        // A writer that finds the shared connection busy does not queue behind
+        // it (#3075): the holder may be waiting out a timeout on a silent hub.
+        // It writes on a connection of its own, as before the shared one
+        // existed, so contention is never worse than that and a one-shot
+        // process with no daemon still lands its record live.
         let Some(mut slot) = lock_unless_busy(&self.conn) else {
-            if let Err(e) = self.watermark.record(&record.ts) {
-                eprintln!("flow::RedisSink: could not persist the hub outage watermark: {e:#}");
-            }
-            return Ok(Delivery::Skipped);
+            self.xadd_once(&mut self.open_bounded()?, hub_stream, &payload)?;
+            return Ok(Delivery::Sent);
         };
         // The sink may have disabled itself while this writer waited.
         if !self.should_attempt() {
@@ -5541,8 +5539,8 @@ mod tests {
 
     /// (#3075) Writers share one process-wide sink, so a hub that accepts and
     /// goes silent must cost ONE writer a timeout, not each writer in turn:
-    /// the others skip the hub (their record is already in the local file) and
-    /// leave the outage watermark for the backfill.
+    /// the others each pay at most one bound on a connection of their own, in
+    /// parallel, as before the shared connection existed.
     #[test]
     fn eight_writers_against_a_silent_hub_do_not_queue_behind_one_timeout() {
         let port = spawn_silent_redis_peer(40);
@@ -5575,7 +5573,7 @@ mod tests {
         );
         assert!(
             hub_link::OutageWatermark::new(dir.path().join("hub-outage.json")).load().is_some(),
-            "a skipped hub write leaves the watermark for the backfill"
+            "a failed hub write leaves the watermark for the backfill"
         );
     }
 
