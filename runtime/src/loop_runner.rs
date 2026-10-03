@@ -450,15 +450,26 @@ pub enum EscalationReason {
     /// (#2171) A turn kept hitting the GENERATION check-in
     /// (`generation_checkpoint_interval_tokens`) more times than
     /// `answer_max_tokens / generation_checkpoint_interval_tokens` allows.
-    /// Deliberately bounded, unlike the reasoning check-in's continuations
-    /// (which stay open-ended by design — see the comment at the
-    /// checkpoint-continuation site): a thought is expected to run long,
+    /// Deliberately bounded by a continuation COUNT, unlike the reasoning
+    /// check-in's continuations (which have no count and are bounded only by
+    /// the context window, [`Self::TurnContinuationsExhausted`], #3074): a
+    /// thought is expected to run long,
     /// but a single answer/tool-call turn that never converges after
     /// `answer_max_tokens` worth of generation-bound continuations is a
     /// model that will not stop on its own, and the alternative is the
     /// same unbounded-continuation shape the reasoning check-in already
     /// tolerates for a region where it should NOT be tolerated.
     GenerationCheckpointBudgetExhausted,
+    /// (#3074) One logical turn kept continuing past a checkpoint until the
+    /// tokens it generated reached the context window. Every continuation
+    /// resends the thought carried so far, so a turn that long cannot be
+    /// resumed again: the next request would overflow the window. This is the
+    /// bound on the open-ended REASONING check-in (and on any continuation),
+    /// derived from the window rather than guessed, and it exists because
+    /// `max_turns` does not count continuations (#1221) and the inactivity
+    /// deadline resets on every streamed chunk. Absent a configured context
+    /// window there is nothing to derive it from, so no bound applies.
+    TurnContinuationsExhausted,
     /// (#2169 merge-gate finding 4) `MAX_CONSECUTIVE_MALFORMED_TURNS`
     /// consecutive turns each dispatched ZERO real tool calls — every
     /// `tool_calls` entry named either a non-tool or a real tool this
@@ -495,6 +506,7 @@ pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
         EscalationReason::GenerationCheckpointBudgetExhausted => {
             "escalation_generation_checkpoint_budget_exhausted"
         }
+        EscalationReason::TurnContinuationsExhausted => "escalation_turn_continuations_exhausted",
         EscalationReason::MalformedToolCallsExhausted => "escalation_malformed_tool_calls",
     }
 }
@@ -1713,6 +1725,10 @@ fn run_with_sleeper(
     // continuation of the same turn) — see the `turn.begin()` site. Counts
     // only continuations that were themselves generation-bound.
     let mut generation_continuations_this_turn: u32 = 0;
+    // (#3074) Completion tokens this logical turn has generated across its
+    // checkpoint continuations. Reset with the counter above; compared with
+    // the context window, which every continuation's resent prefill must fit.
+    let mut turn_completion_tokens: u32 = 0;
     // Set when the previous iteration handed a turn back as a prefill; read by
     // the turn counter so the resumed call is not counted as a new turn.
     // (#2114) A resume whose checkpoint carried a pending #1221 hand-back
@@ -2884,6 +2900,7 @@ fn run_with_sleeper(
             // budget — the cap bounds how long ONE turn may keep hitting the
             // generation check-in, not the whole dispatch.
             generation_continuations_this_turn = 0;
+            turn_completion_tokens = 0;
         }
 
         // (#406) Recover plain-text tool calls the model emitted in
@@ -2990,6 +3007,8 @@ fn run_with_sleeper(
         // reads the estimate as a reported figure.
         total_completion_tokens = total_completion_tokens
             .saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
+        turn_completion_tokens =
+            turn_completion_tokens.saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
         // The prompt count is the ground truth everything below calibrates
         // against, so all of it needs one the endpoint actually reported.
         if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
@@ -4637,6 +4656,13 @@ fn run_with_sleeper(
                     } else {
                         false
                     };
+                    // (#3074) The continuation bound that does not depend on the
+                    // kind of check-in: once this logical turn has generated as
+                    // many tokens as the context window holds, no further
+                    // continuation can fit the prefill it would resend.
+                    let window_filled = compaction_cfg
+                        .context_window
+                        .is_some_and(|window| turn_completion_tokens >= window);
                     // Only judge while the thought is still open. After the
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
@@ -4774,18 +4800,17 @@ fn run_with_sleeper(
                     //       is exactly what it meters. It defaults to unset
                     //       (uncapped), so it bounds this only for an operator
                     //       who set it.
-                    //   the inactivity budget bounds it only as an absolute
-                    //       600s SIGKILL: a checkpoint is not a proof-of-work
-                    //       signal, so the timer never resets on one. That is a
-                    //       HARD kill — no conclusion, no envelope.
+                    //   the inactivity deadline does NOT bound it: streaming is the
+                    //       production default, and every streamed chunk resets
+                    //       the host's deadline (`on_stream_tick`), so a turn
+                    //       that keeps producing slices is never idle.
+                    //   the context window DOES (#3074): once the turn has
+                    //       generated as many tokens as the window holds, it
+                    //       escalates (`TurnContinuationsExhausted`), because the
+                    //       next continuation would resend a prefill that cannot
+                    //       fit. That is the bound when no `max_tokens` is set,
+                    //       and it needs a configured window to derive from.
                     //
-                    // So under default config the only backstop is that hard
-                    // kill. Deliberately left as-is rather than inventing a
-                    // checkpoint ceiling here, which is the thing this change
-                    // exists to remove — but it is a real gap, and the fix
-                    // belongs at the config layer (a default for
-                    // `runtime.max_tokens`), not in this gate. Tracked
-                    // separately.
                     // A degenerate turn that never opened a thought has no
                     // delimiter to close, so it does not get a prefill at all —
                     // it goes back to the recovery path that already owns this
@@ -4874,6 +4899,30 @@ fn run_with_sleeper(
                             final_answer: turn.pending_answer(),
                             terminal_reason: TerminalReason::EscalationTriggered(
                                 EscalationReason::GenerationCheckpointBudgetExhausted,
+                            ),
+                            messages,
+                            turn_delay_effective_ms: turn_delay_ms,
+                            failed_to_run: failed_to_run.clone(),
+                        });
+                    }
+                    if window_filled {
+                        eprintln!(
+                            "darkmux-runtime: escalation_triggered — turn {turns} generated \
+                             {turn_completion_tokens} tokens across {checkpoints_used} \
+                             checkpoints, as many as the context window holds, so it cannot be \
+                             resumed again. Emitting EscalationTriggered for frontier handoff \
+                             with everything banked so far ATTACHED. (#3074)"
+                        );
+                        trajectory.append_escalation_triggered(
+                            turns,
+                            escalation_reason_str(EscalationReason::TurnContinuationsExhausted),
+                            model,
+                            latest_prompt_tokens,
+                        );
+                        return Ok(LoopOutcome {
+                            final_answer: turn.pending_answer(),
+                            terminal_reason: TerminalReason::EscalationTriggered(
+                                EscalationReason::TurnContinuationsExhausted,
                             ),
                             messages,
                             turn_delay_effective_ms: turn_delay_ms,
@@ -9509,6 +9558,43 @@ mod tests {
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2);
+    }
+
+    /// (#3074) A turn that keeps hitting a checkpoint until what it has
+    /// generated reaches the context window escalates with a named reason
+    /// rather than continuing forever. `max_turns` does not count
+    /// continuations and the inactivity deadline resets on every chunk, so
+    /// this is the bound a streaming model that never stops runs into. The
+    /// slices are distinct, so the degeneracy gate stays out of the way and
+    /// only the window-derived bound can end the turn.
+    #[test]
+    #[serial_test::serial]
+    fn a_turn_whose_continuations_fill_the_context_window_escalates() {
+        let block: String = (0..8100).map(|i| format!("w{i} ")).collect();
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some(&block), None, "length", 100, 999));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-continuations").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig { context_window: Some(2500), ..compaction::CompactionConfig::never_compact() };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(100_000), None, Some(1000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("window exhaustion is a clean EscalationTriggered outcome, not an Err (#3074)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::TurnContinuationsExhausted),
+        );
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit continues the SAME turn");
     }
 
     /// (#2171 test d, floor added on merge-gate review) A turn that keeps
