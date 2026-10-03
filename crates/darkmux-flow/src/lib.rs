@@ -63,7 +63,7 @@ use std::sync::{Arc, OnceLock};
 /// per sink) so a new sink kind can be added without touching every
 /// downstream consumer — the human formatter prints whatever's in
 /// `config`; the JSON serializer is a pass-through.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SinkInfo {
     pub kind: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -77,6 +77,21 @@ pub struct SinkInfo {
     /// HTTP endpoint). See `find_redis_cfg` for the consumer side. (#216)
     #[serde(skip)]
     pub raw_url: Option<String>,
+}
+
+// Hand-written (NOT derived) so `{:?}` cannot print `raw_url`, which holds the
+// operator's Redis password and address. The field is reported as present or
+// absent only. (#3074)
+impl std::fmt::Debug for SinkInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let raw_url = self.raw_url.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SinkInfo")
+            .field("kind", &self.kind)
+            .field("config", &self.config)
+            .field("children", &self.children)
+            .field("raw_url", &raw_url)
+            .finish()
+    }
 }
 
 /// Abstraction over the destination of a flow record. Implementations
@@ -691,10 +706,10 @@ fn keychain_redis_password() -> Option<String> {
 /// Percent-encode the URL-structural characters (`@ : / # ? &` — the exact set
 /// the Homebrew wrapper documents as forbidden) in a Redis password. Two
 /// reasons, one security + one functional:
-/// - **Security:** `redact_url_creds` masks only the userinfo before the FIRST
-///   `@`, so an `@` *inside* the password would push its tail into the
-///   (unredacted) host portion and leak on `Display`. Encoding `@`→`%40` keeps
-///   the whole secret in the masked userinfo.
+/// - **Security:** an unencoded `@` or `#` in the password makes the URL
+///   ambiguous to every reader (the connection parser and the redactor each
+///   have to guess where the password ends). Encoding them keeps the whole
+///   secret in the userinfo both agree on.
 /// - **Functional:** the other structural chars would otherwise split the URL.
 ///
 /// A contract-compliant password contains none of these → **no-op**. The `redis`
@@ -4866,20 +4881,43 @@ mod tests {
             "redis://user:***@h:6379",
             "multiple `@`s — only the final one is the boundary"
         );
-        // An `@` in the PATH is data, not a boundary — the authority is
-        // bounded at the first `/` so redaction neither mis-splits on it
-        // nor swallows the path.
-        assert_eq!(
-            redact_url_creds("redis://user:pw@h:6379/queue@2"),
-            "redis://user:***@h:6379/queue@2"
-        );
-        // No `@` in the authority but one in the path: no userinfo exists,
-        // and the path `@` must not conjure one (the old code split on it
-        // and mangled the URL).
-        assert_eq!(
-            redact_url_creds("redis://h:6379/queue@2"),
-            "redis://h:6379/queue@2"
-        );
+        // (#3074) A redis URL has no path `@`: the path is the database
+        // number. An `@` after the password's own `/`, `?` or `#` is
+        // indistinguishable from a password holding that character, so the
+        // redactor fails closed and treats everything left of the last `@`
+        // as userinfo. Over-masking costs a misread host in a diagnostic;
+        // under-masking leaks the password.
+        assert_eq!(redact_url_creds("redis://user:pw@h:6379/queue@2"), "redis://user:***@2");
+        assert_eq!(redact_url_creds("redis://h:6379/queue@2"), "redis://h:***@2");
+    }
+
+    /// (#3074) A password holding `#`, `/` or `?` must not leak. The redis
+    /// crate cannot connect with such a URL, so an operator sees one exactly
+    /// while debugging a broken `DARKMUX_REDIS_URL`, on the surfaces that
+    /// print it (`flow status`, doctor, the flow-status panel).
+    #[test]
+    fn redact_url_creds_masks_a_password_containing_url_delimiters() {
+        for pw in ["p#ssw0rd", "pa/ss", "pa?ss", "a#b/c?d"] {
+            let url = format!("redis://:{pw}@127.0.0.1:6379");
+            assert_eq!(redact_url_creds(&url), "redis://:***@127.0.0.1:6379", "{pw}");
+            let url = format!("redis://kain:{pw}@127.0.0.1:6379/0");
+            assert_eq!(redact_url_creds(&url), "redis://kain:***@127.0.0.1:6379/0", "{pw}");
+        }
+    }
+
+    /// (#3074) `SinkInfo` carries the raw URL for the in-process probe; its
+    /// `Debug` must not print it.
+    #[test]
+    fn sink_info_debug_never_prints_the_raw_url() {
+        let info = SinkInfo {
+            kind: "redis".to_string(),
+            config: Default::default(),
+            children: vec![],
+            raw_url: Some("redis://:hunter2@127.0.0.1:6379".to_string()),
+        };
+        let shown = format!("{info:?} {info:#?}");
+        assert!(!shown.contains("hunter2") && !shown.contains("127.0.0.1"), "{shown}");
+        assert!(shown.contains("raw_url"), "the field is still reported as present: {shown}");
     }
 
     #[test]

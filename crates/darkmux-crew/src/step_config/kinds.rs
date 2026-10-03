@@ -71,6 +71,8 @@ pub struct DispatchInternalConfig {
     pub max_completion_tokens: Option<Count>,
     pub resume_from: Option<String>,
     pub timeout_override_seconds: Option<Count>,
+    /// Mount `/workspace` read-only (#3074).
+    pub workspace_read_only: Option<Flag>,
 }
 
 impl ConfigRules for DispatchInternalConfig {
@@ -165,6 +167,11 @@ pub struct ShellConfig {
     pub cwd: Option<String>,
     /// Where the command runs when the task names none.
     pub workdir: Option<String>,
+    /// Environment variables for the command (#3074). The way to hand it a
+    /// value that came from a launch input or a grown item: the command reads
+    /// `"$NAME"`, so the value is data and never shell text. A number or
+    /// flag a `--input` file supplied is written as its text.
+    pub env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 /// `procedural.noop`: returns a fixed string.

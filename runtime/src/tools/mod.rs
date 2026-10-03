@@ -47,6 +47,12 @@ use workspace::{resolve_read, resolve_write, DEFAULT_WORKSPACE};
 /// tool result from blowing the context window on its own.
 const READ_MAX_BYTES: usize = 1024 * 1024; // 1 MB
 
+/// (#3073) Cap on how much of ONE stream (stdout or stderr) of a Bash command
+/// reaches the model. The rest is read and dropped, never buffered, so a
+/// command that prints without end can neither exhaust the container's memory
+/// nor put the whole output into the next request.
+const BASH_STREAM_MAX_BYTES: usize = 256 * 1024;
+
 /// Default cap on how long a Bash command can run before timing out.
 /// Overridable per-invocation via the tool's `timeout_seconds` arg.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -650,8 +656,8 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     )
     .with_context(|| format!("spawning {shell} for: {}", args.command))?;
 
-    let stdout = String::from_utf8_lossy(&bounded.stdout);
-    let stderr = String::from_utf8_lossy(&bounded.stderr);
+    let stdout = capped_text(&bounded.stdout, "stdout");
+    let stderr = capped_text(&bounded.stderr, "stderr");
     let exit_code = bounded.exit_code.unwrap_or(-1);
 
     // Two DIFFERENT outcomes, two different things to tell the model.
@@ -705,11 +711,37 @@ const GRANDCHILD_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// How often [`run_bash_bounded`]'s deadline loop polls `try_wait`.
 const BASH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// One stream of a bash command: the first [`BASH_STREAM_MAX_BYTES`] it wrote,
+/// and how many bytes it wrote in all.
+#[derive(Default)]
+struct CappedStream {
+    kept: Vec<u8>,
+    total: usize,
+}
+
+impl CappedStream {
+    fn push(&mut self, chunk: &[u8]) {
+        let room = BASH_STREAM_MAX_BYTES.saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        self.total += chunk.len();
+    }
+}
+
+/// The text of a captured stream, with a marker naming the dropped byte count
+/// when the cap cut it short.
+fn capped_text(stream: &CappedStream, name: &str) -> String {
+    let text = String::from_utf8_lossy(&stream.kept);
+    match stream.total - stream.kept.len() {
+        0 => text.into_owned(),
+        dropped => format!("{text}\n[output truncated: {dropped} more bytes of {name} not shown]"),
+    }
+}
+
 /// What one bounded bash invocation produced.
 struct BoundedBash {
     exit_code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: CappedStream,
+    stderr: CappedStream,
     /// `true` when THIS runner's own deadline (or the post-exit drain
     /// grace) had to kill the process group directly — as opposed to the
     /// coreutils `timeout` wrapper reporting its own exit 124. Distinct
@@ -786,8 +818,8 @@ fn run_bash_bounded(mut cmd: Command, deadline: Duration) -> Result<BoundedBash>
     let mut child = cmd.spawn()?;
     let pid = child.id();
 
-    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(CappedStream::default()));
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(CappedStream::default()));
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
     for (pipe, buf) in [
         (child.stdout.take().map(BashDrainSource::Out), out_buf.clone()),
@@ -806,7 +838,7 @@ fn run_bash_bounded(mut cmd: Command, deadline: Duration) -> Result<BoundedBash>
                         break;
                     }
                     if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(&chunk[..n]);
+                        b.push(&chunk[..n]);
                     }
                 }
             }
@@ -897,8 +929,9 @@ fn run_bash_bounded(mut cmd: Command, deadline: Duration) -> Result<BoundedBash>
         }
     }
 
-    let stdout = out_buf.lock().map(|b| b.clone()).unwrap_or_default();
-    let stderr = err_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let take = |buf: &std::sync::Mutex<CappedStream>| buf.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
+    let stdout = take(&out_buf);
+    let stderr = take(&err_buf);
     Ok(BoundedBash {
         exit_code: exit_status.and_then(|s| s.code()),
         stdout,
@@ -1475,6 +1508,41 @@ mod tests {
         let result = execute_bash(&raw, ws.path()).unwrap();
         assert!(result.contains("exit: 0"));
         assert!(result.contains("from-bash"));
+    }
+
+    /// (#3073) A command's output is capped per stream: the tool result
+    /// carries the first `BASH_STREAM_MAX_BYTES`, a marker naming how many
+    /// bytes were dropped, and the command still runs to completion (the
+    /// drain keeps reading, so a full pipe never blocks it).
+    #[test]
+    fn bash_caps_each_stream_and_says_how_much_was_dropped() {
+        let ws = fresh_workspace();
+        let total = BASH_STREAM_MAX_BYTES * 4;
+        let command = format!(
+            "head -c {total} /dev/zero | tr '\\0' 'o'; head -c {total} /dev/zero | tr '\\0' 'e' >&2; echo done"
+        );
+        let raw = serde_json::json!({"command": command}).to_string();
+        let result = execute_bash(&raw, ws.path()).unwrap();
+        assert!(result.starts_with("exit: 0\n"), "the command must finish: {}", &result[..80.min(result.len())]);
+        assert!(result.len() < BASH_STREAM_MAX_BYTES * 3, "both streams capped, got {} bytes", result.len());
+        let dropped = total + 5 - BASH_STREAM_MAX_BYTES; // stdout also carries "done\n"
+        assert!(
+            result.contains(&format!("[output truncated: {dropped} more bytes of stdout not shown]")),
+            "stdout marker names the count"
+        );
+        let dropped_err = total - BASH_STREAM_MAX_BYTES;
+        assert!(
+            result.contains(&format!("[output truncated: {dropped_err} more bytes of stderr not shown]")),
+            "stderr marker names the count"
+        );
+    }
+
+    #[test]
+    fn bash_output_under_the_cap_carries_no_marker() {
+        let ws = fresh_workspace();
+        let raw = serde_json::json!({"command": "echo small"}).to_string();
+        let result = execute_bash(&raw, ws.path()).unwrap();
+        assert!(!result.contains("output truncated"));
     }
 
     #[test]

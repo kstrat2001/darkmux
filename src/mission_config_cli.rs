@@ -1612,6 +1612,7 @@ mod tests {
                 default: Some(serde_json::json!("0")),
                 ignored: None,
                 ignored_reason: None,
+                whole_number: None,
                 extras: Default::default(),
             },
             MissionInput {
@@ -1621,6 +1622,7 @@ mod tests {
                 default: None,
                 ignored: None,
                 ignored_reason: None,
+                whole_number: None,
                 extras: Default::default(),
             },
         ];
@@ -1665,6 +1667,7 @@ mod tests {
                 default: None,
                 ignored: None,
                 ignored_reason: None,
+                whole_number: None,
                 extras: Default::default(),
             },
             MissionInput {
@@ -1674,6 +1677,7 @@ mod tests {
                 default: None,
                 ignored: None,
                 ignored_reason: None,
+                whole_number: None,
                 extras: Default::default(),
             },
         ];

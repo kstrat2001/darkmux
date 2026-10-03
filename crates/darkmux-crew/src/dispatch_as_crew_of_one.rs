@@ -371,53 +371,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         image: opts.image.clone(),
     };
 
-    let mut config = serde_json::json!({
-        "message": opts.message,
-        "timeout_seconds": opts.timeout_seconds,
-        "session_id": opts.session,
-        "skip_preflight": opts.skip_preflight,
-        "json": opts.json,
-        "preserve_dispatch_result": true,
-    });
-    if let Some(max_tokens) = opts.max_completion_tokens {
-        config["max_completion_tokens"] = serde_json::Value::from(max_tokens);
-    }
-    // (#2114 follow-up) `--resume-from <dir>` — threaded into the step
-    // config the same way as every other optional `DispatchOpts` field
-    // here; read back by `DispatchInternalStepKind::run` in
-    // `step_kinds/builtins.rs`.
-    // (#2295) `--finding <key>` / `--mod <key>` refs, threaded the same way.
-    // This graph copies `DispatchOpts` into the step config FIELD BY FIELD, so
-    // a field added to `DispatchOpts` and not added HERE is silently dropped
-    // on the ONLY path a top-level `darkmux dispatch` takes — which is what
-    // made the flow record's ref list an empty list on every real `--finding`
-    // dispatch while the brief itself carried the blocks (#2265 review,
-    // CRITICAL 8). The step config is the ref list's HOME: a mission graph
-    // sets `brief_refs` on its own steps directly, and the verb flags are only
-    // how the crew-of-one graph gets there.
-    if !opts.brief_refs.is_empty() {
-        config["brief_refs"] = crate::brief_refs::to_json(&opts.brief_refs);
-    }
-    if let Some(resume_from) = &opts.resume_from {
-        config["resume_from"] = serde_json::Value::String(resume_from.display().to_string());
-    }
-    // (#2480 review, blocker 1) `--timeout <n>`'s inactivity-budget override.
-    // This one hop is what made the whole flag a no-op a second time: #2480
-    // wired `DispatchOpts::timeout_override_seconds` end to end through
-    // `dispatch_internal::dispatch`, but `darkmux dispatch` has not called
-    // that primitive directly since #1509 — it comes through THIS graph, and
-    // a field not copied here is dropped exactly as the block above warns.
-    // Read back by `step_kinds::builtins::dispatch_opts_for`, and asserted
-    // AGAINST that reader — the real one the step kind runs, not a
-    // test-local re-read — in
-    // `build_graph_step_config_carries_the_cli_flags` below, so the two
-    // halves of the hand-off are pinned to each other, not separately.
-    //
-    // Only set when present, so a step config naming no override reads back
-    // `None` and the standing `env > config > 600` resolution stands.
-    if let Some(secs) = opts.timeout_override_seconds {
-        config["timeout_override_seconds"] = serde_json::Value::from(secs);
-    }
+    let config = step_config(opts);
 
     let step = Step {
         id: step_id,
@@ -432,6 +386,104 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
     };
 
     (mission, phase, task, step)
+}
+
+/// The step config a crew-of-one dispatch carries `opts` in.
+///
+/// (#3074) The destructure below names EVERY `DispatchOpts` field and has no
+/// `..`, so a field added to `DispatchOpts` fails to compile here until it is
+/// either copied into the config or listed as deliberately not carried. A hop
+/// that copied by hand once dropped `workspace_read_only`, which mounted the
+/// operator's tree read-write under `--workspace-read-only`.
+fn step_config(opts: &DispatchOpts) -> serde_json::Value {
+    let DispatchOpts {
+        message,
+        timeout_seconds,
+        session,
+        skip_preflight,
+        json,
+        max_completion_tokens,
+        brief_refs,
+        resume_from,
+        timeout_override_seconds,
+        workspace_read_only,
+        // Carried on the Task, not the step config.
+        role_id: _,
+        profile_name: _,
+        workdir: _,
+        image: _,
+        // Not set by `darkmux dispatch` (its CLI builds each as a constant),
+        // so there is nothing for this hop to carry.
+        finding_sites: _,
+        allow_utility_model: _,
+        remote_origin: _,
+        live_channel: _,
+        record_context: _,
+        phase_id: _,
+        machine: _,
+        wait: _,
+        compaction: _,
+        config_path: _,
+        force_container: _,
+        model_base_url_override: _,
+        step_id: _,
+        system_prompt_override: _,
+        host_out: _,
+        max_turns_override: _,
+    } = opts;
+    let mut config = serde_json::json!({
+        "message": message,
+        "timeout_seconds": timeout_seconds,
+        "session_id": session,
+        "skip_preflight": skip_preflight,
+        "json": json,
+        "preserve_dispatch_result": true,
+    });
+    if let Some(max_tokens) = max_completion_tokens {
+        config["max_completion_tokens"] = serde_json::Value::from(*max_tokens);
+    }
+    // (#2114 follow-up) `--resume-from <dir>` — threaded into the step
+    // config the same way as every other optional `DispatchOpts` field
+    // here; read back by `DispatchInternalStepKind::run` in
+    // `step_kinds/builtins.rs`.
+    // (#2295) `--finding <key>` / `--mod <key>` refs, threaded the same way.
+    // This copy used to be field by field with no check, so a field added to
+    // `DispatchOpts` and not added HERE was silently dropped on the ONLY path
+    // a top-level `darkmux dispatch` takes (the flow record's ref list was an
+    // empty list on every real `--finding` dispatch while the brief carried
+    // the blocks; #2265 review,
+    // CRITICAL 8). The step config is the ref list's HOME: a mission graph
+    // sets `brief_refs` on its own steps directly, and the verb flags are only
+    // how the crew-of-one graph gets there.
+    if !brief_refs.is_empty() {
+        config["brief_refs"] = crate::brief_refs::to_json(brief_refs);
+    }
+    if let Some(resume_from) = resume_from {
+        config["resume_from"] = serde_json::Value::String(resume_from.display().to_string());
+    }
+    // (#2480 review, blocker 1) `--timeout <n>`'s inactivity-budget override.
+    // This one hop is what made the whole flag a no-op a second time: #2480
+    // wired `DispatchOpts::timeout_override_seconds` end to end through
+    // `dispatch_internal::dispatch`, but `darkmux dispatch` has not called
+    // that primitive directly since #1509 — it comes through THIS graph, and
+    // the destructure above now refuses to compile past a field nobody placed.
+    // Read back by `step_kinds::builtins::dispatch_opts_for`, and asserted
+    // AGAINST that reader — the real one the step kind runs, not a
+    // test-local re-read — in
+    // `build_graph_step_config_carries_the_cli_flags` below, so the two
+    // halves of the hand-off are pinned to each other, not separately.
+    //
+    // Only set when present, so a step config naming no override reads back
+    // `None` and the standing `env > config > 600` resolution stands.
+    if let Some(secs) = timeout_override_seconds {
+        config["timeout_override_seconds"] = serde_json::Value::from(*secs);
+    }
+    // (#3074) `--workspace-read-only`. Only set when asked, so the step kind
+    // reads a missing key as the read-write default every other caller has.
+    if *workspace_read_only {
+        config["workspace_read_only"] = serde_json::Value::Bool(true);
+    }
+    config
 }
 
 /// A lightweight, non-cryptographic grouping fingerprint over the dispatch's
@@ -925,6 +977,26 @@ mod tests {
         let read: crate::step_config::DispatchInternalConfig =
             crate::step_config::load(&step, crate::step_config::ConfigKind::DispatchInternal).unwrap();
         assert_eq!(read.brief_refs.unwrap_or_default(), opts.brief_refs);
+    }
+
+    /// (#3074) `--workspace-read-only` must survive the crew-of-one hop. The
+    /// graph copies `DispatchOpts` into the step config field by field, and
+    /// the flag was once dropped there (and hardcoded `false` on the read
+    /// side), so a read-only request mounted the operator's tree read-write.
+    #[serial_test::serial]
+    #[test]
+    fn build_graph_carries_workspace_read_only_to_the_step_kind() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let mut opts = test_opts("coder", "hi");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
+        assert!(!rebuilt_opts(&task, &step).workspace_read_only, "off by default");
+
+        opts.workspace_read_only = true;
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
+        assert!(
+            rebuilt_opts(&task, &step).workspace_read_only,
+            "the flag must reach the DispatchOpts the step kind dispatches with"
+        );
     }
 
     #[serial_test::serial]

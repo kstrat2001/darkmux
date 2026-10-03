@@ -330,28 +330,32 @@ pub(crate) fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
 /// daemon's permissive-CORS endpoint and shown in the browser modal).
 /// (#170 QA Q7)
 ///
-/// The userinfo/host boundary is the **last** `@` in the authority (RFC
-/// 3986), which is also how the `redis`/`url` crates parse the URL they
-/// connect with. This function used to split on the *first* `@` — so a
-/// password itself containing `@` (a real shape: cloud Redis providers
-/// generate them, and the Tier-1 `DARKMUX_REDIS_URL` path is documented
-/// verbatim-no-validation) had everything after its first `@` treated as
-/// "host" and echoed in clear:
+/// The userinfo/host boundary is the **last** `@` in the URL, which is also
+/// how the `redis`/`url` crates parse the URL they connect with. This
+/// function used to split on the *first* `@` — so a password itself
+/// containing `@` (a real shape: cloud Redis providers generate them, and the
+/// Tier-1 `DARKMUX_REDIS_URL` path is documented verbatim-no-validation) had
+/// everything after its first `@` treated as "host" and echoed in clear:
 ///
 /// `redis://:my@secretpw@real.host:6379/0` → `redis://:***@secretpw@real.host:6379/0`
 ///
 /// A redactor that disagrees with the connection parser about where the
-/// password ends leaks exactly the disagreement. The authority is bounded
-/// at the first `/`, `?`, or `#` first, so an `@` in the path/query is
-/// data, never a boundary. URLs without an `@` in the authority are
-/// returned unchanged.
+/// password ends leaks exactly the disagreement.
+///
+/// (#3074) It then bounded the authority at the first `/`, `?` or `#` before
+/// looking for `@`, which leaked a password holding one of them
+/// (`redis://:p#ssw0rd@h` printed in clear). A redis URL has no path `@`
+/// (the path is the database number), so the only `@` that can follow the
+/// password's own delimiter is the boundary: everything between `://` and the
+/// last `@` is userinfo. The cost of that fail-closed choice is a misread
+/// host in a diagnostic for a URL that carries an `@` after its host;
+/// the alternative is a leaked password. URLs without an `@` are returned
+/// unchanged.
 pub fn redact_url_creds(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(auth_end);
-    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+    let Some((userinfo, host_and_tail)) = rest.rsplit_once('@') else {
         return url.to_string();
     };
     let masked_userinfo = if let Some((user, _pass)) = userinfo.split_once(':') {
@@ -360,7 +364,7 @@ pub fn redact_url_creds(url: &str) -> String {
         // username only, no password — still keep the username visible.
         userinfo.to_string()
     };
-    format!("{scheme}://{masked_userinfo}@{host}{tail}")
+    format!("{scheme}://{masked_userinfo}@{host_and_tail}")
 }
 
 /// (#1715) Whether the near-maxlen warning is genuinely actionable. Pure

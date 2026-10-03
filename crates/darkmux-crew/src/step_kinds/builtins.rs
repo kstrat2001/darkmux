@@ -528,7 +528,10 @@ pub(crate) fn dispatch_opts_for(
         remote_origin: None,
         live_channel: true,
         brief_refs,
-        workspace_read_only: false,
+        // (#3074) Read back off the step config the crew-of-one graph wrote
+        // it into; a mission step that names no key mounts read-write, as
+        // every such step always has.
+        workspace_read_only: cfg.workspace_read_only.is_some_and(|f| f.0),
         record_context: None,
         role_id,
         message,
@@ -2950,6 +2953,14 @@ impl StepKind for ProceduralShellStepKind {
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
+        // (#3074) Declared values first, so the darkmux-set variables below
+        // (`DARKMUX_STEP_INPUT_*`, `DARKMUX_BIN`) win over a clashing name.
+        for (name, value) in cfg.env.iter().flatten() {
+            match value {
+                serde_json::Value::String(text) => cmd.env(name, text),
+                other => cmd.env(name, other.to_string()),
+            };
+        }
         for (dep_id, output) in input {
             let env_key = sanitize_env_key(dep_id);
             cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
@@ -4229,6 +4240,31 @@ mod tests {
             std::fs::canonicalize(out.output.trim()).unwrap(),
             std::fs::canonicalize(dir.path()).unwrap()
         );
+    }
+
+    /// (#3074) A step's `env` reaches the command as environment variables,
+    /// never as shell text: a value full of quotes and `;` is read back
+    /// byte for byte, and the command it would have broken out into does not
+    /// run.
+    #[serial_test::serial]
+    #[test]
+    fn procedural_shell_env_values_reach_the_command_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("injected");
+        let evil = format!("0';touch {};#", marker.display());
+        let s = step(
+            "s1",
+            "procedural.shell",
+            json!({
+                "command": "printf '%s' \"$DARKMUX_TEST_VALUE\"",
+                "env": {"DARKMUX_TEST_VALUE": evil},
+            }),
+        );
+        let out = ProceduralShellStepKind
+            .run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+            .unwrap();
+        assert_eq!(out.output, evil);
+        assert!(!marker.exists(), "the value was run as shell");
     }
 
     /// The owning Task's `workdir` (e.g. a coder-phase worktree — "the

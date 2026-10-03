@@ -392,6 +392,7 @@ pub(crate) fn resolve_config(config_id: &str) -> Result<mission_config::LoadedMi
 /// operator themself supplied (captured before a single default lands: the
 /// inert-input checks in [`launch`] must tell "the operator passed this knob"
 /// apart from "the document defaulted it").
+#[derive(Debug)]
 pub(crate) struct ResolvedInputs {
     pub collected: BTreeMap<String, serde_json::Value>,
     pub operator_supplied: std::collections::BTreeSet<String>,
@@ -2379,7 +2380,25 @@ fn refuse_bad_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_
     if !missing.is_empty() {
         bail!("{}", missing_inputs_message(config, &missing));
     }
+    refuse_non_whole_numbers(config, collected)?;
     refuse_bad_workspace_specs(config, collected)
+}
+
+/// (#3074) An input declared `whole_number` takes digits and nothing else.
+/// Refused at launch, a dry run included, so text that is not a number never
+/// reaches the step that reads it.
+fn refuse_non_whole_numbers(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    for input in config.inputs.iter().filter(|i| i.whole_number == Some(true)) {
+        let Some(value) = collected.get(&input.name) else { continue };
+        let text = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("input `{}` must be a whole number (digits only), got {text:?}", input.name);
+        }
+    }
+    Ok(())
 }
 
 /// The inputs a step's `workspace` names (`"workspace": "{{<input>}}"`, the
@@ -6279,6 +6298,7 @@ mod tests {
             default: Some(serde_json::json!("all-rules")),
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         };
         let cfg = MissionConfig {
@@ -7163,6 +7183,7 @@ mod tests {
                 default,
                 ignored,
                 ignored_reason: None,
+                whole_number: None,
                 extras: BTreeMap::new(),
             }
         };
@@ -7211,6 +7232,24 @@ mod tests {
         );
     }
 
+    /// (#3074) A whole-number input refuses text that is not one at launch,
+    /// before anything is minted: `review`'s `mod_wait_seconds` lands inside
+    /// a wait script, so a quote or a `;` in it must never get that far.
+    #[test]
+    fn a_whole_number_input_refuses_other_text_at_launch() {
+        let loaded = resolve_config("review").unwrap();
+        let params = |v: &str| vec!["diff_file=d.diff".to_string(), format!("mod_wait_seconds={v}")];
+        for bad in ["0';touch x;#", "1.5", "-3", "", " 5", "5s"] {
+            let err = resolve_inputs(&loaded.config, None, &params(bad)).unwrap_err().to_string();
+            assert!(err.contains("mod_wait_seconds") && err.contains("whole number"), "{bad:?}: {err}");
+        }
+        for good in ["0", "45", "0600"] {
+            resolve_inputs(&loaded.config, None, &params(good)).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+        let default = resolve_inputs(&loaded.config, None, &["diff_file=d.diff".to_string()]).unwrap();
+        assert_eq!(default.collected["mod_wait_seconds"], serde_json::json!("0"));
+    }
+
     #[test]
     fn missing_required_inputs_excludes_mission_id_and_optional_fields() {
         let input = |name: &str, required: Option<bool>| mission_config::MissionInput {
@@ -7220,6 +7259,7 @@ mod tests {
             default: None,
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         };
         let cfg = MissionConfig {
