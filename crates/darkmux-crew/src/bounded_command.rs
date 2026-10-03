@@ -127,6 +127,12 @@ pub fn configured_timeout() -> Duration {
 /// owns the BOUND, not the command.
 pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
     use std::io::Read;
+    // (#3074) A signal that landed before this spawn must stop the command
+    // from ever starting; the poll below only notices it after the child is
+    // already running.
+    if darkmux_types::interrupt::is_set() {
+        return Bounded::Interrupted;
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -285,6 +291,20 @@ fn kill_group(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3074) A signal observed BEFORE the spawn means nothing is spawned.
+    /// A program that cannot exist makes that observable without a race: a
+    /// real spawn attempt reports `SpawnFailed`, the guard reports
+    /// `Interrupted`.
+    #[test]
+    #[serial_test::serial]
+    fn run_bounded_does_not_spawn_once_a_signal_was_observed() {
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let out = run_bounded(Command::new("/nonexistent/darkmux-3074"), Duration::from_secs(5));
+        darkmux_types::interrupt::reset_for_test();
+        assert!(matches!(out, Bounded::Interrupted), "got {out:?}");
+    }
 
     fn sh(command: &str) -> Command {
         let mut c = Command::new("sh");

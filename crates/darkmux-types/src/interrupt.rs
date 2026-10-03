@@ -160,6 +160,19 @@ pub fn install_hup() {
 /// its own; `mission_launch` reads it to tell the two apart.
 pub const INTERRUPTED_BY_SIGNAL: &str = "interrupted by an operator signal";
 
+/// (#3074) The launch-boundary guard: `Err` naming `context` once a signal
+/// has been observed, `Ok` otherwise. Called before each scheduler wave, each
+/// spawn and the launcher's finalize, so a run that was interrupted never
+/// starts more work and never closes as a success. The error carries
+/// [`INTERRUPTED_BY_SIGNAL`], the marker `mission_launch` already reads to
+/// tell an interrupted step from one that failed for its own reason.
+pub fn bail_if_set(context: &str) -> anyhow::Result<()> {
+    if is_set() {
+        anyhow::bail!("{INTERRUPTED_BY_SIGNAL}: {context}");
+    }
+    Ok(())
+}
+
 /// Whether SIGINT, SIGTERM, or SIGHUP has been received since [`install`]/
 /// [`install_term`]/[`install_hup`] was called. Never resets — see the
 /// module doc.
@@ -286,6 +299,19 @@ mod tests {
         on_sigint(libc::SIGINT);
         assert!(is_set());
         INTERRUPTED.store(false, Ordering::SeqCst);
+    }
+
+    /// (#3074) `bail_if_set` is `Ok` before a signal and an `Err` carrying
+    /// the interrupt marker and the caller's context after one.
+    #[test]
+    #[serial_test::serial]
+    fn bail_if_set_errs_with_the_marker_once_interrupted() {
+        reset_for_test();
+        assert!(bail_if_set("before wave").is_ok());
+        mark_interrupted();
+        let err = bail_if_set("before wave").unwrap_err().to_string();
+        assert!(err.contains(INTERRUPTED_BY_SIGNAL) && err.contains("before wave"), "{err}");
+        reset_for_test();
     }
 
     /// (#2476) `mark_interrupted` sets the SAME flag a real signal sets,
