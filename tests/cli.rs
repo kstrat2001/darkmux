@@ -11028,14 +11028,12 @@ fn a_mod_seat_profile_naming_a_defined_profile_proceeds() {
 // therefore not a coder dispatch but a shell command, and a shell command in
 // a JSON document is exactly the kind of artifact that rots silently. These
 // tests execute the SHIPPED BYTES: `create_mod_wait_command` pulls the
-// command out of the embedded config and substitutes only the two
-// placeholders the launcher/grow passes would have substituted, so a change
-// to the command text is a change these tests see.
+// command out of the embedded config and sets the two variables the step's
+// `env` would have set, so a change to the command text is a change these
+// tests see.
 
-/// The `create-mod` task's wait command, as shipped, with `{{item.key}}`
-/// (grow's namespace) and `{{mod_wait_seconds}}` (the launch-input
-/// namespace) resolved the way the two real substitution passes resolve
-/// them.
+/// The `create-mod` task's wait command, as shipped, run with the finding key
+/// and bound in the environment the way the step's `env` provides them.
 fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
     let doc: serde_json::Value =
         serde_json::from_str(include_str!("../templates/builtin/mission-configs/review.json"))
@@ -11049,7 +11047,10 @@ fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
     let raw = phase["tasks"][0]["grow"]["config"]["command"]
         .as_str()
         .expect("the create-mod task's grow config carries a shell command");
-    raw.replace("{{item.key}}", finding_key).replace("{{mod_wait_seconds}}", bound)
+    // The shipped command reads both values from the environment the step's
+    // `env` sets (#3074), so the test sets them the same way: quoted, and
+    // exported ahead of the unchanged command text.
+    format!("export DARKMUX_FINDING_KEY='{finding_key}' DARKMUX_MOD_WAIT_SECONDS='{bound}'\n{raw}")
 }
 
 /// Record a mod naming `finding_key` through the real `mod create` verb, in
@@ -11181,7 +11182,10 @@ fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
         "wait then gate: no dispatch step: {task}"
     );
     let command = task["grow"]["config"]["command"].as_str().unwrap();
-    for needle in ["{{item.key}}", "{{mod_wait_seconds}}", "mod list --for", "DARKMUX_BIN"] {
+    let env = &task["grow"]["config"]["env"];
+    assert_eq!(env["DARKMUX_FINDING_KEY"], serde_json::json!("{{item.key}}"), "{env}");
+    assert_eq!(env["DARKMUX_MOD_WAIT_SECONDS"], serde_json::json!("{{mod_wait_seconds}}"), "{env}");
+    for needle in ["$DARKMUX_FINDING_KEY", "$DARKMUX_MOD_WAIT_SECONDS", "mod list --for", "DARKMUX_BIN"] {
         assert!(command.contains(needle), "the wait command must name {needle:?}:\n{command}");
     }
 }

@@ -364,6 +364,11 @@ pub struct MissionInput {
     /// case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored: Option<bool>,
+    /// (#3074) `true` when the input is a count of seconds, items or the
+    /// like: the launcher refuses a value that is not made of digits, before
+    /// anything is minted. Absent or `false` leaves the value free-form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_number: Option<bool>,
     /// Why this input is ignored — rendered into the warning. Unenforced
     /// at parse time (a missing reason on an `ignored: true` input is a
     /// doc smell, not a load-bearing break); `darkmux doctor`/`validate`
@@ -3256,6 +3261,7 @@ mod tests {
             default: None,
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         }
     }
@@ -3414,6 +3420,7 @@ mod tests {
             inputs: vec![MissionInput {
                 ignored: Some(true),
                 ignored_reason: Some("kept for parity".to_string()),
+                whole_number: None,
                 ..input_named("x")
             }],
             ..doc(vec![])

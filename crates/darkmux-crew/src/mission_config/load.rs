@@ -518,6 +518,39 @@ mod tests {
         }
     }
 
+    /// (#3074) A `{{placeholder}}` spliced into a `command` is shell text:
+    /// a value holding a quote runs as code before any check in the script
+    /// sees it. Every shipped command takes its values from environment
+    /// variables (the step's `env`) instead, so none may carry a placeholder.
+    #[test]
+    fn no_embedded_shell_command_splices_a_placeholder() {
+        fn walk(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let here = format!("{path}/{key}");
+                        match child.as_str() {
+                            Some(text) if key == "command" && text.contains("{{") => found.push(here),
+                            _ => walk(child, &here, found),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        walk(child, &format!("{path}[{i}]"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for (id, json) in EMBEDDED_MISSION_CONFIGS {
+            let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+            walk(&doc, id, &mut found);
+        }
+        assert!(found.is_empty(), "a placeholder is spliced into a shell command at: {found:?}");
+    }
+
     /// #1917 — the function `darkmux doctor`'s mission-config drift remedy
     /// needed and didn't have. "review" resolves to the embedded built-in
     /// (with no user or on-disk copy present), so a fallback genuinely

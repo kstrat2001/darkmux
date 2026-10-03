@@ -1419,7 +1419,7 @@ pub(crate) mod tests {
     // ── argument mapping ────────────────────────────────────────────────
 
     fn input(name: &str) -> MissionInput {
-        MissionInput { name: name.to_string(), description: None, required: Some(false), default: None, ignored: None, ignored_reason: None, extras: Map::new() }
+        MissionInput { name: name.to_string(), description: None, required: Some(false), default: None, ignored: None, ignored_reason: None, whole_number: None, extras: Map::new() }
     }
 
     fn config_with(inputs: &[&str], reads_args: bool) -> MissionConfig {

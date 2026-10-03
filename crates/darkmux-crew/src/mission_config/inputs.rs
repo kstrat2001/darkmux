@@ -717,6 +717,7 @@ mod tests {
                 default: None,
                 ignored: None,
                 ignored_reason: None,
+                whole_number: None,
                 extras: BTreeMap::new(),
             }],
             phases,
@@ -840,6 +841,7 @@ mod tests {
             default: None,
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         });
         cfg
@@ -949,6 +951,7 @@ mod tests {
             default: None,
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         });
         assert_eq!(
@@ -992,6 +995,7 @@ mod tests {
             default: None,
             ignored: Some(true),
             ignored_reason: Some("review-v2 has no external bundler".to_string()),
+            whole_number: None,
             extras: BTreeMap::new(),
         });
         assert!(unreferenced_inputs(&cfg, &[]).is_empty());
@@ -1018,6 +1022,7 @@ mod tests {
             default: None,
             ignored: None,
             ignored_reason: None,
+            whole_number: None,
             extras: BTreeMap::new(),
         });
         let supplied: BTreeSet<String> = ["dry_run".to_string()].into_iter().collect();
