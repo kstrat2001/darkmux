@@ -4931,28 +4931,20 @@ enum KillOutcome {
     /// a container being created right now (an `--image` still being pulled)
     /// looks exactly like this. (#2232, round 2)
     ///
-    /// **This variant DISCLOSES the pull window; it does not close it
-    /// ([#2252]).** When the inactivity deadline fires while `docker run` is
-    /// still pulling a BYO `--image`, the watchdog burns its budget against a
-    /// container that does not exist yet, settles here, warns — and then the
-    /// thread RETURNS. Nothing re-arms. The pull finishes, the container
-    /// starts UNWATCHED, and the main thread is still parked in
-    /// `wait_with_output()` with nothing left that can kill it, exactly as
-    /// before. What changed in round 2 is only that the operator is now told:
-    /// the outcome used to read `Confirmed { attempts: 1 }` at ~0s and lie.
+    /// **This is the pull window (#2252).** When the inactivity deadline
+    /// fires while `docker run` is still pulling a BYO `--image`, the watchdog
+    /// burns its budget against a container that does not exist yet and
+    /// settles here. It does NOT retire: `rearm_after_absent_kill` re-arms the
+    /// deadline for a full budget and the watchdog keeps watching, so the
+    /// container that eventually starts is still covered. The pull's own time
+    /// is therefore never charged against the dispatch, and a container that
+    /// never appears ends the watchdog when `docker run` returns and the main
+    /// thread sets `watchdog_done`.
     ///
-    /// Two limits on how far that disclosure reaches, so nobody mistakes this
-    /// for the fix:
-    ///
-    /// - The warning is an `eprintln!` from a process that may never exit. An
-    ///   unattended `mission launch` whose harness reads stderr only at
-    ///   process end shows the operator NOTHING.
-    /// - Nothing re-arms the deadline against the container that eventually
-    ///   starts, so the dispatch can still hang indefinitely.
-    ///
-    /// The real fixes — re-arming the watchdog once the container appears, or
-    /// pulling the image in a preflight step outside the inactivity budget —
-    /// are [#2252], deliberately NOT built here.
+    /// Before #2252 the thread returned here, the pull finished, and the
+    /// container ran UNWATCHED with the main thread parked in
+    /// `wait_with_output()` and nothing left that could kill it. The outcome
+    /// used to read `Confirmed { attempts: 1 }` at ~0s and lie (#2232 round 2).
     ///
     /// [#2252]: https://github.com/kstrat2001/darkmux/issues/2252
     Absent { attempts: u32 },
@@ -4973,14 +4965,13 @@ impl KillOutcome {
             // model load" alarm: docker told us, conclusively and repeatedly,
             // that there is no such container. What the operator needs to
             // know is the other thing — the watchdog had nothing to kill, so
-            // whatever the deadline fired against is not accounted for.
+            // whatever the deadline fired against is not accounted for yet.
             KillOutcome::Absent { attempts } => Some(format!(
                 "darkmux dispatch: ⚠ the inactivity watchdog found NO container named \
-                 `{container_name}` across {attempts} attempts — nothing was killed. If the \
-                 dispatch is still running, its container was created after the deadline fired \
-                 (an `--image` pulled inline by `docker run` can take longer than the inactivity \
-                 budget) and is now UNWATCHED; stop it with `docker ps` + `docker kill` if it \
-                 hangs. (#2232)"
+                 `{container_name}` across {attempts} attempts — nothing was killed. Its \
+                 container is probably still being created (an `--image` pulled inline by \
+                 `docker run` can take longer than the inactivity budget), so the watchdog \
+                 re-arms for a full budget and keeps watching it. (#2232, #2252)"
             )),
             KillOutcome::Unconfirmed { attempts, last_error } => Some(format!(
                 "darkmux dispatch: ⚠ the inactivity watchdog could not confirm container \
@@ -5356,67 +5347,111 @@ fn run_watchdog(
     watchdog_abandoned: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
+    inactivity_secs: u64,
 ) -> WatchdogWake {
-    let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
-    // Race window: a natural exit can land in the final 500ms sleep of the
-    // wait. Re-check before firing to avoid stamping a spurious timeout on a
-    // clean exit (QA finding 2026-05-25).
-    if watchdog_done.load(Ordering::SeqCst) {
-        return WatchdogWake::Done;
+    loop {
+        let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
+        // Race window: a natural exit can land in the final 500ms sleep of
+        // the wait. Re-check before firing to avoid stamping a spurious
+        // timeout on a clean exit (QA finding 2026-05-25).
+        if watchdog_done.load(Ordering::SeqCst) {
+            return WatchdogWake::Done;
+        }
+        match wake {
+            WatchdogWake::Done => return WatchdogWake::Done,
+            // Only a genuine deadline expiry earns the "no proof-of-work
+            // signal" framing that `inactivity_timeout_stderr` builds from
+            // `timeout_fired`. Mark it BEFORE the kill so the post-wait
+            // detection sees the flag.
+            WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
+            // A different cause (the main thread panicked, not that the
+            // dispatch stalled). No in-process reader ever inspects
+            // `timeout_fired` on this path, but this function stays honest
+            // about WHY it is killing regardless of who, if anyone, later
+            // looks.
+            WatchdogWake::Abandoned => {}
+        }
+        // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
+        // until the container is confirmed stopped or the attempts are
+        // exhausted; it used to fire one swallowed `docker kill` and return, so
+        // a single transient docker failure retired the only thing that could
+        // unblock the main thread's `wait_with_output()` — leaving a hung
+        // dispatch hung forever.
+        //
+        // Deliberately does NOT bail out on `watchdog_done`: the main thread
+        // sets that flag when its WAIT returns, which proves the docker CLI
+        // process ended, not that the container did (#2233's whole finding).
+        // Abandoning the kill there would re-open the orphan. The bound is the
+        // attempt budget instead, which keeps `dispatch`'s
+        // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
+        // ~3.75s of backoff plus however long the subprocesses take, and only
+        // on a dispatch that already timed out or was abandoned (a healthy one
+        // returns from the wait above without ever reaching this line).
+        //
+        // It is NOT a hard ceiling, and the ~3.75s figure covers only the
+        // sleeps. Every attempt is a blocking `Command::output()` and the
+        // docker CLI has no client-side timeout of its own, so a daemon that
+        // ACCEPTS a connection and never answers blocks this join for as long
+        // as the CLI hangs (measured against such a socket: `docker ps` still
+        // blocked at 41s, `docker kill` at 25s). Unchanged from before #2232 —
+        // in that hang class attempt 1 blocks and the retries are never
+        // reached, so the worst case is exactly the single fire-and-forget
+        // kill's. Bounding it means spawn-poll-kill instead of `output()`;
+        // `LmsHost`'s `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` handling (#1276)
+        // already does exactly that and is the pattern to copy. (#2232)
+        //
+        // The kill + publish + warn sequence lives in `watchdog_finalize_kill`
+        // rather than inline here, because a `thread::spawn` closure is
+        // unreachable from a unit test and these were the three statements
+        // that decided whether the operator is told the truth. (#2232, round
+        // 3)
+        if let Some(warning) =
+            watchdog_finalize_kill(&container_name, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
+        {
+            eprintln!("{warning}");
+        }
+        if !rearm_after_absent_kill(
+            wake,
+            &kill_disposition,
+            &watchdog_done,
+            &timeout_fired,
+            &inactivity_deadline,
+            inactivity_secs,
+        ) {
+            return wake;
+        }
     }
-    match wake {
-        WatchdogWake::Done => return WatchdogWake::Done,
-        // Only a genuine deadline expiry earns the "no proof-of-work
-        // signal" framing that `inactivity_timeout_stderr` builds from
-        // `timeout_fired`. Mark it BEFORE the kill so the post-wait
-        // detection sees the flag.
-        WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
-        // A different cause (the main thread panicked, not that the
-        // dispatch stalled). No in-process reader ever inspects
-        // `timeout_fired` on this path, but this function stays honest
-        // about WHY it is killing regardless of who, if anyone, later looks.
-        WatchdogWake::Abandoned => {}
+}
+
+/// (#2252) The deadline fired and the kill found NO container: `docker run` is
+/// still creating it (an inline `--image` pull can outlast the budget). Ending
+/// the watchdog there would leave the container, once it starts, with nothing
+/// able to stop it, so the deadline is re-armed for a full budget and the
+/// watchdog keeps watching. Returns whether it did; `false` for every other
+/// outcome (the container was killed, the kill is unconfirmed, the scope was
+/// abandoned) and once the main thread has proved the wait is over, in which
+/// case there is nothing left to watch.
+///
+/// `timeout_fired` is cleared on a re-arm: nothing has timed out yet, so the
+/// dispatch must not report an inactivity kill that never happened. The
+/// persistent kill itself is unchanged (see `run_watchdog`'s comment on why
+/// it must not bail on `watchdog_done`); only the decision to keep going is
+/// new.
+fn rearm_after_absent_kill(
+    wake: WatchdogWake,
+    kill_disposition: &AtomicU8,
+    watchdog_done: &AtomicBool,
+    timeout_fired: &AtomicBool,
+    inactivity_deadline: &Mutex<Instant>,
+    inactivity_secs: u64,
+) -> bool {
+    let absent = kill_disposition.load(Ordering::SeqCst) == KillDisposition::Absent.code();
+    if wake != WatchdogWake::DeadlineExpired || !absent || watchdog_done.load(Ordering::SeqCst) {
+        return false;
     }
-    // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
-    // until the container is confirmed stopped or the attempts are
-    // exhausted; it used to fire one swallowed `docker kill` and return, so
-    // a single transient docker failure retired the only thing that could
-    // unblock the main thread's `wait_with_output()` — leaving a hung
-    // dispatch hung forever.
-    //
-    // Deliberately does NOT bail out on `watchdog_done`: the main thread
-    // sets that flag when its WAIT returns, which proves the docker CLI
-    // process ended, not that the container did (#2233's whole finding).
-    // Abandoning the kill there would re-open the orphan. The bound is the
-    // attempt budget instead, which keeps `dispatch`'s
-    // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
-    // ~3.75s of backoff plus however long the subprocesses take, and only
-    // on a dispatch that already timed out or was abandoned (a healthy one
-    // returns from the wait above without ever reaching this line).
-    //
-    // It is NOT a hard ceiling, and the ~3.75s figure covers only the
-    // sleeps. Every attempt is a blocking `Command::output()` and the
-    // docker CLI has no client-side timeout of its own, so a daemon that
-    // ACCEPTS a connection and never answers blocks this join for as long
-    // as the CLI hangs (measured against such a socket: `docker ps` still
-    // blocked at 41s, `docker kill` at 25s). Unchanged from before #2232 —
-    // in that hang class attempt 1 blocks and the retries are never
-    // reached, so the worst case is exactly the single fire-and-forget
-    // kill's. Bounding it means spawn-poll-kill instead of `output()`;
-    // `LmsHost`'s `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` handling (#1276)
-    // already does exactly that and is the pattern to copy. (#2232)
-    //
-    // The kill + publish + warn sequence lives in `watchdog_finalize_kill`
-    // rather than inline here, because a `thread::spawn` closure is
-    // unreachable from a unit test and these were the three statements
-    // that decided whether the operator is told the truth. (#2232, round
-    // 3)
-    if let Some(warning) =
-        watchdog_finalize_kill(&container_name, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
-    {
-        eprintln!("{warning}");
-    }
-    wake
+    timeout_fired.store(false, Ordering::SeqCst);
+    *lock_deadline(inactivity_deadline) = inactivity_deadline_after(inactivity_secs, Duration::ZERO);
+    true
 }
 
 /// `run_watchdog`'s wait: poll every 500ms until the main thread is done,
@@ -5473,6 +5508,7 @@ fn spawn_guarded_watchdog(
     watchdog_done: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
+    inactivity_secs: u64,
 ) -> (StopFlagGuard, thread::JoinHandle<WatchdogWake>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -5491,6 +5527,7 @@ fn spawn_guarded_watchdog(
             abandoned,
             timeout_fired,
             kill_disposition,
+            inactivity_secs,
         )
     });
     (guard, handle)
@@ -6986,6 +7023,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Arc::clone(&watchdog_done),
         Arc::clone(&timeout_fired),
         Arc::clone(&kill_disposition),
+        inactivity_secs,
     );
 
     // (#557 slice 4 · #1064) Always-on lms + host-load telemetry sampler.
