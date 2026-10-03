@@ -136,6 +136,12 @@ pub enum Reason {
     /// unload-then-load. Carried by BOTH halves: the free-phase Unload of
     /// the stale and the load-phase reload at the required ctx.
     InsufficientCtx,
+    /// Another darkmux-owned copy of the modelKey is resident under a
+    /// DIFFERENT identifier than the one this seat addresses (#3074 B10).
+    /// Carried by the Unload that replaces it (ctx may be ample: this is not
+    /// an undersized-ctx case) and by the Load that sits beside it when
+    /// another seat in the same plan addresses that copy (#3076).
+    OtherOwnedCopy { identifier: String },
     /// Load (alongside): a foreign (user/operator) resident shares the
     /// weights, but its load configuration is unknown (the #1135 ghost) —
     /// never reused, never touched; darkmux loads its own namespaced copy
@@ -225,6 +231,10 @@ impl fmt::Display for Reason {
             Reason::InsufficientCtx => write!(
                 f,
                 "the resident context is below the required minimum — the stale instance is unloaded in the free phase and reloaded at the required context in the load phase (silently reusing the wrong context is the #1135 bug class)"
+            ),
+            Reason::OtherOwnedCopy { identifier } => write!(
+                f,
+                "the darkmux-managed instance \"{identifier}\" of this model is loaded under a different identifier than the one this seat addresses, so this seat never reuses it (its context may be ample; that is not why it is touched)"
             ),
             Reason::ForeignDuplicateLoadAlongside { foreign_identifier } => write!(
                 f,

@@ -553,6 +553,14 @@ fn model_residency(
                         pm.n_ctx.unwrap_or(0)
                     )),
                 ),
+                ResidencyDecision::OtherOwnedCopy { other_identifier, other_ctx } => (
+                    Residency::NotLoaded,
+                    Some(format!(
+                        "this model is loaded as {other_identifier} (ctx {other_ctx}), not under \
+                         {} which the role addresses; launch would load that identifier",
+                        placement.identifier
+                    )),
+                ),
                 ResidencyDecision::ForeignDuplicate { foreign_identifier } => (
                     Residency::LoadedByUser,
                     Some(format!(
@@ -1395,6 +1403,21 @@ mod tests {
         let d = detail.expect("Reconcile must carry a human explanation");
         assert!(d.contains("4096"), "{d}");
         assert!(d.contains("262144"), "{d}");
+    }
+
+    #[test]
+    fn residency_other_owned_copy_with_ample_ctx_never_reads_below_the_profile_3076() {
+        // darkmux:other holds the model at 100k, the profile wants 8k under
+        // its own identifier: the copy's ctx is fine, so the line must not
+        // say "below the profile's".
+        let m = local_model("m-a", 8000);
+        let mut other = loaded_model("m-a", true, 100_000);
+        other.identifier = "darkmux:other".to_string();
+        let (residency, detail) = model_residency(&m, Ok(&[other]));
+        assert_eq!(residency, Residency::NotLoaded);
+        let d = detail.expect("an other-copy residency carries an explanation");
+        assert!(!d.contains("below"), "{d}");
+        assert!(d.contains("darkmux:other") && d.contains("100000"), "{d}");
     }
 
     #[test]

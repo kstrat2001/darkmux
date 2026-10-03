@@ -436,6 +436,22 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   The console gains a `machine list` panel (a tenth, so a phone has no tooltip to
   miss), and its `machine status` panel takes a roster machine (`opt.machine`),
   the same roster-validated opt `profile list` has.
+- **Residency judges the copy the seat addresses** (#3074). A seat dispatches
+  to its own placement's identifier, so only that exact instance can be reused;
+  another `darkmux:` copy of the same model is replaced, never reused at
+  whatever context it holds. A lease on an explicit alias that a placement also
+  names now blocks an unload mid-generation, as a `darkmux:` lease already did.
+- **A sibling seat's copy is never unloaded to make room for another seat** (#3076).
+  When one wave holds two seats on the same model, the copy a seat addresses stays
+  whichever seat is planned first; the other seat loads beside it, or is refused
+  naming the budget. A replaced `darkmux:` copy now carries its own reason instead
+  of an "insufficient context" one, and `mission config show` words it the same way.
+- **A failed `lms ps` no longer paints the model ledger green** (#3074). The
+  machine verdict reads unknown, attribution reads unavailable, and the worker
+  footprint stays in the machine current.
+- **An all-error phase never reads complete** (#3074). The mission graph shows a
+  phase whose every task errored (or was abandoned) as error (or abandoned) even
+  when the phase was persisted complete.
 
 ### Changed (breaking, 4.0)
 

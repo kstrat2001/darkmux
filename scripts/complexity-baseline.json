@@ -74,7 +74,7 @@
   "crates/darkmux-lab/src/providers/workspace_delta.rs::walk_dir": 18,
   "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs::parse_gguf_header_from_reader": 40,
   "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs::read_gguf_scalar": 24,
-  "crates/darkmux-profiles/src/model_ledger.rs::compute_ledger": 42,
+  "crates/darkmux-profiles/src/model_ledger.rs::compute_ledger": 41,
   "crates/darkmux-profiles/src/model_ledger.rs::render_human": 16,
   "crates/darkmux-serve/src/fleet_listener.rs::submit_handler": 18,
   "crates/darkmux-serve/src/host_sampler.rs::spawn": 19,

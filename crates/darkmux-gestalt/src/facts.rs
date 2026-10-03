@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 /// source is `lms ps --json` → `darkmux_types::LoadedModel`).
 ///
 /// `Vec<ResidentFact>` ORDER IS DECISION-BEARING: it is the host-reported
-/// order, [`crate::residency::decide_residency`] is first-match-wins, and
+/// order, [`crate::residency::decide_residency`] takes the first of several
+/// non-exact copies of a model key, and
 /// budget eviction walks it deterministically (#1243). Adapters MUST NOT
 /// sort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -647,6 +647,25 @@ fn phase_status_note(status: PhaseDisplayStatus, counts: &PhaseTaskCounts) -> Op
     if parts.is_empty() { None } else { Some(parts.join(" · ")) }
 }
 
+/// Whether the task rollup beats the persisted phase status. The ordinary
+/// rule is monotone rank; three named ties are resolved toward the derived
+/// side so a laundering persisted word cannot hide it (see
+/// [`phase_display_status`]): a persisted `Complete` loses to a derived
+/// `Degraded`, `Error` or `Abandoned` (#2406, #3074: every task errored yet
+/// the phase read "complete"), and a persisted `Running` loses to a derived
+/// `Waiting` (#2343). A persisted `Abandoned` (the operator's abort) loses
+/// to none of them.
+fn derived_overrides_persisted(derived: PhaseDisplayStatus, persisted: PhaseDisplayStatus) -> bool {
+    let complete_hides = persisted == PhaseDisplayStatus::Complete
+        && matches!(
+            derived,
+            PhaseDisplayStatus::Degraded | PhaseDisplayStatus::Error | PhaseDisplayStatus::Abandoned
+        );
+    let running_hides =
+        derived == PhaseDisplayStatus::Waiting && persisted == PhaseDisplayStatus::Running;
+    complete_hides || running_hides || derived.rank() > persisted.rank()
+}
+
 /// (#1472, revised #2406) Derive a Phase's DISPLAY status from its Tasks'
 /// derived statuses via [`phase_task_rollup`] (task-level `Error`
 /// unchanged — see that function's own doc for why this does NOT reuse
@@ -656,10 +675,10 @@ fn phase_status_note(status: PhaseDisplayStatus, counts: &PhaseTaskCounts) -> Op
 /// the task-derived status wins ONLY when STRICTLY more advanced (by
 /// [`PhaseDisplayStatus::rank`], mirroring the mission-graph lens's own
 /// `statusRank` merge in `ui/src/lenses/mission/graph.ts`, #1868) — WITH
-/// ONE NAMED EXCEPTION:
+/// NAMED EXCEPTIONS (see [`derived_overrides_persisted`]):
 ///
 /// **A `Degraded` derivation wins a RANK TIE against a persisted
-/// `Complete` (#2406).** `crate::types::PhaseStatus` has only `Complete`/`Abandoned`
+/// `Complete` (#2406); so do `Error` and `Abandoned` (#3074).** `crate::types::PhaseStatus` has only `Complete`/`Abandoned`
 /// as terminals — it structurally CANNOT represent "terminal, but a mix"
 /// (see `crew::envelope::PhaseOutcomeKind`'s own doc: a `Degraded` phase's
 /// persisted lifecycle status is driven to `Complete`, same as a clean
@@ -720,24 +739,7 @@ fn phase_display_status(
 ) -> (PhaseDisplayStatus, PhaseTaskCounts) {
     let (derived, counts) = phase_task_rollup(task_statuses);
     let persisted_status = PhaseDisplayStatus::from_node_status(phase_status_to_node(persisted));
-    // `derived == Degraded` against a persisted `Complete`, and `derived
-    // == Waiting` against a persisted `Running`, are the two named
-    // tie-break exceptions (see this fn's own doc); `derived.rank() >
-    // persisted_status.rank()` is the ordinary monotone-authority rule.
-    // Combined with `||` rather than written as separate `if` arms that
-    // all return `derived` (clippy `if_same_then_else` correctly flags
-    // that shape as a dead branch). The `persisted_status ==
-    // Complete`/`Running` conjuncts are what keep an operator's `mission
-    // abort` (persisted `Abandoned`) from losing either tie to a
-    // still-mixed/still-queued rollup.
-    let winner = if (derived == PhaseDisplayStatus::Degraded && persisted_status == PhaseDisplayStatus::Complete)
-        || (derived == PhaseDisplayStatus::Waiting && persisted_status == PhaseDisplayStatus::Running)
-        || derived.rank() > persisted_status.rank()
-    {
-        derived
-    } else {
-        persisted_status
-    };
+    let winner = if derived_overrides_persisted(derived, persisted_status) { derived } else { persisted_status };
     (winner, counts)
 }
 
@@ -2495,6 +2497,30 @@ mod tests {
         assert_eq!(
             phase_display_status(PhaseStatus::Running, &[TaskDisplayStatus::Complete, TaskDisplayStatus::Error]).0,
             PhaseDisplayStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn phase_display_persisted_complete_never_hides_an_all_error_phase_3074() {
+        // #3074: Error ties Complete at rank 2, so a persisted Complete used
+        // to win and a phase whose every task errored read "complete".
+        assert_eq!(
+            phase_display_status(PhaseStatus::Complete, &[TaskDisplayStatus::Error, TaskDisplayStatus::Error]).0,
+            PhaseDisplayStatus::Error
+        );
+        assert_eq!(
+            phase_display_status(PhaseStatus::Complete, &[TaskDisplayStatus::Abandoned]).0,
+            PhaseDisplayStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn phase_display_persisted_abandoned_still_beats_error_rollup_3074() {
+        // Inverted case: the operator's abort stays authoritative over an
+        // all-error rollup.
+        assert_eq!(
+            phase_display_status(PhaseStatus::Abandoned, &[TaskDisplayStatus::Error]).0,
+            PhaseDisplayStatus::Abandoned
         );
     }
 
