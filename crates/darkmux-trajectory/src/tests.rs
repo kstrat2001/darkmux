@@ -402,6 +402,38 @@ fn an_unterminated_trajectory_is_closed_as_interrupted_once() {
     assert_eq!(TrajectoryFold::from_path(&ended).complete.unwrap().result, "stop");
 }
 
+/// A kill that tears a multibyte character makes the tail invalid UTF-8.
+/// That drops the torn line. The lines already written still fold, and the
+/// file can still be closed.
+#[test]
+fn a_torn_multibyte_tail_keeps_the_lines_already_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trajectory.jsonl");
+    let mut bytes = Vec::from(
+        concat!(
+            r#"{"type":"dispatch.start","ts":1000,"model":"m"}"#,
+            "\n",
+            r#"{"type":"model.completed","seq":1,"ts":4000,"finish_reason":"stop","usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+            "\n",
+            r#"{"type":"model.reasoning","reasoning_text":""#,
+        )
+        .as_bytes(),
+    );
+    // U+20AC is the three bytes e2 82 ac. One byte is a torn character.
+    bytes.push(0xE2);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let f = TrajectoryFold::from_path(&path);
+    assert_eq!(f.events, 2, "the torn tail drops one line, not the file: events={}", f.events);
+    assert_eq!(f.tokens.completion, 2, "what completed is kept");
+    assert!(f.complete.is_none(), "the torn file had no terminal record yet");
+    assert!(close_if_unterminated(&path).unwrap(), "a torn tail still closes");
+    let closed = TrajectoryFold::from_path(&path);
+    assert_eq!(closed.complete.unwrap().result, RESULT_INTERRUPTED);
+    assert_eq!(closed.tokens.completion, 2);
+    assert_eq!(TrajectoryFold::from_path(&dir.path().join("missing.jsonl")).events, 0);
+}
+
 /// (F2) One typed parse of a terminal `result`: every runtime escalation
 /// reason reads as `Escalated`, never as an error.
 #[test]

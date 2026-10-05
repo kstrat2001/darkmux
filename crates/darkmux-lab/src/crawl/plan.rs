@@ -1097,9 +1097,23 @@ impl plan_sites::SiteSource for DiffSource<'_> {
                 continue;
             }
             let Some(content) = self.files.get(rel, self.skipped, self.source_id) else { continue };
+            // A hunk numbered `+0` is not a file line (unified diffs are
+            // 1-based; 0 means that side does not exist). Indexing it
+            // underflows in debug and aborts the whole plan, so every
+            // later file in this source is lost with it. Skip the file
+            // and keep going.
+            if expected.keys().any(|&line_no| line_no == 0) {
+                self.skipped.push(SkippedEntry {
+                    reason: "the diff numbers a hunk line at 0, which is not a file line — that hunk is malformed, so this file contributes no sites".to_string(),
+                    file: rel.clone(),
+                    source: Some(self.source_id.to_string()),
+                });
+                continue;
+            }
             let lines: Vec<&str> = content.lines().collect();
             let mismatch = expected.iter().find(|(&line_no, text)| {
-                lines.get(line_no as usize - 1).copied() != Some(text.as_str())
+                let Some(idx) = (line_no as usize).checked_sub(1) else { return true };
+                lines.get(idx).copied() != Some(text.as_str())
             });
             if let Some((line_no, _)) = mismatch {
                 self.skipped.push(SkippedEntry {
@@ -2197,6 +2211,38 @@ line two
         assert_eq!(skipped.len(), 1, "the disagreement is COUNTED, not silently dropped: {skipped:?}");
         assert_eq!(skipped[0].file, "x.ts");
         assert!(skipped[0].reason.contains('3'), "names the first mismatching line: {}", skipped[0].reason);
+    }
+
+    /// A hunk numbered `+0` is not a file line. In debug the index underflows
+    /// and the planner panics, so every later file in that diff is lost. The
+    /// malformed file is skipped and the files after it still plan.
+    #[test]
+    fn a_hunk_numbered_at_line_zero_skips_that_file_and_keeps_the_rest() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("bad.ts"), "hello\n").unwrap();
+        fs::write(dir.path().join("good.ts"), "line one\nline two\n").unwrap();
+        let diff_text = [
+            "diff --git a/bad.ts b/bad.ts",
+            "--- a/bad.ts",
+            "+++ b/bad.ts",
+            "@@ -0,0 +0,1 @@",
+            "+hello",
+            "diff --git a/good.ts b/good.ts",
+            "--- a/good.ts",
+            "+++ b/good.ts",
+            "@@ -1,1 +1,2 @@",
+            " line one",
+            "+line two",
+            "",
+        ]
+        .join("\n");
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let mut source = DiffSource::new(&mut files, &mut skipped, "app", &diff_text);
+        let out = plan_sites::SiteSource::files(&mut source).unwrap();
+        let names: Vec<&str> = out.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(names, vec!["good.ts"], "the file after the malformed hunk still plans: {names:?}");
+        assert!(skipped.iter().any(|s| s.file == "bad.ts"), "the malformed hunk is recorded: {skipped:?}");
     }
 
     #[test]
