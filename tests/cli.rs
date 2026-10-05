@@ -13603,12 +13603,16 @@ fn mission_launch_sigint_closes_the_run_as_an_error_and_starts_no_later_phase() 
 }
 
 /// (#3074) A signal that lands just AFTER the only step exited 0 is still an
-/// interrupted run: it must close `run.error`, never `run.complete`. The step
-/// detaches a self-SIGINT that fires ~60ms after the step returns.
+/// interrupted run: it must close `run.error`, never `run.complete`. The
+/// launcher pauses at that window when `DARKMUX_TEST_SIGNAL_AFTER_STEPS`
+/// names a path, so the signal is delivered there rather than racing the
+/// process exit.
 #[test]
+#[cfg(unix)]
 fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
+    let ready = home.path().join("signal-ready");
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
     let config_json = r#"{
@@ -13622,21 +13626,33 @@ fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
                 "steps": [{
                     "id": "s1",
                     "kind": "procedural.shell",
-                    "config": { "command": "( sleep 0.06; kill -INT $PPID ) >/dev/null 2>&1 &" }
+                    "config": { "command": "true" }
                 }]
             }]
         }]
     }"#;
     fs::write(config_dir.join("late-signal-test.json"), config_json).unwrap();
 
-    let out = darkmux_cmd()
+    let mut child = darkmux_std_cmd();
+    let mut child = child
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_TEST_SIGNAL_AFTER_STEPS", &ready)
         .args(["mission", "launch", "late-signal-test"])
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(!out.status.success(), "an interrupted run must not exit 0");
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the close window never opened");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = std::process::Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap();
+    assert!(status.success());
+    let exit = child.wait().unwrap();
+    assert_eq!(exit.code(), Some(130), "exit: {exit:?}");
 
     let mut all = String::new();
     for e in walkdir_files(flows.path()) {

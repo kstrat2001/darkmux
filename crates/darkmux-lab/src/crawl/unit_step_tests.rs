@@ -2490,15 +2490,18 @@ fn an_interrupt_coincident_dispatch_failure_reads_interrupted_through_the_real_s
 
     // The same shape a real SIGINT produces at either of `dispatch_internal
     // .rs`'s two call sites: the dispatch returns `Err`, and
-    // `interrupt::is_set()` is ALREADY true by the time it does — set here
-    // BEFORE the dispatch fails, mirroring a signal arriving mid-dispatch.
-    darkmux_types::interrupt::simulate_sigint_for_test();
-    assert!(darkmux_types::interrupt::is_set(), "the simulated SIGINT must set the flag");
-
+    // `interrupt::is_set()` is ALREADY true by the time it does. The flag is
+    // set INSIDE the dispatch, mirroring a signal arriving mid-dispatch (#3074:
+    // the scheduler starts no ordinary step after a signal, so it cannot be set
+    // before the unit starts; only the record-only summary runs after it).
     let (steps, summary) = run_one_failing_unit_through_the_real_scheduler(
         &plan,
-        Arc::new(|_| Err(anyhow!("darkmux-runtime container dispatch interrupted by an operator signal"))),
+        Arc::new(|_| {
+            darkmux_types::interrupt::simulate_sigint_for_test();
+            Err(anyhow!("darkmux-runtime container dispatch interrupted by an operator signal"))
+        }),
     );
+    assert!(darkmux_types::interrupt::is_set(), "the simulated SIGINT must have set the flag");
 
     // Same observed shape as the confirmed live run: the unit step still
     // ends in `NodeStatus::Error`, never `Abandoned` — this fix does not

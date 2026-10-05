@@ -1697,6 +1697,7 @@ pub fn launch(
     // (#3074) A signal that landed after the last pass returned (so no pass
     // observed it) is still an interrupted run: it closes through this error
     // path, never as `run.complete`.
+    wait_for_late_signal_probe();
     graph_result = fail_if_interrupted(graph_result);
     if let Err(e) = graph_result {
         // (#1877) Explicit close, not the Drop backstop — a scheduler
@@ -1895,6 +1896,24 @@ fn fail_if_interrupted(
     let report = result?;
     crate::launch_guard::bail_if_operator_signal("mission launch observed a signal before finalizing")?;
     Ok(report)
+}
+
+/// Test seam for a signal that lands after the last step has returned and
+/// before the run is closed. When `DARKMUX_TEST_SIGNAL_AFTER_STEPS` names a
+/// path, write `ready` there and wait until an operator signal is observed,
+/// or 30s. Unset, this returns immediately.
+fn wait_for_late_signal_probe() {
+    let Ok(path) = std::env::var("DARKMUX_TEST_SIGNAL_AFTER_STEPS") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(&path, b"ready");
+    let started = std::time::Instant::now();
+    while !darkmux_types::interrupt::is_set() && started.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// (#2300) Expand every `grow` template a phase declares, from the output

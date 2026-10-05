@@ -418,11 +418,21 @@ pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_secon
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
-            darkmux_types::interrupt::mark_interrupted();
+            mark_bound_fired();
         });
     }
     Some(guard)
+}
+
+/// (#3074) The bound's deadline passed: record it as the cause, UNLESS an
+/// operator signal already landed. A Ctrl-C followed by the bound firing
+/// during wind-down is an operator interrupt (`run.error`), never a bound
+/// `Degraded`. Either way the run is told to stop.
+fn mark_bound_fired() {
+    if !darkmux_types::interrupt::is_set() {
+        WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    darkmux_types::interrupt::mark_interrupted();
 }
 
 /// (#2902 step 5) A run's wall-clock deadline: `started` plus its bound,
@@ -518,6 +528,26 @@ mod tests {
             spawn_wall_clock_watchdog(std::time::Instant::now(), 3600).is_some(),
             "a non-zero bound must return a live guard, not the zero-bound no-op"
         );
+    }
+
+    /// (#3074) The bound firing AFTER an operator signal must not read as a
+    /// bound abort; firing with no signal does.
+    #[test]
+    #[serial_test::serial]
+    fn the_bound_firing_after_an_operator_signal_is_not_recorded_as_the_cause() {
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        mark_bound_fired();
+        let after_signal = wall_clock_exceeded();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        mark_bound_fired();
+        let alone = wall_clock_exceeded();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(!after_signal, "(#3074) an operator signal came first: the bound is not the cause");
+        assert!(alone, "no signal: the bound is the cause");
     }
 
     /// (#2678) `wall_clock_exceeded` is the one extra bit that lets a

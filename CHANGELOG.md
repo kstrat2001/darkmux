@@ -1802,13 +1802,17 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 - **An interrupted launch never closes as a success** (5.0, #3074). A SIGINT,
   SIGTERM or SIGHUP during `mission launch` used to let later phases start and
   then close the run `run.complete` while the process exited 130. The scheduler
-  now starts no wave after a signal, a shell step is not spawned after one, and
-  a run that ends interrupted closes `run.error` with the mission in `Error`.
+  now starts no new work after a signal, except a record-only step that says it
+  still runs (the crawl summary, so an interrupted run still records that it was
+  interrupted). A shell step is not spawned after one, and a run that ends
+  interrupted closes `run.error` with the mission in `Error`.
   A mission whose mint died before its phases existed now closes with an
   `Error` envelope (it closed `Finalized`, which the runs board showed as
   `Complete`). A signal that lands after the last step, and before the run
   closes, now also ends it as `run.error`. A run's own wall-clock bound is not
-  a signal: it still ends `Degraded` with the bound named.
+  a signal: it still ends `Degraded` with the bound named. A signal that
+  already landed is not rewritten into that bound when the deadline passes
+  during wind-down.
 - **An inactivity timeout of `0` means unbounded** (5.0, #3074).
   `runtime.inactivity_timeout_seconds` / `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`
   set to `0` killed every dispatch's container on the watchdog's first poll.
