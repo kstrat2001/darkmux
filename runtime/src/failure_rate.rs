@@ -213,8 +213,11 @@ impl ToolOutcome {
 /// tools route failures through `Tool::execute`'s `Err`, which the dispatcher
 /// wraps as `"tool 'NAME' returned error: ..."`. That is why only the generic
 /// marker plus the bash exit-code parse are needed. Verified against
-/// `runtime/src/tools/mod.rs::execute_{read,write,edit,search}`. A future tool
-/// that returns `Ok(error-shaped-text)` must add its pattern here.
+/// `runtime/src/tools/mod.rs::execute_{read,write,edit,search}`. `write` and
+/// `edit` also return `Ok("NOT WRITTEN…")` / `Ok("NOT EDITED…")` when they
+/// refuse an echoed `read` prefix; those prefixes are classified below, the
+/// same way `create_finding` and `create_mod` are. A future tool that returns
+/// `Ok(error-shaped-text)` must add its pattern here.
 ///
 /// The timeout branch is load-bearing and easy to lose: `classify_failed_to_run`
 /// deliberately returns `None` for exit 124 (it keys on 127/126 and stderr
@@ -255,6 +258,14 @@ pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
     // mod recorded nothing — a genuinely failed tool call.
     if tool_name == "create_mod" && (result.starts_with("REJECTED:") || result.starts_with("NOT RECORDED")) {
         return ToolOutcome::Failed { reason: "the mod was refused and recorded nothing".to_string() };
+    }
+    // `execute_write` / `execute_edit` return Ok text when they refuse an
+    // echoed `read` line-number prefix. The file was not changed.
+    if tool_name == "write" && result.starts_with("NOT WRITTEN") {
+        return ToolOutcome::Failed { reason: "the write was refused and the file was not changed".to_string() };
+    }
+    if tool_name == "edit" && result.starts_with("NOT EDITED") {
+        return ToolOutcome::Failed { reason: "the edit was refused and the file was not changed".to_string() };
     }
 
     if tool_name == "bash" {
@@ -461,6 +472,24 @@ mod tests {
         // Scoped to this tool name: another tool's reply that happens to start
         // the same way is not reclassified.
         assert_eq!(classify_outcome("bash", "NOT RECORDED — whatever"), ToolOutcome::Ok);
+    }
+
+    /// `write` and `edit` refuse an echoed `read` prefix by returning Ok text
+    /// (`NOT WRITTEN` / `NOT EDITED`). The file was not changed, so that call
+    /// failed. A real write, and the same words from another tool, stay Ok.
+    #[test]
+    fn a_refused_write_or_edit_is_failed() {
+        let write = "NOT WRITTEN — `content` still carries `read`'s `N: ` line-number prefix on every line. \
+                     The prefix is not part of the file; remove it from each line and call `write` again. \
+                     The file was not changed.";
+        assert!(matches!(classify_outcome("write", write), ToolOutcome::Failed { .. }));
+        assert!(!classify_outcome("write", write).tool_worked());
+        let edit = "NOT EDITED — an `old_string`/`new_string` still carries `read`'s `N: ` line-number prefix on every line. \
+                    The prefix is not part of the file; remove it and call `edit` again. The file was not changed.";
+        assert!(matches!(classify_outcome("edit", edit), ToolOutcome::Failed { .. }));
+        assert!(!classify_outcome("edit", edit).tool_worked());
+        assert_eq!(classify_outcome("write", "Wrote 12 bytes to /workspace/a.rs"), ToolOutcome::Ok);
+        assert_eq!(classify_outcome("bash", write), ToolOutcome::Ok);
     }
 
     #[test]

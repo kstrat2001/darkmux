@@ -1838,7 +1838,19 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 - **A local `dispatch.map` item that errored and then came back empty reports
   the error** (5.0, #3074), as the hosted path already did, instead of an empty
   success.
-
+- **A torn trajectory still folds** (5.0). A kill that cuts a multibyte
+  character used to make the whole trajectory read as empty, and the
+  close that appends `interrupted` refused the file. The lines already
+  written still fold, and only the torn line is dropped.
+- **A refused write or edit counts as a failed tool call** (5.0). `write`
+  and `edit` answer `NOT WRITTEN` / `NOT EDITED` when they refuse an
+  echoed `read` line-number prefix, and the file is not changed. That
+  call now counts as a failure for the repeated-failure detector. A
+  write that landed, and the same words from another tool, stay successes.
+- **A diff hunk numbered at line 0 skips that file** (5.0). `+0` is not a
+  file line. The crawl planner used to panic on it in debug, which dropped
+  every later file in that diff. The malformed file is recorded as skipped
+  and the files after it still plan.
 - **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
   aborting a mission, while a run waited on its endpoint budget raised the
   process-wide interrupt flag, so a mission launch running other phases'

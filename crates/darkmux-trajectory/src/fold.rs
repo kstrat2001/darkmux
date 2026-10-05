@@ -172,8 +172,14 @@ impl TrajectoryFold {
 
     /// Fold the trajectory at `path`. A missing or unreadable file folds to
     /// the empty fold: a run that died before writing one has no events.
+    /// Bytes that are not valid UTF-8 (a kill that tore a multibyte
+    /// character) are replaced, so the lines already written still fold
+    /// and only the torn line is dropped.
     pub fn from_path(path: &Path) -> Self {
-        Self::from_lines(&std::fs::read_to_string(path).unwrap_or_default())
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        Self::from_lines(&String::from_utf8_lossy(&bytes))
     }
 
     /// Take one event into the fold.
