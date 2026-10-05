@@ -78,7 +78,9 @@ darkmux release.
   dropped, and the result says how many bytes of stdout or stderr were not shown.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
-  with an `@` after the host now masks up to the last `@`.
+  with an `@` after the host now masks up to the last `@`. A unix-socket URL, which has
+  no `@`, has its `password`, `pass`, or `requirepass` query value masked. The flow
+  redactor and the serve redactor split the URL with one parser.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 

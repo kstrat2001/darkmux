@@ -23,6 +23,7 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use darkmux_types::url_authority::UrlAuthority;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
@@ -195,11 +196,10 @@ fn continues_backward(before: &str) -> bool {
 }
 
 /// The host of a URL (`scheme://user:pw@host:port/path`), without userinfo,
-/// port or path.
+/// port or path. The host comes from the same authority parser the flow
+/// redactor uses (#3074).
 fn url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let hostport = UrlAuthority::parse(url)?.hostport();
     let host = address_host(hostport).unwrap_or(hostport);
     (!host.is_empty()).then(|| host.to_string())
 }
@@ -873,6 +873,20 @@ mod tests {
         let r = Redaction::derive();
         assert_eq!(r.line("redis://hubname:6379 and hubname:7000"), format!("redis://{ADDRESS_HIDDEN}:6379 and {ADDRESS_HIDDEN}:7000"));
         assert_eq!(r.line("the hubname word"), "the hubname word", "a bare name is not a host fact as a free word");
+    }
+
+    /// (#3074) A hub password holding `#`, `/` or `?` must not make the host a
+    /// password prefix: serve reads the URL through the same authority parser
+    /// as the flow redactor, so both find the real host.
+    #[test]
+    fn url_host_is_the_real_host_whatever_the_password_holds() {
+        for pw in ["p#ssw0rd", "pa/ss", "pa?ss", "a#b/c?d", "p@ss"] {
+            let url = format!("redis://kain:{pw}@hubhost.example:6379/0");
+            assert_eq!(url_host(&url).as_deref(), Some("hubhost.example"), "{pw}");
+            let url = format!("redis://:{pw}@hubhost.example:6379");
+            assert_eq!(url_host(&url).as_deref(), Some("hubhost.example"), "{pw}");
+        }
+        assert_eq!(url_host("redis+unix:///tmp/x.sock?pass=s3"), None, "a socket has no host");
     }
 
     // ── the rules, unit by unit ────────────────────────────────────────
