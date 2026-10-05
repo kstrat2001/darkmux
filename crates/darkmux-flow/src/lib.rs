@@ -5022,6 +5022,24 @@ mod tests {
         }
     }
 
+    /// (#3074) A unix-socket URL has no `@`. Its password lives in the query,
+    /// and that value is what a status line would print.
+    #[test]
+    fn redact_url_creds_masks_a_unix_socket_query_password() {
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?password=s3cret&db=1"),
+            "redis+unix:///tmp/x.sock?password=***&db=1"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?db=1&pass=s3cret#frag"),
+            "redis+unix:///tmp/x.sock?db=1&pass=***#frag"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix://:s3cret@/tmp/x.sock"),
+            "redis+unix://:***@/tmp/x.sock"
+        );
+    }
+
     /// (#3074) `SinkInfo` carries the raw URL for the in-process probe; its
     /// `Debug` must not print it.
     #[test]

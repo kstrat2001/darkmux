@@ -36,6 +36,7 @@ pub mod size;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_isolation;
 pub mod style;
+pub mod url_authority;
 pub mod user_files;
 pub mod workdir;
 

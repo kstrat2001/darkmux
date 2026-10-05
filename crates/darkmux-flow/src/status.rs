@@ -8,6 +8,7 @@
 //! the operator gets accurate reachability + XLEN data). Disk probes are
 //! read-only file I/O. No record writes.
 
+use darkmux_types::url_authority::UrlAuthority;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -349,22 +350,58 @@ pub(crate) fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
 /// password's own delimiter is the boundary: everything between `://` and the
 /// last `@` is userinfo. The cost of that fail-closed choice is a misread
 /// host in a diagnostic for a URL that carries an `@` after its host;
-/// the alternative is a leaked password. URLs without an `@` are returned
-/// unchanged.
+/// the alternative is a leaked password. A unix-socket URL has no `@` at all
+/// and carries the password in the query (`redis+unix:///tmp/x.sock?password=`),
+/// so that query value is masked too. Both splits go through [`UrlAuthority`],
+/// the same parser the serve redactor uses for the host.
 pub fn redact_url_creds(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some(parsed) = UrlAuthority::parse(url) else {
         return url.to_string();
     };
-    let Some((userinfo, host_and_tail)) = rest.rsplit_once('@') else {
-        return url.to_string();
+    let userinfo = match parsed.userinfo {
+        Some(userinfo) => {
+            let masked = if let Some((user, _pass)) = userinfo.split_once(':') {
+                format!("{user}:***")
+            } else {
+                // username only, no password — still keep the username visible.
+                userinfo.to_string()
+            };
+            format!("{masked}@")
+        }
+        None => String::new(),
     };
-    let masked_userinfo = if let Some((user, _pass)) = userinfo.split_once(':') {
-        format!("{user}:***")
-    } else {
-        // username only, no password — still keep the username visible.
-        userinfo.to_string()
+    format!("{}://{userinfo}{}", parsed.scheme, mask_query_secrets(parsed.host_and_tail))
+}
+
+/// Mask `password`, `pass`, and `requirepass` query values. Other pairs stay.
+fn mask_query_secrets(tail: &str) -> String {
+    let Some((before, rest)) = tail.split_once('?') else {
+        return tail.to_string();
     };
-    format!("{scheme}://{masked_userinfo}@{host_and_tail}")
+    let (query, fragment) = match rest.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (rest, None),
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| {
+            let Some((key, value)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            if value.is_empty() {
+                return pair.to_string();
+            }
+            match key.to_ascii_lowercase().as_str() {
+                "password" | "pass" | "requirepass" => format!("{key}=***"),
+                _ => pair.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(fragment) => format!("{before}?{masked}#{fragment}"),
+        None => format!("{before}?{masked}"),
+    }
 }
 
 /// (#1715) Whether the near-maxlen warning is genuinely actionable. Pure
