@@ -96,6 +96,42 @@ pub enum Bounded {
     SpawnFailed(std::io::Error),
 }
 
+/// The shared buffer a drain thread fills, and the channel it signals EOF on.
+type DrainBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Start one drain thread per pipe (see the comment at its call site for why
+/// they signal rather than being joined).
+fn spawn_drains(child: &mut std::process::Child) -> (DrainBuf, DrainBuf, std::sync::mpsc::Receiver<()>) {
+    let out_buf = DrainBuf::default();
+    let err_buf = DrainBuf::default();
+    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+    for (pipe, buf) in [
+        (child.stdout.take().map(DrainSource::Out), out_buf.clone()),
+        (child.stderr.take().map(DrainSource::Err), err_buf.clone()),
+    ] {
+        let tx = eof_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(src) = pipe {
+                let mut reader: Box<dyn std::io::Read + Send> = match src {
+                    DrainSource::Out(p) => Box::new(p),
+                    DrainSource::Err(p) => Box::new(p),
+                };
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = buf.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+            let _ = tx.send(());
+        });
+    }
+    (out_buf, err_buf, eof_rx)
+}
+
 /// (#2310 fix-loop E2) The value [`configured_timeout`] returns for a
 /// configured `0`. Not a real instant: the deadline is only ever compared
 /// against with `started.elapsed() >= timeout`, which `Duration::MAX` can
@@ -125,8 +161,18 @@ pub fn configured_timeout() -> Duration {
 /// Takes an already-built `Command` (cwd, env and args are the caller's
 /// business) for the same reason `run_security_bounded` does: the runner
 /// owns the BOUND, not the command.
-pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
-    use std::io::Read;
+pub fn run_bounded(cmd: Command, timeout: Duration) -> Bounded {
+    // (#3074) A signal that landed before this spawn must stop the command
+    // from ever starting; the poll in `spawn_and_poll` only notices it after
+    // the child is already running.
+    if darkmux_types::interrupt::is_set() {
+        return Bounded::Interrupted;
+    }
+    spawn_and_poll(cmd, timeout)
+}
+
+/// [`run_bounded`]'s spawn, drain and poll loop.
+fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -159,34 +205,7 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
     // then never returns — reintroducing exactly the unbounded wait this
     // module exists to remove. Proven by this module's own tests: the
     // first cut joined, and the grandchild test hung the whole suite.
-    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
-    for (pipe, buf) in [
-        (child.stdout.take().map(DrainSource::Out), out_buf.clone()),
-        (child.stderr.take().map(DrainSource::Err), err_buf.clone()),
-    ] {
-        let tx = eof_tx.clone();
-        std::thread::spawn(move || {
-            if let Some(src) = pipe {
-                let mut reader: Box<dyn std::io::Read + Send> = match src {
-                    DrainSource::Out(p) => Box::new(p),
-                    DrainSource::Err(p) => Box::new(p),
-                };
-                let mut chunk = [0u8; 8192];
-                while let Ok(n) = reader.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(&chunk[..n]);
-                    }
-                }
-            }
-            let _ = tx.send(());
-        });
-    }
-    drop(eof_tx);
+    let (out_buf, err_buf, eof_rx) = spawn_drains(&mut child);
     // (#2479 audit) `Instant`, deliberately: `started` bounds THIS spawned
     // child (an operator's `test_command`), not wall-clock time. Same
     // reasoning as its sibling in `gestalt_host::lms_host` — if the host
@@ -285,6 +304,20 @@ fn kill_group(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3074) A signal observed BEFORE the spawn means nothing is spawned.
+    /// A program that cannot exist makes that observable without a race: a
+    /// real spawn attempt reports `SpawnFailed`, the guard reports
+    /// `Interrupted`.
+    #[test]
+    #[serial_test::serial]
+    fn run_bounded_does_not_spawn_once_a_signal_was_observed() {
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let out = run_bounded(Command::new("/nonexistent/darkmux-3074"), Duration::from_secs(5));
+        darkmux_types::interrupt::reset_for_test();
+        assert!(matches!(out, Bounded::Interrupted), "got {out:?}");
+    }
 
     fn sh(command: &str) -> Command {
         let mut c = Command::new("sh");

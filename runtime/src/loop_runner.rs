@@ -450,15 +450,26 @@ pub enum EscalationReason {
     /// (#2171) A turn kept hitting the GENERATION check-in
     /// (`generation_checkpoint_interval_tokens`) more times than
     /// `answer_max_tokens / generation_checkpoint_interval_tokens` allows.
-    /// Deliberately bounded, unlike the reasoning check-in's continuations
-    /// (which stay open-ended by design — see the comment at the
-    /// checkpoint-continuation site): a thought is expected to run long,
+    /// Deliberately bounded by a continuation COUNT, unlike the reasoning
+    /// check-in's continuations (which have no count and are bounded only by
+    /// the context window, [`Self::TurnContinuationsExhausted`], #3074): a
+    /// thought is expected to run long,
     /// but a single answer/tool-call turn that never converges after
     /// `answer_max_tokens` worth of generation-bound continuations is a
     /// model that will not stop on its own, and the alternative is the
     /// same unbounded-continuation shape the reasoning check-in already
     /// tolerates for a region where it should NOT be tolerated.
     GenerationCheckpointBudgetExhausted,
+    /// (#3074) One logical turn kept continuing past a checkpoint until the
+    /// tokens it generated reached the context window. Every continuation
+    /// resends the thought carried so far, so a turn that long cannot be
+    /// resumed again: the next request would overflow the window. This is the
+    /// bound on the open-ended REASONING check-in (and on any continuation),
+    /// derived from the window rather than guessed, and it exists because
+    /// `max_turns` does not count continuations (#1221) and the inactivity
+    /// deadline resets on every streamed chunk. Absent a configured context
+    /// window there is nothing to derive it from, so no bound applies.
+    TurnContinuationsExhausted,
     /// (#2169 merge-gate finding 4) `MAX_CONSECUTIVE_MALFORMED_TURNS`
     /// consecutive turns each dispatched ZERO real tool calls — every
     /// `tool_calls` entry named either a non-tool or a real tool this
@@ -495,6 +506,7 @@ pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
         EscalationReason::GenerationCheckpointBudgetExhausted => {
             "escalation_generation_checkpoint_budget_exhausted"
         }
+        EscalationReason::TurnContinuationsExhausted => "escalation_turn_continuations_exhausted",
         EscalationReason::MalformedToolCallsExhausted => "escalation_malformed_tool_calls",
     }
 }
@@ -1713,6 +1725,10 @@ fn run_with_sleeper(
     // continuation of the same turn) — see the `turn.begin()` site. Counts
     // only continuations that were themselves generation-bound.
     let mut generation_continuations_this_turn: u32 = 0;
+    // (#3074) Completion tokens this logical turn has generated across its
+    // checkpoint continuations. Reset with the counter above; compared with
+    // the context window, which every continuation's resent prefill must fit.
+    let mut turn_completion_tokens: u32 = 0;
     // Set when the previous iteration handed a turn back as a prefill; read by
     // the turn counter so the resumed call is not counted as a new turn.
     // (#2114) A resume whose checkpoint carried a pending #1221 hand-back
@@ -2884,6 +2900,7 @@ fn run_with_sleeper(
             // budget — the cap bounds how long ONE turn may keep hitting the
             // generation check-in, not the whole dispatch.
             generation_continuations_this_turn = 0;
+            turn_completion_tokens = 0;
         }
 
         // (#406) Recover plain-text tool calls the model emitted in
@@ -2990,6 +3007,8 @@ fn run_with_sleeper(
         // reads the estimate as a reported figure.
         total_completion_tokens = total_completion_tokens
             .saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
+        turn_completion_tokens =
+            turn_completion_tokens.saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
         // The prompt count is the ground truth everything below calibrates
         // against, so all of it needs one the endpoint actually reported.
         if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
@@ -4637,6 +4656,11 @@ fn run_with_sleeper(
                     } else {
                         false
                     };
+                    // (#3074) The continuation bound that does not depend on the
+                    // kind of check-in: once this logical turn has generated as
+                    // many tokens as the context window holds, no further
+                    // continuation can fit the prefill it would resend.
+                    let window_filled = turn_fills_window(compaction_cfg.context_window, turn_completion_tokens);
                     // Only judge while the thought is still open. After the
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
@@ -4774,18 +4798,17 @@ fn run_with_sleeper(
                     //       is exactly what it meters. It defaults to unset
                     //       (uncapped), so it bounds this only for an operator
                     //       who set it.
-                    //   the inactivity budget bounds it only as an absolute
-                    //       600s SIGKILL: a checkpoint is not a proof-of-work
-                    //       signal, so the timer never resets on one. That is a
-                    //       HARD kill — no conclusion, no envelope.
+                    //   the inactivity deadline does NOT bound it: streaming is the
+                    //       production default, and every streamed chunk resets
+                    //       the host's deadline (`on_stream_tick`), so a turn
+                    //       that keeps producing slices is never idle.
+                    //   the context window DOES (#3074): once the turn has
+                    //       generated as many tokens as the window holds, it
+                    //       escalates (`TurnContinuationsExhausted`), because the
+                    //       next continuation would resend a prefill that cannot
+                    //       fit. That is the bound when no `max_tokens` is set,
+                    //       and it needs a configured window to derive from.
                     //
-                    // So under default config the only backstop is that hard
-                    // kill. Deliberately left as-is rather than inventing a
-                    // checkpoint ceiling here, which is the thing this change
-                    // exists to remove — but it is a real gap, and the fix
-                    // belongs at the config layer (a default for
-                    // `runtime.max_tokens`), not in this gate. Tracked
-                    // separately.
                     // A degenerate turn that never opened a thought has no
                     // delimiter to close, so it does not get a prefill at all —
                     // it goes back to the recovery path that already owns this
@@ -4851,34 +4874,26 @@ fn run_with_sleeper(
                     //     THOUGHT on the exhausting call stops here, with the
                     //     checkpoint record above already carrying the
                     //     `conclude` verdict and the tail ratio that say why.
-                    if generation_budget_exhausted {
-                        eprintln!(
-                            "darkmux-runtime: escalation_triggered — turn {turns} hit the \
-                             generation check-in ({generation_interval} tokens) \
-                             {generation_continuations_this_turn} times, exceeding the \
-                             budget of {max_generation_continuations} continuations \
-                             (answer_max_tokens {answer_max_tokens} / \
-                             generation_checkpoint_interval_tokens {generation_interval}). \
-                             Emitting EscalationTriggered for frontier handoff with \
-                             everything banked so far ATTACHED. (#2171)"
-                        );
-                        trajectory.append_escalation_triggered(
-                            turns,
-                            escalation_reason_str(
-                                EscalationReason::GenerationCheckpointBudgetExhausted,
-                            ),
-                            model,
-                            latest_prompt_tokens,
-                        );
-                        return Ok(LoopOutcome {
-                            final_answer: turn.pending_answer(),
-                            terminal_reason: TerminalReason::EscalationTriggered(
-                                EscalationReason::GenerationCheckpointBudgetExhausted,
-                            ),
+                    if let Some(limit) = ContinuationLimit::reached(generation_budget_exhausted, window_filled) {
+                        return Ok(continuation_limit_outcome(
+                            trajectory,
+                            limit,
+                            ContinuationFacts {
+                                turns,
+                                turn_tokens: turn_completion_tokens,
+                                checkpoints: checkpoints_used,
+                                model,
+                                latest_prompt_tokens,
+                                turn_delay_ms,
+                                generation_interval,
+                                generation_continuations: generation_continuations_this_turn,
+                                max_generation_continuations,
+                                answer_max_tokens,
+                            },
+                            turn.pending_answer(),
                             messages,
-                            turn_delay_effective_ms: turn_delay_ms,
-                            failed_to_run: failed_to_run.clone(),
-                        });
+                            failed_to_run.clone(),
+                        ));
                     }
                     // Everything reaching here is either a clean continue or a
                     // degenerate THOUGHT. The old third branch — abandon the
@@ -5744,6 +5759,101 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
         })
 }
 
+/// (#3074) Whether one logical turn has generated as many tokens as the
+/// context window holds. Without a configured window there is nothing to
+/// derive the bound from, so it never is.
+fn turn_fills_window(context_window: Option<u32>, turn_tokens: u32) -> bool {
+    context_window.is_some_and(|window| turn_tokens >= window)
+}
+
+/// Which bound ended a turn's run of checkpoint continuations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationLimit {
+    /// (#2171) The generation check-in's continuation count.
+    GenerationBudget,
+    /// (#3074) The turn generated as many tokens as the context window holds.
+    ContextWindow,
+}
+
+impl ContinuationLimit {
+    /// The bound that applies, the more specific count first.
+    fn reached(generation_budget_exhausted: bool, window_filled: bool) -> Option<Self> {
+        match (generation_budget_exhausted, window_filled) {
+            (true, _) => Some(Self::GenerationBudget),
+            (false, true) => Some(Self::ContextWindow),
+            (false, false) => None,
+        }
+    }
+
+    fn reason(self) -> EscalationReason {
+        match self {
+            Self::GenerationBudget => EscalationReason::GenerationCheckpointBudgetExhausted,
+            Self::ContextWindow => EscalationReason::TurnContinuationsExhausted,
+        }
+    }
+}
+
+/// The numbers [`continuation_limit_outcome`] reports.
+struct ContinuationFacts<'a> {
+    turns: u32,
+    turn_tokens: u32,
+    checkpoints: u32,
+    model: &'a str,
+    latest_prompt_tokens: u32,
+    turn_delay_ms: u64,
+    generation_interval: u32,
+    generation_continuations: u32,
+    max_generation_continuations: u32,
+    answer_max_tokens: u32,
+}
+
+/// The escalation for a turn that ran out of checkpoint continuations: say so
+/// on stderr, record it, and hand the banked work on.
+fn continuation_limit_outcome(
+    trajectory: &mut Trajectory,
+    limit: ContinuationLimit,
+    f: ContinuationFacts<'_>,
+    final_answer: Option<String>,
+    messages: Vec<Message>,
+    failed_to_run: Vec<FailedExec>,
+) -> LoopOutcome {
+    let detail = match limit {
+        ContinuationLimit::GenerationBudget => format!(
+            "hit the generation check-in ({} tokens) {} times, exceeding the budget of {} \
+             continuations (answer_max_tokens {} / generation_checkpoint_interval_tokens {}). \
+             (#2171)",
+            f.generation_interval,
+            f.generation_continuations,
+            f.max_generation_continuations,
+            f.answer_max_tokens,
+            f.generation_interval
+        ),
+        ContinuationLimit::ContextWindow => format!(
+            "generated {} tokens across {} checkpoints, as many as the context window holds, \
+             so it cannot be resumed again. (#3074)",
+            f.turn_tokens, f.checkpoints
+        ),
+    };
+    eprintln!(
+        "darkmux-runtime: escalation_triggered — turn {} {detail} Emitting EscalationTriggered \
+         for frontier handoff with everything banked so far ATTACHED.",
+        f.turns
+    );
+    trajectory.append_escalation_triggered(
+        f.turns,
+        escalation_reason_str(limit.reason()),
+        f.model,
+        f.latest_prompt_tokens,
+    );
+    LoopOutcome {
+        final_answer,
+        terminal_reason: TerminalReason::EscalationTriggered(limit.reason()),
+        messages,
+        turn_delay_effective_ms: f.turn_delay_ms,
+        failed_to_run,
+    }
+}
+
 /// Inactivity soft-warning threshold (seconds) for a given budget (#466,
 /// hardened in #474). The linear 75% point, floored so it never fires on
 /// loop iteration 1 (budget=1 → 0 without the floor) and held strictly
@@ -5759,6 +5869,11 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
 /// the hard kill at 100% is the unconditional safety net for the
 /// small-budget edge.
 fn inactivity_soft_threshold_secs(budget_secs: u64) -> u64 {
+    // (#3074) `0` is UNBOUNDED: the host sets no deadline, so there is no
+    // kill to warn about and the threshold can never be reached.
+    if budget_secs == 0 {
+        return u64::MAX;
+    }
     const RATIO: f64 = 0.75;
     let linear = ((budget_secs as f64) * RATIO) as u64;
     // clamp(low, high): never zero; never >= budget (always some headroom).
@@ -9504,6 +9619,43 @@ mod tests {
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2);
+    }
+
+    /// (#3074) A turn that keeps hitting a checkpoint until what it has
+    /// generated reaches the context window escalates with a named reason
+    /// rather than continuing forever. `max_turns` does not count
+    /// continuations and the inactivity deadline resets on every chunk, so
+    /// this is the bound a streaming model that never stops runs into. The
+    /// slices are distinct, so the degeneracy gate stays out of the way and
+    /// only the window-derived bound can end the turn.
+    #[test]
+    #[serial_test::serial]
+    fn a_turn_whose_continuations_fill_the_context_window_escalates() {
+        let block: String = (0..8100).map(|i| format!("w{i} ")).collect();
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some(&block), None, "length", 100, 999));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-continuations").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig { context_window: Some(2500), ..compaction::CompactionConfig::never_compact() };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(100_000), None, Some(1000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("window exhaustion is a clean EscalationTriggered outcome, not an Err (#3074)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::TurnContinuationsExhausted),
+        );
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit continues the SAME turn");
     }
 
     /// (#2171 test d, floor added on merge-gate review) A turn that keeps
@@ -17639,6 +17791,13 @@ mod tests {
     }
 
     // ─── (#474) inactivity soft-threshold floor + headroom ───────────
+
+    /// (#3074) A budget of `0` means UNBOUNDED, so there is no kill to warn
+    /// about: the soft threshold can never be reached.
+    #[test]
+    fn soft_threshold_for_an_unbounded_budget_is_never_reached() {
+        assert_eq!(inactivity_soft_threshold_secs(0), u64::MAX);
+    }
 
     #[test]
     fn soft_threshold_default_budget_is_linear_75pct() {

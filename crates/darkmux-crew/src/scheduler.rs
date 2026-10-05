@@ -573,6 +573,29 @@ pub struct SchedulerReport {
 /// `persist` for callers with no durable Step storage (most scheduler unit
 /// tests) — the bulk end-of-run save loops every production caller already
 /// runs stay in place as a cheap idempotent reconcile, not the only write.
+/// The ids ready to run in the next wave. (#3074) Once a signal was observed
+/// only a kind that declares `runs_after_interrupt` (a record-only step that
+/// does no new work) is ready: the run ends without starting any other work, the
+/// steps still `Planned` stay `Planned` (the launcher's phase-exit sweep
+/// abandons them), and the launcher, which sees the same signal, closes the
+/// run as an error rather than a completed one.
+fn next_wave_ready_ids(
+    steps: &BTreeMap<String, Step>,
+    tasks: &BTreeMap<String, Task>,
+    kinds: &StepKindRegistry,
+) -> Vec<String> {
+    let interrupted = darkmux_types::interrupt::is_set();
+    steps
+        .values()
+        .filter(|s| !interrupted || kinds.get(&s.kind).is_ok_and(|k| k.runs_after_interrupt()))
+        .filter(|s| {
+            let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
+            step_is_ready(s, &task, tasks, steps)
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
     // The run this graph is: every record the scheduler emits, and every
@@ -748,14 +771,7 @@ pub fn run_step_graph(
     let bus = std::sync::Arc::new(bus);
 
     loop {
-        let ready_ids: Vec<String> = steps
-            .values()
-            .filter(|s| {
-                let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
-                step_is_ready(s, &task, tasks, steps)
-            })
-            .map(|s| s.id.clone())
-            .collect();
+        let ready_ids = next_wave_ready_ids(steps, tasks, kinds);
 
         if ready_ids.is_empty() {
             break;
@@ -2789,6 +2805,22 @@ mod tests {
         .unwrap()
     }
 
+    /// (#3074) Once a signal was observed no further wave starts: the graph
+    /// returns with the ready step still `Planned` and nothing completed. (The
+    /// launcher, which sees the same signal, closes the run as an error.)
+    #[test]
+    #[serial_test::serial]
+    fn run_step_graph_starts_no_wave_after_a_signal() {
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let report = run_test_graph(&tasks, &mut steps);
+        darkmux_types::interrupt::reset_for_test();
+        assert!(report.completed.is_empty(), "no step may complete after the signal: {report:?}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Planned, "no step may start after the signal");
+    }
+
     // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────
     //
     // `gate::resolve_gate` itself is unit-tested in `crate::gate`'s own
@@ -3677,6 +3709,55 @@ mod tests {
             vec![DegradedStep { step_id: "a-step".to_string(), reason: "1 of 2 item(s) failed".to_string() }]
         );
         assert!(report.errored.is_empty());
+    }
+
+    /// A record-only kind that declares it still runs after a signal.
+    struct RecordOnlyKind;
+    impl StepKind for RecordOnlyKind {
+        fn seat(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> SeatClaim {
+            SeatClaim::NoModel
+        }
+        fn id(&self) -> &'static str {
+            "test.record_only"
+        }
+        fn runs_after_interrupt(&self) -> bool {
+            true
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "recorded".to_string(), flow_records: vec![], degraded: None })
+        }
+    }
+
+    /// (#3074) After a signal only a kind that declares `runs_after_interrupt`
+    /// still runs; an ordinary step beside it stays `Planned`.
+    #[test]
+    #[serial_test::serial]
+    fn a_record_only_kind_still_runs_after_a_signal_and_an_ordinary_one_does_not() {
+        let (tr, sr) = kinded_step("rec", "test.record_only", json!({}), &[]);
+        let (tn, sn) = task_and_step("ord", &[]);
+        let (tasks, mut steps) = graph(vec![(tr, sr), (tn, sn)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(RecordOnlyKind)).unwrap();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_interrupted();
+        let run = run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &Facts::default(),
+            &FixedEstimator::default(),
+            &mock_host_factory,
+            &mut |_| {},
+            &mut |_step| {},
+            None,
+            None,
+            &[],
+        );
+        darkmux_types::interrupt::reset_for_test();
+        run.unwrap();
+        assert_eq!(steps["rec-step"].status, NodeStatus::Complete, "the record-only kind must still run");
+        assert_eq!(steps["ord-step"].status, NodeStatus::Planned, "an ordinary step must not start");
     }
 
     // ─── #1530 Packet 0: the run-scoped `ArtifactBus` ──────────────────
