@@ -566,7 +566,7 @@ pub struct Compaction {
     /// (#3074) The compactor's reply was cut off and lexically repaired
     /// before it parsed, so the installed summary is lossy. Absent when the
     /// reply parsed cleanly.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lexically_repaired: bool,
 }
 
