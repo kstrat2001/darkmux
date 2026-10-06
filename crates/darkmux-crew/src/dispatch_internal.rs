@@ -4869,17 +4869,40 @@ fn join_within<T>(handle: thread::JoinHandle<T>, bound: Duration) -> Option<thre
 const JOIN_POLL: Duration = Duration::from_millis(10);
 
 /// (#3074) How long dispatch completion waits for the telemetry sampler after
-/// asking it to stop. Its worst bounded call is a 30s `lms` listing, and a
-/// governor unload is bounded by the model-load timeout, so a minute covers
-/// every call the sampler makes today; past that something is hung.
-const SAMPLER_JOIN_BOUND: Duration = Duration::from_secs(60);
+/// asking it to stop: the longest single tick it can be inside. A tier-5 eject
+/// lists residents (`lms ps`, run twice, each bounded by `DEFAULT_LIST_BOUND`)
+/// and unloads one (bounded by the model-load timeout), so the bound is
+/// `model_load_timeout_seconds() + 2 x DEFAULT_LIST_BOUND + 5s of slack`
+/// (665s by default). Derived from the same knobs those calls read, so raising
+/// the load timeout cannot leave this bound shorter than the call it waits on.
+/// Past it something is hung.
+fn sampler_join_bound() -> Duration {
+    darkmux_profiles::gestalt_host::resolved_load_deadline().0
+        + 2 * darkmux_profiles::gestalt_host::DEFAULT_LIST_BOUND
+        + SAMPLER_JOIN_SLACK
+}
+
+/// (#3074) Slack on top of the calls [`sampler_join_bound`] sums, for the
+/// sampler's own work around them.
+const SAMPLER_JOIN_SLACK: Duration = Duration::from_secs(5);
+
+/// (#3074) The sampler thread as its two exits hand it over: the stop flag
+/// that ends its loop, the handle to join, and how long to wait for it.
+struct SamplerThread<'a> {
+    stop: &'a AtomicBool,
+    handle: thread::JoinHandle<SamplerOutcome>,
+    bound: Duration,
+}
 
 /// (#3074) The sampler's readings once it has stopped. A panicked sampler and
 /// one still running at the deadline both yield `None` for the ladder, not a
 /// zeroed summary (#2774 review C3: `0 episodes / 0 ms` is not a possible live
 /// reading, so zeros would read as "never throttled").
-fn join_sampler(handle: thread::JoinHandle<SamplerOutcome>) -> (HostStats, HostExtras, Option<crate::thermal_governor::ThermalLadderSummary>) {
-    match join_within(handle, SAMPLER_JOIN_BOUND) {
+fn join_sampler(
+    handle: thread::JoinHandle<SamplerOutcome>,
+    bound: Duration,
+) -> (HostStats, HostExtras, Option<crate::thermal_governor::ThermalLadderSummary>) {
+    match join_within(handle, bound) {
         Some(Ok((stats, extras, ladder))) => (stats, extras, Some(ladder)),
         _ => (HostStats::default(), HostExtras::default(), None),
     }
@@ -4894,16 +4917,15 @@ fn teardown_container_threads(
     container_name: &str,
     watchdog_done: &AtomicBool,
     watchdog_handle: thread::JoinHandle<WatchdogWake>,
-    sampler_stop: &AtomicBool,
-    sampler_handle: thread::JoinHandle<SamplerOutcome>,
+    sampler: SamplerThread<'_>,
     stop_flag: &AtomicBool,
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
 ) {
     watchdog_done.store(true, Ordering::SeqCst);
     docker_kill_by_name(container_name);
     let _ = watchdog_handle.join();
-    sampler_stop.store(true, Ordering::SeqCst);
-    let _ = join_within(sampler_handle, SAMPLER_JOIN_BOUND);
+    sampler.stop.store(true, Ordering::SeqCst);
+    let _ = join_within(sampler.handle, sampler.bound);
     stop_flag.store(true, Ordering::SeqCst);
     let _ = tailer_handle.join();
 }
@@ -7142,8 +7164,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 &container_name,
                 &watchdog_done,
                 watchdog_handle,
-                &sampler_stop,
-                sampler_handle,
+                SamplerThread {
+                    stop: &sampler_stop,
+                    handle: sampler_handle,
+                    bound: sampler_join_bound(),
+                },
                 &stop_flag,
                 tailer_handle,
             );
@@ -7221,8 +7246,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             &container_name,
             &watchdog_done,
             watchdog_handle,
-            &sampler_stop,
-            sampler_handle,
+            SamplerThread {
+                stop: &sampler_stop,
+                handle: sampler_handle,
+                bound: sampler_join_bound(),
+            },
             &stop_flag,
             tailer_handle,
         );
@@ -7260,7 +7288,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // zeros here would be indistinguishable from "this run was never
     // throttled" — the same reason every sibling field in `host_window`
     // is already `Option`.
-    let (host_stats, host_extras, thermal_ladder_summary) = join_sampler(sampler_handle);
+    let (host_stats, host_extras, thermal_ladder_summary) = join_sampler(sampler_handle, sampler_join_bound());
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops

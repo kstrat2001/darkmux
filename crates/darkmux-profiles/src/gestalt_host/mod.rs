@@ -44,7 +44,7 @@ mod mac_probe;
 
 pub use arch_facts::{ArchFactsRaw, ArchFactsReader};
 pub use gguf_facts::GgufFactsReader;
-pub use lms_host::LmsHost;
+pub use lms_host::{LmsHost, DEFAULT_LIST_BOUND};
 pub use mac_probe::MacProbe;
 
 use darkmux_gestalt::Deadline;
