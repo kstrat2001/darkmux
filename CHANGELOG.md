@@ -233,6 +233,13 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   fsynced so its name survives a power cut, and the sink's disable warning names
   what failed last (`write` or `backfill`) instead of counting both as writes.
 
+- **Launch closeout follow-ups** (#3087). A refused post-mint launch closes its
+  run with `run.error` carrying the real refusal text, a failed `mission.json`
+  save removes the zero-byte claim, and `darkmux acp` exits `128 + signo` on a
+  signal (143 for SIGTERM, 130 for SIGINT) like launch, dispatch and lab.
+  **Migration:** a script that expected exit 130 from `darkmux acp` on SIGTERM
+  should expect 143.
+
 - **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
   check no longer treats a flow record without a `machine_uid` as a known name
   (a record with no uid names no machine), and the retired Redis-queue

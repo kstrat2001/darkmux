@@ -3823,8 +3823,8 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// this test needs the process to still be alive when SIGTERM lands, not
 /// racing an unrelated early exit), waits for it to be observably
 /// running, sends a real SIGTERM, and asserts it exits within a bound at
-/// the documented exit code (130 — `reap_on_host_shutdown`'s own
-/// `std::process::exit(130)`, matching the mission-launch SIGTERM
+/// the documented exit code (143, 128 + SIGTERM: `reap_on_host_shutdown`'s own
+/// `std::process::exit(shutdown_exit_code(..))`, matching the mission-launch SIGTERM
 /// precedent's exit code elsewhere in this file).
 ///
 /// RED-PROVED by hand: commenting out the `tokio::spawn(host_shutdown_
@@ -3832,7 +3832,7 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// test fail — the process then has no signal handler installed at all,
 /// SIGTERM takes default disposition (process-terminated-by-signal, no
 /// exit code), and `exit_status.code()` reports `None` instead of
-/// `Some(130)`, so the process also never got the chance to reap
+/// `Some(143)`, so the process also never got the chance to reap
 /// anything it might have had in flight.
 ///
 /// **Retries, growing the pre-signal wait, rather than one fixed sleep.**
@@ -3849,7 +3849,7 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// up-front) keeps the common case fast while still tolerating a
 /// once-in-a-while slow scheduling round without flaking outright.
 #[test]
-fn acp_sigterm_reaps_children_and_exits_130() {
+fn acp_sigterm_reaps_children_and_exits_143() {
     const WAITS_MS: [u64; 4] = [1_000, 3_000, 6_000, 10_000];
     let mut last_debug = String::new();
 
@@ -3897,7 +3897,7 @@ fn acp_sigterm_reaps_children_and_exits_130() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
-        if exit_status.code() == Some(130) {
+        if exit_status.code() == Some(143) {
             return; // PASS — the documented signal-handling contract held.
         }
 
@@ -3926,7 +3926,7 @@ fn acp_sigterm_reaps_children_and_exits_130() {
     }
 
     panic!(
-        "darkmux acp never reached its documented SIGTERM exit code (130) across {} attempts \
+        "darkmux acp never reached its documented SIGTERM exit code (143) across {} attempts \
          with growing pre-signal waits (up to {}ms) — this is no longer plausibly scheduling \
          noise. Last attempt: {last_debug}",
         WAITS_MS.len(),

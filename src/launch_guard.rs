@@ -98,8 +98,8 @@ pub(crate) fn arm() {
 ///
 /// Returns a guard whose `Drop` stops the thread once the caller's own
 /// dispatch is over — hold it for exactly the scope that needs
-/// interruptibility, same as `mission_launch.rs`'s own
-/// `WatchdogStopGuard`. Skipped entirely under `cfg(test)` (no unit test
+/// interruptibility. This is the one reap watchdog `mission launch`,
+/// `dispatch` and `lab` share (#3087); `mission_launch.rs` has no copy. Skipped entirely under `cfg(test)` (no unit test
 /// needs a real background thread); a live signal-delivery proof spawns
 /// the compiled binary as a subprocess instead, where `cfg!(test)` is
 /// false regardless of how it was built.
@@ -143,9 +143,9 @@ impl Drop for WatchdogStopGuard {
 /// blocking call the signal is trying to escape) calls this ONCE its own
 /// terminal record is already durable on disk (i.e., right after
 /// [`LaunchFinalizeGuard::close`] returns). Reaps every registered child
-/// pid and force-exits with the conventional signal-terminated code (130 —
-/// 128 + SIGINT's own 2, reused for SIGTERM/SIGHUP too, matching
-/// `review_finalize_guard.rs`'s precedent) — `SIGKILL`ing a child pid does
+/// pid and force-exits with the conventional signal-terminated code,
+/// `128 + signo` (130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP; 130 when
+/// no OS signal was recorded) — `SIGKILL`ing a child pid does
 /// NOT end this process on its own, so the launcher must explicitly exit
 /// here rather than relying on a self-inclusion side effect.
 ///
@@ -193,7 +193,7 @@ pub(crate) fn reap_and_exit_on_signal() {
 
 /// [`reap_and_exit_on_signal`] for a call site whose only remaining output
 /// is the `Err` it is holding — it PRINTS that error first, then reaps and
-/// exits 130.
+/// exits `128 + signo`.
 ///
 /// (#2462 review) `main` returns `anyhow::Result<()>`, so an `Err` that
 /// propagates out of `run` is printed by std's own `Termination` impl as
