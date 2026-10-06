@@ -300,9 +300,16 @@ type Sessions = Arc<Mutex<HashMap<SessionId, SessionState>>>;
 /// always a `remove`-and-check, never a panic on absence.
 type InFlight = Arc<Mutex<HashMap<SessionId, InFlightSlot>>>;
 
-/// One session's entry in [`InFlight`] — either a genuinely running
-/// command's abort handle, or a `Cancelled` TOMBSTONE (#1777 merge gate,
-/// CONSIDER — the "lost-cancel race").
+/// (#3074) An in-flight task tracked by [`InFlightSlot::Running`], identifying
+/// the spawned task by its [`tokio::task::Id`] alongside its abort handle.
+#[derive(Debug)]
+struct InFlightTask {
+    id: tokio::task::Id,
+    handle: tokio::task::AbortHandle,
+}
+
+/// One session's entry in [`InFlight`] — either running command abort handles,
+/// or a `Cancelled` TOMBSTONE (#1777 merge gate, CONSIDER — the "lost-cancel race").
 ///
 /// The race: `PromptRequest`'s handler returns as soon as `cx.spawn`
 /// SCHEDULES its task, not once that task actually starts running. On the
@@ -315,10 +322,16 @@ type InFlight = Arc<Mutex<HashMap<SessionId, InFlightSlot>>>;
 /// asked of it. Recording `Cancelled` in that same window means
 /// `run_cancellable`'s own insert attempt finds it and aborts immediately
 /// instead of registering a handle nobody will ever call `abort()` on.
+///
+/// (#3074) `Running` holds a list of all active prompts on this session, so
+/// a second concurrent prompt cannot overwrite an existing task's abort handle.
+/// `session/cancel` and `session/close` abort all running tasks for that session.
+#[derive(Debug)]
 enum InFlightSlot {
-    Running(tokio::task::AbortHandle),
+    Running(Vec<InFlightTask>),
     Cancelled,
 }
+
 
 /// `session/set_config_option`'s `config_id` for the "radio host" picker
 /// (#1698 Packet B2, scope F) — selects the answering seat's profile.
@@ -1335,50 +1348,7 @@ async fn serve(
         // error.
         .on_receive_notification(
             async move |cancel: CancelNotification, _cx| {
-                // (#1781) A stop-button press is client traffic — somebody
-                // is at the keyboard. Without this stamp the hard ceiling
-                // would keep counting from before the cancel.
-                idle_for_cancel.record_activity();
-                let mut guard =
-                    in_flight_tasks_for_cancel.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
-                match guard.remove(&cancel.session_id) {
-                    Some(InFlightSlot::Running(handle)) => {
-                        eprintln!(
-                            "[darkmux-acp] session/cancel: {} — aborting the in-flight command",
-                            cancel.session_id
-                        );
-                        drop(guard);
-                        handle.abort();
-                    }
-                    Some(InFlightSlot::Cancelled) => {
-                        // Already tombstoned by an earlier cancel that
-                        // ALSO raced ahead of the command's own
-                        // registration — restore the tombstone rather
-                        // than losing it; still a no-op notification-wise.
-                        guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
-                        eprintln!(
-                            "[darkmux-acp] session/cancel: {} — already tombstoned by an earlier \
-                             cancel",
-                            cancel.session_id
-                        );
-                    }
-                    None => {
-                        // (#1777 merge gate — lost-cancel race) Nothing
-                        // registered YET, which is ambiguous on its own:
-                        // either the command already finished (a genuine
-                        // no-op) or it hasn't reached `run_cancellable`'s
-                        // own insert yet (the race). Recording a tombstone
-                        // costs nothing in the first case (nothing will
-                        // ever consume it) and closes the race in the
-                        // second.
-                        guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
-                        eprintln!(
-                            "[darkmux-acp] session/cancel: {} — nothing in flight yet; recording a \
-                             cancel tombstone in case the command hasn't registered itself yet",
-                            cancel.session_id
-                        );
-                    }
-                }
+                handle_cancel_notification(&in_flight_tasks_for_cancel, &idle_for_cancel, &cancel);
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -1392,29 +1362,14 @@ async fn serve(
         // the wire level by this file's own tests).
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _cx| {
-                // (#1781) Closing a thread is client traffic too. The
-                // ever-attached latch is what keeps this from re-arming the
-                // reported bug (a close no longer makes the process look
-                // never-used), and this stamp is what keeps the hard
-                // ceiling honest about when the client last spoke.
-                idle_for_close.record_activity();
-                if let Some(InFlightSlot::Running(handle)) = in_flight_tasks_for_close
-                    .lock()
-                    .expect("darkmux acp: in-flight tasks mutex poisoned")
-                    .remove(&request.session_id)
-                {
-                    handle.abort();
-                }
-                let existed = sessions_for_close
-                    .lock()
-                    .expect("darkmux acp: sessions mutex poisoned")
-                    .remove(&request.session_id)
-                    .is_some();
-                eprintln!(
-                    "[darkmux-acp] session/close: {} ({})",
-                    request.session_id,
-                    if existed { "pruned" } else { "already unknown" }
+                handle_close_session_request(
+                    &in_flight_tasks_for_close,
+                    &sessions_for_close,
+                    &idle_for_close,
+                    &request.session_id,
                 );
+                responder.respond(CloseSessionResponse::new())
+            },
                 responder.respond(CloseSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
@@ -1423,6 +1378,70 @@ async fn serve(
         .await?;
 
     Ok(())
+}
+
+fn handle_cancel_notification(
+    in_flight: &InFlight,
+    idle: &Arc<IdleState>,
+    cancel: &CancelNotification,
+) {
+    idle.record_activity();
+    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    match guard.remove(&cancel.session_id) {
+        Some(InFlightSlot::Running(tasks)) => {
+            eprintln!(
+                "[darkmux-acp] session/cancel: {} — aborting {} in-flight command(s)",
+                cancel.session_id,
+                tasks.len(),
+            );
+            drop(guard);
+            for task in tasks {
+                task.handle.abort();
+            }
+        }
+        Some(InFlightSlot::Cancelled) => {
+            guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
+            eprintln!(
+                "[darkmux-acp] session/cancel: {} — already tombstoned by an earlier cancel",
+                cancel.session_id
+            );
+        }
+        None => {
+            guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
+            eprintln!(
+                "[darkmux-acp] session/cancel: {} — nothing in flight yet; recording a cancel tombstone in case the command hasn't registered itself yet",
+                cancel.session_id
+            );
+        }
+    }
+}
+
+fn handle_close_session_request(
+    in_flight: &InFlight,
+    sessions: &Sessions,
+    idle: &Arc<IdleState>,
+    session_id: &SessionId,
+) {
+    idle.record_activity();
+    if let Some(InFlightSlot::Running(tasks)) = in_flight
+        .lock()
+        .expect("darkmux acp: in-flight tasks mutex poisoned")
+        .remove(session_id)
+    {
+        for task in tasks {
+            task.handle.abort();
+        }
+    }
+    let existed = sessions
+        .lock()
+        .expect("darkmux acp: sessions mutex poisoned")
+        .remove(session_id)
+        .is_some();
+    eprintln!(
+        "[darkmux-acp] session/close: {} ({})",
+        session_id,
+        if existed { "pruned" } else { "already unknown" }
+    );
 }
 
 /// (#1684 remainder — cancellation) Run `work` as a genuinely abortable
@@ -1456,17 +1475,15 @@ async fn run_cancellable(
     work: impl std::future::Future<Output = Result<()>> + Send + 'static,
 ) -> StopReason {
     let handle = tokio::spawn(work);
+    let task_id = handle.id();
     // (#1777 merge gate — lost-cancel race) Check for a tombstone at the
     // EXACT point this would otherwise insert its own handle — see
     // `register_or_consume_cancel_tombstone`'s own doc.
-    if register_or_consume_cancel_tombstone(in_flight, &session_id, handle.abort_handle()) {
+    if register_or_consume_cancel_tombstone(in_flight, &session_id, task_id, handle.abort_handle()) {
         handle.abort();
     }
     let outcome = handle.await;
-    in_flight
-        .lock()
-        .expect("darkmux acp: in-flight tasks mutex poisoned")
-        .remove(&session_id);
+    deregister_in_flight_task(in_flight, &session_id, task_id);
 
     match outcome {
         Ok(Ok(())) => StopReason::EndTurn,
@@ -1491,6 +1508,24 @@ async fn run_cancellable(
     }
 }
 
+/// (#3074) Deregister one task from [`InFlight`] upon completion.
+/// If other concurrent prompts for the same session are still in flight,
+/// they remain registered; once the last task finishes, the session's entry
+/// is pruned.
+fn deregister_in_flight_task(
+    in_flight: &InFlight,
+    session_id: &SessionId,
+    task_id: tokio::task::Id,
+) {
+    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    if let Some(InFlightSlot::Running(tasks)) = guard.get_mut(session_id) {
+        tasks.retain(|t| t.id != task_id);
+        if tasks.is_empty() {
+            guard.remove(session_id);
+        }
+    }
+}
+
 /// (#1777 merge gate — lost-cancel race) The tombstone check/insert
 /// [`run_cancellable`] performs at the exact point it would otherwise
 /// register `handle` as this session's live running command — factored out
@@ -1500,21 +1535,31 @@ async fn run_cancellable(
 /// there (meaning: `session/cancel` raced ahead of this registration —
 /// consume the tombstone and report "already cancelled, abort `handle`
 /// immediately"), `false` when this call successfully registered `handle`
-/// as the session's new [`InFlightSlot::Running`] entry (the ordinary
-/// case).
+/// into the session's [`InFlightSlot::Running`] entry (the ordinary case).
+///
+/// (#3074) If another prompt is already running on this session, this appends
+/// to the running list rather than replacing the existing task's abort handle.
 fn register_or_consume_cancel_tombstone(
     in_flight: &InFlight,
     session_id: &SessionId,
+    task_id: tokio::task::Id,
     handle: tokio::task::AbortHandle,
 ) -> bool {
     let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
-    match guard.get(session_id) {
+    match guard.get_mut(session_id) {
         Some(InFlightSlot::Cancelled) => {
             guard.remove(session_id);
             true
         }
-        _ => {
-            guard.insert(session_id.clone(), InFlightSlot::Running(handle));
+        Some(InFlightSlot::Running(tasks)) => {
+            tasks.push(InFlightTask { id: task_id, handle });
+            false
+        }
+        None => {
+            guard.insert(
+                session_id.clone(),
+                InFlightSlot::Running(vec![InFlightTask { id: task_id, handle }]),
+            );
             false
         }
     }
@@ -4652,8 +4697,12 @@ mod tests {
         in_flight.lock().unwrap().insert(session_id.clone(), InFlightSlot::Cancelled);
 
         let placeholder = tokio::spawn(async {});
-        let already_cancelled =
-            register_or_consume_cancel_tombstone(&in_flight, &session_id, placeholder.abort_handle());
+        let already_cancelled = register_or_consume_cancel_tombstone(
+            &in_flight,
+            &session_id,
+            placeholder.id(),
+            placeholder.abort_handle(),
+        );
         placeholder.abort();
 
         assert!(already_cancelled, "a pre-existing tombstone must be reported as already-cancelled");
@@ -4674,8 +4723,12 @@ mod tests {
         let session_id = SessionId::new("darkmux-acp-test-session-2");
 
         let placeholder = tokio::spawn(async {});
-        let already_cancelled =
-            register_or_consume_cancel_tombstone(&in_flight, &session_id, placeholder.abort_handle());
+        let already_cancelled = register_or_consume_cancel_tombstone(
+            &in_flight,
+            &session_id,
+            placeholder.id(),
+            placeholder.abort_handle(),
+        );
         placeholder.abort();
 
         assert!(!already_cancelled, "with nothing tombstoned, the handle must register as the running command");
@@ -4683,6 +4736,54 @@ mod tests {
             matches!(in_flight.lock().unwrap().get(&session_id), Some(InFlightSlot::Running(_))),
             "the session's slot must now be Running"
         );
+    }
+
+    /// (#3074) Two concurrent prompts on one session must not replace each
+    /// other's abort handle. Both must be registered and both aborted on cancel.
+    #[tokio::test]
+    async fn two_concurrent_prompts_on_one_session_both_registered_and_aborted_on_cancel() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-concurrent-test");
+
+        let p1 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let p2 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+
+        assert!(!register_or_consume_cancel_tombstone(&in_flight, &session_id, p1.id(), p1.abort_handle()));
+        assert!(!register_or_consume_cancel_tombstone(&in_flight, &session_id, p2.id(), p2.abort_handle()));
+
+        // Both handles are retained under Running
+        {
+            let guard = in_flight.lock().unwrap();
+            match guard.get(&session_id) {
+                Some(InFlightSlot::Running(tasks)) => assert_eq!(tasks.len(), 2),
+                other => panic!("expected 2 running tasks, got {other:?}"),
+            }
+        }
+
+        // Deregistering one task leaves the other
+        deregister_in_flight_task(&in_flight, &session_id, p1.id());
+        {
+            let guard = in_flight.lock().unwrap();
+            match guard.get(&session_id) {
+                Some(InFlightSlot::Running(tasks)) => {
+                    assert_eq!(tasks.len(), 1);
+                    assert_eq!(tasks[0].id, p2.id());
+                }
+                other => panic!("expected 1 running task, got {other:?}"),
+            }
+        }
+
+        // Cancel aborts the remaining task
+        let tasks = match in_flight.lock().unwrap().remove(&session_id) {
+            Some(InFlightSlot::Running(tasks)) => tasks,
+            _ => panic!("expected Running"),
+        };
+        for t in tasks {
+            t.handle.abort();
+        }
+
+        assert!(p2.await.unwrap_err().is_cancelled(), "second task must be aborted");
+        p1.abort();
     }
 
     /// (#2476) `spawn_registered` must register its child's pid BEFORE
