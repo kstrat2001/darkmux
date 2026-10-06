@@ -55,9 +55,12 @@
 //! process, and darkmux's CLI is one-shot-per-invocation, so that
 //! limitation costs nothing today.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// (#3073-P3-1) The last OS signal received, or 0 if none.
+static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 /// How many SIGINTs this process has received since [`install`]. Exists
 /// purely to drive the second-signal escape hatch below — nothing reads
@@ -83,6 +86,7 @@ static SIGHUP_COUNT: AtomicU32 = AtomicU32::new(0);
 /// would forbid (`signal(2)` itself is on POSIX's async-signal-safe list).
 fn deliver(signum: libc::c_int, count: &AtomicU32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
+    LAST_SIGNAL.store(signum, Ordering::SeqCst);
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
     if n >= 2 {
         // (#1959 merge-gate finding 13) A caller that never polls `is_set`
@@ -180,6 +184,18 @@ pub fn is_set() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
+/// (#3073-P3-1) The OS signal number that triggered the interrupt, if a real (or simulated)
+/// signal was received. Returns `None` if interrupted by `mark_interrupted`
+/// without an OS signal.
+pub fn received_signal() -> Option<i32> {
+    let s = LAST_SIGNAL.load(Ordering::SeqCst);
+    if s != 0 {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 /// (#2476) Set [`INTERRUPTED`] directly, WITHOUT installing (or touching)
 /// any `libc::signal(2)` disposition — the production twin of
 /// [`simulate_sigint_for_test`] etc., callable from a normal (non-test)
@@ -251,6 +267,7 @@ pub fn simulate_sighup_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     INTERRUPTED.store(false, Ordering::SeqCst);
+    LAST_SIGNAL.store(0, Ordering::SeqCst);
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
@@ -381,5 +398,24 @@ mod tests {
         // Leave shared state clean for whichever test runs next.
         INTERRUPTED.store(false, Ordering::SeqCst);
         SIGINT_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn signal_handlers_record_received_signal_number() {
+        reset_for_test();
+        assert_eq!(received_signal(), None);
+
+        on_sigint(libc::SIGINT);
+        assert_eq!(received_signal(), Some(libc::SIGINT));
+
+        on_sigterm(libc::SIGTERM);
+        assert_eq!(received_signal(), Some(libc::SIGTERM));
+
+        on_sighup(libc::SIGHUP);
+        assert_eq!(received_signal(), Some(libc::SIGHUP));
+
+        reset_for_test();
+        assert_eq!(received_signal(), None);
     }
 }

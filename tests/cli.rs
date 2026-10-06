@@ -4731,19 +4731,19 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted dispatch must not exit 0");
-    // (#2462) The terminal mission record is already durable by the time
+    // (#2462, #3073-P3-1) The terminal mission record is already durable by the time
     // `dispatch_as_crew_of_one::dispatch` returns its `Err` (asserted via
     // `mission_json["status"]` below) — `main.rs`'s `cmd_dispatch` then
     // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
-    // force-exits 130 (128 + SIGTERM's conventional 2), the SAME code
-    // `mission launch` already exits with on a caught signal. Before this
+    // force-exits 143 (128 + SIGTERM 15), the SAME code
+    // `mission launch` already exits with on a caught SIGTERM. Before this
     // fix, the `Err` just propagated up to the default error handler,
     // which exits 1 — indistinguishable from a real endpoint failure to
     // any wrapper script reading the exit code alone.
     assert_eq!(
         exit_status.code(),
-        Some(130),
-        "a signal-interrupted dispatch must exit 130 (like `mission launch`), not the generic \
+        Some(143),
+        "a signal-interrupted dispatch must exit 143 (like `mission launch`), not the generic \
          error code 1 — a wrapper script can't otherwise tell an operator's Ctrl-C from a real \
          failure: {exit_status:?}"
     );
@@ -4907,18 +4907,18 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted lab run must not exit 0");
-    // (#2462) `lab_run`'s own `lifecycle.json` terminal write is already
+    // (#2462, #3073-P3-1) `lab_run`'s own `lifecycle.json` terminal write is already
     // durable by the time it returns its `Err` (asserted via
     // `lifecycle_json["status"]` below) — `lab_cli.rs`'s `cmd_lab` then
     // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
-    // force-exits 130, the SAME code `mission launch`/`dispatch` exit with
-    // on a caught signal. Before this fix the `Err` just propagated to the
+    // force-exits 143 (128 + SIGTERM 15), the SAME code `mission launch`/`dispatch` exit with
+    // on a caught SIGTERM. Before this fix the `Err` just propagated to the
     // default error handler (exit 1) — indistinguishable from a real
     // failure to any wrapper script reading the exit code alone.
     assert_eq!(
         exit_status.code(),
-        Some(130),
-        "a signal-interrupted lab run must exit 130, not the generic error code 1 — a wrapper \
+        Some(143),
+        "a signal-interrupted lab run must exit 143, not the generic error code 1 — a wrapper \
          script can't otherwise tell an operator's Ctrl-C from a real failure: {exit_status:?}"
     );
 
@@ -13155,7 +13155,7 @@ fn lab_verbs_exit_130_on_sigterm_mid_dispatch() {
         };
         assert_eq!(
             status.code(),
-            Some(130),
+            Some(143),
             "{verb:?}: {}",
             fs::read_to_string(&stderr_path).unwrap_or_default()
         );
