@@ -6884,9 +6884,8 @@ fn pick_active_profile<'a>(
     Some(matches[0])
 }
 
-fn check_platform_and_provider() -> Check {
-    let hw = hardware::detect();
-    let provider = heuristics::active_provider(&hw);
+fn platform_and_provider_status(hw: &hardware::HardwareSpec) -> Check {
+    let provider = heuristics::active_provider(hw);
     let summary = hw.one_line_summary();
     // Pass when a non-generic provider claims the hardware (i.e. we have
     // validated rules for it). Warn when only generic matched — heuristics
@@ -6914,6 +6913,10 @@ fn check_platform_and_provider() -> Check {
             hint: None,
         }
     }
+}
+
+fn check_platform_and_provider() -> Check {
+    platform_and_provider_status(&hardware::detect())
 }
 
 fn power_state_status(source: Option<PowerSource>, is_macos: bool) -> Check {
@@ -12241,6 +12244,23 @@ mod tests {
         let check = power_state_status(None, false);
         assert_eq!(check.status, Status::Pass);
         assert!(check.message.contains("non-Apple Silicon"));
+    }
+
+    #[test]
+    fn platform_and_provider_warns_when_ram_is_unknown() {
+        let hw = darkmux_hardware::HardwareSpec {
+            platform: darkmux_hardware::Platform::AppleSilicon,
+            arch: "aarch64".into(),
+            total_ram_gb: 0,
+            physical_cores: 8,
+            performance_cores: None,
+            efficiency_cores: None,
+            has_unified_memory: true,
+        };
+        let check = platform_and_provider_status(&hw);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("unknown RAM"), "got: {}", check.message);
+        assert!(check.message.contains("generic"), "got: {}", check.message);
     }
 
     /// (#2411/#2450-class regression guard) The production check must

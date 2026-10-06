@@ -265,6 +265,10 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     let mut estimated_gb: f64 = 0.0;
     let mut unparseable: Vec<String> = Vec::new();
     for m in loaded_models {
+        if m.context == 0 {
+            unparseable.push(format!("{} (context=0)", m.identifier));
+            continue;
+        }
         match darkmux_types::size::parse_size_gb(&m.size) {
             Some(size_gb) => {
                 let kv_gb = 0.5 * (m.context as f64) / 32_768.0;
@@ -279,7 +283,7 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     }
     if !unparseable.is_empty() {
         return Verdict::Skipped(format!(
-            "couldn't parse loaded-model size(s): {} — headroom estimate would be \
+            "couldn't parse loaded-model size(s) or context length(s): {} — headroom estimate would be \
              wrong-low, so not firing",
             unparseable.join(", ")
         ));
@@ -389,6 +393,18 @@ mod tests {
                 assert!(msg.contains("couldn't parse"), "got: {msg}");
             }
             other => panic!("expected Skipped on unparseable size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_length_zero_skips_headroom_rule_naming_the_model() {
+        let ctx = ctx_with(32, vec![loaded("zero-ctx-model", "18 GB", 0)]);
+        match eval_memory_headroom(&ctx) {
+            Verdict::Skipped(msg) => {
+                assert!(msg.contains("zero-ctx-model"), "got: {msg}");
+                assert!(msg.contains("context=0"), "got: {msg}");
+            }
+            other => panic!("expected Skipped on context=0, got {other:?}"),
         }
     }
 

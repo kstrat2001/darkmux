@@ -37,6 +37,8 @@ impl Platform {
 /// agnostic enough to apply to non-Mac systems too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum RamTier {
+    /// Failed probe or unstated RAM size.
+    Unknown,
     /// < 32 GB — most consumer Macs / commodity laptops.
     Small,
     /// 32-64 GB — popular MBP Pro tier.
@@ -50,6 +52,7 @@ pub enum RamTier {
 impl RamTier {
     pub fn label(&self) -> &'static str {
         match self {
+            RamTier::Unknown => "unknown",
             RamTier::Small => "small (<32 GB)",
             RamTier::Medium => "medium (32-64 GB)",
             RamTier::Large => "large (64-96 GB)",
@@ -75,7 +78,8 @@ pub struct HardwareSpec {
 impl HardwareSpec {
     pub fn ram_tier(&self) -> RamTier {
         match self.total_ram_gb {
-            0..=32 => RamTier::Small,
+            0 => RamTier::Unknown,
+            1..=32 => RamTier::Small,
             33..=64 => RamTier::Medium,
             65..=96 => RamTier::Large,
             _ => RamTier::Xl,
@@ -88,11 +92,14 @@ impl HardwareSpec {
             (Some(p), Some(e)) => format!(" ({}P+{}E)", p, e),
             _ => String::new(),
         };
+        let ram_part = if self.total_ram_gb == 0 {
+            "unknown RAM".to_string()
+        } else {
+            format!("{} GB RAM ({})", self.total_ram_gb, self.ram_tier().label())
+        };
         format!(
-            "{p_label} {arch}, {ram} GB RAM ({tier}), {cores} cores{detail}{unified}",
+            "{p_label} {arch}, {ram_part}, {cores} cores{detail}{unified}",
             arch = self.arch,
-            ram = self.total_ram_gb,
-            tier = self.ram_tier().label(),
             cores = self.physical_cores,
             detail = cores_label,
             unified = if self.has_unified_memory { ", unified memory" } else { "" }
@@ -372,6 +379,8 @@ mod tests {
             efficiency_cores: None,
             has_unified_memory: true,
         };
+        hw.total_ram_gb = 0;
+        assert_eq!(hw.ram_tier(), RamTier::Unknown);
         hw.total_ram_gb = 16;
         assert_eq!(hw.ram_tier(), RamTier::Small);
         hw.total_ram_gb = 32;
@@ -413,6 +422,21 @@ mod tests {
         assert!(s.contains("XL"));
         assert!(s.contains("12P+4E"));
         assert!(s.contains("unified memory"));
+    }
+
+    #[test]
+    fn one_line_summary_handles_unknown_ram() {
+        let hw = HardwareSpec {
+            platform: Platform::AppleSilicon,
+            arch: "aarch64".into(),
+            total_ram_gb: 0,
+            physical_cores: 16,
+            performance_cores: Some(12),
+            efficiency_cores: Some(4),
+            has_unified_memory: true,
+        };
+        let s = hw.one_line_summary();
+        assert!(s.contains("unknown RAM"), "summary: {s}");
     }
 
     #[test]
