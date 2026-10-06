@@ -19940,3 +19940,31 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         assert_eq!(handle.join().unwrap(), WatchdogWake::Done);
     }
 
+    // (#3074) A hung sampler thread must not wedge dispatch completion.
+    #[test]
+    fn join_within_gives_up_on_a_thread_that_outlives_the_bound() {
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = parked.recv_timeout(Duration::from_secs(3));
+            7
+        });
+        let started = Instant::now();
+        let joined = join_within(handle, Duration::from_millis(100));
+        let waited = started.elapsed();
+        drop(release);
+        assert!(joined.is_none(), "a thread still running at the bound is detached");
+        assert!(waited < Duration::from_secs(2), "the join returned at the bound, not at thread exit: {waited:?}");
+    }
+
+    #[test]
+    fn join_within_returns_the_value_of_a_thread_that_finishes_in_time() {
+        let handle = thread::spawn(|| 7);
+        assert_eq!(join_within(handle, Duration::from_secs(5)).map(|r| r.ok()), Some(Some(7)));
+    }
+
+    #[test]
+    fn join_within_reports_a_panicked_thread_as_joined_err() {
+        let handle = thread::spawn(|| -> u8 { panic!("sampler boom") });
+        let joined = join_within(handle, Duration::from_secs(5));
+        assert!(matches!(joined, Some(Err(_))), "a panic is a finished thread, not a timeout");
+    }

@@ -112,6 +112,9 @@ darkmux release.
 - **An operator gate no longer holds an ungated sibling** (#3073). A wave with both kinds
   of ready step runs the ungated ones first; the gated ones are asked afterward, so a
   tty prompt or an ACP dialog no longer delays work that never needed sign-off.
+- **A hung telemetry sampler cannot wedge a dispatch** (#3074). Completion waits at most a
+  minute for the sampler thread after stopping it, then detaches it and records no thermal
+  ladder summary for the run, the same as a sampler that panicked.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
