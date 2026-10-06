@@ -915,7 +915,11 @@ impl FlowMissionAgg {
         self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
         let ending = self.close.ending();
         self.terminal_status = ending.map(|e| e.status);
-        self.terminal_was_abort = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
+        // #3089: at the mission grain an abort ranks first and sticks, so a
+        // later `run.complete`/`run.error` cannot turn a teardown into a verdict.
+        // (Session attempts keep "first close wins".)
+        self.terminal_was_abort |= ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted)
+            || matches!(action, FlowAction::MissionAbort);
     }
 }
 
@@ -8499,6 +8503,43 @@ mod tests {
             Some(AbandonReason::Aborted),
             "a `mission abort` record must carry the Aborted reason on the wire, not just the collapsed status"
         );
+    }
+
+    /// #3089: at the mission grain an abort ranks first. A `mission.abort`
+    /// followed by a bookend terminal (`run.complete` Clean or `run.error`)
+    /// must still read Abandoned/Aborted on a peer row, as the owner's tracked
+    /// row does (#1627).
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_mission_abort_outranks_a_later_run_terminal() {
+        for (late, outcome) in [("run.complete", "Clean"), ("run.error", "")] {
+            let _g = CrewGuard::new();
+            let flows = TempDir::new().unwrap();
+            let rec = |action: &str| {
+                let mut v = serde_json::json!({
+                    "ts": darkmux_flow::ts_utc_now(),
+                    "action": action,
+                    "source": "mission_lifecycle",
+                    "session_id": "mission-abort-first",
+                    "mission_id": "abort-first",
+                    "machine_id": "m1-max-32gb-studio",
+                });
+                if !outcome.is_empty() {
+                    v["outcome"] = serde_json::json!(outcome);
+                }
+                v
+            };
+            let fleet = vec![
+                peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+                rec("mission.abort"),
+                rec(late),
+            ];
+            let runs = build_runs(flows.path(), None, &fleet);
+            let row = runs.iter().find(|r| r.id == "abort-first").unwrap();
+            assert_eq!(row.status, RunStatus::Abandoned, "abort then {late} must stay Abandoned");
+            assert_eq!(row.abandoned_reason, Some(AbandonReason::Aborted), "abort then {late}");
+            assert!(row.completed_ts.is_none(), "abort then {late} carries no completion stamp");
+        }
     }
 
     /// The fleet half must obey the same 14-day bound the local walk does.
