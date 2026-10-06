@@ -9460,50 +9460,42 @@ fn run_telemetry_sampler(
         // on that — before any config read, threshold comparison or file
         // write.
         if let Some(event) = tick_events.battery {
-            match event {
-                // The `state` string carries BOTH numbers the decision was
-                // made on — the observation and the operator's floor — so
-                // the flow record answers "why did this rest" without a
-                // reader having to go look up the config that was in force
-                // at the time.
-                crate::power_policy::BatteryEvent::Paused { charge_pct, floor_pct } => {
-                    emit_rest(
-                        crate::power_policy::PACE_REASON,
-                        &format!("{charge_pct}% (floor {floor_pct}%)"),
-                        true,
-                    );
-                }
-                crate::power_policy::BatteryEvent::Resumed { charge_pct, floor_pct } => {
-                    emit_rest(
-                        crate::power_policy::PACE_REASON,
-                        &format!("{charge_pct}% (floor {floor_pct}%)"),
-                        false,
-                    );
-                }
-                crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } => {
-                    // WARN, not Info: the operator asked for a pause and is
-                    // not getting one. Loud beats quiet — a silent
-                    // non-pause is exactly the "silently disables itself"
-                    // failure #2706 exists to prevent. Names the numbers
-                    // and the field, and gives no advice, same contract as
-                    // the start refusal.
-                    let mut payload = battery_pause_unsupported_payload(
-                        charge_pct,
-                        floor_pct,
-                        crate::host_source::provenance(),
-                    );
-                    merge_record_context(&mut payload, &record_context);
-                    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                        darkmux_flow::Level::Warn,
-                        darkmux_flow::FlowSource::Battery,
-                        &role_id,
-                        &session,
-                        &execution,
-                        Some(&model),
-                        phase_id.as_deref(),
-                        payload,
-                    ));
-                }
+            // The `state` string carries BOTH numbers the decision was made
+            // on (the observation and the operator's floor), or for a blind
+            // probe the charge it is holding at (#3074), so the flow record
+            // answers "why did this rest" without a reader having to go look
+            // up the config that was in force at the time.
+            if let Some((level, state, pause)) = event.rest_decision() {
+                emit_rest_with_extra(
+                    level,
+                    crate::power_policy::PACE_REASON,
+                    &state,
+                    pause,
+                    RestExtra::default(),
+                );
+            } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
+                // WARN, not Info: the operator asked for a pause and is
+                // not getting one. Loud beats quiet — a silent
+                // non-pause is exactly the "silently disables itself"
+                // failure #2706 exists to prevent. Names the numbers
+                // and the field, and gives no advice, same contract as
+                // the start refusal.
+                let mut payload = battery_pause_unsupported_payload(
+                    charge_pct,
+                    floor_pct,
+                    crate::host_source::provenance(),
+                );
+                merge_record_context(&mut payload, &record_context);
+                let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                    darkmux_flow::Level::Warn,
+                    darkmux_flow::FlowSource::Battery,
+                    &role_id,
+                    &session,
+                    &execution,
+                    Some(&model),
+                    phase_id.as_deref(),
+                    payload,
+                ));
             }
         }
 

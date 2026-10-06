@@ -108,7 +108,10 @@ darkmux release.
 - **A failed battery probe keeps a held battery pause alive** (#3074). The governor dropped
   its heartbeat on any tick with no reading, so a probe that kept failing for longer than the
   runtime's pause ceiling let the run resume below the floor. It now keeps re-stamping at the
-  last known charge, and only a reading above the floor releases the pause.
+  last known charge, and only a reading above the floor releases the pause. The first blind
+  tick of a failure episode now logs a Warn `dispatch.rest` ("battery probe failing; holding at
+  N%"), and a probe that stays blind for the runtime's pause ceiling
+  (`DARKMUX_THERMAL_MAX_PAUSE_MS`, `0` unbounded) releases the hold with a second Warn.
 - **An operator gate no longer holds an ungated sibling** (#3073). A wave with both kinds
   of ready step runs the ungated ones first; the gated ones are asked afterward, so a
   tty prompt or an ACP dialog no longer delays work that never needed sign-off.

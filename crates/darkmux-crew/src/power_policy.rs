@@ -178,6 +178,35 @@ pub enum BatteryEvent {
     /// rather than parking in a state it cannot leave. Emitted at most
     /// ONCE per governor; the run continues.
     PauseUnsupported { charge_pct: u8, floor_pct: u8 },
+    /// The charge probe failed while a pause was held: the pause keeps its
+    /// heartbeat at the last reading. Emitted ONCE per failure episode (an
+    /// episode ends at the next real reading), so a probe that never comes
+    /// back is reported instead of holding silently (#3074).
+    ProbeFailing { held_pct: u8 },
+    /// The probe stayed blind for the whole blind ceiling, so the pause is
+    /// released: a hold built on a charge nobody can read is not evidence
+    /// the machine is still drained (#3074).
+    ProbeCeiling { held_pct: u8 },
+}
+
+impl BatteryEvent {
+    /// The `dispatch.rest` record this event is reported as: its level, its
+    /// `state` string, and whether it is a pause. `None` for
+    /// [`Self::PauseUnsupported`], which has a record of its own. The blind
+    /// probe events are `Warn` (#3074): the hold is running on a reading
+    /// nobody can take, which the operator should see.
+    pub fn rest_decision(&self) -> Option<(darkmux_flow::Level, String, bool)> {
+        use darkmux_flow::Level::{Info, Warn};
+        match *self {
+            Self::Paused { charge_pct, floor_pct } => Some((Info, format!("{charge_pct}% (floor {floor_pct}%)"), true)),
+            Self::Resumed { charge_pct, floor_pct } => Some((Info, format!("{charge_pct}% (floor {floor_pct}%)"), false)),
+            Self::ProbeFailing { held_pct } => Some((Warn, format!("battery probe failing; holding at {held_pct}%"), true)),
+            Self::ProbeCeiling { held_pct } => {
+                Some((Warn, format!("battery probe failing at the pause ceiling; releasing the hold at {held_pct}%"), false))
+            }
+            Self::PauseUnsupported { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +266,16 @@ pub struct BatteryGovernor {
     last_known_pct: u8,
     /// How often to re-stamp a held pause. See [`Self::new`].
     restamp_interval_ms: u64,
+    /// ms of consecutive no-reading ticks while paused (#3074); a real
+    /// reading zeroes it.
+    blind_ms: u64,
+    /// The blind hold's bound: the runtime's own pause ceiling
+    /// (`thermal_max_pause_ms`, the bound the thermal governor's breaker
+    /// uses for a pause it cannot resolve). `0` is unbounded, the meaning
+    /// that knob gives it everywhere (#3074).
+    blind_ceiling_ms: u64,
+    /// [`BatteryEvent::ProbeFailing`] already went out this failure episode.
+    probe_failing_reported: bool,
 }
 
 impl BatteryGovernor {
@@ -260,6 +299,9 @@ impl BatteryGovernor {
             ms_since_stamp: 0,
             last_known_pct: 0,
             restamp_interval_ms: (darkmux_types::config_access::thermal_max_pause_ms() / 4).max(1),
+            blind_ms: 0,
+            blind_ceiling_ms: darkmux_types::config_access::thermal_max_pause_ms(),
+            probe_failing_reported: false,
         }
     }
 
@@ -292,6 +334,14 @@ impl BatteryGovernor {
     #[cfg(test)]
     pub fn with_restamp_interval_ms(mut self, ms: u64) -> Self {
         self.restamp_interval_ms = ms;
+        self
+    }
+
+    /// Test-only override of the blind ceiling, for the same reason as
+    /// [`Self::with_restamp_interval_ms`].
+    #[cfg(test)]
+    pub fn with_blind_ceiling_ms(mut self, ms: u64) -> Self {
+        self.blind_ceiling_ms = ms;
         self
     }
 
@@ -331,6 +381,8 @@ impl BatteryGovernor {
         let Some(b) = battery else {
             return self.hold_pause_without_reading(elapsed_ms, host_out, thermal_pausing);
         };
+        self.blind_ms = 0;
+        self.probe_failing_reported = false;
         if !self.config.pause_running_below_min {
             return None;
         }
@@ -396,18 +448,32 @@ impl BatteryGovernor {
 
     /// A tick with no reading (#3074). A held pause keeps its heartbeat at the last known
     /// charge, and yields to thermal exactly as a tick with a reading does; only a reading
-    /// above the floor releases it. Anything else is a no-op.
+    /// above the floor releases it, or the blind ceiling. The first blind tick of an
+    /// episode reports it. Anything else is a no-op.
     fn hold_pause_without_reading(&mut self, elapsed_ms: u64, host_out: &Path, thermal_pausing: bool) -> Option<BatteryEvent> {
         if self.state != State::Paused {
             return None;
         }
         self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+        self.blind_ms = self.blind_ms.saturating_add(elapsed_ms);
+        let held_pct = self.last_known_pct;
+        if self.blind_ceiling_ms != 0 && self.blind_ms >= self.blind_ceiling_ms {
+            self.state = State::Idle;
+            if self.pace_owned && !thermal_pausing {
+                self.write_pause(host_out, false);
+            }
+            self.pace_owned = false;
+            return Some(BatteryEvent::ProbeCeiling { held_pct });
+        }
         if thermal_pausing {
             self.pace_owned = false;
         } else if !self.pace_owned || self.ms_since_stamp >= self.restamp_interval_ms {
             self.write_pause(host_out, true);
         }
-        None
+        if std::mem::replace(&mut self.probe_failing_reported, true) {
+            return None;
+        }
+        Some(BatteryEvent::ProbeFailing { held_pct })
     }
 
     /// Write the pace file and reset the heartbeat accounting together, so
@@ -722,7 +788,11 @@ mod tests {
         let mut g = BatteryGovernor::new(cfg(50, true, true));
         g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
         assert!(g.is_pacing());
-        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None);
+        assert_eq!(
+            g.on_sample(None, 2_000, dir.path(), false),
+            Some(BatteryEvent::ProbeFailing { held_pct: 40 }),
+            "a held pause on a failed probe is reported, not decided"
+        );
         assert!(g.is_pacing(), "a probe that failed this tick must not resume the run");
         assert_eq!(pace_json(dir.path())["pause"], true);
     }
@@ -737,12 +807,12 @@ mod tests {
         let first = pace_json(dir.path())["written_at_ms"].as_u64().expect("stamped");
 
         for _ in 0..4 {
-            assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None);
+            g.on_sample(None, 2_000, dir.path(), false);
         }
         assert_eq!(pace_json(dir.path())["written_at_ms"].as_u64(), Some(first), "not due yet");
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None, "holding is not an event");
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None, "past the one report, holding is quiet");
         let after = pace_json(dir.path());
         assert!(after["written_at_ms"].as_u64().expect("stamped") > first, "the failed probe still re-stamps");
         assert_eq!(after["pause"], true);
@@ -765,7 +835,129 @@ mod tests {
         let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(1);
         g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
         crate::pace_file::write(dir.path(), true, "thermal", "hot");
-        assert_eq!(g.on_sample(None, 2_000, dir.path(), true), None);
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), true), Some(BatteryEvent::ProbeFailing { held_pct: 40 }));
         assert_eq!(pace_json(dir.path())["reason"], "thermal", "thermal's hold stays untouched");
+    }
+
+    /// (#3074) A probe that fails for good must not hold the pause silently: the first
+    /// blind tick of an episode says so once, naming the charge it is holding at.
+    #[test]
+    fn a_failing_probe_warns_once_per_episode_naming_the_held_charge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(10_000)
+            .with_blind_ceiling_ms(1_000_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        assert_eq!(
+            g.on_sample(None, 2_000, dir.path(), false),
+            Some(BatteryEvent::ProbeFailing { held_pct: 40 }),
+            "the first blind tick reports"
+        );
+        for _ in 0..3 {
+            assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None, "the rest of the episode is quiet");
+        }
+        // A real reading ends the episode; a new failure is a new episode and reports again.
+        assert_eq!(g.on_sample(Some(&at(41)), 2_000, dir.path(), false), None);
+        assert_eq!(
+            g.on_sample(None, 2_000, dir.path(), false),
+            Some(BatteryEvent::ProbeFailing { held_pct: 41 })
+        );
+    }
+
+    /// (#3074) The blind hold is bounded by the same ceiling the runtime applies to every pause
+    /// (`thermal_max_pause_ms`, the thermal governor's own breaker bound): at it, the pause releases.
+    #[test]
+    fn a_probe_that_never_recovers_releases_the_pause_at_the_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(2_500)
+            .with_blind_ceiling_ms(10_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        for tick in 1..=4 {
+            let ev = g.on_sample(None, 2_000, dir.path(), false);
+            assert!(!matches!(ev, Some(BatteryEvent::ProbeCeiling { .. })), "tick {tick}: 8s is under the ceiling");
+        }
+        assert!(g.is_pacing());
+        assert_eq!(
+            g.on_sample(None, 2_000, dir.path(), false),
+            Some(BatteryEvent::ProbeCeiling { held_pct: 40 }),
+            "10s of blindness reaches the ceiling"
+        );
+        assert!(!g.is_pacing(), "the hold is released");
+        assert_eq!(pace_json(dir.path())["pause"], false);
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None, "released means quiet, not re-held");
+        assert!(!g.is_pacing());
+    }
+
+    /// A zero ceiling is UNBOUNDED, the meaning every darkmux bound gives it.
+    #[test]
+    fn a_zero_ceiling_never_releases_a_blind_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(2_500)
+            .with_blind_ceiling_ms(0);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        for _ in 0..1_000 {
+            let ev = g.on_sample(None, 2_000, dir.path(), false);
+            assert!(!matches!(ev, Some(BatteryEvent::ProbeCeiling { .. })));
+        }
+        assert!(g.is_pacing());
+    }
+
+    /// A reading, even a still-low one, restarts the blind clock.
+    #[test]
+    fn a_reading_restarts_the_blind_clock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(2_500)
+            .with_blind_ceiling_ms(10_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        for _ in 0..4 {
+            g.on_sample(None, 2_000, dir.path(), false);
+        }
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        for _ in 0..4 {
+            g.on_sample(None, 2_000, dir.path(), false);
+        }
+        assert!(g.is_pacing(), "8s blind after a reading is under the ceiling");
+    }
+
+    /// The ceiling releases only a pause this governor owns; thermal's hold is untouched.
+    #[test]
+    fn the_ceiling_does_not_clear_a_pause_thermal_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(1)
+            .with_blind_ceiling_ms(4_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        crate::pace_file::write(dir.path(), true, "thermal", "hot");
+        g.on_sample(None, 2_000, dir.path(), true);
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), true), Some(BatteryEvent::ProbeCeiling { held_pct: 40 }));
+        assert_eq!(pace_json(dir.path())["reason"], "thermal");
+        assert_eq!(pace_json(dir.path())["pause"], true);
+    }
+
+    #[test]
+    fn the_blind_ceiling_is_derived_from_the_runtime_max_pause() {
+        let g = BatteryGovernor::new(cfg(50, true, true));
+        assert_eq!(g.blind_ceiling_ms, darkmux_types::config_access::thermal_max_pause_ms());
+    }
+
+    #[test]
+    fn every_battery_event_but_the_unsupported_one_reports_as_a_rest() {
+        let rest = |e: BatteryEvent| e.rest_decision().expect("a rest");
+        let (level, state, pause) = rest(BatteryEvent::Paused { charge_pct: 45, floor_pct: 50 });
+        assert!(matches!(level, darkmux_flow::Level::Info) && pause, "{state}");
+        assert_eq!(state, "45% (floor 50%)");
+        let (level, state, pause) = rest(BatteryEvent::Resumed { charge_pct: 52, floor_pct: 50 });
+        assert!(matches!(level, darkmux_flow::Level::Info) && !pause, "{state}");
+        assert_eq!(state, "52% (floor 50%)");
+        let (level, state, pause) = rest(BatteryEvent::ProbeFailing { held_pct: 40 });
+        assert!(matches!(level, darkmux_flow::Level::Warn) && pause);
+        assert_eq!(state, "battery probe failing; holding at 40%");
+        let (level, state, pause) = rest(BatteryEvent::ProbeCeiling { held_pct: 40 });
+        assert!(matches!(level, darkmux_flow::Level::Warn) && !pause);
+        assert!(state.contains("40%"), "{state}");
+        assert!(BatteryEvent::PauseUnsupported { charge_pct: 5, floor_pct: 50 }.rest_decision().is_none());
     }
 }
