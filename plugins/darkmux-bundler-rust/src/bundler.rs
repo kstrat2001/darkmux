@@ -18,7 +18,7 @@ use crate::facts;
 use crate::scan;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 fn is_rust_file(path: &str) -> bool {
     path.ends_with(".rs") && !path.starts_with("target/")
@@ -132,6 +132,30 @@ fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
     bundles
 }
 
+/// Resolve a diff-supplied path to a file inside `worktree`, or fail (#3074).
+/// The path is the diff author's input: reject absolute paths and any `..`
+/// component lexically, then canonicalize and prefix-check so a symlink
+/// inside the checkout cannot point back out of it.
+fn resolve_inside_worktree(worktree: &Path, path: &str) -> Result<PathBuf> {
+    let escapes = || anyhow::anyhow!("diff path `{path}` resolves outside the worktree");
+    let rel = Path::new(path);
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return Err(escapes());
+    }
+    let root = worktree
+        .canonicalize()
+        .with_context(|| format!("resolving worktree {}", worktree.display()))?;
+    let full = root
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("reading {path} from the worktree"))?;
+    if full.starts_with(&root) {
+        Ok(full)
+    } else {
+        Err(escapes())
+    }
+}
+
 /// Worktree-available bundling: full-file context, so `find_enclosing_fn`
 /// resolves reliably and rarely truncates. Multiple hunks resolving to
 /// the SAME function dedup to ONE bundle (its code span was already
@@ -141,7 +165,7 @@ fn bundle_file_diff_only(path: &str, hunks: &[Hunk]) -> Vec<Bundle> {
 /// pre-image is a real finding; silently keeping just the first hunk's
 /// facts would lose it.
 fn bundle_file_with_worktree(worktree: &Path, path: &str, hunks: &[Hunk]) -> Result<Vec<Bundle>> {
-    let full_path = worktree.join(path);
+    let full_path = resolve_inside_worktree(worktree, path)?;
     let content = std::fs::read_to_string(&full_path)
         .with_context(|| format!("reading {} from the worktree", full_path.display()))?;
     let file_lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -337,5 +361,54 @@ mod tests {
         assert_eq!(set.bundles[0].id, "process@src/lib.rs");
         assert_eq!(set.bundles[0].code[0].start, 1);
         assert_eq!(set.bundles[0].code[0].end, 5);
+    }
+
+    /// A `+++ b/` path is attacker-shaped input (the diff's author). It
+    /// must never read outside the worktree (#3074).
+    fn escape_attempt(dir: &std::path::Path, path: &str) -> String {
+        let d = diff(&[&format!("+++ b/{path}"), "@@ -1,1 +1,1 @@", "-a", "+b"]);
+        build_bundles(Some(dir), &d).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn worktree_mode_rejects_parent_dir_paths() {
+        let outer = tempfile::tempdir().unwrap();
+        let wt = outer.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(outer.path().join("secret.rs"), "fn leak() {}\n").unwrap();
+        let err = escape_attempt(&wt, "../secret.rs");
+        assert!(err.contains("outside the worktree"), "{err}");
+    }
+
+    #[test]
+    fn worktree_mode_rejects_absolute_paths() {
+        let outer = tempfile::tempdir().unwrap();
+        let secret = outer.path().join("secret.rs");
+        std::fs::write(&secret, "fn leak() {}\n").unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let d = diff(&[&format!("+++ b/{}", secret.display()), "@@ -1,1 +1,1 @@", "-a", "+b"]);
+        let err = build_bundles(Some(wt.path()), &d).unwrap_err().to_string();
+        assert!(err.contains("outside the worktree"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_mode_rejects_symlink_escape() {
+        let outer = tempfile::tempdir().unwrap();
+        let wt = outer.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(outer.path().join("secret.rs"), "fn leak() {}\n").unwrap();
+        std::os::unix::fs::symlink(outer.path().join("secret.rs"), wt.join("link.rs")).unwrap();
+        let err = escape_attempt(&wt, "link.rs");
+        assert!(err.contains("outside the worktree"), "{err}");
+    }
+
+    #[test]
+    fn worktree_mode_rejects_dotdot_even_when_it_lands_back_inside() {
+        let wt = tempfile::tempdir().unwrap();
+        let name = wt.path().file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::write(wt.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let err = escape_attempt(wt.path(), &format!("../{name}/a.rs"));
+        assert!(err.contains("outside the worktree"), "{err}");
     }
 }
