@@ -208,6 +208,18 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
     }
 }
 
+/// (#3073) Gate resolution blocks this thread for as long as the operator
+/// takes (a tty prompt, an ACP round trip), so a wave that mixes ungated and
+/// gated ready steps runs the ungated ones first. The gated ones stay `Ready`
+/// and are asked on a later pass of the wave loop, once nothing ungated is
+/// left to hold.
+fn ungated_first(ready_ids: Vec<String>, steps: &BTreeMap<String, Step>) -> Vec<String> {
+    let (ungated, gated): (Vec<String>, Vec<String>) = ready_ids
+        .into_iter()
+        .partition(|id| steps.get(id).is_some_and(|s| s.gate.is_none()));
+    if ungated.is_empty() { gated } else { ungated }
+}
+
 /// `true` iff `step` is ready to run: itself `Planned`, AND —
 /// - if it's the FIRST step of `task` (or `task.step_ids` doesn't list it
 ///   at all — defensive): every Task named in `task.depends_on` OR
@@ -791,6 +803,8 @@ pub fn run_step_graph(
         // "step error" flow record, same durable `persist` call, same
         // "downstream dependent never becomes ready" consequence via
         // `step_is_ready`/`task_status`.
+        // (#3073) A gated step waits behind any ungated ready sibling.
+        let ready_ids = ungated_first(ready_ids, steps);
         let ready_ids: Vec<String> = {
             let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
             for id in ready_ids {
@@ -2951,6 +2965,51 @@ mod tests {
         assert_eq!(steps["a-step"].status, NodeStatus::Complete, "an approved gated step must still run");
         assert_eq!(report.completed, vec!["a-step".to_string()]);
         assert!(steps["a-step"].started_ts.is_some(), "an approved step actually ran (started_ts set)");
+    }
+
+    /// (#3073 P2) A gated sibling's operator dialog must not hold an ungated
+    /// step of the same wave: the ungated step finishes BEFORE the gate
+    /// handler is ever asked.
+    #[test]
+    fn an_ungated_ready_step_runs_before_a_gated_sibling_is_asked() {
+        use std::cell::RefCell;
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (task_b, step_b) = task_and_step("b", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut handler = |s: &Step, _f: &BTreeMap<String, String>| {
+            log.borrow_mut().push(format!("gate:{}", s.id));
+            crate::gate::GateDecision::Approved
+        };
+        let mut persist = |s: &Step| {
+            if s.status == NodeStatus::Complete {
+                log.borrow_mut().push(format!("done:{}", s.id));
+            }
+        };
+        run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut persist,
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        let log = log.into_inner();
+        let pos = |needle: &str| log.iter().position(|e| e == needle).unwrap_or_else(|| panic!("{needle} in {log:?}"));
+        assert!(pos("done:b-step") < pos("gate:a-step"), "ungated b must finish before the gate is asked: {log:?}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete, "the gated step still runs once approved");
     }
 
     /// (F9) A step that errors says why on its `step.error` record: the cause
