@@ -339,6 +339,21 @@ pub(crate) fn run_bookend_record(
 
 
 
+/// (#3087 review) Close the run's open bookend with `run.error` carrying the
+/// launch's own error text, so a post-mint refusal reads as what it was
+/// rather than as the Drop backstop's "terminated before completion".
+fn close_run_with_error<S: flow::BookendSink + ?Sized>(
+    bookend: &mut flow::BookendGuard<'_, S>,
+    config_id: &str,
+    run: &RunId,
+    err: &anyhow::Error,
+) {
+    bookend.close(
+        "run",
+        run_bookend_record(flow::Edge::Error, config_id, run, RunPayload::failed(format!("{err:#}"))),
+    );
+}
+
 /// The refusal every launch runs first: a stale or invalid user file the
 /// launch scope consumes (every effective user-tier mission config
 /// included) blocks ALL launches. [`resolve_config`] and the surfaces that
@@ -878,6 +893,7 @@ pub fn launch(
     {
         let mut no_steps = BTreeMap::new();
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+        close_run_with_error(&mut bookend, config_id, &run, &e);
         return Err(e);
     }
 
@@ -903,6 +919,7 @@ pub fn launch(
             Err(e) => {
                 let mut no_steps = BTreeMap::new();
                 reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+                close_run_with_error(&mut bookend, config_id, &run, &e);
                 return Err(e);
             }
         };
@@ -940,6 +957,7 @@ pub fn launch(
         darkmux_types::config_access::role_profile(role)
     }) {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut all_steps, &e);
+        close_run_with_error(&mut bookend, config_id, &run, &e);
         return Err(e);
     }
 
@@ -2751,7 +2769,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         // RUNS_FLOW_SCAN_WINDOW_DAYS-bounded flow join.
         machine: crate::flow::resolve_machine_id(),
     };
-    crew::lifecycle::save_mission(&mission).context("persisting mission.json")?;
+    save_claimed_mission(&mission_path, || crew::lifecycle::save_mission(&mission))?;
 
     for phase in &config.phases {
         let real_id = &real_phase_ids[&phase.id];
@@ -2773,6 +2791,16 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
     .context("starting the newly-minted mission")?;
 
     Ok(real_phase_ids)
+}
+
+/// (#3087 review) Persist the mission over the zero-byte claim file. When the
+/// save fails, remove the claim: left behind, it is an empty `mission.json`
+/// that `reconcile_mint_failure`'s `exists()` guard would mistake for a minted
+/// mission, and a retry would read it as an id collision.
+fn save_claimed_mission(mission_path: &Path, save: impl FnOnce() -> Result<()>) -> Result<()> {
+    save().context("persisting mission.json").inspect_err(|_| {
+        let _ = std::fs::remove_file(mission_path);
+    })
 }
 
 /// Build the [`LaunchParams`] `mission_config::interpret` needs: every
@@ -4946,6 +4974,65 @@ mod tests {
             MissionStatus::Finalized,
             "a refused launch closes the minted mission; it must never stay Active with no terminal"
         );
+        drop(guard);
+    }
+
+    /// The `run.*` records the launch wrote, as `(action, payload error text)`.
+    fn run_bookends_written() -> Vec<(String, Option<String>)> {
+        read_all_flow_records()
+            .iter()
+            .filter(|r| is_run_bookend(r))
+            .map(|r| {
+                let action = r["action"].as_str().unwrap_or_default().to_string();
+                let text = r["payload"]["error"].as_str().map(str::to_string);
+                (action, text)
+            })
+            .collect()
+    }
+
+    /// (#3087 review) The post-mint refusal closes the run with `run.error`
+    /// carrying the REAL refusal text, not the Drop backstop's "run terminated
+    /// before completion". Before the explicit close the pair was still
+    /// `run.start` + `run.error`, but the text was the backstop's.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refusal_on_the_utility_model_closes_the_run_with_the_real_error() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("util-probe", UTIL_PROBE_CONFIG);
+        let registry_dir = TempDir::new().unwrap();
+        let pf = registry_dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},"default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+        )
+        .unwrap();
+        let err = launch("util-probe", None, &[format!("profiles={}", pf.display())], None).unwrap_err();
+
+        let written = run_bookends_written();
+        let actions: Vec<&str> = written.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(actions, ["run.start", "run.error"], "{written:?}");
+        let text = written[1].1.clone().unwrap_or_default();
+        assert!(text.contains("stub-util"), "run.error must carry the refusal text, got {text:?}");
+        assert!(text.contains(&err.to_string()), "run.error text is the launch's own error: {text:?} vs {err}");
+        assert!(!text.contains("terminated before completion"), "not the Drop backstop's text: {text:?}");
+        drop(guard);
+    }
+
+    /// (#3087 review) A freeform launch has no graph to drive: it mints, writes
+    /// the launch's own `run.start` + `run.complete` pair, and leaves the
+    /// MISSION Active for work by hand. The pair says the launch finished; it
+    /// is not a verdict on the mission (see the serve-side
+    /// `build_runs_3087_freeform_launch_bookends_do_not_complete_the_active_mission`).
+    #[test]
+    #[serial_test::serial]
+    fn freeform_launch_writes_a_run_pair_and_leaves_the_mission_active() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
+        assert_eq!(launch("freeform-test-mission", None, &[], None).unwrap(), 0);
+        let written = run_bookends_written();
+        let actions: Vec<&str> = written.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(actions, ["run.start", "run.complete"], "{written:?}");
+        assert_eq!(mission_status_on_disk(&single_mission_id()), MissionStatus::Active);
         drop(guard);
     }
 
@@ -7933,6 +8020,48 @@ mod tests {
             "a bailed-out collision attempt must never mutate the existing record"
         );
         assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Complete);
+    }
+
+    /// (#3087 review) The claim is zero bytes until `save_mission` lands. A
+    /// failed save must not leave it behind.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_mission_save_removes_the_zero_byte_claim() {
+        let _guard = LaunchTestGuard::new();
+        let path = crew::lifecycle::mission_path("claim-cleanup-test");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let err = save_claimed_mission(&path, || anyhow::bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "the cause must survive: {err:#}");
+        assert!(!path.exists(), "the claim must not outlive a failed save");
+    }
+
+    /// (#3087 review) Two launches racing on ONE id: exactly one claims it,
+    /// the other bails with the collision error, and the winner's record is
+    /// intact. (The sequential collision test goes red when `create_new`
+    /// becomes `create`; this one is the race itself.)
+    #[test]
+    #[serial_test::serial]
+    fn two_concurrent_mints_of_one_id_claim_it_exactly_once() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let gate = std::sync::Barrier::new(2);
+        let results: Vec<Result<BTreeMap<String, String>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        ensure_mission_and_phases_with_provenance("race-test", &config, None, None)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(wins, 1, "exactly one launch claims the id: {results:?}");
+        let loser = results.iter().find_map(|r| r.as_ref().err()).expect("one loser");
+        assert!(loser.to_string().contains("already exists"), "{loser}");
+        assert_eq!(mission_status_on_disk("race-test"), MissionStatus::Active);
     }
 
     /// (#1504) The strand-accumulation gap: `ensure_mission_and_phases_with_

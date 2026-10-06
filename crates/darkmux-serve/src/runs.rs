@@ -7278,6 +7278,39 @@ mod tests {
         );
     }
 
+    /// (#3087 review) A freeform launch writes `run.start` + `run.complete` on
+    /// the RUN session the moment it has minted, while the mission itself stays
+    /// Active for work by hand (`mission.start`, no `mission.close`). The launch
+    /// finishing is not the mission finishing: the mission's row must not read
+    /// Complete off the run session's bookend pair.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_3087_freeform_launch_bookends_do_not_complete_the_active_mission() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let id = "freeform-1000000000-abc123";
+        let active = minimal_mission(
+            id,
+            vec![],
+            Some(MissionSpec { config_id: "freeform".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&active).unwrap();
+        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(id).unwrap()).to_string();
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action":"mission.start","session_id":format!("mission-{id}"),"mission_id":id,"source":"mission_lifecycle"}),
+                serde_json::json!({"ts": now, "action":"run.start","session_id":run_session,"mission_id":id}),
+                serde_json::json!({"ts": now, "action":"run.complete","session_id":run_session,"mission_id":id}),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == id).expect("the freeform mission has a row");
+        assert_eq!(row.status, RunStatus::Running, "launch bookends must not complete an Active mission: {row:?}");
+    }
+
     /// (#2123) The SAME mission as above, once it later gets a `mission
     /// close` (the happy-path finalize, not the operator's actual `mission
     /// abort` — both terminals are covered elsewhere; this one locks in

@@ -827,7 +827,7 @@ const LAUNCH_CHILD_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::fr
 /// process above, which owns its own guards and receives SIGTERM first. A
 /// future in-process container dispatch would have to kill its container
 /// explicitly before this exit.
-fn reap_on_host_shutdown() {
+fn reap_on_host_shutdown(signo: i32) {
     eprintln!("[darkmux-acp] shutdown signal received — reaping in-flight dispatch children");
     darkmux_types::interrupt::mark_interrupted();
 
@@ -868,7 +868,14 @@ fn reap_on_host_shutdown() {
     }
 
     darkmux_types::child_registry::kill_all_except(darkmux_types::child_registry::SIGKILL, &launch_pids);
-    std::process::exit(130);
+    std::process::exit(shutdown_exit_code(signo));
+}
+
+/// (#3087 review) The conventional signal-terminated exit code, `128 + signo`:
+/// 130 for SIGINT, 143 for SIGTERM. The same rule `launch_guard`'s
+/// `reap_and_exit_on_signal` applies to launch, dispatch and lab.
+fn shutdown_exit_code(signo: i32) -> i32 {
+    128 + signo
 }
 
 /// Log the client's requested protocol version and identity to stderr
@@ -2421,7 +2428,7 @@ async fn spawn_registered(mut cmd: Command) -> std::io::Result<std::process::Out
 /// `SIGTERM` takes default disposition, which does not just fail the one
 /// test — it kills the WHOLE test BINARY outright. The latch removes the
 /// bet, and changes nothing about the control flow production sees.
-async fn wait_for_host_shutdown_signal_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
+async fn wait_for_host_shutdown_signal_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) -> i32 {
     #[cfg(unix)]
     let term = async {
         use tokio::signal::unix::{signal, SignalKind};
@@ -2432,18 +2439,19 @@ async fn wait_for_host_shutdown_signal_ready(ready: Option<tokio::sync::oneshot:
         if let Ok(mut sig) = sig {
             sig.recv().await;
         }
+        libc::SIGTERM
     };
     #[cfg(not(unix))]
     let term = async {
         if let Some(tx) = ready {
             let _ = tx.send(());
         }
-        std::future::pending::<()>().await
+        std::future::pending::<i32>().await
     };
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = term => {},
+        _ = tokio::signal::ctrl_c() => libc::SIGINT,
+        signo = term => signo,
     }
 }
 
@@ -2475,7 +2483,7 @@ async fn wait_for_host_shutdown_signal_ready(ready: Option<tokio::sync::oneshot:
 /// conventionally "stop", exactly like `darkmux serve`'s own shutdown
 /// path already treats it — so `is_set()`'s never-reset contract costs
 /// nothing here, and no scoped/resettable variant needed to be built.
-async fn host_shutdown_reap_loop(on_signal: impl FnOnce() + Send + 'static) {
+async fn host_shutdown_reap_loop(on_signal: impl FnOnce(i32) + Send + 'static) {
     host_shutdown_reap_loop_ready(on_signal, None).await
 }
 
@@ -2484,11 +2492,11 @@ async fn host_shutdown_reap_loop(on_signal: impl FnOnce() + Send + 'static) {
 /// [`wait_for_host_shutdown_signal_ready`] — see that function's own doc.
 /// Production ([`host_shutdown_reap_loop`], above) always passes `None`.
 async fn host_shutdown_reap_loop_ready(
-    on_signal: impl FnOnce() + Send + 'static,
+    on_signal: impl FnOnce(i32) + Send + 'static,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
-    wait_for_host_shutdown_signal_ready(ready).await;
-    on_signal();
+    let signo = wait_for_host_shutdown_signal_ready(ready).await;
+    on_signal(signo);
 }
 
 /// (#1684 rule D) Launch a panel command whose graph has at least one
@@ -4811,10 +4819,18 @@ mod tests {
             "kill -TERM itself must succeed sending a real signal to this process"
         );
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        let signo = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
             .await
             .expect("wait_for_host_shutdown_signal_ready did not resolve within 5s of a real SIGTERM")
             .expect("joining the wait task");
+        assert_eq!(signo, libc::SIGTERM, "the wait must report WHICH signal landed (#3087)");
+        assert_eq!(shutdown_exit_code(signo), 143, "exit is 128 + signo, like launch, dispatch and lab");
+    }
+
+    #[test]
+    fn shutdown_exit_code_is_128_plus_the_signal() {
+        assert_eq!(shutdown_exit_code(libc::SIGINT), 130);
+        assert_eq!(shutdown_exit_code(libc::SIGTERM), 143);
     }
 
     /// (#2476) `host_shutdown_reap_loop` must call `on_signal` — and ONLY
@@ -4839,7 +4855,7 @@ mod tests {
         let called_for_closure = called.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(host_shutdown_reap_loop_ready(
-            move || {
+            move |_signo| {
                 called_for_closure.store(true, AtomicOrdering::SeqCst);
             },
             Some(ready_tx),
