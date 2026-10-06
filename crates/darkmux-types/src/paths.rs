@@ -336,6 +336,12 @@ fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
 /// (#661 Slice 3).
 pub(crate) fn expand_tilde(s: &str) -> PathBuf {
     if let Some(stripped) = s.strip_prefix("~/") {
+        if let Some(rest) = stripped.strip_prefix(".darkmux/") {
+            let root = resolve(ResolveScope::ForceUser).root;
+            return root.join(rest);
+        } else if stripped == ".darkmux" {
+            return resolve(ResolveScope::ForceUser).root;
+        }
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped);
         }
