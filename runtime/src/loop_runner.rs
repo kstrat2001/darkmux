@@ -9660,6 +9660,51 @@ mod tests {
         assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit continues the SAME turn");
     }
 
+    /// (#3074) The same window bound for a turn that keeps REASONING: the
+    /// slices arrive in the separate `reasoning_content` field with empty
+    /// `content`, which is the shape a reasoning model that never closes its
+    /// thought produces. The answer-content twin above does not reach this
+    /// path (its budget is bounded by #2171 already), so this is the test
+    /// that shows the window bound fires for a reasoning continuation.
+    #[test]
+    #[serial_test::serial]
+    fn a_reasoning_turn_whose_continuations_fill_the_context_window_escalates() {
+        let block: String = (0..8100).map(|i| format!("w{i} ")).collect();
+        let server = crate::test_support::GuardedMockServer::start();
+        let mut body = chat_response_json(Some(""), None, "length", 100, 999);
+        body["choices"][0]["message"]["reasoning_content"] = serde_json::json!(block);
+        // Only the first calls are answered: past that the server refuses, so
+        // a missing bound fails the test with an error instead of continuing
+        // without end.
+        static CUT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CUT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        server.mock(move |when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|_| CUT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 12);
+            then.status(200).json_body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-continuations-reasoning").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig { context_window: Some(2500), ..compaction::CompactionConfig::never_compact() };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(100_000), None, Some(1000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("window exhaustion is a clean EscalationTriggered outcome, not an Err (#3074)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::TurnContinuationsExhausted),
+        );
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit continues the SAME turn");
+    }
+
     /// (#2171 test d, floor added on merge-gate review) A turn that keeps
     /// hitting the GENERATION check-in past its continuation budget must
     /// escalate with a NAMED reason rather than continuing forever —
