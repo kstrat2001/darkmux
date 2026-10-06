@@ -84,7 +84,7 @@ darkmux release.
   step and the next one's `step.start` (long when the next step waits on a gate). The record
   now carries an additive `later_step_planned` marker when a later step of the task is
   still planned, and neither the daemon nor the viewer counts it as the end. Archives
-  without the marker read as before.
+  without the marker read as before. Flow schema 2.1.0 (additive) records the key.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
