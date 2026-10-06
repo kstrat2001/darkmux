@@ -39,6 +39,21 @@ pub struct StepStartPayload {
 
 impl Attribution for StepStartPayload {}
 
+/// A step completed: the payload of `step.complete`, written only when it carries the mark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct StepCompletePayload {
+    /// A later step of the same task is still planned, so the task's session is not over: the
+    /// record does not close it (#3074). Absent on the task's last step, and on archives written
+    /// before the mark existed, where the record closes as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub later_step_planned: Option<bool>,
+}
+
+impl Attribution for StepCompletePayload {}
+
 /// The widest cause a `step.error` record carries, in rendered columns.
 const STEP_ERROR_CAUSE_COLUMNS: usize = 400;
 

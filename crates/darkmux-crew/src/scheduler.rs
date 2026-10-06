@@ -1287,6 +1287,7 @@ fn apply_step_terminal(
     flow_records: Vec<FlowRecord>,
     degraded: Option<String>,
 ) {
+    let more_steps_follow = later_step_planned(id, tasks, steps);
     let step = steps.get_mut(id).expect("id came from ready_ids itself");
     for record in flow_records {
         emit(record);
@@ -1324,7 +1325,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Complete;
             step.completed_ts = Some(at);
             step.output = Some(output);
-            emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete));
+            emit(step_complete_record(run, step, more_steps_follow));
             persist(step);
             report.completed.push(id.to_string());
             if let Some(reason) = degraded {
@@ -1806,6 +1807,33 @@ fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
             Category::Work,
             Stage::Dispatch,
             darkmux_flow::Payload::StepError(darkmux_flow::payload::StepErrorPayload::from_message(message)),
+            step.id.clone(),
+        )
+    }
+}
+
+/// Whether a step after `id` in its task is still planned.
+fn later_step_planned(id: &str, tasks: &BTreeMap<String, Task>, steps: &BTreeMap<String, Step>) -> bool {
+    let Some(task) = steps.get(id).and_then(|s| tasks.get(&s.task_id)) else { return false };
+    let Some(at) = task.step_ids.iter().position(|s| s == id) else { return false };
+    task.step_ids[at + 1..].iter().any(|s| steps.get(s).is_some_and(|s| s.status == NodeStatus::Planned))
+}
+
+/// The `step.complete` record. It says so when a later step of the task is still planned, so
+/// the task's session is not read as over between the two steps (#3074); the task's last step
+/// carries no payload.
+fn step_complete_record(run: &RunId, step: &Step, later_step_planned: bool) -> FlowRecord {
+    if !later_step_planned {
+        return step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete);
+    }
+    FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Info,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepComplete(darkmux_flow::payload::StepCompletePayload { later_step_planned: Some(true) }),
             step.id.clone(),
         )
     }
@@ -2465,6 +2493,34 @@ mod tests {
         let steps: BTreeMap<String, Step> =
             [("multi-0".to_string(), step0), ("multi-1".to_string(), step1.clone())].into_iter().collect();
         assert!(step_is_ready(&step1, &task, &tasks, &steps));
+    }
+
+    /// (#3074) A task's session reads Complete between step N's `step.complete`
+    /// and step N+1's `step.start`, so a step that is NOT the task's last says
+    /// so on its record; the last step's record carries no such mark.
+    #[test]
+    fn step_complete_names_a_later_planned_step_of_its_task() {
+        let (mut task, step0) = task_and_step("multi", &[]);
+        task.step_ids = vec!["multi-0".to_string(), "multi-1".to_string()];
+        let mut step0 = step0;
+        step0.id = "multi-0".to_string();
+        let mut step1 = step0.clone();
+        step1.id = "multi-1".to_string();
+        let (tasks, mut steps) = graph(vec![(task, step0)]);
+        steps.insert(step1.id.clone(), step1);
+        let kinds = StepKindRegistry::with_builtins();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        run_step_graph(
+            &crate::test_run(), &mut steps, &tasks, &kinds, &Facts::default(), &est, &mock_host_factory,
+            &mut |r| emitted.push(r), &mut |_step| {}, None, None, &[],
+        )
+        .unwrap();
+        let completes: Vec<&FlowRecord> =
+            emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::StepComplete).collect();
+        assert_eq!(completes.len(), 2, "both steps complete");
+        assert_eq!(completes[0].payload_json()["later_step_planned"], true, "step 0 has step 1 still planned");
+        assert!(completes[1].payload.is_none(), "the last step's record carries no mark");
     }
 
     // ─── the output ledger (#1619 — `Task.reads`) ───────────────────

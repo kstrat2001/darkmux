@@ -32,7 +32,9 @@
  *    starts the next attempt (a relaunch under the same id). The attempt
  *    current as of t is the latest one opened by t.
  * 2. Close. An attempt closes on its earliest closing record: a bookend
- *    terminal (a run's or an execution's), a step terminal, `session.end`,
+ *    terminal (a run's or an execution's), a step terminal (a `step.complete`
+ *    that names a later step of its task still planned does not close it,
+ *    #3074), `session.end`,
  *    `budget.stop`, `mission.close` or `mission.abort`. A closing record timestamped before anything opened
  *    (clock skew across machines, #1988) closes the first attempt left with
  *    no close of its own, and is marked `skewed`; with no attempt at all to
@@ -206,9 +208,10 @@ function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
     case ACTION.RunComplete:
     case ACTION.DispatchComplete:
-    case ACTION.StepComplete:
     case ACTION.MissionClose:
       return { kind: "complete" };
+    case ACTION.StepComplete:
+      return payloadOf(r, ACTION.StepComplete)?.later_step_planned === true ? null : { kind: "complete" };
     case ACTION.RunError:
     case ACTION.DispatchError:
       return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };

@@ -68,14 +68,18 @@ struct Folded {
     names_a_reason: bool,
     /// A `budget.wait`'s announced wait, milliseconds.
     wait_ms: u64,
+    /// A `step.complete` that names a later step of its task still planned: the task's session
+    /// goes on (#3074).
+    later_step_planned: bool,
 }
 
 impl Folded {
     fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
-        let (names_a_reason, wait_ms) = match darkmux_flow::reader::payload_of(v) {
-            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0),
-            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0)),
-            _ => (false, 0),
+        let (names_a_reason, wait_ms, later_step_planned) = match darkmux_flow::reader::payload_of(v) {
+            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0, false),
+            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
+            Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
+            _ => (false, 0, false),
         };
         Folded {
             action: action.cloned(),
@@ -85,12 +89,17 @@ impl Folded {
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason,
             wait_ms,
+            later_step_planned,
         }
     }
 
     /// The ending it implies when it is a closing record (rule 2).
     fn ending(&self) -> Option<Ending> {
-        ending_of(self.action.as_ref()?, self.names_a_reason)
+        let action = self.action.as_ref()?;
+        if *action == FlowAction::StepComplete && self.later_step_planned {
+            return None;
+        }
+        ending_of(action, self.names_a_reason)
     }
 
     /// A bookend terminal: the outcome over any other close (rule 3).

@@ -99,6 +99,12 @@ darkmux release.
   no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
   the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
   an endpoint's host split the URL with one parser.
+- **A task with a later step still planned does not read as finished** (#3074). A step's
+  `step.complete` closed its task's session, so the session showed Complete between that
+  step and the next one's `step.start` (long when the next step waits on a gate). The record
+  now carries an additive `later_step_planned` marker when a later step of the task is
+  still planned, and neither the daemon nor the viewer counts it as the end. Archives
+  without the marker read as before.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
