@@ -19940,31 +19940,121 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         assert_eq!(handle.join().unwrap(), WatchdogWake::Done);
     }
 
-    // (#3074) A hung sampler thread must not wedge dispatch completion.
-    #[test]
-    fn join_within_gives_up_on_a_thread_that_outlives_the_bound() {
-        let (release, parked) = std::sync::mpsc::channel::<()>();
-        let handle = thread::spawn(move || {
-            let _ = parked.recv_timeout(Duration::from_secs(3));
-            7
-        });
-        let started = Instant::now();
-        let joined = join_within(handle, Duration::from_millis(100));
-        let waited = started.elapsed();
-        drop(release);
-        assert!(joined.is_none(), "a thread still running at the bound is detached");
-        assert!(waited < Duration::from_secs(2), "the join returned at the bound, not at thread exit: {waited:?}");
-    }
+// (#3074) A hung sampler thread must not wedge dispatch completion.
+#[test]
+fn join_within_gives_up_on_a_thread_that_outlives_the_bound() {
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        let _ = parked.recv();
+        7
+    });
+    let started = Instant::now();
+    let joined = join_within(handle, Duration::from_millis(100));
+    let waited = started.elapsed();
+    drop(release);
+    assert!(joined.is_none(), "a thread still running at the bound is detached");
+    assert!(waited < Duration::from_secs(2), "the join returned at the bound, not at thread exit: {waited:?}");
+}
 
-    #[test]
-    fn join_within_returns_the_value_of_a_thread_that_finishes_in_time() {
-        let handle = thread::spawn(|| 7);
-        assert_eq!(join_within(handle, Duration::from_secs(5)).map(|r| r.ok()), Some(Some(7)));
-    }
+#[test]
+fn join_within_returns_the_value_of_a_thread_that_finishes_in_time() {
+    let handle = thread::spawn(|| 7);
+    assert_eq!(join_within(handle, Duration::from_secs(5)).map(|r| r.ok()), Some(Some(7)));
+}
 
-    #[test]
-    fn join_within_reports_a_panicked_thread_as_joined_err() {
-        let handle = thread::spawn(|| -> u8 { panic!("sampler boom") });
-        let joined = join_within(handle, Duration::from_secs(5));
-        assert!(matches!(joined, Some(Err(_))), "a panic is a finished thread, not a timeout");
+#[test]
+fn join_within_reports_a_panicked_thread_as_joined_err() {
+    let handle = thread::spawn(|| -> u8 { panic!("sampler boom") });
+    let joined = join_within(handle, Duration::from_secs(5));
+    assert!(matches!(joined, Some(Err(_))), "a panic is a finished thread, not a timeout");
+}
+
+#[test]
+#[serial]
+fn the_sampler_join_bound_is_derived_from_the_load_timeout_and_the_list_bound() {
+    let k = "DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS";
+    let prev = std::env::var(k).ok();
+    let list = darkmux_profiles::gestalt_host::DEFAULT_LIST_BOUND;
+    unsafe { std::env::remove_var(k) };
+    // The default load timeout is 600s: 600 + 2 x 30 + 5 = 665s.
+    assert_eq!(sampler_join_bound(), Duration::from_secs(600) + 2 * list + Duration::from_secs(5));
+    unsafe { std::env::set_var(k, "45") };
+    assert_eq!(sampler_join_bound(), Duration::from_secs(45) + 2 * list + Duration::from_secs(5));
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
     }
+}
+
+// (#3074) join_sampler reports a sampler that finished as `Some(ladder)`, and a hung or panicked one
+// as `None`: zeros would read as "never throttled" (#2774 review C3).
+#[test]
+fn join_sampler_gives_a_ladder_only_for_a_sampler_that_finished() {
+    let ladder = crate::thermal_governor::ThermalLadderSummary { serious_episodes: 2, current_duty_delay_ms: 500 };
+    let done = thread::spawn(move || (HostStats::default(), HostExtras::default(), ladder));
+    assert_eq!(join_sampler(done, Duration::from_secs(5)).2, Some(ladder));
+
+    let panicked = thread::spawn(|| -> SamplerOutcome { panic!("sampler boom") });
+    assert_eq!(join_sampler(panicked, Duration::from_secs(5)).2, None);
+
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let hung = thread::spawn(move || {
+        let _ = parked.recv();
+        (HostStats::default(), HostExtras::default(), ladder)
+    });
+    let started = Instant::now();
+    assert_eq!(join_sampler(hung, Duration::from_millis(100)).2, None, "a hung sampler records no ladder");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(release);
+}
+
+// (#3074) The early-exit teardown bounds the sampler join too: a hung sampler must not wedge
+// the failed-wait and interrupted-run exits, and the tailer is still stopped and joined after.
+#[test]
+fn teardown_returns_at_the_sampler_bound_when_the_sampler_hangs() {
+    let done = AtomicBool::new(false);
+    let sampler_stop = AtomicBool::new(false);
+    let stop_flag = AtomicBool::new(false);
+    let watchdog = thread::spawn(|| WatchdogWake::Done);
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let sampler = thread::spawn(move || {
+        let _ = parked.recv();
+        (HostStats::default(), HostExtras::default(), crate::thermal_governor::ThermalLadderSummary::default())
+    });
+    let tailer = thread::spawn(TrajectorySummary::default);
+    let started = Instant::now();
+    teardown_container_threads(
+        "darkmux-test-no-such-container",
+        &done,
+        watchdog,
+        SamplerThread { stop: &sampler_stop, handle: sampler, bound: Duration::from_millis(100) },
+        &stop_flag,
+        tailer,
+    );
+    let waited = started.elapsed();
+    drop(release);
+    assert!(waited < Duration::from_secs(4), "teardown returned at the sampler bound, not at thread exit: {waited:?}");
+    assert!(done.load(Ordering::SeqCst) && sampler_stop.load(Ordering::SeqCst) && stop_flag.load(Ordering::SeqCst));
+}
+
+// (#3074) The three joins of the sampler thread all go through the bounded join. `dispatch()`
+// cannot be driven in-process, so reverting its completion join to an unbounded one would
+// leave every behavioral test above green; this pins the call sites physically.
+#[test]
+fn every_sampler_join_in_dispatch_is_the_bounded_one() {
+    let src = include_str!("dispatch_internal.rs");
+    assert!(!src.contains("sampler_handle.join()"), "an unbounded join of the sampler thread returned");
+    assert_eq!(
+        src.matches("join_sampler(sampler_handle, sampler_join_bound())").count(),
+        1,
+        "dispatch completion must join the sampler through join_sampler with the derived bound"
+    );
+    assert_eq!(
+        src.matches("bound: sampler_join_bound(),").count(),
+        2,
+        "both early-exit teardowns hand the sampler over with the derived bound"
+    );
+}
+

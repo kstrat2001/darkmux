@@ -115,9 +115,6 @@ darkmux release.
 - **An operator gate no longer holds an ungated sibling** (#3073). A wave with both kinds
   of ready step runs the ungated ones first; the gated ones are asked afterward, so a
   tty prompt or an ACP dialog no longer delays work that never needed sign-off.
-- **A hung telemetry sampler cannot wedge a dispatch** (#3074). Completion waits at most a
-  minute for the sampler thread after stopping it, then detaches it and records no thermal
-  ladder summary for the run, the same as a sampler that panicked.
 - **Indented and commented tool-call markup is not promoted into a call** (#3074). The
   plain-text XML scan already skipped fenced blocks; it now also skips a line indented
   four columns or a tab after a blank line or another indented line (indentation under
@@ -134,6 +131,11 @@ darkmux release.
   notice for `create_finding` / `create_mod` warns of a duplicate record rather than
   telling the model to inspect the workspace. Cost: one extra checkpoint write per workspace-changing call, about
   22 ms on a 600 KB transcript.
+- **A hung telemetry sampler cannot wedge a dispatch** (#3074). Completion, and both early
+  exits, wait at most the longest tick the sampler can be inside (the model-load timeout
+  plus two listing bounds plus 5s, 665s by default) for the sampler thread after stopping
+  it, then detach it and record no thermal ladder summary for the run, the same as a
+  sampler that panicked.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
