@@ -1255,7 +1255,7 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
         message: format!(
             "config.json binds `role_profiles.radio-router` to `{profile}`: the router has no profile; \
              delete the `radio-router` entry from the `role_profiles` block in {} by hand",
-            paths.config.display()
+            home_display(&paths.config)
         ),
         hint: Some(format!(
             "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
@@ -1263,7 +1263,7 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
              This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
              `role_profiles.radio-host`.",
-            paths.profiles.display()
+            home_display(&paths.profiles)
         )),
     }
 }
@@ -1362,8 +1362,8 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
 /// `LoadedModel.context` against the declared `n_ctx` if that shape shows
 /// up in practice.
 fn check_unreachable_darkmux_residents() -> Check {
-    let registry = match darkmux_profiles::profiles::load_registry(None) {
-        Ok(r) => r.registry,
+    let (registry, registry_path) = match darkmux_profiles::profiles::load_registry(None) {
+        Ok(r) => (r.registry, r.path),
         Err(_) => {
             return Check {
                 name: "unreachable residents".into(),
@@ -1384,7 +1384,7 @@ fn check_unreachable_darkmux_residents() -> Check {
             };
         }
     };
-    unreachable_residents_status(&loaded, &registry)
+    unreachable_residents_status(&loaded, &registry, &registry_path)
 }
 
 /// Pure decision for [`check_unreachable_darkmux_residents`], split out so
@@ -1393,6 +1393,7 @@ fn check_unreachable_darkmux_residents() -> Check {
 fn unreachable_residents_status(
     loaded: &[darkmux_types::LoadedModel],
     registry: &darkmux_types::ProfileRegistry,
+    registry_path: &std::path::Path,
 ) -> Check {
     let name = "unreachable residents".to_string();
 
@@ -1464,8 +1465,8 @@ fn unreachable_residents_status(
             unreachable.join(", ")
         ),
         hint: Some(format!(
-            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (profiles are resolved from {}). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
-            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles.display(),
+            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (this registry was loaded from {}). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            home_display(registry_path),
             unreachable[0],
             quarantine_note
         )),
@@ -4346,6 +4347,13 @@ fn check_crew_role_prompt_coverage() -> Check {
         .into_iter()
         .filter(|id| !prompts.contains(id))
         .collect();
+    role_prompt_coverage_status(&missing)
+}
+
+/// Pure decision for [`check_crew_role_prompt_coverage`], split out so the
+/// missing-prompt arm (and its hint) is testable while every shipped prompt
+/// is present (#3081).
+fn role_prompt_coverage_status(missing: &[&str]) -> Check {
     if missing.is_empty() {
         Check {
             name: "crew role prompt coverage".into(),
@@ -4370,9 +4378,20 @@ fn check_crew_role_prompt_coverage() -> Check {
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
                  add them to `BUILTIN_ROLE_PROMPTS` in `crates/darkmux-crew/src/loader.rs`. Operators can \
                  override at `{}/<id>.md`.",
-                darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles").display()
+                home_display(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles"))
             )),
         }
+    }
+}
+
+/// A path for operator-facing text: the home prefix prints as `~` so doctor
+/// output pasted into an issue does not carry the account name (#3081). The
+/// resolved location is unchanged, and a path outside home prints in full.
+fn home_display(path: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -12615,20 +12634,45 @@ mod tests {
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
         let c = super::removed_radio_router_staffing_status(Some("radio"));
-        let expected_config = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-        assert!(c.message.contains(&expected_config.display().to_string()), "names the file: {}", c.message);
+        let expected_config = super::home_display(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config);
+        assert!(c.message.contains(&expected_config), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
     }
 
     #[test]
     fn crew_role_prompt_coverage_hint_points_to_correct_loader_and_roles_dir() {
-        let hint = match super::check_crew_role_prompt_coverage().hint {
-            Some(h) => h,
-            None => return, // all prompts present in test env
-        };
+        let c = super::role_prompt_coverage_status(&["analyst"]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("`analyst`"), "{}", c.message);
+        let hint = c.hint.expect("a missing prompt carries a hint");
         assert!(hint.contains("crates/darkmux-crew/src/loader.rs"), "loader path: {hint}");
-        let expected_roles = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles");
-        assert!(hint.contains(&expected_roles.display().to_string()), "roles dir: {hint}");
+        assert!(!hint.contains("src/crew/loader.rs"), "stale loader path: {hint}");
+        let expected_roles = super::home_display(
+            &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles"),
+        );
+        assert!(hint.contains(&expected_roles), "roles dir: {hint}");
+        assert_eq!(super::role_prompt_coverage_status(&[]).status, Status::Pass);
+    }
+
+    /// (#3081) Doctor output gets pasted into issues: the home prefix prints
+    /// as `~`, a path outside home prints in full.
+    #[test]
+    fn home_display_prints_the_home_prefix_as_a_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(super::home_display(&home.join(".darkmux/profiles.json")), "~/.darkmux/profiles.json");
+        assert_eq!(super::home_display(&home), "~");
+        assert_eq!(super::home_display(std::path::Path::new("/srv/darkmux/profiles.json")), "/srv/darkmux/profiles.json");
+    }
+
+    /// (#3081) The unreachable-residents hint names the registry that was
+    /// actually loaded, not the default user location.
+    #[test]
+    fn unreachable_residents_hint_names_the_loaded_registry_path() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        let loaded = [lm("darkmux:orphan", "orphan")];
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/srv/alt/profiles.json"));
+        let hint = c.hint.expect("hint");
+        assert!(hint.contains("/srv/alt/profiles.json"), "{hint}");
     }
 
     /// (#2914) The removed routing-seat binding `role_profiles.radio-router` is
@@ -12878,7 +12922,7 @@ mod tests {
     #[test]
     fn unreachable_residents_no_loaded_models_passes() {
         let registry = registry_with(&[]);
-        let c = super::unreachable_residents_status(&[], &registry);
+        let c = super::unreachable_residents_status(&[], &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass);
     }
 
@@ -12886,7 +12930,7 @@ mod tests {
     fn unreachable_residents_addressable_resident_passes() {
         let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
         let loaded = vec![lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass, "message: {}", c.message);
     }
 
@@ -12901,7 +12945,7 @@ mod tests {
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:qwen38-probe", "qwen/qwen3.8-27b"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("darkmux:qwen38-probe"), "names the orphan: {}", c.message);
         assert!(
@@ -12946,7 +12990,7 @@ mod tests {
             lm("predarkmux:orphan", "orphan"),
             lm("DARKMUX:orphan", "orphan"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(
             c.status,
             Status::Pass,
@@ -12974,7 +13018,7 @@ mod tests {
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass, "the utility binding is addressable, not orphaned: {}", c.message);
     }
 
@@ -12986,7 +13030,7 @@ mod tests {
     fn unreachable_residents_honors_an_explicit_identifier_override() {
         let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", Some("darkmux:my-alias"))])]);
         let loaded = vec![lm("darkmux:my-alias", "qwen/qwen3.8-27b")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(
             c.status,
             Status::Pass,
@@ -13010,7 +13054,7 @@ mod tests {
             error: "missing field `models`".to_string(),
         });
         let loaded = vec![lm("darkmux:orphan", "orphan")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Warn);
         let hint = c.hint.expect("a warn carries a remedy");
         assert!(
@@ -13030,7 +13074,7 @@ mod tests {
         ] {
             registry.quarantined.push(darkmux_types::QuarantinedEntry { kind, name: name.into(), error: "x".into() });
         }
-        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry);
+        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry, std::path::Path::new("/x/profiles.json"));
         let hint = c.hint.expect("a warn carries a remedy");
         assert!(hint.contains("2 registry entries are currently quarantined"), "{hint}");
         assert!(hint.contains("profile \"broken-profile\"") && hint.contains("endpoint \"broken-endpoint\""), "{hint}");
