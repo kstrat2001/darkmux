@@ -5038,6 +5038,15 @@ mod tests {
             redact_url_creds("redis+unix://:s3cret@/tmp/x.sock"),
             "redis+unix://:***@/tmp/x.sock"
         );
+        // A secret holding `@` is still one value: the `@` is not a boundary.
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?password=p@ss"),
+            "redis+unix:///tmp/x.sock?password=***"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?pass=a:b@c&db=1"),
+            "redis+unix:///tmp/x.sock?pass=***&db=1"
+        );
     }
 
     /// (#3074) `SinkInfo` carries the raw URL for the in-process probe; its

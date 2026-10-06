@@ -11,9 +11,11 @@
 //! database number), so an `@` after the password's own delimiter can only be
 //! the userinfo/host boundary: the userinfo is everything between `://` and
 //! the LAST `@`. The cost is a misread host for a URL carrying a stray `@`
-//! after its host, in a diagnostic; the alternative is a leaked password.
+//! after its host, in a diagnostic; the alternative is a leaked password. The
+//! one exception is an empty authority (`redis+unix:///tmp/x.sock`): it has no
+//! userinfo, so an `@` in its query is part of a value, not a boundary.
 
-/// A URL split at `://` and at the last `@`.
+/// A URL split at `://` and at the last `@` (none for an empty authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UrlAuthority<'a> {
     /// What precedes `://`.
@@ -28,9 +30,11 @@ impl<'a> UrlAuthority<'a> {
     /// `None` when `url` has no `scheme://`.
     pub fn parse(url: &'a str) -> Option<Self> {
         let (scheme, rest) = url.split_once("://")?;
+        // An empty authority (`scheme:///path`, a unix socket) has nothing
+        // to hold userinfo: an `@` after it is path or query.
         let (userinfo, host_and_tail) = match rest.rsplit_once('@') {
-            Some((u, h)) => (Some(u), h),
-            None => (None, rest),
+            Some((u, h)) if !rest.starts_with('/') => (Some(u), h),
+            _ => (None, rest),
         };
         Some(Self { scheme, userinfo, host_and_tail })
     }
@@ -70,5 +74,22 @@ mod tests {
         let u = UrlAuthority::parse("redis+unix:///tmp/x.sock?pass=s3&db=1#f").unwrap();
         assert_eq!((u.scheme, u.hostport(), u.query()), ("redis+unix", "", Some("pass=s3&db=1")));
         assert_eq!(UrlAuthority::parse("garbage"), None);
+    }
+
+    /// (#3074) An empty authority (`scheme:///path`, a unix socket) has no
+    /// userinfo: an `@` after it belongs to the path or the query, and
+    /// treating it as the boundary would turn the socket path into userinfo
+    /// and leave the query's secret outside every mask.
+    #[test]
+    fn an_at_in_a_unix_socket_query_is_not_a_userinfo_boundary() {
+        for url in ["redis+unix:///tmp/x.sock?password=p@ss", "redis+unix:///tmp/x.sock?pass=a:b@c&db=1"] {
+            let a = UrlAuthority::parse(url).unwrap();
+            assert_eq!(a.userinfo, None, "{url}");
+            assert_eq!(a.hostport(), "", "{url}");
+            assert_eq!(a.host_and_tail, &url["redis+unix://".len()..], "{url}");
+        }
+        // An authority with userinfo is still split at the last `@`.
+        let a = UrlAuthority::parse("redis+unix://:s3cret@/tmp/x.sock").unwrap();
+        assert_eq!((a.userinfo, a.host_and_tail), (Some(":s3cret"), "/tmp/x.sock"));
     }
 }
