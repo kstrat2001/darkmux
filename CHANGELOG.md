@@ -1909,6 +1909,10 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   file line. The crawl planner used to panic on it in debug, which dropped
   every later file in that diff. The malformed file is recorded as skipped
   and the files after it still plan.
+- **The reference Rust bundler stays inside the worktree** (#3074). A diff path
+  that is absolute, contains `..`, or resolves through a symlink to outside the
+  checkout is now refused instead of read into the bundle.
+
 - **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
   aborting a mission, while a run waited on its endpoint budget raised the
   process-wide interrupt flag, so a mission launch running other phases'
