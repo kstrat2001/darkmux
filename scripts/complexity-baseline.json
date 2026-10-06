@@ -17,7 +17,7 @@
   "crates/darkmux-crew/src/dispatch_internal.rs::ensure_runtime_binary_cached_at": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::kill_container_persistently": 19,
   "crates/darkmux-crew/src/dispatch_internal.rs::resolve_dispatch_model_with_hosts": 16,
-  "crates/darkmux-crew/src/dispatch_internal.rs::run_telemetry_sampler": 38,
+  "crates/darkmux-crew/src/dispatch_internal.rs::run_telemetry_sampler": 37,
   "crates/darkmux-crew/src/exclusive_fs.rs::write_file_refusing_symlinks_0600": 23,
   "crates/darkmux-crew/src/findings.rs::sync_at": 17,
   "crates/darkmux-crew/src/host_probe/ioreport.rs::imp[cfg(all(target_os=\"macos\",target_arch=\"aarch64\"))]::IoReportProbe::new": 18,

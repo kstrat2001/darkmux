@@ -82,7 +82,10 @@ darkmux release.
 - **A failed battery probe keeps a held battery pause alive** (#3074). The governor dropped
   its heartbeat on any tick with no reading, so a probe that kept failing for longer than the
   runtime's pause ceiling let the run resume below the floor. It now keeps re-stamping at the
-  last known charge, and only a reading above the floor releases the pause.
+  last known charge, and only a reading above the floor releases the pause. The first blind
+  tick of a failure episode now logs a Warn `dispatch.rest` ("battery probe failing; holding at
+  N%"), and a probe that stays blind for the runtime's pause ceiling
+  (`DARKMUX_THERMAL_MAX_PAUSE_MS`, `0` unbounded) releases the hold with a second Warn.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
