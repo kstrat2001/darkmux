@@ -259,13 +259,8 @@ pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
     if tool_name == "create_mod" && (result.starts_with("REJECTED:") || result.starts_with("NOT RECORDED")) {
         return ToolOutcome::Failed { reason: "the mod was refused and recorded nothing".to_string() };
     }
-    // `execute_write` / `execute_edit` return Ok text when they refuse an
-    // echoed `read` line-number prefix. The file was not changed.
-    if tool_name == "write" && result.starts_with("NOT WRITTEN") {
-        return ToolOutcome::Failed { reason: "the write was refused and the file was not changed".to_string() };
-    }
-    if tool_name == "edit" && result.starts_with("NOT EDITED") {
-        return ToolOutcome::Failed { reason: "the edit was refused and the file was not changed".to_string() };
+    if let Some(outcome) = classify_refused_write(tool_name, result) {
+        return outcome;
     }
 
     if tool_name == "bash" {
@@ -287,6 +282,22 @@ pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
         }
     }
     ToolOutcome::Ok
+}
+
+/// `execute_write` / `execute_edit` return Ok text when they refuse an
+/// echoed `read` line-number prefix. The file was not changed.
+fn classify_refused_write(tool_name: &str, result: &str) -> Option<ToolOutcome> {
+    if tool_name == "write" && result.starts_with("NOT WRITTEN") {
+        return Some(ToolOutcome::Failed {
+            reason: "the write was refused and the file was not changed".to_string(),
+        });
+    }
+    if tool_name == "edit" && result.starts_with("NOT EDITED") {
+        return Some(ToolOutcome::Failed {
+            reason: "the edit was refused and the file was not changed".to_string(),
+        });
+    }
+    None
 }
 
 /// (#799) Classify whether a bash result means the command **failed to run**
