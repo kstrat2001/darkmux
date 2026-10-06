@@ -305,9 +305,11 @@ impl BatteryGovernor {
     /// Feed one charge reading.
     ///
     /// - `battery: None` — no battery on this machine, or the probe failed
-    ///   this tick: **no-op, unconditionally**, before any config is read.
-    ///   The state machine does not move and nothing is written. An absent
-    ///   reading is not evidence the charge crossed anything.
+    ///   this tick: the state machine does not move, no config is read, and
+    ///   nothing is decided. An absent reading is not evidence the charge
+    ///   crossed anything. The one thing that still runs is the heartbeat of a
+    ///   pause already held, at the last reading (#3074), because the runtime
+    ///   releases a pause whose stamp goes stale.
     /// - `elapsed_ms` is wall time since the previous tick, injected so the
     ///   heartbeat is testable without real sleeps.
     /// - `thermal_pausing` — the thermal governor holds an ACTUAL pause
@@ -323,8 +325,12 @@ impl BatteryGovernor {
         thermal_pausing: bool,
     ) -> Option<BatteryEvent> {
         // THE INERTNESS, first and unconditional. A machine with no battery
-        // never reaches a config read, a threshold comparison, or a write.
-        let b = battery?;
+        // never reaches a config read or a threshold comparison, and never
+        // holds a pause, so the only thing an absent reading can do is keep
+        // an already-held pause alive (#3074).
+        let Some(b) = battery else {
+            return self.hold_pause_without_reading(elapsed_ms, host_out, thermal_pausing);
+        };
         if !self.config.pause_running_below_min {
             return None;
         }
@@ -386,6 +392,22 @@ impl BatteryGovernor {
                 None
             }
         }
+    }
+
+    /// A tick with no reading (#3074). A held pause keeps its heartbeat at the last known
+    /// charge, and yields to thermal exactly as a tick with a reading does; only a reading
+    /// above the floor releases it. Anything else is a no-op.
+    fn hold_pause_without_reading(&mut self, elapsed_ms: u64, host_out: &Path, thermal_pausing: bool) -> Option<BatteryEvent> {
+        if self.state != State::Paused {
+            return None;
+        }
+        self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+        if thermal_pausing {
+            self.pace_owned = false;
+        } else if !self.pace_owned || self.ms_since_stamp >= self.restamp_interval_ms {
+            self.write_pause(host_out, true);
+        }
+        None
     }
 
     /// Write the pace file and reset the heartbeat accounting together, so
@@ -703,5 +725,47 @@ mod tests {
         assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None);
         assert!(g.is_pacing(), "a probe that failed this tick must not resume the run");
         assert_eq!(pace_json(dir.path())["pause"], true);
+    }
+
+    /// (#3074) The runtime releases a pause whose stamp goes stale, so a probe that keeps
+    /// failing must not stop the heartbeat of a pause already held: it holds the last reading.
+    #[test]
+    fn a_failing_probe_keeps_restamping_a_held_pause_at_the_last_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(10_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        let first = pace_json(dir.path())["written_at_ms"].as_u64().expect("stamped");
+
+        for _ in 0..4 {
+            assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None);
+        }
+        assert_eq!(pace_json(dir.path())["written_at_ms"].as_u64(), Some(first), "not due yet");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None, "holding is not an event");
+        let after = pace_json(dir.path());
+        assert!(after["written_at_ms"].as_u64().expect("stamped") > first, "the failed probe still re-stamps");
+        assert_eq!(after["pause"], true);
+        assert_eq!(after["state"], "40%", "the last reading is held");
+        assert!(g.is_pacing());
+    }
+
+    #[test]
+    fn a_failing_probe_while_idle_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(1);
+        g.on_sample(Some(&at(80)), 2_000, dir.path(), false);
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), false), None);
+        assert!(!crate::pace_file::path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_failing_probe_does_not_take_the_file_back_from_thermal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(1);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        crate::pace_file::write(dir.path(), true, "thermal", "hot");
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), true), None);
+        assert_eq!(pace_json(dir.path())["reason"], "thermal", "thermal's hold stays untouched");
     }
 }

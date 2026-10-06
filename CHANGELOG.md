@@ -105,6 +105,11 @@ darkmux release.
   now carries an additive `later_step_planned` marker when a later step of the task is
   still planned, and neither the daemon nor the viewer counts it as the end. Archives
   without the marker read as before.
+  with an `@` after the host now masks up to the last `@`.
+- **A failed battery probe keeps a held battery pause alive** (#3074). The governor dropped
+  its heartbeat on any tick with no reading, so a probe that kept failing for longer than the
+  runtime's pause ceiling let the run resume below the floor. It now keeps re-stamping at the
+  last known charge, and only a reading above the floor releases the pause.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
