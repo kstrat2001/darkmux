@@ -29,6 +29,7 @@ import type { OpenPayload } from "./OpenPayload";
 import type { PhaseReviewVerdictPayload } from "./PhaseReviewVerdictPayload";
 import type { RadioRoutePayload } from "./RadioRoutePayload";
 import type { RunPayload } from "./RunPayload";
+import type { StepCompletePayload } from "./StepCompletePayload";
 import type { StepErrorPayload } from "./StepErrorPayload";
 import type { StepResultPayload } from "./StepResultPayload";
 import type { StepSeatUnresolvedPayload } from "./StepSeatUnresolvedPayload";
@@ -91,6 +92,7 @@ export type FlowPayloads = {
   "run.complete": RunPayload,
   "run.error": RunPayload,
   "step.start": StepStartPayload,
+  "step.complete": StepCompletePayload,
   "step.error": StepErrorPayload,
   "step.result": StepResultPayload,
   "step.timing": StepTimingPayload,

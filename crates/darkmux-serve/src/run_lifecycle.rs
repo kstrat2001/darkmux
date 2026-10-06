@@ -68,14 +68,18 @@ struct Folded {
     names_a_reason: bool,
     /// A `budget.wait`'s announced wait, milliseconds.
     wait_ms: u64,
+    /// A `step.complete` that names a later step of its task still planned: the task's session
+    /// goes on (#3074).
+    later_step_planned: bool,
 }
 
 impl Folded {
     fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
-        let (names_a_reason, wait_ms) = match darkmux_flow::reader::payload_of(v) {
-            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0),
-            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0)),
-            _ => (false, 0),
+        let (names_a_reason, wait_ms, later_step_planned) = match darkmux_flow::reader::payload_of(v) {
+            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0, false),
+            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
+            Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
+            _ => (false, 0, false),
         };
         Folded {
             action: action.cloned(),
@@ -85,6 +89,7 @@ impl Folded {
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason,
             wait_ms,
+            later_step_planned,
         }
     }
 
@@ -96,6 +101,9 @@ impl Folded {
             Some(Edge::Complete) => return ended(RunStatus::Complete, None),
             Some(Edge::Error) => return ended(RunStatus::Error, None),
             Some(Edge::Start) | None => {}
+        }
+        if *action == FlowAction::StepComplete && self.later_step_planned {
+            return None;
         }
         if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
             return ended(RunStatus::Complete, None);
