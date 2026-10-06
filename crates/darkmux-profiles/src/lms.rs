@@ -172,34 +172,45 @@ pub fn list_loaded() -> Result<Vec<LoadedModel>> {
 /// recognizable but this parser did not understand what it said, which is
 /// precisely the "could not tell" case.
 fn interpret_text_ps(stdout: &str) -> Option<Vec<LoadedModel>> {
-    let rows = parse_text_ps(stdout);
-    if !rows.is_empty() {
-        return Some(rows);
-    }
-    // (#2774 round-9 review C4) Everything ABOVE the header is preamble
-    // and is not evidence of anything; only what comes BELOW it had to
-    // parse. Without this the reading was narrower than the very case it
-    // exists to protect: an old `lms` that prints its own version banner
-    // above the header, on a host with genuinely nothing loaded, read as
-    // "could not tell" — so `machine eject` went rc 0 -> rc 1 on a
-    // correct answer. Reachable only when `--json` ALSO fails, which is
-    // precisely the old-CLI case.
-    //
-    // With no header at all there is no preamble to discount, so every
-    // non-blank line still has to be accounted for.
     let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
-    let body: &[&str] = match lines.iter().position(|l| is_ps_header(l)) {
-        Some(header_at) => &lines[header_at + 1..],
+    let header_at = lines.iter().position(|l| is_ps_header(l));
+    let body: &[&str] = match header_at {
+        Some(idx) => &lines[idx + 1..],
         None => &lines[..],
     };
-    let unaccounted: Vec<&&str> = body.iter().filter(|l| !l.is_empty()).collect();
-    if unaccounted.is_empty() {
+    let non_empty: Vec<&str> = body.iter().copied().filter(|l| !l.is_empty()).collect();
+    if non_empty.is_empty() {
+        return if header_at.is_some() || stdout.trim().is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    if non_empty.iter().all(|l| l.to_ascii_lowercase().contains("no models")) {
         return Some(Vec::new());
     }
-    if unaccounted.iter().all(|l| l.to_ascii_lowercase().contains("no models")) {
-        return Some(Vec::new());
+
+    let mut rows = Vec::new();
+    for line in non_empty {
+        let cols: Vec<&str> = line
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.len() < 5 {
+            return None;
+        }
+        let context = cols[4].parse::<u64>().unwrap_or(0);
+        rows.push(LoadedModel {
+            identifier: cols[0].to_string(),
+            model: if cols.len() > 1 { cols[1].to_string() } else { cols[0].to_string() },
+            status: cols.get(2).copied().unwrap_or("").to_string(),
+            size: cols.get(3).copied().unwrap_or("").to_string(),
+            context,
+            queued: None,
+        });
     }
-    None
+    Some(rows)
 }
 
 fn model_from_json(v: &serde_json::Value) -> LoadedModel {
@@ -271,6 +282,7 @@ fn is_ps_header(trimmed: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
 }
 
+#[cfg(test)]
 fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
     let mut out: Vec<LoadedModel> = Vec::new();
     for line in text.lines() {
@@ -386,8 +398,19 @@ pub fn unload(identifier: &str) -> Result<()> {
     cmd.args(["unload", identifier]);
     let out = run_bounded(cmd, "unload", resolved_load_deadline(), StdoutMode::Null)
         .map_err(|e| anyhow::anyhow!("running `lms unload {identifier}`: {e}"))?;
-    if !out.status.success() {
-        bail!("lms unload {identifier} failed: {}", out.stderr.trim());
+    verify_unload_outcome(out.status.success(), &out.stderr, identifier)
+}
+
+fn verify_unload_outcome(success: bool, stderr: &str, identifier: &str) -> Result<()> {
+    if !success {
+        bail!("lms unload {identifier} failed: {}", stderr.trim());
+    }
+    let lower = stderr.to_ascii_lowercase();
+    const NOT_FOUND_PATTERNS: &[&str] = &[
+        "no model", "not loaded", "not found", "no such model", "cannot find a model",
+    ];
+    if NOT_FOUND_PATTERNS.iter().any(|p| lower.contains(p)) || lower.contains("error") {
+        bail!("lms unload {identifier} failed: {}", stderr.trim());
     }
     Ok(())
 }
@@ -782,5 +805,19 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_LMS_BIN"),
             }
         }
+    }
+
+    #[test]
+    fn verify_unload_outcome_accepts_clean_or_noise_stderr() {
+        assert!(verify_unload_outcome(true, "", "darkmux:m").is_ok());
+        assert!(verify_unload_outcome(true, "Unloading darkmux:m...", "darkmux:m").is_ok());
+    }
+
+    #[test]
+    fn verify_unload_outcome_rejects_failure_stderr_or_nonzero_exit() {
+        assert!(verify_unload_outcome(false, "", "darkmux:m").is_err());
+        assert!(verify_unload_outcome(true, "Model Not Found", "darkmux:m").is_err());
+        assert!(verify_unload_outcome(true, "Cannot find a model with the identifier darkmux:m", "darkmux:m").is_err());
+        assert!(verify_unload_outcome(true, "Error: server disconnected", "darkmux:m").is_err());
     }
 }

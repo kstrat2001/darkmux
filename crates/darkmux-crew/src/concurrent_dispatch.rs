@@ -971,7 +971,7 @@ pub(crate) fn ensure_wave_loaded(
         attempt += 1;
         let residents = host
             .list_resident()
-            .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
+            .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(&committed)))?;
         let pools = MacProbe.pools().unwrap_or_default();
         let facts = Facts { residents, pools, utility_binding: utility_binding.map(str::to_string), ..Default::default() };
 
@@ -2161,20 +2161,32 @@ mod tests {
         /// Returned from EVERY `load` when set (the op is still recorded —
         /// the attempt happened).
         always_fail_load: Option<HostError>,
+        fail_list_at: Option<(usize, HostError)>,
     }
 
     impl ScriptedHost {
         fn new(scripted: Vec<Vec<ResidentFact>>, always_fail_load: Option<HostError>) -> Self {
-            Self { inner: MockHost::new(), scripted, list_calls: 0, always_fail_load }
+            Self { inner: MockHost::new(), scripted, list_calls: 0, always_fail_load, fail_list_at: None }
+        }
+
+        fn with_list_failure(mut self, call_index: usize, err: HostError) -> Self {
+            self.fail_list_at = Some((call_index, err));
+            self
         }
     }
 
     impl ModelHost for ScriptedHost {
         fn list_resident(&mut self) -> Result<Vec<ResidentFact>, HostError> {
-            if let Some(next) = self.scripted.get(self.list_calls) {
+            let current = self.list_calls;
+            self.list_calls += 1;
+            if let Some((idx, ref err)) = self.fail_list_at {
+                if idx == current {
+                    return Err(err.clone());
+                }
+            }
+            if let Some(next) = self.scripted.get(current) {
                 self.inner.residents = next.clone();
             }
-            self.list_calls += 1;
             self.inner.list_resident()
         }
 
@@ -2275,6 +2287,51 @@ mod tests {
             msg.contains("unloaded \"darkmux:orphan\"") && msg.contains("unloaded \"darkmux:m\""),
             "and names BOTH mutations attempt 1 committed, even though the attempt that \
              finally gave up committed nothing itself: {msg}"
+        );
+
+        drop(sibling_guard);
+        drop(own_guard);
+    }
+
+    /// (#3074) An earlier attempt that committed an unload before retrying
+    /// must still report what it changed if a later attempt fails to query `lms ps`.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_reports_an_earlier_attempts_commits_when_a_later_attempt_fails_list_resident_3074() {
+        let _env = LeaseTestEnv::new();
+
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:sibling".to_string()]).expect("sibling writes its lease");
+        sibling_guard
+            .mark_loaded(&["darkmux:sibling".to_string()])
+            .expect("the sibling is genuinely mid-generation");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = ScriptedHost::new(
+            vec![vec![
+                resident_fact("darkmux:orphan", "orphan", 8_000),
+                resident_fact("darkmux:m", "m", 32_000),
+            ]],
+            Some(HostError::InsufficientResources { detail: "not enough RAM".into() }),
+        ).with_list_failure(1, HostError::CommandFailed { detail: "lms ps crashed".into() });
+        let wave = vec![placement("m", 68_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
+            .expect_err("second attempt's list_resident fails");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not read LMStudio residents (`lms ps`)"),
+            "reports the list_resident error: {msg}"
+        );
+        assert!(
+            msg.contains("already changed darkmux-owned residency"),
+            "still carries the partial execution note: {msg}"
+        );
+        assert!(
+            msg.contains("unloaded \"darkmux:orphan\""),
+            "names the unload attempt 1 committed: {msg}"
         );
 
         drop(sibling_guard);

@@ -93,9 +93,49 @@ fn partition_by_ownership(loaded: &[darkmux_types::LoadedModel]) -> (Vec<&darkmu
 /// no set to act on, and continuing would mean guessing.
 pub fn eject_all_managed(dry_run: bool) -> anyhow::Result<EjectSummary> {
     let loaded = crate::lms::list_loaded()?;
-    let (managed, user_loaded_count) = partition_by_ownership(&loaded);
-    let (ejected, failed) = eject_each(&managed, dry_run, &|id| crate::lms::unload(id));
+    eject_managed_inner(
+        &loaded,
+        dry_run,
+        &|id| crate::lms::unload(id),
+        &|| crate::lms::list_loaded(),
+    )
+}
+
+pub(crate) fn eject_managed_inner(
+    loaded: &[darkmux_types::LoadedModel],
+    dry_run: bool,
+    unload: &dyn Fn(&str) -> anyhow::Result<()>,
+    recheck_loaded: &dyn Fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
+) -> anyhow::Result<EjectSummary> {
+    let (managed, user_loaded_count) = partition_by_ownership(loaded);
+    let (mut ejected, mut failed) = eject_each(&managed, dry_run, unload);
+    if !dry_run && !ejected.is_empty() {
+        if let Ok(recheck) = recheck_loaded() {
+            let still_resident: std::collections::HashSet<String> =
+                recheck.into_iter().map(|m| m.identifier).collect();
+            ejected = reconcile_still_resident(ejected, &mut failed, &still_resident);
+        }
+    }
     Ok(EjectSummary { ejected, user_loaded_count, failed })
+}
+
+fn reconcile_still_resident(
+    ejected: Vec<EjectedModel>,
+    failed: &mut Vec<EjectFailure>,
+    still_resident: &std::collections::HashSet<String>,
+) -> Vec<EjectedModel> {
+    let mut actually_ejected = Vec::with_capacity(ejected.len());
+    for m in ejected {
+        if still_resident.contains(&m.identifier) {
+            failed.push(EjectFailure {
+                identifier: m.identifier,
+                error: "model still resident after unload".to_string(),
+            });
+        } else {
+            actually_ejected.push(m);
+        }
+    }
+    actually_ejected
 }
 
 /// (#2774 review C1) The unload LOOP, with the unloader injected — so the
@@ -239,5 +279,24 @@ mod tests {
         assert_eq!(*attempts.borrow(), 0, "dry_run calls the unloader zero times");
         assert_eq!(would_eject.len(), 2, "a dry run still reports what WOULD come out");
         assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn eject_sweep_rechecks_residency_and_fails_still_resident_models() {
+        let rows = vec![loaded("darkmux:ghost"), loaded("darkmux:gone")];
+        // ghost is still reported by recheck_loaded
+        let recheck = vec![loaded("darkmux:ghost")];
+        let summary = eject_managed_inner(
+            &rows,
+            false,
+            &|_| Ok(()),
+            &|| Ok(recheck.clone()),
+        ).expect("sweep completes");
+
+        assert_eq!(summary.ejected.len(), 1);
+        assert_eq!(summary.ejected[0].identifier, "darkmux:gone");
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].identifier, "darkmux:ghost");
+        assert!(summary.failed[0].error.contains("still resident"));
     }
 }
