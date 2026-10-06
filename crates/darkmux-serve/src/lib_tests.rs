@@ -2538,6 +2538,8 @@
 
     #[test]
     fn tokens_match_is_exact() {
+        assert!(!tokens_match(b"abcd", b"abc")); // longer presented token (#3073)
+        assert!(tokens_match(b"", b""));
         assert!(tokens_match(b"abc", b"abc"));
         assert!(!tokens_match(b"abc", b"abd"));
         assert!(!tokens_match(b"abc", b"abcd")); // length differs
