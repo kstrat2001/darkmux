@@ -95,12 +95,8 @@ fn redact_credentials(text: &str) -> String {
 }
 
 fn redact_word(word: &str) -> String {
-    let word = match word.split_once("://") {
-        Some((scheme, rest)) => {
-            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let (authority, tail) = rest.split_at(end);
-            format!("{scheme}://{}{tail}", authority.rsplit('@').next().unwrap_or(authority))
-        }
+    let word = match darkmux_types::url_authority::UrlAuthority::parse(word) {
+        Some(url) => format!("{}://{}", url.scheme, url.host_and_tail),
         None => word.to_string(),
     };
     let mut out = String::with_capacity(word.len());
@@ -799,6 +795,18 @@ mod step_error_tests {
         assert!(p.cause.contains("https://github.com/x.git"), "{}", p.cause);
         assert!(p.cause.contains("api_key=<redacted>&x=1"), "{}", p.cause);
         assert!(p.cause.contains("git@github.com:o/r.git"), "ssh form untouched: {}", p.cause);
+    }
+
+    /// (#3074) A password holding `/`, `?` or `#` must not survive in a cause
+    /// that rides the fleet stream: the userinfo is split by the same parser
+    /// the connection-URL redactors use, not at the first delimiter.
+    #[test]
+    fn step_error_cause_redacts_a_password_holding_url_delimiters() {
+        for pw in ["pa/ss", "pa?ss", "pa#ss", "a#b/c?d"] {
+            let p = StepErrorPayload::from_message(&format!("hub failed: redis://kain:{pw}@hub.example:6379/0 refused"));
+            assert!(!p.cause.contains("kain") && !p.cause.contains(pw) && !p.cause.contains("ss@"), "{pw} leaked: {}", p.cause);
+            assert!(p.cause.contains("redis://hub.example:6379/0"), "{pw}: {}", p.cause);
+        }
     }
 
     /// (F9) The cause is one line with invisible and control characters gone,

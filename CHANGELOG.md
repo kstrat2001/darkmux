@@ -83,8 +83,9 @@ darkmux release.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
   with an `@` after the host now masks up to the last `@`. A unix-socket URL, which has
-  no `@`, has its `password`, `pass`, or `requirepass` query value masked. The flow
-  redactor and the serve redactor split the URL with one parser.
+  no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
+  the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
+  an endpoint's host split the URL with one parser.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 

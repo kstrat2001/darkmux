@@ -757,9 +757,7 @@ pub fn lmstudio_chat_url(base: &str) -> String {
 /// The authority of `url` with any userinfo stripped: `https://tok@h:1/p`
 /// → `h:1`. `None` when `url` has no `scheme://`.
 pub fn url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    Some(authority.rsplit('@').next().unwrap_or(authority).to_string())
+    Some(crate::url_authority::UrlAuthority::parse(url)?.hostport().to_string())
 }
 
 /// (#3035) Why `limits.concurrent_calls` is refused on a managed endpoint.
@@ -1049,6 +1047,9 @@ mod tests {
         assert_eq!(ep.host().as_deref(), Some("proxy.example:8443"));
         assert_eq!(ModelEndpoint::managed_lmstudio().host(), None);
         assert_eq!(url_host("no-scheme.example/v1"), None);
+        // (#3074) Userinfo holding a delimiter still resolves to the real host.
+        assert_eq!(url_host("https://tok:pa/ss@proxy.example:8443/v1").as_deref(), Some("proxy.example:8443"));
+        assert_eq!(url_host("https://tok:pa?ss@proxy.example/v1").as_deref(), Some("proxy.example"));
     }
 
     #[test]
