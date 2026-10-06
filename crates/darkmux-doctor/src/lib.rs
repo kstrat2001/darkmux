@@ -835,9 +835,14 @@ fn build_state_file_permissions_check(roots: &[ScanRoot], budget: usize) -> Chec
     }
 
     if violations == 0 {
+        let status = if truncated.is_empty() {
+            Status::Pass
+        } else {
+            Status::Warn
+        };
         return Check {
             name: STATE_FILE_PERMS_CHECK_NAME.into(),
-            status: Status::Pass,
+            status,
             message: format!(
                 "{checked} darkmux state file(s) checked; none are group- or world-readable{suffix}"
             ),
@@ -1243,25 +1248,23 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
     let Some(profile) = role_binding else {
         return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
     };
+    let paths = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
     Check {
         name,
         status: Status::Warn,
-        // (C6) No CLI removes a `role_profiles` binding (`config set`
-        // refuses a blank value like any other, and there is no `config
-        // unset`), so this is a hand edit, the way every other removed key's
-        // check says: name the file and the block.
         message: format!(
             "config.json binds `role_profiles.radio-router` to `{profile}`: the router has no profile; \
-             delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
+             delete the `radio-router` entry from the `role_profiles` block in {} by hand",
+            paths.config.display()
         ),
-        hint: Some(
+        hint: Some(format!(
             "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
-             `internal.utility` in ~/.darkmux/profiles.json (with its `n_ctx`), never on a profile. \
+             `internal.utility` in {} (with its `n_ctx`), never on a profile. \
              This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
-             `role_profiles.radio-host`."
-                .into(),
-        ),
+             `role_profiles.radio-host`.",
+            paths.profiles.display()
+        )),
     }
 }
 
@@ -1461,7 +1464,8 @@ fn unreachable_residents_status(
             unreachable.join(", ")
         ),
         hint: Some(format!(
-            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (a doctor run in a project directory can be reading a different profiles.json than a dispatch run elsewhere — local `.darkmux.json`/`.darkmux/profiles.json` take precedence over `~/.darkmux/profiles.json`). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (profiles are resolved from {}). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles.display(),
             unreachable[0],
             quarantine_note
         )),
@@ -4362,12 +4366,12 @@ fn check_crew_role_prompt_coverage() -> Check {
                 "{} role manifest(s) ship without `.md` prompts and cannot be dispatched: {list}",
                 missing.len()
             ),
-            hint: Some(
+            hint: Some(format!(
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
-                 add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
-                 override at `~/.darkmux/roles/<id>.md`."
-                    .into(),
-            ),
+                 add them to `BUILTIN_ROLE_PROMPTS` in `crates/darkmux-crew/src/loader.rs`. Operators can \
+                 override at `{}/<id>.md`.",
+                darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles").display()
+            )),
         }
     }
 }
@@ -6882,8 +6886,8 @@ fn check_platform_and_provider() -> Check {
     }
 }
 
-fn check_power_state() -> Check {
-    match read_power_source() {
+fn power_state_status(source: Option<PowerSource>, is_macos: bool) -> Check {
+    match source {
         Some(PowerSource::Ac) => Check {
             name: "power state".into(),
             status: Status::Pass,
@@ -6900,13 +6904,28 @@ fn check_power_state() -> Check {
                     .into(),
             ),
         },
-        None => Check {
-            name: "power state".into(),
-            status: Status::Pass,
-            message: "n/a (non-Apple Silicon? skipping)".into(),
-            hint: None,
-        },
+        None => {
+            if is_macos {
+                Check {
+                    name: "power state".into(),
+                    status: Status::Warn,
+                    message: "could not read power source (`pmset -g batt` returned no status)".into(),
+                    hint: Some("Check pmset permissions or power management daemon.".into()),
+                }
+            } else {
+                Check {
+                    name: "power state".into(),
+                    status: Status::Pass,
+                    message: "n/a (non-Apple Silicon? skipping)".into(),
+                    hint: None,
+                }
+            }
+        }
     }
+}
+
+fn check_power_state() -> Check {
+    power_state_status(read_power_source(), cfg!(target_os = "macos"))
 }
 
 /// Name of the mission-envelope readability check (#1881).
@@ -12016,6 +12035,7 @@ mod tests {
         // Budget smaller than the file count — the scan must stop early and
         // say it did not finish, rather than silently claiming a clean sweep.
         let check = build_state_file_permissions_check(&roots, 3);
+        assert_eq!(check.status, Status::Warn, "truncated scan must report Warn, not Pass");
         assert!(
             check.message.contains("budget") && check.message.contains("findings"),
             "must name the cost bound it hit: {}",
@@ -12103,6 +12123,20 @@ mod tests {
             "and a symlink must not be counted as a file that WAS checked: {}",
             check.message
         );
+    }
+
+    #[test]
+    fn power_state_warns_on_macos_when_read_fails() {
+        let check = power_state_status(None, true);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("could not read power source"));
+    }
+
+    #[test]
+    fn power_state_skips_on_non_macos_when_read_fails() {
+        let check = power_state_status(None, false);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("non-Apple Silicon"));
     }
 
     /// (#2411/#2450-class regression guard) The production check must
@@ -12581,8 +12615,20 @@ mod tests {
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
         let c = super::removed_radio_router_staffing_status(Some("radio"));
-        assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
+        let expected_config = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+        assert!(c.message.contains(&expected_config.display().to_string()), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
+    }
+
+    #[test]
+    fn crew_role_prompt_coverage_hint_points_to_correct_loader_and_roles_dir() {
+        let hint = match super::check_crew_role_prompt_coverage().hint {
+            Some(h) => h,
+            None => return, // all prompts present in test env
+        };
+        assert!(hint.contains("crates/darkmux-crew/src/loader.rs"), "loader path: {hint}");
+        let expected_roles = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles");
+        assert!(hint.contains(&expected_roles.display().to_string()), "roles dir: {hint}");
     }
 
     /// (#2914) The removed routing-seat binding `role_profiles.radio-router` is

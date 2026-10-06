@@ -142,7 +142,7 @@ pub fn all_rules() -> Vec<RuleDef> {
             Severity::Warn,
             "Estimated KV pre-allocation (primary + compactor) plus working set is \
              close to the unified memory budget. Heavy dispatches may OOM mid-run.",
-            "Either lower the primary or compactor `contextWindow`, unload other \
+            "Either lower the primary or compactor `n_ctx`, unload other \
              models, or pick a slimmer darkmux profile (e.g. `balanced`/`fast`).",
         ),
     ];
