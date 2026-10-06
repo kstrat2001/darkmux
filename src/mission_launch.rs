@@ -1899,9 +1899,12 @@ fn fail_if_interrupted(
 }
 
 /// Test seam for a signal that lands after the last step has returned and
-/// before the run is closed. When `DARKMUX_TEST_SIGNAL_AFTER_STEPS` names a
-/// path, write `ready` there and wait until an operator signal is observed,
-/// or 30s. Unset, this returns immediately.
+/// before the run is closed. In a debug build, when
+/// `DARKMUX_TEST_SIGNAL_AFTER_STEPS` names a path, write `ready` there and
+/// wait until an operator signal is observed, or 30s. Compiled out of a
+/// release binary (#3074): an environment variable must not be able to hold
+/// a shipped launch or make it write to an arbitrary path.
+#[cfg(debug_assertions)]
 fn wait_for_late_signal_probe() {
     let Ok(path) = std::env::var("DARKMUX_TEST_SIGNAL_AFTER_STEPS") else {
         return;
@@ -1915,6 +1918,9 @@ fn wait_for_late_signal_probe() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn wait_for_late_signal_probe() {}
 
 /// (#2300) Expand every `grow` template a phase declares, from the output
 /// an EARLIER phase's producing task already wrote.

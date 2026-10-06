@@ -4583,32 +4583,50 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         .spawn()
         .expect("spawning darkmux mission launch wall-clock-generic-test");
 
-    assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the generic-graph dispatch never reached a dispatch call to the stub server within 20s"
-    );
-
-    // NO signal is ever sent here — the process must stop itself.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // NO signal is ever sent here: the process must stop itself. The 1s
+    // bound is measured from process start, so on a slow host it fires
+    // during the mint and no wave ever starts; on a fast one the step
+    // connects first. Either is a valid run for this test, so the wait is
+    // on the exit, and the connection is checked afterwards (#3074).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let exit_status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "mission launch did not self-terminate within 15s of its 1s wall-clock bound (#2678 regression)"
+            "mission launch did not self-terminate within 60s of its 1s wall-clock bound (#2678 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
 
-    assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
-        "no `curl` connection to the stub server was ever torn down — the wall-clock watchdog \
-         must reap it the same way a real signal's watchdog does (#2678 regression)"
-    );
+    let records = flow_actions(&flows);
+    let step_starts = records.iter().filter(|r| r["action"] == "step.start").count();
+    if stub.wait_for_a_connection(std::time::Duration::ZERO) {
+        assert!(
+            stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+            "no `curl` connection to the stub server was ever torn down: the wall-clock watchdog \
+             must reap it the same way a real signal's watchdog does (#2678 regression)"
+        );
+    } else {
+        assert_eq!(
+            step_starts, 0,
+            "the bound fired before any dispatch connected, so no wave may have started (#3074)"
+        );
+    }
 
     assert_no_surviving_remote_curl(child.id(), "wall-clock");
+
+    // (#3074) The bound is a Degraded outcome, not a failure: the whole-run
+    // bookend closes `run.complete` naming Degraded, never `run.error`.
+    let run_closes: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "run.complete" || r["action"] == "run.error")
+        .collect();
+    assert_eq!(run_closes.len(), 1, "exactly one terminal run record: {run_closes:#?}");
+    assert_eq!(run_closes[0]["action"], "run.complete", "{run_closes:#?}");
+    assert_eq!(run_closes[0]["payload"]["status"], "Degraded", "{run_closes:#?}");
 
     let missions_dir = home.path().join("missions");
     let mission_id = fs::read_dir(&missions_dir)
@@ -13609,6 +13627,8 @@ fn mission_launch_sigint_closes_the_run_as_an_error_and_starts_no_later_phase() 
 /// process exit.
 #[test]
 #[cfg(unix)]
+// The seam this drives is compiled out of a release binary (#3074).
+#[cfg(debug_assertions)]
 fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();

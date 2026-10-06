@@ -527,6 +527,29 @@ pub struct SchedulerReport {
     pub step_records: Vec<StepRecord>,
 }
 
+/// The ids ready to run in the next wave. (#3074) Once a signal was observed
+/// only a kind that declares `runs_after_interrupt` (a record-only step that
+/// does no new work) is ready: the run ends without starting any other work, the
+/// steps still `Planned` stay `Planned` (the launcher's phase-exit sweep
+/// abandons them), and the launcher, which sees the same signal, closes the
+/// run as an error rather than a completed one.
+fn next_wave_ready_ids(
+    steps: &BTreeMap<String, Step>,
+    tasks: &BTreeMap<String, Task>,
+    kinds: &StepKindRegistry,
+) -> Vec<String> {
+    let interrupted = darkmux_types::interrupt::is_set();
+    steps
+        .values()
+        .filter(|s| !interrupted || kinds.get(&s.kind).is_ok_and(|k| k.runs_after_interrupt()))
+        .filter(|s| {
+            let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
+            step_is_ready(s, &task, tasks, steps)
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 /// Walk `steps` to completion: each iteration computes every currently-
 /// ready node, marks them `Running`, fans them out through Packet 1's
 /// `run_bounded` (one call = one wave — see the module doc's Residency
@@ -573,29 +596,6 @@ pub struct SchedulerReport {
 /// `persist` for callers with no durable Step storage (most scheduler unit
 /// tests) — the bulk end-of-run save loops every production caller already
 /// runs stay in place as a cheap idempotent reconcile, not the only write.
-/// The ids ready to run in the next wave. (#3074) Once a signal was observed
-/// only a kind that declares `runs_after_interrupt` (a record-only step that
-/// does no new work) is ready: the run ends without starting any other work, the
-/// steps still `Planned` stay `Planned` (the launcher's phase-exit sweep
-/// abandons them), and the launcher, which sees the same signal, closes the
-/// run as an error rather than a completed one.
-fn next_wave_ready_ids(
-    steps: &BTreeMap<String, Step>,
-    tasks: &BTreeMap<String, Task>,
-    kinds: &StepKindRegistry,
-) -> Vec<String> {
-    let interrupted = darkmux_types::interrupt::is_set();
-    steps
-        .values()
-        .filter(|s| !interrupted || kinds.get(&s.kind).is_ok_and(|k| k.runs_after_interrupt()))
-        .filter(|s| {
-            let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
-            step_is_ready(s, &task, tasks, steps)
-        })
-        .map(|s| s.id.clone())
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
     // The run this graph is: every record the scheduler emits, and every

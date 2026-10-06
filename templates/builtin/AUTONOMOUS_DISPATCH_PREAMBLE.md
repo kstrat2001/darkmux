@@ -66,7 +66,10 @@ This dispatch is bounded along seven dimensions:
   reports `escalation_intra_turn_stall_exhausted`. Either way the
   work you have already written is handed on, so when you notice
   yourself restating what you just wrote, stop and give your answer
-  from what you have rather than continuing.
+  from what you have rather than continuing. A turn that keeps continuing
+  past its check-ins until it has produced as many tokens as the
+  context window holds stops on
+  `escalation_turn_continuations_exhausted`, with the same handoff.
 - **Cumulative completion-token cap** — sum of all completion tokens
   (content + reasoning) across every turn. Crossing terminates via
   `escalation_cumulative_tokens_exceeded`.
