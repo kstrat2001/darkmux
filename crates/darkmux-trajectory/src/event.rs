@@ -563,6 +563,11 @@ pub struct Compaction {
     pub tokens_before: Option<u64>,
     /// A chars/4 estimate of the compacted buffer.
     pub tokens_after: Option<u64>,
+    /// (#3074) The compactor's reply was cut off and lexically repaired
+    /// before it parsed, so the installed summary is lossy. Absent when the
+    /// reply parsed cleanly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lexically_repaired: bool,
 }
 
 /// `compaction.skipped`: triggered and refused; nothing was installed.

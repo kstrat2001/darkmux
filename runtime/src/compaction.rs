@@ -1529,9 +1529,15 @@ pub(crate) fn parse_compactor_response_content(content: &str) -> Result<Structur
              — content: {content}"
         )
     })?;
-    // (#3074) Set truncation_patched if either lexical repair (layer 1) or
-    // schema patching (layer 2) occurred, so lossy compaction is marked in the metadata.
-    if repaired || was_patched {
+    // (#3074) Two distinct flags, one per repair layer: `lexically_repaired`
+    // (layer 1, a cut-off reply was balanced) and `truncation_patched`
+    // (layer 2, missing required fields got defaults). A summary with a
+    // defaulted `objective` and one with a cut optional slot are different
+    // losses, so they must not read the same.
+    if repaired {
+        out.compaction_metadata.lexically_repaired = Some(true);
+    }
+    if was_patched {
         out.compaction_metadata.truncation_patched = Some(true);
     }
     Ok(out)
@@ -2240,6 +2246,11 @@ pub struct CompactionMetadata {
     /// data shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_patched: Option<bool>,
+    /// (#3074) `Some(true)` when the compactor's reply was cut off and the
+    /// lexical repair (#401 layer 1) balanced it before it parsed. Distinct
+    /// from `truncation_patched`, which is layer 2 only. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexically_repaired: Option<bool>,
     /// (#439) Dispatch-budget snapshot at compaction time. Surfaced
     /// to the model via the synthesized SYSTEM message's markdown
     /// render so it can pace within bounds + escalate explicitly
@@ -3739,6 +3750,7 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
                 truncation_patched: None,
+                lexically_repaired: None,
                 turns_used: None,
                 max_turns: None,
                 cumulative_completion_tokens_used: None,
@@ -3867,6 +3879,7 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
                 truncation_patched: None,
+                lexically_repaired: None,
                 turns_used: None,
                 max_turns: None,
                 cumulative_completion_tokens_used: None,
@@ -3916,6 +3929,7 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
                 truncation_patched: None,
+                lexically_repaired: None,
                 turns_used: None,
                 max_turns: None,
                 cumulative_completion_tokens_used: None,
@@ -4056,6 +4070,7 @@ mod tests {
                 generation: 1,
                 source_message_count: 10,
                 truncation_patched: None,
+                lexically_repaired: None,
                 turns_used: None,
                 max_turns: None,
                 cumulative_completion_tokens_used: None,
@@ -4995,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_compactor_response_content_sets_truncation_patched_on_lexical_repair_only() {
+    fn parse_compactor_response_content_sets_lexically_repaired_on_lexical_repair_only() {
         let truncated = r#"{
             "objective": "complete migration",
             "current_truth": {},
@@ -5013,9 +5028,13 @@ mod tests {
             Some("decision 1: foo; decision 2: bar")
         );
         assert_eq!(
-            out.compaction_metadata.truncation_patched,
+            out.compaction_metadata.lexically_repaired,
             Some(true),
-            "lexically repaired compactor output must carry truncation_patched: true (#3074)"
+            "lexically repaired compactor output must carry lexically_repaired: true (#3074)"
+        );
+        assert_eq!(
+            out.compaction_metadata.truncation_patched, None,
+            "layer 1 repair alone must not claim the layer-2 flag (#3074)"
         );
     }
 
@@ -5051,6 +5070,7 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
+            lexically_repaired: None,
             turns_used: None,
             max_turns: None,
             cumulative_completion_tokens_used: None,
@@ -5071,6 +5091,7 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: Some(true),
+            lexically_repaired: None,
             turns_used: None,
             max_turns: None,
             cumulative_completion_tokens_used: None,
@@ -5136,6 +5157,7 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
+            lexically_repaired: None,
             turns_used: Some(b.turns_used),
             max_turns: b.max_turns,
             cumulative_completion_tokens_used: Some(b.cumulative_completion_tokens_used),
@@ -5199,6 +5221,7 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
+            lexically_repaired: None,
             turns_used: None,
             max_turns: None,
             cumulative_completion_tokens_used: None,
@@ -5234,6 +5257,7 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
+            lexically_repaired: None,
             turns_used: None,
             max_turns: None,
             cumulative_completion_tokens_used: None,

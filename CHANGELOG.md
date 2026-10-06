@@ -62,6 +62,10 @@ darkmux release.
 
 ### Fixed (5.0): isolation
 
+- **A compaction whose reply was cut off and repaired is flagged** (#3074). The installed
+  `compaction` trajectory event and `compaction-N.json` carry `lexically_repaired`, distinct
+  from `truncation_patched` (missing fields defaulted), so an operator can see a lossy
+  summary without reading stderr.
 - **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
   The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
   the operator asked to protect. A `dispatch.internal` step reads it from the config key
