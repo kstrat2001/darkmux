@@ -428,9 +428,134 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// Which way an atomic record write ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Committed {
+    /// This call put the record in place.
+    Created,
+    /// A write-once target already existed; it was left untouched.
+    AlreadyPresent,
+}
+
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A sibling temp path unique per CALL (pid plus a process-wide counter), so two
+/// writers in one process never share a temp inode (#3074). A crash between the
+/// temp write and the commit leaves a `.<name>.tmp.*` orphan; readers only ever
+/// open the final name, so it is harmless.
+fn unique_tmp_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("record path {} has no file name", path.display()))?;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(path.with_file_name(format!(".{name}.tmp.{}.{seq}", std::process::id())))
+}
+
+/// Create `path` (which must not exist) with mode `0o600`, write `bytes`, fsync.
+fn write_new_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// A hard link refused because the filesystem cannot link, not because of a race.
+pub(crate) fn link_unsupported(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied)
+}
+
+/// Write-once, last-resort path for filesystems without hard links: still
+/// `create_new` on the final name (a second writer is refused), and a failed
+/// write removes its partial file rather than leaving a torn record.
+pub(crate) fn create_new_in_place(path: &std::path::Path, bytes: &[u8]) -> Result<Committed> {
+    match write_new_owner_only(path, bytes) {
+        Ok(()) => Ok(Committed::Created),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Committed::AlreadyPresent),
+        Err(e) => {
+            let _ = fs::remove_file(path);
+            Err(e).with_context(|| format!("creating {}", path.display()))
+        }
+    }
+}
+
+/// Write a record that must never be overwritten (#3074). The bytes go to a
+/// unique temp file, are fsynced, then hard-linked to `path`: the link fails with
+/// `AlreadyExists` instead of replacing, so a second writer is refused and a
+/// reader never sees a torn file. `before_commit` runs between the temp write
+/// and the link; tests inject a failure there to simulate a crash.
+///
+/// On a filesystem that cannot hard-link (`Unsupported` / `PermissionDenied`)
+/// the commit falls back to `create_new` on the final name. That fallback is
+/// write-once but NOT crash-atomic: a crash mid-write leaves a torn record,
+/// which is why a failed write removes its partial file. It runs on FAT/exFAT,
+/// some network and FUSE mounts, and similar link-less volumes, never on APFS
+/// or ext4.
+pub(crate) fn commit_write_once(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<Committed> {
+    commit_write_once_with(path, bytes, before_commit, |a, b| fs::hard_link(a, b))
+}
+
+/// [`commit_write_once`] with the link call injectable, so tests can force the
+/// link-less fallback arm (#3074). Production passes `fs::hard_link`.
+pub(crate) fn commit_write_once_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> Result<()>,
+    link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<Committed> {
+    let dir = path.parent().with_context(|| format!("record path {} has no parent", path.display()))?;
+    let tmp = unique_tmp_path(path)?;
+    write_new_owner_only(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    let outcome = before_commit().and_then(|()| match link(&tmp, path) {
+        Ok(()) => Ok(Committed::Created),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Committed::AlreadyPresent),
+        Err(e) if link_unsupported(&e) => create_new_in_place(path, bytes),
+        Err(e) => Err(e).with_context(|| format!("linking {} -> {}", tmp.display(), path.display())),
+    });
+    let _ = fs::remove_file(&tmp);
+    if outcome? == Committed::Created {
+        fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))?;
+        return Ok(Committed::Created);
+    }
+    Ok(Committed::AlreadyPresent)
+}
+
+/// Replace an existing record atomically (#3074): unique temp, fsync, rename. A
+/// failure before the rename leaves the previous committed bytes intact.
+/// `before_commit` is the same crash-injection seam as [`commit_write_once`].
+pub(crate) fn replace_atomic(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let dir = path.parent().with_context(|| format!("record path {} has no parent", path.display()))?;
+    let tmp = unique_tmp_path(path)?;
+    write_new_owner_only(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    let outcome = before_commit().and_then(|()| {
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
+    });
+    if outcome.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    outcome?;
+    fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))
+}
+
 /// `fsync(2)` a directory so a rename(2) that landed inside it reaches
 /// stable storage. POSIX-only — on non-Unix this is a no-op.
-fn fsync_dir(dir: &std::path::Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         let f = fs::File::open(dir)

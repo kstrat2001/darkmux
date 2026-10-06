@@ -312,6 +312,15 @@ pub fn stamp_site(record: &mut FindingRecord, sites: &serde_json::Value) {
 /// second producer to arrive reports [`Materialized::AlreadyPresent`] and
 /// leaves the bytes on disk untouched.
 pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> {
+    materialize_with(root, record, || Ok(()))
+}
+
+/// [`materialize`] with a crash-injection seam between the temp write and the commit.
+fn materialize_with(
+    root: &Path,
+    record: &FindingRecord,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<Materialized> {
     // The backstop for `parse_key`'s check: a record's `dispatch` comes from
     // the stream, so a producer that never parsed a key still cannot write
     // outside the store.
@@ -328,37 +337,11 @@ pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating finding dir {}", dir.display()))?;
     let body = serde_json::to_string_pretty(record)? + "\n";
-    // `create_new` closes the last of the race: two producers that both saw an
-    // absent file still cannot double-write, and the loser reports the same
-    // already-present outcome the `exists()` fast path does.
-    //
-    // (#2451) Owner-only on POSIX — `emitted` (and, for a crawl finding,
-    // `context`) can carry a source line copied verbatim out of the
-    // operator's repository, and this writer landed at the umask default
-    // (typically 0o644, world-readable) with no mode of its own. Fixed at
-    // the creator, same shape as the #2259 hook-outbox fix: `.mode()`
-    // applies only when this call WINS the create race (the write-once
-    // contract above means it never runs again for this path), so an
-    // already-present finding from a pre-#2451 binary keeps whatever mode
-    // it already has — this does not retroactively `chmod` it, the same
-    // call #2259 makes (a migration that walks the store and re-modes it is
-    // a separate, operator-visible decision, not a side effect of a write).
-    #[cfg(unix)]
-    let opened = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
-    };
-    #[cfg(not(unix))]
-    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-    match opened {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(body.as_bytes())
-                .with_context(|| format!("writing finding {}", path.display()))?;
-            Ok(Materialized::Created)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Materialized::AlreadyPresent),
-        Err(e) => Err(e).with_context(|| format!("creating finding {}", path.display())),
+    // (#3074) Temp file, fsync, link: finding.json is never written in place and
+    // never replaced, so a reader sees no record or a whole one.
+    match crate::lifecycle::commit_write_once(&path, body.as_bytes(), before_commit)? {
+        crate::lifecycle::Committed::Created => Ok(Materialized::Created),
+        crate::lifecycle::Committed::AlreadyPresent => Ok(Materialized::AlreadyPresent),
     }
 }
 
@@ -1186,5 +1169,118 @@ mod tests {
         println!("findings {n}, with a context {with_context}, mismatches {}", bad.len());
         assert!(bad.is_empty(), "{bad:#?}");
         assert!(n > 0);
+    }
+
+    /// (#3074) A crash between the temp write and the commit leaves NO finding.json
+    /// (never a torn one that reads as present forever); the retry creates it whole.
+    #[test]
+    fn materialize_crash_before_commit_leaves_no_record_then_retry_creates() {
+        let tmp = TempDir::new().unwrap();
+        let rec = rec_at("sess-crash", 1, "2026-09-03T01:00:00Z");
+        let path = record_path_at(tmp.path(), "sess-crash", 1);
+        let err = materialize_with(tmp.path(), &rec, || anyhow::bail!("injected crash")).unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert!(!path.exists(), "a crashed write must not leave finding.json");
+        assert!(std::fs::read_dir(path.parent().unwrap()).unwrap().next().is_none(), "temp orphan left");
+        assert_eq!(materialize(tmp.path(), &rec).unwrap(), Materialized::Created);
+        let loaded = load_at(tmp.path(), "sess-crash", 1).unwrap().unwrap();
+        assert_eq!(loaded.seq, rec.seq);
+    }
+
+    /// (#3074) A second write of the same record is refused and the original
+    /// bytes stay, even when the existence pre-check is bypassed (the race).
+    #[test]
+    fn materialize_refuses_second_write_and_keeps_original() {
+        let tmp = TempDir::new().unwrap();
+        let first = rec_at("sess-once", 1, "2026-09-03T01:00:00Z");
+        assert_eq!(materialize(tmp.path(), &first).unwrap(), Materialized::Created);
+        let path = record_path_at(tmp.path(), "sess-once", 1);
+        let original = std::fs::read(&path).unwrap();
+        let mut other = rec_at("sess-once", 1, "2026-09-03T02:00:00Z");
+        other.emitted = "different".into();
+        assert_eq!(materialize(tmp.path(), &other).unwrap(), Materialized::AlreadyPresent);
+        // The race: the target appears after the pre-check; the commit must refuse.
+        let body = serde_json::to_string_pretty(&other).unwrap();
+        let committed = crate::lifecycle::commit_write_once(&path, body.as_bytes(), || Ok(())).unwrap();
+        assert_eq!(committed, crate::lifecycle::Committed::AlreadyPresent);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "temp orphan left");
+    }
+
+    /// (#3074) Concurrent writers of one record each use their own temp file: exactly
+    /// one wins, the rest see it present, and the winner's bytes parse.
+    #[test]
+    fn materialize_concurrent_writers_do_not_share_a_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let rec = rec_at("sess-race", 1, "2026-09-03T01:00:00Z");
+        let created = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let r = materialize_with(tmp.path(), &rec, || {
+                        std::thread::yield_now();
+                        Ok(())
+                    })
+                    .unwrap();
+                    if r == Materialized::Created {
+                        created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(load_at(tmp.path(), "sess-race", 1).unwrap().is_some());
+        let path = record_path_at(tmp.path(), "sess-race", 1);
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    /// (#3074) Only a filesystem that cannot link falls back; a race is not one.
+    #[test]
+    fn link_unsupported_is_only_unsupported_or_denied() {
+        use std::io::{Error, ErrorKind};
+        assert!(crate::lifecycle::link_unsupported(&Error::from(ErrorKind::Unsupported)));
+        assert!(!crate::lifecycle::link_unsupported(&Error::from(ErrorKind::AlreadyExists)));
+        assert!(!crate::lifecycle::link_unsupported(&Error::from(ErrorKind::NotFound)));
+    }
+
+    /// (#3074) The no-hard-link fallback is still write-once.
+    #[test]
+    fn create_new_fallback_refuses_existing_target() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("finding.json");
+        assert_eq!(crate::lifecycle::create_new_in_place(&p, b"first").unwrap(), crate::lifecycle::Committed::Created);
+        assert_eq!(crate::lifecycle::create_new_in_place(&p, b"second").unwrap(), crate::lifecycle::Committed::AlreadyPresent);
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+    }
+
+    /// (#3074) A link refused as unsupported or denied falls back to `create_new`:
+    /// the record is still written, and a second writer is still refused.
+    #[test]
+    fn link_less_filesystem_falls_back_and_stays_write_once() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("finding.json");
+            let refuse = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(kind));
+            let first = crate::lifecycle::commit_write_once_with(&p, b"first", || Ok(()), refuse).unwrap();
+            assert_eq!(first, crate::lifecycle::Committed::Created, "{kind:?}");
+            assert_eq!(std::fs::read(&p).unwrap(), b"first", "{kind:?}");
+            let refuse = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(kind));
+            let second = crate::lifecycle::commit_write_once_with(&p, b"second", || Ok(()), refuse).unwrap();
+            assert_eq!(second, crate::lifecycle::Committed::AlreadyPresent, "{kind:?}");
+            assert_eq!(std::fs::read(&p).unwrap(), b"first", "{kind:?}");
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "temp file left behind");
+        }
+    }
+
+    /// (#3074) A link error that is neither AlreadyExists nor link-less is an error.
+    #[test]
+    fn other_link_errors_do_not_fall_back() {
+        use std::io::{Error, ErrorKind};
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("finding.json");
+        let boom = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(ErrorKind::NotFound));
+        assert!(crate::lifecycle::commit_write_once_with(&p, b"x", || Ok(()), boom).is_err());
+        assert!(!p.exists());
     }
 }
