@@ -68,7 +68,9 @@ darkmux release.
   response into one JSON value (about 5 to 7 times the body) and withheld anything over a
   cap; it now rewrites each string and key as it passes and sends the result in 64 KiB
   slices, so memory is bounded by the largest value and a busy day is never answered 500.
-  A body that is not JSON, or stops being JSON partway, is redacted line by line as text.
+  Nesting of any depth stays in JSON mode (one bit per level). A JSON body that is not
+  JSON ends the stream, a truncated body, instead of being read as text, which missed
+  facts behind `\n` and `\t` escapes; only routes declared non-JSON are redacted line by line.
   Measured on a 64 MB `/flow/:date`-shaped body: peak memory +222 MB before, +1.6 MB now.
   A wrong-length bearer token no longer returns early.
 

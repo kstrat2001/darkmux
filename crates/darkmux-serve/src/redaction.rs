@@ -648,7 +648,8 @@ struct RedactState {
 }
 
 /// The body's bytes, each slice redacted as it passes, then the flush of what
-/// the last one left pending. A body error ends the stream with that error.
+/// the last one left pending. A body error, or a JSON body that is not JSON
+/// (fail closed, #3073), ends the stream with that error.
 fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl futures::Stream<Item = Result<Vec<u8>, axum::Error>> {
     use futures::StreamExt;
     let state = RedactState { chunks: Box::pin(body.into_data_stream()), redactor, held: Default::default(), done: false };
@@ -660,7 +661,10 @@ fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl fut
             let mut out = Vec::new();
             if !st.held.is_empty() {
                 let slice = st.held.split_to(st.held.len().min(REDACT_SLICE_BYTES));
-                st.redactor.feed(&slice, &mut out);
+                if let Err(e) = st.redactor.feed(&slice, &mut out) {
+                    st.done = true;
+                    return Some((Err(axum::Error::new(e)), st));
+                }
             } else {
                 match st.chunks.next().await {
                     Some(Ok(bytes)) => st.held = bytes,
@@ -670,7 +674,9 @@ fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl fut
                     }
                     None => {
                         st.done = true;
-                        st.redactor.finish(&mut out);
+                        if let Err(e) = st.redactor.finish(&mut out) {
+                            return Some((Err(axum::Error::new(e)), st));
+                        }
                     }
                 }
             }
@@ -1131,15 +1137,71 @@ mod tests {
         assert!(largest <= REDACT_SLICE_BYTES + record.len(), "a {largest} byte chunk");
     }
 
-    /// A body that claims to be JSON and is not is redacted as text, never withheld or passed on.
+    /// What a remote caller receives: the status, every byte that reached it, and whether the
+    /// body ended in an error (a truncated response).
+    async fn get_streamed(app: axum::Router, path: &str) -> (u16, String, bool) {
+        use futures::StreamExt;
+        let mut req = Request::builder().uri(path).header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(REMOTE));
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let mut chunks = resp.into_body().into_data_stream();
+        let (mut got, mut errored) = (Vec::new(), false);
+        while let Some(c) = chunks.next().await {
+            match c {
+                Ok(b) => got.extend_from_slice(&b),
+                Err(_) => errored = true,
+            }
+        }
+        (status, String::from_utf8_lossy(&got).into_owned(), errored)
+    }
+
+    fn json_route(body: String) -> axum::Router {
+        axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads))
+    }
+
+    /// A body that claims to be JSON and is not fails closed: the stream errors (a truncated
+    /// body) and nothing past the break reaches the caller, where text redaction missed
+    /// escaped facts (#3073).
     #[tokio::test]
-    async fn a_malformed_json_reply_is_redacted_as_text_for_a_remote_reader() {
-        let app = axum::Router::new()
-            .route("/t", axum::routing::get(|| async { ([("content-type", "application/json")], "{\"a\": 100.64.7.7 /Users/someone/x") }))
-            .layer(axum::middleware::from_fn(redact_reads));
-        let (status, remote) = get(app, "/t", REMOTE).await;
+    async fn a_malformed_json_reply_ends_the_stream_for_a_remote_reader() {
+        let (status, remote, errored) = get_streamed(json_route("{\"a\": 100.64.7.7 /Users/someone/x".into()), "/t").await;
         assert_eq!(status, 200);
+        assert!(errored, "the stream ends in an error: {remote}");
         assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+    }
+
+    /// The reviewer's proof: a real `axum::Json` handler, 130 levels deep (past serde_json's
+    /// 128), a string with escaped newline and tab before each fact. It stays JSON, every fact
+    /// is hidden, and what arrives is valid JSON (#3073).
+    #[tokio::test]
+    async fn a_body_nested_past_128_with_escaped_facts_is_redacted_as_json() {
+        let mut v = serde_json::json!({"line": "err\n/Users/someone/x\tat\t100.64.7.7"});
+        for _ in 0..130 {
+            v = serde_json::json!([v]);
+        }
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let v = v.clone(); async move { axum::Json(v) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, remote, errored) = get_streamed(app, "/t").await;
+        assert_eq!(status, 200);
+        assert!(!errored, "valid JSON of any depth is served");
+        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+        let inner = remote.strip_prefix(&"[".repeat(130)).and_then(|r| r.strip_suffix(&"]".repeat(130))).expect("130 levels kept");
+        let line = serde_json::from_str::<serde_json::Value>(inner).expect("valid JSON")["line"].as_str().unwrap().to_string();
+        assert!(line.starts_with("err\n") && line.contains(ADDRESS_HIDDEN), "{line}");
+    }
+
+    /// JavaScript accepts `["\ud800", ...]` where serde_json refuses the lone surrogate; the
+    /// stream must not fall to a text pass that cannot read the escaped path (#3073).
+    #[tokio::test]
+    async fn a_body_serde_rejects_but_a_browser_reads_leaks_no_fact() {
+        let body = r#"["\ud800","\/Users\/kfake\/x","\n100.64.7.7"]"#.to_string();
+        let (_, remote, errored) = get_streamed(json_route(body), "/t").await;
+        assert!(errored, "fails closed: {remote}");
+        assert!(!remote.contains("kfake") && !remote.contains(PEER_IP) && !remote.contains("Users"), "{remote}");
     }
 
     /// A route registered anywhere but the route table escapes the layer. The
