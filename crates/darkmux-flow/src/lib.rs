@@ -6050,6 +6050,49 @@ mod tests {
         assert_eq!(report.torn_tails.len(), 1);
     }
 
+    /// (#3088) The 64 KiB tail window can start inside a multibyte character.
+    /// The partial line before the first newline is dropped before decoding,
+    /// so appends keep working instead of sticking on "tail is not valid UTF-8".
+    #[test]
+    fn audit_append_survives_window_starting_mid_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        // Vary the length per record so the window start lands on both a
+        // character boundary and mid-character across the appends.
+        for i in 0..12 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "\u{e9}".repeat(12_000 + i));
+            crate::integrity::audit_record_at(&rec, &path)
+                .unwrap_or_else(|e| panic!("append {i} failed: {e:#}"));
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024);
+        append_one(&path, "ascii-retry");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 13);
+    }
+
+    /// (#3088) Fails unless the append reads only the tail window: invalid
+    /// UTF-8 far before the window must not block an append (a full-file
+    /// read refuses it).
+    #[test]
+    fn audit_append_ignores_invalid_bytes_before_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..8 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 90 * 1024);
+        bytes[5_000] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        crate::integrity::audit_record_at(&minimal_record(), &path)
+            .expect("append must read only the tail window");
+    }
+
     // (#1775) The exit-status belt, exercised directly rather than through a
     // spawned binary.
 

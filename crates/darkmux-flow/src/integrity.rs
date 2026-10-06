@@ -118,12 +118,7 @@ pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     })
 }
 
-/// The locked transaction body of [`audit_record_at`] — reads the chain's
-/// current tail hash from `file` (the SAME file `flock`'s held on, opened
-/// by the shared `darkmux_types::flock::with_locked_file` helper) and
-/// appends the new record. Split out so the lock acquisition (now shared
-/// with `darkmux-lab`'s registry lock and `darkmux-fleet`'s roster lock)
-/// stays separate from this crate's own read/parse/append logic.
+/// Size of the trailing window read to recover the chain's tail hash (#3073).
 const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
 
 /// Read the first line of `file` from offset 0 up to 4096 bytes.
@@ -271,7 +266,11 @@ fn read_large_tail(path: &Path, file: &mut std::fs::File, file_len: u64) -> Resu
     if window_start == 0 {
         resolve_prev_hash_from_contents(&raw, path)
     } else {
-        let contents = String::from_utf8(raw)
+        // The window can start inside a multibyte character; the bytes up to
+        // the first newline are a partial line, so drop them before decoding
+        // (#3088). Without this one such file refuses every later append.
+        let first_line_end = raw.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let contents = String::from_utf8(raw.split_off(first_line_end))
             .with_context(|| format!("audit log {} tail is not valid UTF-8", path.display()))?;
         let non_empty: Vec<&str> =
             contents.lines().filter(|l| !l.trim().is_empty()).collect();
