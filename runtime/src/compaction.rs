@@ -1493,9 +1493,12 @@ fn call_and_parse(
         .map(|c| c.message)
         .ok_or_else(|| anyhow!("compactor returned no choice"))?;
     let content = extract_compactor_content(message)?;
+    parse_compactor_response_content(&content)
+}
 
+pub(crate) fn parse_compactor_response_content(content: &str) -> Result<StructuredCompactionOutput> {
     // Layer 1: lexical repair via the generic json_repair module.
-    let (value, repaired) = crate::json_repair::parse_with_repair::<serde_json::Value>(&content)
+    let (value, repaired) = crate::json_repair::parse_with_repair::<serde_json::Value>(content)
         .map_err(|e| {
             anyhow!("parsing compactor JSON failed (even after repair): {e} — content: {content}")
         })?;
@@ -1520,12 +1523,18 @@ fn call_and_parse(
         );
     }
 
-    serde_json::from_value::<StructuredCompactionOutput>(patched_value).map_err(|e| {
+    let mut out = serde_json::from_value::<StructuredCompactionOutput>(patched_value).map_err(|e| {
         anyhow!(
             "parsing compactor JSON failed (even after repair + schema patch): {e} \
              — content: {content}"
         )
-    })
+    })?;
+    // (#3074) Set truncation_patched if either lexical repair (layer 1) or
+    // schema patching (layer 2) occurred, so lossy compaction is marked in the metadata.
+    if repaired || was_patched {
+        out.compaction_metadata.truncation_patched = Some(true);
+    }
+    Ok(out)
 }
 
 /// (#401 layer 2) Procedural patch for missing required schema fields
@@ -4983,6 +4992,52 @@ mod tests {
         );
         assert_eq!(out.compaction_metadata.generation, 2);
         assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
+    }
+
+    #[test]
+    fn parse_compactor_response_content_sets_truncation_patched_on_lexical_repair_only() {
+        let truncated = r#"{
+            "objective": "complete migration",
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            },
+            "completed_decisions": "decision 1: foo; decision 2: bar"#;
+        let out = parse_compactor_response_content(truncated)
+            .expect("lexical repair should salvage truncated trailing string");
+        assert_eq!(out.objective, "complete migration");
+        assert_eq!(
+            out.completed_decisions.as_deref(),
+            Some("decision 1: foo; decision 2: bar")
+        );
+        assert_eq!(
+            out.compaction_metadata.truncation_patched,
+            Some(true),
+            "lexically repaired compactor output must carry truncation_patched: true (#3074)"
+        );
+    }
+
+    #[test]
+    fn parse_compactor_response_content_clean_output_has_no_truncation_patched() {
+        let clean = r#"{
+            "objective": "complete migration",
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            }
+        }"#;
+        let out = parse_compactor_response_content(clean)
+            .expect("clean output should parse successfully");
+        assert_eq!(out.objective, "complete migration");
+        assert_eq!(
+            out.compaction_metadata.truncation_patched,
+            None,
+            "clean output must not have truncation_patched set"
+        );
     }
 
     #[test]
