@@ -27,9 +27,16 @@ use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
 pub(crate) const ADDRESS_HIDDEN: &str = "(address hidden)";
-/// The largest JSON body the layer will re-read to redact; a bigger one is
-/// withheld, never passed through unfiltered.
-const MAX_REDACTED_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// The largest body the layer will re-read to redact; a bigger one is withheld,
+/// never passed through unfiltered. A parsed JSON `Value` is ~6.6x its text
+/// (measured 2026-10: 8 MiB of flow-shaped rows peaked +53 MiB), so 16 MiB bounds
+/// a remote read near 105 MiB, and holds the largest legitimate body (a
+/// `FLOW_READ_CAP_RECORDS` window of ~1 KiB records) with room to spare (#3073).
+const MAX_REDACTED_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// How long a derived [`Redaction`] is reused. The key below catches a roster or
+/// directory change at once; this bounds staleness for what it does not cover
+/// (the fleet hub in the config, the machine id, a symlink repointed).
+const REDACTION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a non-local caller must not read in a response, derived from the
 /// daemon's own state when the request is served: every roster ADDRESS (and its
@@ -43,6 +50,53 @@ pub(crate) struct Redaction {
     /// Roster addresses (and their hosts, and the hub's), then directory
     /// prefixes, each longest first within its kind.
     needles: Vec<Needle>,
+}
+
+/// What a derivation read: `fleet.json`'s mtime and length, and the two
+/// directory variables (#3073).
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    roster: Option<(std::time::SystemTime, u64)>,
+    home: Option<String>,
+    darkmux_home: Option<String>,
+}
+
+impl CacheKey {
+    fn current() -> Self {
+        let roster = std::fs::metadata(darkmux_fleet::roster_path()).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        Self { roster, home: std::env::var("HOME").ok(), darkmux_home: std::env::var("DARKMUX_HOME").ok() }
+    }
+}
+
+/// The last derivation, so a remote request does not reload the roster and
+/// canonicalize the directories every time (#3073).
+#[derive(Default)]
+struct RedactionCache {
+    entry: Option<(CacheKey, std::time::Instant, std::sync::Arc<Redaction>)>,
+}
+
+impl RedactionCache {
+    fn get(&mut self, key: CacheKey, now: std::time::Instant, derive: impl FnOnce() -> Redaction) -> std::sync::Arc<Redaction> {
+        if let Some((k, at, r)) = &self.entry {
+            if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
+                return r.clone();
+            }
+        }
+        let r = std::sync::Arc::new(derive());
+        self.entry = Some((key, now, r.clone()));
+        r
+    }
+}
+
+static REDACTION_CACHE: std::sync::Mutex<Option<RedactionCache>> = std::sync::Mutex::new(None);
+
+impl Redaction {
+    /// [`Self::derive`], reused while `fleet.json`, HOME and DARKMUX_HOME are unchanged.
+    fn derive_cached() -> std::sync::Arc<Self> {
+        let key = CacheKey::current();
+        let mut guard = REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get_or_insert_with(RedactionCache::default).get(key, std::time::Instant::now(), Self::derive)
+    }
 }
 
 /// One thing to find, lowercased once.
@@ -67,7 +121,7 @@ impl Needle {
 
 impl Redaction {
     /// The roster is read from disk and the directories from the environment
-    /// per call; there is no list to maintain. An unreadable roster hides
+    /// per call (see [`Self::derive_cached`]); there is no list to maintain. An unreadable roster hides
     /// nothing it cannot name, and the caller still gets no `stderr_tail`.
     pub(crate) fn derive() -> Self {
         let roster = darkmux_fleet::load_roster().ok();
@@ -614,7 +668,7 @@ pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
     let (mut parts, body) = resp.into_parts();
     let withheld = || (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_REDACTED_BODY_BYTES).await else { return withheld() };
-    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive).await else { return withheld() };
+    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else { return withheld() };
     let out = if is_json {
         let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
         r.json(&mut value);
@@ -981,6 +1035,46 @@ mod tests {
             }
         }
         assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
+    }
+
+    #[tokio::test]
+    async fn a_remote_body_over_sixteen_mib_is_withheld_not_parsed() {
+        // #3073: a JSON Value is ~6.6x its text (measured, 8 MiB of flow-shaped
+        // rows peaked +53 MiB), so the cap is what bounds a remote read's memory.
+        let big = format!("\"{}\"", "x".repeat(17 * 1024 * 1024));
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = big.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, _) = get(app.clone(), "/t", REMOTE).await;
+        assert_eq!(status, 500, "a remote reader's body over the cap is withheld");
+        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(LOCAL));
+        assert_eq!(app.oneshot(req).await.unwrap().status().as_u16(), 200, "a local reader is never capped");
+    }
+
+    #[test]
+    fn the_cache_derives_once_per_key_and_again_when_the_key_changes() {
+        let derives = std::cell::Cell::new(0);
+        let mut cache = RedactionCache::default();
+        let key = |m: u64| CacheKey { roster: Some((std::time::UNIX_EPOCH, m)), home: Some("/h".into()), darkmux_home: None };
+        let now = std::time::Instant::now();
+        let derive = || { derives.set(derives.get() + 1); Redaction::from_parts(&[], &[], None, None) };
+        cache.get(key(1), now, derive);
+        cache.get(key(1), now, derive);
+        assert_eq!(derives.get(), 1, "an unchanged roster, HOME and DARKMUX_HOME reuse the derivation");
+        cache.get(key(2), now, derive);
+        assert_eq!(derives.get(), 2, "a changed fleet.json derives again");
+        let mut other_home = key(2);
+        other_home.home = Some("/other".into());
+        cache.get(other_home, now, derive);
+        assert_eq!(derives.get(), 3, "a changed HOME derives again");
+        cache.get(key(2), now + REDACTION_CACHE_TTL, derive);
+        assert_eq!(derives.get(), 4, "an aged entry derives again, so a hub or machine-id change still lands");
+    }
+
+    #[test]
+    fn the_body_cap_stays_within_the_measured_memory_budget() {
+        assert!(MAX_REDACTED_BODY_BYTES <= 16 * 1024 * 1024);
     }
 
     #[tokio::test]
