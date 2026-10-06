@@ -628,6 +628,35 @@
       "status": "complete"
     },
     {
+      "name": "a run.error after a mission.close is the outcome over the close",
+      "as_of": "2026-09-27T10:03:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "mission.start",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "mission.close",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        },
+        {
+          "ts": "2026-09-27T10:02:00Z",
+          "action": "run.error",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
       "name": "a mission aborted by the operator is abandoned as aborted",
       "as_of": "2026-09-27T10:02:00Z",
       "records": [

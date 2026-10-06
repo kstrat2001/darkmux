@@ -90,31 +90,65 @@ impl Folded {
 
     /// The ending it implies when it is a closing record (rule 2).
     fn ending(&self) -> Option<Ending> {
-        let action = self.action.as_ref()?;
-        let ended = |status, reason| Some(Ending { status, reason });
-        match action.bookend().map(|b| b.edge) {
-            Some(Edge::Complete) => return ended(RunStatus::Complete, None),
-            Some(Edge::Error) => return ended(RunStatus::Error, None),
-            Some(Edge::Start) | None => {}
-        }
-        if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
-            return ended(RunStatus::Complete, None);
-        }
-        if *action == FlowAction::StepError {
-            return ended(RunStatus::Error, None);
-        }
-        if *action == FlowAction::SessionEnd {
-            return ended(RunStatus::Abandoned, Some(AbandonReason::NoTerminal));
-        }
-        if *action == FlowAction::MissionAbort || (*action == FlowAction::BudgetStop && self.names_a_reason) {
-            return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted));
-        }
-        (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
+        ending_of(self.action.as_ref()?, self.names_a_reason)
     }
 
     /// A bookend terminal: the outcome over any other close (rule 3).
     fn is_bookend_terminal(&self) -> bool {
         self.action.as_ref().and_then(FlowAction::bookend).is_some_and(|b| b.edge.is_terminal())
+    }
+}
+
+/// The ending `action` implies when it is a closing record (rule 2).
+/// `names_a_reason` is a `budget.stop`'s payload fact.
+pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
+    let ended = |status, reason| Some(Ending { status, reason });
+    match action.bookend().map(|b| b.edge) {
+        Some(Edge::Complete) => return ended(RunStatus::Complete, None),
+        Some(Edge::Error) => return ended(RunStatus::Error, None),
+        Some(Edge::Start) | None => {}
+    }
+    if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
+        return ended(RunStatus::Complete, None);
+    }
+    if *action == FlowAction::StepError {
+        return ended(RunStatus::Error, None);
+    }
+    if *action == FlowAction::SessionEnd {
+        return ended(RunStatus::Abandoned, Some(AbandonReason::NoTerminal));
+    }
+    if *action == FlowAction::MissionAbort || (*action == FlowAction::BudgetStop && names_a_reason) {
+        return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted));
+    }
+    (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
+}
+
+/// Rules 2 and 3 as one decision: the first closing record closes, and the
+/// first bookend terminal is the outcome over any other close. A session's
+/// attempt and a peer's mission row both fold their closing records through
+/// it, so the two cannot read one record sequence differently.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CloseFold {
+    /// The first closing record: when, and what it implies.
+    pub close: Option<(String, Ending)>,
+    /// The first bookend terminal's ending.
+    terminal: Option<Ending>,
+}
+
+impl CloseFold {
+    /// Fold one closing record.
+    pub fn fold(&mut self, ts: &str, ending: Ending, bookend_terminal: bool) {
+        if self.close.is_none() {
+            self.close = Some((ts.to_string(), ending));
+        }
+        if bookend_terminal && self.terminal.is_none() {
+            self.terminal = Some(ending);
+        }
+    }
+
+    /// How it ended: the bookend terminal over the first close.
+    pub fn ending(&self) -> Option<Ending> {
+        self.close.as_ref().map(|(_, e)| self.terminal.unwrap_or(*e))
     }
 }
 
@@ -143,10 +177,8 @@ pub(crate) struct Attempt {
     pub waited: bool,
     /// Its newest timed record's `ts` (an unparsable one never counts).
     pub last_activity_ts: Option<String>,
-    /// Its first closing record: when, and what it implies.
-    pub close: Option<(String, Ending)>,
-    /// Its first bookend terminal: the outcome over any other close (rule 3).
-    terminal: Option<Ending>,
+    /// Its closing records, decided by rules 2 and 3.
+    pub fold: CloseFold,
     /// While a `budget.wait` is open: when it lapses, epoch ms.
     pub wait_until_ms: Option<u64>,
 }
@@ -154,7 +186,7 @@ pub(crate) struct Attempt {
 impl Attempt {
     /// How it ended (rule 3), when it has closed.
     pub fn ending(&self) -> Option<Ending> {
-        self.close.as_ref().map(|(_, e)| self.terminal.unwrap_or(*e))
+        self.fold.ending()
     }
 
     fn add(&mut self, r: &Folded) {
@@ -180,12 +212,7 @@ impl Attempt {
     }
 
     fn close_with(&mut self, ts: &str, ending: Ending, bookend_terminal: bool) {
-        if self.close.is_none() {
-            self.close = Some((ts.to_string(), ending));
-        }
-        if bookend_terminal && self.terminal.is_none() {
-            self.terminal = Some(ending);
-        }
+        self.fold.fold(ts, ending, bookend_terminal);
         self.wait_until_ms = None;
     }
 
@@ -210,7 +237,7 @@ fn target_for(attempts: &[Attempt], mission: Option<&str>, execution: Option<&Ex
     }
     let cur = attempts.len().checked_sub(1);
     let Some(m) = mission else {
-        return attempts.iter().rposition(|a| a.close.is_none()).or(cur);
+        return attempts.iter().rposition(|a| a.fold.close.is_none()).or(cur);
     };
     let own = attempts.iter().rposition(|a| a.mission.as_deref() == Some(m));
     own.or_else(|| cur.filter(|&i| attempts[i].mission.is_none()))
@@ -220,7 +247,7 @@ fn target_for(attempts: &[Attempt], mission: Option<&str>, execution: Option<&Ex
 fn opens(attempts: &[Attempt], mine: Option<usize>, action: &FlowAction) -> bool {
     let Some(i) = mine else { return is_reopener(action) || is_first_opener(action) };
     let a = &attempts[i];
-    is_reopener(action) && (a.close.is_some() || (is_bookend_start(action) && a.has_start))
+    is_reopener(action) && (a.fold.close.is_some() || (is_bookend_start(action) && a.has_start))
 }
 
 /// Rule 2's skew case: each closing record seen before anything of its
@@ -228,9 +255,9 @@ fn opens(attempts: &[Attempt], mine: Option<usize>, action: &FlowAction) -> bool
 /// when it names none) left with no close of its own.
 fn place_orphans(attempts: &mut [Attempt], orphans: &[&Folded]) {
     for o in orphans {
-        let home = attempts.iter_mut().find(|a| a.close.is_none() && (o.mission.is_none() || a.mission == o.mission));
+        let home = attempts.iter_mut().find(|a| a.fold.close.is_none() && (o.mission.is_none() || a.mission == o.mission));
         if let (Some(a), Some(ending)) = (home, o.ending()) {
-            a.close = Some((o.ts.clone(), ending));
+            a.fold.close = Some((o.ts.clone(), ending));
         }
     }
 }
@@ -334,9 +361,9 @@ mod tests {
         fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
         f.seal();
         fold(&mut f, FlowAction::DispatchComplete, "a", "2026-09-27T10:01:00Z");
-        assert!(f.latest().is_some_and(|a| a.close.is_none()), "unsealed records are not read");
+        assert!(f.latest().is_some_and(|a| a.fold.close.is_none()), "unsealed records are not read");
         f.seal();
-        assert!(f.latest().is_some_and(|a| a.close.is_some()), "a seal reads every record");
+        assert!(f.latest().is_some_and(|a| a.fold.close.is_some()), "a seal reads every record");
     }
 
     /// (#2101) A peer's run stays live through tool and turn records alone:
@@ -350,7 +377,7 @@ mod tests {
         fold(&mut f, FlowAction::DispatchTool, "a", "2026-09-27T10:02:00Z");
         f.seal();
         let latest = f.latest().expect("an attempt");
-        assert!(latest.close.is_none(), "still open");
+        assert!(latest.fold.close.is_none(), "still open");
         assert_eq!(latest.last_activity_ts.as_deref(), Some("2026-09-27T10:02:00Z"));
         let at = |ts: &str| crate::runs::parse_flow_ts(ts).unwrap() * 1_000;
         let stale = 1_200_000;

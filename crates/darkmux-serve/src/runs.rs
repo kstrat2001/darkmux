@@ -859,6 +859,11 @@ struct FlowMissionAgg {
     terminal_ts: Option<String>,
     terminal_status: Option<RunStatus>,
     terminal_was_abort: bool,
+    /// The mission-grain closing records folded through the one decision a
+    /// session's attempt uses (`run_lifecycle::CloseFold`, rules 2 and 3), so
+    /// a `run.error` after a `mission.close` reads Error here exactly as it
+    /// does there. The three `terminal_*` fields above are read off it.
+    close: crate::run_lifecycle::CloseFold,
     /// Session ids observed under this mission, used to borrow role/model/
     /// endpoint for the row without a second pass.
     session_ids: Vec<String>,
@@ -894,31 +899,23 @@ impl FlowMissionAgg {
         }
     }
 
+    /// Only the mission grain closes a mission: an execution-grain
+    /// `dispatch.*` bookend ends one role execution, never the run.
     fn fold_terminal(&mut self, v: &serde_json::Value, ts: &str) {
-        let action = darkmux_flow::reader::action_of(v);
-        match action {
-            Some(FlowAction::MissionClose) if self.terminal_ts.is_none() || !self.terminal_was_abort => {
-                self.terminal_ts = Some(ts.to_string());
-                self.terminal_was_abort = false;
-                self.terminal_status = Some(RunStatus::Complete);
-            }
-            Some(FlowAction::MissionAbort) => {
-                self.terminal_ts = Some(ts.to_string());
-                self.terminal_was_abort = true;
-                self.terminal_status = Some(RunStatus::Abandoned);
-            }
-            Some(FlowAction::RunComplete) if self.terminal_ts.is_none() => {
-                self.terminal_ts = Some(ts.to_string());
-                self.terminal_was_abort = false;
-                self.terminal_status = Some(RunStatus::Complete);
-            }
-            Some(FlowAction::RunError) if self.terminal_ts.is_none() => {
-                self.terminal_ts = Some(ts.to_string());
-                self.terminal_was_abort = false;
-                self.terminal_status = Some(RunStatus::Error);
-            }
-            _ => {}
+        let Some(action) = darkmux_flow::reader::action_of(v) else { return };
+        if !matches!(
+            action,
+            FlowAction::MissionClose | FlowAction::MissionAbort | FlowAction::RunComplete | FlowAction::RunError
+        ) {
+            return;
         }
+        let Some(ending) = crate::run_lifecycle::ending_of(&action, false) else { return };
+        let bookend_terminal = matches!(action, FlowAction::RunComplete | FlowAction::RunError);
+        self.close.fold(ts, ending, bookend_terminal);
+        self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
+        let ending = self.close.ending();
+        self.terminal_status = ending.map(|e| e.status);
+        self.terminal_was_abort = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
     }
 }
 
@@ -2450,7 +2447,7 @@ impl SessionAgg {
         self.last_activity_ts = a.last_activity_ts.clone();
         self.wait_until_ms = a.wait_until_ms;
         self.terminal_status = ending.map(|e| e.status);
-        self.terminal_ts = a.close.as_ref().map(|(ts, _)| ts.clone());
+        self.terminal_ts = a.fold.close.as_ref().map(|(ts, _)| ts.clone());
         self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
     }
 
@@ -8293,6 +8290,34 @@ mod tests {
         let runs_error = build_runs(flows.path(), None, &fleet_error);
         let row_error = runs_error.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row_error.status, RunStatus::Error);
+    }
+
+    /// (#3074) The peer row decides a mission's end through the same fold a
+    /// session's attempt uses (`run_lifecycle::CloseFold`): the generic
+    /// launcher writes `mission.close` and then `run.error` for a failed
+    /// mission, and the run's bookend is the outcome over the close. A role
+    /// execution's own `dispatch.complete` never closes the mission. The
+    /// shared spec (`tests/lifecycle/cases.json`) pins the same sequence for
+    /// the session row.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_run_error_after_mission_close_reads_error() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mission_rec = |action: &str, ts: &str| {
+            let mut r = peer_record(action, ts);
+            r["session_id"] = serde_json::json!("mission-review-on-the-hub");
+            r
+        };
+        let fleet = vec![
+            peer_record("dispatch.start", "2026-09-27T10:00:00Z"),
+            peer_record("dispatch.complete", "2026-09-27T10:01:00Z"),
+            mission_rec("mission.close", "2026-09-27T10:02:00Z"),
+            mission_rec("run.error", "2026-09-27T10:03:00Z"),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row.status, RunStatus::Error, "the run's bookend outranks the close: {row:?}");
     }
 
     /// (#3074) When dispatch.start has aged out, mission_to_run falls back to a session

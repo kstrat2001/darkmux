@@ -265,9 +265,11 @@ pub struct CardBatteryGate {
     /// `power.pause_running_below_min`.
     pub pause_running_below_min: bool,
     /// The start decision at the current reading: `true` when a new run would
-    /// be refused, `false` when it would not (including a machine with no
-    /// battery). `null` when nothing was observed: no host sampler ran in
-    /// the process that built the card, so no decision was made.
+    /// be refused, `false` when it would not. `null` when no battery reading
+    /// was observed: no host sampler ran in the process that built the card,
+    /// or the probe reported no battery. The probe cannot tell a machine with
+    /// no battery from a failed read, so a desktop publishes `null`, never
+    /// a confident `false`.
     pub refusing_start: Option<bool>,
 }
 

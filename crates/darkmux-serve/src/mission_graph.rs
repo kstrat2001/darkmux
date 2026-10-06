@@ -2785,40 +2785,40 @@ mod tests {
         assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
     }
 
+    /// (#3074) A task whose `depends_on` names a task that is not in the graph
+    /// gets no edge for it, while its real dependency keeps its edge. The
+    /// fixture goes through the lifecycle writers so it has the on-disk layout
+    /// the loader reads (`tasks/<phase>/<task>.json`): with the wrong layout
+    /// the graph has no nodes and the guard is never reached.
     #[test]
     #[serial_test::serial]
     fn build_mission_graph_omits_depends_on_edge_to_missing_node() {
         let _g = darkmux_types::test_isolation::IsolatedState::new();
-        let mission_dir = _g.join("missions").join("m-missing-dep");
-        std::fs::create_dir_all(mission_dir.join("phases").join("p1").join("tasks")).unwrap();
-
-        let mission = serde_json::json!({
+        let mission: Mission = serde_json::from_value(serde_json::json!({
             "id": "m-missing-dep",
             "description": "test mission",
             "phase_ids": ["p1"],
             "created_ts": 1_700_000_000u64,
-        });
-        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
-
-        let phase = serde_json::json!({
+        }))
+        .unwrap();
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase: Phase = serde_json::from_value(serde_json::json!({
             "id": "p1",
             "mission_id": "m-missing-dep",
             "description": "phase 1",
-            "task_ids": ["t1"],
-        });
-        std::fs::write(mission_dir.join("phases").join("p1").join("phase.json"), serde_json::to_string(&phase).unwrap()).unwrap();
-
-        let task = serde_json::json!({
-            "id": "t1",
-            "phase_id": "p1",
-            "description": "task 1",
-            "step_ids": [],
-            "depends_on": ["nonexistent-task"],
-        });
-        std::fs::write(mission_dir.join("phases").join("p1").join("tasks").join("t1.json"), serde_json::to_string(&task).unwrap()).unwrap();
+            "created_ts": 1_700_000_000u64,
+            "task_ids": ["t-a", "t-c"],
+        }))
+        .unwrap();
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-a", &[], &[])).unwrap();
+        darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-c", &["t-a", "nonexistent-task"], &[])).unwrap();
 
         let flows = tempfile::TempDir::new().unwrap();
         let graph = build_mission_graph("m-missing-dep", flows.path()).unwrap().expect("graph emitted");
-        assert!(!graph.edges.iter().any(|e| e.source == "nonexistent-task"));
+        assert!(graph.nodes.iter().any(|n| n.id == "t-c"), "the fixture must reach the task nodes: {:?}", graph.nodes.len());
+        let dep_edges: Vec<&str> =
+            graph.edges.iter().filter(|e| e.kind == EdgeKind::DependsOn).map(|e| e.id.as_str()).collect();
+        assert_eq!(dep_edges, ["depends_on:t-a:t-c"], "only the real dependency gets an edge");
     }
 }
