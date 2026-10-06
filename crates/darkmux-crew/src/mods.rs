@@ -849,12 +849,10 @@ pub fn materialize(root: &Path, record: &ModRecord) -> Result<Materialized> {
     // `chmod` it, the same call #2259 makes.
     //
     // The mode set here is the mode the record has for its whole life on
-    // two counts a future change could break: `stage_and_commit` finishes
-    // with a `std::fs::rename`, which moves this inode rather than copying
-    // it; and `record_gate_with_source` — the one writer that legitimately
-    // rewrites this path — uses `std::fs::write`, which truncates an
-    // existing file WITHOUT touching its mode. Switching that rewrite to a
-    // temp-then-rename for atomicity would silently drop back to 0o644.
+    // two counts: `stage_and_commit` finishes with a `std::fs::rename`, which
+    // moves this inode rather than copying it; and `record_gate_with_source`
+    // writes via `write_owner_only` into a temp file and renames, preserving
+    // 0o600 across the atomic replacement without truncating in place.
     #[cfg(unix)]
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -922,7 +920,13 @@ pub fn record_gate_with_source(
         record.source = resolved_source.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     }
     let body = serde_json::to_string_pretty(&record)? + "\n";
-    std::fs::write(&path, body).with_context(|| format!("writing gated mod {}", path.display()))?;
+    let dir = path.parent().expect("record path always has a parent");
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    crate::lifecycle::write_owner_only(&tmp, body.as_bytes())
+        .with_context(|| format!("writing gated mod tmp {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming gated mod {} -> {}", tmp.display(), path.display()))?;
+    crate::lifecycle::fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))?;
     Ok(Materialized::Created)
 }
 
@@ -2624,6 +2628,53 @@ mod tests {
         assert!(rec.gate.is_none(), "the original skip must survive: {rec:?}");
         assert_eq!(rec.gate_skipped_reason.as_deref(), Some("no test_command configured"));
     }
+
+    /// (#3074) `record_gate_with_source` atomically replaces the mod file via
+    /// temp-and-rename rather than truncating with `std::fs::write`, preserving
+    /// 0o600 mode and cleaning up the temp file.
+    #[test]
+    fn record_gate_atomic_rewrite_preserves_owner_only_and_cleans_tmp() {
+        let tmp = TempDir::new().unwrap();
+        materialize(tmp.path(), &a_gateable_mod("mod-atomic")).unwrap();
+
+        let path = record_path_at(tmp.path(), "mod-atomic");
+        assert!(path.exists());
+
+        let res = record_gate_with_source(
+            tmp.path(),
+            "mod-atomic",
+            Some(GateOutcome {
+                passed: true,
+                command: "cargo check".into(),
+                exit_code: Some(0),
+                applied: Some(true),
+                reason: None,
+            }),
+            None,
+            Some("resolved-src"),
+        )
+        .unwrap();
+        assert_eq!(res, Materialized::Created);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "gated mod record must preserve mode 0o600");
+        }
+
+        let dir = path.parent().unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["mod.json".to_string()]);
+
+        let rec = load_at(tmp.path(), "mod-atomic").unwrap().unwrap();
+        assert!(rec.gate.as_ref().unwrap().passed);
+        assert_eq!(rec.source.as_deref(), Some("resolved-src"));
+    }
+
 
     #[test]
     fn load_all_at_sorts_by_ts_and_skips_what_it_cannot_read() {

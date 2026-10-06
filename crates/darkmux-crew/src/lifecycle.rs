@@ -398,7 +398,7 @@ fn save_value(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
 /// the default umask-respecting write on non-POSIX. Wave-E.11 added the
 /// mode; Wave-E.13 added the sync_all call so the doc claim about
 /// "durable atomic rename" actually holds across power failure.
-fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -430,7 +430,7 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 /// `fsync(2)` a directory so a rename(2) that landed inside it reaches
 /// stable storage. POSIX-only — on non-Unix this is a no-op.
-fn fsync_dir(dir: &std::path::Path) -> Result<()> {
+pub(crate) fn fsync_dir(dir: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         let f = fs::File::open(dir)

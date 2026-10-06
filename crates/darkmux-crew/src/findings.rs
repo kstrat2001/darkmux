@@ -328,37 +328,31 @@ pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating finding dir {}", dir.display()))?;
     let body = serde_json::to_string_pretty(record)? + "\n";
-    // `create_new` closes the last of the race: two producers that both saw an
-    // absent file still cannot double-write, and the loser reports the same
-    // already-present outcome the `exists()` fast path does.
-    //
-    // (#2451) Owner-only on POSIX — `emitted` (and, for a crawl finding,
-    // `context`) can carry a source line copied verbatim out of the
-    // operator's repository, and this writer landed at the umask default
-    // (typically 0o644, world-readable) with no mode of its own. Fixed at
-    // the creator, same shape as the #2259 hook-outbox fix: `.mode()`
-    // applies only when this call WINS the create race (the write-once
-    // contract above means it never runs again for this path), so an
-    // already-present finding from a pre-#2451 binary keeps whatever mode
-    // it already has — this does not retroactively `chmod` it, the same
-    // call #2259 makes (a migration that walks the store and re-modes it is
-    // a separate, operator-visible decision, not a side effect of a write).
-    #[cfg(unix)]
-    let opened = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
-    };
-    #[cfg(not(unix))]
-    let opened = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-    match opened {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(body.as_bytes())
-                .with_context(|| format!("writing finding {}", path.display()))?;
+    // (#3074) Temp file, fsync, atomic write-once: finding.json is not written in place,
+    // so readers never observe a truncated or half-written record.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    crate::lifecycle::write_owner_only(&tmp, body.as_bytes())
+        .with_context(|| format!("writing finding tmp {}", tmp.display()))?;
+    match std::fs::hard_link(&tmp, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            crate::lifecycle::fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))?;
             Ok(Materialized::Created)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Materialized::AlreadyPresent),
-        Err(e) => Err(e).with_context(|| format!("creating finding {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(Materialized::AlreadyPresent)
+        }
+        Err(_) => {
+            if path.exists() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(Materialized::AlreadyPresent);
+            }
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("renaming finding {} -> {}", tmp.display(), path.display()))?;
+            crate::lifecycle::fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))?;
+            Ok(Materialized::Created)
+        }
     }
 }
 
@@ -1187,4 +1181,39 @@ mod tests {
         assert!(bad.is_empty(), "{bad:#?}");
         assert!(n > 0);
     }
+
+    /// (#3074) `materialize` writes to a temp file and hard-links/renames into place,
+    /// ensuring readers never see a truncated or partially written file.
+    #[test]
+    fn materialize_atomic_write_once_preserves_owner_only_and_cleans_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let rec = rec_at("sess-atomic", 1, "2026-09-03T01:00:00Z");
+        let first = materialize(tmp.path(), &rec).unwrap();
+        assert_eq!(first, Materialized::Created);
+
+        let path = record_path_at(tmp.path(), "sess-atomic", 1);
+        assert!(path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "finding record must be mode 0o600");
+        }
+
+        let dir = path.parent().unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["finding.json".to_string()]);
+
+        let second = materialize(tmp.path(), &rec).unwrap();
+        assert_eq!(second, Materialized::AlreadyPresent);
+
+        let loaded = load_at(tmp.path(), "sess-atomic", 1).unwrap().unwrap();
+        assert_eq!(loaded.execution, rec.execution);
+        assert_eq!(loaded.seq, rec.seq);
+    }
 }
+
