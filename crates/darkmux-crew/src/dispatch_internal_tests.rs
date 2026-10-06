@@ -18009,6 +18009,51 @@ fn already_resident_refusal_recovers_by_reusing() {
 
 #[test]
 #[serial_test::serial]
+fn reload_tolerates_a_stale_instance_that_vanished_before_the_unload() {
+    // (#3083 review) The stale resident can disappear between `lms ps` and
+    // `lms unload` (a TTL expiry, another shell). `lms unload` answers that
+    // with the not-resident shape; the end state the reload wants (nothing
+    // stale resident) already holds, so the dispatch must go on to LOAD, not
+    // fail where it used to succeed.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut small = ps_row_2318();
+    small.context = 4096;
+    let loads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| vec![small.clone()],
+        &|id| {
+            Err(anyhow::Error::new(darkmux_gestalt::HostError::NotResident {
+                identifier: id.to_string(),
+            }))
+        },
+        &|_key, _identifier, _n_ctx| {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(out.is_ok(), "expected the reload to proceed, got {:?}", out.err().map(|e| format!("{e:#}")));
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "the load must still run after a benign unload");
+}
+
+#[test]
+#[serial_test::serial]
+fn reload_still_fails_when_the_unload_genuinely_fails() {
+    // The tolerance is for NotResident ONLY; a stuck unload stays loud.
+    let mut small = ps_row_2318();
+    small.context = 4096;
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| vec![small.clone()],
+        &|_| anyhow::bail!("lms unload failed: device busy"),
+        &|_key, _identifier, _n_ctx| Ok(()),
+    );
+    let err = format!("{:#}", out.expect_err("a stuck unload must fail the preflight"));
+    assert!(err.contains("device busy"), "got: {err}");
+}
+
+#[test]
+#[serial_test::serial]
 fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     // The refusal is only benign when the resident actually satisfies the
     // declared context. A smaller one is the #1135 class and must stay loud.

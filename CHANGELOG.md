@@ -233,6 +233,11 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   fsynced so its name survives a power cut, and the sink's disable warning names
   what failed last (`write` or `backfill`) instead of counting both as writes.
 
+- **Unload reporting and empty profiles** (#3083 follow-ups). `machine eject` no
+  longer lists an already-gone model as failed, and a dispatch reload goes on to
+  load when its stale instance vanished first (one classifier for both). A profile
+  with an empty `models[]` is quarantined alone instead of failing the registry.
+
 - **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
   check no longer treats a flow record without a `machine_uid` as a known name
   (a record with no uid names no machine), and the retired Redis-queue

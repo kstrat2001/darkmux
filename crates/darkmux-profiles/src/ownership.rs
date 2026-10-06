@@ -150,7 +150,10 @@ fn eject_each(
     let mut failed = Vec::new();
     for m in managed {
         if !dry_run {
-            if let Err(e) = unload(&m.identifier) {
+            // (#3083) An instance already gone is the end state the eject wants.
+            let outcome = unload(&m.identifier)
+                .or_else(|e| if crate::lms::is_not_resident(&e) { Ok(()) } else { Err(e) });
+            if let Err(e) = outcome {
                 failed.push(EjectFailure {
                     identifier: m.identifier.clone(),
                     error: format!("{e:#}"),
@@ -260,6 +263,23 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].identifier, "darkmux:stuck");
         assert!(failed[0].error.contains("device busy"), "the cause must survive: {:?}", failed[0]);
+    }
+
+    /// (#3083 review) `lms unload` of an instance that is already gone
+    /// ("Model Not Found", exit 0) leaves the end state the eject wanted. It
+    /// is not a failure: `machine eject` must not list it as one (and exit 1).
+    #[test]
+    fn eject_of_an_already_gone_model_is_not_a_failure() {
+        let rows = vec![loaded("darkmux:gone")];
+        let summary = eject_managed_inner(
+            &rows,
+            false,
+            &|id| crate::lms::verify_unload_outcome(true, "Model Not Found\nCannot find a model with the identifier darkmux:gone", id),
+            &|| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(summary.failed.is_empty(), "got {:?}", summary.failed);
+        assert_eq!(summary.ejected.len(), 1);
     }
 
     #[test]
