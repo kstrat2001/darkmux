@@ -120,6 +120,18 @@ impl Tool {
         }
     }
 
+    /// (#3074) Whether running this tool a second time could change anything
+    /// the first run already changed. A resume marks these as started before
+    /// dispatch (`checkpoint::ToolStart`) so it never replays one silently.
+    /// `echo` only returns its text; a read or search only looks. Exhaustive,
+    /// so a new tool decides.
+    pub fn may_change_workspace(self) -> bool {
+        match self {
+            Tool::Bash | Tool::Write | Tool::Edit | Tool::CreateFinding | Tool::CreateMod => true,
+            Tool::Echo | Tool::Read | Tool::Search => false,
+        }
+    }
+
     /// Whether this tool only LOOKS at the workspace: it changes nothing and
     /// its result is what it read. A repeat of these after a compaction is a
     /// re-read; a repeat of anything else may be progress. Exhaustive, so a

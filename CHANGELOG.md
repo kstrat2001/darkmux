@@ -79,6 +79,14 @@ darkmux release.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
   with an `@` after the host now masks up to the last `@`.
+- **A resume no longer silently replays a tool call that had already started** (#3074).
+  Just before the agent runs a call that can change the workspace (`bash`, `write`,
+  `edit`, `create_finding`, `create_mod`), its checkpoint is written with a started marker
+  (`pending_head_started`, additive; an older checkpoint reads as not started). A resume
+  that finds the marker tells the model the call was interrupted and may have taken
+  effect, and does not run it again. Read-only calls carry no marker and are still
+  re-dispatched. Cost: one extra checkpoint write per workspace-changing call, about
+  22 ms on a 600 KB transcript.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
