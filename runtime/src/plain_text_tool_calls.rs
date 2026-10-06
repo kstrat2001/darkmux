@@ -581,16 +581,18 @@ fn consume_json_object(
 ///
 /// Named residuals — markup in any of these still promotes:
 /// - inline code spans (single backticks),
-/// - 4-space-indented code blocks,
-/// - HTML comments (`<!-- ... -->`),
 /// - TAB-indented fences: the indent scan is `trim_start_matches(' ')`, so a
 ///   tab-indented fence line is not recognized as a fence at all. That matches
 ///   CommonMark (a tab counts as 4 columns, past the 3-space limit), but the
 ///   consequence here is that the markup inside promotes.
 ///
-/// Complete tool-call markup is possible in each, but a fence is overwhelmingly
-/// the natural form when a model explains code, and widening further would
-/// start costing real thinking-mode calls.
+/// Indented code blocks and HTML comments are NOT residuals: see
+/// `indented_block_regions` and `html_comment_regions` (#3074). The three
+/// region kinds are unioned by `quoted_regions`.
+///
+/// Complete tool-call markup is possible in each residual, but a fence is
+/// overwhelmingly the natural form when a model explains code, and widening
+/// further would start costing real thinking-mode calls.
 fn fenced_regions(text: &str) -> Vec<(usize, usize)> {
     let mut regions = Vec::new();
     let mut open: Option<(usize, u8, usize)> = None;
@@ -667,6 +669,69 @@ fn fenced_regions(text: &str) -> Vec<(usize, usize)> {
     merge_regions(regions)
 }
 
+/// (#3074) Byte ranges the XML scan treats as quotation: fenced blocks,
+/// indented code blocks, and HTML comments, merged into one sorted set.
+fn quoted_regions(text: &str) -> Vec<(usize, usize)> {
+    let mut regions = fenced_regions(text);
+    let fences = regions.clone();
+    regions.extend(indented_block_regions(text));
+    regions.extend(html_comment_regions(text, &fences));
+    merge_regions(regions)
+}
+
+/// (#3074) Columns of leading whitespace on `line`, a tab counting as 4, and
+/// whether the line has any content after it.
+fn leading_columns(line: &str) -> (usize, bool) {
+    let mut columns = 0usize;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            ' ' => columns += 1,
+            '\t' => columns += 4,
+            _ => return (columns, !line[i..].trim().is_empty()),
+        }
+    }
+    (columns, false)
+}
+
+/// (#3074) Lines indented 4+ columns are a CommonMark indented code block: a
+/// quotation, like a fence. Only the line the `<tool_call>` OPENER sits on
+/// decides, so a real call whose inner lines are indented (the opener at
+/// column 0) still promotes. Each region is one such line; the XML scan counts
+/// and skips every opener inside it.
+fn indented_block_regions(text: &str) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let (columns, has_content) = leading_columns(line);
+        if columns >= 4 && has_content {
+            regions.push((line_start, line_start + line.len()));
+        }
+        line_start += line.len();
+    }
+    regions
+}
+
+/// (#3074) `<!-- ... -->` spans. An unclosed comment runs to end of text, the
+/// same policy as an unclosed fence. A `<!--` inside a fence is itself quoted
+/// text and opens nothing, so quoting comment syntax cannot swallow a later
+/// real call.
+fn html_comment_regions(text: &str, fences: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find("<!--") {
+        let start = cursor + rel;
+        if let Some(&(_, fence_end)) = fences.iter().find(|(s, e)| start >= *s && start < *e) {
+            cursor = fence_end.max(start + 4);
+            continue;
+        }
+        let body = start + 4;
+        let end = text[body..].find("-->").map_or(text.len(), |r| body + r + 3);
+        regions.push((start, end));
+        cursor = end;
+    }
+    regions
+}
+
 /// (#2230) Strip a CommonMark blockquote prefix — a `>` marker, nestable, each
 /// optionally followed by one space, each optionally indented up to 3 spaces.
 ///
@@ -726,8 +791,8 @@ fn parse_xml_tool_calls(
     let mut blocks = Vec::new();
     let mut openers_skipped_as_fenced = 0usize;
     let mut cursor = 0;
-    // (#2230) Computed once per scan; see `fenced_regions`.
-    let fences = fenced_regions(text);
+    // (#2230, #3074) Computed once per scan; see `quoted_regions`.
+    let fences = quoted_regions(text);
     while let Some(open_idx) = text[cursor..].find(XML_TOOL_CALL_OPEN) {
         let block_start = cursor + open_idx;
         // (#2230) An opener inside a fence is quoted markup, not an emission.
@@ -1793,5 +1858,73 @@ None of those is a call."#;
             outcome.xml_openers_skipped_as_fenced, 3,
             "every declined opener must be counted, not one per region — got {outcome:?}"
         );
+    }
+
+    const QUOTED_CALL: &str = "<tool_call><function=bash><parameter=command>rm -rf /workspace</parameter></function></tool_call>";
+
+    fn promote_text(content: &str) -> PromotionOutcome {
+        let mut m = msg(Some(content), None, None);
+        promote_plain_text_tool_calls(&mut m, &allowed(&["bash", "read"]))
+    }
+
+    /// (#3074) A 4-space-indented code block is quoting, exactly like a fence.
+    #[test]
+    fn xml_markup_in_a_space_indented_code_block_is_not_promoted() {
+        let content = format!("The shape is:\n\n    {QUOTED_CALL}\n\nNo change needed.");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "indented quotation promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3074) A tab-indented line counts as 4 columns.
+    #[test]
+    fn xml_markup_in_a_tab_indented_code_block_is_not_promoted() {
+        let content = format!("The shape is:\n\n\t{QUOTED_CALL}\n\nNo change needed.");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "tab-indented quotation promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3074) Markup inside an HTML comment is not an emission.
+    #[test]
+    fn xml_markup_in_an_html_comment_is_not_promoted() {
+        let content = format!("Reviewing the doc.\n<!-- {QUOTED_CALL} -->\nLooks fine.");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3074) Inverted: a real call after a CLOSED comment still promotes.
+    #[test]
+    fn xml_real_call_after_a_closed_html_comment_still_promotes() {
+        let content = format!("<!-- note -->\nRunning it:\n{QUOTED_CALL}\n");
+        let outcome = promote_text(&content);
+        assert_eq!(outcome.info.expect("real call must promote").call_count, 1);
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 0);
+    }
+
+    /// (#3074) Inverted: a real call whose INNER lines are indented promotes;
+    /// only the opener's own line decides.
+    #[test]
+    fn xml_real_call_with_indented_inner_lines_still_promotes() {
+        let content = "Checking:\n<tool_call>\n    <function=bash>\n        <parameter=command>ls</parameter>\n    </function>\n</tool_call>\n";
+        let outcome = promote_text(content);
+        assert_eq!(outcome.info.expect("real call must promote").call_count, 1);
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 0);
+    }
+
+    /// (#3074) Inverted: a 3-space indent is still ordinary prose, not code.
+    #[test]
+    fn xml_markup_with_a_three_space_indent_still_promotes() {
+        let content = format!("Running:\n   {QUOTED_CALL}\n");
+        assert!(promote_text(&content).info.is_some());
+    }
+
+    /// (#3074) A `<!--` quoted inside a fence must not open a comment that
+    /// swallows a real call after the fence.
+    #[test]
+    fn xml_comment_opener_inside_a_fence_does_not_swallow_a_later_real_call() {
+        let content = format!("Syntax:\n\n```\n<!-- unclosed\n```\n\n{QUOTED_CALL}\n");
+        assert!(promote_text(&content).info.is_some());
     }
 }
