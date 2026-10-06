@@ -209,15 +209,21 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
 }
 
 /// (#3073) Gate resolution blocks this thread for as long as the operator
-/// takes (a tty prompt, an ACP round trip), so a wave that mixes ungated and
-/// gated ready steps runs the ungated ones first. The gated ones stay `Ready`
-/// and are asked on a later pass of the wave loop, once nothing ungated is
-/// left to hold.
-fn ungated_first(ready_ids: Vec<String>, steps: &BTreeMap<String, Step>) -> Vec<String> {
-    let (ungated, gated): (Vec<String>, Vec<String>) = ready_ids
-        .into_iter()
-        .partition(|id| steps.get(id).is_some_and(|s| s.gate.is_none()));
-    if ungated.is_empty() { gated } else { ungated }
+/// takes (a tty prompt, an ACP round trip), so a gated ready step waits one
+/// pass behind ungated ready siblings: it stays `Ready`, is recorded in
+/// `deferred`, and is asked on the next pass, where it joins the wave.
+///
+/// ONE pass, not until nothing ungated is left: held behind every ungated
+/// ready step, a gated step sitting beside a long independent chain would be
+/// asked only once the chain ended (gated a -> a2 beside b1 -> b2 -> b3 took
+/// five passes where three suffice). A pass with no ungated step asks every
+/// gated one at once, as before.
+fn ungated_first(ready_ids: Vec<String>, steps: &BTreeMap<String, Step>, deferred: &mut HashSet<String>) -> Vec<String> {
+    let is_ungated = |id: &String| steps.get(id).is_some_and(|s| s.gate.is_none());
+    if !ready_ids.iter().any(is_ungated) {
+        return ready_ids;
+    }
+    ready_ids.into_iter().filter(|id| is_ungated(id) || !deferred.insert(id.clone())).collect()
 }
 
 /// `true` iff `step` is ready to run: itself `Planned`, AND —
@@ -758,6 +764,7 @@ pub fn run_step_graph(
     }
 
     let bus = std::sync::Arc::new(bus);
+    let mut gate_deferred: HashSet<String> = HashSet::new();
 
     loop {
         let ready_ids: Vec<String> = steps
@@ -787,8 +794,8 @@ pub fn run_step_graph(
         // "step error" flow record, same durable `persist` call, same
         // "downstream dependent never becomes ready" consequence via
         // `step_is_ready`/`task_status`.
-        // (#3073) A gated step waits behind any ungated ready sibling.
-        let ready_ids = ungated_first(ready_ids, steps);
+        // (#3073) A gated step waits one pass behind an ungated ready sibling.
+        let ready_ids = ungated_first(ready_ids, steps, &mut gate_deferred);
         let ready_ids: Vec<String> = {
             let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
             for id in ready_ids {
@@ -2922,6 +2929,87 @@ mod tests {
         let pos = |needle: &str| log.iter().position(|e| e == needle).unwrap_or_else(|| panic!("{needle} in {log:?}"));
         assert!(pos("done:b-step") < pos("gate:a-step"), "ungated b must finish before the gate is asked: {log:?}");
         assert_eq!(steps["a-step"].status, NodeStatus::Complete, "the gated step still runs once approved");
+    }
+
+    /// (#3073, review) A gated step waits behind ungated siblings for ONE pass, not behind
+    /// every independent ungated chain: gated a -> a2 beside ungated b1 -> b2 -> b3 is three
+    /// passes, as without the deferral, so the gate is asked on the pass after b1 (before b2
+    /// ran), not after b3.
+    #[test]
+    fn a_gated_step_is_deferred_by_one_pass_not_behind_an_independent_chain() {
+        use std::cell::RefCell;
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        let (task_a2, step_a2) = task_and_step("a2", &["a"]);
+        let (task_b1, step_b1) = task_and_step("b1", &[]);
+        let (task_b2, step_b2) = task_and_step("b2", &["b1"]);
+        let (task_b3, step_b3) = task_and_step("b3", &["b2"]);
+        let (tasks, mut steps) = graph(vec![
+            (task_a, step_a),
+            (task_a2, step_a2),
+            (task_b1, step_b1),
+            (task_b2, step_b2),
+            (task_b3, step_b3),
+        ]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut handler = |s: &Step, _f: &BTreeMap<String, String>| {
+            log.borrow_mut().push(format!("gate:{}", s.id));
+            crate::gate::GateDecision::Approved
+        };
+        let mut persist = |s: &Step| {
+            if s.status == NodeStatus::Complete {
+                log.borrow_mut().push(format!("done:{}", s.id));
+            }
+        };
+        run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut persist,
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        let log = log.into_inner();
+        let pos = |needle: &str| log.iter().position(|e| e == needle).unwrap_or_else(|| panic!("{needle} in {log:?}"));
+        assert!(pos("done:b1-step") < pos("gate:a-step"), "the gated step still waits one pass: {log:?}");
+        assert!(pos("gate:a-step") < pos("done:b2-step"), "and is asked on the next pass, not after the chain: {log:?}");
+        assert_eq!(steps["a2-step"].status, NodeStatus::Complete);
+    }
+
+    /// (#3073) The deferral itself: a pass of only gated steps asks them all at once and
+    /// defers nothing; a mixed pass runs the ungated and defers each gated step once; the
+    /// next pass holds it no longer.
+    #[test]
+    fn ungated_first_defers_a_gated_step_once_and_only_beside_an_ungated_one() {
+        let (_, mut gated) = task_and_step("g", &[]);
+        gated.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        let (_, open) = task_and_step("u", &[]);
+        let steps: BTreeMap<String, Step> =
+            [(gated.id.clone(), gated), (open.id.clone(), open)].into_iter().collect();
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut deferred = HashSet::new();
+
+        assert_eq!(ungated_first(ids(&["g-step"]), &steps, &mut deferred), ids(&["g-step"]), "only gated: asked now");
+        assert!(deferred.is_empty(), "nothing was deferred");
+
+        assert_eq!(ungated_first(ids(&["g-step", "u-step"]), &steps, &mut deferred), ids(&["u-step"]), "mixed: ungated first");
+        assert!(deferred.contains("g-step"));
+
+        assert_eq!(
+            ungated_first(ids(&["g-step", "u-step"]), &steps, &mut deferred),
+            ids(&["g-step", "u-step"]),
+            "one pass later the gated step joins the wave"
+        );
     }
 
     /// (F9) A step that errors says why on its `step.error` record: the cause
