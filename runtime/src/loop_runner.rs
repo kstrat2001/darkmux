@@ -1515,6 +1515,34 @@ pub fn run(
     result
 }
 
+/// (#3074) Mark `call` started on disk, then run it. The marker is written
+/// first so a kill while the tool runs leaves a checkpoint a resume can read
+/// (`checkpoint::ToolStart`). `dispatcher` is `tools::dispatch` in production;
+/// a test passes one that looks at the checkpoint mid-call.
+fn dispatch_marked(
+    start: &checkpoint::ToolStart<'_>,
+    call: &ToolCall,
+    dispatcher: impl FnOnce(&str, &str) -> crate::tools::ToolRun,
+) -> crate::tools::ToolRun {
+    start.write();
+    dispatcher(&call.function.name, &call.function.arguments)
+}
+
+/// (#3074) One call of a resume's catch-up pass: surface it to the model if the
+/// checkpoint says it had already started, otherwise mark it and dispatch it.
+fn catch_up_dispatch(
+    seed: Option<&checkpoint::RunCheckpoint>,
+    idx: usize,
+    start: &checkpoint::ToolStart<'_>,
+    call: &ToolCall,
+    dispatcher: impl FnOnce(&str, &str) -> crate::tools::ToolRun,
+) -> crate::tools::ToolRun {
+    match seed.and_then(|c| checkpoint::interrupted_call_notice(c, idx, call)) {
+        Some(notice) => crate::tools::ToolRun::text(notice),
+        None => dispatch_marked(start, call, dispatcher),
+    }
+}
+
 /// (#2114) Production entry point for a dispatch that may pause against a
 /// host-driven pace file and/or resume a prior checkpoint. Kept SEPARATE
 /// from [`run`] rather than adding these two params there: `run`'s
@@ -2063,7 +2091,22 @@ fn run_with_sleeper(
                 );
             }
             let tool_seq = seq_base + idx as u32;
-            let run = dispatch(&call.function.name, &call.function.arguments);
+            let run = catch_up_dispatch(
+                resume_seed.as_ref(),
+                idx,
+                &checkpoint::ToolStart {
+                    out_dir,
+                    role_id,
+                    messages: &messages,
+                    turns,
+                    total_completion_tokens,
+                    compactions,
+                    pending: &pending_calls[idx..],
+                    seq_base: tool_seq,
+                },
+                &call,
+                dispatch,
+            );
             let result = run.result;
             let outcome = crate::failure_rate::classify_outcome(&call.function.name, &result);
             let tool_ok = outcome.tool_worked();
@@ -2104,6 +2147,7 @@ fn run_with_sleeper(
                 pending_hand_back: None,
                 pending_tool_calls: if remaining_is_empty { None } else { Some(remaining) },
                 pending_tool_calls_seq_base: if remaining_is_empty { 0 } else { tool_seq + 1 },
+                pending_head_started: false,
                 written_at_unix_ms: checkpoint::unix_ms(),
             };
             if let Err(e) = checkpoint::write_checkpoint(out_dir, &snapshot) {
@@ -2510,6 +2554,7 @@ fn run_with_sleeper(
                 pending_hand_back,
                 pending_tool_calls: None,
                 pending_tool_calls_seq_base: 0,
+                pending_head_started: false,
                 written_at_unix_ms: checkpoint::unix_ms(),
             };
             if let Err(e) = checkpoint::write_checkpoint(out_dir, &snapshot) {
@@ -3775,7 +3820,20 @@ fn run_with_sleeper(
                             window_size,
                         );
                     }
-                    let run = dispatch(&call.function.name, &call.function.arguments);
+                    let run = dispatch_marked(
+                        &checkpoint::ToolStart {
+                            out_dir,
+                            role_id,
+                            messages: &messages,
+                            turns,
+                            total_completion_tokens,
+                            compactions,
+                            pending: &calls_snapshot[tool_seq..],
+                            seq_base: tool_seq as u32,
+                        },
+                        &call,
+                        dispatch,
+                    );
                     let result = run.result;
                     // (#469/#2008) Classify with the same function the
                     // failure-rate detector uses, and record it on the
@@ -3952,6 +4010,7 @@ fn run_with_sleeper(
                         // calls always start at tool_seq 0, so the next
                         // pending call's seq is simply tool_seq + 1.
                         pending_tool_calls_seq_base: if remaining_is_empty { 0 } else { tool_seq as u32 + 1 },
+                        pending_head_started: false,
                         written_at_unix_ms: checkpoint::unix_ms(),
                     };
                     if let Err(e) = checkpoint::write_checkpoint(out_dir, &mid_turn_snapshot) {
@@ -7515,6 +7574,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -7692,6 +7752,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -7760,6 +7821,7 @@ mod tests {
             }),
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -7969,6 +8031,7 @@ mod tests {
             // call_1 (index 0) already completed, so the next pending
             // call (call_2) resumes at tool_seq 1.
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -8010,6 +8073,177 @@ mod tests {
             "either the last mid-turn checkpoint cleared pending_tool_calls, or a later \
              clean-boundary checkpoint (turns > 1) has already superseded it"
         );
+    }
+
+    /// (#3074) Resume a checkpoint killed with a bash call pending; returns the
+    /// text of the tool result the model is handed for it. `head_started` is the
+    /// marker under test. The host has no `/workspace`, so an executed bash call
+    /// here comes back as a spawn error rather than output, which is enough to
+    /// tell "ran" from "surfaced".
+    fn resume_with_pending_bash(tmp: &std::path::Path, head_started: bool) -> String {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+        let server = crate::test_support::GuardedMockServer::start();
+        let _next = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut traj = Trajectory::open(tmp);
+        let call = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"command":"echo ran >> out.txt","timeout_seconds":5}"#.into(),
+            },
+            extra_content: None,
+        };
+        let assistant = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![call.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
+            messages: vec![Message::system("test"), Message::user("append"), assistant],
+            turns: 1,
+            total_completion_tokens: 20,
+            compactions: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![call]),
+            pending_tool_calls_seq_base: 0,
+            pending_head_started: head_started,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &[Tool::Bash], &mut traj, false,
+            &compaction::CompactionConfig::never_compact(),
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp, "test-role", Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("resumed dispatch returns Ok");
+        outcome
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call_1"))
+            .and_then(|m| m.content.clone())
+            .expect("the model must get a tool result for call_1")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_surfaces_a_started_mutating_call_instead_of_replaying_it() {
+        let tmp = tempfile::Builder::new().prefix("resume-started").tempdir().unwrap();
+        let result = resume_with_pending_bash(tmp.path(), true);
+        assert!(result.contains("interrupted") && result.contains("NOT re-run"), "{result}");
+        assert!(!result.contains("spawning bash"), "the call must not have been executed: {result}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_still_dispatches_a_pending_call_that_had_not_started() {
+        let tmp = tempfile::Builder::new().prefix("resume-unstarted").tempdir().unwrap();
+        let result = resume_with_pending_bash(tmp.path(), false);
+        assert!(result.contains("spawning bash"), "an unstarted pending call runs on resume: {result}");
+        assert!(!result.contains("interrupted"), "{result}");
+    }
+
+    /// The marker has to be on disk BEFORE the tool runs, or a kill mid-tool
+    /// leaves nothing to find. The stand-in dispatcher reads the checkpoint it
+    /// can see at the moment the tool would execute.
+    #[test]
+    fn a_mutating_call_is_marked_started_before_it_is_dispatched() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let call = ToolCall {
+            id: "call_probe".into(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall { name: "bash".into(), arguments: "{}".into() },
+            extra_content: None,
+        };
+        let pending = [call.clone()];
+        let messages = [Message::system("test")];
+        let start = checkpoint::ToolStart {
+            out_dir: out_dir.path(),
+            role_id: "test-role",
+            messages: &messages,
+            turns: 1,
+            total_completion_tokens: 0,
+            compactions: 0,
+            pending: &pending,
+            seq_base: 0,
+        };
+        let seen = std::cell::RefCell::new(None);
+        let run = dispatch_marked(&start, &call, |name, _args| {
+            *seen.borrow_mut() =
+                checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(out_dir.path())).ok();
+            crate::tools::ToolRun::text(format!("ran {name}"))
+        });
+        assert_eq!(run.result, "ran bash");
+        let during = seen.into_inner().expect("a checkpoint existed while the tool ran");
+        assert!(during.pending_head_started, "the marker must be set while the call runs");
+        assert_eq!(during.pending_tool_calls.unwrap()[0].id, "call_probe");
+    }
+
+    /// (#3074) The catch-up pass's own wiring: a started head never reaches
+    /// the dispatcher, and a call that did go to it was marked first.
+    #[test]
+    fn catch_up_dispatch_skips_a_started_head_and_marks_the_rest() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let mk = |id: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall { name: "bash".into(), arguments: "{}".into() },
+            extra_content: None,
+        };
+        let pending = [mk("a"), mk("b")];
+        let messages = [Message::system("test")];
+        let start = |idx: usize| checkpoint::ToolStart {
+            out_dir: out_dir.path(),
+            role_id: "test-role",
+            messages: &messages,
+            turns: 1,
+            total_completion_tokens: 0,
+            compactions: 0,
+            pending: &pending[idx..],
+            seq_base: idx as u32,
+        };
+        let seed = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".into(),
+            messages: messages.to_vec(),
+            turns: 1,
+            total_completion_tokens: 0,
+            compactions: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(pending.to_vec()),
+            pending_tool_calls_seq_base: 0,
+            pending_head_started: true,
+            written_at_unix_ms: 0,
+        };
+        let never = |_: &str, _: &str| -> crate::tools::ToolRun { panic!("a started head must not be dispatched") };
+        let head = catch_up_dispatch(Some(&seed), 0, &start(0), &pending[0], never);
+        assert!(head.result.contains("NOT re-run"), "{}", head.result);
+        assert!(
+            !checkpoint::checkpoint_file_path(out_dir.path()).exists(),
+            "a surfaced call is not dispatched, so it is not marked again"
+        );
+        let second = catch_up_dispatch(Some(&seed), 1, &start(1), &pending[1], |_, _| {
+            let during =
+                checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(out_dir.path())).unwrap();
+            assert!(during.pending_head_started && during.pending_tool_calls_seq_base == 1);
+            crate::tools::ToolRun::text("ran".into())
+        });
+        assert_eq!(second.result, "ran");
     }
 
     #[test]
@@ -8084,6 +8318,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2, call3]),
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -8207,6 +8442,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2]),
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -8336,6 +8572,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2, c3]),
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -15848,6 +16085,7 @@ mod tests {
                 extra_content: None,
             }]),
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
@@ -15992,6 +16230,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2]),
             pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 

@@ -119,6 +119,14 @@ darkmux release.
   plain-text XML scan already skipped fenced blocks; it now also skips a line indented
   four columns or a tab, and an HTML comment (an unclosed one runs to the end of the
   text). Skipped openers count in `xml_openers_skipped_as_fenced`.
+- **A resume no longer silently replays a tool call that had already started** (#3074).
+  Just before the agent runs a call that can change the workspace (`bash`, `write`,
+  `edit`, `create_finding`, `create_mod`), its checkpoint is written with a started marker
+  (`pending_head_started`, additive; an older checkpoint reads as not started). A resume
+  that finds the marker tells the model the call was interrupted and may have taken
+  effect, and does not run it again. Read-only calls carry no marker and are still
+  re-dispatched. Cost: one extra checkpoint write per workspace-changing call, about
+  22 ms on a 600 KB transcript.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
