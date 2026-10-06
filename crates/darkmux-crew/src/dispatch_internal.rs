@@ -4850,6 +4850,41 @@ fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyh
     }
 }
 
+type SamplerOutcome = (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary);
+
+/// (#3074) Join `handle`, giving up after `bound`. `None` means the thread was
+/// still running at the deadline and is detached, never waited on again.
+fn join_within<T>(handle: thread::JoinHandle<T>, bound: Duration) -> Option<thread::Result<T>> {
+    let deadline = Instant::now() + bound;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(JOIN_POLL);
+    }
+    Some(handle.join())
+}
+
+/// How often [`join_within`] checks whether the thread has finished.
+const JOIN_POLL: Duration = Duration::from_millis(10);
+
+/// (#3074) How long dispatch completion waits for the telemetry sampler after
+/// asking it to stop. Its worst bounded call is a 30s `lms` listing, and a
+/// governor unload is bounded by the model-load timeout, so a minute covers
+/// every call the sampler makes today; past that something is hung.
+const SAMPLER_JOIN_BOUND: Duration = Duration::from_secs(60);
+
+/// (#3074) The sampler's readings once it has stopped. A panicked sampler and
+/// one still running at the deadline both yield `None` for the ladder, not a
+/// zeroed summary (#2774 review C3: `0 episodes / 0 ms` is not a possible live
+/// reading, so zeros would read as "never throttled").
+fn join_sampler(handle: thread::JoinHandle<SamplerOutcome>) -> (HostStats, HostExtras, Option<crate::thermal_governor::ThermalLadderSummary>) {
+    match join_within(handle, SAMPLER_JOIN_BOUND) {
+        Some(Ok((stats, extras, ladder))) => (stats, extras, Some(ladder)),
+        _ => (HostStats::default(), HostExtras::default(), None),
+    }
+}
+
 /// (#889, #2131) The teardown both early exits of `dispatch()` share (the
 /// failed wait and the interrupted or stopped run): tell the watchdog the
 /// wait is over, kill the container by name, stop and join the watchdog and
@@ -4860,7 +4895,7 @@ fn teardown_container_threads(
     watchdog_done: &AtomicBool,
     watchdog_handle: thread::JoinHandle<WatchdogWake>,
     sampler_stop: &AtomicBool,
-    sampler_handle: thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>,
+    sampler_handle: thread::JoinHandle<SamplerOutcome>,
     stop_flag: &AtomicBool,
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
 ) {
@@ -4868,7 +4903,7 @@ fn teardown_container_threads(
     docker_kill_by_name(container_name);
     let _ = watchdog_handle.join();
     sampler_stop.store(true, Ordering::SeqCst);
-    let _ = sampler_handle.join();
+    let _ = join_within(sampler_handle, SAMPLER_JOIN_BOUND);
     stop_flag.store(true, Ordering::SeqCst);
     let _ = tailer_handle.join();
 }
@@ -7225,10 +7260,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // zeros here would be indistinguishable from "this run was never
     // throttled" — the same reason every sibling field in `host_window`
     // is already `Option`.
-    let (host_stats, host_extras, thermal_ladder_summary) = match sampler_handle.join() {
-        Ok((stats, extras, ladder)) => (stats, extras, Some(ladder)),
-        Err(_) => (HostStats::default(), HostExtras::default(), None),
-    };
+    let (host_stats, host_extras, thermal_ladder_summary) = join_sampler(sampler_handle);
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops

@@ -79,6 +79,9 @@ darkmux release.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
   with an `@` after the host now masks up to the last `@`.
+- **A hung telemetry sampler cannot wedge a dispatch** (#3074). Completion waits at most a
+  minute for the sampler thread after stopping it, then detaches it and records no thermal
+  ladder summary for the run, the same as a sampler that panicked.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
