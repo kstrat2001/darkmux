@@ -958,6 +958,12 @@ pub fn rerun_in_own_process(test: &str) -> bool {
     if is_own_process() {
         return true;
     }
+    // Read directly, not through `is_own_process`: a re-run child that ever
+    // reached this point would re-run itself again, without end.
+    assert!(
+        std::env::var_os(OWN_PROCESS_VAR).is_none(),
+        "`{test}` is already a re-run child and must never start another"
+    );
     let exe = std::env::current_exe().expect("the running test binary has a path");
     let out = std::process::Command::new(exe)
         .args([test, "--exact", "--test-threads=1"])
@@ -1057,6 +1063,32 @@ mod tests {
         assert!(super::is_own_process(), "the body ran in a shared process");
     }
 
+    /// (#3100) The re-run happens and runs the body: under plain `cargo test`
+    /// the parent is not its own process, the re-run reports it ran the body
+    /// elsewhere, and the child left a file named for its parent's pid to say
+    /// it did. Under nextest no re-run is needed and none happens.
+    #[test]
+    #[cfg(unix)]
+    fn a_rerun_runs_the_body_in_a_child_and_the_parent_skips_it() {
+        let probe = |pid: u32| std::env::temp_dir().join(format!("darkmux-own-process-probe-{pid}"));
+        if std::env::var_os(super::OWN_PROCESS_VAR).is_some() {
+            std::fs::write(probe(std::os::unix::process::parent_id()), "ran").unwrap();
+            return;
+        }
+        let name = "test_isolation::tests::a_rerun_runs_the_body_in_a_child_and_the_parent_skips_it";
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test") {
+            assert!(super::rerun_in_own_process(name), "nextest already isolates the test: run the body here");
+            return;
+        }
+        assert!(!super::is_own_process(), "plain cargo test shares the process");
+        let sentinel = probe(std::process::id());
+        let _ = std::fs::remove_file(&sentinel);
+        assert!(!super::rerun_in_own_process(name), "the parent must not run the body itself");
+        let ran = std::fs::read_to_string(&sentinel);
+        let _ = std::fs::remove_file(&sentinel);
+        assert_eq!(ran.ok().as_deref(), Some("ran"), "the re-run never ran the body");
+    }
+
     /// Calls that raise the process-wide interrupt flag. The test-only
     /// raisers also refuse at run time outside a process of their own; the
     /// production ones (`mark_interrupted` and the shutdown paths that call
@@ -1075,17 +1107,21 @@ mod tests {
         "reap_on_host_shutdown(",
         "mark_bound_fired(",
         " arm();",
+        "launch_guard::arm();",
+        "= arm();",
     ];
 
     /// Every `#[test]` fn in `src`, as (name, body). A body ends at the first
-    /// line that is the fn line's own indentation followed by `}`.
+    /// line that is the fn line's own indentation followed by `}`, or at the
+    /// next test attribute, whichever comes first, so a body whose closing
+    /// brace sits at another indentation never swallows the next test.
     fn test_fns(src: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = Vec::new();
         let mut pending = false;
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
-            if t.starts_with("#[test]") || t.starts_with("#[tokio::test") {
+            if is_test_attr(t) {
                 pending = true;
                 continue;
             }
@@ -1094,10 +1130,28 @@ mod tests {
             };
             pending = false;
             let close = format!("{}}}", &line[..line.len() - t.len()]);
-            let body: Vec<&str> = lines[i..].iter().take_while(|l| **l != close).copied().collect();
+            let body: Vec<&str> = lines[i..]
+                .iter()
+                .take_while(|l| **l != close && !is_test_attr(l.trim_start()))
+                .copied()
+                .collect();
             out.push((sig.split('(').next().unwrap_or_default().to_string(), body.join("\n")));
         }
         out
+    }
+
+    fn is_test_attr(trimmed: &str) -> bool {
+        trimmed.starts_with("#[test]") || trimmed.starts_with("#[tokio::test")
+    }
+
+    /// A raising test whose closing brace is mis-indented still ends before
+    /// the next test, so the next test's macro cannot cover for it.
+    #[test]
+    fn a_misindented_body_does_not_swallow_the_next_test() {
+        let src = "    #[test]\n    fn raises() {\n        mark_interrupted();\n}\n    #[test]\n    fn isolated() {\n        run_in_own_process!();\n    }\n";
+        let fns = test_fns(src);
+        assert_eq!(fns.len(), 2, "{fns:?}");
+        assert!(fns[0].1.contains("mark_interrupted(") && !fns[0].1.contains("run_in_own_process!()"), "{fns:?}");
     }
 
     fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
