@@ -1515,6 +1515,19 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 
 #[cfg(test)]
 mod tests {
+    /// (#3074) Which tools a resume must not replay silently. Exhaustive over
+    /// `Tool::ALL`, so a new tool has to be classified here too.
+    #[test]
+    fn may_change_workspace_for_every_tool() {
+        for tool in Tool::ALL {
+            let expected = match tool {
+                Tool::Bash | Tool::Write | Tool::Edit | Tool::CreateFinding | Tool::CreateMod => true,
+                Tool::Echo | Tool::Read | Tool::Search => false,
+            };
+            assert_eq!(tool.may_change_workspace(), expected, "{}", tool.name());
+        }
+    }
+
     // (#2268) `Tool::ALL`, `name`, and `from_name` are generated from one
     // list by the `tools!` macro, so membership cannot drift and a round-trip
     // through `from_name` is true by construction (review round 3: such a

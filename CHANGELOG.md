@@ -126,7 +126,10 @@ darkmux release.
   (`pending_head_started`, additive; an older checkpoint reads as not started). A resume
   that finds the marker tells the model the call was interrupted and may have taken
   effect, and does not run it again. Read-only calls carry no marker and are still
-  re-dispatched. Cost: one extra checkpoint write per workspace-changing call, about
+  re-dispatched. The call a resume reports instead of running is recorded as `failed`
+  (`ok: false`, "not re-run"), so it counts as no work for the inactivity timer, and the
+  notice for `create_finding` / `create_mod` warns of a duplicate record rather than
+  telling the model to inspect the workspace. Cost: one extra checkpoint write per workspace-changing call, about
   22 ms on a 600 KB transcript.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes

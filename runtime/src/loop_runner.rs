@@ -38,7 +38,11 @@ use crate::pace;
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::stream_gate::{AbortReason, CutSource, StreamGate, StreamOutcome};
-use crate::tools::{dispatch, Tool};
+use crate::tools::Tool;
+#[cfg(not(test))]
+use crate::tools::dispatch;
+#[cfg(test)]
+use observed_dispatch as dispatch;
 use darkmux_trajectory::{FailedExec, MalformedReason};
 use crate::trajectory::Trajectory;
 
@@ -1528,6 +1532,30 @@ fn dispatch_marked(
     dispatcher(&call.function.name, &call.function.arguments)
 }
 
+/// (#3074) What a resume's catch-up pass did with one call. `interrupted` means
+/// the call was reported to the model instead of run, so it is NOT a tool
+/// success: it is recorded as an outcome of its own and proves no work.
+struct CaughtUp {
+    run: crate::tools::ToolRun,
+    interrupted: bool,
+}
+
+/// (#3074) The failure reason a surfaced-not-run call carries on its
+/// `tool.completed` record.
+const INTERRUPTED_NOT_RERUN: &str = "interrupted before the kill; not re-run on resume";
+
+impl CaughtUp {
+    /// A call that never ran is `Failed` ("did not run", `ok: false`), which
+    /// also keeps it out of the inactivity timer's proof-of-work.
+    fn outcome(&self, tool_name: &str) -> crate::failure_rate::ToolOutcome {
+        if self.interrupted {
+            crate::failure_rate::ToolOutcome::Failed { reason: INTERRUPTED_NOT_RERUN.to_string() }
+        } else {
+            crate::failure_rate::classify_outcome(tool_name, &self.run.result)
+        }
+    }
+}
+
 /// (#3074) One call of a resume's catch-up pass: surface it to the model if the
 /// checkpoint says it had already started, otherwise mark it and dispatch it.
 fn catch_up_dispatch(
@@ -1536,11 +1564,29 @@ fn catch_up_dispatch(
     start: &checkpoint::ToolStart<'_>,
     call: &ToolCall,
     dispatcher: impl FnOnce(&str, &str) -> crate::tools::ToolRun,
-) -> crate::tools::ToolRun {
+) -> CaughtUp {
     match seed.and_then(|c| checkpoint::interrupted_call_notice(c, idx, call)) {
-        Some(notice) => crate::tools::ToolRun::text(notice),
-        None => dispatch_marked(start, call, dispatcher),
+        Some(notice) => CaughtUp { run: crate::tools::ToolRun::text(notice), interrupted: true },
+        None => CaughtUp { run: dispatch_marked(start, call, dispatcher), interrupted: false },
     }
+}
+
+// (#3074) Test seam for the LIVE loop's call site: a thread-local observer
+// runs at the moment a tool would execute, then the real dispatcher does.
+#[cfg(test)]
+thread_local! {
+    static DISPATCH_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observed_dispatch(name: &str, raw_args: &str) -> crate::tools::ToolRun {
+    DISPATCH_OBSERVER.with(|o| {
+        if let Some(observer) = o.borrow().as_ref() {
+            observer();
+        }
+    });
+    crate::tools::dispatch(name, raw_args)
 }
 
 /// (#2114) Production entry point for a dispatch that may pause against a
@@ -2091,7 +2137,7 @@ fn run_with_sleeper(
                 );
             }
             let tool_seq = seq_base + idx as u32;
-            let run = catch_up_dispatch(
+            let caught = catch_up_dispatch(
                 resume_seed.as_ref(),
                 idx,
                 &checkpoint::ToolStart {
@@ -2107,8 +2153,9 @@ fn run_with_sleeper(
                 &call,
                 dispatch,
             );
+            let outcome = caught.outcome(&call.function.name);
+            let run = caught.run;
             let result = run.result;
-            let outcome = crate::failure_rate::classify_outcome(&call.function.name, &result);
             let tool_ok = outcome.tool_worked();
             if let Some(reason) =
                 crate::failure_rate::classify_failed_to_run(&call.function.name, &result)
@@ -8194,6 +8241,91 @@ mod tests {
         assert_eq!(during.pending_tool_calls.unwrap()[0].id, "call_probe");
     }
 
+    /// (#3074 review) A resumed call that is reported instead of run is not a
+    /// success: the trajectory records it as `failed` (ok:false), which is also
+    /// what keeps the inactivity timer from resetting as if work happened.
+    #[test]
+    #[serial_test::serial]
+    fn a_surfaced_resume_call_is_recorded_as_not_run_not_as_success() {
+        let tmp = tempfile::Builder::new().prefix("resume-outcome").tempdir().unwrap();
+        let _ = resume_with_pending_bash(tmp.path(), true);
+        let body = std::fs::read_to_string(darkmux_trajectory::trajectory_path(tmp.path())).unwrap();
+        let completed: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "tool.completed")
+            .collect();
+        assert_eq!(completed.len(), 1, "{body}");
+        assert_eq!(completed[0]["ok"], serde_json::json!(false), "{}", completed[0]);
+        assert_eq!(completed[0]["outcome"], "failed");
+        assert!(
+            completed[0]["failure_reason"].as_str().unwrap().contains("not re-run"),
+            "{}",
+            completed[0]
+        );
+    }
+
+    /// (#3074 review) The LIVE loop's call site marks a mutating call started
+    /// before the tool runs. `dispatch` is the cfg(test) observer here, which
+    /// reads checkpoint.json at the moment the tool would execute; swapping the
+    /// site back to a plain dispatch leaves nothing on disk and fails this.
+    #[test]
+    #[serial_test::serial]
+    fn the_live_loop_marks_a_mutating_call_started_before_it_runs() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+        let server = crate::test_support::GuardedMockServer::start();
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"role\":\"tool\"");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 200, 10));
+        });
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"role\":\"user\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "bash", "arguments": "{\"command\":\"true\"}" },
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("live-marker").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = std::rc::Rc::clone(&seen);
+        let out = tmp.path().to_path_buf();
+        DISPATCH_OBSERVER.with(|o| {
+            *o.borrow_mut() = Some(Box::new(move || {
+                *observed.borrow_mut() =
+                    checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(&out)).ok();
+            }));
+        });
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model",
+            vec![Message::system("test"), Message::user("run it")],
+            &[Tool::Bash], &mut traj, false,
+            &compaction::CompactionConfig::never_compact(),
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("two-turn dispatch returns Ok");
+        DISPATCH_OBSERVER.with(|o| *o.borrow_mut() = None);
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        let during = seen.borrow_mut().take().expect("a checkpoint existed while the tool ran");
+        assert!(during.pending_head_started, "the live site must mark the call started first");
+        assert_eq!(during.pending_tool_calls.unwrap()[0].id, "call_1");
+    }
+
     /// (#3074) The catch-up pass's own wiring: a started head never reaches
     /// the dispatcher, and a call that did go to it was marked first.
     #[test]
@@ -8232,7 +8364,8 @@ mod tests {
         };
         let never = |_: &str, _: &str| -> crate::tools::ToolRun { panic!("a started head must not be dispatched") };
         let head = catch_up_dispatch(Some(&seed), 0, &start(0), &pending[0], never);
-        assert!(head.result.contains("NOT re-run"), "{}", head.result);
+        assert!(head.interrupted);
+        assert!(head.run.result.contains("NOT re-run"), "{}", head.run.result);
         assert!(
             !checkpoint::checkpoint_file_path(out_dir.path()).exists(),
             "a surfaced call is not dispatched, so it is not marked again"
@@ -8243,7 +8376,8 @@ mod tests {
             assert!(during.pending_head_started && during.pending_tool_calls_seq_base == 1);
             crate::tools::ToolRun::text("ran".into())
         });
-        assert_eq!(second.result, "ran");
+        assert!(!second.interrupted);
+        assert_eq!(second.run.result, "ran");
     }
 
     #[test]

@@ -378,12 +378,23 @@ pub fn interrupted_call_notice(checkpoint: &RunCheckpoint, idx: usize, call: &To
     if idx != 0 || !checkpoint.pending_head_started {
         return None;
     }
+    let name = &call.function.name;
+    // `create_finding` / `create_mod` write to the output dir, not the
+    // workspace, so "inspect the workspace" would send the model nowhere. Their
+    // risk is a duplicate record.
+    let advice = match Tool::from_name(name) {
+        Some(Tool::CreateFinding | Tool::CreateMod) => "the report may already have been recorded \
+             and its result was lost. It was NOT re-run. Re-issue it only if you still need \
+             it; it may then be recorded twice."
+            .to_string(),
+        _ => "it may have changed the workspace and its result was lost. It was NOT re-run. \
+              Inspect the workspace to see whether its effect is already there, and re-issue \
+              the call only if it is not."
+            .to_string(),
+    };
     Some(format!(
-        "[darkmux-runtime] This `{}` call was interrupted: the run stopped while it was \
-         executing, so it may have changed the workspace and its result was lost. It was NOT \
-         re-run. Inspect the workspace to see whether its effect is already there, and \
-         re-issue the call only if it is not.",
-        call.function.name
+        "[darkmux-runtime] This `{name}` call was interrupted: the run stopped while it was \
+         executing, so {advice}"
     ))
 }
 
@@ -623,6 +634,25 @@ mod tests {
         let out_dir = tempfile::tempdir().unwrap();
         tool_start(out_dir.path(), &[Message::system("sys")], &[tool_call("read")]).write();
         assert!(!checkpoint_file_path(out_dir.path()).exists(), "a replayed read is harmless");
+    }
+
+    /// (#3074 review) The notice is worded per tool kind: `create_finding` and
+    /// `create_mod` write to the output dir, not the workspace, so telling the
+    /// model to inspect the workspace for their effect sends it nowhere.
+    #[test]
+    fn interrupted_call_notice_is_worded_per_tool_kind() {
+        let mut checkpoint = sample();
+        checkpoint.pending_head_started = true;
+        for name in ["bash", "write", "edit"] {
+            let notice = interrupted_call_notice(&checkpoint, 0, &tool_call(name)).unwrap();
+            assert!(notice.contains("Inspect the workspace"), "{name}: {notice}");
+        }
+        for name in ["create_finding", "create_mod"] {
+            let notice = interrupted_call_notice(&checkpoint, 0, &tool_call(name)).unwrap();
+            assert!(!notice.contains("workspace"), "{name}: {notice}");
+            assert!(notice.contains("NOT re-run") && notice.contains(name), "{name}: {notice}");
+            assert!(notice.contains("recorded twice"), "{name}: {notice}");
+        }
     }
 
     #[test]
