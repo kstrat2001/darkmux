@@ -9,8 +9,8 @@
 //! Two entry points, one rule set ([`Redaction`]):
 //!
 //! - [`redact_reads`] is the layer every JSON route carries. For a remote
-//!   caller it parses the body and redacts each key and value, so a field no
-//!   one thought to list (an operator-authored profile description, a path in
+//!   caller it streams the body through [`crate::redaction_stream`], redacting each
+//!   key and value as it passes, so a field no one thought to list (an operator-authored profile description, a path in
 //!   an error line) is covered without naming it.
 //! - [`redact_stdout`] is for a console panel's terminal output, which needs
 //!   its escape sequences split out first (see [`classify_escape`]).
@@ -23,38 +23,11 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use crate::redaction_stream::StreamRedactor;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
 pub(crate) const ADDRESS_HIDDEN: &str = "(address hidden)";
-/// The windows one `GET /flow/:date` response can fill, each capped at
-/// `FLOW_READ_CAP_RECORDS`: the local day file's ring, its separate bookend
-/// ring (#2409), the Redis work stream and the Redis telemetry stream. The
-/// local and Redis views are unioned, so a response can hold all four in the
-/// worst case. That route is the largest body the layer sees (#3073).
-const FLOW_RESPONSE_WINDOWS: usize = 4;
-/// Bytes one flow record is budgeted at: the heaviest contiguous 10,000-record
-/// window in 14 day files on the laptop (410,759 records, whole-corpus mean 767 B;
-/// a 10k window peaked at 1,539 B per record, 2026-10-06), rounded up.
-const FLOW_RECORD_BUDGET_BYTES: usize = 1_600;
-/// Headroom over the budget, in percent, for a window heavier than any measured.
-const BODY_HEADROOM_PERCENT: usize = 125;
-/// The largest body the layer will re-read to redact; a bigger one is withheld,
-/// never passed through unfiltered. Derived, not guessed (#3073):
-/// `FLOW_RESPONSE_WINDOWS x FLOW_READ_CAP_RECORDS x FLOW_RECORD_BUDGET_BYTES x 125%`
-/// = 80,000,000 bytes, so the largest legitimate body fits and a tokenless phone
-/// viewer on a busy day is not answered 500. A parsed JSON `Value` is ~6.6x its
-/// text (measured 2026-10: 8 MiB of flow-shaped rows peaked +53 MiB), so this
-/// bounds one remote read's parse peak near 500 MiB; the handler already holds
-/// the same records as `Value`s when it builds the body, so the layer doubles an
-/// amount the route itself carries rather than adding a new one.
-const MAX_REDACTED_BODY_BYTES: usize =
-    FLOW_RESPONSE_WINDOWS * darkmux_flow::FLOW_READ_CAP_RECORDS * FLOW_RECORD_BUDGET_BYTES * BODY_HEADROOM_PERCENT / 100;
-// The reviewed failure: one source's two windows (20,000 records, ~19.4 MiB) must fit.
-const _: () = assert!(
-    MAX_REDACTED_BODY_BYTES >= 2 * darkmux_flow::FLOW_READ_CAP_RECORDS * 1024,
-    "the body cap would 500 a remote read of a full flow day (#3073)"
-);
 /// How long a derived [`Redaction`] is reused. The key below catches a roster or
 /// directory change at once; this bounds staleness for what it does not cover
 /// (the fleet hub in the config, the machine id, a symlink repointed).
@@ -636,56 +609,16 @@ impl Redaction {
     pub(crate) fn line(&self, line: &str) -> String {
         redact_text(line, self).into_owned()
     }
-
-    /// Every string in a JSON document, keys and values, redacted in place.
-    pub(crate) fn json(&self, v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::String(s) => {
-                if let std::borrow::Cow::Owned(n) = redact_text(s, self) {
-                    *s = n;
-                }
-            }
-            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| self.json(x)),
-            serde_json::Value::Object(o) => {
-                o.values_mut().for_each(|x| self.json(x));
-                let renames: Vec<(String, String)> = o
-                    .keys()
-                    .filter_map(|k| match redact_text(k, self) {
-                        std::borrow::Cow::Owned(n) => Some((k.clone(), n)),
-                        std::borrow::Cow::Borrowed(_) => None,
-                    })
-                    .collect();
-                for (old, new) in renames {
-                    if let Some(val) = o.remove(&old) {
-                        // Two keys can redact to the same text: the later one
-                        // is suffixed so a remote map loses no entry.
-                        let mut key = new.clone();
-                        let mut n = 2;
-                        while o.contains_key(&key) {
-                            key = format!("{new} #{n}");
-                            n += 1;
-                        }
-                        o.insert(key, val);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// The layer every JSON read route carries: a caller that is this machine or
 /// holds the token gets the response as built; anyone else gets it with host
-/// facts redacted ([`Redaction`]). A JSON body is redacted value by value, and
-/// anything else on a JSON route (a plain-text error) is redacted as text, so
-/// nothing passes through unfiltered. A body it cannot read is withheld (500).
+/// facts redacted ([`Redaction`]). The body is redacted as it streams, token by
+/// token for JSON and line by line for anything else on a JSON route (a
+/// plain-text error), so memory is bounded by the largest single value or line
+/// and no response is too big to serve; nothing passes through unfiltered
+/// ([`crate::redaction_stream`], #3073).
 pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
-    redact_reads_capped(req, next, MAX_REDACTED_BODY_BYTES).await
-}
-
-/// [`redact_reads`] with the body cap as a parameter, so a test can reach the
-/// cap with a small body.
-async fn redact_reads_capped(req: Request, next: Next, cap: usize) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let full_view = crate::caller_is_local_or_holds_token(peer, req.headers());
     let resp = next.run(req).await;
@@ -694,20 +627,58 @@ async fn redact_reads_capped(req: Request, next: Next, cap: usize) -> Response {
     }
     let is_json = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
     let (mut parts, body) = resp.into_parts();
-    let withheld = || (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
-    let Ok(bytes) = axum::body::to_bytes(body, cap).await else { return withheld() };
-    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else { return withheld() };
-    let out = if is_json {
-        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
-        r.json(&mut value);
-        let Ok(out) = serde_json::to_vec(&value) else { return withheld() };
-        out
-    } else {
-        let Ok(text) = String::from_utf8(bytes.to_vec()) else { return withheld() };
-        r.line(&text).into_bytes()
+    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
     };
+    let redactor = if is_json { StreamRedactor::json(r) } else { StreamRedactor::text(r) };
     parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, axum::body::Body::from(out))
+    Response::from_parts(parts, axum::body::Body::from_stream(redacted_chunks(body, redactor)))
+}
+
+/// How much of an arriving chunk is redacted per output chunk, so a handler that
+/// builds its body in one piece still leaves the layer in pieces, not as a
+/// second copy of the response.
+const REDACT_SLICE_BYTES: usize = 64 * 1024;
+
+struct RedactState {
+    chunks: std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
+    redactor: StreamRedactor,
+    held: axum::body::Bytes,
+    done: bool,
+}
+
+/// The body's bytes, each slice redacted as it passes, then the flush of what
+/// the last one left pending. A body error ends the stream with that error.
+fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl futures::Stream<Item = Result<Vec<u8>, axum::Error>> {
+    use futures::StreamExt;
+    let state = RedactState { chunks: Box::pin(body.into_data_stream()), redactor, held: Default::default(), done: false };
+    futures::stream::unfold(state, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            let mut out = Vec::new();
+            if !st.held.is_empty() {
+                let slice = st.held.split_to(st.held.len().min(REDACT_SLICE_BYTES));
+                st.redactor.feed(&slice, &mut out);
+            } else {
+                match st.chunks.next().await {
+                    Some(Ok(bytes)) => st.held = bytes,
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(e), st));
+                    }
+                    None => {
+                        st.done = true;
+                        st.redactor.finish(&mut out);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Some((Ok(out), st));
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -780,7 +751,7 @@ mod tests {
         req.extensions_mut().insert(peer(from));
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status().as_u16();
-        let bytes = to_bytes(resp.into_body(), 16 * 1024 * 1024).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -1007,27 +978,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn json_keys_are_redacted_with_the_values() {
-        let r = rules();
-        let mut v = serde_json::json!({"peer 100.64.7.7": "x", "ok": {"/Users/someone/k": ["at 10.0.0.1"]}});
-        r.json(&mut v);
-        assert_eq!(v, serde_json::json!({format!("peer {ADDRESS_HIDDEN}"): "x", "ok": {"~/k": [format!("at {ADDRESS_HIDDEN}")]}}));
-    }
-
-    #[test]
-    fn two_keys_that_redact_alike_both_survive() {
-        let r = rules();
-        let mut v = serde_json::json!({"100.64.7.7": 1, "10.0.0.1": 2, "(address hidden)": 3, "ok": 4});
-        r.json(&mut v);
-        let o = v.as_object().unwrap();
-        assert_eq!(o.len(), 4, "{v}");
-        let mut got: Vec<i64> = o.values().map(|x| x.as_i64().unwrap()).collect();
-        got.sort();
-        assert_eq!(got, [1, 2, 3, 4]);
-        assert!(o.contains_key(ADDRESS_HIDDEN) && o.contains_key(&format!("{ADDRESS_HIDDEN} #2")) && o.contains_key(&format!("{ADDRESS_HIDDEN} #3")), "{v}");
-    }
-
     /// A bare roster host (`studio`) must not be found inside a longer word,
     /// and must be where it addresses, even as the whole string after `@`.
     #[test]
@@ -1063,34 +1013,6 @@ mod tests {
             }
         }
         assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
-    }
-
-    /// The cap bounds a remote read: a body over it is withheld (500) for a remote reader and a
-    /// body at it is redacted and served; a local reader is never capped (#3073).
-    #[tokio::test]
-    async fn a_remote_body_over_the_cap_is_withheld_and_one_at_it_is_served() {
-        const CAP: usize = 4096;
-        let body_of = |len: usize| format!("\"{}\"", "x".repeat(len - 2));
-        let app = |body: String| {
-            axum::Router::new()
-                .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
-                .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: Next| redact_reads_capped(req, next, CAP)))
-        };
-        let status = |app: axum::Router, from: &str| {
-            let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
-            req.extensions_mut().insert(peer(from));
-            async move { app.oneshot(req).await.unwrap().status().as_u16() }
-        };
-        assert_eq!(status(app(body_of(CAP)), REMOTE).await, 200, "a body at the cap is served");
-        assert_eq!(status(app(body_of(CAP + 1)), REMOTE).await, 500, "a body over the cap is withheld, not parsed");
-        assert_eq!(status(app(body_of(CAP + 1)), LOCAL).await, 200, "a local reader is never capped");
-    }
-
-    /// The real cap is derived from the read windows, so it holds a full flow day.
-    #[test]
-    fn the_body_cap_is_derived_from_the_read_windows() {
-        assert_eq!(MAX_REDACTED_BODY_BYTES, 4 * darkmux_flow::FLOW_READ_CAP_RECORDS * 1_600 * 125 / 100);
-        assert_eq!(MAX_REDACTED_BODY_BYTES, 80_000_000);
     }
 
     /// `CacheKey` follows a real `fleet.json` edit: a roster that changes between two
@@ -1153,6 +1075,57 @@ mod tests {
         assert_eq!(remote, format!("failed at {ADDRESS_HIDDEN} in ~/x"));
         let (_, local) = get(app, "/t", LOCAL).await;
         assert_eq!(local, "failed at 100.64.7.7 in /Users/someone/x");
+    }
+
+    /// A remote read has no size cap: a 100 MB JSON body is served, redacted, where the
+    /// parse-and-walk layer withheld anything over 80 MB (#3073).
+    #[tokio::test]
+    async fn a_remote_body_of_a_hundred_megabytes_is_served_redacted() {
+        let record = format!(r#"{{"peer":"{PEER_IP}","note":"{}"}}"#, "x".repeat(1400));
+        let n = 100_000_000 / record.len() + 1;
+        let body = format!("[{}]", vec![record.as_str(); n].join(","));
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, remote) = get(app.clone(), "/t", REMOTE).await;
+        assert_eq!(status, 200);
+        assert!(remote.len() > 100_000_000 && !remote.contains(PEER_IP), "served in full, redacted");
+        let (_, local) = get(app, "/t", LOCAL).await;
+        assert!(local.contains(PEER_IP), "a local reader sees it as built");
+    }
+
+    /// A handler that builds its body in one piece still leaves the layer in slices, so the
+    /// redacted copy is never a second whole response (#3073).
+    #[tokio::test]
+    async fn a_remote_body_leaves_the_layer_in_slices() {
+        use futures::StreamExt;
+        let record = format!(r#"{{"peer":"{PEER_IP}","note":"{}"}}"#, "x".repeat(1400));
+        let body = format!("[{}]", vec![record.as_str(); 2000].join(","));
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(REMOTE));
+        let mut chunks = app.oneshot(req).await.unwrap().into_body().into_data_stream();
+        let (mut largest, mut total) = (0, 0);
+        while let Some(c) = chunks.next().await {
+            let c = c.unwrap();
+            largest = largest.max(c.len());
+            total += c.len();
+        }
+        assert!(total > 2_000_000);
+        assert!(largest <= REDACT_SLICE_BYTES + record.len(), "a {largest} byte chunk");
+    }
+
+    /// A body that claims to be JSON and is not is redacted as text, never withheld or passed on.
+    #[tokio::test]
+    async fn a_malformed_json_reply_is_redacted_as_text_for_a_remote_reader() {
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(|| async { ([("content-type", "application/json")], "{\"a\": 100.64.7.7 /Users/someone/x") }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, remote) = get(app, "/t", REMOTE).await;
+        assert_eq!(status, 200);
+        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
     }
 
     /// A route registered anywhere but the route table escapes the layer. The
