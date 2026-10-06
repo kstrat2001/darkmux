@@ -116,7 +116,7 @@
   "src/main.rs::cmd_scan": 25,
   "src/main.rs::run": 22,
   "src/mission_config_cli.rs::render_show_text": 28,
-  "src/mission_launch.rs::launch": 106,
+  "src/mission_launch.rs::launch": 101,
   "src/mod_cli.rs::show": 16,
   "src/radio_busy.rs::router_wait_notice": 19,
   "src/role_cli.rs::role_show_at": 21,

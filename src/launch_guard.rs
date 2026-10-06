@@ -128,15 +128,8 @@ pub(crate) fn spawn_reap_watchdog() -> WatchdogStopGuard {
 
 /// RAII stop-flag for [`spawn_reap_watchdog`]'s background thread.
 ///
-/// **NOT shared with `mission_launch.rs` — it still has its own inline
-/// `WatchdogStopGuard` and its own inline spawn.** An earlier version of this
-/// comment claimed the migration had happened; it has not, and saying so was
-/// worse than the duplication, because it invited a reader to assume one
-/// definition governs both. The two bodies were diffed and are semantically
-/// identical, so migrating `mission_launch` onto this one is safe — but it is
-/// its own change, kept out of #2262's diff so a working launcher was not
-/// touched by a signal-handling fix. Until then these two must stay in sync by
-/// discipline, which is exactly the reason to do the migration.
+/// Shared across launchers and CLI entry points (`mission_launch.rs`, `main.rs`,
+/// `lab_cli.rs`, `radio_cli.rs`).
 pub(crate) struct WatchdogStopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for WatchdogStopGuard {
@@ -193,7 +186,9 @@ pub(crate) fn reap_and_exit_on_signal() {
         return;
     }
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-    std::process::exit(130);
+    // (#3073-P3-1) Exit with 128 + signo (e.g. 130 for SIGINT, 143 for SIGTERM).
+    let signo = darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT);
+    std::process::exit(128 + signo);
 }
 
 /// [`reap_and_exit_on_signal`] for a call site whose only remaining output

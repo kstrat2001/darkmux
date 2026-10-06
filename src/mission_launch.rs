@@ -337,23 +337,7 @@ pub(crate) fn run_bookend_record(
     run_record(level, config_id, run, payload)
 }
 
-/// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
-/// child-reaping watchdog thread — `Drop` sets the shared flag, so it
-/// fires on EVERY exit from `launch` (an early `?`-return, a panic, or
-/// the normal fall-through at the bottom) without needing a store call at
-/// each of that function's several return points. Without this, the
-/// watchdog thread spawned per `launch()` call ran for the rest of the
-/// PROCESS's lifetime (an interrupted run's reaping `loop` never exited;
-/// a clean run's waiting `while` never got a reason to either) — harmless
-/// on a real one-shot-per-invocation CLI process, but ~25 unit tests each
-/// leaving a background thread spinning is real, avoidable waste.
-struct WatchdogStopGuard(Arc<std::sync::atomic::AtomicBool>);
 
-impl Drop for WatchdogStopGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 /// The refusal every launch runs first: a stale or invalid user file the
 /// launch scope consumes (every effective user-tier mission config
@@ -855,6 +839,24 @@ pub fn launch(
             }
         };
 
+    // (#3074) The run's liveness bookend opens as soon as the mission is minted,
+    // so any post-mint error return (interpret, staffing check, unexecutable kinds)
+    // records run.error rather than leaving the run unclosed in the flow trail.
+    let mut run_sink = |record: flow::FlowRecord| {
+        let _ = flow::record(record);
+    };
+    let run_for_abort = run.clone();
+    let config_id_for_abort = config_id.to_string();
+    let mut bookend = flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
+        run_bookend_record(
+            flow::Edge::Error,
+            &config_id_for_abort,
+            &run_for_abort,
+            RunPayload::failed("run terminated before completion (early return or panic)"),
+        )
+    });
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
     // a bare `?` would leave the instance permanently Active with no envelope,
@@ -1014,6 +1016,10 @@ pub fn launch(
                  darkmux mission abort {mission_id})"
             ))
         );
+        bookend.close(
+            "run",
+            run_bookend_record(flow::Edge::Complete, config_id, &run, RunPayload::default()),
+        );
         return Ok(0);
     }
 
@@ -1050,6 +1056,15 @@ pub fn launch(
                  can run it end to end (exit code 4).",
                 unknown.join(", ")
             ))
+        );
+        bookend.close(
+            "run",
+            run_bookend_record(
+                flow::Edge::Error,
+                config_id,
+                &run,
+                RunPayload::failed(format!("unexecutable step kind(s): {}", unknown.join(", "))),
+            ),
         );
         return Ok(4);
     }
@@ -1144,35 +1159,9 @@ pub fn launch(
     // path that registers a pid without its own poll seam) rather than
     // the sole mechanism the paragraph above originally described it as.
     //
-    // (#2131 review round 2, item 5) Bounded: `watchdog_stop` (set by
-    // `WatchdogStopGuard`'s `Drop`, above — fires on every exit from this
-    // function) is re-checked in BOTH loops below, so this thread exits
-    // once this `launch()` call is over instead of running for the rest
-    // of the process's lifetime. And skipped entirely under `cfg(test)` —
-    // `cfg!(test)` is true for the WHOLE crate whenever it's built by
-    // `cargo test` (not just inside `#[cfg(test)] mod tests`), so none of
-    // this module's ~25 unit tests that call `launch()` spin up a
-    // watchdog thread they have no use for.
-    let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _watchdog_stop_guard = WatchdogStopGuard(Arc::clone(&watchdog_stop));
-    if !cfg!(test) {
-        let watchdog_stop = Arc::clone(&watchdog_stop);
-        std::thread::spawn(move || {
-            while !darkmux_types::interrupt::is_set() {
-                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            loop {
-                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
-    }
+    // (#3073-P3-4) Shared reap watchdog — bounded background thread that reaps
+    // children when an interrupt is observed.
+    let _watchdog_stop_guard = crate::launch_guard::spawn_reap_watchdog();
 
     // Real execution — start every real phase that has tasks, run the
     // scheduler against `registry` (built once, at the top of this function,
@@ -1235,30 +1224,7 @@ pub fn launch(
         None
     };
 
-    // (#1877 "no blind runs", contract 8) The run bookend, opened for EVERY
-    // config that reaches this point, whether its graph dispatches a model
-    // or only runs procedural/shell steps. Host samples are not this
-    // function's job: the one machine-scoped sampler writes them and a
-    // reader joins them to this run by `machine_uid` and time.
-    let mut run_sink = |record: flow::FlowRecord| {
-        let _ = flow::record(record);
-    };
-    let run_for_abort = run.clone();
-    let config_id_for_abort = config_id.to_string();
-    // The guard's Drop writes `run.error` for any exit between `open` and a
-    // matching `close` (contract 2: RAII on every exit path): an early
-    // `?`-return, or a panic. Every KNOWN exit below (the scheduler error,
-    // the coder-phase gate and the gate-less finish) closes it explicitly
-    // with the real outcome; Drop is the backstop for the unexpected case.
-    let mut bookend = flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
-        run_bookend_record(
-            flow::Edge::Error,
-            &config_id_for_abort,
-            &run_for_abort,
-            RunPayload::failed("run terminated before completion (early return or panic)"),
-        )
-    });
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+
     // (#2877, pre-PR review) The mission's own run session beats presence for
     // as long as the launch runs. Its executions beat only while a model call
     // is live, so during the steps between them (a summary, a mod wait, a test
@@ -2693,14 +2659,34 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
     let real_phase_ids: BTreeMap<String, String> = derive_phase_ids(mission_id, config);
 
     let mission_path = crew::lifecycle::mission_path(mission_id);
-    if mission_path.exists() {
-        bail!(
-            "mission launch: run id `{mission_id}` already exists on disk — this should be \
-             impossible (run ids are minted uniquely per launch, never derived from inputs, \
-             see `mint_run_id`); if you're hitting this, it's either a genuine id collision or \
-             a re-run against a copied/restored `.darkmux` directory. Rename or remove the \
-             existing record and relaunch — implicit reuse/reopen was removed in #1503."
-        );
+    if let Some(parent) = mission_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // (#3074) Atomic claim with create_new(true) (O_EXCL) prevents two launches
+    // racing on the same id from both passing an exists() check.
+    #[cfg(unix)]
+    let claim_res = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&mission_path)
+    };
+    #[cfg(not(unix))]
+    let claim_res = std::fs::OpenOptions::new().write(true).create_new(true).open(&mission_path);
+
+    match claim_res {
+        Ok(file) => drop(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "mission launch: run id `{mission_id}` already exists on disk — this should be \
+                 impossible (run ids are minted uniquely per launch, never derived from inputs, \
+                 see `mint_run_id`); if you're hitting this, it's either a genuine id collision or \
+                 a re-run against a copied/restored `.darkmux` directory. Rename or remove the \
+                 existing record and relaunch — implicit reuse/reopen was removed in #1503."
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("claiming {}", mission_path.display()));
+        }
     }
 
     let now = now_unix();
