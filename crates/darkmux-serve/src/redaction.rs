@@ -27,13 +27,34 @@ use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
 pub(crate) const ADDRESS_HIDDEN: &str = "(address hidden)";
+/// The windows one `GET /flow/:date` response can fill, each capped at
+/// `FLOW_READ_CAP_RECORDS`: the local day file's ring, its separate bookend
+/// ring (#2409), the Redis work stream and the Redis telemetry stream. The
+/// local and Redis views are unioned, so a response can hold all four in the
+/// worst case. That route is the largest body the layer sees (#3073).
+const FLOW_RESPONSE_WINDOWS: usize = 4;
+/// Bytes one flow record is budgeted at: the heaviest contiguous 10,000-record
+/// window in 14 day files on the laptop (410,759 records, whole-corpus mean 767 B;
+/// a 10k window peaked at 1,539 B per record, 2026-10-06), rounded up.
+const FLOW_RECORD_BUDGET_BYTES: usize = 1_600;
+/// Headroom over the budget, in percent, for a window heavier than any measured.
+const BODY_HEADROOM_PERCENT: usize = 125;
 /// The largest body the layer will re-read to redact; a bigger one is withheld,
-/// never passed through unfiltered. A parsed JSON `Value` is ~6.6x its text
-/// (measured 2026-10: 8 MiB of flow-shaped rows peaked +53 MiB), so 16 MiB bounds
-/// a remote read near 105 MiB, and holds the largest legitimate body (a
-/// `FLOW_READ_CAP_RECORDS` window of ~1 KiB records) with room to spare (#3073).
-const MAX_REDACTED_BODY_BYTES: usize = 16 * 1024 * 1024;
-const _: () = assert!(MAX_REDACTED_BODY_BYTES <= 16 * 1024 * 1024, "the cap bounds a remote read's parse memory (#3073)");
+/// never passed through unfiltered. Derived, not guessed (#3073):
+/// `FLOW_RESPONSE_WINDOWS x FLOW_READ_CAP_RECORDS x FLOW_RECORD_BUDGET_BYTES x 125%`
+/// = 80,000,000 bytes, so the largest legitimate body fits and a tokenless phone
+/// viewer on a busy day is not answered 500. A parsed JSON `Value` is ~6.6x its
+/// text (measured 2026-10: 8 MiB of flow-shaped rows peaked +53 MiB), so this
+/// bounds one remote read's parse peak near 500 MiB; the handler already holds
+/// the same records as `Value`s when it builds the body, so the layer doubles an
+/// amount the route itself carries rather than adding a new one.
+const MAX_REDACTED_BODY_BYTES: usize =
+    FLOW_RESPONSE_WINDOWS * darkmux_flow::FLOW_READ_CAP_RECORDS * FLOW_RECORD_BUDGET_BYTES * BODY_HEADROOM_PERCENT / 100;
+// The reviewed failure: one source's two windows (20,000 records, ~19.4 MiB) must fit.
+const _: () = assert!(
+    MAX_REDACTED_BODY_BYTES >= 2 * darkmux_flow::FLOW_READ_CAP_RECORDS * 1024,
+    "the body cap would 500 a remote read of a full flow day (#3073)"
+);
 /// How long a derived [`Redaction`] is reused. The key below catches a roster or
 /// directory change at once; this bounds staleness for what it does not cover
 /// (the fleet hub in the config, the machine id, a symlink repointed).
@@ -659,6 +680,12 @@ impl Redaction {
 /// anything else on a JSON route (a plain-text error) is redacted as text, so
 /// nothing passes through unfiltered. A body it cannot read is withheld (500).
 pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
+    redact_reads_capped(req, next, MAX_REDACTED_BODY_BYTES).await
+}
+
+/// [`redact_reads`] with the body cap as a parameter, so a test can reach the
+/// cap with a small body.
+async fn redact_reads_capped(req: Request, next: Next, cap: usize) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let full_view = crate::caller_is_local_or_holds_token(peer, req.headers());
     let resp = next.run(req).await;
@@ -668,7 +695,7 @@ pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
     let is_json = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
     let (mut parts, body) = resp.into_parts();
     let withheld = || (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_REDACTED_BODY_BYTES).await else { return withheld() };
+    let Ok(bytes) = axum::body::to_bytes(body, cap).await else { return withheld() };
     let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else { return withheld() };
     let out = if is_json {
         let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
@@ -1038,19 +1065,63 @@ mod tests {
         assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
     }
 
+    /// The cap bounds a remote read: a body over it is withheld (500) for a remote reader and a
+    /// body at it is redacted and served; a local reader is never capped (#3073).
     #[tokio::test]
-    async fn a_remote_body_over_sixteen_mib_is_withheld_not_parsed() {
-        // #3073: a JSON Value is ~6.6x its text (measured, 8 MiB of flow-shaped
-        // rows peaked +53 MiB), so the cap is what bounds a remote read's memory.
-        let big = format!("\"{}\"", "x".repeat(17 * 1024 * 1024));
-        let app = axum::Router::new()
-            .route("/t", axum::routing::get(move || { let b = big.clone(); async move { ([("content-type", "application/json")], b) } }))
-            .layer(axum::middleware::from_fn(redact_reads));
-        let (status, _) = get(app.clone(), "/t", REMOTE).await;
-        assert_eq!(status, 500, "a remote reader's body over the cap is withheld");
-        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(peer(LOCAL));
-        assert_eq!(app.oneshot(req).await.unwrap().status().as_u16(), 200, "a local reader is never capped");
+    async fn a_remote_body_over_the_cap_is_withheld_and_one_at_it_is_served() {
+        const CAP: usize = 4096;
+        let body_of = |len: usize| format!("\"{}\"", "x".repeat(len - 2));
+        let app = |body: String| {
+            axum::Router::new()
+                .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+                .layer(axum::middleware::from_fn(|req: axum::extract::Request, next: Next| redact_reads_capped(req, next, CAP)))
+        };
+        let status = |app: axum::Router, from: &str| {
+            let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(peer(from));
+            async move { app.oneshot(req).await.unwrap().status().as_u16() }
+        };
+        assert_eq!(status(app(body_of(CAP)), REMOTE).await, 200, "a body at the cap is served");
+        assert_eq!(status(app(body_of(CAP + 1)), REMOTE).await, 500, "a body over the cap is withheld, not parsed");
+        assert_eq!(status(app(body_of(CAP + 1)), LOCAL).await, 200, "a local reader is never capped");
+    }
+
+    /// The real cap is derived from the read windows, so it holds a full flow day.
+    #[test]
+    fn the_body_cap_is_derived_from_the_read_windows() {
+        assert_eq!(MAX_REDACTED_BODY_BYTES, 4 * darkmux_flow::FLOW_READ_CAP_RECORDS * 1_600 * 125 / 100);
+        assert_eq!(MAX_REDACTED_BODY_BYTES, 80_000_000);
+    }
+
+    /// `CacheKey` follows a real `fleet.json` edit: a roster that changes between two
+    /// `derive_cached` calls inside the TTL is read again (#3073).
+    #[test]
+    #[serial_test::serial]
+    fn derive_cached_follows_an_edit_to_the_real_fleet_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = dir.path().join("fleet.json");
+        let roster = |address: &str| {
+            format!(r#"{{"version":"2","machines":{{"peerone":{{"id":"peerone","address":"{address}","added_unix_ms":1}}}}}}"#)
+        };
+        let saved = std::env::var_os("DARKMUX_FLEET_FILE");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &fleet) };
+        *REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+        std::fs::write(&fleet, roster("alpha.example:8765")).unwrap();
+        let first = Redaction::derive_cached();
+        assert!(!first.line("see alpha.example").contains("alpha.example"), "the first roster's address is hidden");
+        assert!(first.line("see beta.example").contains("beta.example"), "an address not in the roster is not");
+
+        // A longer address, so the length half of the key differs even on a coarse mtime.
+        std::fs::write(&fleet, roster("beta.example.longer:8765")).unwrap();
+        let second = Redaction::derive_cached();
+        assert!(!second.line("see beta.example.longer").contains("beta.example.longer"), "the edit is picked up inside the TTL");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+        *REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     #[test]
