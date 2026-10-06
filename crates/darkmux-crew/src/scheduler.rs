@@ -2888,10 +2888,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn run_step_graph_starts_no_wave_after_a_signal() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         let (task_a, step_a) = task_and_step("a", &[]);
         let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
         darkmux_types::interrupt::reset_for_test();
-        darkmux_types::interrupt::mark_interrupted();
+        darkmux_types::interrupt::raise_for_test();
         let report = run_test_graph(&tasks, &mut steps);
         darkmux_types::interrupt::reset_for_test();
         assert!(report.completed.is_empty(), "no step may complete after the signal: {report:?}");
@@ -3936,13 +3938,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_record_only_kind_still_runs_after_a_signal_and_an_ordinary_one_does_not() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         let (tr, sr) = kinded_step("rec", "test.record_only", json!({}), &[]);
         let (tn, sn) = task_and_step("ord", &[]);
         let (tasks, mut steps) = graph(vec![(tr, sr), (tn, sn)]);
         let kinds = StepKindRegistry::with_builtins();
         kinds.register(Arc::new(RecordOnlyKind)).unwrap();
         darkmux_types::interrupt::reset_for_test();
-        darkmux_types::interrupt::mark_interrupted();
+        darkmux_types::interrupt::raise_for_test();
         let run = run_step_graph(
             &crate::test_run(),
             &mut steps,

@@ -240,13 +240,36 @@ pub fn mark_interrupted() {
 /// feature on its dev-dependency to reach this.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sigint_for_test() {
+    assert_own_process();
     on_sigint(libc::SIGINT);
+}
+
+/// (#3100) Test-only: raise the flag the way [`mark_interrupted`] does, from
+/// a test that runs in a process of its own. The flag is read by code every
+/// other test in a shared `cargo test` process runs (the scheduler starts no
+/// wave once it is set), so a test raising it there fails its neighbors.
+#[cfg(any(test, feature = "test-support"))]
+pub fn raise_for_test() {
+    assert_own_process();
+    mark_interrupted();
+}
+
+/// (#3100) The guard every test-only raiser runs: refuse to raise the
+/// process-wide flag where other tests share the process.
+#[cfg(any(test, feature = "test-support"))]
+fn assert_own_process() {
+    assert!(
+        crate::test_isolation::is_own_process(),
+        "a test that raises the process-wide interrupt flag must run in a process of its own: \
+         start it with `darkmux_types::run_in_own_process!();` (#3100)"
+    );
 }
 
 /// (#2124) Test-only: deliver a simulated SIGTERM the same way
 /// [`simulate_sigint_for_test`] delivers a simulated SIGINT.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sigterm_for_test() {
+    assert_own_process();
     on_sigterm(libc::SIGTERM);
 }
 
@@ -254,6 +277,7 @@ pub fn simulate_sigterm_for_test() {
 /// [`simulate_sigint_for_test`] delivers a simulated SIGINT.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sighup_for_test() {
+    assert_own_process();
     on_sighup(libc::SIGHUP);
 }
 
@@ -308,6 +332,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn is_set_reflects_a_raised_flag() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         // Reset for test isolation — other tests in this binary may have
         // already set the process-wide flag via a real SIGINT delivery
         // (there won't be one in CI, but the store is here for hygiene).
@@ -323,6 +349,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn bail_if_set_errs_with_the_marker_once_interrupted() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         reset_for_test();
         assert!(bail_if_set("before wave").is_ok());
         mark_interrupted();
@@ -342,6 +370,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mark_interrupted_sets_the_flag_without_touching_sigint_disposition() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         INTERRUPTED.store(false, Ordering::SeqCst);
         let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
         assert_eq!(before, libc::SIG_DFL, "SIGINT must already be at its default disposition before this test runs");
@@ -372,6 +402,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn second_sigint_restores_default_disposition_so_a_third_ctrl_c_kills_normally() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         INTERRUPTED.store(false, Ordering::SeqCst);
         SIGINT_COUNT.store(0, Ordering::SeqCst);
         install();
@@ -403,6 +435,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn signal_handlers_record_received_signal_number() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         reset_for_test();
         assert_eq!(received_signal(), None);
 

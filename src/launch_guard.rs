@@ -530,6 +530,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_bound_firing_after_an_operator_signal_is_not_recorded_as_the_cause() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         reset_wall_clock_exceeded_for_test();
         darkmux_types::interrupt::reset_for_test();
         darkmux_types::interrupt::simulate_sigterm_for_test();
@@ -641,6 +643,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn arm_installs_real_sigterm_and_sighup_handlers() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
         let _restore = RestoreSignalsGuard;
         arm();

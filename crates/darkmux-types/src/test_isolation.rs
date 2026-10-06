@@ -920,8 +920,238 @@ pub fn process_scratch_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+/// (#3100) Set on a test binary that [`rerun_in_own_process`] started, so the
+/// re-run knows it is the one test in its process and runs the body.
+pub const OWN_PROCESS_VAR: &str = "DARKMUX_TEST_OWN_PROCESS";
+
+/// (#3100) Whether this process runs exactly one test: nextest's
+/// process-per-test mode, or a child [`rerun_in_own_process`] started. Plain
+/// `cargo test` (which cargo-mutants uses) runs every test of a binary as a
+/// thread in ONE process, so there this is false.
+pub fn is_own_process() -> bool {
+    own_process_from(
+        std::env::var_os(OWN_PROCESS_VAR).is_some(),
+        std::env::var("NEXTEST_EXECUTION_MODE").ok().as_deref(),
+    )
+}
+
+fn own_process_from(rerun_child: bool, nextest_mode: Option<&str>) -> bool {
+    rerun_child || nextest_mode == Some("process-per-test")
+}
+
+/// (#3100) Run the test named `test` (its libtest path, without the crate
+/// name) in a process of its own, and report whether the CALLER should run
+/// the body: `true` when this process already holds only this test, `false`
+/// after a child ran it and passed. A failing child fails the caller with the
+/// child's output.
+///
+/// For a test that changes process-global state another test's code READS,
+/// so concurrent tests cannot see it: the interrupt flag is the case it was
+/// built for, read by the scheduler, the shell-step runner, the dispatch
+/// tailer and more. Use it through [`run_in_own_process!`](crate::run_in_own_process).
+///
+/// # Panics
+///
+/// When the child fails, or when it ran anything but exactly one passing
+/// test: a name that matched nothing would otherwise pass without running.
+pub fn rerun_in_own_process(test: &str) -> bool {
+    if is_own_process() {
+        return true;
+    }
+    let exe = std::env::current_exe().expect("the running test binary has a path");
+    let out = std::process::Command::new(exe)
+        .args([test, "--exact", "--test-threads=1"])
+        .env(OWN_PROCESS_VAR, "1")
+        .output()
+        .expect("re-running the test binary for one test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && ran_exactly_one_passing_test(&stdout),
+        "`{test}` failed in its own process ({}):\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+/// Whether a libtest run's summary line says one test ran and passed.
+fn ran_exactly_one_passing_test(stdout: &str) -> bool {
+    stdout.lines().any(|l| l.starts_with("test result: ok. 1 passed; 0 failed;"))
+}
+
+/// (#3100) The libtest name of the test function a macro expanded in, from
+/// the `type_name` of a fn item declared inside it: the crate name and the
+/// marker item are dropped, and so is any `{{closure}}` frame an attribute
+/// such as `#[serial]` wraps the body in.
+#[doc(hidden)]
+pub fn test_name_from_marker(marker: &str) -> String {
+    let path = marker.rsplit_once("::").map_or(marker, |(p, _)| p);
+    let path = path.split_once("::").map_or(path, |(_, rest)| rest);
+    path.split("::").filter(|s| *s != "{{closure}}").collect::<Vec<_>>().join("::")
+}
+
+/// (#3100) Make the rest of this test run in a process of its own (see
+/// [`test_isolation::rerun_in_own_process`](crate::test_isolation::rerun_in_own_process)).
+/// The FIRST statement of a `()`-returning `#[test]` fn: in a shared process
+/// it re-runs this test alone and returns; in the re-run (or under nextest)
+/// it does nothing and the body runs.
+#[macro_export]
+macro_rules! run_in_own_process {
+    () => {{
+        fn own_process_marker() {}
+        let test = $crate::test_isolation::test_name_from_marker(::std::any::type_name_of_val(&own_process_marker));
+        if !$crate::test_isolation::rerun_in_own_process(&test) {
+            return;
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
+    /// (#3100) The re-run's own name for this test, derived the way the macro
+    /// derives it, is the name libtest knows it by.
+    #[test]
+    fn a_marker_path_names_the_enclosing_test() {
+        assert_eq!(
+            super::test_name_from_marker("darkmux_crew::scheduler::tests::the_test::own_process_marker"),
+            "scheduler::tests::the_test"
+        );
+        assert_eq!(
+            super::test_name_from_marker("cli::the_test::{{closure}}::own_process_marker"),
+            "the_test"
+        );
+        fn own_process_marker() {}
+        assert_eq!(
+            super::test_name_from_marker(std::any::type_name_of_val(&own_process_marker)),
+            "test_isolation::tests::a_marker_path_names_the_enclosing_test"
+        );
+    }
+
+    /// (#3100) Only nextest's process-per-test mode or a re-run child count
+    /// as a process of one's own; plain `cargo test` does not.
+    #[test]
+    fn only_a_rerun_child_or_process_per_test_is_its_own_process() {
+        assert!(super::own_process_from(true, None));
+        assert!(super::own_process_from(false, Some("process-per-test")));
+        assert!(!super::own_process_from(false, None));
+        assert!(!super::own_process_from(false, Some("something-else")));
+    }
+
+    /// (#3100) A child that ran zero tests (a name that matched nothing)
+    /// exits 0 but must not read as a pass.
+    #[test]
+    fn a_run_that_matched_no_test_is_not_a_pass() {
+        assert!(super::ran_exactly_one_passing_test(
+            "running 1 test\ntest a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
+        ));
+        assert!(!super::ran_exactly_one_passing_test(
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\n"
+        ));
+    }
+
+    /// (#3100) The macro re-runs the test and the re-run sees itself as its
+    /// own process; a body that ran in a shared process fails here.
+    #[test]
+    fn the_macro_runs_the_body_only_in_a_process_of_its_own() {
+        crate::run_in_own_process!();
+        assert!(super::is_own_process(), "the body ran in a shared process");
+    }
+
+    /// Calls that raise the process-wide interrupt flag. The test-only
+    /// raisers also refuse at run time outside a process of their own; the
+    /// production ones (`mark_interrupted` and the shutdown paths that call
+    /// it, and `arm()`, after which a real signal raises it) cannot, so this
+    /// scan is their guard.
+    const RAISERS: &[&str] = &[
+        "mark_interrupted(",
+        "raise_for_test(",
+        "simulate_sigint_for_test(",
+        "simulate_sigterm_for_test(",
+        "simulate_sighup_for_test(",
+        "on_sigint(",
+        "on_sigterm(",
+        "on_sighup(",
+        "reap_dispatch_children_on_shutdown(",
+        "reap_on_host_shutdown(",
+        "mark_bound_fired(",
+        " arm();",
+    ];
+
+    /// Every `#[test]` fn in `src`, as (name, body). A body ends at the first
+    /// line that is the fn line's own indentation followed by `}`.
+    fn test_fns(src: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut pending = false;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("#[test]") || t.starts_with("#[tokio::test") {
+                pending = true;
+                continue;
+            }
+            let Some(sig) = t.strip_prefix("async fn ").or_else(|| t.strip_prefix("fn ")).filter(|_| pending) else {
+                continue;
+            };
+            pending = false;
+            let close = format!("{}}}", &line[..line.len() - t.len()]);
+            let body: Vec<&str> = lines[i..].iter().take_while(|l| **l != close).copied().collect();
+            out.push((sig.split('(').next().unwrap_or_default().to_string(), body.join("\n")));
+        }
+        out
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.file_name().is_some_and(|n| n != "target") {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// (#3100) Every test that raises the process-wide interrupt flag runs in
+    /// a process of its own. Plain `cargo test` (cargo-mutants' runner) runs a
+    /// binary's tests as threads of ONE process, and the flag is read by the
+    /// scheduler (no wave starts once it is set), the shell-step runner, the
+    /// dispatch tailer, the lab and crawl error paths and the launch guard: a
+    /// raise in a shared process failed an unrelated scheduler test in CI.
+    #[test]
+    fn every_test_that_raises_the_interrupt_flag_runs_in_its_own_process() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for dir in ["src", "tests"] {
+            rust_files(&root.join(dir), &mut files);
+        }
+        for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+            rust_files(&krate.path().join("src"), &mut files);
+            rust_files(&krate.path().join("tests"), &mut files);
+        }
+        assert!(files.len() > 100, "the scan found only {} files under {}", files.len(), root.display());
+        let this_file = std::path::Path::new(file!()).file_name().unwrap();
+        let mut raising = 0;
+        let mut offenders = Vec::new();
+        for f in files.iter().filter(|f| f.file_name() != Some(this_file)) {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            for (name, body) in test_fns(&src) {
+                if RAISERS.iter().any(|r| body.contains(r)) {
+                    raising += 1;
+                    if !body.contains("run_in_own_process!()") {
+                        offenders.push(format!("{}: {name}", f.display()));
+                    }
+                }
+            }
+        }
+        assert!(raising >= 10, "the scan saw only {raising} raising tests; it has stopped finding them");
+        assert!(
+            offenders.is_empty(),
+            "these tests raise the process-wide interrupt flag without `run_in_own_process!()`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// A spawned darkmux refuses to start while a retired or renamed
     /// setting's env var is set, so the guard must clear every one of them.
     #[test]

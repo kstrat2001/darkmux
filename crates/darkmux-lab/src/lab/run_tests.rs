@@ -437,9 +437,11 @@ fn a_provider_error_fails_the_run_and_the_batch_goes_on() {
 #[test]
 #[serial_test::serial]
 fn a_provider_error_under_a_signal_records_the_run_interrupted() {
+    // (#3100) It raises the process-wide interrupt flag.
+    darkmux_types::run_in_own_process!();
     let lab = Lab::scripted(&["wi"]);
     script(Script { run_err: true, ..Default::default() });
-    darkmux_types::interrupt::mark_interrupted();
+    darkmux_types::interrupt::raise_for_test();
     let err = lab.run("wi", 1).unwrap_err();
     darkmux_types::interrupt::reset_for_test();
     assert_eq!(err.to_string(), "scripted run failure");
