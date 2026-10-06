@@ -1066,9 +1066,9 @@ mod tests {
         assert_eq!(derives.get(), 2, "a changed fleet.json derives again");
         let mut other_home = key(2);
         other_home.home = Some("/other".into());
-        cache.get(other_home, now, derive);
+        cache.get(other_home.clone(), now, derive);
         assert_eq!(derives.get(), 3, "a changed HOME derives again");
-        cache.get(key(2), now + REDACTION_CACHE_TTL, derive);
+        cache.get(other_home, now + REDACTION_CACHE_TTL, derive);
         assert_eq!(derives.get(), 4, "an aged entry derives again, so a hub or machine-id change still lands");
     }
 
