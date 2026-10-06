@@ -757,7 +757,27 @@ pub fn lmstudio_chat_url(base: &str) -> String {
 /// The authority of `url` with any userinfo stripped: `https://tok@h:1/p`
 /// → `h:1`. `None` when `url` has no `scheme://`.
 pub fn url_host(url: &str) -> Option<String> {
-    Some(crate::url_authority::UrlAuthority::parse(url)?.hostport().to_string())
+    let (_, rest) = url.split_once("://")?;
+    // (#3079) The transport ends the authority at the first `/`, `?` or `#`;
+    // userinfo is then everything before the authority's last `@`. Malformed
+    // userinfo (a delimiter inside it) leaves a non-host remainder: `None`.
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    is_hostport(hostport).then(|| hostport.to_string())
+}
+
+/// A valid host (a bracketed IPv6 literal, or `[A-Za-z0-9._-]+`) plus an
+/// optional numeric port.
+fn is_hostport(s: &str) -> bool {
+    let (host_ok, port) = if let Some(v6) = s.strip_prefix('[') {
+        let Some((inner, tail)) = v6.split_once(']') else { return false };
+        let port = if tail.is_empty() { None } else { Some(tail.strip_prefix(':')) };
+        (inner.contains(':') && inner.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.')), port)
+    } else {
+        let (host, port) = s.rsplit_once(':').map_or((s, None), |(h, p)| (h, Some(Some(p))));
+        (!host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')), port)
+    };
+    host_ok && port.is_none_or(|p| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
 }
 
 /// (#3035) Why `limits.concurrent_calls` is refused on a managed endpoint.
@@ -1047,9 +1067,21 @@ mod tests {
         assert_eq!(ep.host().as_deref(), Some("proxy.example:8443"));
         assert_eq!(ModelEndpoint::managed_lmstudio().host(), None);
         assert_eq!(url_host("no-scheme.example/v1"), None);
-        // (#3074) Userinfo holding a delimiter still resolves to the real host.
-        assert_eq!(url_host("https://tok:pa/ss@proxy.example:8443/v1").as_deref(), Some("proxy.example:8443"));
-        assert_eq!(url_host("https://tok:pa?ss@proxy.example/v1").as_deref(), Some("proxy.example"));
+    }
+
+    /// (#3079) The transport ends the authority at the FIRST `/`, `?` or `#`,
+    /// so an `@` in the path is path, and userinfo holding a delimiter is a
+    /// malformed authority that fails closed (labeled "remote"), not a host
+    /// found past the delimiter.
+    #[test]
+    fn url_host_ends_the_authority_at_the_first_delimiter_like_the_transport() {
+        assert_eq!(url_host("http://127.0.0.1:1234/gw/models@latest/v1").as_deref(), Some("127.0.0.1:1234"));
+        assert_eq!(url_host("http://u:p@h:1/x").as_deref(), Some("h:1"));
+        assert_eq!(url_host("http://u@h@h2:9/x").as_deref(), Some("h2:9"));
+        assert_eq!(url_host("http://[::1]:8080/v1").as_deref(), Some("[::1]:8080"));
+        for malformed in ["http://tok:pa/ss@h/", "https://tok:pa?ss@proxy.example/v1", "http://tok:pa#ss@h/", "http://h:notaport/x", "http:///x"] {
+            assert_eq!(url_host(malformed), None, "{malformed}");
+        }
     }
 
     #[test]
