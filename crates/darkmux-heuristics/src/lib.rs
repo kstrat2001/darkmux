@@ -109,6 +109,7 @@ impl Architecture {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SizeBucket {
+    Unknown,
     Tiny,   // < 8B
     Small,  // 8 – 15B
     Medium, // 15 – 50B
@@ -120,6 +121,7 @@ impl SizeBucket {
     /// Row of this bucket in a [`RulesTable`].
     const fn row(self) -> usize {
         match self {
+            SizeBucket::Unknown => 0,
             SizeBucket::Tiny => 0,
             SizeBucket::Small => 1,
             SizeBucket::Medium => 2,
@@ -130,6 +132,7 @@ impl SizeBucket {
 
     fn label(self) -> &'static str {
         match self {
+            SizeBucket::Unknown => "unknown-size",
             SizeBucket::Tiny => "tiny",
             SizeBucket::Small => "small",
             SizeBucket::Medium => "medium",
@@ -208,8 +211,17 @@ pub fn parse_param_bucket(params: &str) -> Option<SizeBucket> {
     let lower = params.to_ascii_lowercase();
     // Strip trailing "B" / "b" then parse as float
     let stripped = lower.trim_end_matches('b').trim();
-    let parsed: f32 = stripped.parse().ok()?;
-    Some(bucket_from_billions(parsed))
+    if let Ok(parsed) = stripped.parse::<f32>() {
+        return Some(bucket_from_billions(parsed));
+    }
+    // Handle MoE or compound formats like "35B-A3B", "35b-a3b"
+    if let Some((first, _)) = stripped.split_once('-') {
+        let first = first.trim().trim_end_matches('b').trim();
+        if let Ok(parsed) = first.parse::<f32>() {
+            return Some(bucket_from_billions(parsed));
+        }
+    }
+    None
 }
 
 fn bucket_from_billions(b: f32) -> SizeBucket {
@@ -230,6 +242,9 @@ fn bucket_from_billions(b: f32) -> SizeBucket {
 /// approximation only. ~1 byte per param at 4-bit quantization is the
 /// rule of thumb; double for 8-bit.
 fn classify_size_from_bytes(bytes: u64) -> SizeBucket {
+    if bytes == 0 {
+        return SizeBucket::Unknown;
+    }
     let gb = bytes / (1024 * 1024 * 1024);
     if gb < 8 {
         SizeBucket::Tiny
@@ -383,7 +398,10 @@ pub fn suggest_profile_for(
 ) -> ProfileSuggestion {
     let bucket = classify_size_from_meta(meta);
     let arch = classify_architecture(meta);
-    let max_ctx = meta.max_context_length.unwrap_or(32_000);
+    let (max_ctx, ctx_unknown) = match meta.max_context_length {
+        Some(c) => (c, false),
+        None => (32_000, true),
+    };
 
     let provider = active_provider(hw);
     let RuleResult { primary_n_ctx, compactor: compactor_raw } =
@@ -410,6 +428,18 @@ pub fn suggest_profile_for(
     ));
     for extra in provider.extra_notes() {
         notes.push((*extra).to_string());
+    }
+    if bucket == SizeBucket::Unknown {
+        notes.push(
+            "Model size is unknown (no parseable params or disk size) — defaulted to tiny rules; verify before relying on this."
+                .to_string(),
+        );
+    }
+    if ctx_unknown {
+        notes.push(
+            "Model does not declare maxContextLength — defaulted context limit to 32,000 for suggestion; adjust if needed."
+                .to_string(),
+        );
     }
     if max_ctx < primary_n_ctx {
         notes.push(format!(
@@ -729,6 +759,29 @@ mod tests {
         assert_eq!(parse_param_bucket("70B"), Some(SizeBucket::Large));
         assert_eq!(parse_param_bucket("120B"), Some(SizeBucket::Xl));
         assert_eq!(parse_param_bucket("122B"), Some(SizeBucket::Xl));
+        assert_eq!(parse_param_bucket("35B-A3B"), Some(SizeBucket::Medium));
+        assert_eq!(parse_param_bucket("8x7B"), None);
+    }
+
+    #[test]
+    fn unknown_size_and_context_are_disclosed_in_notes() {
+        let m = meta("mystery-model", None, None, 0, 0);
+        let mut m_no_ctx = m.clone();
+        m_no_ctx.max_context_length = None;
+        assert_eq!(classify_size_from_meta(&m_no_ctx), SizeBucket::Unknown);
+
+        let s = suggest_profile_for(&m_no_ctx, TaskClass::Fast, &apple_silicon_128gb());
+        assert!(s.description.contains("unknown-size"), "desc: {}", s.description);
+        assert!(
+            s.notes.iter().any(|n| n.contains("Model size is unknown")),
+            "notes should name unknown size: {:?}",
+            s.notes
+        );
+        assert!(
+            s.notes.iter().any(|n| n.contains("does not declare maxContextLength")),
+            "notes should name unknown context: {:?}",
+            s.notes
+        );
     }
 
     #[test]
