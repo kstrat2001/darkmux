@@ -265,9 +265,11 @@ pub struct CardBatteryGate {
     /// `power.pause_running_below_min`.
     pub pause_running_below_min: bool,
     /// The start decision at the current reading: `true` when a new run would
-    /// be refused, `false` when it would not (including a machine with no
-    /// battery). `null` when nothing was observed: no host sampler ran in
-    /// the process that built the card, so no decision was made.
+    /// be refused, `false` when it would not. `null` when no battery reading
+    /// was observed: no host sampler ran in the process that built the card,
+    /// or the probe reported no battery. The probe cannot tell a machine with
+    /// no battery from a failed read, so a desktop publishes `null`, never
+    /// a confident `false`.
     pub refusing_start: Option<bool>,
 }
 
@@ -499,8 +501,11 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
         state: b.state,
         minutes_to_empty: b.minutes_to_empty,
     });
-    let refusing_start =
-        now.map(|_| matches!(power_policy::start_decision(sample.as_ref(), cfg), StartDecision::Refuse(_)));
+    // (#3074) When there is no battery sample (or probe failed), publish
+    // refusing_start as None so viewers render unknown rather than a confident false.
+    let refusing_start = sample
+        .as_ref()
+        .map(|s| matches!(power_policy::start_decision(Some(s), cfg), StartDecision::Refuse(_)));
     CardGovernor {
         thermal: now.and_then(|n| n.thermal.clone()),
         battery,
@@ -836,12 +841,11 @@ pub(crate) mod tests {
         assert_eq!(card_governor(Some(&now(None, Some(charge(50)))), &cfg(true)).battery_gate.refusing_start, Some(false), "at the floor starts");
     }
 
-    /// A machine with a sample but no battery has nothing to refuse (a
-    /// decision: `false`); a process that never sampled made no decision
-    /// (`null`), and the card must not say `false` for it.
+    /// (#3074) A machine with no battery sample (or probe failed) has no
+    /// measurement, so refusing_start is `None` (`null`), not a confident `false`.
     #[test]
     fn a_gate_nobody_measured_is_not_observed_rather_than_false() {
-        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, Some(false));
+        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, None);
         let nothing = card_governor(None, &cfg(true));
         assert!(nothing.thermal.is_none() && nothing.battery.is_none());
         assert_eq!(nothing.battery_gate.refusing_start, None);
