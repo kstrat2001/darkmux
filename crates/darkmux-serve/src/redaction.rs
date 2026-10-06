@@ -33,6 +33,7 @@ pub(crate) const ADDRESS_HIDDEN: &str = "(address hidden)";
 /// a remote read near 105 MiB, and holds the largest legitimate body (a
 /// `FLOW_READ_CAP_RECORDS` window of ~1 KiB records) with room to spare (#3073).
 const MAX_REDACTED_BODY_BYTES: usize = 16 * 1024 * 1024;
+const _: () = assert!(MAX_REDACTED_BODY_BYTES <= 16 * 1024 * 1024, "the cap bounds a remote read's parse memory (#3073)");
 /// How long a derived [`Redaction`] is reused. The key below catches a roster or
 /// directory change at once; this bounds staleness for what it does not cover
 /// (the fleet hub in the config, the machine id, a symlink repointed).
@@ -1070,11 +1071,6 @@ mod tests {
         assert_eq!(derives.get(), 3, "a changed HOME derives again");
         cache.get(other_home, now + REDACTION_CACHE_TTL, derive);
         assert_eq!(derives.get(), 4, "an aged entry derives again, so a hub or machine-id change still lands");
-    }
-
-    #[test]
-    fn the_body_cap_stays_within_the_measured_memory_budget() {
-        assert!(MAX_REDACTED_BODY_BYTES <= 16 * 1024 * 1024);
     }
 
     #[tokio::test]

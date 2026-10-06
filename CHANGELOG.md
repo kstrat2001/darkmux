@@ -61,6 +61,12 @@ darkmux release.
   `tests/cli-json.golden` regenerated for the new field).
 
 ### Fixed (5.0): isolation
+- **A remote read's redaction is cached, its body cap is 16 MiB, and the serve token compares as digests** (#3073).
+  The redaction layer reloaded `fleet.json` and canonicalized the home directories on
+  every remote request; it now reuses the last derivation while `fleet.json`'s mtime and
+  length, `HOME` and `DARKMUX_HOME` are unchanged (10 s at most). A parsed JSON body is
+  about 6.6 times its text, so the cap fell from 64 MiB to 16 MiB; a larger remote body
+  is withheld, as before. A wrong-length bearer token no longer returns early.
 
 - **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
   The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
