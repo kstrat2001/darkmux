@@ -6566,55 +6566,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
-            if let Some(window) = load_window {
-                if used_fallback {
-                    eprintln!(
-                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
-                         `internal.utility`; loading it at the primary model's context window \
-                         ({window}) as a fallback. Declare it once, for every profile: \
-                         `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
-                         in ~/.darkmux/profiles.json. (#1616, #2914)"
-                    );
-                }
-                // (#2536) `apply_compactor_residency` both ensures residency
-                // (delegating to `ensure_utility_resident`, unchanged) AND
-                // WRITES `compaction.compactor_model` — the SAME darkmux-
-                // namespaced identifier the residency load just created (or
-                // reused) it under, mirroring `managed_wire_model`'s
-                // treatment of the main dispatch model (#2240). Pre-#2536, this
-                // field kept whatever spelling `internal.utility` used (#1615
-                // tolerates a bare key OR an already-namespaced identifier), so
-                // an operator who wrote the bare key got a compactor LOADED
-                // under `darkmux:<key>` but ADDRESSED as `<key>` on the wire —
-                // the exact split #2240 closed one binding over.
-                //
-                // (#2536 review, blocker 1) The ASSIGNMENT lives INSIDE that
-                // function deliberately. The first cut of this fix left it here
-                // as a bare `compaction.compactor_model = wire_id;` beside a
-                // helper that merely RETURNED the id — and neutering that one
-                // statement to `let _ = wire_id;` restored the pre-fix bug
-                // verbatim while all 1559 tests stayed green, because every test
-                // stopped at the helper's return value. Moving the write into
-                // the tested function is what makes the effect observable.
-                //
-                // Still NOT covered, stated plainly: deleting this whole call
-                // compiles and stays green. Everything past it crosses the
-                // docker-spawn boundary, so covering it needs a dispatch()-level
-                // integration test this crate does not have — and the mock-model
-                // harness cannot supply one, since the enclosing
-                // `model_base_url_override.is_none()` gate skips this block.
-                // (#2914 review, C5) The compactor's window is the binding's
-                // (or the named fallback); the load message says which.
-                let source = if used_fallback { WindowSource::UtilityFallback } else { WindowSource::UtilityBinding };
-                if let Some(warning) = apply_compactor_residency(
-                    &mut compaction,
-                    &compactor_id,
-                    window,
-                    |pm| ensure_model_loaded_at_ctx_from(pm, source),
-                ) {
-                    eprintln!("{warning}");
-                }
-            }
+            let _ = apply_compactor_setup(
+                &mut compaction,
+                &compactor_id,
+                load_window,
+                used_fallback,
+                ensure_model_loaded_at_ctx_from,
+            );
         } else if let Some(warning) = compaction.unset_compactor_warning() {
             // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
             // all the way through `from_profile` + `apply_utility_model` —
@@ -12664,6 +12622,62 @@ pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
 /// would silently JIT-load at the wrong context (the #1135 ghost). See
 /// `ensure_utility_resident`'s doc for what that failure now costs — since
 /// this change the run dies at its first compaction rather than degrading.
+/// (#3074) Resolve the compactor model's context window and residency, or
+/// refuse compaction if no context window could be resolved.
+///
+/// Pre-#3074, when neither the compactor binding nor the primary model declared
+/// an `n_ctx`, `apply_compactor_residency` was skipped, leaving
+/// `compaction.compactor_model` as a bare key. The runtime would accept an
+/// absolute `--compact-threshold-tokens`, causing LM Studio to JIT-load the
+/// compactor at default context.
+///
+/// Here, if no window resolves, compaction is refused for this dispatch by
+/// clearing `compaction.compactor_model` to `None` and emitting a loud warning.
+/// No bare key is ever posted on the container CLI or wire.
+pub(crate) fn apply_compactor_setup(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    compactor_id: &str,
+    load_window: Option<u32>,
+    used_fallback: bool,
+    ensure_resident: impl Fn(&darkmux_types::ProfileModel, WindowSource) -> Result<()>,
+) -> Option<String> {
+    if let Some(window) = load_window {
+        if used_fallback {
+            eprintln!(
+                "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
+                 `internal.utility`; loading it at the primary model's context window \
+                 ({window}) as a fallback. Declare it once, for every profile: \
+                 `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
+                 in ~/.darkmux/profiles.json. (#1616, #2914)"
+            );
+        }
+        let source = if used_fallback {
+            WindowSource::UtilityFallback
+        } else {
+            WindowSource::UtilityBinding
+        };
+        let warning = apply_compactor_residency(
+            compaction,
+            compactor_id,
+            window,
+            |pm| ensure_resident(pm, source),
+        );
+        if let Some(w) = &warning {
+            eprintln!("{w}");
+        }
+        warning
+    } else {
+        compaction.compactor_model = None;
+        let warning = format!(
+            "darkmux dispatch: compactor `{compactor_id}` has no resolved context window \
+             (neither `internal.utility.n_ctx` nor primary model context window is set); \
+             refusing compaction for this dispatch. Declare `n_ctx` in ~/.darkmux/profiles.json. (#1616, #2914, #3074)"
+        );
+        eprintln!("{warning}");
+        Some(warning)
+    }
+}
+
 fn apply_compactor_residency(
     compaction: &mut crate::dispatch::CompactionDispatchArgs,
     compactor_id: &str,

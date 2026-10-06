@@ -13759,6 +13759,59 @@
         );
     }
 
+    #[test]
+    fn apply_compactor_setup_refuses_compaction_when_no_window_resolves() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: None,
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_setup(
+            &mut compaction,
+            "util-4b",
+            None,
+            false,
+            |_pm, _src| Ok(()),
+        );
+        assert!(warning.is_some(), "must warn on refusal when neither window is set");
+        assert!(warning.as_ref().unwrap().contains("refusing compaction"));
+        assert_eq!(
+            compaction.compactor_model, None,
+            "compactor_model must be cleared to refuse compaction and avoid posting a bare key (#3074)"
+        );
+        assert_eq!(
+            compaction.compactor_context_window, None,
+            "compactor_context_window must stay None"
+        );
+        let mut args = Vec::new();
+        super::apply_compaction_flags(&mut args, &compaction);
+        assert!(
+            !args.iter().any(|a| a == "--compactor-model"),
+            "argv must not post a bare compactor key when window was unresolved"
+        );
+    }
+
+    #[test]
+    fn apply_compactor_setup_loads_and_namespaces_when_compactor_n_ctx_set() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: None,
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_setup(
+            &mut compaction,
+            "util-4b",
+            Some(64_000),
+            false,
+            |_pm, _src| Ok(()),
+        );
+        assert!(warning.is_none());
+        assert_eq!(
+            compaction.compactor_model.as_deref(),
+            Some("darkmux:util-4b")
+        );
+    }
+
     /// The same write, followed all the way to the argv the container is
     /// actually spawned with — the flag whose value the compactor sends as its
     /// `model` field. Pins the two halves together: if either the store or the
