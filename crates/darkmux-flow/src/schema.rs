@@ -18,8 +18,20 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.1.0";
 // Version history:
+//   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
+//           bool written ONLY as `true`: a later step of the same task is
+//           still planned, so this record is not the end of the task's
+//           session and a consumer must not close it (the serve run status
+//           and the viewer's lifecycle read it that way).
+//
+//           ADDITIVE, and the record's action/level/handle/session are
+//           unchanged: a reader that does not know the key ignores it, and a
+//           `step.complete` written before 2.1.0, or for a task's last step,
+//           simply has a `null` payload and closes the session as it always
+//           did. Absence means "this darkmux did not record a later step",
+//           never "there is none" (the 1.41.0 `seat_class` convention).
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           (5.0, #3035, folded in, unreleased: "remote" was the wrong axis,
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
