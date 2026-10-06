@@ -40,7 +40,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::lmstudio::{FunctionDef, ToolDef};
-use workspace::{resolve_read, resolve_write, DEFAULT_WORKSPACE};
+use workspace::{
+    read_file_nofollow, resolve_read, resolve_write, write_file_nofollow, DEFAULT_WORKSPACE,
+};
 
 /// Hard cap on how much content a Read tool returns. Anything bigger
 /// gets truncated with a marker so the model knows. Keeps a single
@@ -1193,7 +1195,7 @@ fn execute_write(raw_args: &str, workspace_root: &Path) -> Result<String> {
 
     let path = resolve_write(&args.path, workspace_root)?;
 
-    std::fs::write(&path, args.content.as_bytes())
+    write_file_nofollow(&path, args.content.as_bytes())
         .with_context(|| format!("writing file: {path:?}"))?;
 
     Ok(format!(
@@ -1232,19 +1234,38 @@ fn execute_edit(raw_args: &str, workspace_root: &Path) -> Result<String> {
         return Err(anyhow!("edit: edits[] must contain at least one entry"));
     }
 
-    // File must already exist (resolve_read enforces that).
-    let path = resolve_read(&args.path, workspace_root)?;
+    // (#3073) File must resolve through the write path so symlinks are refused.
+    let path = resolve_write(&args.path, workspace_root)?;
+    if !path.exists() {
+        return Err(anyhow!("resolving path: {path:?} does not exist"));
+    }
 
-    let original = std::fs::read_to_string(&path)
+    let original = read_file_nofollow(&path)
         .with_context(|| format!("reading file for edit: {path:?}"))?;
 
-    // Apply all edits sequentially in memory. If any single edit fails
-    // validation, the original file stays untouched — write is a single
-    // atomic operation at the end.
-    let mut content = original;
+    let (content, total_replacements) = apply_edits(original, &args.edits, &path)?;
+
+    write_file_nofollow(&path, content.as_bytes())
+        .with_context(|| format!("writing edited file: {path:?}"))?;
+
+    let edit_count = args.edits.len();
+    Ok(format!(
+        "Edited {} ({edit_count} edit{} applied; {total_replacements} replacement{} total)",
+        path.display(),
+        if edit_count == 1 { "" } else { "s" },
+        if total_replacements == 1 { "" } else { "s" }
+    ))
+}
+
+fn apply_edits(
+    initial: String,
+    edits: &[EditOp],
+    path: &Path,
+) -> Result<(String, usize)> {
+    let mut content = initial;
     let mut total_replacements: usize = 0;
 
-    for (idx, op) in args.edits.iter().enumerate() {
+    for (idx, op) in edits.iter().enumerate() {
         if op.old_string.is_empty() {
             return Err(anyhow!(
                 "edit: edits[{idx}].old_string cannot be empty"
@@ -1280,17 +1301,7 @@ fn execute_edit(raw_args: &str, workspace_root: &Path) -> Result<String> {
         };
         total_replacements += replacements;
     }
-
-    std::fs::write(&path, content.as_bytes())
-        .with_context(|| format!("writing edited file: {path:?}"))?;
-
-    let edit_count = args.edits.len();
-    Ok(format!(
-        "Edited {} ({edit_count} edit{} applied; {total_replacements} replacement{} total)",
-        path.display(),
-        if edit_count == 1 { "" } else { "s" },
-        if total_replacements == 1 { "" } else { "s" }
-    ))
+    Ok((content, total_replacements))
 }
 
 // ─── search ───────────────────────────────────────────────────────────────
@@ -2841,6 +2852,22 @@ y = 2
         assert_eq!(written, "replaced");
     }
 
+    #[test]
+    fn write_rejects_symlink_at_final_component() {
+        use std::os::unix::fs::symlink;
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("escaped-target.txt");
+        fs::write(&outside, b"secret").unwrap();
+        let link = ws.path().join("link.txt");
+        symlink(&outside, &link).unwrap();
+
+        let raw = serde_json::json!({"path": "link.txt", "content": "clobber"}).to_string();
+        let err = execute_write(&raw, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+        let _ = fs::remove_file(&outside);
+    }
+
     // ─── edit ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -2949,6 +2976,29 @@ y = 2
         let raw = serde_json::json!({"path": "a.txt", "edits": []}).to_string();
         let err = execute_edit(&raw, ws.path()).unwrap_err();
         assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn edit_rejects_symlink_at_final_component() {
+        use std::os::unix::fs::symlink;
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("escaped-edit-target.txt");
+        fs::write(&outside, b"secret original").unwrap();
+        let link = ws.path().join("link.txt");
+        symlink(&outside, &link).unwrap();
+
+        let raw = serde_json::json!({
+            "path": "link.txt",
+            "edits": [{"old_string": "original", "new_string": "clobbered"}]
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink refusal, got: {err}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret original");
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]

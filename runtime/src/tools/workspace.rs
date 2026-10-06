@@ -128,6 +128,55 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// (#3074) Open and write to a file with `O_NOFOLLOW` so a symlink planted
+/// at the final component (e.g. via a TOCTOU race) is rejected atomically
+/// by the kernel without following it.
+#[cfg(unix)]
+pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
+    file.write_all(content)
+        .with_context(|| format!("writing to {path:?}"))?;
+    file.flush()
+        .with_context(|| format!("flushing {path:?}"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
+    std::fs::write(path, content)
+        .with_context(|| format!("writing to {path:?}"))
+}
+
+/// Open and read a file with `O_NOFOLLOW` to guarantee symlinks are not followed on read.
+#[cfg(unix)]
+pub fn read_file_nofollow(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
+    let mut s = String::new();
+    file.read_to_string(&mut s)
+        .with_context(|| format!("reading {path:?}"))?;
+    Ok(s)
+}
+
+#[cfg(not(unix))]
+pub fn read_file_nofollow(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("reading {path:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +383,38 @@ mod tests {
         let result = resolve_write("subdir/file.txt", ws.path()).unwrap();
         assert!(result.starts_with(ws.path().canonicalize().unwrap()));
         assert_eq!(result.file_name().unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn write_file_nofollow_refuses_to_write_through_symlink() {
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("escaped-target.txt");
+        fs::write(&outside, b"original").unwrap();
+        let link = ws.path().join("link-to-outside.txt");
+        symlink(&outside, &link).unwrap();
+
+        let err = write_file_nofollow(&link, b"overwrite").unwrap_err();
+        assert!(
+            err.to_string().contains("O_NOFOLLOW")
+                || format!("{err:?}").contains("Too many levels of symbolic links")
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn read_file_nofollow_refuses_to_read_through_symlink() {
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("read-target.txt");
+        fs::write(&outside, b"original").unwrap();
+        let link = ws.path().join("link-to-read.txt");
+        symlink(&outside, &link).unwrap();
+
+        let err = read_file_nofollow(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("O_NOFOLLOW")
+                || format!("{err:?}").contains("Too many levels of symbolic links")
+        );
+        let _ = fs::remove_file(&outside);
     }
 }
