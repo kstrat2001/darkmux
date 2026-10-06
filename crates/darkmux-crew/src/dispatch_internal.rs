@@ -6515,6 +6515,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
+            // (#2536) Still NOT covered, stated plainly: deleting this whole
+            // call compiles and stays green. Everything past it crosses the
+            // docker-spawn boundary, so covering it needs a dispatch()-level
+            // integration test this crate does not have; the mock-model
+            // harness cannot supply one, since the enclosing
+            // `model_base_url_override.is_none()` gate skips this block.
             let _ = apply_compactor_setup(
                 &mut compaction,
                 &compactor_id,
@@ -12549,29 +12555,6 @@ pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
     darkmux_gestalt::namespaced_identifier(bare_model_key(compactor_id), None)
 }
 
-/// (#2536) Ensure the compactor is resident AND write the wire id it was made
-/// resident under onto `compaction.compactor_model` — the field that becomes
-/// the container's `--compactor-model` flag and then the `model` field of the
-/// compactor's own chat-completions request (`runtime/src/compaction.rs`).
-///
-/// The ensure and the WRITE are one function on purpose (#2536 review, blocker
-/// 1): a variant that only returned the id left the single assignment at the
-/// call site untested, so deleting it restored the bug with a green suite.
-/// Everything the call site still has to do is print the returned warning.
-///
-/// Both parameters are non-optional. The load's two preconditions — a
-/// configured compactor, and a window to load it at — are the caller's `if let
-/// Some(compactor_id)` and `if let Some(window)` guards, so an "ensured
-/// nothing, namespace nothing" arm inside here would be unreachable from the
-/// only call site (#2536 review, finding 2). When either guard fails, no load
-/// is attempted and this is simply not called: `compaction.compactor_model`
-/// keeps the configured spelling, exactly as pre-#2536.
-///
-/// A load FAILURE still writes the namespaced id (alongside the warning): the
-/// load was attempted under that identifier, and addressing a bare key instead
-/// would silently JIT-load at the wrong context (the #1135 ghost). See
-/// `ensure_utility_resident`'s doc for what that failure now costs — since
-/// this change the run dies at its first compaction rather than degrading.
 /// (#3074) Resolve the compactor model's context window and residency, or
 /// refuse compaction if no context window could be resolved.
 ///
@@ -12628,6 +12611,28 @@ pub(crate) fn apply_compactor_setup(
     }
 }
 
+/// (#2536) Ensure the compactor is resident AND write the wire id it was made
+/// resident under onto `compaction.compactor_model` — the field that becomes
+/// the container's `--compactor-model` flag and then the `model` field of the
+/// compactor's own chat-completions request (`runtime/src/compaction.rs`).
+///
+/// The ensure and the WRITE are one function on purpose (#2536 review, blocker
+/// 1): a variant that only returned the id left the single assignment at the
+/// call site untested, so deleting it restored the bug with a green suite.
+/// Everything the call site still has to do is print the returned warning.
+///
+/// Both parameters are non-optional. Its caller, `apply_compactor_setup`,
+/// only calls it once a compactor is configured and a window resolved, so an
+/// "ensured nothing, namespace nothing" arm inside here would be unreachable
+/// (#2536 review, finding 2). When no window resolves, `apply_compactor_setup`
+/// does not call this: it clears `compaction.compactor_model` to `None` and
+/// compaction is refused for the dispatch (#3074).
+///
+/// A load FAILURE still writes the namespaced id (alongside the warning): the
+/// load was attempted under that identifier, and addressing a bare key instead
+/// would silently JIT-load at the wrong context (the #1135 ghost). See
+/// `ensure_utility_resident`'s doc for what that failure now costs — since
+/// this change the run dies at its first compaction rather than degrading.
 fn apply_compactor_residency(
     compaction: &mut crate::dispatch::CompactionDispatchArgs,
     compactor_id: &str,

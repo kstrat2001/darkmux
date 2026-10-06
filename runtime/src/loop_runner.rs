@@ -2155,7 +2155,8 @@ fn run_with_sleeper(
                     attempted_generation,
                     compaction_cfg,
                     &mut compactor_calls,
-                ),
+                )
+                .map(|chars| (chars, false)),
                 compaction::CompactionStrategy::StructuredSlot => {
                     let budget = compaction::BudgetSnapshot {
                         turns_used: turns,
@@ -2178,7 +2179,7 @@ fn run_with_sleeper(
                             attempted_generation,
                             &parsed,
                         );
-                        summary_chars
+                        (summary_chars, parsed.compaction_metadata.lexically_repaired == Some(true))
                     })
                 }
             };
@@ -2205,7 +2206,7 @@ fn run_with_sleeper(
                     None
                 }
             };
-            if let Some(summary_chars) = installed_summary_chars {
+            if let Some((summary_chars, lexically_repaired)) = installed_summary_chars {
                 let after_count = messages.len();
                 let (sys_chars_after, prompt_chars_after) = measure_request_context(&messages);
                 let tokens_after = ((sys_chars_after + prompt_chars_after) / 4) as u32;
@@ -2213,7 +2214,7 @@ fn run_with_sleeper(
                     compactions,
                     before_count,
                     after_count,
-                    summary_chars,
+                    crate::trajectory::InstalledSummary { summary_chars, lexically_repaired },
                     resume_estimate_tokens,
                     tokens_after,
                 );
@@ -4068,7 +4069,8 @@ fn run_with_sleeper(
                             attempted_generation,
                             compaction_cfg,
                             &mut compactor_calls,
-                        ),
+                        )
+                        .map(|chars| (chars, false)),
                         compaction::CompactionStrategy::StructuredSlot => {
                             // (#439) Build budget snapshot so the
                             // compacted SYSTEM message can surface
@@ -4106,7 +4108,7 @@ fn run_with_sleeper(
                                     attempted_generation,
                                     &parsed,
                                 );
-                                summary_chars
+                                (summary_chars, parsed.compaction_metadata.lexically_repaired == Some(true))
                             })
                         }
                     };
@@ -4174,7 +4176,7 @@ fn run_with_sleeper(
                     // none of them may claim it did. The liveness stamp below is
                     // deliberately OUTSIDE: a refused attempt still spent a real
                     // compactor call, and it is real proof of work.
-                    if let Some(summary_chars) = installed_summary_chars {
+                    if let Some((summary_chars, lexically_repaired)) = installed_summary_chars {
                         let after_count = messages.len();
                         // (#885) summary_chars now comes directly from the
                         // compaction fn — the inserted summary's true length —
@@ -4202,7 +4204,7 @@ fn run_with_sleeper(
                             compactions,
                             before_count,
                             after_count,
-                            summary_chars,
+                            crate::trajectory::InstalledSummary { summary_chars, lexically_repaired },
                             tokens_before,
                             tokens_after,
                         );
@@ -9980,6 +9982,7 @@ mod tests {
                 generation,
                 source_message_count: 5,
             truncation_patched: None,
+            lexically_repaired: None,
             turns_used: None,
             max_turns: None,
             cumulative_completion_tokens_used: None,
@@ -10482,6 +10485,87 @@ mod tests {
             !skipped.is_empty() && crate::trajectory::recorded(tmp.path()).compactions() as usize != installed + skipped.len(),
             "the scenario must contain at least one refusal that is excluded from \
              the count, else this pins nothing"
+        );
+    }
+
+    /// (#3074) LOOP grain: a structured compaction whose reply was cut off
+    /// and lexically repaired still installs (#401), and the installed
+    /// `compaction` trajectory event says so, so an operator can see the
+    /// summary is lossy without reading stderr.
+    #[test]
+    #[serial_test::serial]
+    fn a_lexically_repaired_structured_compaction_is_flagged_on_the_trajectory_event() {
+        let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
+            threshold_tokens: 5000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::StructuredSlot,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let _primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                6000,
+                50,
+            ));
+        });
+        let truncated = r#"{"objective": "finish", "current_truth": {}, "compaction_metadata": {"schema_version": "0.1", "generation": 1, "source_message_count": 3}, "completed_decisions": "decision one; decis"#;
+        let _compactor = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200)
+                .json_body(chat_response_json(Some(truncated), None, "length", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("repaired-compaction").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let big = "y".repeat(40_000);
+        let initial = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::user(&big),
+            Message::assistant("ok"),
+            Message::user("go"),
+            Message::assistant("sure"),
+            Message::user("one"),
+            Message::assistant("two"),
+        ];
+        let tools = [Tool::Read];
+        run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(3), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the scenario completes");
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .unwrap();
+        let installed: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| v["type"] == "compaction")
+            .collect();
+        assert!(!installed.is_empty(), "the scenario must install a compaction: {raw}");
+        assert_eq!(
+            installed[0]["lexically_repaired"], true,
+            "the installed compaction event must carry the repair flag: {}", installed[0]
         );
     }
 
