@@ -388,6 +388,17 @@ fn attach_abort_handle(ticket: &PromptTicket, handle: tokio::task::AbortHandle) 
     }
 }
 
+/// Whether a cancel already reached this prompt's reservation. Checked before
+/// the work is spawned, so a prompt cancelled in the window between
+/// reservation and first poll never starts on the multi-thread runtime (#3074).
+fn reservation_cancelled(ticket: &PromptTicket) -> bool {
+    let guard = ticket.in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    guard
+        .get(&ticket.session_id)
+        .and_then(|tasks| tasks.iter().find(|t| t.ticket == ticket.ticket))
+        .is_some_and(|task| matches!(task.state, TaskState::ReservedCancelled))
+}
+
 /// Aborts every prompt currently in flight on `session_id` (`session/cancel`
 /// and `session/close` both land here) and returns how many it reached.
 /// Entries stay until their tickets drop.
@@ -1529,6 +1540,10 @@ async fn run_cancellable(
     cx: ConnectionTo<Client>,
     work: impl std::future::Future<Output = Result<()>> + Send + 'static,
 ) -> StopReason {
+    if reservation_cancelled(&ticket) {
+        drop(ticket);
+        return report_cancelled(&session_id, &cx);
+    }
     let handle = tokio::spawn(work);
     // (#1777 merge gate — lost-cancel race) A cancel may have reached this
     // prompt's reservation before the task had a handle; see `TaskState`.
@@ -1545,11 +1560,7 @@ async fn run_cancellable(
             let _ = cx.send_notification(agent_chunk(&session_id, format!("darkmux acp: command failed: {err:#}")));
             StopReason::EndTurn
         }
-        Err(join_err) if join_err.is_cancelled() => {
-            eprintln!("[darkmux-acp] session/prompt: {session_id} cancelled via session/cancel");
-            let _ = cx.send_notification(agent_chunk(&session_id, "darkmux: cancelled.".to_string()));
-            StopReason::Cancelled
-        }
+        Err(join_err) if join_err.is_cancelled() => report_cancelled(&session_id, &cx),
         Err(join_err) => {
             eprintln!("[darkmux-acp] session/prompt: command task panicked: {join_err}");
             let _ = cx.send_notification(agent_chunk(
@@ -1559,6 +1570,14 @@ async fn run_cancellable(
             StopReason::EndTurn
         }
     }
+}
+
+/// Sends the "cancelled" chunk for a prompt `session/cancel` stopped and
+/// returns the stop reason its response carries.
+fn report_cancelled(session_id: &SessionId, cx: &ConnectionTo<Client>) -> StopReason {
+    eprintln!("[darkmux-acp] session/prompt: {session_id} cancelled via session/cancel");
+    let _ = cx.send_notification(agent_chunk(session_id, "darkmux: cancelled.".to_string()));
+    StopReason::Cancelled
 }
 
 /// The one message both cwd-lookup guards in `serve()`'s `PromptRequest`
@@ -4821,6 +4840,72 @@ mod tests {
         drop(release_tx);
     }
 
+    /// Writes a `session/prompt` and a `session/cancel` frame in ONE
+    /// `write_all`, so the agent reads both from a single buffer and handles
+    /// the cancel before the prompt's spawned task is ever polled (#3074).
+    async fn send_prompt_and_cancel_in_one_write(writer: &mut DuplexStream, session_id: &str, text: &str) {
+        let mut bytes = Vec::new();
+        for frame in [
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 20, "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        ] {
+            bytes.extend(serde_json::to_vec(&frame).expect("test value serializes"));
+            bytes.push(b'\n');
+        }
+        writer.write_all(&bytes).await.expect("writing to the test duplex");
+        writer.flush().await.expect("flushing the test duplex");
+    }
+
+    async fn assert_cancelled_within_3s(reader: &mut BufReader<DuplexStream>) {
+        let reasons = tokio::time::timeout(std::time::Duration::from_secs(3), recv_stop_reasons(reader, 1))
+            .await
+            .expect("a prompt cancelled in the same write must report cancelled within 3s");
+        assert_eq!(reasons, vec!["cancelled"]);
+    }
+
+    /// (#3074 wire probe) No-slash path: the cancel arrives in the same read
+    /// as the prompt, before its task runs, and must still cancel it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_in_the_same_write_as_a_no_slash_prompt_cancels_it() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (router, _started_rx, release_tx) = blocking_router(1);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt_and_cancel_in_one_write(&mut writer, &session_id, "please give me the fixture").await;
+        assert_cancelled_within_3s(&mut reader).await;
+        drop(release_tx);
+    }
+
+    /// (#3074 wire probe) Slash path, same shape, against a command that
+    /// would otherwise run for 5s.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_in_the_same_write_as_a_slash_prompt_cancels_it() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        let marker = crew_tmp.path().join("shell-started.marker");
+        write_slow_shell_fixture(crew_tmp.path(), "slow-echo", &marker, 5, "slow-output-marker");
+        let (router, _started_rx, release_tx) = blocking_router(1);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt_and_cancel_in_one_write(&mut writer, &session_id, "/mission launch slow-echo").await;
+        assert_cancelled_within_3s(&mut reader).await;
+        drop(release_tx);
+    }
+
     /// (#1777 merge gate, #3074) The lost-cancel race: a `session/cancel`
     /// processed after the prompt is reserved but before its task has a handle
     /// marks that reservation, and attaching the handle reports "abort now".
@@ -4835,6 +4920,19 @@ mod tests {
         let placeholder = tokio::spawn(async {});
         assert!(attach_abort_handle(&ticket, placeholder.abort_handle()), "the early cancel must be reported");
         placeholder.abort();
+    }
+
+    /// (#3074) A reservation a cancel already reached is reported before any
+    /// task is spawned; an untouched one is not.
+    #[tokio::test]
+    async fn reservation_cancelled_reports_only_a_cancelled_reservation() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-precheck-test");
+        let ticket = reserve_prompt(&in_flight, &session_id);
+        assert!(!reservation_cancelled(&ticket), "no cancel yet");
+
+        abort_session_prompts(&in_flight, &session_id);
+        assert!(reservation_cancelled(&ticket), "the cancel reached this reservation");
     }
 
     /// The inverted case: no cancel, so attaching registers the handle.
