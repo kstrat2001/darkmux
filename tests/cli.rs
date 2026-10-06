@@ -4523,23 +4523,12 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
 }
 
-/// (#2678) `runtime.mission_wall_clock_timeout_seconds` (here set via its
-/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` env override) must stop a
-/// grinding `mission launch <generic-graph-config>` on ITS OWN, with NO
-/// external signal ever sent — the exact scenario #2678 exists for: a CI
-/// job's `timeout-minutes` killing the whole process tree with nothing
-/// rendered. Bound to an explicit deadline throughout (this test sends no
-/// real signal and starts no thread of its own that could hang the suite).
-///
-/// Distinguishes itself from
-/// `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
-/// (above) in the one place that matters: a REAL operator signal still
-/// finalizes `error`, but the run's OWN bound must finalize `degraded`
-/// with a reason naming the bound — an honest partial outcome the
-/// operator opted into, not a failure (darkmux describes, never
-/// adjudicates: it never asserts why the run was slow).
-#[test]
-fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
+/// Spawns `mission launch` on a one-step hanging-dispatch graph with
+/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` set to `bound_seconds` (#2678),
+/// returning the stub endpoint, the temp dirs and the child.
+fn spawn_wall_clock_launch(
+    bound_seconds: &str,
+) -> (HangingStubServer, TempDir, TempDir, std::process::Child) {
     let stub = HangingStubServer::start();
 
     let home = TempDir::new().unwrap();
@@ -4568,7 +4557,7 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
     }"#;
     fs::write(config_dir.join("wall-clock-generic-test.json"), config_json).unwrap();
 
-    let mut child = darkmux_std_cmd()
+    let child = darkmux_std_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
@@ -4576,12 +4565,33 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         // stays fast, and deliberately shorter than `--timeout` below so
         // the WALL-CLOCK bound is what fires, not the per-dispatch
         // inactivity cap.
-        .env("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", "1")
+        .env("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", bound_seconds)
         .args(["mission", "launch", "wall-clock-generic-test", "--timeout", "60"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawning darkmux mission launch wall-clock-generic-test");
+    (stub, home, flows, child)
+}
+
+/// (#2678) `runtime.mission_wall_clock_timeout_seconds` (here set via its
+/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` env override) must stop a
+/// grinding `mission launch <generic-graph-config>` on ITS OWN, with NO
+/// external signal ever sent — the exact scenario #2678 exists for: a CI
+/// job's `timeout-minutes` killing the whole process tree with nothing
+/// rendered. Bound to an explicit deadline throughout (this test sends no
+/// real signal and starts no thread of its own that could hang the suite).
+///
+/// Distinguishes itself from
+/// `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
+/// (above) in the one place that matters: a REAL operator signal still
+/// finalizes `error`, but the run's OWN bound must finalize `degraded`
+/// with a reason naming the bound — an honest partial outcome the
+/// operator opted into, not a failure (darkmux describes, never
+/// adjudicates: it never asserts why the run was slow).
+#[test]
+fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
+    let (stub, home, flows, mut child) = spawn_wall_clock_launch("1");
 
     // NO signal is ever sent here: the process must stop itself. The 1s
     // bound is measured from process start, so on a slow host it fires
@@ -4659,6 +4669,48 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         mission_json["status"], "finalized",
         "a wall-clock-bound run must reach a terminal mission status, never stay active: {mission_json}"
     );
+}
+
+/// (#2678) The mid-dispatch half of the wall-clock bound. The 1s test above
+/// may fire before the stub is ever contacted (slow host), so it cannot pin the
+/// reap. Here the bound is 6s and the test first WAITS for the stub to see a
+/// connection, so the bound provably fires mid-dispatch: the watchdog must tear
+/// the `curl` down, and the run must still close `run.complete` Degraded.
+#[test]
+fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
+    let (stub, _home, flows, mut child) = spawn_wall_clock_launch("6");
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(5)),
+        "the dispatch never connected within 5s, so the bound cannot be shown to fire mid-dispatch"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mission launch did not self-terminate within 60s of its 6s wall-clock bound (#2678 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "the `curl` connection opened mid-dispatch was never torn down: the wall-clock watchdog \
+         must reap it (#2678 regression)"
+    );
+    assert_no_surviving_remote_curl(child.id(), "wall-clock-mid-dispatch");
+
+    let records = flow_actions(&flows);
+    let closes: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "run.complete" || r["action"] == "run.error")
+        .collect();
+    assert_eq!(closes.len(), 1, "exactly one terminal run record: {closes:#?}");
+    assert_eq!(closes[0]["action"], "run.complete", "{closes:#?}");
+    assert_eq!(closes[0]["payload"]["status"], "Degraded", "{closes:#?}");
 }
 
 /// (#2262) `kill <pid>` (SIGTERM) on a plain `darkmux dispatch <role>`
