@@ -1194,13 +1194,20 @@ fn execute_write(raw_args: &str, workspace_root: &Path) -> Result<String> {
     }
 
     let path = resolve_write(&args.path, workspace_root)?;
+    write_resolved(&path, &args.content)
+}
 
-    write_file_nofollow(&path, args.content.as_bytes())
+/// Write to an already-resolved path. Separate from `execute_write` so the
+/// resolve-then-open window is a testable seam (#3073): the open is
+/// `O_NOFOLLOW`, so a symlink planted after the resolve is refused.
+fn write_resolved(path: &Path, content_str: &str) -> Result<String> {
+    let path = path.to_path_buf();
+    write_file_nofollow(&path, content_str.as_bytes())
         .with_context(|| format!("writing file: {path:?}"))?;
 
     Ok(format!(
         "Wrote {} bytes to {}",
-        args.content.len(),
+        content_str.len(),
         path.display()
     ))
 }
@@ -1234,21 +1241,26 @@ fn execute_edit(raw_args: &str, workspace_root: &Path) -> Result<String> {
         return Err(anyhow!("edit: edits[] must contain at least one entry"));
     }
 
-    // (#3073) File must resolve through the write path so symlinks are refused.
-    let path = resolve_write(&args.path, workspace_root)?;
-    if !path.exists() {
-        return Err(anyhow!("resolving path: {path:?} does not exist"));
-    }
+    // (#3073) Resolve to the canonical in-workspace target (an in-workspace
+    // symlink such as CLAUDE.md -> AGENTS.md edits its target; an outside
+    // target is refused), then open that target with O_NOFOLLOW so a
+    // final-component swap after the resolve is refused too.
+    let path = resolve_read(&args.path, workspace_root)?;
+    edit_resolved(&path, &args.edits)
+}
 
+/// Apply edits to an already-resolved path; the `O_NOFOLLOW` seam for edit.
+fn edit_resolved(path: &Path, edits: &[EditOp]) -> Result<String> {
+    let path = path.to_path_buf();
     let original = read_file_nofollow(&path)
         .with_context(|| format!("reading file for edit: {path:?}"))?;
 
-    let (content, total_replacements) = apply_edits(original, &args.edits, &path)?;
+    let (content, total_replacements) = apply_edits(original, edits, &path)?;
 
     write_file_nofollow(&path, content.as_bytes())
         .with_context(|| format!("writing edited file: {path:?}"))?;
 
-    let edit_count = args.edits.len();
+    let edit_count = edits.len();
     Ok(format!(
         "Edited {} ({edit_count} edit{} applied; {total_replacements} replacement{} total)",
         path.display(),
@@ -2992,11 +3004,56 @@ y = 2
             "edits": [{"old_string": "original", "new_string": "clobbered"}]
         })
         .to_string();
-        let err = execute_edit(&raw, ws.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("symlink"),
-            "expected symlink refusal, got: {err}"
-        );
+        let _ = execute_edit(&raw, ws.path());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret original");
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn edit_follows_in_workspace_symlink_to_its_target() {
+        use std::os::unix::fs::symlink;
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("AGENTS.md"), b"rules v1").unwrap();
+        symlink(ws.path().join("AGENTS.md"), ws.path().join("CLAUDE.md")).unwrap();
+        let raw = serde_json::json!({
+            "path": "CLAUDE.md",
+            "edits": [{"old_string": "v1", "new_string": "v2"}]
+        })
+        .to_string();
+        execute_edit(&raw, ws.path()).unwrap();
+        assert_eq!(fs::read_to_string(ws.path().join("AGENTS.md")).unwrap(), "rules v2");
+        assert!(fs::symlink_metadata(ws.path().join("CLAUDE.md")).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn write_resolved_refuses_symlink_planted_after_resolve_3073() {
+        use std::os::unix::fs::symlink;
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("race-write-target.txt");
+        fs::write(&outside, b"secret").unwrap();
+        let path = resolve_write("race.txt", ws.path()).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(write_resolved(&path, "clobber").is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn edit_resolved_refuses_symlink_planted_after_resolve_3073() {
+        use std::os::unix::fs::symlink;
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("race-edit-target.txt");
+        fs::write(&outside, b"secret original").unwrap();
+        fs::write(ws.path().join("race.txt"), b"secret original").unwrap();
+        let path = resolve_read("race.txt", ws.path()).unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        let edits = [EditOp {
+            old_string: "original".into(),
+            new_string: "clobbered".into(),
+            replace_all: false,
+        }];
+        assert!(edit_resolved(&path, &edits).is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret original");
         let _ = fs::remove_file(&outside);
     }
