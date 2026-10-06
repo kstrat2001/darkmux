@@ -6018,6 +6018,56 @@ mod tests {
         assert!(report.chain_valid && report.torn_tails.is_empty());
     }
 
+    /// (#3073-1.3) Appending to a file larger than the 64 KiB tail window
+    /// uses the windowed read path.
+    #[test]
+    fn audit_append_windowed_read_on_large_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..6 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 64 * 1024, "file must exceed 64 KiB: {size} bytes");
+
+        append_one(&path, "tail-record");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 7);
+        assert!(report.torn_tails.is_empty());
+    }
+
+    /// (#3073-1.3) Torn-tail recovery on a file larger than 64 KiB works
+    /// and continues the chain.
+    #[test]
+    fn torn_tail_on_large_file_is_recovered_and_chain_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..6 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let before_size = std::fs::metadata(&path).unwrap().len();
+        assert!(before_size > 64 * 1024);
+
+        let mut torn = std::fs::read(&path).unwrap();
+        let half = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef {\"ts\":\"2025";
+        torn.extend_from_slice(half);
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "chain must verify: {report:?}");
+        assert_eq!(report.records_checked, 7);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+        assert_eq!(report.torn_tails.len(), 1);
+    }
+
     // (#1775) The exit-status belt, exercised directly rather than through a
     // spawned binary.
 

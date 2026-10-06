@@ -51,7 +51,6 @@
   "crates/darkmux-flow/src/hooks.rs::hook_match": 17,
   "crates/darkmux-flow/src/hooks.rs::test_receiver[cfg(any(test,feature=\"test-support\"))]::handle_one": 27,
   "crates/darkmux-flow/src/hooks.rs::try_post": 16,
-  "crates/darkmux-flow/src/integrity.rs::audit_record_at_locked[cfg(unix)]": 22,
   "crates/darkmux-flow/src/presence_reconciler.rs::spawn_reconciler_thread": 24,
   "crates/darkmux-flow/src/status.rs::format_status_human": 36,
   "crates/darkmux-lab/src/crawl/plan.rs::plan_with_params": 28,
