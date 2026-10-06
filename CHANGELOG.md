@@ -62,6 +62,10 @@ darkmux release.
 
 ### Fixed (5.0): isolation
 
+- **`finding.json` and `mod.json` are written atomically** (#3074). A finding is
+  written to a unique temp file, fsynced, and hard-linked into place, so a crash leaves
+  no record rather than a torn one and a second write of the same finding is refused. A
+  gated mod is rewritten by temp file and rename instead of truncating in place.
 - **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
   The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
   the operator asked to protect. A `dispatch.internal` step reads it from the config key

@@ -851,7 +851,7 @@ pub fn materialize(root: &Path, record: &ModRecord) -> Result<Materialized> {
     // The mode set here is the mode the record has for its whole life on
     // two counts: `stage_and_commit` finishes with a `std::fs::rename`, which
     // moves this inode rather than copying it; and `record_gate_with_source`
-    // writes via `write_owner_only` into a temp file and renames, preserving
+    // writes via `replace_atomic` (unique temp, then rename), preserving
     // 0o600 across the atomic replacement without truncating in place.
     #[cfg(unix)]
     let opened = {
@@ -906,6 +906,18 @@ pub fn record_gate_with_source(
     skipped_reason: Option<&str>,
     resolved_source: Option<&str>,
 ) -> Result<Materialized> {
+    record_gate_with(root, key, outcome, skipped_reason, resolved_source, || Ok(()))
+}
+
+/// [`record_gate_with_source`] with a crash-injection seam between the temp write and the rename.
+fn record_gate_with(
+    root: &Path,
+    key: &str,
+    outcome: Option<GateOutcome>,
+    skipped_reason: Option<&str>,
+    resolved_source: Option<&str>,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<Materialized> {
     anyhow::ensure!(is_safe_key(key), "refusing to gate a mod under an unsafe key {key:?}");
     let path = record_path_at(root, key);
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading mod {}", path.display()))?;
@@ -920,13 +932,8 @@ pub fn record_gate_with_source(
         record.source = resolved_source.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     }
     let body = serde_json::to_string_pretty(&record)? + "\n";
-    let dir = path.parent().expect("record path always has a parent");
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    crate::lifecycle::write_owner_only(&tmp, body.as_bytes())
-        .with_context(|| format!("writing gated mod tmp {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming gated mod {} -> {}", tmp.display(), path.display()))?;
-    crate::lifecycle::fsync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))?;
+    crate::lifecycle::replace_atomic(&path, body.as_bytes(), before_commit)
+        .with_context(|| format!("writing gated mod {}", path.display()))?;
     Ok(Materialized::Created)
 }
 
@@ -2629,52 +2636,56 @@ mod tests {
         assert_eq!(rec.gate_skipped_reason.as_deref(), Some("no test_command configured"));
     }
 
-    /// (#3074) `record_gate_with_source` atomically replaces the mod file via
-    /// temp-and-rename rather than truncating with `std::fs::write`, preserving
-    /// 0o600 mode and cleaning up the temp file.
+    fn gate_pass() -> Option<GateOutcome> {
+        Some(GateOutcome {
+            passed: true,
+            command: "cargo check".into(),
+            exit_code: Some(0),
+            applied: Some(true),
+            reason: None,
+        })
+    }
+
+    /// (#3074) A crash between the temp write and the commit leaves the previous
+    /// committed `mod.json` byte-for-byte intact, with no temp orphan.
     #[test]
-    fn record_gate_atomic_rewrite_preserves_owner_only_and_cleans_tmp() {
+    fn record_gate_crash_before_commit_keeps_previous_record() {
         let tmp = TempDir::new().unwrap();
-        materialize(tmp.path(), &a_gateable_mod("mod-atomic")).unwrap();
-
-        let path = record_path_at(tmp.path(), "mod-atomic");
-        assert!(path.exists());
-
-        let res = record_gate_with_source(
-            tmp.path(),
-            "mod-atomic",
-            Some(GateOutcome {
-                passed: true,
-                command: "cargo check".into(),
-                exit_code: Some(0),
-                applied: Some(true),
-                reason: None,
-            }),
-            None,
-            Some("resolved-src"),
-        )
-        .unwrap();
-        assert_eq!(res, Materialized::Created);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "gated mod record must preserve mode 0o600");
-        }
-
-        let dir = path.parent().unwrap();
-        let entries: Vec<_> = std::fs::read_dir(dir)
+        materialize(tmp.path(), &a_gateable_mod("mod-crash")).unwrap();
+        let path = record_path_at(tmp.path(), "mod-crash");
+        let before = std::fs::read(&path).unwrap();
+        let err = record_gate_with(tmp.path(), "mod-crash", gate_pass(), None, Some("src"), || {
+            anyhow::bail!("injected crash")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("injected crash"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(entries, vec!["mod.json".to_string()]);
-
-        let rec = load_at(tmp.path(), "mod-atomic").unwrap().unwrap();
-        assert!(rec.gate.as_ref().unwrap().passed);
-        assert_eq!(rec.source.as_deref(), Some("resolved-src"));
+        assert_eq!(names, vec!["mod.json".to_string()]);
+        // The retry after the crash commits a whole, gated record.
+        record_gate_with_source(tmp.path(), "mod-crash", gate_pass(), None, Some("src")).unwrap();
+        let rec = load_at(tmp.path(), "mod-crash").unwrap().unwrap();
+        assert!(rec.gate.unwrap().passed);
     }
 
+    /// (#3074) The rewrite replaces the file (new inode) instead of truncating in
+    /// place, and the mode stays owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn record_gate_replaces_inode_and_stays_owner_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new().unwrap();
+        materialize(tmp.path(), &a_gateable_mod("mod-ino")).unwrap();
+        let path = record_path_at(tmp.path(), "mod-ino");
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        record_gate_with_source(tmp.path(), "mod-ino", gate_pass(), None, Some("src")).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_ne!(meta.ino(), ino, "rewrite must replace the file, not truncate it");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn load_all_at_sorts_by_ts_and_skips_what_it_cannot_read() {
