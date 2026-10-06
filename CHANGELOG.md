@@ -117,8 +117,9 @@ darkmux release.
   ladder summary for the run, the same as a sampler that panicked.
 - **Indented and commented tool-call markup is not promoted into a call** (#3074). The
   plain-text XML scan already skipped fenced blocks; it now also skips a line indented
-  four columns or a tab, and an HTML comment (an unclosed one runs to the end of the
-  text). Skipped openers count in `xml_openers_skipped_as_fenced`.
+  four columns or a tab after a blank line or another indented line (indentation under
+  a list or prose line still promotes), and a CLOSED HTML comment (an unclosed `<!--`,
+  one in inline code, or one inside a call payload opens nothing). Skipped openers count in `xml_openers_skipped_as_fenced`.
 - **A resume no longer silently replays a tool call that had already started** (#3074).
   Just before the agent runs a call that can change the workspace (`bash`, `write`,
   `edit`, `create_finding`, `create_mod`), its checkpoint is written with a started marker
