@@ -491,15 +491,33 @@ pub(crate) fn create_new_in_place(path: &std::path::Path, bytes: &[u8]) -> Resul
 /// `AlreadyExists` instead of replacing, so a second writer is refused and a
 /// reader never sees a torn file. `before_commit` runs between the temp write
 /// and the link; tests inject a failure there to simulate a crash.
+///
+/// On a filesystem that cannot hard-link (`Unsupported` / `PermissionDenied`)
+/// the commit falls back to `create_new` on the final name. That fallback is
+/// write-once but NOT crash-atomic: a crash mid-write leaves a torn record,
+/// which is why a failed write removes its partial file. It runs on FAT/exFAT,
+/// some network and FUSE mounts, and similar link-less volumes, never on APFS
+/// or ext4.
 pub(crate) fn commit_write_once(
     path: &std::path::Path,
     bytes: &[u8],
     before_commit: impl FnOnce() -> Result<()>,
 ) -> Result<Committed> {
+    commit_write_once_with(path, bytes, before_commit, |a, b| fs::hard_link(a, b))
+}
+
+/// [`commit_write_once`] with the link call injectable, so tests can force the
+/// link-less fallback arm (#3074). Production passes `fs::hard_link`.
+pub(crate) fn commit_write_once_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> Result<()>,
+    link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<Committed> {
     let dir = path.parent().with_context(|| format!("record path {} has no parent", path.display()))?;
     let tmp = unique_tmp_path(path)?;
     write_new_owner_only(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    let outcome = before_commit().and_then(|()| match fs::hard_link(&tmp, path) {
+    let outcome = before_commit().and_then(|()| match link(&tmp, path) {
         Ok(()) => Ok(Committed::Created),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Committed::AlreadyPresent),
         Err(e) if link_unsupported(&e) => create_new_in_place(path, bytes),

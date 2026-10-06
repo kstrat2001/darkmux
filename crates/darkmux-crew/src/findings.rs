@@ -1252,4 +1252,35 @@ mod tests {
         assert_eq!(crate::lifecycle::create_new_in_place(&p, b"second").unwrap(), crate::lifecycle::Committed::AlreadyPresent);
         assert_eq!(std::fs::read(&p).unwrap(), b"first");
     }
+
+    /// (#3074) A link refused as unsupported or denied falls back to `create_new`:
+    /// the record is still written, and a second writer is still refused.
+    #[test]
+    fn link_less_filesystem_falls_back_and_stays_write_once() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("finding.json");
+            let refuse = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(kind));
+            let first = crate::lifecycle::commit_write_once_with(&p, b"first", || Ok(()), refuse).unwrap();
+            assert_eq!(first, crate::lifecycle::Committed::Created, "{kind:?}");
+            assert_eq!(std::fs::read(&p).unwrap(), b"first", "{kind:?}");
+            let refuse = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(kind));
+            let second = crate::lifecycle::commit_write_once_with(&p, b"second", || Ok(()), refuse).unwrap();
+            assert_eq!(second, crate::lifecycle::Committed::AlreadyPresent, "{kind:?}");
+            assert_eq!(std::fs::read(&p).unwrap(), b"first", "{kind:?}");
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "temp file left behind");
+        }
+    }
+
+    /// (#3074) A link error that is neither AlreadyExists nor link-less is an error.
+    #[test]
+    fn other_link_errors_do_not_fall_back() {
+        use std::io::{Error, ErrorKind};
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("finding.json");
+        let boom = |_: &std::path::Path, _: &std::path::Path| Err(Error::from(ErrorKind::NotFound));
+        assert!(crate::lifecycle::commit_write_once_with(&p, b"x", || Ok(()), boom).is_err());
+        assert!(!p.exists());
+    }
 }
