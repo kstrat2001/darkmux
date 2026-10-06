@@ -540,7 +540,7 @@ fn classify_load_failure(stderr: &str, model_key: &str, detail: String) -> HostE
 /// whatever stderr says, and error-shaped stderr on a 0 exit is a failure
 /// too — never a silent success. Non-error stderr noise (progress remnants)
 /// on a 0 exit passes.
-fn classify_unload_outcome(
+pub(crate) fn classify_unload_outcome(
     success: bool,
     stderr: &str,
     identifier: &str,

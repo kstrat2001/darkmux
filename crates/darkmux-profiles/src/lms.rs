@@ -68,7 +68,7 @@ pub fn pin_cwd(cmd: &mut Command) {
 /// interpret is an `Err`, never an empty success.
 ///
 /// It used to collapse the two. Both probes fell through to
-/// `Ok(parse_text_ps(&stdout))`, and `parse_text_ps` yields an empty vec
+/// `Ok(<text parse of stdout>)`, and that parse yields an empty vec
 /// for unrecognized text exactly as it does for a header with no rows —
 /// with neither call site checking `status.success()`. Proven with a fake
 /// `lms` on `PATH`: garbage stdout at exit 0, and exit 1 with no stdout,
@@ -271,7 +271,7 @@ fn model_from_json(v: &serde_json::Value) -> LoadedModel {
 /// whitespace-separated word rather than a prefix. Both halves fix a
 /// pre-existing defect: `starts_with("IDENTIFIER")` let a lowercase
 /// header (`identifier model status size context`) through as a
-/// five-column model row, so `parse_text_ps` reported one PHANTOM
+/// five-column model row, so the text parser reported one PHANTOM
 /// resident — a model named "identifier" that is not loaded and cannot
 /// be unloaded. Word-matching also stops a real identifier that merely
 /// begins with those letters from being swallowed as a header.
@@ -280,36 +280,6 @@ fn is_ps_header(trimmed: &str) -> bool {
         .split_whitespace()
         .next()
         .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
-}
-
-#[cfg(test)]
-fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
-    let mut out: Vec<LoadedModel> = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || is_ps_header(trimmed) {
-            continue;
-        }
-        // columns separated by 2+ spaces
-        let cols: Vec<&str> = trimmed
-            .split("  ")
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .collect();
-        if cols.len() < 5 {
-            continue;
-        }
-        let context = cols[4].parse::<u64>().unwrap_or(0);
-        out.push(LoadedModel {
-            identifier: cols[0].to_string(),
-            model: if cols.len() > 1 { cols[1].to_string() } else { cols[0].to_string() },
-            status: cols.get(2).copied().unwrap_or("").to_string(),
-            size: cols.get(3).copied().unwrap_or("").to_string(),
-            context,
-            queued: None,
-        });
-    }
-    out
 }
 
 /// One row from `lms ls --json` — every model the LMStudio catalog knows
@@ -401,18 +371,24 @@ pub fn unload(identifier: &str) -> Result<()> {
     verify_unload_outcome(out.status.success(), &out.stderr, identifier)
 }
 
-fn verify_unload_outcome(success: bool, stderr: &str, identifier: &str) -> Result<()> {
-    if !success {
-        bail!("lms unload {identifier} failed: {}", stderr.trim());
+/// Whether an unload error is the typed not-resident outcome (#3083).
+pub fn is_not_resident(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<darkmux_gestalt::HostError>(),
+        Some(darkmux_gestalt::HostError::NotResident { .. })
+    )
+}
+
+/// Classify `lms unload` through the ONE shared classifier the gestalt host
+/// uses (#3083: two classifiers had diverged on "Model Not Found"). The typed
+/// [`darkmux_gestalt::HostError`] rides the `anyhow` error, so a caller that
+/// treats an already-gone instance as benign asks [`is_not_resident`].
+pub(crate) fn verify_unload_outcome(success: bool, stderr: &str, identifier: &str) -> Result<()> {
+    let exit_detail = format!("of {identifier} failed: {}", stderr.trim());
+    match crate::gestalt_host::lms_host::classify_unload_outcome(success, stderr, identifier, &exit_detail) {
+        Some(err) => Err(anyhow::Error::new(err)),
+        None => Ok(()),
     }
-    let lower = stderr.to_ascii_lowercase();
-    const NOT_FOUND_PATTERNS: &[&str] = &[
-        "no model", "not loaded", "not found", "no such model", "cannot find a model",
-    ];
-    if NOT_FOUND_PATTERNS.iter().any(|p| lower.contains(p)) || lower.contains("error") {
-        bail!("lms unload {identifier} failed: {}", stderr.trim());
-    }
-    Ok(())
 }
 
 /// Load a model into LMStudio under an explicit identifier. The caller is
@@ -588,7 +564,7 @@ mod tests {
     #[test]
     fn parses_text_ps_output() {
         let text = "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\nqwen3-4b  qwen3-4b  idle  2.15 GB  68000\nqwen35-mlx  qwen35-mlx  idle  18.45 GB  101000\n";
-        let parsed = parse_text_ps(text);
+        let parsed = interpret_text_ps(text).expect("a readable listing");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].identifier, "qwen3-4b");
         assert_eq!(parsed[0].context, 68000);
@@ -597,23 +573,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_ps_skips_header_and_blank() {
+    fn text_ps_skips_header_and_blank() {
         let text = "\nIDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\n\n";
-        let parsed = parse_text_ps(text);
-        assert_eq!(parsed.len(), 0);
+        assert_eq!(interpret_text_ps(text), Some(Vec::new()));
     }
 
     #[test]
-    fn parse_text_ps_handles_short_columns() {
+    fn text_ps_short_columns_are_could_not_tell() {
         let text = "IDENTIFIER  MODEL\nbroken  row\n";
-        let parsed = parse_text_ps(text);
-        // 2 columns is below the 5-column threshold
-        assert_eq!(parsed.len(), 0);
+        // 2 columns is below the 5-column threshold: "could not tell", not "none".
+        assert_eq!(interpret_text_ps(text), None);
+    }
+
+    /// (#3083 review) The production parser, mixed rows: one good row beside a
+    /// short one is NOT a partial listing. A silently dropped resident would
+    /// read as "not loaded" to the eject sweep, so the whole listing is
+    /// "could not tell".
+    #[test]
+    fn a_good_row_beside_a_short_row_is_could_not_tell() {
+        let text = "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\n\
+                    darkmux:qwen3-4b  qwen3-4b  idle  2.15 GB  68000\n\
+                    qwen3-4b  qwen\n";
+        assert_eq!(interpret_text_ps(text), None);
     }
 
     // ─── (#2774 round-9 MF3) "nothing loaded" vs "could not tell" ──────
     //
-    // `parse_text_ps` above returns an empty vec for BOTH, which is fine
+    // `interpret_text_ps` on a headed table returns an empty vec for BOTH, which is fine
     // for a parser and fatal for a safety path — tier 5's unattended
     // eject had no way to distinguish them. `interpret_text_ps` is where
     // the distinction lives; these pin both halves, because a guard that
@@ -681,7 +667,7 @@ mod tests {
         );
     }
 
-    /// (#2774 round-9 review) Pre-existing in `parse_text_ps`, found while
+    /// (#2774 round-9 review) Pre-existing in the text parser, found while
     /// fixing the listing: `starts_with("IDENTIFIER")` is case-SENSITIVE,
     /// so a lowercase header parsed as a five-column model row and the
     /// listing reported one PHANTOM resident — a model named "identifier"
@@ -689,16 +675,11 @@ mod tests {
     #[test]
     fn a_lowercase_header_is_a_header_not_a_phantom_resident() {
         let lower = "identifier  model  status  size  context\n";
-        assert!(
-            parse_text_ps(lower).is_empty(),
-            "got {:?}",
-            parse_text_ps(lower)
-        );
         assert_eq!(interpret_text_ps(lower), Some(Vec::new()));
 
         // A real row under a lowercase header is still a real row.
         let with_row = "identifier  model  status  size  context\ndarkmux:qwen3-4b  qwen3-4b  idle  2.15 GB  68000\n";
-        let rows = parse_text_ps(with_row);
+        let rows = interpret_text_ps(with_row).expect("a readable listing");
         assert_eq!(rows.len(), 1, "got {rows:?}");
         assert_eq!(rows[0].identifier, "darkmux:qwen3-4b");
     }
@@ -816,8 +797,20 @@ mod tests {
     #[test]
     fn verify_unload_outcome_rejects_failure_stderr_or_nonzero_exit() {
         assert!(verify_unload_outcome(false, "", "darkmux:m").is_err());
-        assert!(verify_unload_outcome(true, "Model Not Found", "darkmux:m").is_err());
-        assert!(verify_unload_outcome(true, "Cannot find a model with the identifier darkmux:m", "darkmux:m").is_err());
         assert!(verify_unload_outcome(true, "Error: server disconnected", "darkmux:m").is_err());
+    }
+
+    /// (#3083 review) One classifier, not two: the not-found shape is the
+    /// typed `HostError::NotResident` (benign to callers that downcast), the
+    /// same answer `classify_unload_outcome` gives the gestalt host.
+    #[test]
+    fn verify_unload_outcome_types_not_found_as_not_resident() {
+        for stderr in ["Model Not Found", "Cannot find a model with the identifier darkmux:m"] {
+            let err = verify_unload_outcome(true, stderr, "darkmux:m").unwrap_err();
+            assert!(is_not_resident(&err), "{stderr:?} must read as NotResident, got {err:#}");
+        }
+        let stuck = verify_unload_outcome(false, "device busy", "darkmux:m").unwrap_err();
+        assert!(!is_not_resident(&stuck));
+        assert!(format!("{stuck:#}").contains("device busy"), "the cause must survive: {stuck:#}");
     }
 }

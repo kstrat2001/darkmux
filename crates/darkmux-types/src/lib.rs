@@ -468,7 +468,7 @@ pub struct Profile {
     /// differentiate (no offers, or a tie). Replaces the old `Primary`-role
     /// designation. When `None`, the first model in `models[]` is the implicit
     /// default (mirrors the old Primary-is-first convention). Must name a real
-    /// `models[]` id when set (checked by `validate_profile`).
+    /// `models[]` id when set (checked at registry load; a bad one quarantines the profile).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -12923,6 +12923,22 @@ fn ensure_model_resident(
     ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load)
 }
 
+/// (#3083) Unload the stale instance a reload replaces. It can vanish between
+/// `lms ps` and the unload; that is the end state the reload wants, so a
+/// not-resident answer is success and the caller goes on to load.
+fn unload_stale_for_reload(
+    unload: &dyn Fn(&str) -> Result<()>,
+    stale_identifier: &str,
+    n_ctx: u32,
+) -> Result<()> {
+    match unload(stale_identifier) {
+        Err(e) if darkmux_profiles::lms::is_not_resident(&e) => Ok(()),
+        other => other.with_context(|| {
+            format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
+        }),
+    }
+}
+
 fn ensure_model_resident_from(
     pm: &darkmux_types::ProfileModel,
     source: WindowSource,
@@ -12992,9 +13008,7 @@ fn ensure_model_resident_from(
                 source.describe(),
                 n_ctx
             );
-            unload(&stale_identifier).with_context(|| {
-                format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
-            })?;
+            unload_stale_for_reload(unload, &stale_identifier, n_ctx)?;
         }
         PreflightDecision::LoadFresh { foreign_identifier } => {
             // (#1609) A foreign resident of the same model is NOT an error and

@@ -236,8 +236,7 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
 fn validate_registry(reg: &mut ProfileRegistry, path: &Path) -> Result<()> {
     let mut to_quarantine = Vec::new();
     for (name, profile) in &reg.profiles {
-        validate_profile(name, profile, path)?;
-        if let Some(err) = check_bad_default_model(name, profile, path) {
+        if let Some(err) = check_empty_models(name, profile, path).or_else(|| check_bad_default_model(name, profile, path)) {
             to_quarantine.push((name.clone(), err));
         }
     }
@@ -263,15 +262,12 @@ fn validate_registry(reg: &mut ProfileRegistry, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
-    if profile.models.is_empty() {
-        bail!(
-            "{}: profile \"{}\" must have at least one model",
-            path.display(),
-            name
-        );
-    }
-    Ok(())
+/// (#3083) A profile with no `models[]` quarantines that profile rather than
+/// failing the whole registry, the same shape as a bad `default_model`.
+fn check_empty_models(name: &str, profile: &Profile, path: &Path) -> Option<String> {
+    profile.models.is_empty().then(|| {
+        format!("{}: profile \"{}\" must have at least one model", path.display(), name)
+    })
 }
 
 fn check_bad_default_model(name: &str, profile: &Profile, path: &Path) -> Option<String> {
@@ -654,15 +650,23 @@ mod tests {
     }
 
     #[test]
-    fn validates_no_models() {
+    fn a_profile_with_no_models_is_quarantined_not_fatal() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
             &p,
-            r#"{"profiles":{"empty":{"models":[]}}}"#,
+            r#"{"profiles":{
+                    "valid":{"models":[{"id":"m","n_ctx":1000}]},
+                    "empty":{"models":[]}
+                },
+                "default_profile":"valid"}"#,
         );
-        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains("at least one model"));
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("one empty profile never fails the file");
+        assert!(loaded.registry.profiles.contains_key("valid"));
+        assert!(!loaded.registry.profiles.contains_key("empty"));
+        let q = loaded.registry.quarantined.iter().find(|q| q.name == "empty").expect("quarantined");
+        assert_eq!(q.kind, darkmux_types::QuarantinedEntryKind::Profile);
+        assert!(q.error.contains("at least one model"), "error names the problem: {}", q.error);
     }
 
     #[test]
