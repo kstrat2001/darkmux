@@ -79,6 +79,10 @@ darkmux release.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
   with an `@` after the host now masks up to the last `@`.
+- **Indented and commented tool-call markup is not promoted into a call** (#3074). The
+  plain-text XML scan already skipped fenced blocks; it now also skips a line indented
+  four columns or a tab, and an HTML comment (an unclosed one runs to the end of the
+  text). Skipped openers count in `xml_openers_skipped_as_fenced`.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
