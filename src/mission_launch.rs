@@ -4876,9 +4876,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fail_if_interrupted_turns_an_ok_pass_into_an_error_only_after_a_signal() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
         assert!(fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).is_ok());
-        darkmux_types::interrupt::mark_interrupted();
+        darkmux_types::interrupt::raise_for_test();
         let err = fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).unwrap_err();
         assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
         let own = fail_if_interrupted(Err(anyhow!("its own failure"))).unwrap_err();

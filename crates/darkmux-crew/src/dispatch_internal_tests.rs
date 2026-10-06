@@ -15580,6 +15580,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     #[serial]
     fn run_tailer_kills_registered_children_on_interrupt_and_returns_promptly() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         // A real integration proof of the tailer's own interrupt-check —
         // the ONE poll point the docker/coder/crawl dispatch path has
         // between spawning the container and the main thread's blocking

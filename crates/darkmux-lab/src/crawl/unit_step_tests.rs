@@ -2480,6 +2480,8 @@ fn run_one_failing_unit_through_the_real_scheduler(
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME + the process-global interrupt flag
 fn an_interrupt_coincident_dispatch_failure_reads_interrupted_through_the_real_scheduler() {
+    // (#3100) It raises the process-wide interrupt flag.
+    darkmux_types::run_in_own_process!();
     darkmux_types::interrupt::reset_for_test();
 
     let home = TempDir::new().unwrap();

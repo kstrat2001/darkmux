@@ -762,6 +762,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_interrupt_during_the_prompt_is_never_consent_even_if_a_yes_follows() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
         let mut out = Vec::new();
         let consent =
@@ -801,6 +803,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_interrupt_already_seen_before_the_prompt_ends_it_without_asking_or_reading() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
         darkmux_types::interrupt::simulate_sigint_for_test();
         let mut out = Vec::new();

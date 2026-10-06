@@ -312,8 +312,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn run_bounded_does_not_spawn_once_a_signal_was_observed() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
-        darkmux_types::interrupt::mark_interrupted();
+        darkmux_types::interrupt::raise_for_test();
         let out = run_bounded(Command::new("/nonexistent/darkmux-3074"), Duration::from_secs(5));
         darkmux_types::interrupt::reset_for_test();
         assert!(matches!(out, Bounded::Interrupted), "got {out:?}");
@@ -439,6 +441,8 @@ mod tests {
     #[serial_test::serial] // the interrupt flag is process-wide
     #[cfg(unix)]
     fn a_caught_signal_kills_the_child_group_and_returns_interrupted() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         let m = marker(4);
         darkmux_types::interrupt::reset_for_test();
         darkmux_types::interrupt::simulate_sigterm_for_test();

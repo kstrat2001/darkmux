@@ -4211,7 +4211,8 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
         }
     }
     let _child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    // (#3100) A hang guard sized for a loaded host, like the fleet daemon's.
+    wait_for_serve_health(port, FLEET_TEST_HANG_BOUND);
     let body = ureq::get(&format!("http://127.0.0.1:{port}/health")).call().unwrap().into_string().unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let soft = v["open_file_limit"].as_u64().expect("the daemon reports its open-file limit to loopback");
@@ -4243,9 +4244,11 @@ fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit()
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    // (#3100) Hang guards sized for a loaded host, like the fleet daemon's:
+    // each poll returns the moment the daemon answers.
+    wait_for_serve_health(port, FLEET_TEST_HANG_BOUND);
     let record = std::path::Path::new(&darkmux_home).join("run/daemon.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     while !record.exists() {
         assert!(std::time::Instant::now() < deadline, "the daemon never recorded where it bound");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4673,25 +4676,41 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
 
 /// (#2678) The mid-dispatch half of the wall-clock bound. The 1s test above
 /// may fire before the stub is ever contacted (slow host), so it cannot pin the
-/// reap. Here the bound is 6s and the test first WAITS for the stub to see a
-/// connection, so the bound provably fires mid-dispatch: the watchdog must tear
-/// the `curl` down, and the run must still close `run.complete` Degraded.
+/// reap. Here the test first WAITS for the stub to see a connection, so the
+/// bound provably fires mid-dispatch: the watchdog must tear the `curl` down,
+/// and the run must still close `run.complete` Degraded.
+///
+/// (#3100) The bound is measured from process start, and the mint before the
+/// dispatch took more than 5s on a loaded host, so a 6s bound left the test at
+/// the host's mercy. The bound is now far above any realistic mint, and the
+/// wait for the connection runs until shortly before it: a run whose dispatch
+/// connects at all connects inside that window, and one that never connects
+/// still fails here rather than passing without the bound firing mid-dispatch.
 #[test]
 fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
-    let (stub, _home, flows, mut child) = spawn_wall_clock_launch("6");
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let (stub, _home, flows, mut child) = spawn_wall_clock_launch(&BOUND.as_secs().to_string());
 
     assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(5)),
-        "the dispatch never connected within 5s, so the bound cannot be shown to fire mid-dispatch"
+        stub.wait_for_a_connection((BOUND - MARGIN).saturating_sub(started.elapsed())),
+        "the dispatch never connected within {:?} of a {BOUND:?} bound, so the bound cannot be \
+         shown to fire mid-dispatch",
+        BOUND - MARGIN
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the launch must still be running, blocked on the dispatch, when the stub sees it"
+    );
+    let deadline = std::time::Instant::now() + BOUND + std::time::Duration::from_secs(60);
     let exit_status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "mission launch did not self-terminate within 60s of its 6s wall-clock bound (#2678 regression)"
+            "mission launch did not self-terminate within 60s past its {BOUND:?} wall-clock bound (#2678 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
