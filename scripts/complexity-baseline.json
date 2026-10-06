@@ -97,7 +97,6 @@
   "runtime/src/main.rs::run_dispatch": 136,
   "runtime/src/plain_text_tool_calls.rs::fenced_regions": 23,
   "runtime/src/tools/mod.rs::execute_create_mod_with": 25,
-  "runtime/src/tools/mod.rs::execute_edit": 18,
   "runtime/src/tools/mod.rs::run_bash_bounded": 23,
   "runtime/src/usage_conformance.rs::blank_literals": 21,
   "runtime/src/usage_conformance.rs::block_range": 20,
