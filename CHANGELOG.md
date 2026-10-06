@@ -62,6 +62,9 @@ darkmux release.
 
 ### Fixed (5.0): isolation
 
+- **A second prompt on one ACP session no longer replaces the first prompt's abort handle** (#3074).
+  `session/cancel` and `session/close` abort every prompt in flight on the session, and a
+  cancel that finds nothing in flight does nothing, so it cannot abort the session's next prompt.
 - **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
   The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
   the operator asked to protect. A `dispatch.internal` step reads it from the config key

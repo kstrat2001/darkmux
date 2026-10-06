@@ -140,9 +140,10 @@
 //!   [`run_cancellable`] has inserted its own abort handle into
 //!   [`InFlight`] — used to be a silently-lost no-op that let the command
 //!   run to completion reporting `EndTurn` as if nothing happened;
-//!   `InFlight` now stores a `Cancelled` tombstone (`InFlightSlot`) in that
-//!   window, so the command aborts itself the instant it registers instead
-//!   of racing ahead uncancelled. (2) A `kill_on_drop`'d SIGKILL has no
+//!   the request handler now reserves the prompt in `InFlight` before
+//!   `cx.spawn` (`TaskState::Reserved`), so a cancel in that window marks
+//!   that one prompt and the command aborts itself the instant it
+//!   registers, instead of racing ahead uncancelled. (2) A `kill_on_drop`'d SIGKILL has no
 //!   finalize step — a cancelled `run_launch_command` mission
 //!   is left permanently `Active` (`darkmux mission status` will flag it;
 //!   a manual `mission abort` reconciles it), and the temp diff file
@@ -291,47 +292,130 @@ struct SessionState {
 
 type Sessions = Arc<Mutex<HashMap<SessionId, SessionState>>>;
 
-/// (#1684 remainder) The abort-handle registry `session/cancel` and
-/// `session/close` both drive: keyed by session id, holding an
-/// [`InFlightSlot`] for whatever command that session currently has
-/// running (inserted by [`run_cancellable`] for the duration of one
-/// `session/prompt`, removed when that command finishes on its own). A
-/// session with nothing in flight simply has no entry — looking one up is
-/// always a `remove`-and-check, never a panic on absence.
-type InFlight = Arc<Mutex<HashMap<SessionId, InFlightSlot>>>;
+/// (#1684 remainder) The abort registry `session/cancel` and `session/close`
+/// both drive: keyed by session id, one [`InFlightTask`] per prompt that
+/// session currently has in flight (#3074: several prompts may overlap, and
+/// none may replace another's handle). A prompt is entered by
+/// [`reserve_prompt`] when its request is handled and leaves when its
+/// [`PromptTicket`] drops, so a cancel can only ever reach prompts that
+/// existed when it arrived. A session with nothing in flight has no entry.
+type InFlight = Arc<Mutex<HashMap<SessionId, Vec<InFlightTask>>>>;
 
-/// (#3074) An in-flight task tracked by [`InFlightSlot::Running`], identifying
-/// the spawned task by its [`tokio::task::Id`] alongside its abort handle.
+/// Source of [`InFlightTask::ticket`] values, unique for the process.
+static NEXT_PROMPT_TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One in-flight prompt's entry in [`InFlight`].
 #[derive(Debug)]
 struct InFlightTask {
-    id: tokio::task::Id,
-    handle: tokio::task::AbortHandle,
+    ticket: u64,
+    state: TaskState,
 }
 
-/// One session's entry in [`InFlight`] — either running command abort handles,
-/// or a `Cancelled` TOMBSTONE (#1777 merge gate, CONSIDER — the "lost-cancel race").
+/// Where one in-flight prompt is in its life.
 ///
-/// The race: `PromptRequest`'s handler returns as soon as `cx.spawn`
-/// SCHEDULES its task, not once that task actually starts running. On the
-/// multi-thread runtime, `session/cancel`'s notification can therefore be
-/// processed — and find `InFlight` empty for that session, since
-/// [`run_cancellable`] hasn't reached its own insert yet — before the
-/// command's first poll ever happens. Before this tombstone existed, that
-/// window turned a genuine cancel into a silently logged no-op, and the
-/// mission ran to completion reporting `EndTurn` as if nothing had been
-/// asked of it. Recording `Cancelled` in that same window means
-/// `run_cancellable`'s own insert attempt finds it and aborts immediately
-/// instead of registering a handle nobody will ever call `abort()` on.
-///
-/// (#3074) `Running` holds a list of all active prompts on this session, so
-/// a second concurrent prompt cannot overwrite an existing task's abort handle.
-/// `session/cancel` and `session/close` abort all running tasks for that session.
+/// `Reserved` exists for the lost-cancel race (#1777 merge gate, CONSIDER):
+/// `PromptRequest`'s handler returns as soon as `cx.spawn` SCHEDULES its task,
+/// not once the task starts, so `session/cancel` can be processed before
+/// [`run_cancellable`] has an abort handle to register. The handler therefore
+/// reserves the prompt synchronously, before `cx.spawn`; a cancel in that
+/// window marks the reservation `ReservedCancelled`, and `run_cancellable`
+/// aborts its task the instant it attaches. Unlike the tombstone this
+/// replaces, the mark belongs to one specific prompt: a cancel with nothing
+/// reserved is a no-op and cannot abort a later prompt (#3074).
+/// `Aborted` keeps the entry until the task settles, so a repeated cancel is
+/// inert rather than a second chance to abort anything.
 #[derive(Debug)]
-enum InFlightSlot {
-    Running(Vec<InFlightTask>),
-    Cancelled,
+enum TaskState {
+    Reserved,
+    ReservedCancelled,
+    Running(tokio::task::AbortHandle),
+    Aborted,
 }
 
+/// RAII claim on one [`InFlight`] entry: dropping it removes the entry, on
+/// every exit path, including a `cx.spawn`'d future that is dropped unpolled.
+struct PromptTicket {
+    in_flight: InFlight,
+    session_id: SessionId,
+    ticket: u64,
+}
+
+impl Drop for PromptTicket {
+    fn drop(&mut self) {
+        let mut guard = self.in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+        if let Some(tasks) = guard.get_mut(&self.session_id) {
+            tasks.retain(|t| t.ticket != self.ticket);
+            if tasks.is_empty() {
+                guard.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// Registers a prompt as in flight on `session_id`. Call it synchronously in
+/// the request handler, before `cx.spawn` (see [`TaskState`]).
+fn reserve_prompt(in_flight: &InFlight, session_id: &SessionId) -> PromptTicket {
+    let ticket = NEXT_PROMPT_TICKET.fetch_add(1, Ordering::SeqCst);
+    in_flight
+        .lock()
+        .expect("darkmux acp: in-flight tasks mutex poisoned")
+        .entry(session_id.clone())
+        .or_default()
+        .push(InFlightTask { ticket, state: TaskState::Reserved });
+    PromptTicket { in_flight: in_flight.clone(), session_id: session_id.clone(), ticket }
+}
+
+/// Attaches `handle` to the prompt's reserved entry. Returns `true` when a
+/// cancel already reached that reservation, meaning the caller must abort
+/// `handle` now.
+fn attach_abort_handle(ticket: &PromptTicket, handle: tokio::task::AbortHandle) -> bool {
+    let mut guard = ticket.in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    let Some(task) = guard
+        .get_mut(&ticket.session_id)
+        .and_then(|tasks| tasks.iter_mut().find(|t| t.ticket == ticket.ticket))
+    else {
+        return false;
+    };
+    match task.state {
+        TaskState::ReservedCancelled => {
+            task.state = TaskState::Aborted;
+            true
+        }
+        _ => {
+            task.state = TaskState::Running(handle);
+            false
+        }
+    }
+}
+
+/// Aborts every prompt currently in flight on `session_id` (`session/cancel`
+/// and `session/close` both land here) and returns how many it reached.
+/// Entries stay until their tickets drop.
+fn abort_session_prompts(in_flight: &InFlight, session_id: &SessionId) -> usize {
+    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    let Some(tasks) = guard.get_mut(session_id) else {
+        return 0;
+    };
+    let mut reached = 0;
+    for task in tasks.iter_mut() {
+        match std::mem::replace(&mut task.state, TaskState::Aborted) {
+            TaskState::Reserved => {
+                task.state = TaskState::ReservedCancelled;
+                reached += 1;
+            }
+            TaskState::Running(handle) => {
+                handle.abort();
+                reached += 1;
+            }
+            TaskState::ReservedCancelled => {
+                task.state = TaskState::ReservedCancelled;
+                reached += 1;
+            }
+            TaskState::Aborted => {}
+        }
+    }
+    reached
+}
 
 /// `session/set_config_option`'s `config_id` for the "radio host" picker
 /// (#1698 Packet B2, scope F) — selects the answering seat's profile.
@@ -1118,7 +1202,10 @@ async fn serve(
                     let cx_task = cx.clone();
                     let sessions_for_task = sessions_for_prompt.clone();
                     let idle_for_task = idle_for_prompt.clone();
-                    let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
+                    // (#3074) Reserved synchronously, BEFORE `cx.spawn`, so a
+                    // `session/cancel` processed ahead of the task's first poll
+                    // still reaches this prompt (see `TaskState`).
+                    let prompt_ticket = reserve_prompt(&in_flight_tasks_for_prompt, &session_id);
                     return cx.spawn(async move {
                         // (#1698 Packet B2, scope G2) Incremented HERE, as
                         // the future's own first action, not before
@@ -1144,7 +1231,7 @@ async fn serve(
                         let work_sessions = sessions_for_task.clone();
                         let work_cwd = cwd.clone();
                         let stop_reason = run_cancellable(
-                            &in_flight_tasks_for_task,
+                            prompt_ticket,
                             session_id.clone(),
                             cx_task.clone(),
                             async move {
@@ -1177,7 +1264,8 @@ async fn serve(
                 let seat_for_task = seat_for_prompt.clone();
                 let sessions_for_task = sessions_for_prompt.clone();
                 let idle_for_task = idle_for_prompt.clone();
-                let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
+                // (#3074) Reserved before `cx.spawn`; see the slash path.
+                let prompt_ticket = reserve_prompt(&in_flight_tasks_for_prompt, &session_id);
                 cx.spawn(async move {
                     // (#1698 Packet B2, scope G2) See the slash-path arm's
                     // own comment on why this increments HERE, inside the
@@ -1191,7 +1279,7 @@ async fn serve(
                     let work_cwd = cwd.clone();
                     let work_text = text.clone();
                     let stop_reason = run_cancellable(
-                        &in_flight_tasks_for_task,
+                        prompt_ticket,
                         session_id.clone(),
                         cx_task.clone(),
                         async move {
@@ -1340,12 +1428,11 @@ async fn serve(
         // "Cancellation is wired" note for the full mechanism, including why
         // aborting the task actually kills the OS subprocess rather than
         // orphaning it. A cancel for a session with nothing in flight (the
-        // command already finished, or the id is unknown) records a
-        // `Cancelled` tombstone instead of a bare no-op (#1777 merge gate,
-        // CONSIDER — the lost-cancel race; see `InFlightSlot`'s own doc) —
-        // `session/cancel` stays fire-and-forget by protocol design either
-        // way, so there is still no response to fail even if it were an
-        // error.
+        // command already finished, or the id is unknown) is a no-op and
+        // leaves nothing behind to abort a later prompt (#3074); the
+        // lost-cancel race is covered by reserving each prompt before
+        // `cx.spawn` (see `TaskState`). `session/cancel` stays
+        // fire-and-forget by protocol design, so there is no response to fail.
         .on_receive_notification(
             async move |cancel: CancelNotification, _cx| {
                 handle_cancel_notification(&in_flight_tasks_for_cancel, &idle_for_cancel, &cancel);
@@ -1370,8 +1457,6 @@ async fn serve(
                 );
                 responder.respond(CloseSessionResponse::new())
             },
-                responder.respond(CloseSessionResponse::new())
-            },
             agent_client_protocol::on_receive_request!(),
         )
         .connect_to(transport)
@@ -1385,35 +1470,14 @@ fn handle_cancel_notification(
     idle: &Arc<IdleState>,
     cancel: &CancelNotification,
 ) {
+    // (#1781) A cancel is client activity: stamp it so a busy-but-quiet
+    // session is not idle-exited out from under the stop press.
     idle.record_activity();
-    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
-    match guard.remove(&cancel.session_id) {
-        Some(InFlightSlot::Running(tasks)) => {
-            eprintln!(
-                "[darkmux-acp] session/cancel: {} — aborting {} in-flight command(s)",
-                cancel.session_id,
-                tasks.len(),
-            );
-            drop(guard);
-            for task in tasks {
-                task.handle.abort();
-            }
-        }
-        Some(InFlightSlot::Cancelled) => {
-            guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
-            eprintln!(
-                "[darkmux-acp] session/cancel: {} — already tombstoned by an earlier cancel",
-                cancel.session_id
-            );
-        }
-        None => {
-            guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
-            eprintln!(
-                "[darkmux-acp] session/cancel: {} — nothing in flight yet; recording a cancel tombstone in case the command hasn't registered itself yet",
-                cancel.session_id
-            );
-        }
-    }
+    let reached = abort_session_prompts(in_flight, &cancel.session_id);
+    eprintln!(
+        "[darkmux-acp] session/cancel: {} — aborting {reached} in-flight command(s)",
+        cancel.session_id,
+    );
 }
 
 fn handle_close_session_request(
@@ -1422,16 +1486,9 @@ fn handle_close_session_request(
     idle: &Arc<IdleState>,
     session_id: &SessionId,
 ) {
+    // (#1781) Same activity stamp as `session/cancel`.
     idle.record_activity();
-    if let Some(InFlightSlot::Running(tasks)) = in_flight
-        .lock()
-        .expect("darkmux acp: in-flight tasks mutex poisoned")
-        .remove(session_id)
-    {
-        for task in tasks {
-            task.handle.abort();
-        }
-    }
+    abort_session_prompts(in_flight, session_id);
     let existed = sessions
         .lock()
         .expect("darkmux acp: sessions mutex poisoned")
@@ -1464,26 +1521,22 @@ fn handle_close_session_request(
 /// swallowed — see the caller's own "nothing may panic across the protocol
 /// boundary" robustness rule).
 ///
-/// Entry removal happens unconditionally once `work` settles (success,
-/// error, or abort) — `session/cancel`/`session/close` already remove the
-/// entry themselves on the abort path, so this is a harmless no-op remove
-/// in that case, not a double-abort risk (removing an absent key is inert).
+/// The prompt's entry leaves [`InFlight`] when `ticket` drops, once `work`
+/// settles (success, error, or abort).
 async fn run_cancellable(
-    in_flight: &InFlight,
+    ticket: PromptTicket,
     session_id: SessionId,
     cx: ConnectionTo<Client>,
     work: impl std::future::Future<Output = Result<()>> + Send + 'static,
 ) -> StopReason {
     let handle = tokio::spawn(work);
-    let task_id = handle.id();
-    // (#1777 merge gate — lost-cancel race) Check for a tombstone at the
-    // EXACT point this would otherwise insert its own handle — see
-    // `register_or_consume_cancel_tombstone`'s own doc.
-    if register_or_consume_cancel_tombstone(in_flight, &session_id, task_id, handle.abort_handle()) {
+    // (#1777 merge gate — lost-cancel race) A cancel may have reached this
+    // prompt's reservation before the task had a handle; see `TaskState`.
+    if attach_abort_handle(&ticket, handle.abort_handle()) {
         handle.abort();
     }
     let outcome = handle.await;
-    deregister_in_flight_task(in_flight, &session_id, task_id);
+    drop(ticket);
 
     match outcome {
         Ok(Ok(())) => StopReason::EndTurn,
@@ -1504,63 +1557,6 @@ async fn run_cancellable(
                 format!("darkmux acp: internal error — the command task panicked: {join_err}"),
             ));
             StopReason::EndTurn
-        }
-    }
-}
-
-/// (#3074) Deregister one task from [`InFlight`] upon completion.
-/// If other concurrent prompts for the same session are still in flight,
-/// they remain registered; once the last task finishes, the session's entry
-/// is pruned.
-fn deregister_in_flight_task(
-    in_flight: &InFlight,
-    session_id: &SessionId,
-    task_id: tokio::task::Id,
-) {
-    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
-    if let Some(InFlightSlot::Running(tasks)) = guard.get_mut(session_id) {
-        tasks.retain(|t| t.id != task_id);
-        if tasks.is_empty() {
-            guard.remove(session_id);
-        }
-    }
-}
-
-/// (#1777 merge gate — lost-cancel race) The tombstone check/insert
-/// [`run_cancellable`] performs at the exact point it would otherwise
-/// register `handle` as this session's live running command — factored out
-/// as a pure function of `in_flight` (no `cx`/`SessionId`-wire dependency)
-/// so the race fix is unit-testable without spinning up a full ACP
-/// connection. Returns `true` when a `Cancelled` tombstone was ALREADY
-/// there (meaning: `session/cancel` raced ahead of this registration —
-/// consume the tombstone and report "already cancelled, abort `handle`
-/// immediately"), `false` when this call successfully registered `handle`
-/// into the session's [`InFlightSlot::Running`] entry (the ordinary case).
-///
-/// (#3074) If another prompt is already running on this session, this appends
-/// to the running list rather than replacing the existing task's abort handle.
-fn register_or_consume_cancel_tombstone(
-    in_flight: &InFlight,
-    session_id: &SessionId,
-    task_id: tokio::task::Id,
-    handle: tokio::task::AbortHandle,
-) -> bool {
-    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
-    match guard.get_mut(session_id) {
-        Some(InFlightSlot::Cancelled) => {
-            guard.remove(session_id);
-            true
-        }
-        Some(InFlightSlot::Running(tasks)) => {
-            tasks.push(InFlightTask { id: task_id, handle });
-            false
-        }
-        None => {
-            guard.insert(
-                session_id.clone(),
-                InFlightSlot::Running(vec![InFlightTask { id: task_id, handle }]),
-            );
-            false
         }
     }
 }
@@ -4678,112 +4674,249 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// (#1777 merge gate — CONSIDER, the lost-cancel race) A `session/
-    /// cancel` that arrives BEFORE `run_cancellable` has registered its
-    /// own handle used to be silently lost — see `InFlightSlot`'s own
-    /// doc. This proves the fix at the exact seam that matters:
-    /// `register_or_consume_cancel_tombstone` finds a pre-existing
-    /// `Cancelled` tombstone (simulating the race deterministically,
-    /// rather than trying to win a real timing race against the tokio
-    /// scheduler) and reports "already cancelled" instead of registering
-    /// a handle nobody will ever call `abort()` on.
-    #[tokio::test]
-    async fn a_cancel_tombstone_recorded_before_registration_is_consumed_and_reported() {
-        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
-        let session_id = SessionId::new("darkmux-acp-test-session");
-
-        // Simulate `session/cancel` racing ahead of the command's own
-        // registration — exactly the window `InFlightSlot`'s doc names.
-        in_flight.lock().unwrap().insert(session_id.clone(), InFlightSlot::Cancelled);
-
-        let placeholder = tokio::spawn(async {});
-        let already_cancelled = register_or_consume_cancel_tombstone(
-            &in_flight,
-            &session_id,
-            placeholder.id(),
-            placeholder.abort_handle(),
-        );
-        placeholder.abort();
-
-        assert!(already_cancelled, "a pre-existing tombstone must be reported as already-cancelled");
-        assert!(
-            in_flight.lock().unwrap().get(&session_id).is_none(),
-            "the tombstone must be CONSUMED (removed), not left in place to fire twice"
-        );
+    /// [`send_prompt`] with a caller-chosen JSON-RPC id, so two prompts can
+    /// be in flight on one session without sharing a response id.
+    async fn send_prompt_with_id(writer: &mut DuplexStream, session_id: &str, id: u32, text: &str) {
+        send_json(
+            writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+            }),
+        )
+        .await;
     }
 
-    /// (#1777 merge gate — CONSIDER, the lost-cancel race) The ordinary
-    /// case: no tombstone waiting, so `register_or_consume_cancel_
-    /// tombstone` registers the handle normally and reports "not yet
-    /// cancelled" — the SAME behavior `run_cancellable` relied on before
-    /// this fix, proving the race fix didn't change the common path.
-    #[tokio::test]
-    async fn no_tombstone_present_registers_the_handle_as_running() {
-        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
-        let session_id = SessionId::new("darkmux-acp-test-session-2");
-
-        let placeholder = tokio::spawn(async {});
-        let already_cancelled = register_or_consume_cancel_tombstone(
-            &in_flight,
-            &session_id,
-            placeholder.id(),
-            placeholder.abort_handle(),
-        );
-        placeholder.abort();
-
-        assert!(!already_cancelled, "with nothing tombstoned, the handle must register as the running command");
-        assert!(
-            matches!(in_flight.lock().unwrap().get(&session_id), Some(InFlightSlot::Running(_))),
-            "the session's slot must now be Running"
-        );
+    async fn send_cancel(writer: &mut DuplexStream, session_id: &str) {
+        send_json(
+            writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
     }
 
-    /// (#3074) Two concurrent prompts on one session must not replace each
-    /// other's abort handle. Both must be registered and both aborted on cancel.
+    /// Reads agent lines until `count` `session/prompt` responses (lines
+    /// carrying a `result.stopReason`) have arrived; returns their stop reasons.
+    async fn recv_stop_reasons(reader: &mut BufReader<DuplexStream>, count: usize) -> Vec<String> {
+        let mut reasons = Vec::new();
+        while reasons.len() < count {
+            let line = recv_json(reader).await;
+            if let Some(reason) = line["result"]["stopReason"].as_str() {
+                reasons.push(reason.to_string());
+            }
+        }
+        reasons
+    }
+
+    /// A router whose first `blocking` calls announce themselves on the
+    /// returned receiver and then park until the returned sender is dropped;
+    /// every later call answers at once.
+    fn blocking_router(
+        blocking: usize,
+    ) -> (
+        impl Fn(&str) -> Result<String> + Send + Sync + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = std::sync::Mutex::new(started_tx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let router = move |_msg: &str| -> Result<String> {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) < blocking {
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+            }
+            Ok("```json\n{\"command\": \"echo-fixture\", \"args\": \"\"}\n```".to_string())
+        };
+        (router, started_rx, release_tx)
+    }
+
+    async fn wait_for_started(started_rx: std::sync::mpsc::Receiver<()>, count: usize) -> std::sync::mpsc::Receiver<()> {
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..count {
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the router must start running before the test can cancel it");
+            }
+            started_rx
+        })
+        .await
+        .expect("joining the started-signal wait")
+    }
+
+    async fn assert_next_slash_prompt_runs(
+        writer: &mut DuplexStream,
+        reader: &mut BufReader<DuplexStream>,
+        session_id: &str,
+    ) {
+        send_prompt_with_id(writer, session_id, 90, "/mission launch echo-fixture").await;
+        let output = recv_json(reader).await;
+        assert_eq!(chunk_text(&output), "fixture output", "the next prompt must run, not be aborted");
+        assert_end_turn(&recv_json(reader).await);
+    }
+
+    /// (#3074) A cancel that finds nothing in flight must not leave a marker
+    /// that aborts the session's NEXT prompt.
     #[tokio::test]
-    async fn two_concurrent_prompts_on_one_session_both_registered_and_aborted_on_cancel() {
+    #[serial_test::serial]
+    async fn cancel_with_nothing_in_flight_does_not_abort_the_next_prompt() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_cancel(&mut writer, &session_id).await;
+        assert_next_slash_prompt_runs(&mut writer, &mut reader, &session_id).await;
+    }
+
+    /// (#3074) Two prompts in flight on one session: one cancel aborts both
+    /// (neither replaces the other's abort handle), and the next prompt runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_aborts_both_concurrent_prompts_and_the_next_prompt_runs() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (router, started_rx, release_tx) = blocking_router(2);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt_with_id(&mut writer, &session_id, 10, "first").await;
+        send_prompt_with_id(&mut writer, &session_id, 11, "second").await;
+        let _started_rx = wait_for_started(started_rx, 2).await;
+
+        send_cancel(&mut writer, &session_id).await;
+        assert_eq!(recv_stop_reasons(&mut reader, 2).await, vec!["cancelled", "cancelled"]);
+
+        assert_next_slash_prompt_runs(&mut writer, &mut reader, &session_id).await;
+        drop(release_tx);
+    }
+
+    /// (#3074) A repeated cancel while the aborted prompt is still settling
+    /// must not poison the next prompt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn double_cancel_does_not_abort_the_next_prompt() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (router, started_rx, release_tx) = blocking_router(1);
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt_with_id(&mut writer, &session_id, 10, "first").await;
+        let _started_rx = wait_for_started(started_rx, 1).await;
+
+        send_cancel(&mut writer, &session_id).await;
+        send_cancel(&mut writer, &session_id).await;
+        assert_eq!(recv_stop_reasons(&mut reader, 1).await, vec!["cancelled"]);
+
+        assert_next_slash_prompt_runs(&mut writer, &mut reader, &session_id).await;
+        drop(release_tx);
+    }
+
+    /// (#1777 merge gate, #3074) The lost-cancel race: a `session/cancel`
+    /// processed after the prompt is reserved but before its task has a handle
+    /// marks that reservation, and attaching the handle reports "abort now".
+    #[tokio::test]
+    async fn a_cancel_between_reserve_and_attach_aborts_on_attach() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-race-test");
+        let ticket = reserve_prompt(&in_flight, &session_id);
+
+        assert_eq!(abort_session_prompts(&in_flight, &session_id), 1);
+
+        let placeholder = tokio::spawn(async {});
+        assert!(attach_abort_handle(&ticket, placeholder.abort_handle()), "the early cancel must be reported");
+        placeholder.abort();
+    }
+
+    /// The inverted case: no cancel, so attaching registers the handle.
+    #[tokio::test]
+    async fn attach_without_a_cancel_registers_the_handle_as_running() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-attach-test");
+        let ticket = reserve_prompt(&in_flight, &session_id);
+
+        let placeholder = tokio::spawn(async {});
+        assert!(!attach_abort_handle(&ticket, placeholder.abort_handle()));
+        placeholder.abort();
+        assert!(matches!(
+            in_flight.lock().unwrap().get(&session_id).map(|t| &t[0].state),
+            Some(TaskState::Running(_))
+        ));
+    }
+
+    /// (#3074) A cancel with nothing reserved leaves no state behind, so a
+    /// prompt reserved afterward is untouched.
+    #[tokio::test]
+    async fn a_cancel_with_nothing_reserved_leaves_no_marker() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-stale-test");
+
+        assert_eq!(abort_session_prompts(&in_flight, &session_id), 0);
+        assert!(in_flight.lock().unwrap().is_empty(), "a no-op cancel must not insert an entry");
+
+        let ticket = reserve_prompt(&in_flight, &session_id);
+        let placeholder = tokio::spawn(async {});
+        assert!(!attach_abort_handle(&ticket, placeholder.abort_handle()), "a later prompt must not be aborted");
+        placeholder.abort();
+    }
+
+    /// (#3074) Two prompts on one session both keep their handle; one cancel
+    /// reaches both through the real handler; dropping the tickets prunes the
+    /// session's entry.
+    #[tokio::test]
+    async fn the_cancel_handler_aborts_every_prompt_on_the_session() {
         let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
         let session_id = SessionId::new("darkmux-acp-concurrent-test");
+        let idle = Arc::new(IdleState::new());
 
         let p1 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
         let p2 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let t1 = reserve_prompt(&in_flight, &session_id);
+        let t2 = reserve_prompt(&in_flight, &session_id);
+        assert!(!attach_abort_handle(&t1, p1.abort_handle()));
+        assert!(!attach_abort_handle(&t2, p2.abort_handle()));
 
-        assert!(!register_or_consume_cancel_tombstone(&in_flight, &session_id, p1.id(), p1.abort_handle()));
-        assert!(!register_or_consume_cancel_tombstone(&in_flight, &session_id, p2.id(), p2.abort_handle()));
+        let cancel = CancelNotification::new(session_id.clone());
+        handle_cancel_notification(&in_flight, &idle, &cancel);
+        handle_cancel_notification(&in_flight, &idle, &cancel);
 
-        // Both handles are retained under Running
-        {
-            let guard = in_flight.lock().unwrap();
-            match guard.get(&session_id) {
-                Some(InFlightSlot::Running(tasks)) => assert_eq!(tasks.len(), 2),
-                other => panic!("expected 2 running tasks, got {other:?}"),
-            }
-        }
+        assert!(p1.await.unwrap_err().is_cancelled(), "first prompt must be aborted by the cancel");
+        assert!(p2.await.unwrap_err().is_cancelled(), "second prompt must be aborted by the cancel");
+        drop(t1);
+        assert_eq!(in_flight.lock().unwrap().get(&session_id).map(Vec::len), Some(1));
+        drop(t2);
+        assert!(in_flight.lock().unwrap().is_empty(), "the last ticket drop prunes the session");
+    }
 
-        // Deregistering one task leaves the other
-        deregister_in_flight_task(&in_flight, &session_id, p1.id());
-        {
-            let guard = in_flight.lock().unwrap();
-            match guard.get(&session_id) {
-                Some(InFlightSlot::Running(tasks)) => {
-                    assert_eq!(tasks.len(), 1);
-                    assert_eq!(tasks[0].id, p2.id());
-                }
-                other => panic!("expected 1 running task, got {other:?}"),
-            }
-        }
+    /// (#3074) `session/close` aborts every prompt too.
+    #[tokio::test]
+    async fn the_close_handler_aborts_every_prompt_on_the_session() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-close-test");
+        let idle = Arc::new(IdleState::new());
 
-        // Cancel aborts the remaining task
-        let tasks = match in_flight.lock().unwrap().remove(&session_id) {
-            Some(InFlightSlot::Running(tasks)) => tasks,
-            _ => panic!("expected Running"),
-        };
-        for t in tasks {
-            t.handle.abort();
-        }
+        let p1 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let p2 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let t1 = reserve_prompt(&in_flight, &session_id);
+        let t2 = reserve_prompt(&in_flight, &session_id);
+        attach_abort_handle(&t1, p1.abort_handle());
+        attach_abort_handle(&t2, p2.abort_handle());
 
-        assert!(p2.await.unwrap_err().is_cancelled(), "second task must be aborted");
-        p1.abort();
+        handle_close_session_request(&in_flight, &sessions, &idle, &session_id);
+
+        assert!(p1.await.unwrap_err().is_cancelled());
+        assert!(p2.await.unwrap_err().is_cancelled());
+        drop((t1, t2));
     }
 
     /// (#2476) `spawn_registered` must register its child's pid BEFORE
