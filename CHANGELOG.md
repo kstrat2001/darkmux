@@ -79,6 +79,10 @@ darkmux release.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
   with an `@` after the host now masks up to the last `@`.
+- **A failed battery probe keeps a held battery pause alive** (#3074). The governor dropped
+  its heartbeat on any tick with no reading, so a probe that kept failing for longer than the
+  runtime's pause ceiling let the run resume below the floor. It now keeps re-stamping at the
+  last known charge, and only a reading above the floor releases the pause.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
