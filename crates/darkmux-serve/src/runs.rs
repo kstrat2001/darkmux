@@ -857,12 +857,69 @@ struct FlowMissionAgg {
     /// on every peer's viewer, while the owning machine correctly showed it
     /// Abandoned.
     terminal_ts: Option<String>,
+    terminal_status: Option<RunStatus>,
     terminal_was_abort: bool,
     /// Session ids observed under this mission, used to borrow role/model/
     /// endpoint for the row without a second pass.
     session_ids: Vec<String>,
     /// The newest receive key among this mission's records ([`record_receive_key`]).
     last_key: Option<u64>,
+}
+
+impl FlowMissionAgg {
+    fn fold_record(&mut self, v: &serde_json::Value) {
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        self.last_key = self.last_key.max(record_receive_key(v));
+        if self.machine.is_none() {
+            if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
+                if !m.is_empty() {
+                    self.machine = Some(m.to_string());
+                    self.machine_uid = record_machine_uid(v);
+                }
+            }
+        }
+        if !ts.is_empty() {
+            if self.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
+                self.first_ts = Some(ts.to_string());
+            }
+            if self.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
+                self.last_ts = Some(ts.to_string());
+            }
+        }
+        self.fold_terminal(v, ts);
+        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            if !sid.is_empty() && !self.session_ids.iter().any(|s| s == sid) {
+                self.session_ids.push(sid.to_string());
+            }
+        }
+    }
+
+    fn fold_terminal(&mut self, v: &serde_json::Value, ts: &str) {
+        let action = darkmux_flow::reader::action_of(v);
+        match action {
+            Some(FlowAction::MissionClose) if self.terminal_ts.is_none() || !self.terminal_was_abort => {
+                self.terminal_ts = Some(ts.to_string());
+                self.terminal_was_abort = false;
+                self.terminal_status = Some(RunStatus::Complete);
+            }
+            Some(FlowAction::MissionAbort) => {
+                self.terminal_ts = Some(ts.to_string());
+                self.terminal_was_abort = true;
+                self.terminal_status = Some(RunStatus::Abandoned);
+            }
+            Some(FlowAction::RunComplete) if self.terminal_ts.is_none() => {
+                self.terminal_ts = Some(ts.to_string());
+                self.terminal_was_abort = false;
+                self.terminal_status = Some(RunStatus::Complete);
+            }
+            Some(FlowAction::RunError) if self.terminal_ts.is_none() => {
+                self.terminal_ts = Some(ts.to_string());
+                self.terminal_was_abort = false;
+                self.terminal_status = Some(RunStatus::Error);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn build_flow_mission_index(
@@ -902,42 +959,7 @@ fn build_flow_mission_index_in(
         if mid.is_empty() {
             return;
         }
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-        let agg = idx.entry(mid.to_string()).or_default();
-        agg.last_key = agg.last_key.max(record_receive_key(v));
-        if agg.machine.is_none() {
-            if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
-                if !m.is_empty() {
-                    agg.machine = Some(m.to_string());
-                    agg.machine_uid = record_machine_uid(v);
-                }
-            }
-        }
-        if !ts.is_empty() {
-            if agg.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
-                agg.first_ts = Some(ts.to_string());
-            }
-            if agg.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
-                agg.last_ts = Some(ts.to_string());
-            }
-        }
-        // The only terminal mission-lifecycle actions the emitter actually
-        // writes are `mission close` and `mission abort`
-        // (`darkmux_crew::lifecycle`); `mission start` is the opening
-        // bookend. Matching vocabulary that is never emitted would read as
-        // real coverage to the next person who greps for it.
-        let action = darkmux_flow::reader::action_of(v);
-        if let Some(terminal @ (FlowAction::MissionClose | FlowAction::MissionAbort)) = action {
-            if agg.terminal_ts.is_none() {
-                agg.terminal_ts = Some(ts.to_string());
-                agg.terminal_was_abort = terminal == FlowAction::MissionAbort;
-            }
-        }
-        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-            if !sid.is_empty() && !agg.session_ids.iter().any(|s| s == sid) {
-                agg.session_ids.push(sid.to_string());
-            }
-        }
+        idx.entry(mid.to_string()).or_default().fold_record(v);
     };
 
     for v in fleet.iter().filter(|v| within_window(v)) {
@@ -980,12 +1002,13 @@ fn flow_mission_to_run(
         .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
         .collect();
     let any_live = mission_status_sessions(mission_id, &sessions).iter().any(|s| session_is_live(s, now_ms));
-    let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
+    let status = match (&agg.terminal_ts, agg.terminal_was_abort, agg.terminal_status) {
         // #1627 again: abort is teardown, not success.
-        (Some(_), true) => RunStatus::Abandoned,
-        (Some(_), false) => RunStatus::Complete,
-        (None, _) if any_live => RunStatus::Running,
-        (None, _) => RunStatus::Abandoned,
+        (Some(_), true, _) => RunStatus::Abandoned,
+        (Some(_), false, Some(term_stat)) => term_stat,
+        (Some(_), false, None) => RunStatus::Complete,
+        (None, _, _) if any_live => RunStatus::Running,
+        (None, _, _) => RunStatus::Abandoned,
     };
     // (#1907) Both `Abandoned` arms above are already told apart by
     // `agg.terminal_was_abort` — a real `mission abort` record versus no
@@ -997,11 +1020,44 @@ fn flow_mission_to_run(
     } else {
         None
     };
+    let mut sessions_by_start: Vec<(&str, &SessionAgg)> = sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_some())
+        .collect();
+    sessions_by_start.sort_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)));
+
+    let mut sessions_fallback: Vec<(&str, &SessionAgg)> = sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_none())
+        .collect();
+    sessions_fallback.sort_by(|(ia, a), (ib, b)| {
+        a.last_activity_ts
+            .cmp(&b.last_activity_ts)
+            .then_with(|| ia.cmp(ib))
+    });
+
     // Borrow route/model from whichever session first resolved one — a
     // mission-level row has no endpoint of its own, and showing the seat's
     // is more informative than showing nothing.
-    let route = sessions.iter().find_map(|(_, s)| s.endpoint.clone());
-    let model = sessions.iter().find_map(|(_, s)| s.model.clone());
+    let route = sessions_by_start
+        .iter()
+        .find_map(|(_, s)| s.endpoint.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.endpoint.clone()))
+        .or_else(|| sessions.iter().find_map(|(_, s)| s.endpoint.clone()));
+    let model = sessions_by_start
+        .iter()
+        .find_map(|(_, s)| s.model.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.model.clone()))
+        .or_else(|| sessions.iter().find_map(|(_, s)| s.model.clone()));
+    let role = sessions_by_start
+        .iter()
+        .filter(|(_, s)| !s.run_grain)
+        .find_map(|(_, s)| s.role.clone())
+        .or_else(|| sessions_by_start.iter().find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
     // (#1915) This IS the fix: a mission this daemon only sees via the
     // fleet stream is exactly the row #1915 diagnosed as inert — `tracked:
     // false` below with no drill target at all. The SAME representative-
@@ -1024,7 +1080,7 @@ fn flow_mission_to_run(
         machine: agg.machine.clone(),
         machine_uid: agg.machine_uid.clone(),
         route,
-        role: None,
+        role,
         model,
         started_ts: agg.first_ts.as_deref().and_then(parse_flow_ts),
         // An aborted mission has a terminal stamp but no COMPLETION — the
@@ -1277,11 +1333,25 @@ fn mission_to_run(
         unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
+    let mut sessions_fallback: Vec<(&str, &SessionAgg)> = unambiguous_sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_none())
+        .collect();
+    sessions_fallback.sort_by(|(ia, a), (ib, b)| {
+        a.last_activity_ts
+            .cmp(&b.last_activity_ts)
+            .then_with(|| ia.cmp(ib))
+    });
+
     // Model is simple: the run bookend NEVER carries one (a run spans
     // however many executions it makes), so a plain "first session that
     // resolved one" — same idiom as `flow_mission_to_run`'s route/model
     // fallback above — is enough.
-    let model = sessions_by_start.iter().find_map(|s| s.model.clone());
+    let model = sessions_by_start
+        .iter()
+        .find_map(|s| s.model.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.model.clone()));
 
     // Role needs one more step: the run bookend's `handle` is the LAUNCHED
     // CONFIG ID (`run_bookend_record`), a real, non-empty string, so a plain
@@ -1290,9 +1360,13 @@ fn mission_to_run(
     // resolved a role; fall back to the run's config-id label only when
     // nothing else did, the honest outcome for a Tier-1-only procedural
     // mission that runs no role at all (#1877's named gap 2).
+    //
+    // (#3074) If dispatch.start has aged out, fall back to sessions that still have a role.
     let role = dispatch_role
         .or_else(|| sessions_by_start.iter().filter(|s| !s.run_grain).find_map(|s| s.role.clone()))
-        .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()));
+        .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
 
     // `machine` deliberately stays representative-only, unlike role/model
     // above: EVERY flow record — the #1877 bookend included — gets
@@ -8180,6 +8254,82 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Complete);
         assert!(row.completed_ts.is_some(), "a closed mission carries its completion stamp");
+        // (#3074) Peer mission resolves role and model from sessions just like local mission
+        assert_eq!(row.role.as_deref(), Some("azure-review"));
+        assert_eq!(row.model.as_deref(), Some("gpt-4o"));
+    }
+
+    /// (#3074) Peer mission accepts run.complete and run.error as terminal records.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_reads_run_complete_and_run_error_as_terminal() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let fleet_complete = vec![
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "run.complete",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs_complete = build_runs(flows.path(), None, &fleet_complete);
+        let row_complete = runs_complete.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row_complete.status, RunStatus::Complete);
+        assert!(row_complete.completed_ts.is_some());
+
+        let fleet_error = vec![
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "run.error",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs_error = build_runs(flows.path(), None, &fleet_error);
+        let row_error = runs_error.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row_error.status, RunStatus::Error);
+    }
+
+    /// (#3074) When dispatch.start has aged out, mission_to_run falls back to a session
+    /// that still has a role and model.
+    #[test]
+    #[serial_test::serial]
+    fn mission_with_aged_out_dispatch_start_falls_back_to_session_with_role_and_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "ts": darkmux_flow::ts_utc_now(),
+            "level": "info",
+            "category": "work",
+            "tier": "local",
+            "stage": "dispatch",
+            "action": "dispatch.complete",
+            "handle": "fallback-coder",
+            "model": "qwen3.6",
+            "session_id": "task-aged-1",
+            "mission_id": "mission-aged-out",
+        });
+        write_day_file(flows.path(), &today(), &[rec]);
+
+        let mission_dir = _g.join("missions").join("mission-aged-out");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mission = serde_json::json!({
+            "id": "mission-aged-out",
+            "description": "aged mission",
+            "phase_ids": [],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "mission-aged-out").expect("mission row present");
+        assert_eq!(row.role.as_deref(), Some("fallback-coder"));
+        assert_eq!(row.model.as_deref(), Some("qwen3.6"));
     }
 
     /// A peer that fell asleep mid-mission must not leave a row claiming to

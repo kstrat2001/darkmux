@@ -499,8 +499,11 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
         state: b.state,
         minutes_to_empty: b.minutes_to_empty,
     });
-    let refusing_start =
-        now.map(|_| matches!(power_policy::start_decision(sample.as_ref(), cfg), StartDecision::Refuse(_)));
+    // (#3074) When there is no battery sample (or probe failed), publish
+    // refusing_start as None so viewers render unknown rather than a confident false.
+    let refusing_start = sample
+        .as_ref()
+        .map(|s| matches!(power_policy::start_decision(Some(s), cfg), StartDecision::Refuse(_)));
     CardGovernor {
         thermal: now.and_then(|n| n.thermal.clone()),
         battery,
@@ -836,12 +839,11 @@ pub(crate) mod tests {
         assert_eq!(card_governor(Some(&now(None, Some(charge(50)))), &cfg(true)).battery_gate.refusing_start, Some(false), "at the floor starts");
     }
 
-    /// A machine with a sample but no battery has nothing to refuse (a
-    /// decision: `false`); a process that never sampled made no decision
-    /// (`null`), and the card must not say `false` for it.
+    /// (#3074) A machine with no battery sample (or probe failed) has no
+    /// measurement, so refusing_start is `None` (`null`), not a confident `false`.
     #[test]
     fn a_gate_nobody_measured_is_not_observed_rather_than_false() {
-        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, Some(false));
+        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, None);
         let nothing = card_governor(None, &cfg(true));
         assert!(nothing.thermal.is_none() && nothing.battery.is_none());
         assert_eq!(nothing.battery_gate.refusing_start, None);

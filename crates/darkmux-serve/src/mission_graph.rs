@@ -1384,6 +1384,8 @@ pub fn build_mission_graph(
         steps_by_phase.insert(phase_id.clone(), steps);
     }
     let task_depth = layer_tasks_by_depth(&all_tasks);
+    let all_task_ids: std::collections::HashSet<String> =
+        all_tasks.iter().map(|t| t.id.clone()).collect();
 
     // (#1432 item 4) Every step id this mission declares, across all phases —
     // the correlation filter for the flow-record backfill below. Read once,
@@ -1554,6 +1556,11 @@ pub fn build_mission_graph(
             // retired along with the step nodes they connected; a real
             // Task dependency is now exactly one edge, no detour needed.
             for dep_task_id in &task.depends_on {
+                // (#3074) A depends_on edge can name a node not in the graph;
+                // emit the edge only when dep_task_id is among the emitted task nodes.
+                if !all_task_ids.contains(dep_task_id) {
+                    continue;
+                }
                 let edge_id = format!("depends_on:{dep_task_id}:{}", task.id);
                 if !seen_dep_edges.insert(edge_id.clone()) {
                     continue;
@@ -2776,5 +2783,42 @@ mod tests {
         // No mission dir at all under this id in the test's isolated
         // DARKMUX_HOME — the function must return None, not error.
         assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_mission_graph_omits_depends_on_edge_to_missing_node() {
+        let _g = darkmux_types::test_isolation::IsolatedState::new();
+        let mission_dir = _g.join("missions").join("m-missing-dep");
+        std::fs::create_dir_all(mission_dir.join("phases").join("p1").join("tasks")).unwrap();
+
+        let mission = serde_json::json!({
+            "id": "m-missing-dep",
+            "description": "test mission",
+            "phase_ids": ["p1"],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+
+        let phase = serde_json::json!({
+            "id": "p1",
+            "mission_id": "m-missing-dep",
+            "description": "phase 1",
+            "task_ids": ["t1"],
+        });
+        std::fs::write(mission_dir.join("phases").join("p1").join("phase.json"), serde_json::to_string(&phase).unwrap()).unwrap();
+
+        let task = serde_json::json!({
+            "id": "t1",
+            "phase_id": "p1",
+            "description": "task 1",
+            "step_ids": [],
+            "depends_on": ["nonexistent-task"],
+        });
+        std::fs::write(mission_dir.join("phases").join("p1").join("tasks").join("t1.json"), serde_json::to_string(&task).unwrap()).unwrap();
+
+        let flows = tempfile::TempDir::new().unwrap();
+        let graph = build_mission_graph("m-missing-dep", flows.path()).unwrap().expect("graph emitted");
+        assert!(!graph.edges.iter().any(|e| e.source == "nonexistent-task"));
     }
 }
