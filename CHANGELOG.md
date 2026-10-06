@@ -116,8 +116,9 @@ darkmux release.
   N%"), and a probe that stays blind for the runtime's pause ceiling
   (`DARKMUX_THERMAL_MAX_PAUSE_MS`, `0` unbounded) releases the hold with a second Warn.
 - **An operator gate no longer holds an ungated sibling** (#3073). A wave with both kinds
-  of ready step runs the ungated ones first; the gated ones are asked afterward, so a
-  tty prompt or an ACP dialog no longer delays work that never needed sign-off.
+  of ready step runs the ungated ones first; a gated one is asked on the next pass, so a
+  tty prompt or an ACP dialog no longer delays work that never needed sign-off, and a gated
+  step beside a long independent chain is not held until the chain ends.
 - **Indented and commented tool-call markup is not promoted into a call** (#3074). The
   plain-text XML scan already skipped fenced blocks; it now also skips a line indented
   four columns or a tab after a blank line or another indented line (indentation under
