@@ -8044,6 +8044,33 @@ mod tests {
         assert!(!path.exists(), "the claim must not outlive a failed save");
     }
 
+    /// (#3087) Only `AlreadyExists` is a collision. A claim that fails for any
+    /// other reason (here the mission directory refuses writes) reports that
+    /// cause, never the collision message, which would send the operator to
+    /// rename or remove a record that does not exist.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn a_claim_that_fails_for_another_reason_is_not_reported_as_a_collision() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let dir = crew::lifecycle::mission_path("claim-denied-test").parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // The mode does not bind a superuser; there this failure cannot be built.
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: a read-only directory is writable here (running as root)");
+            return;
+        }
+        let result = ensure_mission_and_phases_with_provenance("claim-denied-test", &config, None, None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("claiming") && err.to_lowercase().contains("permission denied"), "{err}");
+        assert!(!err.contains("already exists"), "a denied claim is not a collision: {err}");
+    }
+
     /// (#3087 review) Two launches racing on ONE id: exactly one claims it,
     /// the other bails with the collision error, and the winner's record is
     /// intact. (The sequential collision test goes red when `create_new`
