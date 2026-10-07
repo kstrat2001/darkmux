@@ -494,8 +494,9 @@ pub struct TaskConfig {
     ///
     /// **What the disabled state does and does not silence.** The CONFLICT
     /// is only reported when both sides would actually be minted — a pair
-    /// with one side `enabled: false`, or living under a disabled phase,
-    /// is the intended shipping shape and says nothing. A MALFORMED
+    /// with one side pruned before the mint (`enabled: false` on it, on its
+    /// phase or on every one of its steps, or every dependency pruned; see
+    /// `prune.rs`) is the intended shipping shape and says nothing. A MALFORMED
     /// exclusion is not covered by that: an id naming no task in the
     /// document, or a task naming itself, is an `Error` regardless of
     /// enabled state. That asymmetry is deliberate. An exclusion that
@@ -983,13 +984,6 @@ impl MissionConfig {
         // possible: the producer's phase must have already run.
         let mut phase_index_of_task: BTreeMap<&str, usize> = BTreeMap::new();
         let mut grow_templates: BTreeSet<&str> = BTreeSet::new();
-        // (#2345 CONSIDER-2, round 2) A task this document itself prunes at
-        // mint time (`enabled: false` on the task, or on its owning phase —
-        // `prune.rs`'s own two checks) is never minted either, same as a
-        // `grow` template — it just has a different REASON for never
-        // producing a `Step.output`. Tracked alongside `grow_templates` so
-        // `outcome_from` can refuse naming either kind below.
-        let mut disabled_tasks: BTreeSet<&str> = BTreeSet::new();
         for (pi, phase) in self.phases.iter().enumerate() {
             for task in &phase.tasks {
                 all_task_ids.insert(task.id.as_str());
@@ -997,11 +991,29 @@ impl MissionConfig {
                 if task.grow.is_some() {
                     grow_templates.insert(task.id.as_str());
                 }
-                if !task.is_enabled() || !phase.is_enabled() {
-                    disabled_tasks.insert(task.id.as_str());
-                }
             }
         }
+        // (#2345 CONSIDER-2, round 2) A declared task the launcher prunes
+        // before minting is never minted either, same as a `grow` template:
+        // it just has a different REASON for never producing a
+        // `Step.output`. The set is derived from `prune::prune_disabled`'s
+        // own output, so the rule has one owner: a disabled task or phase,
+        // a task whose every step is disabled, a task whose every
+        // dependency is pruned. Used by `outcome_from` and `excludes` below.
+        let pruned_tasks: BTreeSet<&str> = {
+            let (minted, _) = prune::prune_disabled(self);
+            let minted: BTreeSet<&str> = minted
+                .phases
+                .iter()
+                .flat_map(|p| &p.tasks)
+                .map(|t| t.id.as_str())
+                .collect();
+            all_task_ids
+                .iter()
+                .copied()
+                .filter(|id| !minted.contains(id))
+                .collect()
+        };
 
         for (pi, phase) in self.phases.iter().enumerate() {
             let phase_path = format!("phases[{pi}]");
@@ -1396,12 +1408,12 @@ impl MissionConfig {
                          as the close payload"
                     ),
                 });
-            } else if disabled_tasks.contains(outcome_from.as_str()) {
+            } else if pruned_tasks.contains(outcome_from.as_str()) {
                 // (#2345 CONSIDER-2, round 2) `all_task_ids` (checked above)
-                // includes `enabled: false` tasks — they are real DECLARED
-                // tasks, just pruned at mint (`prune.rs`), so the "unknown
-                // task id" branch above never catches this. Without this
-                // check, `outcome_from` naming a disabled task passed
+                // includes pruned tasks — they are real DECLARED tasks, just
+                // never minted (`prune.rs`), so the "unknown task id" branch
+                // above never catches this. Without this check,
+                // `outcome_from` naming a pruned task passed
                 // `validate` cleanly and only failed at CLOSE time, silently
                 // (`run_summary_payload` returning `Ok(None)` reads
                 // identically to "the task hasn't produced output yet" —
@@ -1410,10 +1422,11 @@ impl MissionConfig {
                     severity: FindingSeverity::Error,
                     path: "outcome_from".to_string(),
                     message: format!(
-                        "outcome_from names \"{outcome_from}\", which is disabled (`enabled: false` \
-                         on the task itself, or on its owning phase) — a disabled task is pruned at \
-                         mint and never produces a `Step.output`, so it has nothing to promote as \
-                         the close payload. Enable the task, or name a different one"
+                        "outcome_from names \"{outcome_from}\", which is pruned before the run is \
+                         minted (disabled by `enabled: false` on the task, on its owning phase or on \
+                         every one of its steps, or left with only pruned dependencies) — a pruned \
+                         task never produces a `Step.output`, so it has nothing to promote as the \
+                         close payload. Enable the task, or name a different one"
                     ),
                 });
             }
@@ -1462,8 +1475,8 @@ impl MissionConfig {
                                     task.id
                                 ),
                             });
-                        } else if !disabled_tasks.contains(task.id.as_str())
-                            && !disabled_tasks.contains(peer.as_str())
+                        } else if !pruned_tasks.contains(task.id.as_str())
+                            && !pruned_tasks.contains(peer.as_str())
                         {
                             // One PAIR is one finding, whichever side (or
                             // both) declared the relation — a duplicated
@@ -1847,6 +1860,60 @@ mod tests {
         }"#;
         let cfg: MissionConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.validate(&[]).is_empty(), "{:?}", cfg.validate(&[]));
+    }
+
+    /// The launcher prunes (`prune::prune_disabled`) a task for two reasons
+    /// beyond its own or its phase's `enabled` flag: every one of its steps
+    /// is disabled (`stepless-at-mint`), or every task it depends on is
+    /// pruned (`orphaned`). validate must agree with prune about what is
+    /// never minted, or it judges a document the launcher never runs.
+    const PRUNED_FOR_STEPS_OR_DEPENDENCIES: &str = r#"{
+      "id":"x","name":"X",
+      "phases":[{"id":"p","tasks":[
+        {"id":"live","steps":[{"id":"live-step","kind":"procedural.noop","config":{}}]},
+        {"id":"off","enabled":false,"steps":[{"id":"off-step","kind":"procedural.noop","config":{}}]},
+        {"id":"stepless-at-mint","steps":[{"id":"x-step","kind":"procedural.noop","enabled":false,"config":{}}]},
+        {"id":"orphaned","depends_on":["off"],"steps":[{"id":"o-step","kind":"procedural.noop","config":{}}]}
+      ]}]
+    }"#;
+
+    fn pruned_for_steps_or_dependencies() -> MissionConfig {
+        serde_json::from_str(PRUNED_FOR_STEPS_OR_DEPENDENCIES).unwrap()
+    }
+
+    /// A task pruned for its steps or its dependencies never produces a
+    /// `Step.output`, so naming it in `outcome_from` is refused before the
+    /// run, not by the close-time backstop after the whole mission ran
+    /// (#2345). The refusal names every reason the launcher prunes a task.
+    #[test]
+    fn outcome_from_naming_a_task_pruned_for_its_steps_or_dependencies_is_an_error() {
+        for id in ["stepless-at-mint", "orphaned"] {
+            let mut cfg = pruned_for_steps_or_dependencies();
+            cfg.outcome_from = Some(id.into());
+            let findings = cfg.validate(&[]);
+            assert_eq!(findings.len(), 1, "`{id}` is never minted, so it has no output to promote: {findings:?}");
+            let hit = &findings[0];
+            assert_eq!((hit.severity, hit.path.as_str()), (FindingSeverity::Error, "outcome_from"), "{findings:?}");
+            assert!(hit.message.contains(&format!("outcome_from names \"{id}\"")), "{}", hit.message);
+            for reason in ["on the task", "on its owning phase", "on every one of its steps", "only pruned dependencies"] {
+                assert!(hit.message.contains(reason), "the refusal must name `{reason}`: {}", hit.message);
+            }
+        }
+        let mut cfg = pruned_for_steps_or_dependencies();
+        cfg.outcome_from = Some("live".into());
+        assert!(cfg.validate(&[]).is_empty(), "{:?}", cfg.validate(&[]));
+    }
+
+    /// An exclusion whose other side is pruned for its steps or its
+    /// dependencies mints one seat, so it is not a "both ENABLED" conflict.
+    #[test]
+    fn an_exclusion_with_a_side_pruned_for_its_steps_or_dependencies_is_not_a_conflict() {
+        for peer in ["stepless-at-mint", "orphaned"] {
+            let mut cfg = pruned_for_steps_or_dependencies();
+            cfg.phases[0].tasks[0].excludes = vec![peer.to_string()];
+            let findings = cfg.validate(&[]);
+            assert!(findings.is_empty(), "`{peer}` is never minted, so `live` has no live rival: {findings:?}");
+        }
     }
 
     /// (#2310 P4f review, CONSIDER 4) The disabled guard covers the
@@ -3594,7 +3661,7 @@ mod tests {
 
     #[test]
     fn outcome_from_naming_an_enabled_task_in_a_document_with_other_disabled_tasks_validates_clean() {
-        // Sanity: `disabled_tasks` must not over-match — a document with
+        // Sanity: the never-minted set must not over-match — a document with
         // ONE disabled task elsewhere must not block `outcome_from` naming
         // a DIFFERENT, enabled one.
         let mut cfg = doc(vec![phase(
