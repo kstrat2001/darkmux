@@ -569,6 +569,14 @@ mod tests {
         // Century years are leap years only when divisible by 400.
         assert_eq!(pmset_timestamp_epoch("2000-02-29 00:00:00 +0000"), Some(951_782_400));
         assert_eq!(pmset_timestamp_epoch("2100-02-29 00:00:00 +0000"), None);
+        // Every field at its largest legal value, then one past it.
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:59:59 +2359"), Some(1_783_641_659));
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 00:00:00 -2359"), Some(1_783_727_940));
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 25:00:00 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 00:61:00 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 00:00:61 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 00:00:00 +2500"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 00:00:00 +0061"), None);
     }
 
     #[test]
