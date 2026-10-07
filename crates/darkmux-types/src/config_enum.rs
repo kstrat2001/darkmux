@@ -937,6 +937,30 @@ mod tests {
         assert!(!DetectionPolicy::Off.measures() && !DetectionPolicy::Off.acts() && !DetectionPolicy::Off.warns());
     }
 
+    /// (#2947) Help lists every valid value with its meaning, marks the shipped
+    /// one, and names each retired spelling with its replacement, for every
+    /// registered setting, in the block every help surface prints.
+    #[test]
+    fn help_lists_every_value_with_its_meaning_the_default_and_retired_spellings() {
+        let block = help_block();
+        for s in ENUM_SETTINGS {
+            let help = s.values_help("    ");
+            assert_eq!(help.lines().count(), s.values.len() + s.retired.len(), "{}: {help}", s.key);
+            for (t, m) in s.values {
+                let line = help
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(&format!("{t} ")))
+                    .unwrap_or_else(|| panic!("{}: no line for `{t}` in:\n{help}", s.key));
+                assert!(line.starts_with("    ") && line.contains(m), "{}: `{line}`", s.key);
+                assert_eq!(line.ends_with(" (default)"), s.shipped == Some(*t), "{}: `{line}`", s.key);
+            }
+            for (old, new) in s.retired {
+                assert!(help.contains(&format!("`{old}` was renamed to `{new}`")), "{}: {help}", s.key);
+            }
+            assert!(block.contains(&s.values_help("      ")), "{}: missing from the help block", s.key);
+        }
+    }
+
     #[test]
     fn the_macro_round_trips_every_token() {
         fn check<T: ConfigEnum>() {
