@@ -417,6 +417,18 @@ mod tests {
         assert_eq!(again, json!({"a": 2}), "a duplicate the caller sent stays a duplicate");
     }
 
+    /// Only a KEY is suffixed when it redacts like an earlier one: a value
+    /// that redacts to an emitted key's name is a value, and reads exactly as
+    /// redacted, in every object and at every chunking.
+    #[test]
+    fn a_value_that_redacts_like_a_key_is_never_suffixed() {
+        let body = json!({"100.64.7.7": "10.0.0.1", "n": {"10.0.0.1": 1, "b": ["x"], "c": "100.64.7.7"}}).to_string();
+        for size in [1, 3, body.len()] {
+            let out: Value = serde_json::from_slice(&stream(body.as_bytes(), size, true)).unwrap();
+            assert_eq!(out, json!({ADDRESS_HIDDEN: ADDRESS_HIDDEN, "n": {ADDRESS_HIDDEN: 1, "b": ["x"], "c": ADDRESS_HIDDEN}}), "chunk {size}");
+        }
+    }
+
     #[test]
     fn malformed_json_ends_the_stream_and_leaks_nothing() {
         for body in [
