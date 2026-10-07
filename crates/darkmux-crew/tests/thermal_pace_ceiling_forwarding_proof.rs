@@ -141,11 +141,19 @@ fn stable_fake_bin() -> std::path::PathBuf {
 /// differs, via a same-directory temp file and an atomic rename, so parallel
 /// test processes never exec a half-written file and an unchanged fake is
 /// never re-created (a re-created file is a new file to XProtect).
+///
+/// The temp name is unique per CALL (pid plus a process-wide counter, the
+/// shape `darkmux_crew::lifecycle`'s `unique_tmp_path` uses). A pid alone is
+/// shared by every test thread in one `cargo test` process, so two tests
+/// finding the fakes absent wrote the same temp file and the loser's
+/// `set_permissions` or `rename` hit NotFound after the winner renamed it.
 fn write_executable_once(path: &Path, body: &str) {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if fs::read_to_string(path).ok().as_deref() == Some(body) {
         return;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
     fs::write(&tmp, body).expect("writing a fake");
     #[cfg(unix)]
     {
@@ -155,9 +163,37 @@ fn write_executable_once(path: &Path, body: &str) {
     fs::rename(&tmp, path).expect("publishing a fake");
 }
 
+/// Threads of one process share a pid, so a temp name built from the pid
+/// alone is one file for all of them. Several first writes of the same fake
+/// at once must all succeed.
+#[test]
+fn concurrent_first_writes_of_one_fake_all_succeed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let target = dir.path().join("fake");
+    let start = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| {
+                start.wait();
+                write_executable_once(&target, "#!/bin/sh\nexit 0\n");
+            }))
+            .collect();
+        for h in handles {
+            h.join().expect("a concurrent first write panicked");
+        }
+    });
+    assert_eq!(fs::read_to_string(&target).unwrap(), "#!/bin/sh\nexit 0\n");
+}
+
 /// Pins the #2923 fix: a second request for the fakes must not re-create
 /// them (a re-created file is re-assessed by XProtect on its next exec).
+///
+/// Serial: it asserts on the fakes' mtime, which every other test in this
+/// binary can change by writing the fakes when it finds them absent.
+/// Unserialized, a concurrent first write landing between `before` and the
+/// second read failed it under plain `cargo test`.
 #[test]
+#[serial_test::serial]
 fn the_fakes_are_written_once_not_per_test() {
     let first = stable_fake_bin();
     let modified = |d: &Path| fs::metadata(d.join("docker")).unwrap().modified().unwrap();

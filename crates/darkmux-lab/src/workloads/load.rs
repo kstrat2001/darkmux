@@ -691,7 +691,15 @@ mod tests {
     /// `command`) is the part of the original fix that was actually
     /// justified. This test guards against a future edit re-widening the
     /// manifest keyword back to a stem.
+    ///
+    /// Serial: `load(.., None)` reads `DARKMUX_TEMPLATES_DIR` and `HOME`,
+    /// and two serial tests point the first at a directory holding their
+    /// own `quick-q` (`on_disk_override_beats_embedded_for_a_known_id`,
+    /// `user_files_tests::a_shadowed_workload_does_not_block_a_run`). An
+    /// unserialized read here loaded that override, which has no verify
+    /// spec, under plain `cargo test`.
     #[test]
+    #[serial_test::serial]
     fn quick_q_verify_keyword_is_the_bare_word_not_a_widened_stem() {
         let loaded = load("quick-q", None).expect("quick-q should load from the embedded const");
         let verify = loaded
