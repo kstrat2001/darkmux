@@ -65,9 +65,9 @@ test('runs lens renders every kind in one flat list, newest first', async ({ pag
   // All six fixture runs, from all three sources, in ONE list — the point of
   // the lens: "what ran recently" without knowing which subsystem recorded it.
   await expect(page.locator('.labrunrow')).toHaveCount(6);
-  await expect(page.locator('.runkind.lab')).toHaveCount(3);
-  await expect(page.locator('.runkind.mission')).toHaveCount(1);
-  await expect(page.locator('.runkind.dispatch')).toHaveCount(2);
+  await expect(page.locator('[data-run-kind="lab"]')).toHaveCount(3);
+  await expect(page.locator('[data-run-kind="mission"]')).toHaveCount(1);
+  await expect(page.locator('[data-run-kind="dispatch"]')).toHaveCount(2);
 
   // Strictly newest-activity-first, with NO hoisting of `running` rows — a
   // lab run killed before writing scores.json stays `running` forever, so
@@ -112,7 +112,7 @@ test('kind chips filter the one list rather than navigating', async ({ page }) =
 
   await page.click('.runchip[data-arg="lab"]');
   await expect(page.locator('.labrunrow')).toHaveCount(3);
-  await expect(page.locator('.runkind.mission')).toHaveCount(0);
+  await expect(page.locator('[data-run-kind="mission"]')).toHaveCount(0);
   // The lens never changes — the filter is addressable state on it.
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
   await expect.poll(() => page.evaluate(() => location.hash)).toContain('kind=lab');
@@ -162,7 +162,7 @@ test('a retired #lens=lab bookmark opens the Unknown route page, not the runs le
   await page.goto('/index-lab.html#lens=runs&kind=lab');
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
   await expect(page.locator('.labrunrow')).toHaveCount(3);
-  await expect(page.locator('.runkind.lab')).toHaveCount(3);
+  await expect(page.locator('[data-run-kind="lab"]')).toHaveCount(3);
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });

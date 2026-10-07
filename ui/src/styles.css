@@ -2404,10 +2404,10 @@ body {
    empirically — see the packet's own report) — so `.labrunmain`/`.runsbar`
    being `display:flex` (not just visually similar) is load-bearing for
    parity, not a styling nicety. Likewise `text-transform: uppercase` on
-   `.labbadge`/`.runkind` is what turns the wire's lowercase `status`/`kind`
-   strings into the goldens' UPPERCASE text — innerText reflects CSS
-   text-transform. Don't "clean up" either property without re-running the
-   parity spec.
+   `.labbadge` is what turns the wire's lowercase `status` string into the
+   goldens' UPPERCASE text (a run's kind is an icon, with no text) —
+   innerText reflects CSS text-transform. Don't "clean up" either property
+   without re-running the parity spec.
    (#2860 follow-up) `.labtaskcard`/`.labtaskhdr`/`.labtaskcount`/
    `.labdiffline`/`.labdegenerate` — the `◧ series` knob-diff sub-view's own
    classes — are removed below along with the view itself; every OTHER
@@ -2682,27 +2682,28 @@ body {
     padding: 9px 2px;
   }
 }
-.runkind {
-  display: inline-block;
-  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 3px 7px;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--dim);
+/* A run's kind (`RunKindIcon`): a monochrome line icon, deliberately NOT a
+   chip. It used to be a bordered, colored chip in the status chip's style, so
+   a green LAB read as a status (operator, 2026-10-07). No border, no fill, no
+   status color: the dim token only.
+   The box is the old chip's height (its 10px mono line, 3px padding and 1px
+   border each side: 10px * --fs-scale + 8px) so the row's first line keeps
+   its height. Square, so the icon centers; `min-width` lets the fallback word
+   for an unknown kind widen it instead of overflowing. */
+.kindicon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(10px * var(--fs-scale) + 8px);
+  min-width: calc(10px * var(--fs-scale) + 8px);
   flex: 0 0 auto;
+  color: var(--dim);
+  font: 400 calc(10px * var(--fs-scale))/1 var(--font-mono);
 }
-.runkind.mission {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.runkind.dispatch {
-  color: var(--fg);
-}
-.runkind.lab {
-  color: var(--good);
-  border-color: var(--good);
+.kindicon svg {
+  width: calc(13px * var(--fs-scale));
+  height: calc(13px * var(--fs-scale));
+  display: block;
 }
 /* `.labrunrow-ph` (#2862) is the runs-list SKELETON row's own class — same
    box as `.labrunrow` (below), deliberately a DIFFERENT class token rather

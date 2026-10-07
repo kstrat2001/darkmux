@@ -86,6 +86,30 @@ describe("RunsBoard", () => {
     expect(rows).toEqual(["m1", "d1", "l1"]); // updated_ts 300 > 200 > 100
   });
 
+  // (operator, 2026-10-07) The kind is an icon with a tooltip, not a chip in
+  // the status chip's style: a green "LAB" read as a status. The row keeps the
+  // status as its only colored chip, and the kind word leaves the row's text.
+  it("each row shows its kind as an icon, labeled and titled, with no kind chip or kind word", async () => {
+    mockFetch();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    const rows = [...document.querySelectorAll(".labrunrow")];
+    const kinds = rows.map((row) => {
+      const icon = row.querySelector("[data-run-kind]")!;
+      expect(icon).toHaveAttribute("role", "img");
+      expect(icon.getAttribute("title")).toBe(icon.getAttribute("aria-label"));
+      return [icon.getAttribute("data-run-kind"), icon.getAttribute("aria-label")];
+    });
+    expect(kinds).toEqual([
+      ["mission", "mission run"],
+      ["dispatch", "dispatch run"],
+      ["lab", "lab run"],
+    ]);
+    expect(screen.getByRole("img", { name: "lab run" })).toBeInTheDocument();
+    expect(document.querySelector(".runkind")).toBeNull();
+    for (const row of rows) expect(row.querySelector(".labrunmain")!.textContent).not.toMatch(/mission|dispatch|lab/i);
+  });
+
   /** (#1881, QA-caught) `RunStatus` gained a sixth value (`unparseable`,
    *  for an envelope this binary couldn't resolve a verdict for) and
    *  nothing in this file exercised it — the badge path is fully generic
