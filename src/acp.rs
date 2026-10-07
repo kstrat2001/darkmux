@@ -5064,9 +5064,9 @@ mod tests {
     }
 
     /// (#3091) The count a cancel reports (the `session/cancel` log line) is
-    /// every prompt it reached: a running prompt it aborts, and a reserved
-    /// prompt an earlier cancel already marked, which has not settled yet.
-    /// A running prompt already aborted is not counted again.
+    /// every prompt it NEWLY reaches: a running prompt it aborts, or a
+    /// reservation it marks. A prompt an earlier cancel already reached, a
+    /// marked reservation or an aborted running prompt, is not counted again.
     #[tokio::test]
     async fn a_cancel_counts_every_prompt_it_reaches() {
         let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
@@ -5087,14 +5087,14 @@ mod tests {
         assert!(!attach_abort_handle(&t_second, second.abort_handle()));
         assert_eq!(
             abort_session_prompts(&in_flight, &session_id),
-            2,
-            "the still-reserved prompt and the running one are both reached"
+            1,
+            "only the running prompt is newly reached; the reservation was already marked"
         );
         assert!(second.await.unwrap_err().is_cancelled());
         assert_eq!(
             abort_session_prompts(&in_flight, &session_id),
-            1,
-            "the aborted prompt is not counted again; the unsettled reservation is"
+            0,
+            "nothing new: the aborted prompt and the marked reservation are not counted again"
         );
         drop((t_reserved, t_second));
     }
