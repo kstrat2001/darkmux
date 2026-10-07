@@ -1797,14 +1797,28 @@ _TARGET_CFG_KEYS = {
     "windows",
 }
 
-# Item and statement keywords: an attributed element that starts with one of
-# these ends at `;` or at its closing brace, never at a comma (a generic
-# parameter list's comma sits at bracket depth 0, since `<>` is not tracked).
-_ITEM_KEYWORDS = {
-    "fn", "impl", "struct", "enum", "union", "trait", "mod", "type", "const",
-    "static", "use", "extern", "macro_rules", "pub", "unsafe", "async",
-    "let", "if", "match", "for", "while", "loop",
+# How an attributed element ends, by its first keyword (after any
+# visibility and `unsafe`/`async`/`extern "ABI"` qualifiers):
+#
+#   - `_SEMI_KEYWORDS` end at the `;` at bracket depth 0, whatever braces
+#     come first (`let x = S { .. };`, `const C: T = { .. };`).
+#   - `_BRACE_KEYWORDS` (items, and the block-like statements) end at their
+#     first closing brace at depth 0, or at a `;` before it (`struct S(u8);`,
+#     `mod x;`). An `if` chain continues through `else`. A block-like
+#     statement is a complete statement in Rust: what follows it (`*x = 1;`,
+#     `(a, b) = t;`) is the NEXT statement, never part of this one.
+#   - A bare `{` (a block statement) behaves the same.
+#   - Anything else (an expression statement, a struct field, an enum
+#     variant, a match arm) uses the general rule in `_item_end`.
+#
+# Neither of the first two ever ends at a comma: a generic parameter list's
+# comma sits at bracket depth 0, since `<>` is not tracked.
+_SEMI_KEYWORDS = {"use", "const", "static", "type", "let"}
+_BRACE_KEYWORDS = {
+    "fn", "impl", "struct", "enum", "union", "trait", "mod", "macro_rules",
+    "if", "match", "for", "while", "loop",
 }
+_QUALIFIERS = {"pub", "unsafe", "async", "extern", "default", "crate"}
 
 
 def parse_rustc_cfg(text: str) -> dict[str, set[str] | bool]:
@@ -1830,7 +1844,7 @@ def _rust_tokens(text: str) -> list[tuple[str, str, int, int]]:
     and column, as cargo-mutants reports them). Comments (nested block
     comments included) are dropped; string, raw string, byte and char
     literals become one `lit` token so a brace or quote inside one is never
-    read as code. Kinds: `ident`, `lit`, `lifetime`, `punct` (one char)."""
+    read as code. Kinds: `ident`, `lit`, `punct` (one char)."""
     toks: list[tuple[str, str, int, int]] = []
     i, n = 0, len(text)
     line, col = 1, 1
@@ -1924,11 +1938,8 @@ def _rust_tokens(text: str) -> list[tuple[str, str, int, int]]:
                 toks.append(("lit", m.group(0), start_line, start_col))
                 advance(m.end())
                 continue
-            m = _LIFETIME.match(text, i)
-            if m:
-                toks.append(("lifetime", m.group(0), start_line, start_col))
-                advance(m.end())
-                continue
+            # Not a char literal: a lifetime's `'`, a lone punctuation token
+            # (its name lexes as an identifier next).
             toks.append(("punct", ch, start_line, start_col))
             advance(i + 1)
             continue
@@ -1957,7 +1968,6 @@ def _rust_tokens(text: str) -> list[tuple[str, str, int, int]]:
     return toks
 
 
-_LIFETIME = re.compile(r"'[A-Za-z_][A-Za-z0-9_]*")
 _OPEN = {"(": ")", "[": "]", "{": "}"}
 _CLOSE = {")", "]", "}"}
 
@@ -2026,9 +2036,30 @@ def _eval_cfg(toks, start: int, end: int, cfg) -> bool | None:
 def _item_end(toks, pairs, j: int) -> int:
     """Index of the last token of the item, statement, field or arm that
     starts at token `j` (just past its attributes). See the section comment
-    for the shapes this reads short."""
+    for the shapes this reads short; where unsure it ends EARLY, never late."""
     n = len(toks)
-    is_item = toks[j][0] == "ident" and toks[j][1] in _ITEM_KEYWORDS
+    # Classify by the first keyword past any qualifiers (`pub(crate) unsafe
+    # fn`, `extern "C" fn`, `const fn` is a fn, `unsafe { .. }` a block).
+    k = j
+    while k < n and toks[k][0] == "ident" and toks[k][1] in _QUALIFIERS:
+        if toks[k][1] == "pub" and k + 1 < n and toks[k + 1][1] == "(":
+            k = pairs.get(k + 1, k + 1)
+        k += 1
+        if k < n and toks[k][0] == "lit":  # extern "ABI"
+            k += 1
+    head = toks[k] if k < n else None
+    if head and head[:2] == ("ident", "const") and k + 1 < n and toks[k + 1][1] in ("fn", "unsafe", "async", "extern"):
+        head = ("ident", "fn", 0, 0)
+    if head is None:
+        return n - 1
+    if head[0] == "ident" and head[1] in _SEMI_KEYWORDS:
+        mode = "semi"
+    elif (head[0] == "ident" and head[1] in _BRACE_KEYWORDS) or head[1] == "{" or k > j:
+        # `k > j`: only qualifiers before a `{` (`unsafe { .. }`, `async { .. }`).
+        mode = "brace"
+    else:
+        mode = "expr"
+
     k = j
     saw_arrow = False
     while k < n:
@@ -2038,28 +2069,35 @@ def _item_end(toks, pairs, j: int) -> int:
                 close = pairs.get(k)
                 if close is None:
                     return n - 1
-                if t == "{":
+                if t == "{" and mode != "semi":
                     nxt = toks[close + 1] if close + 1 < n else None
                     nt = nxt[1] if nxt else None
+                    if mode == "brace":
+                        if nxt is not None and nxt[:2] == ("ident", "else"):
+                            k = close + 1
+                            continue
+                        return close
+                    # mode == "expr"
                     if nt == ";":
                         return close + 1
                     if saw_arrow:
                         return close + 1 if nt == "," else close
                     if nt == ",":
-                        return close if is_item else close + 1
-                    if nxt is None or nt in ("#", "}", ")", "]"):
-                        return close
-                    if nxt[0] == "ident" and nt not in ("else", "as"):
-                        return close
-                    if nxt[0] in ("lit", "lifetime"):
-                        return close
+                        return close + 1
+                    # A struct literal or closure body inside a longer
+                    # expression continues only into a method call, `?` or a
+                    # cast; anything else starts something new.
+                    if nt in (".", "?") or (nxt is not None and nxt[:2] == ("ident", "as")):
+                        k = close + 1
+                        continue
+                    return close
                 k = close + 1
                 continue
             if t in _CLOSE:
                 return k - 1  # closes the parent: the element ended before it
             if t == ";":
                 return k
-            if t == "," and not is_item:
+            if t == "," and mode == "expr":
                 return k
             if t == "=" and k + 1 < n and toks[k + 1][1] == ">":
                 saw_arrow = True
@@ -2128,20 +2166,59 @@ def cfg_false_spans(text: str, cfg) -> tuple[bool, list[tuple[tuple[int, int], t
                     if end >= j:
                         spans.append(((toks[k][2], toks[k][3]), pos_end(end)))
         k = rb + 1
+    # Every `mod name;` declaration, false or not: a file is excluded only
+    # when no compiled declaration reaches it (see `platform_not_built`).
+    # Each carries the inline modules around it (`mod outer { mod inner; }`
+    # looks for `outer/inner.rs`) and its own `#[path = "..."]`, if any.
+    inline: list[tuple[int, int, str]] = []  # (open brace, close brace, name)
+    for k in range(n - 2):
+        if toks[k][:2] == ("ident", "mod") and toks[k + 1][0] == "ident" and toks[k + 2][1] == "{":
+            inline.append((k + 2, pairs.get(k + 2, n - 1), toks[k + 1][1]))
     mod_decls = []
     for k in range(n - 2):
         if toks[k][:2] == ("ident", "mod") and toks[k + 1][0] == "ident" and toks[k + 2][1] == ";":
             pos = (toks[k][2], toks[k][3])
-            if whole_file or any(s <= pos < e for s, e in spans):
-                mod_decls.append(toks[k + 1][1])
+            is_false = whole_file or any(s <= pos < e for s, e in spans)
+            chain = [name for o, c, name in inline if o < k < c]
+            # Look back over this declaration's attributes for `#[path = ..]`.
+            path_attr = None
+            b = k - 1
+            while b >= 0 and toks[b][1] in ("pub", "crate", ")", "(", "self", "super", "in"):
+                b -= 1
+            while b >= 0 and toks[b][1] == "]" and b in pairs:
+                o = pairs[b]
+                if (
+                    o >= 2
+                    and toks[o - 1][1] == "#"
+                    and o + 3 < b
+                    and toks[o + 1][:2] == ("ident", "path")
+                    and toks[o + 2][1] == "="
+                    and toks[o + 3][0] == "lit"
+                ):
+                    path_attr = toks[o + 3][1].strip('"')
+                b = o - 2
+            mod_decls.append((toks[k + 1][1], chain, path_attr, is_false))
     return whole_file, spans, mod_decls
 
 
-def _child_module_prefixes(decl_file: str, name: str) -> list[str]:
-    """Where `mod name;` in `decl_file` looks for its source: `<base>/name.rs`
-    and `<base>/name/` (which also holds its own children)."""
+def _module_targets(decl_file: str, name: str, chain: list[str], path_attr: str | None) -> list[str]:
+    """Where `mod name;` in `decl_file` (inside inline modules `chain`) finds
+    its source: `<base>/name.rs` and `<base>/name/` (which also holds its own
+    children), or exactly the `#[path]` file. `<base>` is the declaring
+    file's directory for a crate root or a `mod.rs`, and `<dir>/<stem>/`
+    for any other file."""
     p = Path(decl_file)
-    base = p.parent if p.name in ("lib.rs", "main.rs", "mod.rs") else p.parent / p.stem
+    is_root_like = (
+        p.name in ("lib.rs", "main.rs", "mod.rs", "build.rs")
+        or p.parent.name in ("bin", "tests", "benches", "examples")
+    )
+    base = p.parent if is_root_like else p.parent / p.stem
+    for inner in chain:
+        base = base / inner
+    if path_attr is not None:
+        # Relative to the declaring file's directory (inside inline modules,
+        # to their directory). Its own children are not followed.
+        return [str(Path(str(p.parent if not chain else base)) / path_attr)]
     return [str(base / f"{name}.rs"), str(base / name) + "/"]
 
 
@@ -2153,6 +2230,7 @@ def platform_not_built(
     (reported, never guessed about: its mutants are kept)."""
     false_files: set[str] = set()
     false_prefixes: list[str] = []
+    built_targets: list[str] = []
     spans_by_file: dict[str, list] = {}
     unreadable: list[str] = []
     for f in sorted(set(files) | {m.get("file", "") for m in mutants if m.get("file")}):
@@ -2166,13 +2244,22 @@ def platform_not_built(
             false_files.add(f)
         if spans:
             spans_by_file[f] = spans
-        for name in mod_decls:
-            false_prefixes += _child_module_prefixes(f, name)
+        for name, chain, path_attr, is_false in mod_decls:
+            targets = _module_targets(f, name, chain, path_attr)
+            (false_prefixes if is_false else built_targets).extend(targets)
+
+    def under(f: str, pre: str) -> bool:
+        return f == pre or (pre.endswith("/") and f.startswith(pre))
 
     def file_false(f: str) -> bool:
         if f in false_files:
             return True
-        return any(f == pre or (pre.endswith("/") and f.startswith(pre)) for pre in false_prefixes)
+        # Excluded only when a false declaration reaches it and no compiled
+        # (or undecided) one does: the platform-dual idiom declares one module
+        # name twice, once per platform, sometimes with `#[path]`.
+        return any(under(f, pre) for pre in false_prefixes) and not any(
+            under(f, pre) for pre in built_targets
+        )
 
     names: set[str] = set()
     for m in mutants:
@@ -4252,6 +4339,71 @@ mod platform {
 mod platform {
     pub fn probe() -> u32 { M_PLATFORM_OTHER }
 }
+
+// Predicates the target does not decide never exclude anything.
+#[cfg(not(test))]
+fn not_test() -> u32 { M_NOT_TEST }
+
+#[cfg(debug_assertions)]
+fn debug_only() -> u32 { M_DEBUG }
+
+#[cfg(coverage)]
+fn coverage_only() -> u32 { M_COVERAGE }
+
+#[cfg(all(unix, feature = "x"))]
+fn all_unknown() -> u32 { M_ALL_UNKNOWN }
+
+// Literals and comments holding brackets must not move a span's end, and a
+// block-like statement ends at its brace: the statement after it is built.
+fn lexing<'a>(state: &'a mut u32) -> u32 {
+    let _c = '{';
+    let _s = "\\"{";
+    let _r = r#"}"#;
+    /* } /* { */ ) */
+    #[cfg(target_os = "macos")]
+    { M_BLOCK_MAC; }
+    *state = M_AFTER_BLOCK;
+    #[cfg(target_os = "macos")]
+    unsafe { M_UNSAFE_MAC; }
+    (a, b) = (M_AFTER_UNSAFE, 0);
+    M_LEX_TAIL
+}
+
+// A bracket inside a literal or a comment, ahead of the marker, would end
+// the attributed fn early (and leave its marker tested) if lexed as code.
+#[cfg(target_os = "macos")]
+fn char_mac() -> u32 { let _c = '}'; M_CHAR_MAC }
+#[cfg(target_os = "macos")]
+fn raw_mac() -> u32 { let _r = r#"say "}" now"#; M_RAW_MAC }
+#[cfg(target_os = "macos")]
+fn comment_mac() -> u32 { /* /* nested */ } */ M_COMMENT_MAC }
+
+// A cfg'd struct-literal field ends at its comma; the next field is built.
+fn fields() -> S {
+    S {
+        #[cfg(target_os = "macos")]
+        a: M_FIELD_MAC,
+        b: M_FIELD_BUILT,
+    }
+}
+
+// Module files: an inline module's `mod` resolves under its directory, a
+// `#[path]` names its file, and the platform-dual idiom declares one name
+// twice. A file any compiled declaration reaches is built.
+mod inner;
+#[cfg(target_os = "macos")]
+mod outer {
+    mod inner;
+}
+#[cfg(target_os = "macos")]
+#[path = "imp_mac.rs"]
+mod imp;
+#[cfg(not(target_os = "macos"))]
+mod imp;
+#[cfg(target_os = "macos")]
+mod shared;
+#[cfg(not(target_os = "macos"))]
+mod shared;
 """
 
 _PLAN_MAC_ONLY_RS = "pub fn m() -> u32 { M_MAC_ONLY_FILE }\n"
@@ -4261,6 +4413,11 @@ _PLAN_FILES = {
     "crates/x/src/lib.rs": _PLAN_LIB_RS,
     "crates/x/src/mac_only.rs": _PLAN_MAC_ONLY_RS,
     "crates/x/src/iokit.rs": _PLAN_IOKIT_RS,
+    "crates/x/src/inner.rs": "pub fn i() -> u32 { M_INNER_BUILT }\n",
+    "crates/x/src/outer/inner.rs": "pub fn o() -> u32 { M_OUTER_INNER_MAC }\n",
+    "crates/x/src/imp_mac.rs": "pub fn p() -> u32 { M_IMP_MAC }\n",
+    "crates/x/src/imp.rs": "pub fn p() -> u32 { M_IMP_OTHER }\n",
+    "crates/x/src/shared.rs": "pub fn s() -> u32 { M_SHARED_BUILT }\n",
 }
 
 _LINUX_CFG = 'panic="unwind"\ntarget_arch="x86_64"\ntarget_family="unix"\ntarget_os="linux"\nunix\ndebug_assertions\n'
@@ -4268,9 +4425,11 @@ _MAC_CFG = 'panic="unwind"\ntarget_arch="aarch64"\ntarget_family="unix"\ntarget_
 
 _MAC_ONLY_MARKERS = {
     "M_MAC_FN", "M_STACKED", "M_MIXED_MAC", "M_ARM_MAC", "M_PLATFORM_MAC",
-    "M_MAC_ONLY_FILE", "M_IOKIT_FILE", "M_GENERIC_MAC",
+    "M_MAC_ONLY_FILE", "M_IOKIT_FILE", "M_GENERIC_MAC", "M_BLOCK_MAC", "M_UNSAFE_MAC",
+    "M_OUTER_INNER_MAC", "M_IMP_MAC", "M_CHAR_MAC", "M_RAW_MAC", "M_COMMENT_MAC",
+    "M_FIELD_MAC",
 }
-_NOT_MAC_MARKERS = {"M_OTHER_FN", "M_MIXED_OTHER", "M_PLATFORM_OTHER"}
+_NOT_MAC_MARKERS = {"M_OTHER_FN", "M_MIXED_OTHER", "M_PLATFORM_OTHER", "M_IMP_OTHER"}
 
 
 def _plan_fixture_mutants() -> list[dict]:
@@ -4298,6 +4457,9 @@ def _plan_fixture_mutants() -> list[dict]:
         "name": f"crates/x/src/lib.rs:{first}:5: replace mixed -> u32 with 1",
         "span": {"start": {"line": first, "column": 5}, "end": {"line": last, "column": 40}},
     })
+    # No span at all, in a macOS-only file: it cannot be placed, so it is
+    # tested, never excluded.
+    mutants.append({"file": "crates/x/src/mac_only.rs", "name": "crates/x/src/mac_only.rs: M_NOSPAN"})
     return mutants
 
 
@@ -4321,8 +4483,8 @@ PLAN_SELF_TEST_CASES = [
         "expect_markers": _NOT_MAC_MARKERS,
         "per_shard": 5,
         "max_shards": 20,
-        # 18 fixture mutants - 3 excluded = 15 testable -> ceil(15 / 5) = 3.
-        "expect_shards": 3,
+        # 38 fixture mutants - 4 excluded = 34 testable -> ceil(34 / 5) = 7.
+        "expect_shards": 7,
     },
     {
         "name": "the cap holds: more testable mutants than per_shard * max_shards",

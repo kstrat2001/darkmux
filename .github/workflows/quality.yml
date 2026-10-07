@@ -261,6 +261,9 @@ jobs:
       - name: List this diff's mutants and plan the shards
         id: plan
         run: |
+          # The plan's output is piped through `tee`; without pipefail a
+          # failed `--plan` would hide behind tee's exit status.
+          set -o pipefail
           if [ -s plan/pr.diff ]; then
             # A non-zero exit (5 FilterDiffMismatch, 6 FilterDiffInvalid, ...)
             # means the listing itself failed: fail here, loudly, rather than
@@ -321,6 +324,9 @@ jobs:
     #     for the mutate step (`rust-cache` turns it off job-wide):
     #     cargo-mutants rebuilds the same tree once per mutant in each worker,
     #     which is the case incremental compilation exists for.
+    #   - Every test process runs under a 4 GiB data limit
+    #     (`scripts/ci-mutants-test-cap.sh`): the first real run lost a
+    #     shard's runner to a mutant that allocates without bound.
     #   - The diff comes from the plan's artifact rather than each shard's
     #     own `git diff`, so the checkout no longer needs full history
     #     (`fetch-depth: 1`, like ci.yml's test job, which runs the same
@@ -495,7 +501,10 @@ jobs:
           # `--test-tool nextest` with the repo's `mutants` profile; the
           # config file is named explicitly so the same flags work for the
           # runtime/ and bundler workspaces, which have no `.config` of
-          # their own.
+          # their own. `--no-tests=pass`: nextest exits 4 when a package
+          # has no tests, and cargo-mutants reads any non-zero test exit as
+          # "caught"; under `cargo test` such a mutant read as missed, which
+          # is the truth.
           #
           # Mutant builds go to the larger of `/` and `/mnt` (cargo-mutants
           # copies the tree into `$TMPDIR` once per worker).
@@ -504,10 +513,14 @@ jobs:
           export TMPDIR
           TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
           export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
           cargo mutants --workspace --in-diff plan/pr.diff --shard "${{ matrix.shard }}/$SHARD_COUNT" -j 4 --timeout 300 \
             --copy-vcs true --test-tool nextest \
-            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
             --output mutants-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
@@ -844,10 +857,14 @@ jobs:
           export TMPDIR
           TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
           export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
           cargo mutants --manifest-path runtime/Cargo.toml --in-diff /tmp/pr-runtime.diff -j 4 --timeout 300 \
             --copy-vcs true --test-tool nextest \
-            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
             --output mutants-runtime-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
@@ -920,10 +937,14 @@ jobs:
           export TMPDIR
           TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
           export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
           cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --in-diff /tmp/pr-bundler.diff -j 4 --timeout 300 \
             --copy-vcs true --test-tool nextest \
-            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
             --output mutants-bundler-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
