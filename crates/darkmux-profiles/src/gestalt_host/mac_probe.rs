@@ -23,18 +23,16 @@
 //! speculative as available because it reports *pressure* for observation —
 //! the two answer different questions, deliberately.
 
-use darkmux_gestalt::{Pools, ProbeError, ResourceProbe};
-// (#1662) `PoolFact`/`PoolId` are constructed ONLY by `unified_pool`, which
-// is macOS-gated — so importing them unconditionally is an unused import on
-// every other platform, and this crate denies warnings. Gated alongside their
-// single consumer rather than blanket-allowed, so the import list keeps
-// telling the truth about what each platform actually uses.
-#[cfg(target_os = "macos")]
-use darkmux_gestalt::{PoolFact, PoolId};
+// `PoolFact`/`PoolId` are constructed only by `unified_pool`, one of the pure
+// helpers below that compile on every platform so their tests (and mutation
+// testing, which runs on Linux) cover them everywhere. Only the probe's
+// shell-outs are macOS-gated. (#1662 had gated the import with its consumer;
+// the consumer is no longer gated, so neither is the import.)
+use darkmux_gestalt::{PoolFact, PoolId, Pools, ProbeError, ResourceProbe};
 
 /// The single pool name this probe emits. Named per the #1274 pools-as-data
 /// vocabulary ("unified" on Apple Silicon).
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const UNIFIED_POOL: &str = "unified";
 
 /// macOS unified-memory probe. Stateless; each [`ResourceProbe::pools`] call
@@ -88,9 +86,15 @@ fn run_ok(cmd: &mut std::process::Command) -> Option<String> {
 }
 
 // ── pure parsers (canned-output tests below; compiled on every platform) ──
+//
+// Their only production caller is the macOS `probe_pools`, so elsewhere they
+// are dead code outside the tests; `allow(dead_code)` off macOS says so rather
+// than gating them, which compiled their tests out on every other platform
+// (the `tests` module below calls them unconditionally, so a Linux test build
+// failed outright).
 
 /// Parse `sysctl -n hw.memsize` output (a bare integer, possibly padded).
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_memsize(s: &str) -> Option<u64> {
     s.trim().parse::<u64>().ok()
 }
@@ -101,7 +105,7 @@ fn parse_memsize(s: &str) -> Option<u64> {
 /// host-telemetry sampler's `mem_percent_from_vm_stat`: page size from
 /// vm_stat's own header (`page size of N bytes`), defaulting to 16384 on
 /// Apple Silicon; field values are `NNN.`-suffixed counts.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
     let page = vm_stat
         .lines()
@@ -119,7 +123,7 @@ fn parse_vm_stat_free_bytes(vm_stat: &str) -> Option<u64> {
 }
 
 /// Assemble the one-pool `Pools` map.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn unified_pool(capacity_bytes: u64, available_bytes: u64) -> Pools {
     Pools::from([(
         PoolId(UNIFIED_POOL.to_string()),

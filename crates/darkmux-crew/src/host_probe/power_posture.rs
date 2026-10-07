@@ -15,7 +15,6 @@
 //! walks (see [`THERMAL_LOG_LINE_CAP`]) rather than reading the whole
 //! thing.
 
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::thermal::{self, ThermalSample};
@@ -199,27 +198,72 @@ fn timestamp_prefix(line: &str) -> Option<String> {
     }
 }
 
-/// Seconds between a `pmset -g log` timestamp and `now`. Shells out to the
-/// system `date` to parse the `%z`-offset format rather than adding a date
-/// dependency to the workspace for one field (CLAUDE.md: don't add
-/// dependencies casually) — `darkmux-doctor` already shells out to `pmset`/
-/// `vm_stat`/`pagesize` for the same reason.
+/// Seconds between a `pmset -g log` timestamp and `now`.
 fn seconds_since(timestamp: &str, now: SystemTime) -> Option<u64> {
-    let out = Command::new("date")
-        .args(["-j", "-f", "%Y-%m-%d %H:%M:%S %z", timestamp, "+%s"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let epoch: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    let epoch = u64::try_from(pmset_timestamp_epoch(timestamp)?).ok()?;
     let event = UNIX_EPOCH + Duration::from_secs(epoch);
     now.duration_since(event).ok().map(|d| d.as_secs())
+}
+
+/// Unix seconds for a `pmset -g log` timestamp, `YYYY-MM-DD HH:MM:SS ±HHMM`,
+/// or `None` for anything else (including an impossible date).
+///
+/// Parsed in-process. This used to shell out to BSD `date -j -f`, which
+/// made [`find_recent_thermal_emergency`] do I/O despite its contract, and
+/// made it macOS-only in practice: GNU `date` has no `-j`, so on Linux every
+/// timestamp read as unparseable and nothing was ever "recent". The civil
+/// date arithmetic is Howard Hinnant's `days_from_civil`, a few lines, so
+/// still no date dependency (CLAUDE.md: don't add dependencies casually).
+fn pmset_timestamp_epoch(timestamp: &str) -> Option<i64> {
+    let mut parts = timestamp.split_whitespace();
+    let (date, time, offset) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || !offset.is_ascii() || offset.len() != 5 {
+        return None;
+    }
+    let num = |s: &str| -> Option<i64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    let fields = |s: &str, sep: char| -> Option<[i64; 3]> {
+        let mut it = s.split(sep).map(num);
+        let v = [it.next()??, it.next()??, it.next()??];
+        it.next().is_none().then_some(v)
+    };
+    let [year, month, day] = fields(date, '-')?;
+    let [hour, minute, second] = fields(time, ':')?;
+    let sign = match offset.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (off_h, off_m) = (num(&offset[1..3])?, num(&offset[3..5])?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&month)
+        || !(1..=month_days[(month - 1) as usize]).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || off_h > 23
+        || off_m > 59
+    {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - sign * (off_h * 3_600 + off_m * 60))
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use std::process::Command;
     use std::sync::OnceLock;
 
     fn run(cmd: &str, args: &[&str]) -> Option<String> {
@@ -461,12 +505,47 @@ mod tests {
         assert_eq!(found.at, "2026-07-10 23:16:05 +0800");
     }
 
+    /// The fixtures' timestamps in Unix seconds, computed OUTSIDE this
+    /// crate (BSD `date -j -f '%Y-%m-%d %H:%M:%S %z' <ts> +%s` and Python's
+    /// `datetime.strptime(ts, '%Y-%m-%d %H:%M:%S %z').timestamp()` agree), so
+    /// the oracle is neither the parser under test nor a platform's `date`.
+    /// It used to shell out to BSD `date -j` here, which does not exist on
+    /// Linux.
     fn seconds_since_epoch_for_test(ts: &str) -> u64 {
-        let out = std::process::Command::new("date")
-            .args(["-j", "-f", "%Y-%m-%d %H:%M:%S %z", ts, "+%s"])
-            .output()
-            .expect("date must parse the fixture timestamp");
-        String::from_utf8_lossy(&out.stdout).trim().parse().expect("date printed a number")
+        match ts {
+            "2026-07-11 07:09:50 +0800" => 1_783_724_990,
+            "2026-07-10 23:16:05 +0800" => 1_783_696_565,
+            other => panic!("no precomputed epoch for fixture timestamp {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pmset_timestamps_parse_to_unix_seconds() {
+        assert_eq!(pmset_timestamp_epoch("2026-07-11 07:09:50 +0800"), Some(1_783_724_990));
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05 +0800"), Some(1_783_696_565));
+        // Same instant as the first, written in another offset (and a
+        // negative one): 2026-07-10 23:09:50 UTC.
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:09:50 +0000"), Some(1_783_724_990));
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 18:39:50 -0430"), Some(1_783_724_990));
+        assert_eq!(pmset_timestamp_epoch("1970-01-01 00:00:00 +0000"), Some(0));
+        // 2024-02-29 00:00:00 UTC is a real day (leap year); 2026 has none.
+        assert_eq!(pmset_timestamp_epoch("2024-02-29 00:00:00 +0000"), Some(1_709_164_800));
+        assert_eq!(pmset_timestamp_epoch("2026-02-29 00:00:00 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-13-01 00:00:00 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 24:00:00 +0000"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05 0800"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16 +0800"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05 +0800 trailing"), None);
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05 +08000"), None);
+        // Five bytes but not five ASCII characters: refused before any byte
+        // slicing, which would otherwise split the `é` and panic.
+        assert_eq!(pmset_timestamp_epoch("2026-07-10 23:16:05 +0é0"), None);
+        // A sign is not a digit, though `str::parse::<i64>` accepts one.
+        assert_eq!(pmset_timestamp_epoch("2026-+7-10 23:16:05 +0800"), None);
+        // Century years are leap years only when divisible by 400.
+        assert_eq!(pmset_timestamp_epoch("2000-02-29 00:00:00 +0000"), Some(951_782_400));
+        assert_eq!(pmset_timestamp_epoch("2100-02-29 00:00:00 +0000"), None);
     }
 
     #[test]
