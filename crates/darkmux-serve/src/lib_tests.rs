@@ -8242,7 +8242,12 @@ mod fleet_cache_wall_clock {
     /// `laptop` entry last seen months ago — outside any window the UI can
     /// rebuild aliases from, while that same machine was beating under a
     /// different name.
+    ///
+    /// Serial, like every test that reaches `history_uids`: its one cache
+    /// slot is process-global, and a scan here replaces the slot another
+    /// test's TTL assertion depends on.
     #[test]
+    #[serial_test::serial]
     fn roster_uids_are_backfilled_from_flow_history_when_the_entry_declares_none() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -8320,7 +8325,10 @@ mod fleet_cache_wall_clock {
     /// only `machine_id`/`machine_uid`, never the action, so this pins that a
     /// retired spelling cannot make a record unreadable here; it cannot be
     /// red-proved by removing the upgrade, which this route does not depend on.
+    ///
+    /// Serial: it replaces `history_uids`' one process-global cache slot.
     #[test]
+    #[serial_test::serial]
     fn roster_backfill_reads_a_spaced_archive_like_its_dotted_twin() {
         let backfill = |action: &str| {
             let tmp = TempDir::new().unwrap();
@@ -8352,7 +8360,15 @@ mod fleet_cache_wall_clock {
     /// The promise: the flow-history scan runs once per TTL, not once per
     /// caller. A pairing that appears in history after a scan is not seen
     /// until the TTL passes; a zero TTL always rescans.
+    ///
+    /// Serial, with every other test that reaches `history_uids` (the backfill
+    /// tests here, and the `/fleet/roster` and fleet-view tests). The cache is
+    /// ONE process-global slot keyed by directory, so another test's scan
+    /// between this test's calls replaced the slot and the second call
+    /// rescanned, under plain `cargo test`. Production keeps one slot: both
+    /// callers pass the daemon's own `flows_dir()`.
     #[test]
+    #[serial_test::serial]
     fn the_uid_history_is_scanned_once_per_ttl() {
         let tmp = TempDir::new().unwrap();
         let day = tmp.path().join("2026-09-30.jsonl");
