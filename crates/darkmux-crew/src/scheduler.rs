@@ -2542,6 +2542,29 @@ mod tests {
         assert_eq!(completes.len(), 2, "both steps complete");
         assert_eq!(completes[0].payload_json()["later_step_planned"], true, "step 0 has step 1 still planned");
         assert!(completes[1].payload.is_none(), "the last step's record carries no mark");
+        for c in &completes {
+            assert_eq!(c.source, Some(darkmux_flow::FlowSource::Scheduler), "both shapes are scheduler records: {c:?}");
+        }
+    }
+
+    /// (#3074) "Later" means after `id` in its task, never `id` itself: a task's
+    /// last step has no later planned step even while its own status still reads
+    /// Planned, and a later step counts only while it is Planned.
+    #[test]
+    fn later_step_planned_looks_only_past_the_step_itself() {
+        let (mut task, step0) = task_and_step("multi", &[]);
+        task.step_ids = vec!["multi-0".to_string(), "multi-1".to_string()];
+        let mut step0 = step0;
+        step0.id = "multi-0".to_string();
+        let mut step1 = step0.clone();
+        step1.id = "multi-1".to_string();
+        let (tasks, mut steps) = graph(vec![(task, step0)]);
+        steps.insert(step1.id.clone(), step1);
+        assert_eq!(steps["multi-1"].status, NodeStatus::Planned);
+        assert!(later_step_planned("multi-0", &tasks, &steps), "step 1 is still planned");
+        assert!(!later_step_planned("multi-1", &tasks, &steps), "nothing follows the last step");
+        steps.get_mut("multi-1").unwrap().status = NodeStatus::Complete;
+        assert!(!later_step_planned("multi-0", &tasks, &steps), "a finished later step is not planned");
     }
 
     // ─── the output ledger (#1619 — `Task.reads`) ───────────────────

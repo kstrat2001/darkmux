@@ -1253,6 +1253,18 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"first");
     }
 
+    /// (#3074) Only a target that already exists reads as `AlreadyPresent`. A
+    /// write that failed for any other reason is an error, never reported as
+    /// a record someone else already wrote.
+    #[test]
+    fn create_new_fallback_reports_a_failed_write_as_an_error_not_already_present() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("no-such-dir").join("finding.json");
+        let err = crate::lifecycle::create_new_in_place(&p, b"first").unwrap_err();
+        assert!(format!("{err:#}").contains("creating"), "{err:#}");
+        assert!(!p.exists());
+    }
+
     /// (#3074) A link refused as unsupported or denied falls back to `create_new`:
     /// the record is still written, and a second writer is still refused.
     #[test]
