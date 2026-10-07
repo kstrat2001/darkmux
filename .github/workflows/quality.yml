@@ -364,20 +364,29 @@ jobs:
     # reason to exist (a diff spread thinner than its shard count must NOT
     # read as the wiring-broken shape).
     #
-    # `needs:` + `if: always()`: this job must still report even when one
-    # or more shards failed or were cancelled — same "report the truth
-    # about what happened, never go silent" posture as every `always()` in
-    # this file. `github.event_name == 'pull_request'` keeps it from
-    # running (and erroring on missing artifacts) on `push`/`schedule`
-    # triggers, where the shard matrix's own `if:` already skips it
-    # entirely.
+    # `needs:` + `if: !cancelled()`: this job must still report when one or
+    # more shards failed, or were cut off by their own `timeout-minutes`
+    # (which GitHub reports as a `cancelled` job), but NOT when the RUN was
+    # cancelled. `cancelled()` is the run-level status ("the workflow was
+    # canceled": a manual cancel, or `cancel-in-progress` superseding the
+    # run); a shard's own timeout does not cancel the run, which is why the
+    # remaining shards still start after one times out. It used to be
+    # `always()`, which also ran on a cancelled run: the job then sat queued
+    # for a macOS runner, kept the cancelled run alive in this workflow's
+    # concurrency group, and blocked the PR's next quality run behind it.
+    # `!cancelled()` also lets the server cancel this job if it is already
+    # running when the run is cancelled, where `always()` kept it running.
+    # `github.event_name == 'pull_request'` keeps it from running (and
+    # erroring on missing artifacts) on `push`/`schedule` triggers, where
+    # the shard matrix's own `if:` already skips it entirely.
     name: mutation — PR diff root floor check (aggregate across shards)
     runs-on: macos-latest
     needs: mutants-in-diff
-    # (#2896) Same `full-ci` gate as the shards: without it, `always()` would
-    # start this job on an unlabeled PR whose shards were skipped, and it
-    # would fail on their missing artifacts.
-    if: always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
+    # (#2896) Same `full-ci` gate as the shards: without it, the status
+    # function would start this job on an unlabeled PR whose shards were
+    # skipped (a skipped `needs:` job does not cancel the run), and it would
+    # fail on their missing artifacts.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -444,12 +453,12 @@ jobs:
           pattern: mutants-in-diff-shard-*
           path: shard-artifacts
           # A shard whose own upload step never ran at all (an extremely
-          # early cancellation) leaves fewer than 6 artifacts to match —
-          # `sum_shard_outcomes` already reports a missing directory as a
-          # real, visible absence rather than erroring, so this job should
-          # not error either; `warn` (the action's own default) logs it
-          # without failing the step.
-          if-no-artifact-found: warn
+          # early cancellation) leaves fewer than 6 artifacts to match.
+          # A `pattern` that matches fewer artifacts does not fail this
+          # step, and `sum_shard_outcomes` reports a missing directory as a
+          # real, visible absence. (download-artifact@v4 has no
+          # `if-no-artifact-found` input; an earlier version of this step
+          # set one, and the action ignored it.)
 
       - name: Root floor check (aggregate across all 6 shards)
         run: |
