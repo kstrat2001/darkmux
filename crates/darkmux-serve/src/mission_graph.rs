@@ -1937,7 +1937,7 @@ mod tests {
         assert_eq!(out["s1"].tokens, Some(15200));
         assert_eq!(out["s1"].turns, Some(9));
         let old = fold_step_finals(recs("step-s1-twin-mission-1757-abc123"), &step_ids, mission);
-        assert!(old.get("s1").is_none_or(|f| f.tokens.is_none()), "a pre-4.0 step session names no step");
+        assert!(old.get("s1").is_none_or(|f| f.tokens.is_none()), "a pre-5.0 step session names no step");
     }
 
     /// (#1918 QA) The peel must not become a NEW cross-mission leak: a
@@ -1961,7 +1961,7 @@ mod tests {
         ];
         stamp_session_steps(&mut recs, "m1");
         let step = |i: usize| recs[i].pointer("/payload/step_id").and_then(|v| v.as_str()).map(str::to_string);
-        assert_eq!(step(0), None, "a pre-4.0 step session names no step");
+        assert_eq!(step(0), None, "a pre-5.0 step session names no step");
         assert_eq!(step(1), None, "nor does its run-scoped spelling");
         assert_eq!(step(2).as_deref(), Some("s1"));
         assert_eq!(recs[2]["payload"]["total_tokens"], 3, "the rest of the payload is kept");

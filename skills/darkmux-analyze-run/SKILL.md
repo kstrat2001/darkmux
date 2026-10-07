@@ -228,7 +228,7 @@ These are the specific names where the schema has evolved or where similar conce
 | `tokens` (anywhere) | `prompt_tokens` + `completion_tokens` + `total_tokens` | always the three-way split; never a single "tokens" field |
 | `wall_ms` (in manifest.json) | `duration_ms` (in manifest.json) | manifest uses snake_case; qa-reply uses snake_case |
 | `model.completed.usage.tokens` | `model.completed.usage.{prompt,completion,total}_tokens` | usage is always the three-field object |
-| `metrics.this_run.*`, or `metrics.json` anywhere | `metrics.*` in qa-reply.json, or a fold of `trajectory.jsonl` | 4.0 retired `metrics.json` and `this_run`: the envelope's `metrics` block is already this invocation's own. There is no whole-task turn count across resumes: a resumed run's `turns` counts only its own, and a hand-back resume continues the prior run's last turn, so do not sum `turns` across a resume (compaction counts do sum). A task's whole-task tokens are the sum of its `telemetry.tokens` usage records |
+| `metrics.this_run.*`, or `metrics.json` anywhere | `metrics.*` in qa-reply.json, or a fold of `trajectory.jsonl` | 5.0 retired `metrics.json` and `this_run`: the envelope's `metrics` block is already this invocation's own. There is no whole-task turn count across resumes: a resumed run's `turns` counts only its own, and a hand-back resume continues the prior run's last turn, so do not sum `turns` across a resume (compaction counts do sum). A task's whole-task tokens are the sum of its `telemetry.tokens` usage records |
 
 If a query returns `null` for a field you expect populated:
 
@@ -349,6 +349,6 @@ Equal `baseline_hash` ⇒ both runs started from the same source state. Equal `f
 ## Notes
 
 - A run dir without `manifest.json` will error with "no run manifest" — that means the dispatch wasn't done via `darkmux lab run` (or was interrupted before writing).
-- A `metrics.json` in an older run or sandbox is a pre-4.0 artifact and is never read: it was written on clean exit only, so a killed dispatch left a previous run's copy in place. Trust `trajectory.jsonl`.
+- A `metrics.json` in an older run or sandbox is a pre-5.0 artifact and is never read: it was written on clean exit only, so a killed dispatch left a previous run's copy in place. Trust `trajectory.jsonl`.
 - For a side-by-side diff of two runs, use `darkmux-compare-runs` instead.
 - When in doubt, run the diagnostic two-line check (`.field` then `keys`) before assuming a feature is broken.

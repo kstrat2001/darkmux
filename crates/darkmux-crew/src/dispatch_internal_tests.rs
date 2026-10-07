@@ -338,7 +338,7 @@
         let settle = body.find("crate::budget::settle_dispatch_live(").expect("per-dispatch settle");
         assert!(endpoint_gate < open, "the window gate runs before the first record");
         assert!(settle > call, "the per-dispatch cap is settled with the call's real spend");
-        assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
+        assert!(!src.contains("fn admit_remote_execution("), "the pre-5.0 zero-refusal gate is gone");
         // (3rd review #4) A call the gate holds is live work: the presence
         // heartbeat starts before the gate, the bookend only after it.
         let beat = body.find("session_presence::spawn_session_emitter(").expect("heartbeat");

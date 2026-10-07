@@ -62,7 +62,7 @@ fn role_retired(path: &str) -> Option<String> {
     let line = match path {
         "capabilities" => "renamed to `skills` (#449): the skill ids this role draws on",
         "tier" => "removed in #605: nothing reads it (a model is chosen by capability, not tier). Delete it",
-        "escalation_posture" => "removed in 4.0, it had no effect: the runtime treated `auto` and `pause` the same. Delete it",
+        "escalation_posture" => "removed in 5.0, it had no effect: the runtime treated `auto` and `pause` the same. Delete it",
         _ => return None,
     };
     Some(line.to_string())

@@ -181,7 +181,7 @@ fn ignored_project_local_note(id: &str) -> Option<String> {
     let found = find_in_dir(&project_workloads, id)?;
     Some(format!(
         "Note: `{id}` exists at {} but is ignored: darkmux no longer reads a \
-         project-local `.darkmux/` (4.0). Move it to \
+         project-local `.darkmux/` (5.0). Move it to \
          ~/.darkmux/workloads/{id}.json, or export DARKMUX_HOME=<dir> to make \
          that directory the root.",
         display_under_cwd(&found),

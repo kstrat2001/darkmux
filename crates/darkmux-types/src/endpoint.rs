@@ -567,7 +567,7 @@ impl ModelEndpoint {
                 return Err(EndpointError(
                     "darkmux: an endpoint declares what darkmux does at it: `\"managed\": \"lmstudio\"` for a \
                      server darkmux loads models into, or a `url` for one it only sends requests to. \
-                     This one declares neither (4.0 has no implicit kind). (#2902)"
+                     This one declares neither (5.0 has no implicit kind). (#2902)"
                         .to_string(),
                 ))
             }
@@ -907,7 +907,7 @@ pub(crate) mod endpoint_field {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
                     "an endpoint id: a string naming an `endpoints` entry (an inline endpoint object was \
-                     removed in 4.0: declare it once under `endpoints` and name it by id)",
+                     removed in 5.0: declare it once under `endpoints` and name it by id)",
                 )
             }
             fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -1017,7 +1017,7 @@ mod tests {
             let err = serde_json::from_str::<ProfileModel>(&format!(r#"{{"id":"m","endpoint":{object}}}"#))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("removed in 4.0") && err.contains("`endpoints`"), "{object}: {err}");
+            assert!(err.contains("removed in 5.0") && err.contains("`endpoints`"), "{object}: {err}");
         }
     }
 

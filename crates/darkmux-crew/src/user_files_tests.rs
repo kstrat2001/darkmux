@@ -271,7 +271,7 @@ fn every_historical_role_key_is_named_as_retired() {
     let msg = problems(UserFileKind::Role, Reach::Every).iter().map(ToString::to_string).collect::<String>();
     assert!(msg.contains("unknown key `capabilities`: renamed to `skills`"), "{msg}");
     assert!(msg.contains("unknown key `tier`: removed in #605"), "{msg}");
-    assert!(msg.contains("unknown key `escalation_posture`: removed in 4.0, it had no effect"), "{msg}");
+    assert!(msg.contains("unknown key `escalation_posture`: removed in 5.0, it had no effect"), "{msg}");
 }
 
 /// (review C4) A mission-config copy another tier shadows is never loaded,

@@ -12555,7 +12555,7 @@ fn config_set_refuses_the_retired_remote_keys_naming_the_endpoint_limit() {
 #[test]
 fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
     let cases = [
-        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 4.0"),
+        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 5.0"),
         // (#3035) Ignoring a spend cap would remove the cap, so these refuse.
         ("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "env var DARKMUX_REMOTE_MAX_TOKENS_PER_STEP (/x) is refused: removed in 5.0"),
         (

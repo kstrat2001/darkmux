@@ -133,11 +133,11 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
             (
                 Status::Warn,
                 format!(
-                    "Redis still holds the retired work queue ({}); no 4.0 daemon reads it (#2916)",
+                    "Redis still holds the retired work queue ({}); no 5.0 daemon reads it (#2916)",
                     f.retired_streams.join(", ")
                 ),
                 format!(
-                    "Delete it on the hub once every machine runs 4.0: `redis-cli DEL {}`. A 3.x \
+                    "Delete it on the hub once every machine runs 5.0: `redis-cli DEL {}`. A 3.x \
                      daemon still consumes it (and re-creates it when it starts).",
                     f.retired_streams.join(" ")
                 ),
@@ -150,7 +150,7 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
                      write this Redis can make them run work, unauthenticated",
                     live.join(", ")
                 ),
-                "Upgrade those machines to 4.0 (or stop their `darkmux serve`), then delete the \
+                "Upgrade those machines to 5.0 (or stop their `darkmux serve`), then delete the \
                  streams: the queue hole closes only when no 3.x daemon is left."
                     .to_string(),
             )

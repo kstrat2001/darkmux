@@ -233,7 +233,7 @@ Both `dispatch` and `lab run` use the internal Docker-bounded runtime. The front
 
 OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally independent (no commercial coupling).
 
-The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. That routing is still there, but it runs internally now; the project has grown into an AI-first local-AI orchestrator whose headline is the mission-and-lab pair, with small CLI primitives plus a few jobs the local model does internally (context compaction, routing `darkmux radio` requests). The AI-built-in verbs that used to sit here (`mission propose`, `lab notebook draft`) were removed in 4.0 (#2912/#2913): the frontier orchestrator writes a mission config or a notebook entry better than a small local model did. Earlier framings of darkmux as *"infrastructure, not an agent framework"* or as *"a profile multiplexer"* were honest at the time, but the binary today embeds AI dispatch logic internally and leads with missions, so calling it an AI-first orchestrator out loud is the honest move.
+The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. That routing is still there, but it runs internally now; the project has grown into an AI-first local-AI orchestrator whose headline is the mission-and-lab pair, with small CLI primitives plus a few jobs the local model does internally (context compaction, routing `darkmux radio` requests). The AI-built-in verbs that used to sit here (`mission propose`, `lab notebook draft`) were removed in 5.0 (#2912/#2913): the frontier orchestrator writes a mission config or a notebook entry better than a small local model did. Earlier framings of darkmux as *"infrastructure, not an agent framework"* or as *"a profile multiplexer"* were honest at the time, but the binary today embeds AI dispatch logic internally and leads with missions, so calling it an AI-first orchestrator out loud is the honest move.
 
 ## Design principles
 
@@ -306,7 +306,7 @@ darkmux run stats <run-id> --json   # what the skill reads; the manifest when it
 
 The entry goes wherever your own instructions say your notebook lives; the skill asks when they say nothing. If you collate entries across machines, set a distinct `DARKMUX_MACHINE_ID` on each (`darkmux doctor --verbose` shows the resolved id) and the skill stamps it into the entry header, so cross-machine readouts stay unambiguous.
 
-(The `lab notebook draft`/`list` verbs, the `scribe` role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting were removed in 4.0, #2913. `darkmux doctor` names either setting if it is still set.)
+(The `lab notebook draft`/`list` verbs, the `scribe` role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting were removed in 5.0, #2913. `darkmux doctor` names either setting if it is still set.)
 
 ## Instrumentation
 

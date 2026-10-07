@@ -71,7 +71,7 @@ A retired env var is either refused or ignored with a warning, by whether ignori
 - **Refused: the command does not start.** `DARKMUX_CREW_DIR` (state location: `DARKMUX_HOME` is the one root now), and `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` and `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` (ignoring a spend cap would remove it; the limits moved to the endpoint, step 4d).
 - **Warned and ignored: the command runs, printing `env var ... is ignored: ...`.** `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`, `DARKMUX_ACK_DIR`, `DARKMUX_LOG`, `DARKMUX_REMOTE_STEP_BUDGET_POLICY`, `DARKMUX_REMOTE_CONCURRENT_CAP`, `DARKMUX_MACHINE_ROLLUP_ENABLED` and `DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS`.
 
-Remove every one you find the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
+Remove every one you find the same way. Doctor's row `retired env vars (5.0)` names each one it finds.
 
 1. Find the `export` line in the user's shell rc (`~/.zshrc`, `~/.bashrc`, or a file it sources) and remove it with the Edit tool. It is the user's file: show the line you removed. If they use the same name for something outside darkmux, say so and let them decide. **If 3.x keeps running on this machine, leave the export in place** (3.x still reads it) and prefix each new-binary command with `env -u DARKMUX_NOTEBOOK_DIR` instead.
 2. **Trap: an already-open shell keeps the old value.** A refused var (`DARKMUX_CREW_DIR`, the two `DARKMUX_REMOTE_MAX_TOKENS_*` vars) keeps the new binary from starting in that shell even after the rc is fixed, and a warned one keeps printing its warning. Open a new terminal, run `unset <VAR>` in the current one, or prefix commands with `env -u <VAR>`. Re-sourcing `.zshrc` may print harmless `compdef` noise.
@@ -84,9 +84,9 @@ Leftovers at their old defaults (what `init` wrote) only warn and are safe to de
 
 | Key | Why (from doctor) |
 |---|---|
-| `dirs.notebook` | Retired in 4.0 (#2913). The notebook verbs are gone. |
+| `dirs.notebook` | Retired in 5.0 (#2913). The notebook verbs are gone. |
 | `orchestrator` | Removed in #1766; `init` wrote it before 1.8. |
-| `role_profiles.radio-router` | No effect since 4.0 (#2914); radio routing runs on `internal.utility`. |
+| `role_profiles.radio-router` | No effect since 5.0 (#2914); radio routing runs on `internal.utility`. |
 | `remote` (the whole block) | Retired in 5.0 (#3035): limits live on the endpoint, and nothing is carried over. Do step 4d first if the user ever set a number there, then delete the block. 3.x's `init` wrote it into every config. |
 
 Drop `dirs` if it becomes empty. Other retired keys have their fix in doctor's message: apply exactly what it names. Three of them are moves or respellings rather than deletions:
@@ -247,7 +247,7 @@ darkmux used to find and name these. It now ignores them, so check once by hand:
 <!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
 - **Pre-2.6.0 audit files** (the struct-hash format: a header with no `hash_format`) are no longer verified. `darkmux flow integrity-check` reports each as a break at line 1 with 0 records checked (exit 2), `darkmux doctor` fails its `audit integrity` row naming the file, and the audit sink refuses to extend such a file. Nothing is recomputed, so this is not evidence of editing. The old "legacy" warning, `--strict` and exit 3 are gone. Archive the file (`mv -n` it aside) so a fresh chain starts; a torn-tail warning is separate and unchanged.
 <!-- flow-action-guard:allow-start — names the retired spellings to say what they now read as -->
-- **Flow archives written by 3.x.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-4.0 `telemetry.process` record.
+- **Flow archives written by 3.x.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-5.0 `telemetry.process` record.
 <!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
 
 ## Step 8: Mission configs, workloads, fixtures

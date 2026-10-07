@@ -522,7 +522,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env: Some("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"),
         env_policy: LeftoverPolicy::Refuse,
         leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Int(500_000)]),
-        line: "removed in 5.0 (#3035; it was renamed `remote.max_tokens_per_step` in 4.0): set \
+        line: "removed in 5.0 (#3035; `remote.max_tokens_per_step` was its brief successor): set \
                `endpoints.<id>.limits.tokens_per_dispatch` on the endpoint in profiles.json instead. Nothing is \
                carried over: limits are off until you set them (500000 was darkmux's old default, not a \
                recommendation)",
@@ -587,7 +587,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env: Some("DARKMUX_NOTEBOOK_DIR"),
         env_policy: LeftoverPolicy::Warn,
         leftover: LeftoverValue::Any,
-        line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
+        line: "removed in 5.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
     RetiredSetting {
@@ -633,7 +633,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env: None,
         env_policy: LeftoverPolicy::Refuse,
         leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Str("warn")]),
-        line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), retired in 5.0 (#3035): the policy is \
+        line: "removed in 5.0 (#3035; `remote.step_budget_policy` was its brief successor): the policy is \
                `endpoints.<id>.limits.policy` in profiles.json",
     },
     RetiredSetting {
@@ -649,7 +649,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env: None,
         env_policy: LeftoverPolicy::Refuse,
         leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
-        line: "replaced in 4.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
+        line: "replaced in 5.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
                fleet's execution credential) and `serve.read_auth` (whether reads from off this machine need \
                it, default off). Move your value to `serve.token_keychain`, and set `serve.read_auth true` if \
                you want reads closed",
@@ -667,7 +667,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env: Some("DARKMUX_CREW_DIR"),
         env_policy: LeftoverPolicy::Refuse,
         leftover: LeftoverValue::Refuse,
-        line: "removed in 4.0: \"crew\" is a retired concept. `DARKMUX_HOME` (or `~/.darkmux`) is the one root, and \
+        line: "removed in 5.0: \"crew\" is a retired concept. `DARKMUX_HOME` (or `~/.darkmux`) is the one root, and \
                roles, missions, phases, crews and skills live directly under it. Unset it, and to relocate \
                darkmux set `DARKMUX_HOME`; the autonomous-dispatch preamble override is \
                `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md`",
