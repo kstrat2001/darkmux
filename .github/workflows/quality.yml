@@ -453,12 +453,12 @@ jobs:
           pattern: mutants-in-diff-shard-*
           path: shard-artifacts
           # A shard whose own upload step never ran at all (an extremely
-          # early cancellation) leaves fewer than 6 artifacts to match —
-          # `sum_shard_outcomes` already reports a missing directory as a
-          # real, visible absence rather than erroring, so this job should
-          # not error either; `warn` (the action's own default) logs it
-          # without failing the step.
-          if-no-artifact-found: warn
+          # early cancellation) leaves fewer than 6 artifacts to match.
+          # A `pattern` that matches fewer artifacts does not fail this
+          # step, and `sum_shard_outcomes` reports a missing directory as a
+          # real, visible absence. (download-artifact@v4 has no
+          # `if-no-artifact-found` input; an earlier version of this step
+          # set one, and the action ignored it.)
 
       - name: Root floor check (aggregate across all 6 shards)
         run: |
