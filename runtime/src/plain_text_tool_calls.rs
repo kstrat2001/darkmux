@@ -2020,4 +2020,102 @@ None of those is a call."#;
         let content = format!("Shape:\n\n    first line\n    {QUOTED_CALL}\n");
         assert!(promote_text(&content).info.is_none());
     }
+
+    /// (#3074) An indented code block's region is where the block IS, not
+    /// where the text starts: a preamble longer than the code line must not
+    /// push the quoted opener outside its own region.
+    #[test]
+    fn xml_markup_in_an_indented_code_block_after_a_long_preamble_is_not_promoted() {
+        let preamble = "This paragraph explains at some length why the call below is only an example. ".repeat(3);
+        let content = format!("{preamble}\n\n    {QUOTED_CALL}\n\nNo change needed.");
+        assert!(preamble.len() > QUOTED_CALL.len() + 6, "the preamble must be longer than the code line");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "indented quotation promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) A fence ANYWHERE in the text does not make a later comment
+    /// opener quoted: only a fence that contains the opener does.
+    #[test]
+    fn xml_markup_in_a_comment_after_an_earlier_fence_is_not_promoted() {
+        let content = format!("Ran:\n\n```\nls\n```\n\nThe doc says:\n<!-- {QUOTED_CALL} -->\nLooks fine.");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) A fence's region ends at its closing line's end, exclusive: a
+    /// comment opening on the very next byte is outside it and still quotes.
+    #[test]
+    fn xml_markup_in_a_comment_directly_after_a_closing_fence_is_not_promoted() {
+        let content = format!("```\nls\n```\n<!-- {QUOTED_CALL} -->\n");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) Skipping a `<!--` quoted inside a fence resumes the search at
+    /// the fence's end, so a real comment right after that fence is found.
+    #[test]
+    fn xml_markup_in_a_comment_after_a_fence_quoting_an_opener_is_not_promoted() {
+        let content = format!("```\n<!-- x\n```\n<!-- {QUOTED_CALL} -->\n");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) A tab-indented `<!--` at byte 1 sits in an indented code block
+    /// and opens nothing; skipping it must not underflow.
+    #[test]
+    fn xml_tab_indented_comment_opener_at_the_start_does_not_swallow_a_later_call() {
+        let content = format!("\t<!-- begin\n\n{QUOTED_CALL}\nend -->\n");
+        assert_eq!(promote_text(&content).info.expect("must promote").call_count, 1);
+    }
+
+    /// (#3097) A comment's close is searched for from just past its own
+    /// opener, wherever in the text the comment sits.
+    #[test]
+    fn xml_markup_in_a_comment_after_a_long_preamble_is_not_promoted() {
+        let preamble = "A long review note that runs well past the comment it introduces. ".repeat(3);
+        let tail = "Nothing else in this reply closes a comment. ".repeat(20);
+        let content = format!("{preamble}<!-- {QUOTED_CALL} -->\n{tail}");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) A comment's region runs through its `-->`: an opener ending
+    /// right at the close is inside the comment and is counted with the rest.
+    #[test]
+    fn xml_every_opener_in_a_comment_is_counted_up_to_its_close() {
+        let content = format!("<!-- {QUOTED_CALL}\n<tool_call>-->\nDone.");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 2, "{outcome:?}");
+    }
+
+    /// (#3097) Inline code is decided by the backticks on the opener's OWN
+    /// line: a backtick ending the previous line does not put a comment
+    /// opener in inline code.
+    #[test]
+    fn xml_markup_in_a_comment_after_a_line_ending_in_a_backtick_is_not_promoted() {
+        let content = format!("Run `ls`\n<!-- {QUOTED_CALL} -->\n");
+        let outcome = promote_text(&content);
+        assert!(outcome.info.is_none(), "commented markup promoted: {outcome:?}");
+        assert_eq!(outcome.xml_openers_skipped_as_fenced, 1);
+    }
+
+    /// (#3097) Boundaries: a comment closing at the very end of the text,
+    /// two adjacent comments, and backticks at the first and last byte.
+    #[test]
+    fn xml_comment_and_inline_code_boundaries() {
+        let at_end = format!("Note:\n<!-- {QUOTED_CALL} -->");
+        assert!(promote_text(&at_end).info.is_none(), "a comment closing at end of text still quotes");
+        let adjacent = format!("<!-- a --><!-- {QUOTED_CALL} -->\n");
+        assert!(promote_text(&adjacent).info.is_none(), "the second of two adjacent comments still quotes");
+        let tick_first = format!("`<!--` is the opener.\n{QUOTED_CALL}\n-->");
+        assert_eq!(promote_text(&tick_first).info.expect("must promote").call_count, 1, "a backtick at byte 0 opens inline code");
+        let tick_last = format!("<!-- {QUOTED_CALL} -->`");
+        assert!(promote_text(&tick_last).info.is_none(), "a trailing backtick does not reach back over the comment");
+    }
 }

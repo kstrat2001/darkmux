@@ -10031,6 +10031,60 @@ mod tests {
         assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit continues the SAME turn");
     }
 
+    /// (#3074) Inverted: a turn whose continuations are still UNDER the
+    /// context window keeps going. One checkpoint at 999 tokens against a
+    /// 2500-token window, then the model stops: the turn ends Stop, not with
+    /// the window escalation the twin above pins.
+    #[test]
+    #[serial_test::serial]
+    fn a_turn_whose_continuations_stay_under_the_context_window_continues() {
+        const MARK: &str = "PARTIAL-UNDER-WINDOW";
+        let block: String = std::iter::once(format!("{MARK} ")).chain((0..8100).map(|i| format!("w{i} "))).collect();
+        fn carries_mark(req: &httpmock::prelude::HttpMockRequest) -> bool {
+            req.body.as_ref().is_some_and(|v| String::from_utf8_lossy(v).contains(MARK))
+        }
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| !carries_mark(req));
+            then.status(200).json_body(chat_response_json(Some(&block), None, "length", 100, 999));
+        });
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(carries_mark);
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 100, 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-continuations-under").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think a while")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig { context_window: Some(2500), ..compaction::CompactionConfig::never_compact() };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(100_000), None, Some(1000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a turn under the window completes");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::Stop,
+            "999 of a 2500-token window is not full: the continuation must be sent"
+        );
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "the continuation is the SAME turn");
+    }
+
+    /// (#3074) The window bound's own edge: a turn has filled the window once
+    /// it has generated AS MANY tokens as the window holds, not more; and with
+    /// no window configured there is no bound to reach.
+    #[test]
+    fn turn_fills_window_at_exactly_the_window_and_never_without_one() {
+        assert!(!turn_fills_window(Some(2500), 2499));
+        assert!(turn_fills_window(Some(2500), 2500));
+        assert!(turn_fills_window(Some(2500), 2501));
+        assert!(!turn_fills_window(None, u32::MAX));
+    }
+
     /// (#3074) The same window bound for a turn that keeps REASONING: the
     /// slices arrive in the separate `reasoning_content` field with empty
     /// `content`, which is the shape a reasoning model that never closes its
@@ -16384,6 +16438,119 @@ mod tests {
         assert_eq!(crate::trajectory::recorded(tmp.path()).compactions(), 1, "the bound-crossing compaction is counted");
         assert_eq!(compactor_mock.hits(), 1, "exactly one compactor call, during catch-up");
         primary_mock.assert_hits(0);
+    }
+
+    /// (#3074) RESUME grain twin of
+    /// `a_lexically_repaired_structured_compaction_is_flagged_on_the_trajectory_event`:
+    /// a structured catch-up compaction whose reply was cut off and lexically
+    /// repaired installs, and its `compaction` event says so. The bound of 1
+    /// ends the run right after the install, so the event is the catch-up's.
+    #[test]
+    #[serial_test::serial]
+    fn a_lexically_repaired_resume_catch_up_compaction_is_flagged_on_the_trajectory_event() {
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+        let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
+            threshold_tokens: 1,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::StructuredSlot,
+            bail_after_compactions: Some(1),
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let primary_mock = server.mock_expect_zero(
+            "never hit: the catch-up compaction crosses the bound of 1 before the first post-resume request",
+            |when, then| {
+                when.method(POST)
+                    .path("/v1/chat/completions")
+                    .body_contains("\"model\":\"test-primary\"");
+                then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
+            },
+        );
+        let truncated = r#"{"objective": "finish", "current_truth": {}, "compaction_metadata": {"schema_version": "0.1", "generation": 1, "source_message_count": 3}, "completed_decisions": "decision one; decis"#;
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200)
+                .json_body(chat_response_json(Some(truncated), None, "length", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-repaired").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+
+        let make_call = |id: &str, offset: u32| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+            },
+            extra_content: None,
+        };
+        let c1 = make_call("call_1", 1);
+        let c2 = make_call("call_2", 2);
+        let assistant_turn = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![c1, c2.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        // Same padding as the bail twin above, so the middle clears the
+        // min-reduction guard.
+        let pad = "context detail that occupies transcript space ".repeat(6);
+        let mut checkpoint_messages = vec![Message::system("test system"), Message::user(format!("seed: {pad}"))];
+        for i in 0..3 {
+            checkpoint_messages.push(Message::user(format!("padding user {i}: {pad}")));
+            checkpoint_messages.push(Message::assistant(format!("padding assistant {i}: {pad}")));
+        }
+        checkpoint_messages.push(assistant_turn);
+        checkpoint_messages.push(Message::tool_result("call_1", "read", "<call 1 result>"));
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
+            messages: checkpoint_messages,
+            turns: 2,
+            total_completion_tokens: 40,
+            compactions: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![c2]),
+            pending_tool_calls_seq_base: 1,
+            pending_head_started: false,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("the bound produces Ok with EscalationTriggered");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionLimitReached),
+            "fixture sanity: the catch-up compaction installed and crossed the bound"
+        );
+        assert_eq!(compactor_mock.hits(), 1, "exactly one compactor call, during catch-up");
+        primary_mock.assert_hits(0);
+
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let installed: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| v["type"] == "compaction")
+            .collect();
+        assert_eq!(installed.len(), 1, "exactly the catch-up's compaction installed: {raw}");
+        assert_eq!(
+            installed[0]["lexically_repaired"], true,
+            "the catch-up's installed compaction event must carry the repair flag: {}", installed[0]
+        );
     }
 
     // ===== (#414 PR A) Length-finish stall recovery tests =====
