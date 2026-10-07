@@ -12,7 +12,7 @@
 //!   caller it streams the body through [`crate::redaction_stream`], redacting each
 //!   key and value as it passes, so a field no one thought to list (an operator-authored profile description, a path in
 //!   an error line) is covered without naming it.
-//! - [`redact_stdout`] is for a console panel's terminal output, which needs
+//! - [`redact_panel_stdout`] is for a console panel's terminal output, which needs
 //!   its escape sequences split out first (see [`classify_escape`]).
 //!
 //! The streams redact each event line with [`Redaction::line`]. Local callers
@@ -25,6 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use darkmux_types::url_authority::UrlAuthority;
 use crate::redaction_stream::StreamRedactor;
+use darkmux_types::panel_audience::Withheld;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
@@ -559,8 +560,10 @@ fn osc(rest: &str, r: &Redaction) -> (usize, String) {
 /// escape boundary is always a token boundary: panel children are forced to
 /// color, and `\x1b[2m/Users/kain` must read as a path, not as a path glued to
 /// the `m` that ends the escape. See [`classify_escape`] for which escapes
-/// survive.
-pub(crate) fn redact_stdout(text: &str, r: &Redaction) -> String {
+/// survive. Each run also loses every value in `w` (the console panels'
+/// extra set, [`panel_withheld`]).
+pub(crate) fn redact_panel_stdout(text: &str, r: &Redaction, w: &Withheld) -> String {
+    let redact_run = |run: &str| w.scrub(&redact_text(run, r));
     let mut out = String::with_capacity(text.len());
     let mut run_start = 0;
     let mut i = 0;
@@ -570,14 +573,79 @@ pub(crate) fn redact_stdout(text: &str, r: &Redaction) -> String {
             i += ch.len_utf8();
             continue;
         }
-        out.push_str(&redact_text(&text[run_start..i], r));
+        out.push_str(&redact_run(&text[run_start..i]));
         let (consumed, kept) = classify_escape(&text[i..], r);
         out.push_str(&kept);
         i += consumed;
         run_start = i;
     }
-    out.push_str(&redact_text(&text[run_start..], r));
+    out.push_str(&redact_run(&text[run_start..]));
     out
+}
+
+/// What a console panel withholds from a remote viewer beyond [`Redaction`]:
+/// the addresses, paths, endpoint URLs and credential pointers this machine is
+/// configured with, wherever a verb prints them. Read when the request is
+/// served, from the same places the verbs read: `config.json` (every value
+/// `panel_audience::config_scrub_values` names), the settings as they resolve
+/// (`env > config.json > default`, so an environment override is covered),
+/// the profile registry's endpoints, and the temp directory. Nothing is listed
+/// by hand. A path under the home or `DARKMUX_HOME` directory is left to
+/// [`Redaction`], which already reads it as `~` or `$DARKMUX_HOME`.
+///
+/// The verbs that shape their own remote form (`doctor`, `flow status`) use
+/// the same set before they wrap their output.
+pub fn panel_withheld() -> Withheld {
+    use darkmux_types::config_access as ca;
+    use darkmux_types::panel_audience::config_scrub_values;
+    let read_json = |p: &std::path::Path| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+    };
+    let config_path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+    let from_config = read_json(&config_path).map(|c| config_scrub_values(&c)).unwrap_or_default();
+
+    let path_str = |p: std::path::PathBuf| p.to_string_lossy().to_string();
+    let mut locations: Vec<String> = vec![
+        ca::lms_bin(),
+        ca::lmstudio_url(),
+        ca::serve_bind(),
+        path_str(ca::flows_dir()),
+        path_str(ca::hooks_outbox_dir()),
+        path_str(ca::lab_dir()),
+        path_str(ca::fleet_file()),
+    ];
+    locations.extend(ca::audit_dir_override().map(path_str));
+    locations.extend(ca::redis_host());
+    locations.extend(ca::fleet_identity_bin());
+    locations.extend(ca::daemon_cors_origins());
+    for d in [std::env::temp_dir(), std::env::temp_dir().canonicalize().unwrap_or_default()] {
+        locations.push(path_str(d));
+    }
+
+    // The profile registry's endpoints: where each lives and where its key is.
+    let mut credentials: Vec<String> = Vec::new();
+    if let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) {
+        locations.push(path_str(reg_path.clone()));
+        let endpoints = read_json(&reg_path).and_then(|r| r.get("endpoints").and_then(|e| e.as_object()).cloned());
+        for ep in endpoints.iter().flat_map(|m| m.values()) {
+            locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
+            for key in ["keychain", "key_env"] {
+                credentials.extend(ep.pointer(&format!("/auth/{key}")).and_then(|v| v.as_str()).map(str::to_string));
+            }
+        }
+    }
+
+    let homes: Vec<String> = ["HOME", "DARKMUX_HOME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|h| h.trim_end_matches('/').to_string())
+        .filter(|h| h.len() > 1)
+        .collect();
+    let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
+    let outside = |vs: Vec<String>| vs.into_iter().filter(|v| !under_a_home(v)).collect::<Vec<_>>();
+    Withheld::from_values(outside(from_config))
+        .merged(Withheld::from_locations(outside(locations)))
+        .merged(Withheld::from_values(credentials))
 }
 
 #[cfg(test)]

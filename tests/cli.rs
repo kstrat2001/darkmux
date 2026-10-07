@@ -14065,4 +14065,282 @@ fn init_lists_a_skill_that_is_not_darkmux_s_as_skipped_and_leaves_it_alone() {
 
     assert!(out.contains("  skipped (1): my-skill\n"), "{out}");
     assert_eq!(fs::read_to_string(&installed).unwrap(), "the operator's\n");
+// ── (5.0) what a console panel shows a viewer that is not this machine ──
+
+/// Every fact in the console fixture that a viewer who is not this machine
+/// must not read through a console panel: addresses, a tailnet name, paths, an
+/// endpoint URL, credential pointers, and the fleet's execution surface (the
+/// listener's port, an allow-list entry's node id, images and repos). All
+/// fake. A test build of darkmux reads settings from the environment, never
+/// from `config.json` (#811), so the settings a verb resolves come in through
+/// [`console_env`], and `config.json` carries what readers of the raw file
+/// show (`config list`, the allow-list).
+const CONSOLE_SECRETS: &[&str] = &[
+    "100.64.77.9",
+    "tailnet-example",
+    "100.64.88.3",
+    "srv-fakeflows",
+    "/srv/fakeoutbox",
+    "/opt/fake",
+    "hooks.example.com",
+    "my-hook-signing",
+    "nFAKENODE",
+    "fake-image",
+    "private-repo",
+    "Tailscale.app",
+    "myres-secret",
+    "azure-key-item",
+    "8766",
+];
+
+/// Write a config, a roster and a profile registry that name the fixture's
+/// secrets.
+fn write_console_fixture(darkmux_home: &std::path::Path) {
+    fs::write(
+        darkmux_home.join("config.json"),
+        r#"{
+  "schema_version": "2.0",
+  "machine_id": "studio",
+  "lms_bin": "/opt/fake/bin/lms",
+  "dirs": { "flows": "/srv/fakeflows" },
+  "redis": { "enabled": false, "host": "100.64.77.9", "port": 6379 },
+  "runtime": { "daemon_cors_origins": "https://studio.tailnet-example.ts.net" },
+  "fleet": {
+    "mode": "standalone",
+    "identity": { "provider": "tailscale", "bin": "/Applications/Tailscale.app/Contents/MacOS/Tailscale" },
+    "listener": { "enabled": true, "port": 8766 },
+    "busy_policy": "queue",
+    "accept_work": { "laptop": { "node_id": "nFAKENODE123", "profiles": ["fast"], "roles": ["coder"], "images": ["fake-image:latest"], "workspace": true, "repos": ["git@github.com:someone/private-repo.git"] } }
+  },
+  "hooks": { "enabled": true, "outbox_dir": "/srv/fakeoutbox", "rules": [ { "match": { "action": "run.complete" }, "http": "https://hooks.example.com/secret-path/abc123", "signing_secret_keychain_item": "my-hook-signing" } ] }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        darkmux_home.join("fleet.json"),
+        r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"laptop.tailnet-example.ts.net","added_unix_ms":1},"peer2":{"id":"peer2","address":"100.64.88.3","added_unix_ms":2}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        darkmux_home.join("profiles.json"),
+        r#"{"profiles":{"fast":{"description":"fast","models":[{"id":"qwen-fake","n_ctx":32768}]}},"endpoints":{"azure":{"url":"https://myres-secret.openai.azure.com/v1","auth":{"type":"api-key","keychain":"azure-key-item"}}}}"#,
+    )
+    .unwrap();
+}
+
+/// The value of `key` a built spawn sets.
+fn spawn_env(cmd: &std::process::Command, key: &str) -> std::path::PathBuf {
+    cmd.get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+        .and_then(|(_, v)| v.map(std::path::PathBuf::from))
+        .unwrap_or_else(|| panic!("{key} is set on the spawn"))
+}
+
+/// Point `cmd` at the console fixture: its files, the settings it resolves
+/// from the environment, and a fake `tailscale` first on PATH that answers
+/// nothing, so no verb asks the host's real tailnet who it is (a test build
+/// cannot point `fleet.identity.bin` anywhere, and the default lookup would
+/// otherwise find the real tool).
+fn console_env(cmd: &mut std::process::Command) {
+    let (home, darkmux_home) = (spawn_env(cmd, "HOME"), spawn_env(cmd, "DARKMUX_HOME"));
+    write_console_fixture(&darkmux_home);
+    let flows = home.parent().unwrap().join("srv-fakeflows");
+    fs::create_dir_all(&flows).unwrap();
+    // Residue in the child's temp directory, so doctor's `temp residue` row
+    // prints that directory's path.
+    fs::create_dir_all(spawn_env(cmd, "TMPDIR").join("darkmux-out-coder-1")).unwrap();
+    let fake_bin = home.parent().unwrap().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let tool = fake_bin.join("tailscale");
+    fs::write(&tool, "#!/bin/sh\necho 'fake tailscale: not running' >&2\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // (#2976) The first exec of a fresh executable can take seconds on macOS.
+    let _ = std::process::Command::new(&tool).arg("warm-up").status();
+    let path = format!("{}:{}", fake_bin.display(), spawn_env(cmd, "PATH").display());
+    cmd.env("PATH", path)
+        .env("DARKMUX_LMS_BIN", "/opt/fake/bin/lms")
+        .env("DARKMUX_FLOWS_DIR", &flows)
+        .env("DARKMUX_DAEMON_CORS_ORIGINS", "https://studio.tailnet-example.ts.net")
+        .env("DARKMUX_MACHINE_ID", "studio");
+}
+
+/// Escape sequences out: a check for a fact must not be split by a color.
+fn strip_escapes(text: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+/// A console-panel run of `args` over the fixture: what a viewer on this
+/// machine sees (`remote = false`) or one elsewhere (`true`). `extra` adds
+/// environment settings.
+fn console_run(args: &[&str], remote: bool, extra: &[(&str, &str)]) -> String {
+    let mut cmd = darkmux_std_cmd();
+    console_env(&mut cmd);
+    cmd.env("DARKMUX_PANEL", args.join("-")).env("COLUMNS", "120").args(args);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    if remote {
+        cmd.env("DARKMUX_PANEL_AUDIENCE", "remote");
+    }
+    let out = cmd.output().unwrap();
+    strip_escapes(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn assert_no_console_secret(what: &str, text: &str) {
+    for s in CONSOLE_SECRETS {
+        assert!(!text.contains(s), "{what} shows `{s}` to a remote viewer:\n{text}");
+    }
+}
+
+/// `config list` for a remote viewer: every value that names an address, a
+/// path, a URL or a credential pointer, and the fleet listener and allow-list
+/// entries, read "(shown on this machine only)"; the keys and the plain
+/// settings stay. This machine reads the file as it is.
+#[test]
+fn config_list_withholds_addresses_paths_and_the_execution_surface_from_a_remote_viewer() {
+    let remote = console_run(&["config", "list"], true, &[]);
+    assert_no_console_secret("config list", &remote);
+    assert!(!remote.contains("/srv/fakeflows"), "{remote}");
+    assert!(remote.contains("\"busy_policy\": \"(shown on this machine only)\""), "{remote}");
+    assert!(remote.contains("\"laptop\": \"(shown on this machine only)\""), "the allow-list keeps its machine names only: {remote}");
+    assert!(remote.contains("\"machine_id\": \"studio\""), "a plain setting stays: {remote}");
+    assert!(remote.contains("\"enabled\": true"), "{remote}");
+    let local = console_run(&["config", "list"], false, &[]);
+    for s in ["100.64.77.9", "tailnet-example", "/srv/fakeflows", "/srv/fakeoutbox", "/opt/fake", "hooks.example.com", "my-hook-signing", "nFAKENODE", "fake-image", "private-repo", "Tailscale.app", "8766", "\"queue\""] {
+        assert!(local.contains(s), "this machine reads `{s}` in config list:\n{local}");
+    }
+}
+
+/// `doctor` for a remote viewer runs every check and keeps every row and
+/// remedy, while the fleet listener, identity and allow-list rows withhold
+/// their detail and no row names a configured address, path, URL or
+/// credential pointer.
+#[test]
+fn doctor_keeps_its_rows_and_withholds_the_execution_surface_from_a_remote_viewer() {
+    let listener = [("DARKMUX_FLEET_LISTENER_ENABLED", "true"), ("DARKMUX_FLEET_LISTENER_PORT", "8766"), ("DARKMUX_FLEET_BUSY_POLICY", "queue")];
+    // `-v` prints every row, passing ones included, so each row's remote form
+    // is on screen (the panel runs plain `doctor`, which prints a subset).
+    let remote = console_run(&["doctor", "-v"], true, &listener);
+    assert_no_console_secret("doctor", &remote);
+    // The temp directory (outside HOME here, as `/var/folders/...` is on
+    // macOS) is withheld; the residue row itself stays.
+    let names_tmpdir = |t: &str| t.match_indices("spawn-").any(|(i, _)| t[i + "spawn-0000".len()..].starts_with("/tmp"));
+    assert!(remote.contains("temp residue") && !names_tmpdir(&remote), "{remote}");
+    for row in ["fleet listener", "fleet trust", "fleet identity"] {
+        let is_row = |l: &&str| {
+            let t = l.trim_start();
+            ["✓", "⚠", "✗"].iter().any(|m| t.strip_prefix(m).is_some_and(|r| r.trim_start().starts_with(&format!("{row} "))))
+        };
+        let line = remote.lines().find(is_row).unwrap_or_else(|| panic!("the `{row}` row stays: {remote}"));
+        assert!(line.contains("(shown on this machine only)"), "{row} withholds its detail: {line}");
+    }
+    assert!(remote.contains("lms binary"), "{remote}");
+    assert!(remote.contains("→"), "remedies stay: {remote}");
+    let local = console_run(&["doctor", "-v"], false, &listener);
+    for s in ["8766", "fake-image", "/opt/fake"] {
+        assert!(local.contains(s), "this machine reads `{s}` in doctor:\n{local}");
+    }
+    assert!(names_tmpdir(&local), "this machine reads its temp directory:\n{local}");
+}
+
+/// `flow status` for a remote viewer: its directories are withheld; the
+/// health lines stay.
+#[test]
+fn flow_status_withholds_its_directories_from_a_remote_viewer() {
+    let remote = console_run(&["flow", "status"], true, &[]);
+    assert_no_console_secret("flow status", &remote);
+    assert!(remote.contains("flows_dir:    (shown on this machine only)"), "{remote}");
+    assert!(remote.contains("outbox_dir:   (shown on this machine only)"), "{remote}");
+    assert!(remote.contains("day_files:"), "{remote}");
+    let local = console_run(&["flow", "status"], false, &[]);
+    assert!(local.contains("srv-fakeflows"), "this machine reads its flows dir:\n{local}");
+}
+
+/// Through the real daemon and the real verbs: EVERY registered console panel
+/// (the list is the generated panel table, so a new panel is in it) answers a
+/// viewer that is not this machine with 200, never a refusal for being remote,
+/// and none of its output names a fixture secret, a tailnet name or a home
+/// path. Where something was withheld the response says so, calmly, in
+/// `withheld`, and the diagnostics on stderr are never shown.
+#[test]
+fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut cmd = darkmux_std_cmd();
+    console_env(&mut cmd);
+    let home = spawn_env(&cmd, "HOME");
+    cmd.env("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0")
+        .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
+    wait_for_serve_health(port, FLEET_TEST_HANG_BOUND);
+
+    let get = |id: &str, remote: bool| -> (u16, serde_json::Value) {
+        let mut req = ureq::get(&format!("http://127.0.0.1:{port}/panel/{id}?cols=120"))
+            .timeout(std::time::Duration::from_secs(60))
+            .set("x-darkmux-panel", "1");
+        if remote {
+            // A request proxied to loopback is not this machine.
+            req = req.set("X-Forwarded-For", "100.64.0.7");
+        }
+        let (code, body) = match req.call() {
+            Ok(r) => (r.status(), r.into_string().unwrap()),
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap()),
+            Err(e) => panic!("panel {id}: {e}"),
+        };
+        (code, serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)))
+    };
+
+    let table: Vec<serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src/lenses/console/panel-table.generated.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let ids: Vec<String> = table.iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+    assert!(ids.len() >= 10 && ids.iter().any(|i| i == "doctor"), "{ids:?}");
+    let scratch = home.parent().unwrap().to_string_lossy().to_string();
+    for id in &ids {
+        let (code, body) = get(id, true);
+        assert_eq!(code, 200, "panel {id} refused a remote viewer: {body}");
+        let shown = strip_escapes(&format!(
+            "{}\n{}\n{}",
+            body["ansi_text"].as_str().unwrap(),
+            body["stderr_tail"].as_str().unwrap(),
+            body["withheld"].as_str().unwrap_or_default()
+        ));
+        assert_no_console_secret(id, &shown);
+        assert!(!shown.contains(".ts.net") && !shown.contains("/Users/") && !shown.contains(&scratch), "panel {id}: {shown}");
+        assert_eq!(body["stderr_tail"], "", "panel {id}: a remote viewer never reads stderr");
+    }
+    // A panel that withheld something says so, calmly, naming the command.
+    let (_, config) = get("config-list", true);
+    let notice = config["withheld"].as_str().unwrap_or_default();
+    assert!(notice.contains("shown on this machine only") && notice.contains("darkmux config list") && notice.contains("studio"), "{config}");
+    // This machine still reads everything.
+    let (code, local) = get("config-list", false);
+    assert_eq!(code, 200);
+    let text = local["ansi_text"].as_str().unwrap();
+    for s in ["100.64.77.9", "8766", "nFAKENODE", "/srv/fakeoutbox"] {
+        assert!(text.contains(s), "this machine reads `{s}`: {text}");
+    }
+    assert_eq!(local["withheld"].as_str().unwrap_or_default(), "", "nothing is withheld from this machine");
 }

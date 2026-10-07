@@ -1068,9 +1068,9 @@ pub(crate) async fn cached_view(state: &crate::AppState) -> Result<FleetView, (a
 }
 
 /// `GET /fleet/view`. Every card's seats go to a reader on this machine or one
-/// holding the fleet token: the audience of the doctor panel and of every
-/// other read of the execution surface
-/// ([`crate::caller_is_local_or_holds_token`]). What peers let THIS machine
+/// holding the fleet token: the audience that reads the execution surface in
+/// full ([`crate::caller_is_local_or_holds_token`]; any other reader gets the
+/// console panels redacted). What peers let THIS machine
 /// do goes to a reader on this machine alone ([`crate::is_local_request`]).
 pub(crate) async fn fleet_view_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,

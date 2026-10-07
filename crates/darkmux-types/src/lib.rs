@@ -23,6 +23,7 @@ pub mod flock;
 #[cfg(unix)]
 pub mod interrupt;
 pub mod param_scalar;
+pub mod panel_audience;
 pub mod paths;
 pub mod profile_address;
 pub mod residency_lease;

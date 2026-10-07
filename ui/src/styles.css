@@ -3188,6 +3188,23 @@ body {
   color: var(--dim);
   white-space: pre-wrap;
 }
+/* (5.0) The one notice a viewer that is not this machine reads where a panel
+   withheld something ("shown on this machine only: run `darkmux doctor` on
+   studio itself, or over ssh, for the full output"). Calm by design: the same
+   neutral `--dim` as `.panelwarn`, never `--error`, set apart from the output
+   above by a hairline rule and an italic voice so it reads as the console
+   speaking about the output, not as part of it. */
+.panelnote {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  font: italic calc(12px * var(--fs-scale))/1.5 var(--font-mono);
+  color: var(--dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.panelnote.pc-body-stale {
+  opacity: 0.55;
+}
 /* ANSI SGR -> palette. Only what darkmux's own output emits is mapped with
    intent; the rest fall back to sane terminal-ish values — same scope as
    `ANSI_SGR_CLASS` in `lib/ansi.ts`. */

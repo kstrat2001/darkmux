@@ -12,6 +12,7 @@ function body(overrides: Partial<PanelResponse> = {}): PanelResponse {
     exit_code: 0,
     ansi_text: "",
     stderr_tail: "",
+    withheld: "",
     cols: 100,
     cache_ttl_ms: 3000,
     age_ms: 0,

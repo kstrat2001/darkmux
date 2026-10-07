@@ -7482,6 +7482,27 @@ fn upgrade_skill_pointer(r: &DoctorReport) -> Option<String> {
     })
 }
 
+/// (5.0) The report as a viewer that is not this machine reads it in the
+/// console's doctor panel. Every check has already run; this shapes only what
+/// is printed, before the renderer wraps and colors it (so no withheld value
+/// can be split across a line). Each row keeps its name, its status and its
+/// remedy. The rows whose detail is the fleet's execution surface
+/// ([`fleet_submission::EXECUTION_SURFACE_ROWS`]) withhold that detail whole;
+/// every other row, and every remedy, loses each value in `w` (this machine's
+/// configured addresses, paths, endpoint URLs and credential pointers). A
+/// withheld part reads `panel_audience::WITHHELD`.
+pub fn shape_for_remote(r: &mut DoctorReport, w: &darkmux_types::panel_audience::Withheld) {
+    use darkmux_types::panel_audience::WITHHELD;
+    for c in &mut r.checks {
+        c.message = if fleet_submission::EXECUTION_SURFACE_ROWS.contains(&c.name.as_str()) {
+            WITHHELD.to_string()
+        } else {
+            w.scrub(&c.message)
+        };
+        c.hint = c.hint.as_deref().map(|h| w.scrub(h));
+    }
+}
+
 /// Render the doctor report.
 ///
 /// (#1130) Default (`verbose=false`) is **issues-only**: the build identity
@@ -7579,6 +7600,45 @@ mod tests {
             }
         }
         out
+    }
+
+    // ─── (5.0) the doctor panel for a viewer that is not this machine ──
+
+    /// Every check ran and every row stays, with its name, its status and its
+    /// remedy. The execution-surface rows' detail (the listener's address,
+    /// port and busy policy; this machine's node; what each trusted machine
+    /// may run here) is withheld whole; every other row and remedy loses the
+    /// configured values only.
+    #[test]
+    fn a_remote_viewer_keeps_every_row_and_remedy_and_loses_the_execution_surface() {
+        use darkmux_types::panel_audience::{Withheld, WITHHELD};
+        let row = |name: &str, status, message: &str, hint: Option<&str>| Check {
+            name: name.into(),
+            status,
+            message: message.into(),
+            hint: hint.map(str::to_string),
+        };
+        let full = DoctorReport {
+            checks: vec![
+                row("fleet listener", Status::Pass, "listening on 100.64.0.2:8766; fleet.busy_policy `queue`", None),
+                row("fleet identity", Status::Pass, "tailscale: this machine is `studio` at 100.64.0.2", None),
+                row("fleet trust", Status::Warn, "laptop may run fast (roles: coder; images: img:1)", Some("`darkmux machine untrust laptop`")),
+                row("lms binary", Status::Fail, "`/opt/fake/bin/lms` not found", Some("set `lms_bin` (now /opt/fake/bin/lms)")),
+                row("models loaded", Status::Pass, "2 resident", None),
+            ],
+        };
+        let mut shown = full.clone();
+        shape_for_remote(&mut shown, &Withheld::from_values(["/opt/fake/bin/lms".to_string()]));
+        let by_name = |name: &str| shown.checks.iter().find(|c| c.name == name).unwrap();
+        for name in fleet_submission::EXECUTION_SURFACE_ROWS {
+            assert_eq!(by_name(name).message, WITHHELD, "{name}");
+        }
+        assert_eq!(by_name("fleet trust").hint.as_deref(), Some("`darkmux machine untrust laptop`"), "the remedy stays");
+        assert_eq!(by_name("lms binary").message, format!("`{WITHHELD}` not found"));
+        assert_eq!(by_name("lms binary").hint.as_deref(), Some(format!("set `lms_bin` (now {WITHHELD})").as_str()));
+        assert_eq!(by_name("models loaded").message, "2 resident");
+        let summary = |r: &DoctorReport| r.checks.iter().map(|c| (c.name.clone(), c.status)).collect::<Vec<_>>();
+        assert_eq!(summary(&shown), summary(&full), "every row and status stays");
     }
 
     // ─── (#2707) temp residue ─────────────────────────────────────────

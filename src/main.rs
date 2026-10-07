@@ -662,7 +662,14 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
         Vec::new()
     };
     report.checks.extend(probe_checks);
-    doctor::print_report(&report, verbose)?;
+    // (5.0) Rendering into the console for a viewer that is not this machine:
+    // every check above ran; only what is printed is shaped (the exit code
+    // below still reads the full report).
+    let mut shown = report.clone();
+    if darkmux_types::panel_audience::remote() {
+        doctor::shape_for_remote(&mut shown, &darkmux_serve::panel_withheld());
+    }
+    doctor::print_report(&shown, verbose)?;
 
     Ok(match report.worst_status() {
         doctor::Status::Fail => 1,

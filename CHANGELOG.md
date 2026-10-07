@@ -422,19 +422,32 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   - A 429, a 504 or a network error keeps the last good output on screen and
     says so in the header's meta slot (`failed: slow · 00:40:57`, the full message
     in its tooltip), instead of replacing the output with the error.
-  - `flow-status` joins `doctor` and `config-list` as served only to this machine
-    or a token holder: it prints the flow directories, hook target URLs and the
-    Redis URL. `mission status` rendered in the console links root-relative.
-  - One output filter on every panel for a caller that is neither this machine
-    nor a token holder: `stderr_tail` is replaced by "diagnostics are shown on
-    this machine only", every roster address (and its host part) in stdout reads
-    "(address hidden)", and the daemon user's home prefix reads `~` (a
-    `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`). Matches are whole tokens
-    only (`mac` is not hidden inside `macos`; punctuation and color codes are
-    boundaries; an OSC 8 link to a hidden target loses the target, not its label; only SGR and OSC 8 escapes are sent, and `HOME` and `DARKMUX_HOME` are matched in their symlink-resolved form too), and a machine id or name is never
-    hidden: only the address behind it. The sets come from the roster and the
-    environment at request time.
-    This machine and token holders see the output unchanged.
+  - No console panel is refused for being remote. A caller that is neither
+    this machine nor a token holder is served every panel redacted: the verb
+    renders its remote form (`doctor` runs every check and keeps every row,
+    status and remedy, but withholds the fleet listener's address, port and
+    busy policy, this machine's network node and the allow-list's entries;
+    `config-list` withholds every value that names an address, a path, a URL
+    or a credential pointer, the listener's port, the busy policy and each
+    allow-list entry beyond its machine name; `flow-status` withholds its
+    directories, the Redis URL and each hook's target), and the daemon then
+    filters the text of every panel: `stderr_tail` is withheld, every roster
+    address (and its host part) reads "(address hidden)", the daemon user's
+    home prefix reads `~` (a `DARKMUX_HOME` outside it reads
+    `$DARKMUX_HOME`), and every address, path, endpoint URL and credential
+    pointer this machine's config, profile registry and environment name reads
+    "(shown on this machine only)". Matches are whole tokens only (`mac` is not
+    hidden inside `macos`; punctuation and color codes are boundaries; an OSC 8
+    link to a hidden target loses the target, not its label; only SGR and OSC 8
+    escapes are sent, and `HOME` and `DARKMUX_HOME` are matched in their
+    symlink-resolved form too), and a machine id or name is never hidden: only
+    the address behind it. The sets come from the roster, the config and the
+    environment at request time. Where anything was withheld, the response's
+    new `withheld` field carries one plain notice ("shown on this machine only:
+    run `darkmux doctor` on studio itself, or over ssh, for the full output"),
+    which the console shows calmly below the output, never as an error. This
+    machine and token holders see the output unchanged. Fleet work submission
+    is untouched: it still needs the token and a network-verified sender.
   - A console link that carried something unusable (an unknown panel, option or
     value, a machine with `remote`, a repeated key) says what was not used in the
     header (`2 unused`, the list in its tooltip). A repeated query key on `GET /panel/:id` is a 400 naming the key.

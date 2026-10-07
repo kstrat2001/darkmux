@@ -444,6 +444,7 @@ function CliPanelView({
         ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
         exitCode={loadedBody ? loadedBody.exit_code : null}
         stderrTail={loadedBody ? loadedBody.stderr_tail || "" : ""}
+        withheld={loadedBody ? loadedBody.withheld || "" : ""}
         onPanelSwitch={onPanelSwitch}
       />
     </div>
@@ -961,6 +962,15 @@ function PanelBody(props: ComponentProps<typeof PanelBodyBase> & { keptOutput: b
  * wording from "not run yet" (never fetched) so the two stay
  * distinguishable.
  *
+ * (5.0) A viewer that is not this machine is served every panel redacted,
+ * and `withheld` (empty otherwise) carries the daemon's one notice saying
+ * what to run on that machine for the full output. It renders LAST, in its
+ * own `.panelnote` — neutral, never `.panelerr` and never the failure
+ * state, whatever the exit code: withholding is the expected shape of a
+ * remote read, not a fault. That viewer's stderr is always withheld, so on a
+ * failed exit with a notice the failure line names the exit status only and
+ * makes no claim that nothing was written to stderr.
+ *
  * (#1911, opts-as-command-tokens redesign) `loading` is now
  * `query.isFetching && !stale` (`CliPanelView`'s own computation) — a
  * placeholder-serving refetch (a token flip, mid-flight) no longer blanks
@@ -977,6 +987,7 @@ function PanelBodyBase({
   ansiText,
   exitCode,
   stderrTail,
+  withheld = "",
   onPanelSwitch,
 }: {
   loading: boolean;
@@ -985,6 +996,7 @@ function PanelBodyBase({
   ansiText: string | null;
   exitCode: number | null;
   stderrTail: string;
+  withheld?: string;
   onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
 }) {
   const staleClass = stale ? " pc-body-stale" : "";
@@ -994,7 +1006,8 @@ function PanelBodyBase({
     const failed = typeof exitCode !== "number" || exitCode !== 0;
     const hasStdout = ansiText !== "";
     const hasStderr = stderrTail !== "";
-    const isEmptyCleanOutput = !failed && !hasStdout && !hasStderr;
+    const hasNotice = withheld !== "";
+    const isEmptyCleanOutput = !failed && !hasStdout && !hasStderr && !hasNotice;
 
     if (isEmptyCleanOutput) return <div className={`panelout${staleClass}`}>no output</div>;
 
@@ -1009,11 +1022,16 @@ function PanelBodyBase({
           <div className={`${failed ? "panelerr" : "panelwarn"}${staleClass}`}>
             {hasStderr
               ? stderrTail
-              : typeof exitCode === "number"
-                ? `command exited with status ${exitCode} and printed nothing to stderr`
-                : "command did not exit cleanly (killed) and printed nothing to stderr"}
+              : hasNotice
+                ? typeof exitCode === "number"
+                  ? `command exited with status ${exitCode}`
+                  : "command did not exit cleanly (killed)"
+                : typeof exitCode === "number"
+                  ? `command exited with status ${exitCode} and printed nothing to stderr`
+                  : "command did not exit cleanly (killed) and printed nothing to stderr"}
           </div>
         )}
+        {hasNotice && <div className={`panelnote${staleClass}`}>{withheld}</div>}
       </>
     );
   }

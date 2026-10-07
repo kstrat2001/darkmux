@@ -15,9 +15,16 @@ opts: { [key in string]?: string }, captured_ts_ms: number,
  */
 gather_ms: number, exit_code: number | null, ansi_text: string, 
 /**
- * Non-empty only when something went to stderr.
+ * Non-empty only when something went to stderr, and never for a caller
+ * that is not this machine (its stderr is withheld).
  */
-stderr_tail: string, cols: number, cache_ttl_ms: number, 
+stderr_tail: string, 
+/**
+ * Empty unless the caller is not this machine and something was withheld
+ * from what it is shown: then the one plain notice naming the command to
+ * run on this machine for the full output. Not an error.
+ */
+withheld: string, cols: number, cache_ttl_ms: number, 
 /**
  * How old a cached copy is; `0` for a fresh run.
  */

@@ -201,7 +201,6 @@ interface TableRow {
   id: string;
   argv: string[];
   auto_refresh: boolean;
-  audience: "read" | "local_or_token";
   opts: TableOpt[];
   roster_opt: { name: string; flag: string | null; argv_before_id: string[] } | null;
 }

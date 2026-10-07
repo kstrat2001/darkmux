@@ -74,19 +74,41 @@
 //!
 //! ## What a remote caller is shown
 //!
-//! A panel's output can name this machine's paths and its roster peers'
-//! addresses (a resolver error, a registry path, an environment warning). So
-//! every response to a caller that is neither this machine nor a token holder
-//! passes ONE filter, [`redact_for_remote`], whatever the panel: `stderr_tail`
-//! is replaced by a short note, every roster address (and its host part) in
-//! stdout reads "(address hidden)", and the daemon user's home prefix reads
-//! `~` (a `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`). Matches are whole
-//! tokens only (stdout is split into escape sequences and text runs first, each
-//! run is redacted on its own, and an OSC 8 link to a hidden target loses its
-//! target), and a machine id or name is never hidden, only the address
-//! behind it. The address set is read from the roster and the directories from
-//! the environment when the request is served; nothing is listed by hand. Local
-//! callers and token holders see the output unchanged.
+//! Every panel is served to every caller the read posture admits; none is
+//! refused for being remote (5.0, operator decision 2026-10-07: a console is a
+//! command line, its output names this machine's own facts, and the full
+//! output is for this machine, or for whoever runs the CLI there over ssh). A
+//! caller that is neither this machine nor a token holder is served the
+//! panel REDACTED, in two layers (see `darkmux_types::panel_audience`):
+//!
+//! - **The verb renders its remote form.** The child is spawned with
+//!   `DARKMUX_PANEL_AUDIENCE=remote`, and a verb whose output carries the
+//!   execution surface shapes its own data before printing it: `config list`
+//!   withholds every value that names an address, a path, a URL, a credential
+//!   pointer or the fleet listener and allow-list; `doctor` still runs every
+//!   check and keeps every row and remedy, but its fleet listener, identity
+//!   and allow-list rows' detail is withheld; `flow status` withholds its
+//!   directories, the Redis URL and each hook's target. The remote form is
+//!   cached apart from this machine's (see [`audience_key`]).
+//! - **The daemon redacts the text, whatever the panel** ([`redact_for_remote`]):
+//!   `stderr_tail` is withheld (it carries the daemon's environment warnings
+//!   and resolver errors), every roster address (and its host part) reads
+//!   "(address hidden)", the daemon user's home prefix reads `~` (a
+//!   `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`), and every value in
+//!   [`crate::panel_withheld`] (the addresses, paths, endpoint URLs and
+//!   credential pointers this machine's config, profile registry and
+//!   environment name) reads "(shown on this machine only)". Matches are whole
+//!   tokens only (stdout is split into escape sequences and text runs first,
+//!   each run is redacted on its own, and an OSC 8 link to a hidden target
+//!   loses its target), and a machine id or name is never hidden, only the
+//!   address behind it.
+//!
+//! Where anything was withheld, the response's `withheld` field carries ONE
+//! plain notice naming the command and this machine
+//! (`darkmux_types::panel_audience::notice`); the viewer shows it calmly, never
+//! as an error. Local callers and token holders see the output unchanged and
+//! `withheld` empty. Fleet work submission is untouched by any of this: it
+//! still needs the token plus a network-verified sender.
 //!
 //! ## Response shape
 //!
@@ -142,7 +164,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::redaction::{redact_stdout, Redaction};
+use crate::redaction::{redact_panel_stdout, Redaction};
+use darkmux_types::panel_audience::{self, Withheld};
 use crate::wire::PanelResponse;
 use crate::{current_millis, AppState};
 
@@ -200,8 +223,7 @@ const PANEL_STDOUT_CAP_BYTES: usize = 512 * 1024;
 /// Bearer auth does not cover this: a request from this machine
 /// (`is_local_request`) is exempt by design, and with read auth off every
 /// tailnet peer behind the documented `tailscale serve` phone dashboard
-/// reads the `Read` panels freely too (the `LocalOrToken` ones, see
-/// [`PanelAudience`], still need this machine or the token).
+/// reads every panel too (redacted, see the module doc).
 pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";
 
 /// Server-enforced floor between runs of a MANUAL-ONLY panel (TTL 0).
@@ -299,51 +321,6 @@ const RUN_LIST_USAGE_OPT: PanelOpt = PanelOpt {
 const MISSION_STATUS_OPTS: &[PanelOpt] = &[ALL_OPT];
 const RUN_LIST_OPTS: &[PanelOpt] = &[RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT];
 
-/// Who may run a panel. Every panel's output is a read of this machine, so
-/// `Read` panels follow the daemon's read posture (`serve.read_auth`). A
-/// `Read` panel's output still passes [`redact_for_remote`] for a caller that
-/// is not this machine or a token holder: its `stderr_tail` is withheld, its
-/// roster addresses read "(address hidden)" and the daemon user's home reads
-/// `~`; the panels below that need more than that are `LocalOrToken`. A
-/// panel whose output DESCRIBES THE EXECUTION SURFACE (the fleet listener's
-/// overlay address, port, busy policy, and the allow-list's node names and
-/// roles) or NAMES THIS MACHINE'S OWN NETWORK AND PATHS (the flow sinks'
-/// directories, hook target URLs, the Redis URL, a tailnet hostname) is a
-/// map for the caller with the token, so `/health` withholds the same facts
-/// from a non-local caller; those panels hold the same line even with read
-/// auth off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PanelAudience {
-    /// Served under the read posture: open with read auth off, local or
-    /// token with it on.
-    Read,
-    /// Served only to a local request ([`crate::is_local_request`]) or a
-    /// caller presenting the serve token, whatever the read posture.
-    LocalOrToken,
-}
-
-/// Refuse a panel to a caller its [`PanelAudience`] does not admit: a
-/// `LocalOrToken` panel needs a local request or the serve token, whatever
-/// the read posture. A `Read` panel is already covered by the read gate.
-fn admit_audience(
-    spec: &PanelSpec,
-    peer: Option<std::net::SocketAddr>,
-    headers: &axum::http::HeaderMap,
-) -> Result<(), (StatusCode, String)> {
-    match spec.audience {
-        PanelAudience::Read => Ok(()),
-        PanelAudience::LocalOrToken if crate::caller_is_local_or_holds_token(peer, headers) => Ok(()),
-        PanelAudience::LocalOrToken => Err((
-            StatusCode::UNAUTHORIZED,
-            format!(
-                "panel \"{}\" describes this machine's own paths, endpoints or fleet execution surface; it is \
-                 served to this machine or a caller presenting the serve token (Authorization: Bearer <token>)\n",
-                spec.id
-            ),
-        )),
-    }
-}
-
 /// One allowlist entry: the argv after the binary, whether the viewer may
 /// auto-refresh it, the cache TTL applied, and the closed option space (if
 /// any) it declares.
@@ -372,9 +349,6 @@ pub(crate) struct PanelSpec {
     /// (every other entry is a local-disk read) — see the module doc's
     /// "every panel until now reads local disk only".
     pub(crate) needs_fleet_snapshot: bool,
-    /// Who may run it — see [`PanelAudience`]. One classification per panel,
-    /// stated in [`panel_spec`]'s table.
-    pub(crate) audience: PanelAudience,
     /// The name of this panel's roster-valued opt, if it declares one: its
     /// value is a roster machine name, validated by [`resolve_roster_opt`]
     /// against the roster and reaching argv as [`RosterOpt::flag`]. See the
@@ -442,56 +416,58 @@ pub(crate) const PANEL_IDS: &[&str] = &[
 /// and OPAQUE to the client; the mapping to argv (and opts) lives here and
 /// only here.
 pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
-    use PanelAudience::{LocalOrToken, Read};
-    let (id, argv, auto_refresh, ttl, opts, audience): (
+    let (id, argv, auto_refresh, ttl, opts): (
         &'static str,
         &'static [&'static str],
         bool,
         Duration,
         &'static [PanelOpt],
-        PanelAudience,
     ) = match id {
-        // Read: mission and run state, the same facts `/runs` serves.
-        "mission-status" => {
-            ("mission-status", &["mission", "status"], true, FLEET_PANEL_CACHE_TTL, MISSION_STATUS_OPTS, Read)
-        }
-        // Read: the role manifests the crew loads; no machine or fleet state.
-        "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[], Read),
-        // Read: resident models and their ownership, the same facts
-        // `/machine/status` serves; no fleet listener or allow-list state.
-        "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[], Read),
-        // Read: the fleet view's rows, the same facts `GET /fleet/view` serves
+        // Every panel follows the read posture and is redacted for a caller
+        // that is not this machine (see the module doc, "What a remote caller
+        // is shown"). The notes say what each prints that a remote form
+        // withholds.
+        //
+        // Mission and run state, the same facts `/runs` serves.
+        "mission-status" => ("mission-status", &["mission", "status"], true, FLEET_PANEL_CACHE_TTL, MISSION_STATUS_OPTS),
+        // The role manifests the crew loads; no machine or fleet state.
+        "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[]),
+        // Resident models and their ownership, the same facts
+        // `/machine/status` serves; an `lms` error names the configured
+        // `lms_bin` path (withheld by the daemon's scrub).
+        "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[]),
+        // The fleet view's rows, the same facts `GET /fleet/view` serves
         // (liveness, the card each machine states about itself), worded as the
         // fleet lens's status line words them. A phone has no tooltips, so this
-        // is the touch path for a machine's status and its reason.
-        "machine-list" => ("machine-list", &["machine", "list"], true, PANEL_CACHE_TTL, &[], Read),
-        // LocalOrToken: prints the whole config.json, which holds the
-        // listener's port and enablement and the `fleet.accept_work`
-        // allow-list (node names, roles, profiles, images).
-        "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[], LocalOrToken),
-        // LocalOrToken: prints the flows and outbox directories, each hook's
-        // target URL and the Redis URL (an overlay address). `/health` and the
-        // flow routes show counts, not these.
-        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[], LocalOrToken),
-        // Read: registered lab fixtures; no machine or fleet state.
-        "lab-fixture-list" => {
-            ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[], Read)
-        }
+        // is the touch path for a machine's status and its reason. Names the
+        // roster file's path.
+        "machine-list" => ("machine-list", &["machine", "list"], true, PANEL_CACHE_TTL, &[]),
+        // The whole config.json, which holds addresses, paths, URLs,
+        // credential pointers, the listener's port and the `fleet.accept_work`
+        // allow-list: its remote form withholds all of them.
+        "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[]),
+        // The flows and outbox directories, each hook's target URL and the
+        // Redis URL (an overlay address): its remote form withholds them.
+        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[]),
+        // Registered lab fixtures and their paths.
+        "lab-fixture-list" => ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[]),
         // (#1911) The CLI twin of the RUNS lens's union — see
-        // `src/run_list.rs`'s own module doc. Read: the same rows as `/runs`.
-        "run-list" => ("run-list", &["run", "list"], true, FLEET_PANEL_CACHE_TTL, RUN_LIST_OPTS, Read),
-        // Read: the profiles THIS machine's own grants let it use (its own
+        // `src/run_list.rs`'s own module doc. The same rows as `/runs`.
+        "run-list" => ("run-list", &["run", "list"], true, FLEET_PANEL_CACHE_TTL, RUN_LIST_OPTS),
+        // The profiles THIS machine's own grants let it use (its own
         // registry, or a roster peer's card), the same facts `machine list`
-        // prints; it reveals only this machine's own allow-list entry on
-        // each peer, not the peer's allow-list.
-        "profile-list" => ("profile-list", &["profile", "list"], true, PANEL_CACHE_TTL, PROFILE_LIST_OPTS, Read),
+        // prints; it reveals only this machine's own allow-list entry on each
+        // peer, not the peer's allow-list. An endpoint's host is withheld by
+        // the daemon's scrub.
+        "profile-list" => ("profile-list", &["profile", "list"], true, PANEL_CACHE_TTL, PROFILE_LIST_OPTS),
         // Manual-run only (#1286): never auto-refreshed by the viewer,
         // TTL 0 so an explicit re-run is always a real run, and rate-
         // floored server-side (see MANUAL_MIN_INTERVAL) because
-        // "the viewer must honor it" is not enforcement. LocalOrToken: its
-        // fleet rows print the listener's overlay address, port and busy
-        // policy and the allow-list's node names and roles.
-        "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[], LocalOrToken),
+        // "the viewer must honor it" is not enforcement. Its remote form runs
+        // every check and keeps every row and remedy, and withholds the fleet
+        // listener's address, port and busy policy, the identity row's node,
+        // and the allow-list's entries.
+        "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[]),
         _ => return None,
     };
     // (#1914, widened #1711) Derived from the SAME `id` just matched above,
@@ -511,7 +487,7 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         "machine-status" => Some(ROSTER_AS_POSITIONAL),
         _ => None,
     };
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, spawn_timeout: spawn_timeout_for(id), opts, needs_fleet_snapshot, audience, roster_opt })
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, spawn_timeout: spawn_timeout_for(id), opts, needs_fleet_snapshot, roster_opt })
 }
 
 /// The spawn bound for panel `id`: `doctor` probes every peer and gets the long
@@ -1000,13 +976,11 @@ fn manual_floor_wait(
 
 /// The gates in front of every panel request, in order: the preflight-forcing
 /// header (checked BEFORE the allowlist lookup so a drive-by never even learns
-/// which ids exist), the allowlist lookup, then the panel's audience. Returns
-/// the panel's spec.
-fn admit_panel_request(
-    id: &str,
-    peer: Option<std::net::SocketAddr>,
-    headers: &axum::http::HeaderMap,
-) -> Result<PanelSpec, (StatusCode, String)> {
+/// which ids exist), then the allowlist lookup. Returns the panel's spec. No
+/// panel is refused for who is asking: the read gate in front of this route
+/// already applied the read posture, and a caller that is not this machine is
+/// served the panel redacted (see the module doc).
+fn admit_panel_request(id: &str, headers: &axum::http::HeaderMap) -> Result<PanelSpec, (StatusCode, String)> {
     // The preflight forcer — see PANEL_HEADER.
     if !headers.contains_key(PANEL_HEADER) {
         return Err((
@@ -1025,7 +999,6 @@ fn admit_panel_request(
             format!("unknown panel \"{id}\": panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
-    admit_audience(&spec, peer, headers)?;
     Ok(spec)
 }
 
@@ -1054,22 +1027,39 @@ async fn resolve_selection(
     Ok(with_roster_choice(spec, compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
 }
 
-/// What a caller that is neither this machine nor a token holder is shown
-/// instead of the daemon's diagnostics (see [`redact_for_remote`]).
-const REMOTE_DIAGNOSTICS_NOTE: &str = "diagnostics are shown on this machine only";
-
 /// The ONE output filter for a caller that is not this machine or a token
-/// holder, applied to every panel's response whatever the panel: `stderr_tail`
-/// is withheld (it carries the daemon's environment warnings and resolver
-/// errors), roster addresses in stdout read "(address hidden)", and the daemon
+/// holder, applied to every panel's response whatever the panel (the verb has
+/// already rendered its remote form, see the module doc): `stderr_tail` is
+/// withheld (it carries the daemon's environment warnings and resolver
+/// errors), roster addresses in stdout read "(address hidden)", the daemon
 /// user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
-/// `$DARKMUX_HOME`). Matches are whole tokens only, and a machine id or name is
-/// never hidden. The sets come from [`Redaction::derive`].
-fn redact_for_remote(body: &mut PanelResponse, r: &Redaction) {
-    if !body.stderr_tail.is_empty() {
-        body.stderr_tail = REMOTE_DIAGNOSTICS_NOTE.to_string();
+/// `$DARKMUX_HOME`), and every value in `w` ([`crate::panel_withheld`]) reads
+/// "(shown on this machine only)". Matches are whole tokens only, and a
+/// machine id or name is never hidden. When anything was withheld (here, or
+/// by the verb's remote form), `withheld` carries the one notice naming the
+/// command and `machine`.
+fn redact_for_remote(body: &mut PanelResponse, r: &Redaction, w: &Withheld, machine: Option<&str>) {
+    let mut withheld = !body.stderr_tail.is_empty();
+    body.stderr_tail.clear();
+    let shown = redact_panel_stdout(&body.ansi_text, r, w);
+    withheld |= shown != body.ansi_text || shown.contains(panel_audience::WITHHELD);
+    body.ansi_text = shown;
+    body.withheld = if withheld {
+        panel_audience::notice(&format!("darkmux {}", body.argv.join(" ")), machine)
+    } else {
+        String::new()
+    };
+}
+
+/// The cache and single-flight key for a selection rendered for `remote`: a
+/// verb's remote form is a different output, so it never shares an entry with
+/// this machine's.
+fn audience_key(key: &str, remote: bool) -> String {
+    if remote {
+        format!("{key}\u{0}remote")
+    } else {
+        key.to_string()
     }
-    body.ansi_text = redact_stdout(&body.ansi_text, r);
 }
 
 pub(crate) async fn panel_handler(
@@ -1080,11 +1070,11 @@ pub(crate) async fn panel_handler(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
 ) -> Result<axum::Json<PanelResponse>, (StatusCode, String)> {
-    let peer = peer.map(|c| c.0);
-    let full_view = crate::caller_is_local_or_holds_token(peer, &headers);
-    let mut body = run_panel(&id, raw_query.0, params.0, peer, &headers, &state).await?;
-    if !full_view {
-        redact_for_remote(&mut body, &Redaction::derive());
+    let remote = !crate::caller_is_local_or_holds_token(peer.map(|c| c.0), &headers);
+    let mut body = run_panel(&id, raw_query.0, params.0, remote, &headers, &state).await?;
+    if remote {
+        let machine = darkmux_flow::resolve_machine_id();
+        redact_for_remote(&mut body, &Redaction::derive(), &crate::panel_withheld(), machine.as_deref());
     }
     Ok(axum::Json(body))
 }
@@ -1093,11 +1083,11 @@ async fn run_panel(
     id: &str,
     raw_query: Option<String>,
     params: HashMap<String, String>,
-    peer: Option<std::net::SocketAddr>,
+    remote: bool,
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<PanelResponse, (StatusCode, String)> {
-    let spec = admit_panel_request(id, peer, headers)?;
+    let spec = admit_panel_request(id, headers)?;
     // A repeated query key is ambiguous (the map below would keep one of the
     // two), so it is refused rather than resolved last-wins.
     if let Some(key) = raw_query.as_deref().and_then(duplicate_query_key) {
@@ -1113,6 +1103,7 @@ async fn run_panel(
     // `opt.<name>` query params. An unknown name or value is a 400, never
     // silently ignored.
     let (final_argv, key, opts_echo) = resolve_selection(state, &spec, &params).await?;
+    let key = audience_key(&key, remote);
 
     // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
     // `u16`) resolves to the default width rather than failing the whole
@@ -1184,12 +1175,20 @@ async fn run_panel(
         // endpoint exists to kill). Opt-in by construction: a verb that
         // ignores this env var behaves exactly as it does in a terminal.
         .env("DARKMUX_PANEL", id)
+        // Which form to render: a caller that is not this machine gets the
+        // verb's remote form (see the module doc). Removed otherwise, so a
+        // daemon started from a shell that happened to set it still serves
+        // this machine in full.
+        .env_remove(panel_audience::AUDIENCE_ENV)
         // A child must never inherit the daemon's own serve lifecycle env in
         // a way that could confuse it; everything else (DARKMUX_HOME, dirs)
         // is deliberately inherited — the panel must see the same state the
         // operator's own shell would.
         .kill_on_drop(true);
 
+    if remote {
+        cmd.env(panel_audience::AUDIENCE_ENV, panel_audience::REMOTE);
+    }
     if let Some(file) = &fleet_snapshot {
         // (#1914) Opt-in by the SAME construction as `DARKMUX_PANEL` above:
         // a bare terminal invocation never has this env var set, so it
@@ -1214,6 +1213,7 @@ async fn run_panel(
         // Non-empty only when something went to stderr — surfaced so a
         // failing verb is diagnosable from the panel itself, not just logs.
         stderr_tail,
+        withheld: String::new(),
         cols,
         cache_ttl_ms: spec.cache_ttl.as_millis() as u64,
         age_ms: 0,
@@ -1384,18 +1384,6 @@ mod tests {
         assert!(panel_spec("rm -rf /").is_none());
         assert!(panel_spec("mission status").is_none(), "argv-looking ids are not ids");
         assert!(panel_spec("").is_none());
-    }
-
-    /// The classification table, stated independently of `panel_spec`: a
-    /// new panel must be placed here on purpose, with the reason in the
-    /// table's own comments.
-    #[test]
-    fn every_panel_has_a_stated_audience() {
-        let execution_surface = ["doctor", "config-list", "flow-status"];
-        for id in PANEL_IDS {
-            let want = if execution_surface.contains(id) { PanelAudience::LocalOrToken } else { PanelAudience::Read };
-            assert_eq!(panel_spec(id).unwrap().audience, want, "{id}");
-        }
     }
 
     /// The drift guard the three-parallel-tables shape could not have: the
@@ -2374,7 +2362,6 @@ mod tests {
     fn profile_list_is_a_read_panel_over_the_profile_verb() {
         let spec = panel_spec("profile-list").unwrap();
         assert_eq!(spec.argv, &["profile", "list"]);
-        assert_eq!(spec.audience, PanelAudience::Read);
         assert_eq!(spec.roster_opt, Some(ROSTER_AS_FLAG));
         assert!(!spec.needs_fleet_snapshot);
         let others = PANEL_IDS.iter().filter(|id| !matches!(**id, "profile-list" | "machine-status"));
@@ -2460,7 +2447,6 @@ mod tests {
     fn machine_list_is_a_read_panel_over_the_fleet_view() {
         let spec = panel_spec("machine-list").unwrap();
         assert_eq!(spec.argv, &["machine", "list"]);
-        assert_eq!(spec.audience, PanelAudience::Read);
         assert!(spec.opts.is_empty() && spec.roster_opt.is_none());
         assert!(!spec.needs_fleet_snapshot);
     }
@@ -2660,7 +2646,6 @@ mod tests {
                     "id": s.id,
                     "argv": s.argv,
                     "auto_refresh": s.auto_refresh,
-                    "audience": match s.audience { PanelAudience::Read => "read", PanelAudience::LocalOrToken => "local_or_token" },
                     "opts": s.opts.iter().map(|o| serde_json::json!({
                         "name": o.name,
                         "values": o.values.iter().map(|v| serde_json::json!({"value": v.value, "argv": v.argv})).collect::<Vec<_>>(),
@@ -2700,6 +2685,7 @@ mod tests {
             gather_ms: 1,
             exit_code: Some(1),
             ansi_text: "\x1b[2mregistry:\x1b[0m \x1b[2m/Users/tester/.darkmux/fleet.json\x1b[0m\nfixture: \x1b[2m/Users/tester/fx/a\x1b[0m\n\x1b[1mpeerone\x1b[0m at \x1b[2mpeerone.tailnet.example:8765\x1b[0m\n".into(),
+            withheld: String::new(),
             stderr_tail: "the roster address for peerone (`peerone.tailnet.example:8765`) does not resolve\nwarning: env var X (/Users/tester/notebook) is ignored".into(),
             cols: 100,
             cache_ttl_ms: 3000,
@@ -2717,24 +2703,56 @@ mod tests {
         )
     }
 
+    fn remote_view(body: &mut PanelResponse, r: &Redaction) {
+        redact_for_remote(body, r, &Withheld::default(), Some("studio"));
+    }
+
     #[test]
     fn a_remote_caller_sees_no_roster_address_no_home_path_and_no_stderr() {
         let mut body = probe_body();
-        redact_for_remote(&mut body, &redaction());
+        remote_view(&mut body, &redaction());
         let all = format!("{}{}", body.ansi_text, body.stderr_tail);
         assert!(!all.contains("tailnet.example"), "{all}");
         assert!(!all.contains("/Users/"), "{all}");
         assert!(body.ansi_text.contains("at \x1b[2m(address hidden)\x1b[0m"), "{}", body.ansi_text);
         assert!(body.ansi_text.contains("\x1b[2m~/.darkmux/fleet.json\x1b[0m"), "{}", body.ansi_text);
-        assert_eq!(body.stderr_tail, REMOTE_DIAGNOSTICS_NOTE);
+        assert_eq!(body.stderr_tail, "", "stderr is withheld, never shown");
+        assert_eq!(body.withheld, panel_audience::notice("darkmux machine status", Some("studio")));
     }
 
+    /// Nothing withheld, nothing said: output with no host fact, no
+    /// withheld value and no stderr carries no notice.
     #[test]
-    fn a_clean_stderr_stays_empty_for_a_remote_caller() {
+    fn a_remote_caller_is_told_nothing_when_nothing_was_withheld() {
         let mut body = probe_body();
         body.stderr_tail.clear();
-        redact_for_remote(&mut body, &redaction());
-        assert_eq!(body.stderr_tail, "");
+        body.ansi_text = "role list\nanalyst coder\n".into();
+        remote_view(&mut body, &redaction());
+        assert_eq!((body.stderr_tail.as_str(), body.withheld.as_str()), ("", ""));
+    }
+
+    /// The panel extra set: a configured path and an endpoint URL the shared
+    /// redaction does not know read "(shown on this machine only)", in a
+    /// colored run as in plain text, and the notice says so. A verb's own
+    /// remote form (a `(shown on this machine only)` it printed) earns the
+    /// notice too.
+    #[test]
+    fn a_configured_location_is_withheld_and_the_notice_says_so() {
+        let w = Withheld::from_values(["/opt/fake/bin/lms".to_string(), "https://myres.example.com/v1".into()]);
+        let mut body = probe_body();
+        body.stderr_tail.clear();
+        body.ansi_text = "lms at \x1b[2m/opt/fake/bin/lms\x1b[0m; endpoint https://myres.example.com/v1\n".into();
+        redact_for_remote(&mut body, &redaction(), &w, Some("studio"));
+        assert_eq!(
+            body.ansi_text,
+            "lms at \x1b[2m(shown on this machine only)\x1b[0m; endpoint (shown on this machine only)\n"
+        );
+        assert!(!body.withheld.is_empty());
+        let mut body = probe_body();
+        body.stderr_tail.clear();
+        body.ansi_text = "\"busy_policy\": \"(shown on this machine only)\"\n".into();
+        redact_for_remote(&mut body, &redaction(), &Withheld::default(), Some("studio"));
+        assert!(!body.withheld.is_empty(), "the verb's own remote form earns the notice");
     }
 
     #[test]
@@ -2761,7 +2779,7 @@ mod tests {
 
     fn filtered(r: &Redaction, text: &str) -> String {
         let mut b = body_with(text);
-        redact_for_remote(&mut b, r);
+        remote_view(&mut b, r);
         b.ansi_text
     }
 
@@ -2861,10 +2879,13 @@ mod tests {
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         std::env::set_var("HOME", "/Users/tester");
         let state = app_state();
-        state.panels.cache.lock().await.insert(
-            "role-list".to_string(),
-            CacheEntry { body: probe_body(), captured: SystemTime::now() },
-        );
+        // Both forms seeded: this machine's and the remote one (the verb's
+        // remote form is cached apart, see `audience_key`). The remote entry
+        // holds what an unshaping verb would print, so the daemon's own
+        // filter is what is under test.
+        for key in [audience_key("role-list", false), audience_key("role-list", true)] {
+            state.panels.cache.lock().await.insert(key, CacheEntry { body: probe_body(), captured: SystemTime::now() });
+        }
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(PANEL_HEADER, "1".parse().unwrap());
         headers.insert("host", host.parse().unwrap());
@@ -2895,7 +2916,8 @@ mod tests {
         let remote = served_to("100.64.1.2:50000", "localhost:8765").await;
         let all = format!("{}{}", remote.ansi_text, remote.stderr_tail);
         assert!(!all.contains("tailnet.example") && !all.contains("/Users/"), "{all}");
-        assert_eq!(remote.stderr_tail, REMOTE_DIAGNOSTICS_NOTE);
+        assert_eq!(remote.stderr_tail, "");
+        assert!(!remote.withheld.is_empty());
 
         let local = served_to("127.0.0.1:50000", "localhost:8765").await;
         let want = probe_body();
@@ -2946,8 +2968,12 @@ mod tests {
         let roster = dir.path().join("fleet.json");
         // The child prints a line naming the roster's address.
         let child = dir.path().join("child.sh");
-        std::fs::write(&child, "#!/bin/sh\necho peer at example-host.example:8765 role list\n").unwrap();
+        std::fs::write(&child, "#!/bin/sh\necho \"peer at example-host.example:8765 role list [$DARKMUX_PANEL_AUDIENCE]\"\n").unwrap();
         std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) macOS scans a freshly written executable on its first exec,
+        // which can outlast the panel's spawn bound on a loaded host: exec it
+        // once outside the bound.
+        let _ = std::process::Command::new(&child).output();
         std::fs::write(
             &roster,
             r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"example-host.example:8765","added_unix_ms":1}}}"#,
@@ -2976,8 +3002,105 @@ mod tests {
             Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
             None => std::env::remove_var("DARKMUX_FLEET_FILE"),
         }
-        assert_eq!(remote.ansi_text.trim(), "peer at (address hidden) role list");
-        assert_eq!(local.ansi_text.trim(), "peer at example-host.example:8765 role list", "the cache must hold the unfiltered body");
+        assert_eq!(remote.ansi_text.trim(), "peer at (address hidden) role list [remote]");
+        assert_eq!(
+            local.ansi_text.trim(),
+            "peer at example-host.example:8765 role list []",
+            "this machine's form is cached apart from the remote one, and unfiltered"
+        );
+    }
+
+    /// (5.0) EVERY registered panel, served through the real handler and spawn
+    /// path to a viewer that is not this machine: 200 (never a refusal for
+    /// being remote), the child told to render its remote form, the shared
+    /// redaction applied, stderr withheld, and one calm notice naming the
+    /// command and this machine. This machine gets the child's own output,
+    /// with no remote form asked for and nothing withheld. A panel added to
+    /// the table is in `PANEL_IDS`, so it cannot skip this.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_panel_serves_a_remote_caller_its_redacted_form_and_this_machine_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let roster = dir.path().join("fleet.json");
+        std::fs::write(
+            &roster,
+            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"example-host.example:8765","added_unix_ms":1}}}"#,
+        )
+        .unwrap();
+        // The child names the audience it was asked to render for, a roster
+        // address, and writes a diagnostic to stderr.
+        let child = dir.path().join("child.sh");
+        std::fs::write(
+            &child,
+            "#!/bin/sh\necho \"audience=[$DARKMUX_PANEL_AUDIENCE] peer at example-host.example:8765\"\necho 'warning: something local' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
+        let saved: Vec<(&str, Option<String>)> =
+            ["DARKMUX_FLEET_FILE", "DARKMUX_MACHINE_ID", panel_audience::AUDIENCE_ENV].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        std::env::set_var("DARKMUX_FLEET_FILE", &roster);
+        std::env::set_var("DARKMUX_MACHINE_ID", "studio");
+        // A daemon started from a shell that happened to export the audience
+        // variable must still serve this machine in full.
+        std::env::set_var(panel_audience::AUDIENCE_ENV, panel_audience::REMOTE);
+        let serve = |id: &'static str, peer: &'static str| {
+            let mut state = app_state();
+            state.panels.child_exe = Some(child.clone());
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(PANEL_HEADER, "1".parse().unwrap());
+            headers.insert("host", "localhost:8765".parse().unwrap());
+            panel_handler(
+                Path(id.to_string()),
+                axum::extract::RawQuery(None),
+                Query(HashMap::new()),
+                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                headers,
+                State(state),
+            )
+        };
+        let mut failures = Vec::new();
+        for id in PANEL_IDS {
+            let remote = match serve(id, "100.64.1.2:50000").await {
+                Ok(b) => serde_json::to_value(&b.0).unwrap(),
+                Err((code, msg)) => {
+                    failures.push(format!("{id}: a remote caller was refused {code}: {msg}"));
+                    continue;
+                }
+            };
+            let text = remote["ansi_text"].as_str().unwrap_or_default();
+            if !text.contains("audience=[remote]") {
+                failures.push(format!("{id}: the child was not asked for its remote form: {text}"));
+            }
+            if text.contains("example-host") {
+                failures.push(format!("{id}: a roster address reached a remote caller: {text}"));
+            }
+            if remote["stderr_tail"] != "" {
+                failures.push(format!("{id}: stderr reached a remote caller: {}", remote["stderr_tail"]));
+            }
+            let notice = remote["withheld"].as_str().unwrap_or_default();
+            let command = format!("darkmux {}", panel_spec(id).unwrap().argv.join(" "));
+            if !(notice.contains("shown on this machine only") && notice.contains(&command) && notice.contains("studio")) {
+                failures.push(format!("{id}: no notice naming `{command}` and the machine: {notice:?}"));
+            }
+            let local = serde_json::to_value(&serve(id, "127.0.0.1:50000").await.unwrap().0).unwrap();
+            let text = local["ansi_text"].as_str().unwrap_or_default();
+            if !text.contains("audience=[] peer at example-host.example:8765") {
+                failures.push(format!("{id}: this machine did not get the full output: {text}"));
+            }
+            if local["stderr_tail"] != "warning: something local" || local["withheld"].as_str().unwrap_or_default() != "" {
+                failures.push(format!("{id}: this machine lost its stderr or was told something was withheld: {local}"));
+            }
+        }
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     // ── real panel output: colored, punctuated, linked ─────────────────

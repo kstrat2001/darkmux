@@ -53,6 +53,7 @@ mod host_sampler;
 pub mod machine_card;
 mod panel;
 mod redaction;
+pub use redaction::panel_withheld;
 mod redaction_stream;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
