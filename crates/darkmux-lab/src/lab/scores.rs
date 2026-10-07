@@ -186,9 +186,28 @@ impl MachineFingerprint {
             .ok()
             .filter(|o| o.status.success())
             .and_then(|o| clean_engine_version(&String::from_utf8_lossy(&o.stdout)));
+        Self::from_probes(
+            machine_id,
+            hw,
+            darkmux_hardware::machine_uid().map(str::to_string),
+            os_version,
+            engine_version,
+        )
+    }
+
+    /// Assembles a fingerprint from what [`Self::detect`] probed. A hardware
+    /// count the probe could not read comes back as `0`, and is recorded as
+    /// absent rather than as a machine with no RAM or no cores.
+    fn from_probes(
+        machine_id: &str,
+        hw: darkmux_hardware::HardwareSpec,
+        machine_uid: Option<String>,
+        os_version: Option<String>,
+        engine_version: Option<String>,
+    ) -> Self {
         Self {
             machine_id: machine_id.to_string(),
-            machine_uid: darkmux_hardware::machine_uid().map(str::to_string),
+            machine_uid,
             platform: Some(hw.platform.label().to_string()),
             arch: Some(hw.arch),
             total_ram_gb: (hw.total_ram_gb > 0).then_some(hw.total_ram_gb),
@@ -1061,6 +1080,36 @@ mod tests {
         // Hardware fields come from darkmux_hardware::detect() which always
         // returns; the shell-out fields may be None — both are valid.
         assert!(fp.total_ram_gb.is_some());
+    }
+
+    fn hardware(total_ram_gb: u32, physical_cores: u32) -> darkmux_hardware::HardwareSpec {
+        darkmux_hardware::HardwareSpec {
+            platform: darkmux_hardware::Platform::AppleSilicon,
+            arch: "arm64".to_string(),
+            total_ram_gb,
+            physical_cores,
+            performance_cores: None,
+            efficiency_cores: None,
+            has_unified_memory: true,
+        }
+    }
+
+    /// (#3100) A hardware probe that failed reports `0`; the fingerprint
+    /// records that as absent, never as a machine with 0 GB or 0 cores,
+    /// while any real count, including 1, is kept.
+    #[test]
+    fn a_failed_hardware_count_is_absent_not_zero() {
+        let failed = MachineFingerprint::from_probes("m", hardware(0, 0), None, None, None);
+        assert_eq!(failed.total_ram_gb, None);
+        assert_eq!(failed.physical_cores, None);
+
+        let smallest = MachineFingerprint::from_probes("m", hardware(1, 1), None, None, None);
+        assert_eq!(smallest.total_ram_gb, Some(1));
+        assert_eq!(smallest.physical_cores, Some(1));
+
+        let real = MachineFingerprint::from_probes("m", hardware(128, 18), None, None, None);
+        assert_eq!(real.total_ram_gb, Some(128));
+        assert_eq!(real.physical_cores, Some(18));
     }
 
     /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
