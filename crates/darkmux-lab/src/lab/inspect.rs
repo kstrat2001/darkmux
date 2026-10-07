@@ -283,7 +283,12 @@ mod tests {
         assert_eq!(p, PathBuf::from("./local/run"));
     }
 
+    /// Serial: both sides read `lab_dir()`, which tests holding
+    /// `IsolatedState` (or a `DARKMUX_LAB_DIR` pin) re-point. Unserialized,
+    /// another test could change it between the two reads under plain
+    /// `cargo test`, and the paths came back under two different roots.
     #[test]
+    #[serial_test::serial]
     fn resolve_run_dir_id_resolves_under_the_lab_dir_even_when_missing() {
         let p = resolve_run_dir("just-an-id");
         // An id that doesn't exist under the lab dir still resolves there:
