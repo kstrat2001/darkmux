@@ -156,9 +156,10 @@ describe.each(CELLS.map((c) => [c.id, c] as const))("cell %s renders", (_id, cel
     // keyed on the label).
     expect(badge.className).toContain(`s-${cell.status}`);
 
-    // The kind chip on the row, and the untracked marker, are the other
-    // two axes the row is supposed to carry.
-    expect(within(row).getByText(cell.kind)).toBeInTheDocument();
+    // The kind icon on the row, and the untracked marker, are the other
+    // two axes the row is supposed to carry. The kind is an icon with no
+    // text (operator, 2026-10-07), so it is found by its accessible name.
+    expect(within(row).getByRole("img", { name: `${cell.kind} run` })).toHaveAttribute("data-run-kind", cell.kind);
     const untracked = row.querySelector(".rununtracked");
     if (cell.tracked) {
       expect(untracked, `${cell.id} is tracked but rendered the untracked marker`).toBeNull();

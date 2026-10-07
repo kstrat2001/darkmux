@@ -1,4 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
+import { RunKindIcon } from "../../components/RunKindIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -573,7 +574,9 @@ export function RunsBoard({
             <div className="labrunrow-ph" key={i} aria-hidden="true">
               <div className="labrunmain">
                 <Shimmer as="span" className="wstatus labbadge-ph" minWidth="4.5em" minHeight="1.3em" />
-                <Shimmer as="span" className="runkind" minWidth="3.5em" />
+                {/* The kind icon's slot, as tall as the old kind chip's placeholder so
+                    the skeleton row keeps its height. */}
+                <Shimmer as="span" minWidth="calc(16px * var(--fs-scale))" minHeight="calc(10px * var(--fs-scale))" />
                 <Shimmer as="span" className="labruncrew" minWidth="9em" />
                 <Shimmer as="span" className="labrundir" minWidth="3em" />
               </div>
@@ -835,7 +838,7 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
           className="labbadge"
           title={notReporting ? NOT_REPORTING_TITLE : undefined}
         />
-        <span className={`runkind ${run.kind}`}>{run.kind}</span>
+        <RunKindIcon kind={run.kind} />
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}
         {!run.tracked && <span className="rununtracked">untracked</span>}
