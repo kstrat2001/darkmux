@@ -466,8 +466,8 @@ describe("ConsolePanel", () => {
   // That notice is calm: its own neutral `.panelnote`, never `.panelerr`
   // (error red) and never the panel's failure state, whatever the exit code.
   // A doctor run with failing checks exits 1, so the notice must stay calm
-  // beside a real failure, and the failure line must not claim stderr was
-  // empty when it was only withheld.
+  // beside a real failure. A remote viewer's stderr is redacted, never
+  // dropped, so an empty one really is empty and the failure line says so.
   const NOTICE = "shown on this machine only: run `darkmux doctor` on studio itself, or over ssh, for the full output";
   it("(5.0) a remote viewer's withheld notice renders calm, never error-red, on a clean exit", async () => {
     vi.stubGlobal(
@@ -482,7 +482,7 @@ describe("ConsolePanel", () => {
     expect(screen.getByText(/mission status — 0 missions/)).toBeInTheDocument();
   });
 
-  it("(5.0) beside a failed exit the notice stays calm and the failure line makes no claim about withheld stderr", async () => {
+  it("(5.0) beside a failed exit the notice stays calm and the failure line reads as on this machine", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(() =>
@@ -496,8 +496,21 @@ describe("ConsolePanel", () => {
     await waitFor(() => expect(document.querySelector(".panelnote")).not.toBeNull());
     expect(document.querySelector(".panelnote")!.textContent).toBe(NOTICE);
     expect(document.querySelector(".panelnote")!.closest(".panelerr")).toBeNull();
-    expect(document.querySelector(".panelerr")!.textContent).toBe("command exited with status 1");
-    expect(document.body.textContent).not.toContain("printed nothing to stderr");
+    expect(document.querySelector(".panelerr")!.textContent).toBe("command exited with status 1 and printed nothing to stderr");
+  });
+
+  // (5.0 review item 7) A failed remote panel shows its redacted stderr, so
+  // the remote viewer still reads why it failed, beside the calm notice.
+  it("(5.0) a remote viewer's failed panel shows its redacted stderr and the notice", async () => {
+    const reason = "error: `(shown on this machine only)` was not found (ps)";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse({ ...MISSION_STATUS_BODY, exit_code: 2, ansi_text: "", stderr_tail: reason, withheld: NOTICE }))),
+    );
+    renderPanel("mission-status");
+    await waitFor(() => expect(document.querySelector(".panelnote")).not.toBeNull());
+    expect(document.querySelector(".panelerr")!.textContent).toBe(reason);
+    expect(document.querySelector(".panelnote")!.textContent).toBe(NOTICE);
   });
 
   // A panel this machine reads (no notice) renders no `.panelnote` at all.

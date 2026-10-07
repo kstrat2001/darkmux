@@ -430,13 +430,28 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
     `config-list` withholds every value that names an address, a path, a URL
     or a credential pointer, the listener's port, the busy policy and each
     allow-list entry beyond its machine name; `flow-status` withholds its
-    directories, the Redis URL and each hook's target), and the daemon then
-    filters the text of every panel: `stderr_tail` is withheld, every roster
-    address (and its host part) reads "(address hidden)", the daemon user's
-    home prefix reads `~` (a `DARKMUX_HOME` outside it reads
+    directories, the Redis URL and each hook's target; `lab-fixture-list`
+    withholds each fixture's path), and the daemon then filters the text of
+    every panel, stdout and stderr alike (stderr is redacted, not dropped, so a
+    failed panel still says why): every roster address (and its host part)
+    reads "(address hidden)", an IPv6 address loses its zone with it, the
+    daemon user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
     `$DARKMUX_HOME`), and every address, path, endpoint URL and credential
-    pointer this machine's config, profile registry and environment name reads
-    "(shown on this machine only)". Matches are whole tokens only (`mac` is not
+    pointer this machine is configured with reads "(shown on this machine
+    only)", in any case, and also where a renderer cut it short with `…`.
+    That set is read through the same `config_access` accessors the code uses
+    (`LOCATION_ACCESSORS`; a test scans the module and fails on an accessor
+    that could name a location and is in neither list, so a setting that
+    exists only in the environment is covered), plus `config.json` as written
+    (a value of the wrong type and an unknown key's value included), the
+    profile registry's endpoints, the lab fixture registry, the Redis URL and
+    the temp directory. A credential pointer spelled like a machine, profile
+    or endpoint name does not hide the name. `config-list` also withholds a
+    shown key whose value has the wrong type, and every `config.json` leaf is
+    classified by its own path, so a new field under a withheld prefix fails
+    the guard. `doctor` is floored per audience: a remote run never closes this
+    machine's 30s window, and a remote caller inside the remote window reads
+    the last remote run (with its age) instead of starting a probe. Matches are whole tokens only (`mac` is not
     hidden inside `macos`; punctuation and color codes are boundaries; an OSC 8
     link to a hidden target loses the target, not its label; only SGR and OSC 8
     escapes are sent, and `HOME` and `DARKMUX_HOME` are matched in their

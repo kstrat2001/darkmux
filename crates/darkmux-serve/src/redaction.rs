@@ -89,7 +89,7 @@ static REDACTION_CACHE: std::sync::Mutex<Option<RedactionCache>> = std::sync::Mu
 
 impl Redaction {
     /// [`Self::derive`], reused while `fleet.json`, HOME and DARKMUX_HOME are unchanged.
-    fn derive_cached() -> std::sync::Arc<Self> {
+    pub(crate) fn derive_cached() -> std::sync::Arc<Self> {
         let key = CacheKey::current();
         let mut guard = REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         guard.get_or_insert_with(RedactionCache::default).get(key, std::time::Instant::now(), Self::derive)
@@ -379,7 +379,16 @@ fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
             continue;
         }
         let glued = start > 0 && word_byte(b[start - 1]);
-        if let Some(span) = v6_in_run(text, start, i, glued) {
+        if let Some(mut span) = v6_in_run(text, start, i, glued) {
+            // A zone (`%en0`, or `%25en0` in a URL) names this machine's
+            // interface: it goes with the address.
+            if span.end == i && b.get(i) == Some(&b'%') {
+                let zone = b[i + 1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-')).count();
+                if zone > 0 {
+                    span.end = i + 1 + zone;
+                    i = span.end;
+                }
+            }
             out.push(span);
         }
     }
@@ -514,14 +523,14 @@ pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<
 /// escape is dropped whole; one that is malformed or unterminated loses only
 /// its introducer, so what follows is ordinary text and gets redacted as such
 /// (`\x1b[/Users/kain` must not be eaten as the sequence `\x1b[/U`).
-fn classify_escape(rest: &str, r: &Redaction) -> (usize, String) {
+fn classify_escape(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
     let bytes = rest.as_bytes();
     if rest.starts_with('\u{9b}') {
         return csi(rest, 2);
     }
     match bytes.get(1) {
         Some(b'[') => csi(rest, 2),
-        Some(b']') => osc(rest, r),
+        Some(b']') => osc(rest, r, w),
         // A charset designation (`ESC ( B`) is three bytes.
         Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => (3, String::new()),
         _ => (1, String::new()),
@@ -540,7 +549,9 @@ fn csi(rest: &str, intro: usize) -> (usize, String) {
 }
 
 /// An OSC: kept only as an OSC 8 hyperlink, rebuilt without its parameters.
-fn osc(rest: &str, r: &Redaction) -> (usize, String) {
+/// Its target is dropped when it names a host fact or a value the console
+/// withholds (`w`).
+fn osc(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
     let body = &rest[2..];
     let bel = body.find('\x07').map(|p| (p, 1));
     let st = body.find("\x1b\\").map(|p| (p, 2));
@@ -551,7 +562,7 @@ fn osc(rest: &str, r: &Redaction) -> (usize, String) {
     let Some((_params, target)) = body[..end].strip_prefix("8;").and_then(|l| l.split_once(';')) else {
         return (consumed, String::new());
     };
-    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target;
+    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target || w.hits(target);
     (consumed, format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }))
 }
 
@@ -574,7 +585,7 @@ pub(crate) fn redact_panel_stdout(text: &str, r: &Redaction, w: &Withheld) -> St
             continue;
         }
         out.push_str(&redact_run(&text[run_start..i]));
-        let (consumed, kept) = classify_escape(&text[i..], r);
+        let (consumed, kept) = classify_escape(&text[i..], r, w);
         out.push_str(&kept);
         i += consumed;
         run_start = i;
@@ -586,17 +597,28 @@ pub(crate) fn redact_panel_stdout(text: &str, r: &Redaction, w: &Withheld) -> St
 /// What a console panel withholds from a remote viewer beyond [`Redaction`]:
 /// the addresses, paths, endpoint URLs and credential pointers this machine is
 /// configured with, wherever a verb prints them. Read when the request is
-/// served, from the same places the verbs read: `config.json` (every value
-/// `panel_audience::config_scrub_values` names), the settings as they resolve
-/// (`env > config.json > default`, so an environment override is covered),
-/// the profile registry's endpoints, and the temp directory. Nothing is listed
-/// by hand. A path under the home or `DARKMUX_HOME` directory is left to
-/// [`Redaction`], which already reads it as `~` or `$DARKMUX_HOME`.
+/// served, from the same places the verbs read:
+///
+/// - every location a setting resolves to (`env > config.json > default`),
+///   through the accessors the code itself reads it with
+///   (`darkmux_types::config_access::LOCATION_ACCESSORS`; a test there fails
+///   on an accessor that could name a location and is in no list), so a
+///   setting that exists only in the environment is covered;
+/// - `config.json` as written (`panel_audience::config_scrub_values`: every
+///   value of a scrubbed kind, every unknown key's value and every value of
+///   the wrong type);
+/// - the profile registry's endpoints (where each lives, where its key is),
+///   the lab fixture registry's paths, the Redis URL and the temp directory.
+///
+/// A path under the home or `DARKMUX_HOME` directory is left to
+/// [`Redaction`], which already reads it as `~` or `$DARKMUX_HOME`. A value
+/// spelled like a public name (a roster machine, this machine, a profile or
+/// an endpoint) is never withheld, as [`Redaction`] never hides one: a
+/// credential pointer named after its endpoint must not hide the endpoint.
 ///
 /// The verbs that shape their own remote form (`doctor`, `flow status`) use
 /// the same set before they wrap their output.
 pub fn panel_withheld() -> Withheld {
-    use darkmux_types::config_access as ca;
     use darkmux_types::panel_audience::config_scrub_values;
     let read_json = |p: &std::path::Path| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
@@ -605,28 +627,32 @@ pub fn panel_withheld() -> Withheld {
     let from_config = read_json(&config_path).map(|c| config_scrub_values(&c)).unwrap_or_default();
 
     let path_str = |p: std::path::PathBuf| p.to_string_lossy().to_string();
-    let mut locations: Vec<String> = vec![
-        ca::lms_bin(),
-        ca::lmstudio_url(),
-        ca::serve_bind(),
-        path_str(ca::flows_dir()),
-        path_str(ca::hooks_outbox_dir()),
-        path_str(ca::lab_dir()),
-        path_str(ca::fleet_file()),
-    ];
-    locations.extend(ca::audit_dir_override().map(path_str));
-    locations.extend(ca::redis_host());
-    locations.extend(ca::fleet_identity_bin());
-    locations.extend(ca::daemon_cors_origins());
+    let mut locations = darkmux_types::config_access::resolved_locations();
+    locations.extend(darkmux_lab::lab::registry::fixture_locations());
+    locations.extend(darkmux_flow::redis_url().map(|u| u.expose_for_probe().to_string()));
     for d in [std::env::temp_dir(), std::env::temp_dir().canonicalize().unwrap_or_default()] {
         locations.push(path_str(d));
     }
+
+    // The public names: never withheld (see the doc above).
+    let mut public: Vec<String> = Vec::new();
+    if let Ok(roster) = darkmux_fleet::load_roster() {
+        for m in roster.machines.values() {
+            public.push(m.id.clone());
+            public.extend(m.current_name.clone());
+        }
+    }
+    public.extend(darkmux_flow::resolve_machine_id());
 
     // The profile registry's endpoints: where each lives and where its key is.
     let mut credentials: Vec<String> = Vec::new();
     if let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) {
         locations.push(path_str(reg_path.clone()));
-        let endpoints = read_json(&reg_path).and_then(|r| r.get("endpoints").and_then(|e| e.as_object()).cloned());
+        let registry = read_json(&reg_path);
+        for section in ["profiles", "endpoints"] {
+            public.extend(registry.as_ref().and_then(|r| r.get(section)?.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>())).unwrap_or_default());
+        }
+        let endpoints = registry.as_ref().and_then(|r| r.get("endpoints").and_then(|e| e.as_object()).cloned());
         for ep in endpoints.iter().flat_map(|m| m.values()) {
             locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
             for key in ["keychain", "key_env"] {
@@ -646,6 +672,56 @@ pub fn panel_withheld() -> Withheld {
     Withheld::from_values(outside(from_config))
         .merged(Withheld::from_locations(outside(locations)))
         .merged(Withheld::from_values(credentials))
+        .sparing(&public)
+}
+
+/// What [`panel_withheld`] read, so a cached set is reused only while it is
+/// still the answer: each file's mtime and length, and every `DARKMUX_*`
+/// variable plus `HOME` and `TMPDIR`.
+#[derive(Clone, PartialEq, Eq)]
+struct WithheldKey {
+    files: Vec<Option<(std::time::SystemTime, u64)>>,
+    env: Vec<(String, String)>,
+}
+
+impl WithheldKey {
+    fn current() -> Self {
+        let meta = |p: Option<std::path::PathBuf>| {
+            p.and_then(|p| std::fs::metadata(p).ok()).and_then(|m| Some((m.modified().ok()?, m.len())))
+        };
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
+        let files = vec![
+            meta(Some(root.config.clone())),
+            meta(darkmux_profiles::profiles::registry_path(None)),
+            meta(Some(root.root.join("lab-registry.json"))),
+            meta(Some(darkmux_fleet::roster_path())),
+        ];
+        let mut env: Vec<(String, String)> =
+            std::env::vars().filter(|(k, _)| k.starts_with("DARKMUX_") || k == "HOME" || k == "TMPDIR").collect();
+        env.sort();
+        Self { files, env }
+    }
+}
+
+static PANEL_WITHHELD_CACHE: std::sync::Mutex<Option<(WithheldKey, std::time::Instant, std::sync::Arc<Withheld>)>> =
+    std::sync::Mutex::new(None);
+
+/// [`panel_withheld`], reused for at most [`REDACTION_CACHE_TTL`] while the
+/// files it read and the environment are unchanged: a console on a 3s
+/// auto-refresh would otherwise re-read four files and resolve every setting
+/// per remote request.
+pub(crate) fn panel_withheld_cached() -> std::sync::Arc<Withheld> {
+    let key = WithheldKey::current();
+    let now = std::time::Instant::now();
+    let mut guard = PANEL_WITHHELD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, at, w)) = guard.as_ref() {
+        if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
+            return w.clone();
+        }
+    }
+    let w = std::sync::Arc::new(panel_withheld());
+    *guard = Some((key, now, w.clone()));
+    w
 }
 
 #[cfg(test)]
@@ -1051,6 +1127,76 @@ mod tests {
         }
         for kept in ["::1", "[::1]:8765", "at 12:34:56 today", "darkmux::fleet", "a::b", "::"] {
             assert_eq!(r.line(kept), kept, "{kept}");
+        }
+    }
+
+    /// (5.0 review item 8) An IPv6 address's zone (`%en0`, or `%25en0` in a
+    /// URL) names this machine's interface: it goes with the address.
+    #[test]
+    fn an_ipv6_zone_goes_with_its_address() {
+        let r = rules();
+        assert_eq!(r.line("peer fe80::1%en0 up"), format!("peer {ADDRESS_HIDDEN} up"));
+        assert_eq!(r.line("http://[fe80::1%25en0]:8765/x"), format!("http://[{ADDRESS_HIDDEN}]:8765/x"));
+        assert_eq!(r.line("::1%lo0 stays"), "::1%lo0 stays", "loopback stays, zone and all");
+    }
+
+    /// (5.0 review item 8) An OSC 8 link whose target names a value the
+    /// console withholds loses its target, as one naming a host fact does.
+    #[test]
+    fn a_link_to_a_withheld_location_loses_its_target() {
+        let w = Withheld::from_values(["/opt/fake-fixtures/alpha".to_string()]);
+        let text = "\x1b]8;;file:///opt/fake-fixtures/alpha\x1b\\alpha\x1b]8;;\x1b\\\n";
+        assert_eq!(redact_panel_stdout(text, &rules(), &w), "\x1b]8;;\x1b\\alpha\x1b]8;;\x1b\\\n");
+    }
+
+    /// (5.0 review items 1, 2 and 5) What a console panel withholds is read
+    /// from every place this machine names a location: a setting that exists
+    /// only in the environment, the lab fixture registry, the profile
+    /// registry's endpoints. A credential pointer spelled like a public name
+    /// (an endpoint's Keychain item named after the endpoint, a key variable
+    /// named after a roster machine) is not withheld: the name stays readable.
+    #[test]
+    #[serial_test::serial]
+    fn panel_withheld_reads_every_location_and_spares_public_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dm");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lab-registry.json"),
+            r#"{"fixtures":{"alpha":{"path":"/opt/fake-fixtures/alpha","content_hash":"h","hashed_at":"t","manifest_version":"1"},"beta":{"path":"/Volumes/FakeWork/beta","content_hash":"h","hashed_at":"t","manifest_version":"1"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("profiles.json"),
+            r#"{"profiles":{},"endpoints":{"hosted":{"url":"https://hosted-secret.example.com/v1","auth":{"type":"bearer","keychain":"hosted"}},"relay":{"url":"https://relay-secret.example.com/v1","auth":{"type":"bearer","key_env":"LAPTOP"}},"other":{"url":"https://other-secret.example.com/v1","auth":{"type":"bearer","keychain":"other-key-item"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("fleet.json"), r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"100.64.9.1","added_unix_ms":1}}}"#).unwrap();
+        let vars = [
+            ("DARKMUX_HOME", root.display().to_string()),
+            ("HOME", dir.path().join("home").display().to_string()),
+            ("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-hostsrc/scenario.json".to_string()),
+            ("DARKMUX_MODS_DIR", "/opt/fake-mods".to_string()),
+        ];
+        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).chain([("DARKMUX_FLEET_FILE", std::env::var_os("DARKMUX_FLEET_FILE")), ("DARKMUX_PROFILES", std::env::var_os("DARKMUX_PROFILES"))]).collect();
+        for (k, v) in &vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let w = panel_withheld();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let vals = w.values();
+        for want in ["/opt/fake-hostsrc/scenario.json", "/opt/fake-mods", "/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta", "https://hosted-secret.example.com/v1", "other-key-item"] {
+            assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
+        }
+        for public in ["hosted", "LAPTOP", "laptop", "relay"] {
+            assert!(!vals.iter().any(|v| v.eq_ignore_ascii_case(public)), "the public name {public} is not withheld: {vals:?}");
         }
     }
 

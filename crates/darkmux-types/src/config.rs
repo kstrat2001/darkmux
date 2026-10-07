@@ -722,6 +722,8 @@ pub struct RetiredLeftover {
     pub policy: LeftoverPolicy,
     /// `env var ...`.
     pub found_in: String,
+    /// The value the env var holds (which may name a path).
+    pub value: String,
     /// The operator line: what is refused, what replaced it, and what to do.
     pub line: String,
 }
@@ -738,7 +740,7 @@ pub fn retired_env_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<Retire
                 LeftoverPolicy::Refuse => "is refused",
                 LeftoverPolicy::Warn => "is ignored",
             };
-            Some(RetiredLeftover { setting_old_key: key, policy, line: format!("{found_in} {verdict}: {what}"), found_in })
+            Some(RetiredLeftover { setting_old_key: key, policy, line: format!("{found_in} {verdict}: {what}"), found_in, value: v })
         })
         .collect()
 }

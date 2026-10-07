@@ -15,8 +15,8 @@ opts: { [key in string]?: string }, captured_ts_ms: number,
  */
 gather_ms: number, exit_code: number | null, ansi_text: string, 
 /**
- * Non-empty only when something went to stderr, and never for a caller
- * that is not this machine (its stderr is withheld).
+ * Non-empty only when something went to stderr. A caller that is not
+ * this machine reads it redacted, as it reads stdout.
  */
 stderr_tail: string, 
 /**

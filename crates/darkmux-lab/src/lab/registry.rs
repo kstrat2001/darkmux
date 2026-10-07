@@ -84,6 +84,21 @@ pub(crate) fn orphan_signpost_line(orphan: &Path) -> String {
     )
 }
 
+/// (5.0) Every location the fixture registry names: the registry file, each
+/// registered fixture's path, and an orphaned project-local registry in the
+/// current directory. A console panel served to a viewer that is not this
+/// machine withholds them wherever a verb prints one. An unreadable registry
+/// names only itself.
+pub fn fixture_locations() -> Vec<String> {
+    let reg_path = default_registry_path(&crate::lab::paths::resolve(crate::lab::paths::ResolveScope::ForceUser));
+    let mut out: Vec<String> = LabRegistry::load(&reg_path)
+        .map(|r| r.fixtures.values().map(|f| f.path.display().to_string()).collect())
+        .unwrap_or_default();
+    out.extend(orphaned_project_local_registry(&reg_path).map(|p| p.display().to_string()));
+    out.push(reg_path.display().to_string());
+    out
+}
+
 /// Sidecar lock-file path for a registry at `path` (`<path>.lock`).
 /// `LabRegistry::with_locked` `flock(2)`s this rather than the registry
 /// itself so the load step never confuses an empty lock-created file

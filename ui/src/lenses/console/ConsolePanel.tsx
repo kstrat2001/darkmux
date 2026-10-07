@@ -967,9 +967,9 @@ function PanelBody(props: ComponentProps<typeof PanelBodyBase> & { keptOutput: b
  * what to run on that machine for the full output. It renders LAST, in its
  * own `.panelnote` — neutral, never `.panelerr` and never the failure
  * state, whatever the exit code: withholding is the expected shape of a
- * remote read, not a fault. That viewer's stderr is always withheld, so on a
- * failed exit with a notice the failure line names the exit status only and
- * makes no claim that nothing was written to stderr.
+ * remote read, not a fault. That viewer's stderr is redacted, never
+ * dropped, so it renders as this machine's does: a failed remote panel still
+ * says why.
  *
  * (#1911, opts-as-command-tokens redesign) `loading` is now
  * `query.isFetching && !stale` (`CliPanelView`'s own computation) — a
@@ -1022,13 +1022,9 @@ function PanelBodyBase({
           <div className={`${failed ? "panelerr" : "panelwarn"}${staleClass}`}>
             {hasStderr
               ? stderrTail
-              : hasNotice
-                ? typeof exitCode === "number"
-                  ? `command exited with status ${exitCode}`
-                  : "command did not exit cleanly (killed)"
-                : typeof exitCode === "number"
-                  ? `command exited with status ${exitCode} and printed nothing to stderr`
-                  : "command did not exit cleanly (killed) and printed nothing to stderr"}
+              : typeof exitCode === "number"
+                ? `command exited with status ${exitCode} and printed nothing to stderr`
+                : "command did not exit cleanly (killed) and printed nothing to stderr"}
           </div>
         )}
         {hasNotice && <div className={`panelnote${staleClass}`}>{withheld}</div>}

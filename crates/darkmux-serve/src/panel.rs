@@ -88,20 +88,25 @@
 //!   pointer or the fleet listener and allow-list; `doctor` still runs every
 //!   check and keeps every row and remedy, but its fleet listener, identity
 //!   and allow-list rows' detail is withheld; `flow status` withholds its
-//!   directories, the Redis URL and each hook's target. The remote form is
-//!   cached apart from this machine's (see [`audience_key`]).
-//! - **The daemon redacts the text, whatever the panel** ([`redact_for_remote`]):
-//!   `stderr_tail` is withheld (it carries the daemon's environment warnings
-//!   and resolver errors), every roster address (and its host part) reads
-//!   "(address hidden)", the daemon user's home prefix reads `~` (a
+//!   directories, the Redis URL and each hook's target; `lab fixture list`
+//!   withholds each fixture's path. The remote form is cached apart from this
+//!   machine's (see [`audience_key`]).
+//! - **The daemon redacts the text, whatever the panel** ([`redact_for_remote`]),
+//!   stdout and `stderr_tail` alike (stderr is redacted, not dropped, so a
+//!   failed panel still says why): every roster address (and its host part)
+//!   reads "(address hidden)", the daemon user's home prefix reads `~` (a
 //!   `DARKMUX_HOME` outside it reads `$DARKMUX_HOME`), and every value in
-//!   [`crate::panel_withheld`] (the addresses, paths, endpoint URLs and
-//!   credential pointers this machine's config, profile registry and
-//!   environment name) reads "(shown on this machine only)". Matches are whole
-//!   tokens only (stdout is split into escape sequences and text runs first,
-//!   each run is redacted on its own, and an OSC 8 link to a hidden target
-//!   loses its target), and a machine id or name is never hidden, only the
-//!   address behind it.
+//!   [`crate::panel_withheld`] (every address, path, endpoint URL and
+//!   credential pointer this machine is configured with) reads "(shown on
+//!   this machine only)". Matches are whole tokens only (stdout is split into
+//!   escape sequences and text runs first, each run is redacted on its own,
+//!   and an OSC 8 link to a hidden or withheld target loses its target), and a
+//!   machine, profile or endpoint name is never hidden, only the address
+//!   behind it.
+//!
+//! `doctor`'s manual-run floor is kept per [`Audience`]: a remote caller can
+//! neither close this machine's window nor make it probe more than once per
+//! window, because inside the remote window it is served the last remote run.
 //!
 //! Where anything was withheld, the response's `withheld` field carries ONE
 //! plain notice naming the command and this machine
@@ -793,7 +798,27 @@ pub(crate) struct PanelState {
     /// `MANUAL_MIN_INTERVAL` — rather than the bounded worst case the
     /// pre-#2479 `Instant`-only code had. The monotonic side bounds it
     /// back down to `MANUAL_MIN_INTERVAL` of real elapsed process time.
-    last_manual: Arc<tokio::sync::Mutex<HashMap<&'static str, (SystemTime, Instant)>>>,
+    ///
+    /// (5.0) Keyed by audience too: a caller that is not this machine runs
+    /// against its own window, so it can never hold this machine's doctor
+    /// closed (see [`Audience`]).
+    last_manual: Arc<tokio::sync::Mutex<HashMap<ManualKey, (SystemTime, Instant)>>>,
+}
+
+/// A manual-run floor window: one per panel (BASE id) and audience.
+type ManualKey = (&'static str, Audience);
+
+/// Who a panel run is for. A caller that is not this machine (and holds no
+/// token) is served the verb's remote form, redacted (see the module doc).
+/// The manual-run floor keeps a window per audience: a remote caller cannot
+/// close this machine's window, and inside its own window it is answered
+/// with the last remote run instead of a new probe (see [`run_panel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Audience {
+    /// This machine, or a caller holding the serve token: the full output.
+    Local,
+    /// Any other caller: the remote form, redacted.
+    Remote,
 }
 
 fn clamp_cols(cols: Option<u16>) -> u16 {
@@ -815,10 +840,15 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// `MANUAL_MIN_INTERVAL` by construction, not by convention. `doctor`
 /// declares no options today, so no live manual panel exercises the
 /// distinction yet — the signature itself is the guarantee.
-/// One admitted manual run's claim on the floor: the timestamps stored in
-/// [`PanelState::last_manual`]. A timed-out run hands it back to
-/// [`release_manual_run`], which gives back only a claim that is still its own.
-type ManualClaim = (SystemTime, Instant);
+/// One admitted manual run's claim on the floor: whose window it is, and the
+/// timestamps stored in [`PanelState::last_manual`]. A timed-out run hands it
+/// back to [`release_manual_run`], which gives back only a claim that is
+/// still its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManualClaim {
+    audience: Audience,
+    at: (SystemTime, Instant),
+}
 
 /// Admit one manual run, or refuse it — checking the floor and claiming it
 /// in ONE lock acquisition (#1919).
@@ -847,8 +877,8 @@ type ManualClaim = (SystemTime, Instant);
 ///
 /// There is no `.await` between the read and the insert, so a racer
 /// either observes the timestamp or genuinely arrived after the window.
-async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<ManualClaim, (StatusCode, String)> {
-    admit_manual_run_at(panels, id, SystemTime::now()).await
+async fn admit_manual_run(panels: &PanelState, id: &'static str, audience: Audience) -> Result<ManualClaim, (StatusCode, String)> {
+    admit_manual_run_at(panels, id, audience, SystemTime::now()).await
 }
 
 /// (#2479 audit, MUST FIX 4) `admit_manual_run` with `now` as an explicit
@@ -879,6 +909,7 @@ async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<Manua
 async fn admit_manual_run_at(
     panels: &PanelState,
     id: &'static str,
+    audience: Audience,
     now: SystemTime,
 ) -> Result<ManualClaim, (StatusCode, String)> {
     // (#2479 audit CONSIDER 6) The monotonic companion anchor is always
@@ -891,7 +922,7 @@ async fn admit_manual_run_at(
     // (backward jump), which none of them simulate.
     let now_instant = Instant::now();
     let mut last = panels.last_manual.lock().await;
-    if let Some(&(prev, prev_instant)) = last.get(id) {
+    if let Some(&(prev, prev_instant)) = last.get(&(id, audience)) {
         let monotonic_elapsed = now_instant.duration_since(prev_instant);
         if let Some(remaining) = manual_floor_wait(prev, now, monotonic_elapsed, MANUAL_MIN_INTERVAL) {
             let wait = remaining.as_secs() + 1;
@@ -908,8 +939,8 @@ async fn admit_manual_run_at(
         }
     }
     // Claim the window under the SAME guard that just cleared it.
-    let claim = (now, now_instant);
-    last.insert(id, claim);
+    let claim = ManualClaim { audience, at: (now, now_instant) };
+    last.insert((id, audience), claim.at);
     Ok(claim)
 }
 
@@ -1029,21 +1060,22 @@ async fn resolve_selection(
 
 /// The ONE output filter for a caller that is not this machine or a token
 /// holder, applied to every panel's response whatever the panel (the verb has
-/// already rendered its remote form, see the module doc): `stderr_tail` is
-/// withheld (it carries the daemon's environment warnings and resolver
-/// errors), roster addresses in stdout read "(address hidden)", the daemon
-/// user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
+/// already rendered its remote form, see the module doc), to stdout and
+/// stderr alike: roster addresses read "(address hidden)", the daemon user's
+/// home prefix reads `~` (a `DARKMUX_HOME` outside it reads
 /// `$DARKMUX_HOME`), and every value in `w` ([`crate::panel_withheld`]) reads
-/// "(shown on this machine only)". Matches are whole tokens only, and a
-/// machine id or name is never hidden. When anything was withheld (here, or
-/// by the verb's remote form), `withheld` carries the one notice naming the
-/// command and `machine`.
+/// "(shown on this machine only)". stderr is redacted, not dropped, so a
+/// panel that failed still tells the remote viewer why. Matches are whole
+/// tokens only, and a machine id or name is never hidden. When anything was
+/// withheld (here, or by the verb's remote form), `withheld` carries the one
+/// notice naming the command and `machine`.
 fn redact_for_remote(body: &mut PanelResponse, r: &Redaction, w: &Withheld, machine: Option<&str>) {
-    let mut withheld = !body.stderr_tail.is_empty();
-    body.stderr_tail.clear();
-    let shown = redact_panel_stdout(&body.ansi_text, r, w);
-    withheld |= shown != body.ansi_text || shown.contains(panel_audience::WITHHELD);
-    body.ansi_text = shown;
+    let mut withheld = false;
+    for text in [&mut body.ansi_text, &mut body.stderr_tail] {
+        let shown = redact_panel_stdout(text, r, w);
+        withheld |= shown != *text || shown.contains(panel_audience::WITHHELD);
+        *text = shown;
+    }
     body.withheld = if withheld {
         panel_audience::notice(&format!("darkmux {}", body.argv.join(" ")), machine)
     } else {
@@ -1073,8 +1105,15 @@ pub(crate) async fn panel_handler(
     let remote = !crate::caller_is_local_or_holds_token(peer.map(|c| c.0), &headers);
     let mut body = run_panel(&id, raw_query.0, params.0, remote, &headers, &state).await?;
     if remote {
-        let machine = darkmux_flow::resolve_machine_id();
-        redact_for_remote(&mut body, &Redaction::derive(), &crate::panel_withheld(), machine.as_deref());
+        // Both sets read the disk (the roster, config.json, the profile and
+        // fixture registries), so they are derived off the async runtime, and
+        // reused while what they read is unchanged (see `redaction`'s caches).
+        let (r, w, machine) = tokio::task::spawn_blocking(|| {
+            (Redaction::derive_cached(), crate::redaction::panel_withheld_cached(), darkmux_flow::resolve_machine_id())
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("redacting panel \"{id}\": {e}\n")))?;
+        redact_for_remote(&mut body, &r, &w, machine.as_deref());
     }
     Ok(axum::Json(body))
 }
@@ -1118,8 +1157,20 @@ async fn run_panel(
 
     // Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
     // — see `admit_manual_run`'s own doc for why that must never be the
-    // variant key.
-    let claim = if spec.auto_refresh { None } else { Some(admit_manual_run(&state.panels, id).await?) };
+    // variant key — and by audience. A remote caller inside its window is
+    // answered with the last remote run, never a new probe: polling from
+    // the tailnet can neither close this machine's window nor make it probe
+    // more than once per window.
+    let audience = if remote { Audience::Remote } else { Audience::Local };
+    let claim = if spec.auto_refresh {
+        None
+    } else {
+        match admit_manual_run(&state.panels, id, audience).await {
+            Ok(claim) => Some(claim),
+            Err(refused) if remote => return last_remote_run(&state.panels, &key).await.ok_or(refused),
+            Err(refused) => return Err(refused),
+        }
+    };
 
     // Serve fresh-enough cache without spawning.
     if let Some(body) = cached_if_fresh(&state.panels, &key, spec.cache_ttl).await {
@@ -1220,7 +1271,7 @@ async fn run_panel(
         auto_refresh: spec.auto_refresh,
     };
 
-    if spec.cache_ttl.is_zero() {
+    if spec.cache_ttl.is_zero() && !remote {
         // Manual panel: nothing cached (an explicit run is a real run), but
         // the floor's clock advances so the next caller is bounded. Keyed
         // by BASE id — see `admit_manual_run`'s own doc.
@@ -1228,6 +1279,9 @@ async fn run_panel(
         // window when it admitted this run. Recording again on completion
         // would extend the floor by the spawn's own duration.
     } else {
+        // A manual panel's REMOTE run is kept (under its remote key) as the
+        // last remote run, which a remote caller inside the window reads
+        // ([`last_remote_run`]); `cached_if_fresh` never serves it, TTL 0.
         let mut cache = state.panels.cache.lock().await;
         cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
     }
@@ -1306,8 +1360,9 @@ async fn run_child(
 /// window opened holds its own claim, and this one must not erase it.
 async fn release_manual_run(panels: &PanelState, id: &'static str, claim: ManualClaim) {
     let mut last = panels.last_manual.lock().await;
-    if last.get(id) == Some(&claim) {
-        last.remove(id);
+    let key = (id, claim.audience);
+    if last.get(&key) == Some(&claim.at) {
+        last.remove(&key);
     }
 }
 
@@ -1352,6 +1407,17 @@ fn capped_stdout(stdout: &str) -> String {
         cut,
         stdout.len()
     )
+}
+
+/// The last remote run of a manual panel, with `age_ms` saying how old it is:
+/// what a remote caller inside the panel's floor window is served instead of
+/// a new probe. `None` when no remote run has finished yet.
+async fn last_remote_run(panels: &PanelState, key: &str) -> Option<PanelResponse> {
+    let cache = panels.cache.lock().await;
+    let entry = cache.get(key)?;
+    let mut body = entry.body.clone();
+    body.age_ms = cache_entry_age_ms_at(entry.captured, SystemTime::now());
+    Some(body)
 }
 
 /// Serve the cached body if it is within `ttl`, with `age_ms` restamped so
@@ -2008,7 +2074,7 @@ mod tests {
             let p = panels.clone();
             let a = admitted.clone();
             handles.push(tokio::spawn(async move {
-                if admit_manual_run(&p, "doctor").await.is_ok() {
+                if admit_manual_run(&p, "doctor", Audience::Local).await.is_ok() {
                     a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }));
@@ -2075,14 +2141,14 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_is_open_before_any_run_is_recorded() {
         let panels = PanelState::default();
-        assert!(admit_manual_run(&panels, "doctor").await.is_ok());
+        assert!(admit_manual_run(&panels, "doctor", Audience::Local).await.is_ok());
     }
 
     #[tokio::test]
     async fn manual_floor_fires_on_the_second_call_within_the_window() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
-        let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
+        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
+        let err = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
         assert!(err.1.contains("floored"), "{}", err.1);
     }
@@ -2090,9 +2156,9 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_is_independent_per_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
+        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
         // A DIFFERENT base id must not be floored by doctor's own run.
-        assert!(admit_manual_run(&panels, "some-other-manual-panel").await.is_ok());
+        assert!(admit_manual_run(&panels, "some-other-manual-panel", Audience::Local).await.is_ok());
     }
 
     /// (#2479 audit, MUST FIX 4) The floor OPENING, through the REAL
@@ -2112,20 +2178,20 @@ mod tests {
     async fn admit_manual_run_at_opens_the_floor_through_the_real_call_site_after_the_window() {
         let panels = PanelState::default();
         let prev = SystemTime::now();
-        panels.last_manual.lock().await.insert("doctor", (prev, Instant::now()));
+        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (prev, Instant::now()));
         // Immediately after: still floored (sanity check this scenario
         // actually starts floored, so the assertion below is meaningful).
         assert!(
-            admit_manual_run_at(&panels, "doctor", prev + Duration::from_secs(1)).await.is_err(),
+            admit_manual_run_at(&panels, "doctor", Audience::Local, prev + Duration::from_secs(1)).await.is_err(),
             "sanity: 1s after the previous run must still be floored"
         );
 
         // Reset, then check well past the window — through the SAME real
         // call site, not the pure function.
-        panels.last_manual.lock().await.insert("doctor", (prev, Instant::now()));
+        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (prev, Instant::now()));
         let well_past_the_window = prev + MANUAL_MIN_INTERVAL + Duration::from_secs(5);
         assert!(
-            admit_manual_run_at(&panels, "doctor", well_past_the_window).await.is_ok(),
+            admit_manual_run_at(&panels, "doctor", Audience::Local, well_past_the_window).await.is_ok(),
             "the floor must open once MANUAL_MIN_INTERVAL of real elapsed time has passed, \
              through the actual admission path a real request takes: an argument swap in the \
              manual_floor_wait call site would floor this forever"
@@ -2154,9 +2220,9 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_stays_floored_across_repeated_checks_on_one_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
+        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
         for _ in 0..3 {
-            let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
+            let err = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err();
             assert_eq!(
                 err.0,
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2518,12 +2584,12 @@ mod tests {
         let panels = PanelState::default();
         let mut spec = panel_spec("doctor").unwrap();
         spec.spawn_timeout = Duration::from_millis(50);
-        let claim = admit_manual_run(&panels, spec.id).await.unwrap();
+        let claim = admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap();
         let (status, body) = run_child(&panels, &spec, Some(claim), sleeping_child()).await.unwrap_err();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(body.contains("slow"), "{body}");
         assert!(!body.contains("wedged"), "{body}");
-        admit_manual_run(&panels, spec.id).await.expect("the timeout must give the manual-run window back");
+        admit_manual_run(&panels, spec.id, Audience::Local).await.expect("the timeout must give the manual-run window back");
     }
 
     /// An auto-refresh panel's timeout has no floor to release, and its
@@ -2543,11 +2609,11 @@ mod tests {
     async fn a_finished_manual_spawn_still_holds_the_floor() {
         let panels = PanelState::default();
         let spec = panel_spec("doctor").unwrap();
-        let claim = admit_manual_run(&panels, spec.id).await.unwrap();
+        let claim = admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap();
         let mut ok = tokio::process::Command::new("true");
         ok.kill_on_drop(true);
         run_child(&panels, &spec, Some(claim), ok).await.unwrap();
-        assert_eq!(admit_manual_run(&panels, spec.id).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
@@ -2707,16 +2773,25 @@ mod tests {
         redact_for_remote(body, r, &Withheld::default(), Some("studio"));
     }
 
+    /// (5.0 review item 7) A remote caller reads stderr REDACTED, never
+    /// dropped: a failed panel still says why, with the same facts withheld
+    /// as from stdout.
     #[test]
-    fn a_remote_caller_sees_no_roster_address_no_home_path_and_no_stderr() {
+    fn a_remote_caller_reads_stderr_redacted_with_no_roster_address_or_home_path() {
         let mut body = probe_body();
-        remote_view(&mut body, &redaction());
+        let w = Withheld::from_values(["/opt/fake/bin/lms".to_string()]);
+        body.stderr_tail.push_str("\nerror: `/opt/fake/bin/lms` was not found");
+        redact_for_remote(&mut body, &redaction(), &w, Some("studio"));
         let all = format!("{}{}", body.ansi_text, body.stderr_tail);
-        assert!(!all.contains("tailnet.example"), "{all}");
-        assert!(!all.contains("/Users/"), "{all}");
+        assert!(!all.contains("tailnet.example") && !all.contains("/Users/") && !all.contains("/opt/fake"), "{all}");
         assert!(body.ansi_text.contains("at \x1b[2m(address hidden)\x1b[0m"), "{}", body.ansi_text);
         assert!(body.ansi_text.contains("\x1b[2m~/.darkmux/fleet.json\x1b[0m"), "{}", body.ansi_text);
-        assert_eq!(body.stderr_tail, "", "stderr is withheld, never shown");
+        assert_eq!(
+            body.stderr_tail,
+            "the roster address for peerone (`(address hidden)`) does not resolve\nwarning: env var X (~/notebook) is ignored\n\
+             error: `(shown on this machine only)` was not found",
+            "stderr is shown redacted"
+        );
         assert_eq!(body.withheld, panel_audience::notice("darkmux machine status", Some("studio")));
     }
 
@@ -2916,7 +2991,7 @@ mod tests {
         let remote = served_to("100.64.1.2:50000", "localhost:8765").await;
         let all = format!("{}{}", remote.ansi_text, remote.stderr_tail);
         assert!(!all.contains("tailnet.example") && !all.contains("/Users/"), "{all}");
-        assert_eq!(remote.stderr_tail, "");
+        assert!(remote.stderr_tail.contains("does not resolve"), "stderr is shown redacted: {}", remote.stderr_tail);
         assert!(!remote.withheld.is_empty());
 
         let local = served_to("127.0.0.1:50000", "localhost:8765").await;
@@ -2949,13 +3024,13 @@ mod tests {
         let panels = PanelState::default();
         let mut spec = panel_spec("doctor").unwrap();
         spec.spawn_timeout = Duration::from_millis(50);
-        let first = admit_manual_run_at(&panels, "doctor", SystemTime::now() - Duration::from_secs(120)).await.unwrap();
+        let first = admit_manual_run_at(&panels, "doctor", Audience::Local, SystemTime::now() - Duration::from_secs(120)).await.unwrap();
         // A second run is admitted (the first's window long open) and claims the floor.
-        let second = admit_manual_run(&panels, "doctor").await.unwrap();
+        let second = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap();
         assert_ne!(first, second);
         // The first run now times out: it must not release the second's claim.
         run_child(&panels, &spec, Some(first), sleeping_child()).await.unwrap_err();
-        assert_eq!(admit_manual_run(&panels, "doctor").await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// ONE state: a remote caller is served through the spawn path, then this
@@ -3010,10 +3085,57 @@ mod tests {
         );
     }
 
+    /// (5.0 review item 4) A caller that is not this machine can neither lock
+    /// this machine out of `doctor` nor make it probe on demand. The
+    /// manual-run floor is kept per audience, so a remote run never claims
+    /// this machine's window; and a remote caller inside the remote window is
+    /// served the last remote run (its `age_ms` says how old) rather than a
+    /// new probe. This machine's own floor is unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_remote_caller_cannot_floor_this_machines_doctor_or_probe_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs.log");
+        let child = dir.path().join("child.sh");
+        std::fs::write(&child, format!("#!/bin/sh\necho run >> '{}'\necho \"doctor [$DARKMUX_PANEL_AUDIENCE]\"\n", runs.display())).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
+        std::fs::remove_file(&runs).unwrap();
+        let mut state = app_state();
+        state.panels.child_exe = Some(child.clone());
+        let serve = |peer: &'static str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(PANEL_HEADER, "1".parse().unwrap());
+            headers.insert("host", "localhost:8765".parse().unwrap());
+            panel_handler(
+                Path("doctor".to_string()),
+                axum::extract::RawQuery(None),
+                Query(HashMap::new()),
+                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                headers,
+                State(state.clone()),
+            )
+        };
+        let spawned = || std::fs::read_to_string(&runs).map(|t| t.lines().count()).unwrap_or(0);
+        let remote = serve("100.64.1.2:50000").await.expect("a remote caller runs doctor").0;
+        assert!(remote.ansi_text.contains("doctor [remote]"), "{}", remote.ansi_text);
+        let local = serve("127.0.0.1:50000").await;
+        assert!(local.is_ok(), "a remote run must not floor this machine's doctor: {:?}", local.err());
+        assert!(local.unwrap().0.ansi_text.contains("doctor []"));
+        assert_eq!(spawned(), 2);
+        let again = serve("100.64.9.9:50000").await.expect("a remote caller inside the window is answered").0;
+        assert_eq!(spawned(), 2, "a remote caller inside the window does not start a probe");
+        assert_eq!(again.ansi_text, remote.ansi_text, "it reads the last remote run");
+        let (code, _) = serve("127.0.0.1:50000").await.expect_err("this machine's own floor still holds");
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    }
+
     /// (5.0) EVERY registered panel, served through the real handler and spawn
     /// path to a viewer that is not this machine: 200 (never a refusal for
     /// being remote), the child told to render its remote form, the shared
-    /// redaction applied, stderr withheld, and one calm notice naming the
+    /// redaction applied, stderr shown redacted, and one calm notice naming the
     /// command and this machine. This machine gets the child's own output,
     /// with no remote form asked for and nothing withheld. A panel added to
     /// the table is in `PANEL_IDS`, so it cannot skip this.
@@ -3077,8 +3199,8 @@ mod tests {
             if text.contains("example-host") {
                 failures.push(format!("{id}: a roster address reached a remote caller: {text}"));
             }
-            if remote["stderr_tail"] != "" {
-                failures.push(format!("{id}: stderr reached a remote caller: {}", remote["stderr_tail"]));
+            if remote["stderr_tail"] != "warning: something local" {
+                failures.push(format!("{id}: a remote caller did not read stderr (redacted): {}", remote["stderr_tail"]));
             }
             let notice = remote["withheld"].as_str().unwrap_or_default();
             let command = format!("darkmux {}", panel_spec(id).unwrap().argv.join(" "));

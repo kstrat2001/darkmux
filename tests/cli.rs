@@ -14091,6 +14091,8 @@ const CONSOLE_SECRETS: &[&str] = &[
     "myres-secret",
     "azure-key-item",
     "8766",
+    "/Volumes/FakeWork",
+    "hosted-secret",
 ];
 
 /// Write a config, a roster and a profile registry that name the fixture's
@@ -14104,7 +14106,8 @@ fn write_console_fixture(darkmux_home: &std::path::Path) {
   "lms_bin": "/opt/fake/bin/lms",
   "dirs": { "flows": "/srv/fakeflows" },
   "redis": { "enabled": false, "host": "100.64.77.9", "port": 6379 },
-  "runtime": { "daemon_cors_origins": "https://studio.tailnet-example.ts.net" },
+  "runtime": { "daemon_cors_origins": "https://studio.tailnet-example.ts.net", "max_turns": "/opt/fake-wrongtype-path" },
+  "future_key": "/opt/fake-unknown-value",
   "fleet": {
     "mode": "standalone",
     "identity": { "provider": "tailscale", "bin": "/Applications/Tailscale.app/Contents/MacOS/Tailscale" },
@@ -14123,10 +14126,27 @@ fn write_console_fixture(darkmux_home: &std::path::Path) {
     .unwrap();
     fs::write(
         darkmux_home.join("profiles.json"),
-        r#"{"profiles":{"fast":{"description":"fast","models":[{"id":"qwen-fake","n_ctx":32768}]}},"endpoints":{"azure":{"url":"https://myres-secret.openai.azure.com/v1","auth":{"type":"api-key","keychain":"azure-key-item"}}}}"#,
+        r#"{"profiles":{"fast":{"description":"fast","models":[{"id":"qwen-fake","n_ctx":32768}]},"cloud":{"description":"cloud","models":[{"id":"gpt-fake","endpoint":"hosted"}]},"relayed":{"description":"relayed","models":[{"id":"gpt-fake","endpoint":"relay"}]}},"endpoints":{"azure":{"url":"https://myres-secret.openai.azure.com/v1","auth":{"type":"api-key","keychain":"azure-key-item"}},"hosted":{"url":"https://hosted-secret.example.com/v1","auth":{"type":"bearer","keychain":"hosted"}},"relay":{"url":"https://hosted-secret.example.com/relay","auth":{"type":"bearer","key_env":"laptop"}}}}"#,
+    )
+    .unwrap();
+    // Two registered lab fixtures, at absolute paths outside every home.
+    fs::write(
+        darkmux_home.join("lab-registry.json"),
+        r#"{"fixtures":{"alpha":{"path":"/opt/fake-fixtures/alpha","content_hash":"h1","hashed_at":"2026-01-01T00:00:00Z","manifest_version":"1"},"beta":{"path":"/Volumes/FakeWork/beta","content_hash":"h2","hashed_at":"2026-01-01T00:00:00Z","manifest_version":"2"}}}"#,
     )
     .unwrap();
 }
+
+/// Settings that exist only in the environment (no `config.json` key, or a
+/// directory override), each pointing outside every home directory.
+const CONSOLE_ENV_ONLY: &[(&str, &str)] = &[
+    ("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-hostsrc/scenario.json"),
+    ("DARKMUX_FINDINGS_DIR", "/opt/fake-findings"),
+    ("DARKMUX_MODS_DIR", "/opt/fake-mods"),
+    ("DARKMUX_TEMPLATES_DIR", "/opt/fake-templates"),
+    ("DARKMUX_SKILLS_DIR", "/opt/fake-skills"),
+    ("DARKMUX_IDENTITY_PATH", "/opt/fake-identity/identity.md"),
+];
 
 /// The value of `key` a built spawn sets.
 fn spawn_env(cmd: &std::process::Command, key: &str) -> std::path::PathBuf {
@@ -14164,7 +14184,8 @@ fn console_env(cmd: &mut std::process::Command) {
         .env("DARKMUX_LMS_BIN", "/opt/fake/bin/lms")
         .env("DARKMUX_FLOWS_DIR", &flows)
         .env("DARKMUX_DAEMON_CORS_ORIGINS", "https://studio.tailnet-example.ts.net")
-        .env("DARKMUX_MACHINE_ID", "studio");
+        .env("DARKMUX_MACHINE_ID", "studio")
+        .envs(CONSOLE_ENV_ONLY.iter().copied());
 }
 
 /// Escape sequences out: a check for a fact must not be split by a color.
@@ -14253,7 +14274,10 @@ fn doctor_keeps_its_rows_and_withholds_the_execution_surface_from_a_remote_viewe
     assert!(remote.contains("lms binary"), "{remote}");
     assert!(remote.contains("→"), "remedies stay: {remote}");
     let local = console_run(&["doctor", "-v"], false, &listener);
-    for s in ["8766", "fake-image", "/opt/fake"] {
+    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
+    // the typed load, so this machine's `fleet trust` row names the value in
+    // its parse error; the remote form above names it nowhere.
+    for s in ["8766", "/opt/fake-wrongtype-path", "/opt/fake"] {
         assert!(local.contains(s), "this machine reads `{s}` in doctor:\n{local}");
     }
     assert!(names_tmpdir(&local), "this machine reads its temp directory:\n{local}");
@@ -14277,7 +14301,10 @@ fn flow_status_withholds_its_directories_from_a_remote_viewer() {
 /// viewer that is not this machine with 200, never a refusal for being remote,
 /// and none of its output names a fixture secret, a tailnet name or a home
 /// path. Where something was withheld the response says so, calmly, in
-/// `withheld`, and the diagnostics on stderr are never shown.
+/// `withheld`. A panel's diagnostics on stderr reach the remote viewer
+/// redacted, so a failed panel still says why. The public names (machines,
+/// endpoints, profiles, fixtures) stay readable even where a credential
+/// pointer is spelled the same.
 #[test]
 fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full() {
     let port = {
@@ -14309,6 +14336,7 @@ fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full(
         };
         (code, serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)))
     };
+    let text_of = |body: &serde_json::Value| strip_escapes(body["ansi_text"].as_str().unwrap_or_default());
 
     let table: Vec<serde_json::Value> = serde_json::from_str(
         &fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src/lenses/console/panel-table.generated.json"))
@@ -14318,19 +14346,56 @@ fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full(
     let ids: Vec<String> = table.iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
     assert!(ids.len() >= 10 && ids.iter().any(|i| i == "doctor"), "{ids:?}");
     let scratch = home.parent().unwrap().to_string_lossy().to_string();
+    let mut failures = Vec::new();
+    let mut remote_bodies = std::collections::BTreeMap::new();
     for id in &ids {
         let (code, body) = get(id, true);
-        assert_eq!(code, 200, "panel {id} refused a remote viewer: {body}");
+        if code != 200 {
+            failures.push(format!("panel {id} refused a remote viewer: {code} {body}"));
+            continue;
+        }
         let shown = strip_escapes(&format!(
             "{}\n{}\n{}",
             body["ansi_text"].as_str().unwrap(),
             body["stderr_tail"].as_str().unwrap(),
             body["withheld"].as_str().unwrap_or_default()
         ));
-        assert_no_console_secret(id, &shown);
-        assert!(!shown.contains(".ts.net") && !shown.contains("/Users/") && !shown.contains(&scratch), "panel {id}: {shown}");
-        assert_eq!(body["stderr_tail"], "", "panel {id}: a remote viewer never reads stderr");
+        for s in CONSOLE_SECRETS.iter().chain(&[".ts.net", "/Users/", scratch.as_str()]) {
+            if shown.contains(s) {
+                failures.push(format!("panel {id} shows `{s}` to a remote viewer:\n{shown}"));
+            }
+        }
+        eprintln!("REMOTEDUMP {id}:\n{shown}\nENDDUMP");
+        remote_bodies.insert(id.clone(), body);
     }
+    // A failed panel still says why: its stderr reaches the remote viewer
+    // redacted, not dropped (`machine status` cannot run the fixture's `lms`).
+    if let Some(body) = remote_bodies.get("machine-status") {
+        let (_, local) = get("machine-status", false);
+        let (local_err, remote_err) = (local["stderr_tail"].as_str().unwrap_or_default(), body["stderr_tail"].as_str().unwrap_or_default());
+        if local_err.is_empty() || remote_err.is_empty() {
+            failures.push(format!("machine-status: the reason it failed is not shown to a remote viewer: local {local_err:?}, remote {remote_err:?}"));
+        }
+    }
+    // Public names stay readable, even where a credential pointer is spelled
+    // the same (`hosted`'s Keychain item is `hosted`; `relay`'s key variable
+    // is `laptop`, a roster machine's name).
+    for (id, names) in [("profile-list", &["cloud", "relayed", "hosted", "relay"][..]), ("machine-list", &["laptop", "peer2"][..]), ("lab-fixture-list", &["alpha", "beta"][..])] {
+        let text = remote_bodies.get(id).map(text_of).unwrap_or_default();
+        for name in names {
+            if !text.split(|c: char| !(c.is_alphanumeric() || c == '-')).any(|w| w == *name) {
+                failures.push(format!("{id}: the public name `{name}` is not shown to a remote viewer:\n{text}"));
+            }
+        }
+    }
+    // This machine reads the fixtures' paths.
+    let (_, local_fixtures) = get("lab-fixture-list", false);
+    for s in ["/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta"] {
+        if !text_of(&local_fixtures).contains(s) {
+            failures.push(format!("this machine does not read `{s}`: {local_fixtures}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     // A panel that withheld something says so, calmly, naming the command.
     let (_, config) = get("config-list", true);
     let notice = config["withheld"].as_str().unwrap_or_default();

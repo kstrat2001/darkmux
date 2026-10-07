@@ -14,11 +14,12 @@
 //!   reads [`WITHHELD`]. Shaping happens on the data, before the verb wraps
 //!   and colors it, so no fact can be split across a line break and slip
 //!   through.
-//! - **The daemon redacts every panel's text.** Roster addresses, tailnet
-//!   names, IP literals and home directories (`darkmux-serve`'s shared
-//!   redaction), plus every value in [`Withheld`]: the addresses, paths,
-//!   endpoint URLs and credential pointers this machine's config, profile
-//!   registry and environment name. stderr is never shown.
+//! - **The daemon redacts every panel's text,** stdout and stderr alike
+//!   (stderr is redacted, never dropped, so a failed panel still says why).
+//!   Roster addresses, tailnet names, IP literals and home directories
+//!   (`darkmux-serve`'s shared redaction), plus every value in [`Withheld`]:
+//!   the addresses, paths, endpoint URLs and credential pointers this machine
+//!   is configured with (see `darkmux_serve::panel_withheld`).
 //!
 //! Where anything was withheld the response carries ONE plain notice
 //! ([`notice`]), the same sentence for every panel. Doctor still runs every
@@ -84,11 +85,23 @@ impl Kind {
 
 /// `config.json` paths a remote viewer is not shown, each with why. A pattern
 /// is dotted segments; `*` matches any key of a map, `[]` follows a list's
-/// name. A pattern withholds everything under it.
+/// name. A pattern withholds everything under it. Every leaf the schema has
+/// is named here or in [`CONFIG_SHOWN`] by its own path, even under a prefix
+/// that withholds it whole, so a new field is a decision about its kind (and
+/// so whether it is hidden wherever else it prints), never an inheritance.
 pub const CONFIG_WITHHELD: &[(&str, Kind)] = &[
     ("lms_bin", Kind::Path),
     ("lmstudio_url", Kind::Url),
     ("dirs", Kind::Path),
+    ("dirs.audit", Kind::Path),
+    ("dirs.findings", Kind::Path),
+    ("dirs.fleet_file", Kind::Path),
+    ("dirs.flows", Kind::Path),
+    ("dirs.identity", Kind::Path),
+    ("dirs.lab", Kind::Path),
+    ("dirs.mods", Kind::Path),
+    ("dirs.skills", Kind::Path),
+    ("dirs.templates", Kind::Path),
     ("redis.host", Kind::Address),
     ("redis.port", Kind::ExecutionSurface),
     ("audit.dir", Kind::Path),
@@ -103,10 +116,16 @@ pub const CONFIG_WITHHELD: &[(&str, Kind)] = &[
     ("fleet.accept_work.*", Kind::ExecutionSurface),
     ("fleet.accept_work.*.node_id", Kind::Identity),
     ("fleet.accept_work.*.repos", Kind::Url),
+    ("fleet.accept_work.*.images", Kind::ExecutionSurface),
+    ("fleet.accept_work.*.profiles", Kind::ExecutionSurface),
+    ("fleet.accept_work.*.roles", Kind::ExecutionSurface),
+    ("fleet.accept_work.*.workspace", Kind::ExecutionSurface),
     ("hooks.outbox_dir", Kind::Path),
     ("hooks.rules[].http", Kind::Url),
     ("hooks.rules[].file", Kind::Path),
     ("hooks.rules[].headers", Kind::Credential),
+    ("hooks.rules[].headers.*", Kind::Credential),
+    ("hooks.rules[].headers.*.keychain_item", Kind::Credential),
     ("hooks.rules[].signing_secret_keychain_item", Kind::Credential),
     ("hooks.rules[].transform", Kind::FreeText),
 ];
@@ -203,7 +222,9 @@ fn prefix_match(pattern: &str, path: &[String]) -> bool {
 }
 
 /// What a remote viewer is shown of the `config.json` value at `path` (dotted
-/// segments; a list item's segment is its list's name plus `[]`).
+/// segments; a list item's segment is its list's name plus `[]`), judged by
+/// the key alone. [`shape_config_json`] also withholds a shown key whose
+/// value has the wrong type.
 pub fn config_verdict(path: &[String]) -> Verdict {
     let withheld = CONFIG_WITHHELD
         .iter()
@@ -227,114 +248,140 @@ fn withheld_whole(path: &[String]) -> bool {
     CONFIG_WITHHELD.iter().any(|(p, _)| prefix_match(p, path))
 }
 
-/// `config.json` as a remote viewer reads it: every value [`config_verdict`]
-/// does not show reads [`WITHHELD`]; keys, and the values it shows, stay.
-/// Returns whether anything was withheld.
-pub fn shape_config_json(root: &mut Value) -> bool {
-    fn walk(v: &mut Value, path: &mut Vec<String>) -> bool {
-        if !path.is_empty() && withheld_whole(path) {
-            *v = Value::String(WITHHELD.to_string());
-            return true;
-        }
-        match v {
-            Value::Object(map) => {
-                let mut any = false;
-                for (k, child) in map.iter_mut() {
-                    path.push(k.clone());
-                    any |= walk(child, path);
-                    path.pop();
-                }
-                any
-            }
-            Value::Array(items) => {
-                let Some(last) = path.pop() else { return false };
-                path.push(format!("{last}[]"));
-                let mut any = false;
-                for item in items.iter_mut() {
-                    any |= walk_item(item, path);
-                }
-                path.pop();
-                path.push(last);
-                any
-            }
-            _ => match config_verdict(path) {
-                Verdict::Shown => false,
-                Verdict::Withheld(_) => {
-                    *v = Value::String(WITHHELD.to_string());
-                    true
-                }
-            },
-        }
-    }
-    /// A list item: its path is the list's (`...[]`); a scalar item takes
-    /// the list's own verdict.
-    fn walk_item(v: &mut Value, path: &mut Vec<String>) -> bool {
-        match v {
-            Value::Object(_) => walk(v, path),
-            _ => {
-                let mut list = path.clone();
-                if let Some(last) = list.last_mut() {
-                    *last = last.trim_end_matches("[]").to_string();
-                }
-                if withheld_whole(path) || config_verdict(&list) != Verdict::Shown {
-                    *v = Value::String(WITHHELD.to_string());
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-    walk(root, &mut Vec::new())
+/// The paths (as the user-file gate writes them: `runtime.max_turns`,
+/// `hooks.rules[0].http`) of every value in `root` whose JSON type
+/// `config.json`'s schema does not accept. What such a value holds is not
+/// what its key means, so a key that is shown is not shown with it.
+fn wrong_typed(root: &Value) -> std::collections::HashSet<String> {
+    use crate::user_files::{config_retired, key_issues, Issue};
+    key_issues::<crate::config::DarkmuxConfig>(root, &config_retired)
+        .into_iter()
+        .filter(|k| matches!(k.issue, Issue::WrongType { .. }))
+        .map(|k| k.path)
+        .collect()
 }
 
-/// Every string in `config.json` whose kind [`Kind::scrubbed`]: what a remote
-/// viewer must not read anywhere a panel prints it.
-pub fn config_scrub_values(root: &Value) -> Vec<String> {
-    fn walk(v: &Value, path: &mut Vec<String>, out: &mut Vec<String>) {
+/// One step down from a value: its pattern path (`hooks.rules[].http`, for the
+/// tables) and its display path (`hooks.rules[0].http`, as the user-file gate
+/// names it).
+#[derive(Clone)]
+struct At {
+    pattern: Vec<String>,
+    display: String,
+}
+
+impl At {
+    fn root() -> Self {
+        Self { pattern: Vec::new(), display: String::new() }
+    }
+
+    fn key(&self, k: &str) -> Self {
+        let mut pattern = self.pattern.clone();
+        pattern.push(k.to_string());
+        Self { pattern, display: crate::user_files::join_display(&self.display, k) }
+    }
+
+    /// Item `i` of the list at `self`.
+    fn item(&self, i: usize) -> Self {
+        let mut pattern = self.pattern.clone();
+        if let Some(last) = pattern.last_mut() {
+            last.push_str("[]");
+        }
+        Self { pattern, display: format!("{}[{i}]", self.display) }
+    }
+
+    /// A scalar list item's verdict is its list's.
+    fn verdict(&self) -> Verdict {
+        let mut list = self.pattern.clone();
+        if let Some(last) = list.last_mut() {
+            *last = last.trim_end_matches("[]").to_string();
+        }
+        config_verdict(&list)
+    }
+}
+
+/// `config.json` as a remote viewer reads it: every value [`config_verdict`]
+/// does not show, and every value of the wrong type, reads [`WITHHELD`];
+/// keys, and the values it shows, stay. Returns whether anything was
+/// withheld.
+pub fn shape_config_json(root: &mut Value) -> bool {
+    fn walk(v: &mut Value, at: &At, wrong: &std::collections::HashSet<String>) -> bool {
+        let withhold = |v: &mut Value| {
+            *v = Value::String(WITHHELD.to_string());
+            true
+        };
+        if !at.pattern.is_empty() && (withheld_whole(&at.pattern) || wrong.contains(&at.display)) {
+            return withhold(v);
+        }
         match v {
-            Value::Object(map) => {
-                for (k, child) in map {
-                    path.push(k.clone());
-                    walk(child, path, out);
-                    path.pop();
-                }
-            }
-            Value::Array(items) => {
-                let Some(last) = path.pop() else { return };
-                path.push(format!("{last}[]"));
-                for item in items {
-                    if item.is_object() {
-                        walk(item, path, out);
-                    } else if let Some(s) = item.as_str() {
-                        let mut list = path.clone();
-                        if let Some(l) = list.last_mut() {
-                            *l = l.trim_end_matches("[]").to_string();
-                        }
-                        if matches!(config_verdict(&list), Verdict::Withheld(Some(k)) if k.scrubbed()) {
-                            out.push(s.to_string());
-                        }
-                    }
-                }
-                path.pop();
-                path.push(last);
-            }
-            Value::String(s) => {
-                if matches!(config_verdict(path), Verdict::Withheld(Some(k)) if k.scrubbed()) {
-                    out.push(s.clone());
-                }
-            }
+            Value::Object(map) => map.iter_mut().fold(false, |any, (k, child)| walk(child, &at.key(k), wrong) | any),
+            Value::Array(items) => items.iter_mut().enumerate().fold(false, |any, (i, item)| {
+                let at = at.item(i);
+                let shown = match item {
+                    Value::Object(_) => return walk(item, &at, wrong) | any,
+                    _ => !withheld_whole(&at.pattern) && !wrong.contains(&at.display) && at.verdict() == Verdict::Shown,
+                };
+                (!shown && withhold(item)) | any
+            }),
+            _ => config_verdict(&at.pattern) != Verdict::Shown && withhold(v),
+        }
+    }
+    let wrong = wrong_typed(root);
+    walk(root, &At::root(), &wrong)
+}
+
+/// Every string in `config.json` a remote viewer must not read anywhere a
+/// panel prints it: a value whose kind [`Kind::scrubbed`], a value under a
+/// key neither table names (an unknown or retired key, a note), and a value
+/// of the wrong type (doctor's user-file row prints it).
+pub fn config_scrub_values(root: &Value) -> Vec<String> {
+    fn scrubbed(verdict: Verdict) -> bool {
+        matches!(verdict, Verdict::Withheld(None)) || matches!(verdict, Verdict::Withheld(Some(k)) if k.scrubbed())
+    }
+    fn every_string(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|i| every_string(i, out)),
+            Value::Object(map) => map.values().for_each(|c| every_string(c, out)),
             _ => {}
         }
     }
+    fn walk(v: &Value, at: &At, wrong: &std::collections::HashSet<String>, out: &mut Vec<String>) {
+        if !at.pattern.is_empty() && wrong.contains(&at.display) {
+            return every_string(v, out);
+        }
+        match v {
+            Value::Object(map) => map.iter().for_each(|(k, child)| walk(child, &at.key(k), wrong, out)),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let at = at.item(i);
+                    match item {
+                        Value::Object(_) => walk(item, &at, wrong, out),
+                        _ if wrong.contains(&at.display) || scrubbed(at.verdict()) => every_string(item, out),
+                        _ => {}
+                    }
+                }
+            }
+            Value::String(s) if scrubbed(config_verdict(&at.pattern)) => out.push(s.clone()),
+            _ => {}
+        }
+    }
+    let wrong = wrong_typed(root);
     let mut out = Vec::new();
-    walk(root, &mut Vec::new(), &mut out);
+    walk(root, &At::root(), &wrong, &mut out);
     out
 }
 
+/// The shortest prefix of a withheld value that, cut off by a `…`, is still
+/// treated as that value (see [`Withheld::scrub`]).
+const MIN_CUT_CHARS: usize = 4;
+/// What a truncating renderer puts where it cut a value short.
+const CUT: char = '…';
+
 /// The values a remote viewer must not read anywhere a panel prints them:
 /// this machine's addresses, paths, endpoint URLs and credential pointers.
-/// [`Self::scrub`] replaces each whole occurrence with [`WITHHELD`].
+/// [`Self::scrub`] replaces each whole occurrence with [`WITHHELD`], in any
+/// ASCII case (a host is case-insensitive, and so is a default macOS path).
 #[derive(Debug, Clone, Default)]
 pub struct Withheld {
     /// Longest first, so a path is replaced before a prefix of it.
@@ -354,21 +401,21 @@ impl Withheld {
         for v in values {
             for part in v.split(',') {
                 let part = part.trim().trim_end_matches('/');
-                if part.chars().count() < 4 || is_loopback(part) {
+                if part.chars().count() < MIN_CUT_CHARS || is_loopback(part) {
                     continue;
                 }
                 needles.push(part.to_string());
                 if part.contains("://") {
                     if let Some(hostport) = crate::url_authority::UrlAuthority::parse(part).map(|a| a.hostport()) {
                         let host = host_of(hostport);
-                        needles.extend([hostport, host].into_iter().filter(|h| h.chars().count() >= 4).map(str::to_string));
+                        needles.extend(
+                            [hostport, host].into_iter().filter(|h| h.chars().count() >= MIN_CUT_CHARS).map(str::to_string),
+                        );
                     }
                 }
             }
         }
-        needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        needles.dedup();
-        Self { needles }
+        Self { needles }.sorted()
     }
 
     /// Like [`Self::from_values`], keeping only values that look like an
@@ -380,8 +427,23 @@ impl Withheld {
     /// Both sets together.
     pub fn merged(mut self, other: Withheld) -> Self {
         self.needles.extend(other.needles);
-        self.needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        self.needles.dedup();
+        self.sorted()
+    }
+
+    /// Without any value spelled like one of `public`, in any case: a machine,
+    /// endpoint, profile or fixture name every viewer reads. A credential
+    /// pointer that happens to share a public name (an endpoint's Keychain
+    /// item named after the endpoint) tells a viewer nothing the name does
+    /// not, and hiding it would hide the name everywhere.
+    pub fn sparing<I: IntoIterator<Item = S>, S: AsRef<str>>(mut self, public: I) -> Self {
+        let public: Vec<S> = public.into_iter().collect();
+        self.needles.retain(|n| !public.iter().any(|p| p.as_ref().eq_ignore_ascii_case(n)));
+        self
+    }
+
+    fn sorted(mut self) -> Self {
+        self.needles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        self.needles.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         self
     }
 
@@ -392,18 +454,26 @@ impl Withheld {
 
     /// `text` with every whole occurrence of a value replaced by [`WITHHELD`].
     /// An occurrence inside a longer word is not one (`/srv/x` in
-    /// `/srv/xy`); a path's own children are (`/srv/x` in `/srv/x/y`).
+    /// `/srv/xy`); a path's own children are (`/srv/x` in `/srv/x/y`). A
+    /// value a renderer cut short with `…` is one too, when at least
+    /// [`MIN_CUT_CHARS`] of it show (`/srv/xy…` for `/srv/xyz`): truncating a
+    /// cell must not turn a withheld value into a readable prefix of it.
     pub fn scrub(&self, text: &str) -> String {
         let mut out = text.to_string();
         for n in &self.needles {
             out = replace_whole(&out, n);
+        }
+        if out.contains(CUT) {
+            for n in &self.needles {
+                out = replace_cut(&out, n);
+            }
         }
         out
     }
 
     /// Whether `text` holds any value.
     pub fn hits(&self, text: &str) -> bool {
-        self.needles.iter().any(|n| replace_whole(text, n) != text)
+        self.scrub(text) != text
     }
 
     /// Every string inside `v` scrubbed, keys included.
@@ -429,23 +499,63 @@ fn word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
 }
 
+/// Whether `needle` found at `text[at..at + len]` is glued to a word on
+/// either side (and so is part of a longer token, not the value).
+fn glued(text: &str, needle: &str, at: usize, len: usize) -> bool {
+    let before = text[..at].chars().next_back();
+    let after = text[at + len..].chars().next();
+    (before.is_some_and(word_char) && needle.starts_with(word_char)) || (after.is_some_and(word_char) && needle.ends_with(word_char))
+}
+
+/// `text` with each whole, ASCII-case-insensitive occurrence of `needle`
+/// replaced by [`WITHHELD`]. Byte offsets are char boundaries: a match starts
+/// where the needle's first byte matches, which is ASCII or a UTF-8 lead byte
+/// (compared exactly), and spans the same complete characters.
 fn replace_whole(text: &str, needle: &str) -> String {
+    let (t, n) = (text.as_bytes(), needle.as_bytes());
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(needle) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + needle.len()..].chars().next();
-        let glued_before = before.is_some_and(word_char) && needle.starts_with(word_char);
-        let glued_after = after.is_some_and(word_char) && needle.ends_with(word_char);
-        out.push_str(&rest[..at]);
-        if glued_before || glued_after {
-            out.push_str(needle);
-        } else {
-            out.push_str(WITHHELD);
+    let (mut last, mut i) = (0, 0);
+    while !n.is_empty() && i + n.len() <= t.len() {
+        if !t[i..i + n.len()].eq_ignore_ascii_case(n) {
+            i += 1;
+            continue;
         }
-        rest = &rest[at + needle.len()..];
+        if !glued(text, needle, i, n.len()) {
+            out.push_str(&text[last..i]);
+            out.push_str(WITHHELD);
+            last = i + n.len();
+        }
+        i += n.len();
     }
-    out.push_str(rest);
+    out.push_str(&text[last..]);
+    out
+}
+
+/// `text` with each `…` that ends a proper prefix of `needle` (at least
+/// [`MIN_CUT_CHARS`] long, whole on its left) replaced, prefix and `…`
+/// together, by [`WITHHELD`].
+fn replace_cut(text: &str, needle: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (e, _) in text.match_indices(CUT) {
+        if e < last {
+            continue;
+        }
+        let before = &text[last..e];
+        let prefixes: Vec<usize> = needle.char_indices().skip(MIN_CUT_CHARS).map(|(k, _)| k).collect();
+        let longest = prefixes.into_iter().rev().find(|&k| {
+            k <= before.len()
+                && before.is_char_boundary(before.len() - k)
+                && before.as_bytes()[before.len() - k..].eq_ignore_ascii_case(&needle.as_bytes()[..k])
+                && !(before[..before.len() - k].chars().next_back().is_some_and(word_char) && needle.starts_with(word_char))
+        });
+        if let Some(k) = longest {
+            out.push_str(&text[last..e - k]);
+            out.push_str(WITHHELD);
+            last = e + CUT.len_utf8();
+        }
+    }
+    out.push_str(&text[last..]);
     out
 }
 
@@ -530,6 +640,24 @@ mod tests {
         out
     }
 
+    /// The leaves the tables do not classify: a leaf must be named by its
+    /// own path in exactly one table, so a field added under a prefix that is
+    /// already withheld whole (`fleet.accept_work.*.x`) is a decision about
+    /// its kind, not an inheritance. A shown leaf under a withheld prefix is
+    /// a contradiction (it would be withheld at run time) and is reported
+    /// too.
+    fn unclassified(leaves: &[String]) -> Vec<&String> {
+        leaves
+            .iter()
+            .filter(|l| {
+                let exact_withheld = CONFIG_WITHHELD.iter().any(|(w, _)| w == l);
+                let exact_shown = CONFIG_SHOWN.contains(&l.as_str());
+                let under_withheld = CONFIG_WITHHELD.iter().any(|(w, _)| prefix_match(w, &path(l)));
+                exact_withheld == exact_shown || (exact_shown && under_withheld)
+            })
+            .collect()
+    }
+
     /// The guard that keeps the classification complete: every path
     /// `config.json` can hold is either shown or withheld ON PURPOSE. A field
     /// a new darkmux adds fails here until someone decides what a remote
@@ -538,15 +666,7 @@ mod tests {
     fn every_config_path_is_classified_for_a_remote_viewer() {
         let leaves = schema_leaves();
         assert!(leaves.len() > 60, "the walker found the schema: {leaves:?}");
-        let unclassified: Vec<&String> = leaves
-            .iter()
-            .filter(|l| {
-                let p = path(l);
-                let named_withheld = CONFIG_WITHHELD.iter().any(|(w, _)| prefix_match(w, &p));
-                let named_shown = CONFIG_SHOWN.iter().any(|s| s.split('.').count() == p.len() && prefix_match(s, &p));
-                named_withheld == named_shown
-            })
-            .collect();
+        let unclassified = unclassified(&leaves);
         assert!(unclassified.is_empty(), "classify each (shown, or withheld with a kind): {unclassified:?}");
         // And no entry names a path the schema does not have.
         for s in CONFIG_SHOWN {
@@ -555,6 +675,22 @@ mod tests {
         for (w, _) in CONFIG_WITHHELD {
             assert!(leaves.iter().any(|l| prefix_match(w, &path(l))), "CONFIG_WITHHELD names `{w}`, which config.json does not have");
         }
+    }
+
+    /// (5.0 review) The guard catches a new field under a prefix that is
+    /// already withheld whole: it is withheld at run time anyway, but nobody
+    /// decided what KIND of fact it is, so whether it is also scrubbed
+    /// wherever else it prints was never chosen.
+    #[test]
+    fn a_new_field_under_a_withheld_prefix_is_unclassified() {
+        for new in ["fleet.accept_work.*.new_field", "dirs.new_dir", "hooks.rules[].headers.*.new_part"] {
+            let leaves = vec![new.to_string()];
+            assert_eq!(unclassified(&leaves), vec![&leaves[0]], "{new} must be classified by name");
+        }
+        // A shown leaf under a withheld prefix is a contradiction (it would be
+        // withheld at run time), so it is reported too.
+        let leaves = vec!["dirs.flows".to_string()];
+        assert!(unclassified(&leaves).is_empty(), "an exactly named leaf is classified");
     }
 
     fn fixture() -> Value {
@@ -622,6 +758,63 @@ mod tests {
         assert_eq!(url.scrub("at myres.example.com:8443"), format!("at {WITHHELD}"));
         let only_locations = Withheld::from_locations(["lms".to_string(), "/opt/lms".into(), "item-name".into()]);
         assert_eq!(only_locations.values(), ["/opt/lms"]);
+    }
+
+    /// (5.0 review item 3) A key a remote viewer is shown, holding a value
+    /// of the wrong JSON type, is withheld: what it holds is not what the key
+    /// means. A list where a string belongs is withheld whole.
+    #[test]
+    fn a_shown_key_holding_the_wrong_type_is_withheld() {
+        let mut v = serde_json::json!({
+            "machine_id": ["/opt/fake-list-path"],
+            "runtime": { "max_turns": "/opt/fake-wrongtype-path", "max_tokens": 5 },
+            "radio": { "humor": { "x": "/opt/fake-nested" } }
+        });
+        assert!(shape_config_json(&mut v));
+        let w = Value::String(WITHHELD.into());
+        for p in ["/machine_id", "/runtime/max_turns", "/radio/humor"] {
+            assert_eq!(v.pointer(p), Some(&w), "{p}: {v:#}");
+        }
+        assert_eq!(v.pointer("/runtime/max_tokens"), Some(&Value::from(5)), "a value of the right type stays");
+    }
+
+    /// (5.0 review item 3) Wherever a panel prints a wrong-typed value or an
+    /// unknown key's value (doctor's user-file row names it), it is scrubbed:
+    /// both are in the scrub set.
+    #[test]
+    fn wrong_typed_and_unknown_values_are_scrubbed_everywhere() {
+        let doc = serde_json::json!({
+            "runtime": { "max_turns": "/opt/fake-wrongtype-path" },
+            "future_key": "/opt/fake-unknown-value",
+            "fleet": { "mode": "standalone" }
+        });
+        let vals = config_scrub_values(&doc);
+        for want in ["/opt/fake-wrongtype-path", "/opt/fake-unknown-value"] {
+            assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
+        }
+        assert!(!vals.iter().any(|v| v == "standalone"), "a shown value is not scrubbed: {vals:?}");
+    }
+
+    /// (5.0 review item 6) Hosts are case-insensitive, so the scrub is: a
+    /// host written in another case is the same host.
+    #[test]
+    fn scrub_ignores_case() {
+        let w = Withheld::from_values(["myres.Example.com".to_string(), "/Opt/Fake/lms".into()]);
+        assert_eq!(w.scrub("at MYRES.example.COM:443"), format!("at {WITHHELD}:443"));
+        assert_eq!(w.scrub("bin /opt/fake/LMS"), format!("bin {WITHHELD}"));
+        assert!(w.hits("x MyRes.Example.Com"));
+        assert_eq!(w.scrub("myres.example.community"), "myres.example.community", "still whole tokens only");
+    }
+
+    /// (5.0 review item 8) A value cut short by a truncating cell (`…`) is
+    /// still withheld: the visible part is a prefix of the value.
+    #[test]
+    fn a_value_truncated_with_an_ellipsis_is_still_withheld() {
+        let w = Withheld::from_values(["/opt/fake-wrongtype-path/deep/inside".to_string(), "hosted-secret.example.com".into()]);
+        assert_eq!(w.scrub("got \"/opt/fake-wrongtype-pa…"), format!("got \"{WITHHELD}"));
+        assert_eq!(w.scrub("at hosted-sec…  next"), format!("at {WITHHELD}  next"));
+        assert_eq!(w.scrub("nothing to cut… here"), "nothing to cut… here");
+        assert_eq!(w.scrub("whole /opt/fake-wrongtype-path/deep/inside"), format!("whole {WITHHELD}"));
     }
 
     #[test]

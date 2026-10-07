@@ -560,8 +560,8 @@ pub struct PanelResponse {
     pub gather_ms: u64,
     pub exit_code: Option<i32>,
     pub ansi_text: String,
-    /// Non-empty only when something went to stderr, and never for a caller
-    /// that is not this machine (its stderr is withheld).
+    /// Non-empty only when something went to stderr. A caller that is not
+    /// this machine reads it redacted, as it reads stdout.
     pub stderr_tail: String,
     /// Empty unless the caller is not this machine and something was withheld
     /// from what it is shown: then the one plain notice naming the command to

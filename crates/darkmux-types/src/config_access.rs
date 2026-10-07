@@ -2380,6 +2380,230 @@ pub fn skills_override_dirs() -> Vec<std::path::PathBuf> {
     )
 }
 
+// ── (5.0) Every location the settings resolve to ──
+//
+// A console panel served to a viewer that is not this machine withholds every
+// address, path and URL this machine is configured with, wherever a verb
+// prints one (`darkmux_types::panel_audience`). Those values are read here,
+// through the same accessors the code uses, so an environment override and a
+// setting that has no `config.json` key at all are covered. The table is
+// checked, not trusted: `location_guard` below scans this file for every
+// zero-argument accessor that could return text and fails until each one is
+// either in [`LOCATION_ACCESSORS`] or named, with its reason, as not a
+// location.
+
+/// The locations a resolved setting's value names.
+pub trait AsLocations {
+    fn as_locations(&self) -> Vec<String>;
+}
+
+impl AsLocations for String {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.clone()]
+    }
+}
+
+impl AsLocations for std::path::PathBuf {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.to_string_lossy().into_owned()]
+    }
+}
+
+impl<T: AsLocations> AsLocations for Option<T> {
+    fn as_locations(&self) -> Vec<String> {
+        self.iter().flat_map(AsLocations::as_locations).collect()
+    }
+}
+
+impl<T: AsLocations> AsLocations for Vec<T> {
+    fn as_locations(&self) -> Vec<String> {
+        self.iter().flat_map(AsLocations::as_locations).collect()
+    }
+}
+
+impl AsLocations for crate::config::HookRule {
+    fn as_locations(&self) -> Vec<String> {
+        self.http.iter().chain(&self.file).cloned().collect()
+    }
+}
+
+impl AsLocations for ClientEndpoint {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.addr.clone()]
+    }
+}
+
+impl AsLocations for crate::config::RetiredLeftover {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.value.clone()]
+    }
+}
+
+macro_rules! location_accessors {
+    ($($accessor:ident),* $(,)?) => {
+        /// Every accessor in this module whose value names an address, a path
+        /// or a URL, by name, each read through the accessor itself. See
+        /// [`resolved_locations`].
+        pub const LOCATION_ACCESSORS: &[(&str, fn() -> Vec<String>)] =
+            &[$((stringify!($accessor), || $accessor().as_locations())),*];
+    };
+}
+
+location_accessors!(
+    lms_bin,
+    lmstudio_url,
+    fleet_identity_bin,
+    redis_host,
+    audit_dir_override,
+    hooks_outbox_dir,
+    hooks_rules,
+    hooks_adapters_dir,
+    serve_bind,
+    serve_client_addr,
+    serve_client_endpoint,
+    serve_listen_addr,
+    retired_env_leftovers,
+    daemon_cors_origins,
+    liveness_dir,
+    host_sampler_lock_path,
+    host_source_script,
+    flows_dir,
+    findings_dir,
+    mods_dir,
+    lab_dir,
+    runtime_cache_dir,
+    cache_dir,
+    fleet_file,
+    identity_path_override,
+    templates_override_dirs,
+    skills_override_dirs,
+);
+
+/// Every address, path and URL the settings resolve to right now (`env >
+/// config.json > built-in default`), one entry per value as its accessor
+/// returns it. A caller filters what it does not need (a loopback address, a
+/// path under the home directory).
+pub fn resolved_locations() -> Vec<String> {
+    LOCATION_ACCESSORS.iter().flat_map(|(_, read)| read()).collect()
+}
+
+#[cfg(test)]
+mod location_guard {
+    use super::*;
+
+    /// Accessors that return text but name no address, path or URL, each
+    /// with why. A new accessor that returns text is in neither list and
+    /// fails [`every_accessor_that_can_name_a_location_is_read`].
+    const NOT_LOCATIONS: &[(&str, &str)] = &[
+        ("machine_id", "this machine's public name, which every viewer reads"),
+        ("fleet_mode", "an enum value"),
+        ("declared_fleet_mode", "an enum value"),
+        ("fleet_busy_policy", "an enum value (withheld where printed, as the execution surface)"),
+        ("fleet_identity_provider", "an enum value"),
+        ("fleet_defaults_radio_answerer_profile", "a profile name"),
+        ("radio_answerer_profile", "a profile name"),
+        ("redis_stream", "a stream name"),
+        ("redis_telemetry_stream", "a stream name"),
+        ("cmd_allowed_verbs", "CLI verb names"),
+        ("hooks_enabled_provenance", "which tier set a switch"),
+        ("check_retired_env", "the same leftovers as `retired_env_leftovers`, split by policy"),
+        ("role_profiles", "role and profile names"),
+        ("default_role", "a role name"),
+        ("live_cadence", "milliseconds and a tier"),
+        ("detection_degeneracy_policy", "an enum value"),
+        ("thermal_pause_at", "an enum value"),
+        ("thermal_resume_at", "an enum value"),
+        ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
+    ];
+
+    /// Every `pub fn NAME() -> TYPE` in this file's production code, as
+    /// `(NAME, TYPE)`, signatures spanning lines included.
+    fn zero_arg_accessors() -> Vec<(String, String)> {
+        let src = include_str!("config_access.rs");
+        let production: String =
+            src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(src).split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut out = Vec::new();
+        for piece in production.split("pub fn ").skip(1) {
+            let Some((name, rest)) = piece.split_once('(') else { continue };
+            let Some(rest) = rest.trim_start().strip_prefix(')') else { continue };
+            let Some(ty) = rest.trim_start().strip_prefix("->") else { continue };
+            let ty = ty.split('{').next().unwrap_or("").trim().to_string();
+            out.push((name.trim().to_string(), ty));
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Whether a return type can carry text: anything but numbers, booleans,
+    /// a tier and the wrappers around them.
+    fn can_hold_text(ty: &str) -> bool {
+        const SCALARS: &[&str] = &["bool", "u8", "u16", "u32", "u64", "usize", "f64", "Source", "Option"];
+        ty.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).any(|t| !SCALARS.contains(&t))
+    }
+
+    /// The structural guard: the location table is complete. Every
+    /// zero-argument accessor here whose value could be text (a `String`, a
+    /// path, a list, a struct) is read by [`resolved_locations`] or named in
+    /// `NOT_LOCATIONS` with the reason it names no location. A
+    /// `_with_source` sibling returns its accessor's value and is covered by
+    /// it.
+    #[test]
+    fn every_accessor_that_can_name_a_location_is_read() {
+        let found = zero_arg_accessors();
+        assert!(found.len() > 80, "the scan found the accessors: {found:?}");
+        let read: Vec<&str> = LOCATION_ACCESSORS.iter().map(|(n, _)| *n).collect();
+        let mut unclassified = Vec::new();
+        for (name, ty) in &found {
+            if name.ends_with("_with_source") || !can_hold_text(ty) {
+                continue;
+            }
+            let listed = read.contains(&name.as_str());
+            let excused = NOT_LOCATIONS.iter().any(|(n, _)| n == name);
+            if listed == excused {
+                unclassified.push(format!("{name} -> {ty}"));
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "classify each accessor: add it to LOCATION_ACCESSORS (it names an address, a path or a URL a \
+             remote console viewer must not read), or to NOT_LOCATIONS with the reason it does not: \
+             {unclassified:?}"
+        );
+        for (n, _) in NOT_LOCATIONS {
+            assert!(found.iter().any(|(f, _)| f == n), "NOT_LOCATIONS names `{n}`, which is not an accessor here");
+        }
+        // The scan sees what the guard must: a path-returning accessor, an
+        // env-only one, and a signature spanning lines.
+        for must in ["host_source_script", "findings_dir", "identity_path_override", "fleet_identity_provider"] {
+            assert!(found.iter().any(|(f, _)| f == must), "the scan missed `{must}`");
+        }
+        assert!(!can_hold_text("(Option<u32>, Source)") && can_hold_text("Option<std::path::PathBuf>"));
+    }
+
+    /// Each entry reads its own accessor: a setting that exists only in the
+    /// environment comes back, so a remote console viewer is never shown it.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_only_location_is_resolved() {
+        let keys = ["DARKMUX_HOST_SOURCE_SCRIPT", "DARKMUX_FINDINGS_DIR", "DARKMUX_IDENTITY_PATH"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-host-script.json");
+        std::env::set_var("DARKMUX_FINDINGS_DIR", "/opt/fake-findings");
+        std::env::set_var("DARKMUX_IDENTITY_PATH", "/opt/fake-identity.md");
+        let all = resolved_locations();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        for want in ["/opt/fake-host-script.json", "/opt/fake-findings", "/opt/fake-identity.md"] {
+            assert!(all.iter().any(|l| l == want), "{want} in {all:?}");
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod detection_policy_regression {
