@@ -3399,9 +3399,8 @@
         use super::*;
         use serial_test::serial;
         use std::process::{Child, Command, Stdio};
-        use std::time::Instant;
 
-        const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(5);
+        use darkmux_flow::test_redis::REDIS_READY_TIMEOUT;
 
         fn redis_server_available() -> bool {
             let ok = Command::new("redis-server")
@@ -3453,21 +3452,15 @@
                 .spawn()
                 .expect("redis-server spawn");
 
-            let url = format!("redis://127.0.0.1:{port}");
-            let client = redis::Client::open(url.as_str()).expect("redis client");
-            let start = Instant::now();
-            while start.elapsed() < REDIS_READY_TIMEOUT {
-                if let Ok(mut conn) = client.get_connection() {
-                    let ping: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
-                    if let Ok(s) = ping {
-                        if s == "PONG" {
-                            return RedisFixture { child, url };
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            // The fixture owns the child before the wait, so a failed wait
+            // still kills it on unwind. The wait is bounded and says why it
+            // failed: a `get_connection` poll could block forever on a port
+            // another process took (redis-rs reads with no timeout).
+            let mut fixture = RedisFixture { child, url: format!("redis://127.0.0.1:{port}") };
+            if let Err(why) = darkmux_flow::test_redis::wait_until_redis_answers(&mut fixture.child, port, REDIS_READY_TIMEOUT) {
+                panic!("{why}");
             }
-            panic!("redis-server failed to come ready within {REDIS_READY_TIMEOUT:?}");
+            fixture
         }
 
         fn xadd_flow_record(url: &str, record_json: &str) {

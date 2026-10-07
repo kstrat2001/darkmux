@@ -2529,6 +2529,7 @@ mod hooks_status_tests {
 #[cfg(all(test, unix))]
 mod telemetry_stream_probe_tests {
     use super::*;
+    use crate::test_redis::{wait_until_redis_answers, REDIS_READY_TIMEOUT};
 
     /// (#2101) The probe reports the telemetry stream's own length and ids, and
     /// its schema strings feed the skew sample, against a real redis-server.
@@ -2555,15 +2556,13 @@ mod telemetry_stream_probe_tests {
                 let _ = self.0.wait();
             }
         }
-        let _guard = Kill(child);
+        let mut guard = Kill(child);
+        if let Err(why) = wait_until_redis_answers(&mut guard.0, port, REDIS_READY_TIMEOUT) {
+            panic!("{why}");
+        }
         let url = format!("redis://127.0.0.1:{port}");
         let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = loop {
-            if let Ok(c) = client.get_connection() {
-                break c;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
+        let mut conn = client.get_connection().expect("redis-server answered PING, so a connection opens");
         let add = |conn: &mut redis::Connection, stream: &str, schema: &str| {
             redis::cmd("XADD").arg(stream).arg("*").arg("schema").arg(schema).arg("record").arg("{}").query::<String>(conn).unwrap();
         };

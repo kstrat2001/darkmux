@@ -17,6 +17,8 @@ pub mod presence;
 pub mod presence_reconciler;
 pub mod reader;
 pub mod session_presence;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_redis;
 
 mod bookend;
 mod hub_link;

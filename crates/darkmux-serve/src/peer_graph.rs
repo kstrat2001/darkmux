@@ -1030,20 +1030,17 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("redis-server spawn");
-        let url = format!("redis://127.0.0.1:{port}");
-        let client = redis::Client::open(url.as_str()).expect("redis client");
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            if let Ok(mut conn) = client.get_connection() {
-                if let Ok(pong) = redis::cmd("PING").query::<String>(&mut conn) {
-                    if pong == "PONG" {
-                        return RelayTestRedis { child, url };
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        // Owned before the wait so a failed wait still kills the child; the
+        // wait is bounded and names its cause (see `darkmux_flow::test_redis`).
+        let mut redis = RelayTestRedis { child, url: format!("redis://127.0.0.1:{port}") };
+        if let Err(why) = darkmux_flow::test_redis::wait_until_redis_answers(
+            &mut redis.child,
+            port,
+            darkmux_flow::test_redis::REDIS_READY_TIMEOUT,
+        ) {
+            panic!("{why}");
         }
-        panic!("redis-server did not become ready");
+        redis
     }
 
     #[test]
