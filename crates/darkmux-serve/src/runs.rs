@@ -4830,6 +4830,19 @@ mod tests {
         );
     }
 
+    /// (#3074) The unbounded window the policy publishes is the viewer's
+    /// largest safe integer (`Number.MAX_SAFE_INTEGER`): a JavaScript
+    /// `number` holds it, and every integer below it, exactly, so the viewer
+    /// judges staleness by the value the daemon sent.
+    #[test]
+    #[serial_test::serial]
+    fn the_unbounded_window_on_the_wire_is_the_viewers_largest_safe_integer() {
+        let _budget = InactivityBudgetGuard::seconds(0);
+        let wire = serde_json::to_value(runs_policy()).unwrap();
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        assert_eq!(wire["stale_after_ms"].as_u64(), Some(MAX_SAFE_INTEGER), "{wire}");
+    }
+
     // ── the lifecycle corpus: one spec, two executors ────────────────────
 
     /// What the daemon states about one corpus case's session as of `now_ms`
@@ -8359,6 +8372,53 @@ mod tests {
         assert_eq!(row_error.status, RunStatus::Error);
     }
 
+    /// A peer mission's run session and one execution's session, both on the
+    /// fleet stream: the run bookend's `handle` is the launched config id
+    /// (`review`), the execution's is its role (`reviewer`). `with_starts`
+    /// false leaves out the start records, as when they aged out of the
+    /// window. The ids sort the run session first, so "the first session's
+    /// handle" would be the config id.
+    fn peer_run_and_execution(with_starts: bool) -> Vec<serde_json::Value> {
+        let now = darkmux_flow::ts_utc_now();
+        let rec = |action: &str, session: &str, handle: &str| {
+            serde_json::json!({
+                "ts": now, "action": action, "handle": handle, "session_id": session,
+                "mission_id": "peer-role", "machine_id": "m1-max-32gb-studio",
+            })
+        };
+        let mut records = Vec::new();
+        if with_starts {
+            records.extend([rec("run.start", "peer-role.run", "review"), rec("dispatch.start", "peer-role.task.probe", "reviewer")]);
+        }
+        records.extend([rec("dispatch.complete", "peer-role.task.probe", "reviewer"), rec("run.complete", "peer-role.run", "review")]);
+        records
+    }
+
+    /// (#3074) A peer mission's row names the role an execution ran, not the
+    /// config id its run bookend carries as `handle`.
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_mission_row_names_the_executions_role_not_the_run_bookends_config_id() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let runs = build_runs(flows.path(), None, &peer_run_and_execution(true));
+        let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
+        assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
+    }
+
+    /// (#3074) The same when every start aged out of the window: the
+    /// start-less fallback also prefers an execution's role over the run
+    /// bookend's config id.
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_mission_row_whose_starts_aged_out_still_names_the_executions_role() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let runs = build_runs(flows.path(), None, &peer_run_and_execution(false));
+        let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
+        assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
+    }
+
     /// (#3074) The peer row decides a mission's end through the same fold a
     /// session's attempt uses (`run_lifecycle::CloseFold`): the generic
     /// launcher writes `mission.close` and then `run.error` for a failed
@@ -8422,6 +8482,41 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "mission-aged-out").expect("mission row present");
         assert_eq!(row.role.as_deref(), Some("fallback-coder"));
         assert_eq!(row.model.as_deref(), Some("qwen3.6"));
+    }
+
+    /// (#3074) With every start aged out, the run's own session still holds
+    /// its terminal, whose `handle` is the launched config id. The row names
+    /// the role an execution ran, not that config id, though the run
+    /// session's id sorts first.
+    #[test]
+    #[serial_test::serial]
+    fn a_mission_whose_starts_aged_out_names_the_executions_role_not_the_run_bookends_config_id() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let rec = |action: &str, session: &str, handle: &str| {
+            serde_json::json!({
+                "ts": now, "action": action, "handle": handle, "session_id": session, "mission_id": "mission-aged-two",
+            })
+        };
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[rec("dispatch.complete", "mission-aged-two.task.t", "coder"), rec("run.complete", "mission-aged-two.run", "coder-phase")],
+        );
+        let mission_dir = _g.join("missions").join("mission-aged-two");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mission = serde_json::json!({
+            "id": "mission-aged-two",
+            "description": "aged mission",
+            "phase_ids": [],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "mission-aged-two").expect("mission row present");
+        assert_eq!(row.role.as_deref(), Some("coder"), "{row:?}");
     }
 
     /// A peer that fell asleep mid-mission must not leave a row claiming to

@@ -1115,26 +1115,32 @@ mod tests {
     }
 
     /// A handler that builds its body in one piece still leaves the layer in slices, so the
-    /// redacted copy is never a second whole response (#3073).
+    /// redacted copy is never a second whole response (#3073). The slices are 64 KiB, not
+    /// fragments: a body leaves in about its length over 64 KiB, so the redacted stream does
+    /// not multiply the frames a reader has to take.
     #[tokio::test]
     async fn a_remote_body_leaves_the_layer_in_slices() {
         use futures::StreamExt;
         let record = format!(r#"{{"peer":"{PEER_IP}","note":"{}"}}"#, "x".repeat(1400));
         let body = format!("[{}]", vec![record.as_str(); 2000].join(","));
+        let slices = body.len().div_ceil(64 * 1024);
         let app = axum::Router::new()
             .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
             .layer(axum::middleware::from_fn(redact_reads));
         let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
         req.extensions_mut().insert(peer(REMOTE));
         let mut chunks = app.oneshot(req).await.unwrap().into_body().into_data_stream();
-        let (mut largest, mut total) = (0, 0);
+        let (mut largest, mut total, mut count) = (0, 0, 0);
         while let Some(c) = chunks.next().await {
             let c = c.unwrap();
             largest = largest.max(c.len());
             total += c.len();
+            count += 1;
         }
         assert!(total > 2_000_000);
         assert!(largest <= REDACT_SLICE_BYTES + record.len(), "a {largest} byte chunk");
+        // One output chunk per slice, plus the flush of what the last one left pending.
+        assert!(count <= slices + 1, "{count} chunks for {slices} slices");
     }
 
     /// What a remote caller receives: the status, every byte that reached it, and whether the
@@ -1171,6 +1177,25 @@ mod tests {
         assert_eq!(status, 200);
         assert!(errored, "the stream ends in an error: {remote}");
         assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+    }
+
+    /// The error that truncates a malformed JSON reply says why, so whoever reads it in a
+    /// log learns the body was withheld for not being JSON, not that the stream broke (#3073).
+    #[tokio::test]
+    async fn a_malformed_json_reply_ends_in_an_error_that_names_why() {
+        use futures::StreamExt;
+        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(REMOTE));
+        let resp = json_route("{\"a\": 100.64.7.7".into()).oneshot(req).await.unwrap();
+        let mut chunks = resp.into_body().into_data_stream();
+        let mut error = None;
+        while let Some(c) = chunks.next().await {
+            if let Err(e) = c {
+                error = Some(e.to_string());
+            }
+        }
+        let error = error.expect("the stream ends in an error");
+        assert!(error.contains("not valid JSON") && error.contains("withheld"), "{error:?}");
     }
 
     /// The reviewer's proof: a real `axum::Json` handler, 130 levels deep (past serde_json's

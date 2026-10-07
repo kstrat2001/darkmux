@@ -5709,6 +5709,29 @@ mod tests {
         assert!(report.chain_valid, "header-only recovery must produce a valid chain");
     }
 
+    /// (#899, #1769) A sole surviving line re-seeds the chain only when it is
+    /// BOTH a schema header and in the byte-hash format. Each half alone is
+    /// refused: a pre-2.6.0 header, and a non-header line carrying the marker.
+    #[test]
+    fn audit_reseed_needs_a_schema_header_in_the_byte_hash_format() {
+        let marker_without_schema =
+            serde_json::json!({"_type": "record", "hash_format": crate::integrity::AUDIT_HASH_FORMAT}).to_string();
+        for (label, line) in [
+            ("a header without the hash_format marker", crate::integrity::schema_header_line().unwrap()),
+            ("the marker on a line that is not a schema header", marker_without_schema),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("audit.jsonl");
+            let before = format!("{line}\n");
+            std::fs::write(&path, &before).unwrap();
+            let err = audit_record_at(&minimal_record(), &path)
+                .expect_err(&format!("{label}: must not re-seed a chain"))
+                .to_string();
+            assert!(err.contains("refusing to re-seed"), "{label}: {err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{label}: file untouched");
+        }
+    }
+
     /// (#1768 threat model, FN-1) THE EXPLOIT, executed rather than argued.
     ///
     /// Before #1769, `integrity_check_file` SKIPPED content verification for
@@ -6121,6 +6144,127 @@ mod tests {
 
         crate::integrity::audit_record_at(&minimal_record(), &path)
             .expect("append must read only the tail window");
+    }
+
+    /// The 64 KiB tail window, as the append reads it.
+    const TAIL_WINDOW: usize = 64 * 1024;
+
+    fn newlines_in_tail_window(path: &std::path::Path) -> usize {
+        let bytes = std::fs::read(path).unwrap();
+        bytes[bytes.len() - TAIL_WINDOW..].iter().filter(|&&b| b == b'\n').count()
+    }
+
+    fn append_handle_of_len(path: &std::path::Path, len: usize) {
+        let mut rec = minimal_record();
+        rec.handle = "a".repeat(len);
+        crate::integrity::audit_record_at(&rec, path).unwrap();
+    }
+
+    /// The hash prefix of the file's last line, and the `prev_hash` its record
+    /// carries. Lossy, so a file with a deliberately invalid byte still reads.
+    fn last_line_hash_and_prev(path: &std::path::Path) -> (String, Option<String>) {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        let last = text.lines().last().unwrap();
+        let (hash, json) = last.split_once(' ').unwrap();
+        let rec: FlowRecord = serde_json::from_str(json).unwrap();
+        (hash.to_string(), rec.prev_hash)
+    }
+
+    /// (#3088) A last record longer than the tail window leaves one newline in
+    /// the window, so there is no complete line to read the tail hash from: the
+    /// append must read the whole file instead, and the chain continues.
+    #[test]
+    fn audit_append_reads_the_whole_file_when_the_window_holds_one_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        append_handle_of_len(&path, 70_000);
+        assert_eq!(newlines_in_tail_window(&path), 1, "premise: only the last record's newline is in the window");
+        let (tail_hash, _) = last_line_hash_and_prev(&path);
+
+        crate::integrity::audit_record_at(&minimal_record(), &path)
+            .expect("a window with no complete line must fall back to the whole file");
+
+        assert_eq!(last_line_hash_and_prev(&path).1, Some(tail_hash), "the new record chains onto the long one");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && report.records_checked == 2, "{report:?}");
+    }
+
+    /// (#3088) Two newlines in the window are enough: the line between them is
+    /// whole, so the append stays inside the window. Invalid UTF-8 before the
+    /// window proves it (a whole-file read refuses that file).
+    #[test]
+    fn audit_append_stays_in_the_window_when_it_holds_exactly_two_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for _ in 0..3 {
+            append_handle_of_len(&path, 40_000);
+        }
+        assert_eq!(newlines_in_tail_window(&path), 2, "premise: exactly two newlines in the window");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[5_000] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let (tail_hash, _) = last_line_hash_and_prev(&path);
+
+        crate::integrity::audit_record_at(&minimal_record(), &path)
+            .expect("two newlines in the window must not send the append to the whole file");
+
+        assert_eq!(last_line_hash_and_prev(&path).1, Some(tail_hash), "the new record chains onto the last one");
+    }
+
+    /// (#3088) The window can start exactly ON a newline, so the partial line
+    /// before it is empty. The append must still read the last record, not
+    /// fail on the boundary.
+    #[test]
+    fn audit_append_survives_a_window_that_starts_on_a_newline() {
+        // A last line of 65_535 bytes (newline included) puts the newline
+        // before it at exactly `file_len - 64 KiB`. A line grows one byte per
+        // handle byte, so measure it once on a probe chain built the same way.
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe = probe_dir.path().join("probe.jsonl");
+        append_one(&probe, "first");
+        append_handle_of_len(&probe, 1_000);
+        let probe_text = std::fs::read_to_string(&probe).unwrap();
+        let probe_line_len = probe_text.lines().last().unwrap().len() + 1;
+        let handle_len = 1_000 + (TAIL_WINDOW - 1) - probe_line_len;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        append_one(&path, "first");
+        append_handle_of_len(&path, handle_len);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes[bytes.len() - TAIL_WINDOW], b'\n', "premise: the window starts on a newline");
+        let (tail_hash, _) = last_line_hash_and_prev(&path);
+
+        crate::integrity::audit_record_at(&minimal_record(), &path)
+            .expect("a window starting on a newline must still yield the tail hash");
+
+        assert_eq!(last_line_hash_and_prev(&path).1, Some(tail_hash));
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && report.records_checked == 3, "{report:?}");
+    }
+
+    /// A last line whose prefix is not a BLAKE3 hash is corruption: the append
+    /// refuses rather than chaining onto it, in both the whole-file read and
+    /// the tail-window read, and leaves the file alone.
+    #[test]
+    fn audit_append_refuses_a_last_line_without_a_hash_prefix() {
+        for (label, handle_len, records) in [("small file", 10, 2), ("large file", 12_000, 6)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("chain.jsonl");
+            for _ in 0..records {
+                append_handle_of_len(&path, handle_len);
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend_from_slice(b"not-a-hash {\"action\":\"forged\"}\n");
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(bytes.len() > TAIL_WINDOW, label == "large file", "premise: {label} takes its own read path");
+
+            let err = crate::integrity::audit_record_at(&minimal_record(), &path)
+                .expect_err(&format!("{label}: must not chain onto a line with no hash prefix"))
+                .to_string();
+            assert!(err.contains("lacks a valid `<hash> <json>` prefix"), "{label}: {err}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{label}: a refused append leaves the file alone");
+        }
     }
 
     // (#1775) The exit-status belt, exercised directly rather than through a

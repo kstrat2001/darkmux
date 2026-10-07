@@ -1745,6 +1745,150 @@
       ],
       "phase": "open",
       "status": "running"
+    },
+    {
+      "name": "the first bookend terminal is the outcome over a later one",
+      "as_of": "2026-09-28T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "exit_code": 137
+          }
+        },
+        {
+          "ts": "2026-09-28T10:01:30Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "ok"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "a step that starts after its task's dispatch finished opens the next attempt",
+      "as_of": "2026-09-28T11:00:40Z",
+      "records": [
+        {
+          "ts": "2026-09-28T11:00:00Z",
+          "action": "step.start",
+          "session_id": "task-steps",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-28T11:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-steps",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T11:00:10Z",
+          "action": "dispatch.complete",
+          "session_id": "task-steps",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T11:00:15Z",
+          "action": "step.complete",
+          "session_id": "task-steps",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "later_step_planned": true
+          }
+        },
+        {
+          "ts": "2026-09-28T11:00:20Z",
+          "action": "step.start",
+          "session_id": "task-steps",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a skewed terminal naming its mission closes that mission's run on a shared session",
+      "as_of": "2026-09-28T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-28T09:59:50Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "mission_id": "B",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "mission_id": "A",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-28T10:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "mission_id": "B",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a skewed terminal naming another mission leaves this mission's run open",
+      "as_of": "2026-09-28T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-28T09:59:50Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "mission_id": "B",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "mission_id": "A",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-28T10:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "mission_id": "B",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "open",
+      "status": "running"
     }
   ]
 }

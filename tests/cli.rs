@@ -953,6 +953,52 @@ fn a_non_utf8_argument_with_a_bad_flag_is_a_usage_error_not_a_panic() {
         .stderr(predicate::str::contains("panicked").not());
 }
 
+/// `profile scan` lists the LM Studio LLMs no profile covers, each with a
+/// suggested task class and a draft command, and exits 0. A model whose
+/// size LM Studio does not report is suggested the `fast` class. Driven
+/// against a fake `lms`; nothing here touches the operator's LM Studio.
+#[test]
+fn profile_scan_lists_uncovered_llms_and_exits_zero() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, fixture_json()).unwrap();
+    let fake = tmp.path().join("fake-lms");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+[ "$1" = "ls" ] || exit 1
+cat <<'EOF'
+[{"modelKey":"model-a","type":"llm","paramsString":"7B","sizeBytes":4000000000},
+ {"modelKey":"mystery-model","type":"llm"},
+ {"modelKey":"nomic-embed","type":"embedding"}]
+EOF
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_LMS_BIN", &fake)
+        .args(["profile", "scan", "--profiles-file", p.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("2 model(s) in LMStudio, 1 not yet in any profile"), "{stdout}");
+    assert!(stdout.contains("--model mystery-model --task-class fast"), "{stdout}");
+    assert!(!stdout.contains("--model model-a"), "a covered model is not suggested: {stdout}");
+    assert!(!stdout.contains("nomic-embed"), "a non-LLM is not listed: {stdout}");
+}
+
 #[test]
 fn profile_list_errors_when_config_missing() {
     let mut cmd = darkmux_cmd();

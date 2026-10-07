@@ -19942,6 +19942,45 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         assert_eq!(handle.join().unwrap(), WatchdogWake::Done);
     }
 
+    /// The re-arm decision, every combination: it re-arms ONLY when the
+    /// deadline expired, the kill found no container, and the main thread has
+    /// not proved the wait over. Any other outcome ends the watchdog with
+    /// `timeout_fired` and the deadline as they were. Each condition alone must
+    /// be able to stop a re-arm: a killed container needs no more watching, and
+    /// a done wait has nothing left to watch.
+    #[test]
+    fn the_watchdog_re_arms_only_on_an_expired_deadline_an_absent_kill_and_an_open_wait() {
+        let wakes = [WatchdogWake::Done, WatchdogWake::Abandoned, WatchdogWake::DeadlineExpired];
+        let kills = [KillDisposition::Confirmed, KillDisposition::Absent, KillDisposition::Unconfirmed];
+        for wake in wakes {
+            for kill in kills {
+                for done in [false, true] {
+                    let expected = wake == WatchdogWake::DeadlineExpired && kill == KillDisposition::Absent && !done;
+                    let start = Instant::now();
+                    let deadline = Mutex::new(start);
+                    let timeout_fired = AtomicBool::new(true);
+                    let rearmed = rearm_after_absent_kill(
+                        wake,
+                        &AtomicU8::new(kill.code()),
+                        &AtomicBool::new(done),
+                        &timeout_fired,
+                        &deadline,
+                        600,
+                    );
+                    let case = format!("wake={wake:?} kill={kill:?} done={done}");
+                    assert_eq!(rearmed, expected, "{case}");
+                    assert_eq!(timeout_fired.load(Ordering::SeqCst), !expected, "{case}: timeout_fired cleared only on a re-arm");
+                    let new_deadline = *lock_deadline(&deadline);
+                    if expected {
+                        assert!(new_deadline >= start + Duration::from_secs(599), "{case}: a re-arm grants a full budget");
+                    } else {
+                        assert_eq!(new_deadline, start, "{case}: no re-arm leaves the deadline alone");
+                    }
+                }
+            }
+        }
+    }
+
 // (#3074) A hung sampler thread must not wedge dispatch completion.
 #[test]
 fn join_within_gives_up_on_a_thread_that_outlives_the_bound() {
