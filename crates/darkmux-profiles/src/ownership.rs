@@ -319,4 +319,81 @@ mod tests {
         assert_eq!(summary.failed[0].identifier, "darkmux:ghost");
         assert!(summary.failed[0].error.contains("still resident"));
     }
+
+    /// A dry run unloads nothing, so it has nothing to recheck: the residents
+    /// it WOULD eject are still listed, and must not come back as failures.
+    #[test]
+    fn a_dry_run_reports_what_would_come_out_without_rechecking_residency() {
+        let rows = vec![loaded("darkmux:a"), loaded("user-model")];
+        let rechecks = std::cell::Cell::new(0u32);
+        let summary = eject_managed_inner(&rows, true, &|_| anyhow::bail!("a dry run never unloads"), &|| {
+            rechecks.set(rechecks.get() + 1);
+            Ok(rows.clone())
+        })
+        .unwrap();
+        assert_eq!(rechecks.get(), 0, "a dry run must not recheck residency");
+        let ids: Vec<&str> = summary.ejected.iter().map(|m| m.identifier.as_str()).collect();
+        assert_eq!(ids, vec!["darkmux:a"]);
+        assert!(summary.failed.is_empty(), "nothing was attempted, nothing failed: {:?}", summary.failed);
+        assert_eq!(summary.user_loaded_count, 1);
+    }
+
+    /// Writes a throwaway executable that impersonates `lms` (reached through
+    /// `DARKMUX_LMS_BIN`, never the operator's real LMStudio). `ps --json`
+    /// lists `darkmux:a` until an `unload darkmux:a` is logged, and always
+    /// lists `user-model`; every `unload` argument is appended to the log.
+    fn fake_lms_with_two_residents(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let log = dir.join("unloads.log");
+        let bin = dir.join("fake-lms");
+        let user = r#"{"identifier":"user-model","modelKey":"user-model","contextLength":4096}"#;
+        let ours = r#"{"identifier":"darkmux:a","modelKey":"a","contextLength":8192}"#;
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nLOG='{log}'\ncase \"$1\" in\n  ps)\n    if grep -qx 'darkmux:a' \"$LOG\" 2>/dev/null; then echo '[{user}]'; else echo '[{ours},{user}]'; fi ;;\n  unload) echo \"$2\" >> \"$LOG\" ;;\nesac\nexit 0\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (bin, log)
+    }
+
+    /// (#1274) `eject_all_managed` end to end through a fake `lms`: it unloads
+    /// the `darkmux:` resident and ONLY that one, reports it as ejected, and
+    /// counts the user-loaded model without touching it. A dry run reports the
+    /// same split and unloads nothing.
+    #[test]
+    #[serial_test::serial]
+    fn eject_all_managed_unloads_only_the_darkmux_namespace() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin, log) = fake_lms_with_two_residents(tmp.path());
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+
+        let dry = eject_all_managed(true);
+        let dry_unloads = std::fs::read_to_string(&log).unwrap_or_default();
+        let real = eject_all_managed(false);
+        let unloads = std::fs::read_to_string(&log).unwrap_or_default();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let expected = EjectSummary {
+            ejected: vec![EjectedModel { identifier: "darkmux:a".into(), context: 8192 }],
+            user_loaded_count: 1,
+            failed: Vec::new(),
+        };
+        assert_eq!(dry.unwrap(), expected, "a dry run reports what would come out");
+        assert_eq!(dry_unloads, "", "a dry run unloads nothing");
+        assert_eq!(real.unwrap(), expected);
+        assert_eq!(unloads, "darkmux:a\n", "only the darkmux: resident is unloaded; user state is never touched");
+    }
 }

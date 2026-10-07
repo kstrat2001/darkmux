@@ -631,6 +631,19 @@ mod tests {
         assert_eq!(rows[0].identifier, "darkmux:qwen3-4b");
     }
 
+    /// The MODEL column is the model key, read apart from the IDENTIFIER: a
+    /// darkmux load names its instance `darkmux:<key>`, so collapsing the two
+    /// would report the namespaced identifier as the model.
+    #[test]
+    fn the_model_column_is_read_apart_from_the_identifier() {
+        let text = "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\ndarkmux:qwen3-4b  qwen3-4b  idle  2.15 GB  68000\n";
+        let rows = interpret_text_ps(text).expect("a readable listing");
+        assert_eq!(
+            (rows[0].identifier.as_str(), rows[0].model.as_str(), rows[0].status.as_str(), rows[0].size.as_str()),
+            ("darkmux:qwen3-4b", "qwen3-4b", "idle", "2.15 GB")
+        );
+    }
+
     /// (#2774 round-9 review C4) The narrow reading must actually cover
     /// the case it was written for. An old `lms` with no `--json` support
     /// prints its own version banner above the header; on a host with
