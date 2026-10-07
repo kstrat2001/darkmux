@@ -1,6 +1,6 @@
 ---
 name: darkmux-lab-notebook
-description: Draft a lab notebook entry for a recorded darkmux lab run, from `darkmux run stats <run-id> --json` (and the run's manifest.json when needed). Observation first, methodology over polish, the verify outcome stated exactly as recorded. Writes the entry wherever the operator's own instructions say a notebook lives; asks when they say nothing. Use this after a lab run whose result is worth keeping, or when the operator says "notebook this run" / "write up run X". Replaces the retired `lab notebook` verbs and the `scribe` role (4.0, #2913).
+description: Draft a lab notebook entry for a recorded darkmux lab run, from `darkmux run stats <run-id> --json` (and the run's manifest.json when needed). Observation first, methodology over polish, the verify outcome stated exactly as recorded. Writes the entry wherever the operator's own instructions say a notebook lives; asks when they say nothing. Use this after a lab run whose result is worth keeping, or when the operator says "notebook this run" / "write up run X". Replaces the retired `lab notebook` verbs and the `scribe` role (5.0, #2913).
 user_invocable: true
 allowed-tools: "Bash(darkmux:*), Bash(cat:*), Bash(jq:*), Bash(ls:*), Bash(date:*), Read, Write"
 ---

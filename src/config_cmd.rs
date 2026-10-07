@@ -353,7 +353,7 @@ fn describe_key_at(path: &Path, key: &str) -> Result<String> {
                 Some(Value::String(raw)) if s.canonical(raw).is_none() => match s.renamed(raw) {
                     // (#2947 review C-f) Name the replacement, as doctor does.
                     Some(new) => format!(
-                        "{stored} - not a valid value: `{}` was renamed to `{new}` in 4.0",
+                        "{stored} - not a valid value: `{}` was renamed to `{new}` in 5.0",
                         raw.trim().to_ascii_lowercase()
                     ),
                     None => format!("{stored} - not a valid value; runs that read it refuse to start"),
@@ -671,7 +671,7 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 // (#2947) A retired spelling names its replacement first.
                 if let Some(new) = setting.renamed(raw) {
                     bail!(
-                        "`{raw}` was renamed to `{new}` in 4.0: `darkmux config set {} {new}`: valid values:\n{list}",
+                        "`{raw}` was renamed to `{new}` in 5.0: `darkmux config set {} {new}`: valid values:\n{list}",
                         setting.key
                     )
                 }
@@ -1390,7 +1390,7 @@ mod tests {
                     .into_iter()
                     .find(|c| c.status == darkmux_doctor::Status::Fail)
                     .expect("doctor fails a retired spelling");
-                assert!(row.message.contains(&format!("was renamed to `{new}` in 4.0")), "{row:?}");
+                assert!(row.message.contains(&format!("was renamed to `{new}` in 5.0")), "{row:?}");
                 assert!(row.hint.unwrap_or_default().contains(&format!("config set {} {new}", s.key)));
                 exercised += 1;
             }
@@ -1414,7 +1414,7 @@ mod tests {
         let out = describe_key_at(f.path(), "runtime.detection.degeneracy.policy").unwrap();
         // On the STORED line, not merely in the value list's retired note.
         assert!(
-            out.contains("stored in config.json: \"enforce\" - not a valid value: `enforce` was renamed to `conclude` in 4.0"),
+            out.contains("stored in config.json: \"enforce\" - not a valid value: `enforce` was renamed to `conclude` in 5.0"),
             "{out}"
         );
     }

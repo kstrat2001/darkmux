@@ -1677,7 +1677,7 @@ mod tests {
         write_role(
             guard.path(),
             "mission-compiler",
-            "Leftover pre-4.0 role.",
+            "Leftover pre-5.0 role.",
             &["mission-compiling", "analyzing"],
             "bail-with-explanation",
             None,
@@ -1711,7 +1711,7 @@ mod tests {
         write_role(
             guard.path(),
             "mission-compiler",
-            "Leftover pre-4.0 role.",
+            "Leftover pre-5.0 role.",
             &["mission-compiling", "analyzing"],
             "bail-with-explanation",
             None,

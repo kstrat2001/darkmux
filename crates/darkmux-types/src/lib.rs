@@ -432,7 +432,7 @@ pub struct UtilityBinding {
 /// 4.0 removed and the object to write in its place.
 fn bare_utility_line(id: &str) -> String {
     format!(
-        "`internal.utility` is a bare string (\"{id}\"), which 4.0 removed: write \
+        "`internal.utility` is a bare string (\"{id}\"), which 5.0 removed: write \
          `\"utility\": {{ \"id\": \"{id}\", \"n_ctx\": <the window it is loaded at> }}`"
     )
 }
@@ -918,7 +918,7 @@ impl InlineEndpointRewrite {
     /// The operator line: what was removed and the exact rewrite.
     pub fn line(&self) -> String {
         format!(
-            "an inline endpoint object was removed in 4.0: declare it once under `endpoints` and name it by id. \
+            "an inline endpoint object was removed in 5.0: declare it once under `endpoints` and name it by id. \
              Move this object to `endpoints.\"{id}\"` and write `\"endpoint\": \"{id}\"` on the model",
             id = self.suggested_id
         )

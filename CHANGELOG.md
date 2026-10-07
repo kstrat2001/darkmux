@@ -14,6 +14,10 @@ darkmux release.
 
 ## [Unreleased]
 
+This is the 5.0.0 release. The version jumps from 3.13.0 because the work that began as
+4.0 was never tagged on its own: every entry below labeled 5.0 ships together, and
+the `4.0.0-rc.1` in `Cargo.toml` is renamed at release.
+
 ### Added
 
 - **A relayed run is one run** (#3016). Work asked on one machine and executed
@@ -547,7 +551,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   phase whose every task errored (or was abandoned) as error (or abandoned) even
   when the phase was persisted complete.
 
-### Changed (breaking, 4.0)
+### Changed (breaking, 5.0)
 
 - **`GET /flow/:date` answers the `FlowRecordsResponse` envelope.** It returned a
   bare `FlowRecord[]`; it now returns `{records, count, truncated, generated_at_ms, meta}`,
@@ -1011,7 +1015,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   `note` is `operator.note`, `tier-decision` is `tier.decision`, and
   `verdict: <v>` is `phase.review.verdict` with the verdict in
   `payload.verdict` (the full list is in `crates/darkmux-flow/src/schema.rs`).
-  darkmux's own readers, the daemon routes included, upgrade pre-4.0
+  darkmux's own readers, the daemon routes included, upgrade pre-5.0
   archives on read and never rewrite them. An action retired with no
   current equivalent (`telemetry.process`, `funnel.*`, the old
   `mission.run.*`, `crawl.*` launcher records) still reads, as retired; an
@@ -1041,7 +1045,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   viewer, the fleet card's DISPATCHES chip and the status line's "last
   dispatch" no longer count a run as a dispatch, and the event log files the
   run records as `run.start` / `run.complete` / `run.error` under MISSION.
-  darkmux's own readers read a pre-4.0 archive's whole-run pair (`source`
+  darkmux's own readers read a pre-5.0 archive's whole-run pair (`source`
   `mission`, or the retired review launcher's `review`) as `run.*`, and never
   rewrite it. **Migration:** a hook rule or external reader that watched
   `dispatch.complete` with `source: "mission"` to learn that a run ended
@@ -1057,8 +1061,8 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   records-emitted pairing and the run lifecycle key on the execution, so a
   session holding several (a map's items) no longer blends them. Stored
   findings are filed under `<execution_id>/<seq>`, and `darkmux finding list
-  --dispatch <id>` is now `--execution <id>`; a finding filed before 4.0 keeps
-  its address. darkmux's readers give a pre-4.0 record of an execution the id
+  --dispatch <id>` is now `--execution <id>`; a finding filed before 5.0 keeps
+  its address. darkmux's readers give a pre-5.0 record of an execution the id
   `legacy:<session>:<mission>` and never rewrite the file. **Migration:** a
   hook rule or external reader that counted a map step's `dispatch.start` as
   one per step now sees one per item; one that joined a step's records by
@@ -1073,12 +1077,12 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   pass `--execution <id>` where it passed `--dispatch <id>`. The catalog's
   per-day and per-mission DISPATCHES counts are executions too, so a map
   step's items each count.
-- **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
+- **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 5.0 reader
   upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
-  spellings: a 3.x hub misreads a 4.0 peer's records (its missions never
+  spellings: a 3.x hub misreads a 5.0 peer's records (its missions never
   end, its step results aren't folded). **Migration:** upgrade every
   machine in the fleet before relying on the hub's views.
-- **Dotted hook globs now match the bookends too** (FLOW 2.0.0). Before 4.0
+- **Dotted hook globs now match the bookends too** (FLOW 2.0.0). Before 5.0
   these actions were spaced, so a dotted glob never saw them: `dispatch.*`
   now also matches `dispatch.start` / `complete` / `error` / `route`;
   `mission.*` also matches `mission.start` / `close` / `abort` / `pause` /
@@ -1173,7 +1177,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   writes a Warn-level `dispatch.degeneracy.warning` flow record and counts
   `degeneracy_warnings` in the run envelope, without concluding anything.
   The old spellings are refused with the new word ("`enforce` was renamed
-  to `conclude` in 4.0"); there is no alias and no automatic migration.
+  to `conclude` in 5.0"); there is no alias and no automatic migration.
   CONFIG 1.31, FLOW 1.63.0. **Migration:** a `config.json` written by an
   earlier `darkmux init` carries `"policy": "enforce"`, so every dispatch
   refuses until you run
@@ -1238,14 +1242,14 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   <profile>,... --roles <role>,...`), `darkmux config set fleet.listener.enabled true`, and
   restart `darkmux serve`. On the hub, delete the dead streams: `redis-cli
   DEL darkmux:work darkmux:work:inference` (`darkmux doctor` names any that
-  remain) once every machine runs 4.0. **Mixed versions:** a 3.x daemon
+  remain) once every machine runs 5.0. **Mixed versions:** a 3.x daemon
   still consumes `darkmux:work` (and re-creates the stream when it
   starts), so the queue stays an open, unauthenticated way to make that
   machine run work until it is upgraded; `darkmux doctor` names any daemon
-  still consuming it. A 4.0 sender reaching a 3.x machine gets "no answer"
+  still consuming it. A 5.0 sender reaching a 3.x machine gets "no answer"
   (3.x has no fleet listener); a 3.x `--machine` dispatch publishes to the
-  queue, no 4.0 machine reads it, and it waits silently until its timeout.
-  Two 4.0 builds on different wire schemas are told so by name.
+  queue, no 5.0 machine reads it, and it waits silently until its timeout.
+  Two 5.0 builds on different wire schemas are told so by name.
 
 - **One machine utility model, declared once with its window, never a
   task's model** (#2914; finishes #590, supersedes the open parts of #70).
@@ -1308,7 +1312,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   take; its value is unchanged. **Migration:** a script that read
   `.session_id` on a run row reads `.dispatch_id`.
 
-### Removed (breaking, 4.0)
+### Removed (breaking, 5.0)
 
 - **The persona roles and the acknowledgment gate are gone** (#3036). The
   built-in roles `fitness-coach`, `health-research`, `legal-research`,
@@ -1360,7 +1364,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 - **Limits belong to the endpoint, and the `remote` block is gone** (CONFIG 2.3,
   #3035). "Remote" was the wrong axis: a local server on the same machine is an
   endpoint too, and what matters is whether darkmux manages it.
-  `remote.max_tokens_per_step` (and its 4.0 name `remote.max_tokens_per_execution`),
+  `remote.max_tokens_per_step` (and its earlier name `remote.max_tokens_per_execution`),
   `remote.step_budget_policy` and `remote.concurrent_cap` are retired, with
   `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`, `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`,
   `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP`.
@@ -1747,7 +1751,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 
 - **darkmux no longer reads the formats it retired** (#3036). Old data still
   loads and never panics; it reads as unknown.
-  - **Flow archives.** A record spelled the pre-4.0 way (`dispatch start`,
+  - **Flow archives.** A record spelled the pre-5.0 way (`dispatch start`,
     `step result`, `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) or
     carrying an action darkmux retired outright (`telemetry.process`, `funnel.*`,
     `mission.run.*`, `crawl.*`, ...) reads as an unknown action, kept verbatim and
@@ -1774,7 +1778,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
     no-op pauses cannot be mistaken for a real one. A future operator pause is a
     separate `hold` field with `mission.hold` / `mission.release` (#2996).
 
-### The flow record's leftover fields (breaking, 4.0, FLOW 2.0.0)
+### The flow record's leftover fields (breaking, 5.0, FLOW 2.0.0)
 
 - **`payload.runtime` is gone from every record.** It named the dispatch
   topology (`internal`, `direct`, `scheduler`) and nothing outside the
@@ -1831,7 +1835,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   their names. darkmux's readers rename and convert an old record's keys on
   read.
 
-### Typed flow payloads (4.0, FLOW 2.0.0)
+### Typed flow payloads (5.0, FLOW 2.0.0)
 
 - **Every flow record's payload is written from one Rust type per action, and
   the viewer reads it through that type's generated twin.** A record is built
@@ -1873,7 +1877,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   `dispatch.start` `bounds` block from before the newer knobs existed reads with
   the knobs it has.
 
-### Fixed (4.0)
+### Fixed (5.0)
 
 - **An interrupted launch never closes as a success** (5.0, #3074). A SIGINT,
   SIGTERM or SIGHUP during `mission launch` used to let later phases start and
@@ -2061,7 +2065,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 - **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
 - **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).
 - **A switched-off fleet listener says so.** `/health` reported `fleet_listener: null` when `fleet.listener.enabled` is false; it now reports `off` (`off (fleet.listener.enabled is false)` to this machine), and the startup banner says the listener is off instead of describing the token as if it were serving work.
-- **A relayed run's id is greppable on the receiver.** The receiver's session id was `radio.solo.relay.<peer>.radio_2Esolo_2Eadhoc_...`, the sender's id with every dot escaped. A relay now ends with the sender's wire string verbatim (`radio.solo.relay.<peer>.radio.solo.adhoc....`), so the id the sender printed is a substring of the receiver's. Session ids written by an earlier 4.0 build no longer parse.
+- **A relayed run's id is greppable on the receiver.** The receiver's session id was `radio.solo.relay.<peer>.radio_2Esolo_2Eadhoc_...`, the sender's id with every dot escaped. A relay now ends with the sender's wire string verbatim (`radio.solo.relay.<peer>.radio.solo.adhoc....`), so the id the sender printed is a substring of the receiver's. Session ids written by an earlier 5.0 build no longer parse.
 - **A dispatch running inside the daemon no longer probes for a daemon.** Relayed fleet work ran in-process under `darkmux serve --port 8766` and printed "darkmux serve isn't reachable on 127.0.0.1:8765". The nudge is now silent inside the daemon, and it suggests `brew services start darkmux` only for a Homebrew binary (otherwise `darkmux serve`). Doctor's `daemon reachable` row already follows `DARKMUX_SERVE_PORT` / `serve.port`; a `--port` flag exists only in the daemon's own process, so set one of those for doctor to find a non-default port.
 
 - **The fleet lens reads `GET /fleet/view` for its machine list, hardware and
@@ -2095,7 +2099,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   and the retired `role` key on a model. The rows that depend on the registry
   say it did not load, with the cause, instead of "no profile registry".
 
-### Added (4.0)
+### Added (5.0)
 
 - **A fleet card shows only facts about its own machine; the console names the
   machine it runs on.** The grant line ("runs fast") is gone from the fleet
@@ -2190,7 +2194,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   peer answering seat sends full grounding under `managed_only`; when the
   receiver's check says its profile is hosted, radio asks once more with the
   hosted-safe grounding and says so on stderr. **Migration:** run the same darkmux major on
-  both machines; a 4.0 release candidate that still speaks `"8"` is refused
+  both machines; a 5.0 release candidate that still speaks `"8"` is refused
   with the version remedy. `tests/fixtures` in `crates/darkmux-fleet` pin the
   8.0 wire: a shape change without a version change fails a test.
 
@@ -2621,7 +2625,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   **Behavior change for
   source builds:** a local runtime image must now be built with
   `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .`
-  (from the repo root) to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
+  (from the repo root) to be used. `--image darkmux-runtime:<any tag>` (e.g. `:5.0-rc`) is now
   treated as darkmux's own image: version checked, run directly, never
   injected. A BYO `--image` (#703) now extracts its injected runtime from
   the matching image too. `darkmux doctor`'s `runtime image freshness`

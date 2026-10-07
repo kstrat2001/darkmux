@@ -124,7 +124,7 @@ mod user_file_tests {
             let msg = crate::preflight_with(scope, Some(&path)).expect_err(inline).to_string();
             assert!(msg.contains("profiles.p.models[0].endpoint"), "names the model's endpoint: {msg}");
             assert!(
-                msg.contains("removed in 4.0")
+                msg.contains("removed in 5.0")
                     && msg.contains("endpoints.\"api.example\"")
                     && msg.contains("\"endpoint\": \"api.example\""),
                 "names the rewrite: {msg}"

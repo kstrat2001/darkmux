@@ -38,5 +38,5 @@ After listing, suggest the natural next steps to the user:
 ## Notes
 
 - Lab runs are read from the lab dir (`~/.darkmux/lab/` by default, `$DARKMUX_HOME/lab/` when that is set; a `./.darkmux/` in the cwd is never read). "no recorded lab runs yet" means none have been recorded via `darkmux lab run` yet. Suggest `darkmux-lab-run <workload>` to create one.
-- A 3.x install kept them in `~/.darkmux/runs/`. While that dir still holds runs, `--kind lab` refuses and prints the `mv` that moves them; run it, then list again.
+- A 3.x install kept them in `~/.darkmux/runs/`. 5.0 does not read or name that directory, so those runs are simply absent from the list. Move them with step 5 of the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`), then list again.
 - Run dirs without a `manifest.json` are silently skipped (they typically come from interrupted dispatches).

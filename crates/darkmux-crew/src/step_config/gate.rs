@@ -16,7 +16,7 @@ use darkmux_types::user_files::{closest, key_issues, Issue, KeyIssue, COMMENT_KE
 use serde_json::{Map, Value};
 
 /// Why a `mission.verify` task must not name a role.
-const VERIFY_ROLE_REMOVED: &str = "removed in 4.0, it had no effect: `mission.verify` always dispatches the \
+const VERIFY_ROLE_REMOVED: &str = "removed in 5.0, it had no effect: `mission.verify` always dispatches the \
      `code-reviewer` role, whatever the task names (#2953). Delete it";
 
 /// Every problem in the step configs of the mission-config document `doc`.

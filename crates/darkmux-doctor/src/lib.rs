@@ -1259,7 +1259,7 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
             home_display(&paths.config)
         ),
         hint: Some(format!(
-            "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
+            "Since 5.0 (#2914) radio routing runs on the machine's utility model, declared once as \
              `internal.utility` in {} (with its `n_ctx`), never on a profile. \
              This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \

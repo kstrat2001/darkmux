@@ -298,7 +298,7 @@ impl EnumSetting {
             })
             .collect();
         for (old, new) in self.retired {
-            lines.push(format!("{indent}(`{old}` was renamed to `{new}` in 4.0 and is refused)"));
+            lines.push(format!("{indent}(`{old}` was renamed to `{new}` in 5.0 and is refused)"));
         }
         lines.join("\n")
     }
@@ -364,7 +364,7 @@ impl BadEnumValue {
     pub fn summary(&self) -> String {
         let base = format!("`{}` (from {}) is not a valid {} for `{}`", self.raw, self.set_in, self.kind, self.key);
         match self.renamed_to {
-            Some(new) => format!("{base}: `{}` was renamed to `{new}` in 4.0", self.raw.trim().to_ascii_lowercase()),
+            Some(new) => format!("{base}: `{}` was renamed to `{new}` in 5.0", self.raw.trim().to_ascii_lowercase()),
             None => base,
         }
     }
@@ -914,7 +914,7 @@ mod tests {
                 for b in bads {
                     assert_eq!(b.renamed_to, Some(*new));
                     let msg = b.to_string();
-                    assert!(msg.contains(&format!("`{old}` was renamed to `{new}` in 4.0")), "{msg}");
+                    assert!(msg.contains(&format!("`{old}` was renamed to `{new}` in 5.0")), "{msg}");
                     assert!(b.fix().contains(new), "{}", b.fix());
                 }
                 exercised += 1;

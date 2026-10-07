@@ -184,7 +184,7 @@ darkmux run list --kind lab --limit 50</code></pre>
     <p>Every <code>darkmux lab run</code> works in its own sandbox, a copy-on-write clone of the source, not the source itself. The source fixture directory is <strong>never touched</strong>; cross-run contamination is eliminated by construction. The clone is near-instant where the filesystem supports it (<code>clonefile</code> on APFS, <code>--reflink</code> on btrfs/xfs/zfs) and falls back to a deep copy everywhere else.</p>
     <pre><code>~/.darkmux/lab/&lt;run-id&gt;/
 <span class="comment">  sandbox/          # this run's isolated COW clone, where the model works
-  manifest.json     # now carries baseline_hash + final_hash (schema_version 6)
+  manifest.json     # now carries baseline_hash + final_hash (schema_version 6 and later)
   trajectory.jsonl  # per-turn detail</span></code></pre>
     <p>The manifest gained two content hashes (BLAKE3, formatted <code>blake3:&lt;hex&gt;</code>):</p>
     <ul>

@@ -233,7 +233,7 @@ fn config_retired_keys_name_their_replacement() {
     let keys = config_keys(json!({"remote": {"max_tokens_per_execution": 5}, "dirs": {"notebook": "/x"}}));
     let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
     assert!(msgs.iter().any(|m| m.contains("`remote`: removed in 5.0") && m.contains("endpoints.<id>.limits")), "{msgs:?}");
-    assert!(msgs.iter().any(|m| m.contains("`dirs.notebook`: removed in 4.0")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("`dirs.notebook`: removed in 5.0")), "{msgs:?}");
 }
 
 /// (#3036) `dirs.ack` went with the licensed-adjacent acknowledgment gate:
@@ -476,7 +476,7 @@ fn every_historical_config_key_is_named_as_retired() {
     assert!(not_retired.is_empty(), "{not_retired:#?}");
     assert_eq!(keys.len(), 13, "the retired `remote` block is one key: {keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote`: removed in 5.0 (#3035)", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME", "`runtime.log_level`: removed in 5.0", "`machine_rollup`: removed in 5.0"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote`: removed in 5.0 (#3035)", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 5.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 5.0", "DARKMUX_HOME", "`runtime.log_level`: removed in 5.0", "`machine_rollup`: removed in 5.0"] {
         assert!(msg.contains(says), "{says}: {msg}");
     }
 }

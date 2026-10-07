@@ -224,7 +224,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
    exit paths), regardless of what richer vocabulary it also emits. Liveness surfaces key on
    these bookends plus presence (#857); new vocabularies supplement, never replace.
-   **Amended by #2914 (4.0): darkmux's own UTILITY jobs are exempt, and run lean.** The
+   **Amended by #2914 (5.0): darkmux's own UTILITY jobs are exempt, and run lean.** The
    utility jobs are defined once, by `darkmux_crew::usage::utility_job` (every runtime
    compactor call, and every call by the radio routing role; `call_purpose` and the
    `UtilityJobKind` enum both read it); they run on the machine's one utility model
@@ -365,7 +365,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      which is what `dispatch` already means.
    - **session** — INTERNAL ONLY: a join key tying a family of flow records together,
      typed as `SessionId { kind, run }` (`darkmux-types/src/session_id.rs`): no session
-     exists without its run, `wire()` is its only string form, and a pre-4.0 string is not a
+     exists without its run, `wire()` is its only string form, and a pre-5.0 string is not a
      session (`SessionId::parse` refuses it). Never an operator-facing word, because it is
      also minted for mission lifecycle transitions that are not executions at all (the
      run's own session, `SessionKind::Run`). The `session_id` FIELD keeps its name on
@@ -392,7 +392,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      residency alone is wrong: a declared utility role going resident is not a swap (#1934).
 
    **One wire spelling per event (operator, 2026-09-27; supersedes "the wire keeps its
-   historical spelling").** 4.0 breaks flow compatibility rather than carry two conventions
+   historical spelling").** 5.0 breaks flow compatibility rather than carry two conventions
    for the same event. Every action is a `darkmux_flow::FlowAction` variant, spelled
    `<scope>.<event>[.<detail>]` (lowercase, two or three dot-separated segments), and the
    wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
@@ -400,7 +400,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `FlowAction`'s public deserializer refuses an unknown action. Consumers match
    on the enum, never on a string.
    <!-- flow-action-guard:allow-start — names the old spellings to say what they now read as -->
-   Nothing in the build knows a retired spelling (5.0, #3036): the pre-4.0 spellings
+   Nothing in the build knows a retired spelling (5.0, #3036): the pre-5.0 spellings
    (`dispatch start`, `step result`, `mission close`, `note`, `verdict: <v>`, `sprint *`,
    ...) and the actions darkmux retired with no current equivalent (`telemetry.process`,
    `funnel.*`, ...) read, through `darkmux_flow::reader` like every other record, as
@@ -450,7 +450,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      twin beside it), which bookends each execution through `ExecutionBookends`. It is not
      review-specific, and not used by `review.json`.
 
-   **Every record of an execution names it: `execution_id` (4.0).** The id
+   **Every record of an execution names it: `execution_id` (5.0).** The id
    (`darkmux_types::execution_id::ExecutionId`) is minted ONCE per role execution at the
    host entries that run one: `crew::dispatch::dispatch` (which covers the hosted
    single-shot path), `dispatch_local_single_shot`, the `dispatch.single_shot` step kind, and
@@ -466,13 +466,13 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    rides in the host-only origin record beside the out-dir, `<out-dir>.resume_origin.json`, which the container never mounts);
    a specialist change mints a new one. Consumers key on it: the token sum's legacy
    fallback, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors'
-   attempts, and the finding store (`<execution_id>/<seq>`). A record from before 4.0
+   attempts, and the finding store (`<execution_id>/<seq>`). A record from before 5.0
    names none, and none is invented for it (#3036): the reader and the viewer's `ingest.ts`
    stamp nothing, and only the token and run counts key such a record by `(session,
    mission)` (`usage_sum::execution_key` and `executionOf`), the one place that grouping
    survives.
 
-   **The run grain has its own bookends (4.0).** A `mission launch` and an ACP panel run
+   **The run grain has its own bookends (5.0).** A `mission launch` and an ACP panel run
    open `run.start` on the run's own session and close it with `run.complete` or
    `run.error` on every exit path (a `BookendGuard`: a panic or an early return still
    writes `run.error`). The role executions inside it bookend as `dispatch.*`, so
@@ -486,7 +486,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    either grain and takes its outcome from a bookend terminal. The runs board's
    representative is the run session its `run.start` opened, the fleet card collapses a
    mission onto its run-grain group, and the status line's last-dispatch counts role
-   executions only. A pre-4.0 archive's whole-run pair (`dispatch.*` with `source`
+   executions only. A pre-5.0 archive's whole-run pair (`dispatch.*` with `source`
    `mission`, or the retired review launcher's `review`) is no longer read as `run.*`
    (#3036): it reads as the execution bookends it was spelled as, or as an unknown action
    when spelled the old way; no file is rewritten.
@@ -517,7 +517,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    off, loudly, while the run continues without it).
 
    Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
-   in 4.0"): a rename never reads the old word as the new one. Policy values name the action
+   in 5.0"): a rename never reads the old word as the new one. Policy values name the action
    (`off` / `record` / `warn` / the rule's own verb, e.g. `conclude`), never `enforce`/`observe`.
 
    The mechanism is two declarations in `darkmux-types/src/config_enum.rs`, and everything else
@@ -751,7 +751,7 @@ crates/darkmux-crew/src/step_kinds/
                     types, which is what keeps a Tier 2 pattern actually
                     reusable rather than one mission's code with extra
                     ceremony. (The funnel-era multi_pass_confirm.rs and
-                    dedup.rs were deleted in 4.0: their only consumer was
+                    dedup.rs were deleted in 5.0: their only consumer was
                     the funnel #2310 P4d removed.)
     types.rs      — the StepKind trait itself.
     registry.rs   — StepKindRegistry.
@@ -794,7 +794,7 @@ If a user asks you to:
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab fixture register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
-| "draft a notebook entry" | Invoke the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`): it reads `darkmux run stats <run-id> --json` (and the run's `manifest.json` when needed) and drafts the entry, observation first, with the verify outcome stated as recorded, then writes it wherever the operator's own instructions say. The `lab notebook draft`/`list` verbs and the `scribe` role were removed in 4.0 (#2913). |
+| "draft a notebook entry" | Invoke the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`): it reads `darkmux run stats <run-id> --json` (and the run's `manifest.json` when needed) and drafts the entry, observation first, with the verify outcome stated as recorded, then writes it wherever the operator's own instructions say. The `lab notebook draft`/`list` verbs and the `scribe` role were removed in 5.0 (#2913). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the AREA you touched (`cargo t-review`, `cargo t-flow`, … — see "Testing — run the area, not the world"; `t-all` only for a cross-cutting change or a release), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "check the mission board / housekeeping" | `darkmux mission status` (#829) — the global mission-control read: every mission grouped by status with phase progress + the drift that needs attention (an open mission whose phases are all done; a stalled Active mission; a phase permanently blocked by an earlier abandoned one) + copy-pasteable reconcile commands. READ-ONLY — surfaces + suggests, never mutates; the operator/you run the suggested `mission finalize`/`mission abort` (#1463 — those two whole-mission terminals reconcile phases now, so a "Finalized mission with a non-terminal phase" is no longer a reachable drift). `--json` for programmatic consumption. **Run it as session-start housekeeping** (and before opening PRs / wrapping a work arc) so mission↔phase drift gets caught structurally rather than by memory — and so gh/jira stay reconciled off the same cue. The CLI twin of the viewer's missions lens (#827). |

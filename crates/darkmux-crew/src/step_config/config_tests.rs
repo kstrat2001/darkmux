@@ -178,7 +178,7 @@ fn a_verify_task_naming_a_role_is_refused() {
         {"id": "t", "role_id": "code-reviewer", "steps": [{"id": "s", "kind": "mission.verify"}]},
         {"id": "u", "role_id": "coder", "steps": [{"id": "c", "kind": "mission.coder"}]}]}]});
     let text = rendered(&step_config_issues(&doc)).join("\n");
-    assert!(text.contains("`phases[0].tasks[0].role_id`: removed in 4.0"), "{text}");
+    assert!(text.contains("`phases[0].tasks[0].role_id`: removed in 5.0"), "{text}");
     assert!(!text.contains("tasks[1]"), "the coder task's role is honored: {text}");
 }
 
