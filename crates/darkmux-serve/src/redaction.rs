@@ -9,8 +9,8 @@
 //! Two entry points, one rule set ([`Redaction`]):
 //!
 //! - [`redact_reads`] is the layer every JSON route carries. For a remote
-//!   caller it parses the body and redacts each key and value, so a field no
-//!   one thought to list (an operator-authored profile description, a path in
+//!   caller it streams the body through [`crate::redaction_stream`], redacting each
+//!   key and value as it passes, so a field no one thought to list (an operator-authored profile description, a path in
 //!   an error line) is covered without naming it.
 //! - [`redact_stdout`] is for a console panel's terminal output, which needs
 //!   its escape sequences split out first (see [`classify_escape`]).
@@ -23,13 +23,16 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use darkmux_types::url_authority::UrlAuthority;
+use crate::redaction_stream::StreamRedactor;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
 pub(crate) const ADDRESS_HIDDEN: &str = "(address hidden)";
-/// The largest JSON body the layer will re-read to redact; a bigger one is
-/// withheld, never passed through unfiltered.
-const MAX_REDACTED_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// How long a derived [`Redaction`] is reused. The key below catches a roster or
+/// directory change at once; this bounds staleness for what it does not cover
+/// (the fleet hub in the config, the machine id, a symlink repointed).
+const REDACTION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a non-local caller must not read in a response, derived from the
 /// daemon's own state when the request is served: every roster ADDRESS (and its
@@ -43,6 +46,53 @@ pub(crate) struct Redaction {
     /// Roster addresses (and their hosts, and the hub's), then directory
     /// prefixes, each longest first within its kind.
     needles: Vec<Needle>,
+}
+
+/// What a derivation read: `fleet.json`'s mtime and length, and the two
+/// directory variables (#3073).
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    roster: Option<(std::time::SystemTime, u64)>,
+    home: Option<String>,
+    darkmux_home: Option<String>,
+}
+
+impl CacheKey {
+    fn current() -> Self {
+        let roster = std::fs::metadata(darkmux_fleet::roster_path()).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        Self { roster, home: std::env::var("HOME").ok(), darkmux_home: std::env::var("DARKMUX_HOME").ok() }
+    }
+}
+
+/// The last derivation, so a remote request does not reload the roster and
+/// canonicalize the directories every time (#3073).
+#[derive(Default)]
+struct RedactionCache {
+    entry: Option<(CacheKey, std::time::Instant, std::sync::Arc<Redaction>)>,
+}
+
+impl RedactionCache {
+    fn get(&mut self, key: CacheKey, now: std::time::Instant, derive: impl FnOnce() -> Redaction) -> std::sync::Arc<Redaction> {
+        if let Some((k, at, r)) = &self.entry {
+            if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
+                return r.clone();
+            }
+        }
+        let r = std::sync::Arc::new(derive());
+        self.entry = Some((key, now, r.clone()));
+        r
+    }
+}
+
+static REDACTION_CACHE: std::sync::Mutex<Option<RedactionCache>> = std::sync::Mutex::new(None);
+
+impl Redaction {
+    /// [`Self::derive`], reused while `fleet.json`, HOME and DARKMUX_HOME are unchanged.
+    fn derive_cached() -> std::sync::Arc<Self> {
+        let key = CacheKey::current();
+        let mut guard = REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get_or_insert_with(RedactionCache::default).get(key, std::time::Instant::now(), Self::derive)
+    }
 }
 
 /// One thing to find, lowercased once.
@@ -67,7 +117,7 @@ impl Needle {
 
 impl Redaction {
     /// The roster is read from disk and the directories from the environment
-    /// per call; there is no list to maintain. An unreadable roster hides
+    /// per call (see [`Self::derive_cached`]); there is no list to maintain. An unreadable roster hides
     /// nothing it cannot name, and the caller still gets no `stderr_tail`.
     pub(crate) fn derive() -> Self {
         let roster = darkmux_fleet::load_roster().ok();
@@ -195,11 +245,10 @@ fn continues_backward(before: &str) -> bool {
 }
 
 /// The host of a URL (`scheme://user:pw@host:port/path`), without userinfo,
-/// port or path.
+/// port or path. The host comes from the same authority parser the flow
+/// redactor uses (#3074).
 fn url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let hostport = UrlAuthority::parse(url)?.hostport();
     let host = address_host(hostport).unwrap_or(hostport);
     (!host.is_empty()).then(|| host.to_string())
 }
@@ -560,49 +609,15 @@ impl Redaction {
     pub(crate) fn line(&self, line: &str) -> String {
         redact_text(line, self).into_owned()
     }
-
-    /// Every string in a JSON document, keys and values, redacted in place.
-    pub(crate) fn json(&self, v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::String(s) => {
-                if let std::borrow::Cow::Owned(n) = redact_text(s, self) {
-                    *s = n;
-                }
-            }
-            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| self.json(x)),
-            serde_json::Value::Object(o) => {
-                o.values_mut().for_each(|x| self.json(x));
-                let renames: Vec<(String, String)> = o
-                    .keys()
-                    .filter_map(|k| match redact_text(k, self) {
-                        std::borrow::Cow::Owned(n) => Some((k.clone(), n)),
-                        std::borrow::Cow::Borrowed(_) => None,
-                    })
-                    .collect();
-                for (old, new) in renames {
-                    if let Some(val) = o.remove(&old) {
-                        // Two keys can redact to the same text: the later one
-                        // is suffixed so a remote map loses no entry.
-                        let mut key = new.clone();
-                        let mut n = 2;
-                        while o.contains_key(&key) {
-                            key = format!("{new} #{n}");
-                            n += 1;
-                        }
-                        o.insert(key, val);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// The layer every JSON read route carries: a caller that is this machine or
 /// holds the token gets the response as built; anyone else gets it with host
-/// facts redacted ([`Redaction`]). A JSON body is redacted value by value, and
-/// anything else on a JSON route (a plain-text error) is redacted as text, so
-/// nothing passes through unfiltered. A body it cannot read is withheld (500).
+/// facts redacted ([`Redaction`]). The body is redacted as it streams, token by
+/// token for JSON and line by line for anything else on a JSON route (a
+/// plain-text error), so memory is bounded by the largest single value or line
+/// and no response is too big to serve; nothing passes through unfiltered
+/// ([`crate::redaction_stream`], #3073).
 pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let full_view = crate::caller_is_local_or_holds_token(peer, req.headers());
@@ -612,20 +627,64 @@ pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
     }
     let is_json = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
     let (mut parts, body) = resp.into_parts();
-    let withheld = || (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_REDACTED_BODY_BYTES).await else { return withheld() };
-    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive).await else { return withheld() };
-    let out = if is_json {
-        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return withheld() };
-        r.json(&mut value);
-        let Ok(out) = serde_json::to_vec(&value) else { return withheld() };
-        out
-    } else {
-        let Ok(text) = String::from_utf8(bytes.to_vec()) else { return withheld() };
-        r.line(&text).into_bytes()
+    let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
     };
+    let redactor = if is_json { StreamRedactor::json(r) } else { StreamRedactor::text(r) };
     parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, axum::body::Body::from(out))
+    Response::from_parts(parts, axum::body::Body::from_stream(redacted_chunks(body, redactor)))
+}
+
+/// How much of an arriving chunk is redacted per output chunk, so a handler that
+/// builds its body in one piece still leaves the layer in pieces, not as a
+/// second copy of the response.
+const REDACT_SLICE_BYTES: usize = 64 * 1024;
+
+struct RedactState {
+    chunks: std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
+    redactor: StreamRedactor,
+    held: axum::body::Bytes,
+    done: bool,
+}
+
+/// The body's bytes, each slice redacted as it passes, then the flush of what
+/// the last one left pending. A body error, or a JSON body that is not JSON
+/// (fail closed, #3073), ends the stream with that error.
+fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl futures::Stream<Item = Result<Vec<u8>, axum::Error>> {
+    use futures::StreamExt;
+    let state = RedactState { chunks: Box::pin(body.into_data_stream()), redactor, held: Default::default(), done: false };
+    futures::stream::unfold(state, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            let mut out = Vec::new();
+            if !st.held.is_empty() {
+                let slice = st.held.split_to(st.held.len().min(REDACT_SLICE_BYTES));
+                if let Err(e) = st.redactor.feed(&slice, &mut out) {
+                    st.done = true;
+                    return Some((Err(axum::Error::new(e)), st));
+                }
+            } else {
+                match st.chunks.next().await {
+                    Some(Ok(bytes)) => st.held = bytes,
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(e), st));
+                    }
+                    None => {
+                        st.done = true;
+                        if let Err(e) = st.redactor.finish(&mut out) {
+                            return Some((Err(axum::Error::new(e)), st));
+                        }
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Some((Ok(out), st));
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -698,7 +757,7 @@ mod tests {
         req.extensions_mut().insert(peer(from));
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status().as_u16();
-        let bytes = to_bytes(resp.into_body(), 16 * 1024 * 1024).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -875,6 +934,20 @@ mod tests {
         assert_eq!(r.line("the hubname word"), "the hubname word", "a bare name is not a host fact as a free word");
     }
 
+    /// (#3074) A hub password holding `#`, `/` or `?` must not make the host a
+    /// password prefix: serve reads the URL through the same authority parser
+    /// as the flow redactor, so both find the real host.
+    #[test]
+    fn url_host_is_the_real_host_whatever_the_password_holds() {
+        for pw in ["p#ssw0rd", "pa/ss", "pa?ss", "a#b/c?d", "p@ss"] {
+            let url = format!("redis://kain:{pw}@hubhost.example:6379/0");
+            assert_eq!(url_host(&url).as_deref(), Some("hubhost.example"), "{pw}");
+            let url = format!("redis://:{pw}@hubhost.example:6379");
+            assert_eq!(url_host(&url).as_deref(), Some("hubhost.example"), "{pw}");
+        }
+        assert_eq!(url_host("redis+unix:///tmp/x.sock?pass=s3"), None, "a socket has no host");
+    }
+
     // ── the rules, unit by unit ────────────────────────────────────────
 
     fn rules() -> Redaction {
@@ -925,27 +998,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn json_keys_are_redacted_with_the_values() {
-        let r = rules();
-        let mut v = serde_json::json!({"peer 100.64.7.7": "x", "ok": {"/Users/someone/k": ["at 10.0.0.1"]}});
-        r.json(&mut v);
-        assert_eq!(v, serde_json::json!({format!("peer {ADDRESS_HIDDEN}"): "x", "ok": {"~/k": [format!("at {ADDRESS_HIDDEN}")]}}));
-    }
-
-    #[test]
-    fn two_keys_that_redact_alike_both_survive() {
-        let r = rules();
-        let mut v = serde_json::json!({"100.64.7.7": 1, "10.0.0.1": 2, "(address hidden)": 3, "ok": 4});
-        r.json(&mut v);
-        let o = v.as_object().unwrap();
-        assert_eq!(o.len(), 4, "{v}");
-        let mut got: Vec<i64> = o.values().map(|x| x.as_i64().unwrap()).collect();
-        got.sort();
-        assert_eq!(got, [1, 2, 3, 4]);
-        assert!(o.contains_key(ADDRESS_HIDDEN) && o.contains_key(&format!("{ADDRESS_HIDDEN} #2")) && o.contains_key(&format!("{ADDRESS_HIDDEN} #3")), "{v}");
-    }
-
     /// A bare roster host (`studio`) must not be found inside a longer word,
     /// and must be where it addresses, even as the whole string after `@`.
     #[test]
@@ -983,6 +1035,57 @@ mod tests {
         assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
     }
 
+    /// `CacheKey` follows a real `fleet.json` edit: a roster that changes between two
+    /// `derive_cached` calls inside the TTL is read again (#3073).
+    #[test]
+    #[serial_test::serial]
+    fn derive_cached_follows_an_edit_to_the_real_fleet_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = dir.path().join("fleet.json");
+        let roster = |address: &str| {
+            format!(r#"{{"version":"2","machines":{{"peerone":{{"id":"peerone","address":"{address}","added_unix_ms":1}}}}}}"#)
+        };
+        let saved = std::env::var_os("DARKMUX_FLEET_FILE");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &fleet) };
+        *REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+        std::fs::write(&fleet, roster("alpha.example:8765")).unwrap();
+        let first = Redaction::derive_cached();
+        assert!(!first.line("see alpha.example").contains("alpha.example"), "the first roster's address is hidden");
+        assert!(first.line("see beta.example").contains("beta.example"), "an address not in the roster is not");
+
+        // A longer address, so the length half of the key differs even on a coarse mtime.
+        std::fs::write(&fleet, roster("beta.example.longer:8765")).unwrap();
+        let second = Redaction::derive_cached();
+        assert!(!second.line("see beta.example.longer").contains("beta.example.longer"), "the edit is picked up inside the TTL");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+        *REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn the_cache_derives_once_per_key_and_again_when_the_key_changes() {
+        let derives = std::cell::Cell::new(0);
+        let mut cache = RedactionCache::default();
+        let key = |m: u64| CacheKey { roster: Some((std::time::UNIX_EPOCH, m)), home: Some("/h".into()), darkmux_home: None };
+        let now = std::time::Instant::now();
+        let derive = || { derives.set(derives.get() + 1); Redaction::from_parts(&[], &[], None, None) };
+        cache.get(key(1), now, derive);
+        cache.get(key(1), now, derive);
+        assert_eq!(derives.get(), 1, "an unchanged roster, HOME and DARKMUX_HOME reuse the derivation");
+        cache.get(key(2), now, derive);
+        assert_eq!(derives.get(), 2, "a changed fleet.json derives again");
+        let mut other_home = key(2);
+        other_home.home = Some("/other".into());
+        cache.get(other_home.clone(), now, derive);
+        assert_eq!(derives.get(), 3, "a changed HOME derives again");
+        cache.get(other_home, now + REDACTION_CACHE_TTL, derive);
+        assert_eq!(derives.get(), 4, "an aged entry derives again, so a hub or machine-id change still lands");
+    }
+
     #[tokio::test]
     async fn a_non_json_reply_on_a_json_route_is_redacted_as_text_for_a_remote_reader() {
         let app = axum::Router::new()
@@ -992,6 +1095,113 @@ mod tests {
         assert_eq!(remote, format!("failed at {ADDRESS_HIDDEN} in ~/x"));
         let (_, local) = get(app, "/t", LOCAL).await;
         assert_eq!(local, "failed at 100.64.7.7 in /Users/someone/x");
+    }
+
+    /// A remote read has no size cap: a 100 MB JSON body is served, redacted, where the
+    /// parse-and-walk layer withheld anything over 80 MB (#3073).
+    #[tokio::test]
+    async fn a_remote_body_of_a_hundred_megabytes_is_served_redacted() {
+        let record = format!(r#"{{"peer":"{PEER_IP}","note":"{}"}}"#, "x".repeat(1400));
+        let n = 100_000_000 / record.len() + 1;
+        let body = format!("[{}]", vec![record.as_str(); n].join(","));
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, remote) = get(app.clone(), "/t", REMOTE).await;
+        assert_eq!(status, 200);
+        assert!(remote.len() > 100_000_000 && !remote.contains(PEER_IP), "served in full, redacted");
+        let (_, local) = get(app, "/t", LOCAL).await;
+        assert!(local.contains(PEER_IP), "a local reader sees it as built");
+    }
+
+    /// A handler that builds its body in one piece still leaves the layer in slices, so the
+    /// redacted copy is never a second whole response (#3073).
+    #[tokio::test]
+    async fn a_remote_body_leaves_the_layer_in_slices() {
+        use futures::StreamExt;
+        let record = format!(r#"{{"peer":"{PEER_IP}","note":"{}"}}"#, "x".repeat(1400));
+        let body = format!("[{}]", vec![record.as_str(); 2000].join(","));
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(REMOTE));
+        let mut chunks = app.oneshot(req).await.unwrap().into_body().into_data_stream();
+        let (mut largest, mut total) = (0, 0);
+        while let Some(c) = chunks.next().await {
+            let c = c.unwrap();
+            largest = largest.max(c.len());
+            total += c.len();
+        }
+        assert!(total > 2_000_000);
+        assert!(largest <= REDACT_SLICE_BYTES + record.len(), "a {largest} byte chunk");
+    }
+
+    /// What a remote caller receives: the status, every byte that reached it, and whether the
+    /// body ended in an error (a truncated response).
+    async fn get_streamed(app: axum::Router, path: &str) -> (u16, String, bool) {
+        use futures::StreamExt;
+        let mut req = Request::builder().uri(path).header("host", "localhost").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer(REMOTE));
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let mut chunks = resp.into_body().into_data_stream();
+        let (mut got, mut errored) = (Vec::new(), false);
+        while let Some(c) = chunks.next().await {
+            match c {
+                Ok(b) => got.extend_from_slice(&b),
+                Err(_) => errored = true,
+            }
+        }
+        (status, String::from_utf8_lossy(&got).into_owned(), errored)
+    }
+
+    fn json_route(body: String) -> axum::Router {
+        axum::Router::new()
+            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .layer(axum::middleware::from_fn(redact_reads))
+    }
+
+    /// A body that claims to be JSON and is not fails closed: the stream errors (a truncated
+    /// body) and nothing past the break reaches the caller, where text redaction missed
+    /// escaped facts (#3073).
+    #[tokio::test]
+    async fn a_malformed_json_reply_ends_the_stream_for_a_remote_reader() {
+        let (status, remote, errored) = get_streamed(json_route("{\"a\": 100.64.7.7 /Users/someone/x".into()), "/t").await;
+        assert_eq!(status, 200);
+        assert!(errored, "the stream ends in an error: {remote}");
+        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+    }
+
+    /// The reviewer's proof: a real `axum::Json` handler, 130 levels deep (past serde_json's
+    /// 128), a string with escaped newline and tab before each fact. It stays JSON, every fact
+    /// is hidden, and what arrives is valid JSON (#3073).
+    #[tokio::test]
+    async fn a_body_nested_past_128_with_escaped_facts_is_redacted_as_json() {
+        let mut v = serde_json::json!({"line": "err\n/Users/someone/x\tat\t100.64.7.7"});
+        for _ in 0..130 {
+            v = serde_json::json!([v]);
+        }
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(move || { let v = v.clone(); async move { axum::Json(v) } }))
+            .layer(axum::middleware::from_fn(redact_reads));
+        let (status, remote, errored) = get_streamed(app, "/t").await;
+        assert_eq!(status, 200);
+        assert!(!errored, "valid JSON of any depth is served");
+        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+        let inner = remote.strip_prefix(&"[".repeat(130)).and_then(|r| r.strip_suffix(&"]".repeat(130))).expect("130 levels kept");
+        let line = serde_json::from_str::<serde_json::Value>(inner).expect("valid JSON")["line"].as_str().unwrap().to_string();
+        assert!(line.starts_with("err\n") && line.contains(ADDRESS_HIDDEN), "{line}");
+    }
+
+    /// JavaScript accepts `["\ud800", ...]` where serde_json refuses the lone surrogate; the
+    /// stream must not fall to a text pass that cannot read the escaped path (#3073).
+    #[tokio::test]
+    async fn a_body_serde_rejects_but_a_browser_reads_leaks_no_fact() {
+        let body = r#"["\ud800","\/Users\/kfake\/x","\n100.64.7.7"]"#.to_string();
+        let (_, remote, errored) = get_streamed(json_route(body), "/t").await;
+        assert!(errored, "fails closed: {remote}");
+        assert!(!remote.contains("kfake") && !remote.contains(PEER_IP) && !remote.contains("Users"), "{remote}");
     }
 
     /// A route registered anywhere but the route table escapes the layer. The

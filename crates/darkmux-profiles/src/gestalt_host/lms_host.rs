@@ -37,7 +37,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// adapter supplies a generous bound of its own: a wedged `lms ps` must not
 /// hang plan assembly any more than a wedged `lms load` may hang execution
 /// (#1276).
-pub(crate) const DEFAULT_LIST_BOUND: Duration = Duration::from_secs(30);
+pub const DEFAULT_LIST_BOUND: Duration = Duration::from_secs(30);
 
 /// The `lms`-CLI implementation of the gestalt [`ModelHost`] port.
 ///
@@ -540,7 +540,7 @@ fn classify_load_failure(stderr: &str, model_key: &str, detail: String) -> HostE
 /// whatever stderr says, and error-shaped stderr on a 0 exit is a failure
 /// too — never a silent success. Non-error stderr noise (progress remnants)
 /// on a 0 exit passes.
-fn classify_unload_outcome(
+pub(crate) fn classify_unload_outcome(
     success: bool,
     stderr: &str,
     identifier: &str,

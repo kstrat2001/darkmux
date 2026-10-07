@@ -61,7 +61,30 @@ darkmux release.
   `tests/cli-json.golden` regenerated for the new field).
 
 ### Fixed (5.0): isolation
+- **A remote read is redacted as it streams, with no size cap, and the serve token compares as digests** (#3073).
+  The redaction layer reloaded `fleet.json` and canonicalized the home directories on
+  every remote request; it now reuses the last derivation while `fleet.json`'s mtime and
+  length, `HOME` and `DARKMUX_HOME` are unchanged (10 s at most). It also parsed the whole
+  response into one JSON value (about 5 to 7 times the body) and withheld anything over a
+  cap; it now rewrites each string and key as it passes and sends the result in 64 KiB
+  slices, so memory is bounded by the largest value and a busy day is never answered 500.
+  Nesting of any depth stays in JSON mode (one bit per level). A JSON body that is not
+  JSON ends the stream, a truncated body, instead of being read as text, which missed
+  facts behind `\n` and `\t` escapes; only routes declared non-JSON are redacted line by line.
+  Measured on a 64 MB `/flow/:date`-shaped body: peak memory +222 MB before, +1.6 MB now.
+  A wrong-length bearer token no longer returns early.
 
+- **A compaction whose reply was cut off and repaired is flagged** (#3074). The installed
+  `compaction` trajectory event and `compaction-N.json` carry `lexically_repaired`, distinct
+  from `truncation_patched` (missing fields defaulted), so an operator can see a lossy
+  summary without reading stderr.
+- **`finding.json` and `mod.json` are written atomically** (#3074). A finding is
+  written to a unique temp file, fsynced, and hard-linked into place, so a crash leaves
+  no record rather than a torn one and a second write of the same finding is refused. A
+  gated mod is rewritten by temp file and rename instead of truncating in place.
+- **A second prompt on one ACP session no longer replaces the first prompt's abort handle** (#3074).
+  `session/cancel` and `session/close` abort every prompt in flight on the session, and a
+  cancel that finds nothing in flight does nothing, so it cannot abort the session's next prompt.
 - **`darkmux dispatch --workspace-read-only` mounts the workspace read-only** (#3074).
   The crew-of-one hop dropped the flag, so the agent's tools could write into the tree
   the operator asked to protect. A `dispatch.internal` step reads it from the config key
@@ -78,7 +101,48 @@ darkmux release.
   dropped, and the result says how many bytes of stdout or stderr were not shown.
 - **A Redis password holding `#`, `/` or `?` is masked** (#3074) in `flow status`, doctor
   and the flow-status panel, and `SinkInfo`'s `Debug` no longer prints the raw URL. A URL
-  with an `@` after the host now masks up to the last `@`.
+  with an `@` after the host now masks up to the last `@`. A unix-socket URL, which has
+  no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
+  the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
+  an endpoint's host split the URL with one parser.
+- **A task with a later step still planned does not read as finished** (#3074). A step's
+  `step.complete` closed its task's session, so the session showed Complete between that
+  step and the next one's `step.start` (long when the next step waits on a gate). The record
+  now carries an additive `later_step_planned` marker when a later step of the task is
+  still planned, and neither the daemon nor the viewer counts it as the end. Archives
+  without the marker read as before. Flow schema 2.1.0 (additive) records the key.
+- **A failed battery probe keeps a held battery pause alive** (#3074). The governor dropped
+  its heartbeat on any tick with no reading, so a probe that kept failing for longer than the
+  runtime's pause ceiling let the run resume below the floor. It now keeps re-stamping at the
+  last known charge, and only a reading above the floor releases the pause. The first blind
+  tick of a failure episode now logs a Warn `dispatch.rest` ("battery probe failing; holding at
+  N%"), and a probe that stays blind for the runtime's pause ceiling
+  (`DARKMUX_THERMAL_MAX_PAUSE_MS`, `0` unbounded) releases the hold with a second Warn.
+- **An operator gate no longer holds an ungated sibling** (#3073). A wave with both kinds
+  of ready step runs the ungated ones first; a gated one is asked on the next pass, so a
+  tty prompt or an ACP dialog no longer delays work that never needed sign-off, and a gated
+  step beside a long independent chain is not held until the chain ends.
+- **Indented and commented tool-call markup is not promoted into a call** (#3074). The
+  plain-text XML scan already skipped fenced blocks; it now also skips a line indented
+  four columns or a tab after a blank line or another indented line (indentation under
+  a list or prose line still promotes), and a CLOSED HTML comment (an unclosed `<!--`,
+  one in inline code, or one inside a call payload opens nothing). Skipped openers count in `xml_openers_skipped_as_fenced`.
+- **A resume no longer silently replays a tool call that had already started** (#3074).
+  Just before the agent runs a call that can change the workspace (`bash`, `write`,
+  `edit`, `create_finding`, `create_mod`), its checkpoint is written with a started marker
+  (`pending_head_started`, additive; an older checkpoint reads as not started). A resume
+  that finds the marker tells the model the call was interrupted and may have taken
+  effect, and does not run it again. Read-only calls carry no marker and are still
+  re-dispatched. The call a resume reports instead of running is recorded as `failed`
+  (`ok: false`, "not re-run"), so it counts as no work for the inactivity timer, and the
+  notice for `create_finding` / `create_mod` warns of a duplicate record rather than
+  telling the model to inspect the workspace. Cost: one extra checkpoint write per workspace-changing call, about
+  22 ms on a 600 KB transcript.
+- **A hung telemetry sampler cannot wedge a dispatch** (#3074). Completion, and both early
+  exits, wait at most the longest tick the sampler can be inside (the model-load timeout
+  plus two listing bounds plus 5s, 665s by default) for the sampler thread after stopping
+  it, then detach it and record no thermal ladder summary for the run, the same as a
+  sampler that panicked.
 
 ### Removed (breaking, 5.0): readers of pre-5.0 shapes
 
@@ -232,6 +296,18 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   its temp file is fsynced before the rename, a torn-tail sidecar's directory is
   fsynced so its name survives a power cut, and the sink's disable warning names
   what failed last (`write` or `backfill`) instead of counting both as writes.
+
+- **Unload reporting and empty profiles** (#3083 follow-ups). `machine eject` no
+  longer lists an already-gone model as failed, and a dispatch reload goes on to
+  load when its stale instance vanished first (one classifier for both). A profile
+  with an empty `models[]` is quarantined alone instead of failing the registry.
+
+- **Launch closeout follow-ups** (#3087). A refused post-mint launch closes its
+  run with `run.error` carrying the real refusal text, a failed `mission.json`
+  save removes the zero-byte claim, and `darkmux acp` exits `128 + signo` on a
+  signal (143 for SIGTERM, 130 for SIGINT) like launch, dispatch and lab.
+  **Migration:** a script that expected exit 130 from `darkmux acp` on SIGTERM
+  should expect 143.
 
 - **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
   check no longer treats a flow record without a `machine_uid` as a known name
@@ -1799,6 +1875,60 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 
 ### Fixed (4.0)
 
+- **An interrupted launch never closes as a success** (5.0, #3074). A SIGINT,
+  SIGTERM or SIGHUP during `mission launch` used to let later phases start and
+  then close the run `run.complete` while the process exited 130. The scheduler
+  now starts no new work after a signal, except a record-only step that says it
+  still runs (the crawl summary, so an interrupted run still records that it was
+  interrupted). A shell step is not spawned after one, and a run that ends
+  interrupted closes `run.error` with the mission in `Error`.
+  A mission whose mint died before its phases existed now closes with an
+  `Error` envelope (it closed `Finalized`, which the runs board showed as
+  `Complete`). A signal that lands after the last step, and before the run
+  closes, now also ends it as `run.error`. A run's own wall-clock bound is not
+  a signal: it still ends `Degraded` with the bound named. A signal that
+  already landed is not rewritten into that bound when the deadline passes
+  during wind-down.
+- **An inactivity timeout of `0` means unbounded** (5.0, #3074).
+  `runtime.inactivity_timeout_seconds` / `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`
+  set to `0` killed every dispatch's container on the watchdog's first poll.
+  It now sets no deadline and no soft warning, like every other darkmux
+  zero-knob, and `darkmux doctor` gains a `runtime.inactivity_timeout_seconds`
+  row showing the resolved reading and where it came from. The runs board and
+  the viewer no longer read a live run as abandoned under it: the staleness
+  window is unbounded too.
+- **A turn's checkpoint continuations are bounded** (5.0, #3074). Continuations
+  do not count as turns and every streamed chunk resets the inactivity
+  deadline, so a model that kept hitting a checkpoint was never stopped. A turn
+  that has generated as many tokens as the context window holds now ends with
+  `escalation_turn_continuations_exhausted` and its banked work attached. With
+  no context window configured there is nothing to derive the bound from, so
+  none applies.
+- **A late container stays watched** (5.0, #2252). When the inactivity deadline
+  fired while `docker run` was still pulling a `--image`, the watchdog found no
+  container and retired, and the container then ran with nothing able to stop
+  it. The watchdog now re-arms for a full budget and keeps watching until the
+  dispatch ends.
+- **A local `dispatch.map` item that errored and then came back empty reports
+  the error** (5.0, #3074), as the hosted path already did, instead of an empty
+  success.
+- **A torn trajectory still folds** (5.0). A kill that cuts a multibyte
+  character used to make the whole trajectory read as empty, and the
+  close that appends `interrupted` refused the file. The lines already
+  written still fold, and only the torn line is dropped.
+- **A refused write or edit counts as a failed tool call** (5.0). `write`
+  and `edit` answer `NOT WRITTEN` / `NOT EDITED` when they refuse an
+  echoed `read` line-number prefix, and the file is not changed. That
+  call now counts as a failure for the repeated-failure detector. A
+  write that landed, and the same words from another tool, stay successes.
+- **A diff hunk numbered at line 0 skips that file** (5.0). `+0` is not a
+  file line. The crawl planner used to panic on it in debug, which dropped
+  every later file in that diff. The malformed file is recorded as skipped
+  and the files after it still plan.
+- **The reference Rust bundler stays inside the worktree** (#3074). A diff path
+  that is absolute, contains `..`, or resolves through a symlink to outside the
+  checkout is now refused instead of read into the bundle.
+
 - **A phase stop ends only that phase's dispatch** (5.0). Abandoning a phase, or
   aborting a mission, while a run waited on its endpoint budget raised the
   process-wide interrupt flag, so a mission launch running other phases'
@@ -1893,6 +2023,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 - **A run's resume origin can no longer be forged by the model (#2972).** The record of a run's workspace path, mount mode and image used to sit in the out-dir the container mounts read-write, so a model could flip `workspace_read_only` and have a `:ro` run resumed read-write, or steer the resume hint. It now lives beside the out-dir (`<out-dir>.resume_origin.json`), where the container never mounts it, and the old in-out-dir file is never read. A checkpoint with no such record (every one written before 5.0) is refused for resume with a message to start the dispatch fresh. The record is written 0600 without following a planted symlink, read only when this user owns it, removed together with its out-dir, counted by `doctor` when its dir is gone, and a dispatch is refused if any mount (workspace, cache, attachments) would contain it.
 - **A machine that renames itself keeps receiving work, with no edit on the machines that address it (#3028).** A roster entry now learns its peer's hardware uid and current `machine_id` from the peer's own card (the read `machine list` and the daemon already make, over the verified, pinned path), and `<profile>@<name>` resolves against an entry's id or that learned name. The work wire is 8.1: a job carries the target's optional `target_machine_uid`, and the receiver compares it to its own uid and accepts under any name, refusing a different uid as misaddressed without printing either. A sender that has not learned a uid, and any 8.0 sender, are checked by name as before. `roster identity` warns that an entry's id differs from its machine's own name and that addresses with either name work, and the fleet card is labeled with the machine's own current name. An 8.0 receiver refuses an 8.1 submission by naming both versions.
 - **A daemon resumes publishing to the fleet hub on its own after an outage (#3023).** The Redis flow sink used to disable itself after three failures "for the rest of the process", so a hub restart left a long-lived `darkmux serve` silent until someone restarted it, and the other machines never saw what it did meanwhile. `darkmux serve` now probes the hub on a capped backoff (2s doubling to 60s, each probe bounded by the 500 ms connect timeout), re-enables when it answers, and re-sends its own records from the local day files (current and previous UTC day, in `ts` order, from the first record that failed) as stream entries marked `late`; readers already de-duplicate by record identity. CLI invocations keep the old behavior. `/health` carries `hub_link` (`connected`, or `unreachable` with since and reason; this machine only) and `darkmux doctor` has a `flow hub link` row.
+- **A failed mission on a peer reads error, not complete (5.0, #3074).** The runs board decided a peer's mission end from its first `mission.close`, so a mission that closed and then recorded `run.error` read Complete there while its own machine read Error. A peer's row now folds its closing records through the same decision a session's attempt uses: the run's bookend is the outcome over a close, and a role execution's `dispatch.complete` never ends the mission.
 - **A run on a machine that is not reporting reads unknown, not running (5.0).** A run recorded as running on a peer the fleet view holds as down, with no live session beat from it, has no live evidence and no terminal record can arrive, so the runs board's status chip and Status filter and the run page's pill and timing line say `unknown` (no pulse, no ticking clock) instead of `running`. A run that recorded its end is unaffected. A run quiet past the staleness window still reads "no ending recorded".
 - **The machine page's hardware line is the machine's own, or "hardware not reported" (5.0).** A peer's page reads the card the fleet view just read (ahead of a presence beat's older string) and says "hardware not reported" instead of a blank header; this machine's page still reads its own probe.
 - **The status line says what "last dispatch" covers (5.0).** Its tooltip names it as the newest dispatch start on any machine whose records reach this viewer, not only this machine.

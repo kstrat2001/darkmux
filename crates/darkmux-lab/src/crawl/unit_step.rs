@@ -1700,6 +1700,13 @@ impl StepKind for DispatchSummaryStepKind {
         DISPATCH_SUMMARY_KIND
     }
 
+    /// (#3074, #2588) Record-only: it folds the units' outcomes, including
+    /// the interrupted ones, into the summary that says the run was
+    /// interrupted, so it still runs after a signal.
+    fn runs_after_interrupt(&self) -> bool {
+        true
+    }
+
     fn display_name(&self) -> &'static str {
         "Crawl summary"
     }

@@ -59,11 +59,13 @@ pub fn trajectory_path(out_dir: &std::path::Path) -> std::path::PathBuf {
 /// was killed (SIGKILL cannot be caught, so the runtime wrote no terminal
 /// record). Returns `Ok(true)` when it appended, `Ok(false)` when there is
 /// nothing to close (no events, or a terminal record already present). A
-/// final line cut short by the kill is left in place, ended, and ignored by
+/// final line cut short by the kill — including one torn mid-character,
+/// which is not valid UTF-8 — is left in place, ended, and ignored by
 /// every reader.
 pub fn close_if_unterminated(path: &std::path::Path) -> std::io::Result<bool> {
     use std::io::Write;
-    let raw = std::fs::read_to_string(path)?;
+    let bytes = std::fs::read(path)?;
+    let raw = String::from_utf8_lossy(&bytes);
     let fold = TrajectoryFold::from_lines(&raw);
     if fold.events == 0 || fold.complete.is_some() {
         return Ok(false);

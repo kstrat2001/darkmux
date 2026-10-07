@@ -224,7 +224,7 @@ fn token_row(f: &FleetSubmissionFacts) -> Check {
     } else if f.daemon_token_set == Some(true) {
         check(
             "fleet token",
-            Status::Pass,
+            Status::Warn,
             "set in the running daemon's environment only: this shell cannot resolve it, so a \
              `dispatch` from here cannot send fleet work"
                 .into(),
@@ -588,15 +588,15 @@ mod tests {
         assert!(fleet_submission_checks(&f).is_empty());
     }
 
-    /// The shell has no token but the running daemon does: the row passes and
+    /// The shell has no token but the running daemon does: the row warns and
     /// says whose environment holds it. Without that word from the daemon
     /// (none reachable, or it reports none) the row keeps failing.
     #[test]
-    fn a_token_only_the_daemon_holds_passes_with_a_note() {
+    fn a_token_only_the_daemon_holds_warns_with_a_note() {
         let f = FleetSubmissionFacts { token_present: false, daemon_token_set: Some(true), ..facts() };
         let r = fleet_submission_checks(&f);
         let r = row(&r, "fleet token");
-        assert_eq!(r.status, Status::Pass);
+        assert_eq!(r.status, Status::Warn);
         assert!(r.message.contains("daemon's environment only"), "{}", r.message);
         for daemon in [None, Some(false)] {
             let f = FleetSubmissionFacts { token_present: false, daemon_token_set: daemon, ..facts() };

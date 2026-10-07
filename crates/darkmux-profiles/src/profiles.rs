@@ -121,8 +121,9 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("reading registry at {}", path.display()))?;
-    let registry = parse_registry_lenient(&raw)
+    let mut registry = parse_registry_lenient(&raw)
         .with_context(|| format!("parsing JSON at {}", path.display()))?;
+    validate_registry(&mut registry, &path)?;
     if announce && !registry.quarantined.is_empty() {
         // One warning line per load (matching the loud-but-brief style of
         // this crate's other operator warnings); full per-entry detail lives
@@ -142,7 +143,6 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
             listed
         );
     }
-    validate_registry(&registry, &path)?;
     Ok(LoadedRegistry { registry, path })
 }
 
@@ -233,16 +233,27 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     Ok(registry)
 }
 
-fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
+fn validate_registry(reg: &mut ProfileRegistry, path: &Path) -> Result<()> {
+    let mut to_quarantine = Vec::new();
+    for (name, profile) in &reg.profiles {
+        if let Some(err) = check_empty_models(name, profile, path).or_else(|| check_bad_default_model(name, profile, path)) {
+            to_quarantine.push((name.clone(), err));
+        }
+    }
+    for (name, error) in to_quarantine {
+        reg.profiles.remove(&name);
+        reg.quarantined.push(darkmux_types::QuarantinedEntry {
+            name,
+            kind: darkmux_types::QuarantinedEntryKind::Profile,
+            error,
+        });
+    }
     // (#1282) A registry whose only profiles are quarantined still LOADS
     // (empty healthy set) — failing here would restore the whole-file blast
     // the quarantine exists to prevent, and would hide the per-entry errors
     // from `darkmux doctor`.
     if reg.profiles.is_empty() && reg.quarantined.is_empty() {
         bail!("{}: registry has no profiles", path.display());
-    }
-    for (name, profile) in &reg.profiles {
-        validate_profile(name, profile, path)?;
     }
     // (#1426 ship-2) The `crews` map retired from the schema — review staffing
     // is now DERIVED by the resourcing resolver (`darkmux_crew::resourcing`)
@@ -251,29 +262,28 @@ fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
-    if profile.models.is_empty() {
-        bail!(
-            "{}: profile \"{}\" must have at least one model",
-            path.display(),
-            name
-        );
-    }
-    // (#590) The old "exactly one primary" rule is gone with `ModelRole`. The
-    // default model is `default_model` (or the first model when unset). The
-    // only new failure mode worth catching: a `default_model` that names a
-    // model not present in `models[]` — an operator typo, surfaced loudly.
+/// (#3083) A profile with no `models[]` quarantines that profile rather than
+/// failing the whole registry, the same shape as a bad `default_model`.
+fn check_empty_models(name: &str, profile: &Profile, path: &Path) -> Option<String> {
+    profile.models.is_empty().then(|| {
+        format!("{}: profile \"{}\" must have at least one model", path.display(), name)
+    })
+}
+
+fn check_bad_default_model(name: &str, profile: &Profile, path: &Path) -> Option<String> {
+    // (#3074) A bad `default_model` quarantines the profile rather than failing
+    // the whole registry.
     if let Some(default_id) = profile.default_model.as_deref() {
         if !profile.models.iter().any(|m| m.id == default_id) {
-            bail!(
+            return Some(format!(
                 "{}: profile \"{}\" sets default_model \"{}\", which is not one of its models[]",
                 path.display(),
                 name,
                 default_id
-            );
+            ));
         }
     }
-    Ok(())
+    None
 }
 
 pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profile> {
@@ -640,15 +650,23 @@ mod tests {
     }
 
     #[test]
-    fn validates_no_models() {
+    fn a_profile_with_no_models_is_quarantined_not_fatal() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
             &p,
-            r#"{"profiles":{"empty":{"models":[]}}}"#,
+            r#"{"profiles":{
+                    "valid":{"models":[{"id":"m","n_ctx":1000}]},
+                    "empty":{"models":[]}
+                },
+                "default_profile":"valid"}"#,
         );
-        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains("at least one model"));
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("one empty profile never fails the file");
+        assert!(loaded.registry.profiles.contains_key("valid"));
+        assert!(!loaded.registry.profiles.contains_key("empty"));
+        let q = loaded.registry.quarantined.iter().find(|q| q.name == "empty").expect("quarantined");
+        assert_eq!(q.kind, darkmux_types::QuarantinedEntryKind::Profile);
+        assert!(q.error.contains("at least one model"), "error names the problem: {}", q.error);
     }
 
     #[test]
@@ -674,8 +692,8 @@ mod tests {
 
     #[test]
     fn validates_default_model_must_name_a_real_model() {
-        // (#590) The one new failure mode: `default_model` naming an id that
-        // isn't in `models[]` (an operator typo) fails loud at load time.
+        // (#3074) `default_model` naming an id that isn't in `models[]`
+        // quarantines that profile instead of failing the whole registry.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
@@ -684,8 +702,10 @@ mod tests {
                 {"id":"a","n_ctx":1}
             ]}}}"#,
         );
-        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains("not one of its models"));
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("quarantined, not fatal");
+        assert!(!loaded.registry.profiles.contains_key("bad"));
+        let q = loaded.registry.quarantined.iter().find(|q| q.name == "bad").expect("quarantined");
+        assert!(q.error.contains("not one of its models"));
     }
 
     #[test]
@@ -866,6 +886,27 @@ mod tests {
             issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
             "the reference names the quarantine: {issues:?}"
         );
+    }
+
+    #[test]
+    fn a_bad_default_model_is_quarantined_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "valid":{"models":[{"id":"m","n_ctx":1000}]},
+                    "bad-default":{"default_model":"missing","models":[{"id":"m","n_ctx":1000}]}
+                },
+                "default_profile":"valid"}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("one bad default_model never fails the file");
+        assert!(loaded.registry.profiles.contains_key("valid"));
+        assert!(!loaded.registry.profiles.contains_key("bad-default"));
+        let q = loaded.registry.quarantined.iter().find(|q| q.name == "bad-default").expect("quarantined");
+        assert_eq!(q.kind, darkmux_types::QuarantinedEntryKind::Profile);
+        assert!(q.error.contains("default_model"), "error names the problem: {}", q.error);
+        assert!(get_profile(&loaded.registry, "bad-default").is_err());
     }
 
     /// (#2902 re-review MF1) An `endpoints` value that is not an object at

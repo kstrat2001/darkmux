@@ -118,6 +118,192 @@ pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     })
 }
 
+/// Size of the trailing window read to recover the chain's tail hash (#3073).
+const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Read the first line of `file` from offset 0 up to 4096 bytes.
+#[cfg(unix)]
+fn read_first_line(path: &Path, file: &mut std::fs::File) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seek to start of {}", path.display()))?;
+    let mut buf = [0u8; 4096];
+    let n = file
+        .read(&mut buf)
+        .with_context(|| format!("reading header from {}", path.display()))?;
+    let slice = &buf[..n];
+    let newline_pos = slice.iter().position(|&b| b == b'\n').unwrap_or(n);
+    let line_str = std::str::from_utf8(&slice[..newline_pos])
+        .with_context(|| format!("header in {} is not valid UTF-8", path.display()))?;
+    Ok(line_str.trim().to_string())
+}
+
+#[cfg(unix)]
+fn resolve_prev_hash_from_contents(raw: &[u8], path: &Path) -> Result<(String, Option<String>)> {
+    let contents = String::from_utf8(raw.to_vec())
+        .with_context(|| format!("audit log {} is not valid UTF-8", path.display()))?;
+
+    if contents.is_empty() {
+        // Fresh file — the seed hash binds the chain to the schema header
+        // we're about to write.
+        let header = audit_schema_header_line()?;
+        let seed = audit_seed_hash(&header);
+        return Ok((seed, Some(header)));
+    }
+
+    let non_empty: Vec<&str> =
+        contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    if non_empty.is_empty() {
+        // File exists but trims to nothing (whitespace-only) — treat as fresh.
+        let header = audit_schema_header_line()?;
+        Ok((audit_seed_hash(&header), Some(header)))
+    } else if non_empty.len() == 1 {
+        // Recover ONLY when the sole surviving line is genuinely a
+        // byte-hash-format schema header (process/OS crash between
+        // header write and the first record).
+        //
+        // (#899) This recovery MUST require `_type == "schema"`.
+        // Otherwise truncating a multi-record log down to one
+        // fabricated non-header line would re-seed a fresh, clean-
+        // validating chain on the next write — silently laundering
+        // tampering.
+        //
+        // (#1769) The format check folds into the same guard: a header
+        // in another format also cannot seed a byte-hash chain, and
+        // this binary has no way to tell "an old file, needs archiving"
+        // apart from "a real file truncated to one fabricated line" —
+        // so both refuse, with the same fail-closed posture #899
+        // already established.
+        let last_line = non_empty[0];
+        let is_schema_header = serde_json::from_str::<serde_json::Value>(last_line)
+            .ok()
+            .and_then(|v| v.get("_type").and_then(|t| t.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("schema");
+        if is_schema_header && header_is_byte_hash_format(last_line) {
+            Ok((audit_seed_hash(last_line), None))
+        } else {
+            Err(anyhow::anyhow!(
+                "audit log {} cannot be safely extended: its sole surviving line is not a \
+                 byte-hash-format schema header (#1769) — refusing to re-seed a chain from \
+                 unverified content. If this is a file from before 2.6.0, archive it \
+                 (move/rename so a fresh chain can start); if the file was truncated, this \
+                 is the intended fail-closed response.",
+                path.display()
+            ))
+        }
+    } else {
+        // Multiple lines present — line 1 must be a byte-hash-format
+        // header, or this file predates byte-hash verification and
+        // must not be silently extended in the new format (that would
+        // produce a file whose header lies about its own shape).
+        let header_line = non_empty[0];
+        if !header_is_byte_hash_format(header_line) {
+            return Err(anyhow::anyhow!(
+                "audit log {} is not in the byte-hash format (a file from before 2.6.0, or \
+                 another format) and cannot be safely extended (#1769) — archive this file \
+                 (move/rename it) so a fresh chain can start",
+                path.display()
+            ));
+        }
+
+        let last_line = *non_empty.last().expect("non_empty has >1 element per this branch");
+        // The prefix IS the tail hash — no JSON parse needed to
+        // recover it, which is the point of the format.
+        match last_line.split_once(' ') {
+            Some((hash, _json)) if is_blake3_hex(hash) => Ok((hash.to_string(), None)),
+            _ => Err(anyhow::anyhow!(
+                "audit log {} last line lacks a valid `<hash> <json>` prefix — chain \
+                 corrupted (refusing to re-seed)",
+                path.display()
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_small_tail(path: &Path, file: &mut std::fs::File, file_len: u64) -> Result<(String, Option<String>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut raw = Vec::with_capacity(file_len as usize);
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seek to start of {}", path.display()))?;
+    file.read_to_end(&mut raw)
+        .with_context(|| format!("reading audit log {}", path.display()))?;
+    recover_torn_tail(path, file, 0, &mut raw)?;
+    resolve_prev_hash_from_contents(&raw, path)
+}
+
+#[cfg(unix)]
+fn read_large_tail(path: &Path, file: &mut std::fs::File, file_len: u64) -> Result<(String, Option<String>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let header_line = read_first_line(path, file)?;
+    if !header_is_byte_hash_format(&header_line) {
+        return Err(anyhow::anyhow!(
+            "audit log {} is not in the byte-hash format (a file from before 2.6.0, or \
+             another format) and cannot be safely extended (#1769) — archive this file \
+             (move/rename it) so a fresh chain can start",
+            path.display()
+        ));
+    }
+
+    let mut window_start = file_len - TAIL_WINDOW_BYTES;
+    file.seek(SeekFrom::Start(window_start))
+        .with_context(|| format!("seek to tail window of {}", path.display()))?;
+    let mut raw = Vec::with_capacity(TAIL_WINDOW_BYTES as usize);
+    file.read_to_end(&mut raw)
+        .with_context(|| format!("reading audit log tail {}", path.display()))?;
+
+    if raw.iter().filter(|&&b| b == b'\n').count() < 2 {
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seek to start of {}", path.display()))?;
+        raw.clear();
+        file.read_to_end(&mut raw)
+            .with_context(|| format!("reading audit log {}", path.display()))?;
+        window_start = 0;
+    }
+
+    recover_torn_tail(path, file, window_start, &mut raw)?;
+    if window_start == 0 {
+        resolve_prev_hash_from_contents(&raw, path)
+    } else {
+        // The window can start inside a multibyte character; the bytes up to
+        // the first newline are a partial line, so drop them before decoding
+        // (#3088). Without this one such file refuses every later append.
+        let first_line_end = raw.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let contents = String::from_utf8(raw.split_off(first_line_end))
+            .with_context(|| format!("audit log {} tail is not valid UTF-8", path.display()))?;
+        let non_empty: Vec<&str> =
+            contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        let last_line = non_empty.last().ok_or_else(|| {
+            anyhow::anyhow!(
+                "audit log {} tail lacks records — chain corrupted",
+                path.display()
+            )
+        })?;
+        match last_line.split_once(' ') {
+            Some((hash, _json)) if is_blake3_hex(hash) => Ok((hash.to_string(), None)),
+            _ => Err(anyhow::anyhow!(
+                "audit log {} last line lacks a valid `<hash> <json>` prefix — chain \
+                 corrupted (refusing to re-seed)",
+                path.display()
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn determine_tail_hash(path: &Path, file: &mut std::fs::File, file_len: u64) -> Result<(String, Option<String>)> {
+    if file_len == 0 {
+        let header = audit_schema_header_line()?;
+        let seed = audit_seed_hash(&header);
+        Ok((seed, Some(header)))
+    } else if file_len <= TAIL_WINDOW_BYTES {
+        read_small_tail(path, file, file_len)
+    } else {
+        read_large_tail(path, file, file_len)
+    }
+}
+
 /// The locked transaction body of [`audit_record_at`] — reads the chain's
 /// current tail hash from `file` (the SAME file `flock`'s held on, opened
 /// by the shared `darkmux_types::flock::with_locked_file` helper) and
@@ -126,96 +312,14 @@ pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
 /// stays separate from this crate's own read/parse/append logic.
 #[cfg(unix)]
 fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::File) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write as _};
-    let mut raw = Vec::new();
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("seek to start of {}", path.display()))?;
-    file.read_to_end(&mut raw)
-        .with_context(|| format!("reading audit log {}", path.display()))?;
-    // A crash mid-append leaves a torn last line; settle it before reading
-    // the chain's tail so a write never glues onto or chains from it.
-    recover_torn_tail(path, file, &mut raw)?;
-    let contents = String::from_utf8(raw)
-        .with_context(|| format!("audit log {} is not valid UTF-8", path.display()))?;
+    use std::io::{Seek, SeekFrom, Write as _};
 
-    let (prev_hash, write_header) = if contents.is_empty() {
-        // Fresh file — the seed hash binds the chain to the schema header
-        // we're about to write.
-        let header = audit_schema_header_line()?;
-        let seed = audit_seed_hash(&header);
-        (seed, Some(header))
-    } else {
-        let non_empty: Vec<&str> =
-            contents.lines().filter(|l| !l.trim().is_empty()).collect();
-        if non_empty.is_empty() {
-            // File exists but trims to nothing (whitespace-only) — treat as fresh.
-            let header = audit_schema_header_line()?;
-            (audit_seed_hash(&header), Some(header))
-        } else if non_empty.len() == 1 {
-            // Recover ONLY when the sole surviving line is genuinely a
-            // byte-hash-format schema header (process/OS crash between
-            // header write and the first record).
-            //
-            // (#899) This recovery MUST require `_type == "schema"`.
-            // Otherwise truncating a multi-record log down to one
-            // fabricated non-header line would re-seed a fresh, clean-
-            // validating chain on the next write — silently laundering
-            // tampering.
-            //
-            // (#1769) The format check folds into the same guard: a header
-            // in another format also cannot seed a byte-hash chain, and
-            // this binary has no way to tell "an old file, needs archiving"
-            // apart from "a real file truncated to one fabricated line" —
-            // so both refuse, with the same fail-closed posture #899
-            // already established.
-            let last_line = non_empty[0];
-            let is_schema_header = serde_json::from_str::<serde_json::Value>(last_line)
-                .ok()
-                .and_then(|v| v.get("_type").and_then(|t| t.as_str()).map(str::to_string))
-                .as_deref()
-                == Some("schema");
-            if is_schema_header && header_is_byte_hash_format(last_line) {
-                (audit_seed_hash(last_line), None)
-            } else {
-                return Err(anyhow::anyhow!(
-                    "audit log {} cannot be safely extended: its sole surviving line is not a \
-                     byte-hash-format schema header (#1769) — refusing to re-seed a chain from \
-                     unverified content. If this is a file from before 2.6.0, archive it \
-                     (move/rename so a fresh chain can start); if the file was truncated, this \
-                     is the intended fail-closed response.",
-                    path.display()
-                ));
-            }
-        } else {
-            // Multiple lines present — line 1 must be a byte-hash-format
-            // header, or this file predates byte-hash verification and
-            // must not be silently extended in the new format (that would
-            // produce a file whose header lies about its own shape).
-            let header_line = non_empty[0];
-            if !header_is_byte_hash_format(header_line) {
-                return Err(anyhow::anyhow!(
-                    "audit log {} is not in the byte-hash format (a file from before 2.6.0, or \
-                     another format) and cannot be safely extended (#1769) — archive this file \
-                     (move/rename it) so a fresh chain can start",
-                    path.display()
-                ));
-            }
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("reading metadata of {}", path.display()))?
+        .len();
 
-            let last_line = *non_empty.last().expect("non_empty has >1 element per this branch");
-            // The prefix IS the tail hash — no JSON parse needed to
-            // recover it, which is the point of the format.
-            match last_line.split_once(' ') {
-                Some((hash, _json)) if is_blake3_hex(hash) => (hash.to_string(), None),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "audit log {} last line lacks a valid `<hash> <json>` prefix — chain \
-                         corrupted (refusing to re-seed)",
-                        path.display()
-                    ));
-                }
-            }
-        }
-    };
+    let (prev_hash, write_header) = determine_tail_hash(path, file, file_len)?;
 
     // Build the record to write: stamp prev_hash, never embed hash in the
     // JSON body — the byte-hash format's hash lives in the line prefix, not
@@ -318,10 +422,16 @@ fn torn_sidecar_path(path: &Path, restart: bool) -> PathBuf {
 /// A newline-terminated last line is never touched here: a bad one is
 /// foreign content and the callers' existing refusal applies.
 #[cfg(unix)]
-fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -> Result<()> {
+fn recover_torn_tail(
+    path: &Path,
+    file: &mut std::fs::File,
+    window_start: u64,
+    raw: &mut Vec<u8>,
+) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write as _};
-    let tail_start = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let tail = &raw[tail_start..];
+    let local_tail_start = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let abs_tail_start = window_start + local_tail_start as u64;
+    let tail = &raw[local_tail_start..];
     if tail.is_empty() {
         return Ok(());
     }
@@ -329,10 +439,10 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
     // a headerless file (a record line with its header removed): refusing to
     // extend it is the #899 guard against re-seeding a chain from content
     // nobody verified, and set-aside would quietly undo it.
-    if tail_start == 0 && !header_shaped(tail) && !tail_is_whole_line(tail, true) {
+    if abs_tail_start == 0 && !header_shaped(tail) && !tail_is_whole_line(tail, true) {
         return Ok(());
     }
-    if tail_is_whole_line(tail, tail_start == 0) {
+    if tail_is_whole_line(tail, abs_tail_start == 0) {
         file.seek(SeekFrom::End(0))
             .with_context(|| format!("seek to end of {}", path.display()))?;
         file.write_all(b"\n")
@@ -343,17 +453,17 @@ fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -
         return Ok(());
     }
     if !tail.iter().all(|b| b.is_ascii_whitespace()) {
-        let sidecar = torn_sidecar_path(path, tail_start == 0);
+        let sidecar = torn_sidecar_path(path, abs_tail_start == 0);
         // The sidecar is durable BEFORE the day file is truncated: a power
         // loss must not keep the truncation and lose the bytes.
         write_synced(&sidecar, tail)
             .with_context(|| format!("writing torn-tail sidecar {}", sidecar.display()))?;
     }
-    file.set_len(tail_start as u64)
+    file.set_len(abs_tail_start)
         .with_context(|| format!("truncating torn tail of {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("syncing audit log {}", path.display()))?;
-    raw.truncate(tail_start);
+    raw.truncate(local_tail_start);
     Ok(())
 }
 

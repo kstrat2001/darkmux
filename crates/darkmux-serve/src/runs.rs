@@ -857,12 +857,70 @@ struct FlowMissionAgg {
     /// on every peer's viewer, while the owning machine correctly showed it
     /// Abandoned.
     terminal_ts: Option<String>,
+    terminal_status: Option<RunStatus>,
     terminal_was_abort: bool,
+    /// The mission-grain closing records folded through the one decision a
+    /// session's attempt uses (`run_lifecycle::CloseFold`, rules 2 and 3), so
+    /// a `run.error` after a `mission.close` reads Error here exactly as it
+    /// does there. The three `terminal_*` fields above are read off it.
+    close: crate::run_lifecycle::CloseFold,
     /// Session ids observed under this mission, used to borrow role/model/
     /// endpoint for the row without a second pass.
     session_ids: Vec<String>,
     /// The newest receive key among this mission's records ([`record_receive_key`]).
     last_key: Option<u64>,
+}
+
+impl FlowMissionAgg {
+    fn fold_record(&mut self, v: &serde_json::Value) {
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        self.last_key = self.last_key.max(record_receive_key(v));
+        if self.machine.is_none() {
+            if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
+                if !m.is_empty() {
+                    self.machine = Some(m.to_string());
+                    self.machine_uid = record_machine_uid(v);
+                }
+            }
+        }
+        if !ts.is_empty() {
+            if self.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
+                self.first_ts = Some(ts.to_string());
+            }
+            if self.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
+                self.last_ts = Some(ts.to_string());
+            }
+        }
+        self.fold_terminal(v, ts);
+        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            if !sid.is_empty() && !self.session_ids.iter().any(|s| s == sid) {
+                self.session_ids.push(sid.to_string());
+            }
+        }
+    }
+
+    /// Only the mission grain closes a mission: an execution-grain
+    /// `dispatch.*` bookend ends one role execution, never the run.
+    fn fold_terminal(&mut self, v: &serde_json::Value, ts: &str) {
+        let Some(action) = darkmux_flow::reader::action_of(v) else { return };
+        if !matches!(
+            action,
+            FlowAction::MissionClose | FlowAction::MissionAbort | FlowAction::RunComplete | FlowAction::RunError
+        ) {
+            return;
+        }
+        let Some(ending) = crate::run_lifecycle::ending_of(&action, false) else { return };
+        let bookend_terminal = matches!(action, FlowAction::RunComplete | FlowAction::RunError);
+        self.close.fold(ts, ending, bookend_terminal);
+        self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
+        let ending = self.close.ending();
+        self.terminal_status = ending.map(|e| e.status);
+        // #3089: at the mission grain an abort ranks first and sticks, so a
+        // later `run.complete`/`run.error` cannot turn a teardown into a verdict.
+        // (Session attempts keep "first close wins".)
+        self.terminal_was_abort |= ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted)
+            || matches!(action, FlowAction::MissionAbort);
+    }
 }
 
 fn build_flow_mission_index(
@@ -902,42 +960,7 @@ fn build_flow_mission_index_in(
         if mid.is_empty() {
             return;
         }
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-        let agg = idx.entry(mid.to_string()).or_default();
-        agg.last_key = agg.last_key.max(record_receive_key(v));
-        if agg.machine.is_none() {
-            if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
-                if !m.is_empty() {
-                    agg.machine = Some(m.to_string());
-                    agg.machine_uid = record_machine_uid(v);
-                }
-            }
-        }
-        if !ts.is_empty() {
-            if agg.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
-                agg.first_ts = Some(ts.to_string());
-            }
-            if agg.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
-                agg.last_ts = Some(ts.to_string());
-            }
-        }
-        // The only terminal mission-lifecycle actions the emitter actually
-        // writes are `mission close` and `mission abort`
-        // (`darkmux_crew::lifecycle`); `mission start` is the opening
-        // bookend. Matching vocabulary that is never emitted would read as
-        // real coverage to the next person who greps for it.
-        let action = darkmux_flow::reader::action_of(v);
-        if let Some(terminal @ (FlowAction::MissionClose | FlowAction::MissionAbort)) = action {
-            if agg.terminal_ts.is_none() {
-                agg.terminal_ts = Some(ts.to_string());
-                agg.terminal_was_abort = terminal == FlowAction::MissionAbort;
-            }
-        }
-        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-            if !sid.is_empty() && !agg.session_ids.iter().any(|s| s == sid) {
-                agg.session_ids.push(sid.to_string());
-            }
-        }
+        idx.entry(mid.to_string()).or_default().fold_record(v);
     };
 
     for v in fleet.iter().filter(|v| within_window(v)) {
@@ -980,12 +1003,13 @@ fn flow_mission_to_run(
         .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
         .collect();
     let any_live = mission_status_sessions(mission_id, &sessions).iter().any(|s| session_is_live(s, now_ms));
-    let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
+    let status = match (&agg.terminal_ts, agg.terminal_was_abort, agg.terminal_status) {
         // #1627 again: abort is teardown, not success.
-        (Some(_), true) => RunStatus::Abandoned,
-        (Some(_), false) => RunStatus::Complete,
-        (None, _) if any_live => RunStatus::Running,
-        (None, _) => RunStatus::Abandoned,
+        (Some(_), true, _) => RunStatus::Abandoned,
+        (Some(_), false, Some(term_stat)) => term_stat,
+        (Some(_), false, None) => RunStatus::Complete,
+        (None, _, _) if any_live => RunStatus::Running,
+        (None, _, _) => RunStatus::Abandoned,
     };
     // (#1907) Both `Abandoned` arms above are already told apart by
     // `agg.terminal_was_abort` — a real `mission abort` record versus no
@@ -997,11 +1021,44 @@ fn flow_mission_to_run(
     } else {
         None
     };
+    let mut sessions_by_start: Vec<(&str, &SessionAgg)> = sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_some())
+        .collect();
+    sessions_by_start.sort_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)));
+
+    let mut sessions_fallback: Vec<(&str, &SessionAgg)> = sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_none())
+        .collect();
+    sessions_fallback.sort_by(|(ia, a), (ib, b)| {
+        a.last_activity_ts
+            .cmp(&b.last_activity_ts)
+            .then_with(|| ia.cmp(ib))
+    });
+
     // Borrow route/model from whichever session first resolved one — a
     // mission-level row has no endpoint of its own, and showing the seat's
     // is more informative than showing nothing.
-    let route = sessions.iter().find_map(|(_, s)| s.endpoint.clone());
-    let model = sessions.iter().find_map(|(_, s)| s.model.clone());
+    let route = sessions_by_start
+        .iter()
+        .find_map(|(_, s)| s.endpoint.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.endpoint.clone()))
+        .or_else(|| sessions.iter().find_map(|(_, s)| s.endpoint.clone()));
+    let model = sessions_by_start
+        .iter()
+        .find_map(|(_, s)| s.model.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.model.clone()))
+        .or_else(|| sessions.iter().find_map(|(_, s)| s.model.clone()));
+    let role = sessions_by_start
+        .iter()
+        .filter(|(_, s)| !s.run_grain)
+        .find_map(|(_, s)| s.role.clone())
+        .or_else(|| sessions_by_start.iter().find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
     // (#1915) This IS the fix: a mission this daemon only sees via the
     // fleet stream is exactly the row #1915 diagnosed as inert — `tracked:
     // false` below with no drill target at all. The SAME representative-
@@ -1024,7 +1081,7 @@ fn flow_mission_to_run(
         machine: agg.machine.clone(),
         machine_uid: agg.machine_uid.clone(),
         route,
-        role: None,
+        role,
         model,
         started_ts: agg.first_ts.as_deref().and_then(parse_flow_ts),
         // An aborted mission has a terminal stamp but no COMPLETION — the
@@ -1277,11 +1334,25 @@ fn mission_to_run(
         unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
+    let mut sessions_fallback: Vec<(&str, &SessionAgg)> = unambiguous_sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.start_ts.is_none())
+        .collect();
+    sessions_fallback.sort_by(|(ia, a), (ib, b)| {
+        a.last_activity_ts
+            .cmp(&b.last_activity_ts)
+            .then_with(|| ia.cmp(ib))
+    });
+
     // Model is simple: the run bookend NEVER carries one (a run spans
     // however many executions it makes), so a plain "first session that
     // resolved one" — same idiom as `flow_mission_to_run`'s route/model
     // fallback above — is enough.
-    let model = sessions_by_start.iter().find_map(|s| s.model.clone());
+    let model = sessions_by_start
+        .iter()
+        .find_map(|s| s.model.clone())
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.model.clone()));
 
     // Role needs one more step: the run bookend's `handle` is the LAUNCHED
     // CONFIG ID (`run_bookend_record`), a real, non-empty string, so a plain
@@ -1290,9 +1361,13 @@ fn mission_to_run(
     // resolved a role; fall back to the run's config-id label only when
     // nothing else did, the honest outcome for a Tier-1-only procedural
     // mission that runs no role at all (#1877's named gap 2).
+    //
+    // (#3074) If dispatch.start has aged out, fall back to sessions that still have a role.
     let role = dispatch_role
         .or_else(|| sessions_by_start.iter().filter(|s| !s.run_grain).find_map(|s| s.role.clone()))
-        .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()));
+        .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
 
     // `machine` deliberately stays representative-only, unlike role/model
     // above: EVERY flow record — the #1877 bookend included — gets
@@ -1669,17 +1744,12 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             //   phase to `Complete` before the mission ever reaches
             //   `Finalized`, and never writes an envelope — an intentional
             //   gap, documented at `finalize_mission_if_complete`'s own doc.
-            // - `reconcile_mint_failure` (`crates/darkmux-crew/src/
-            //   lifecycle.rs`, the ONLY other production path that leaves a
-            //   `Finalized` mission with no envelope) is a `mission launch`
-            //   MINT failure backstop: it closes straight to `Finalized` —
-            //   the SUCCESS terminal — after force-abandoning every phase
-            //   it managed to mint (`mission_close_with_reasoning` ->
-            //   `reconcile_mission_phases_terminal`). Before this fix, that
-            //   collapsed onto the exact same `Complete` the happy path
-            //   above gets — a mission that abandoned every phase read
-            //   identically to one that did nothing wrong, #1564's own
-            //   conflation, one layer under #2406's phase-level rollup.
+            // - A Finalized mission whose phases were all force-abandoned.
+            //   `reconcile_mint_failure` used to close that way; since #3074
+            //   it closes with an `Error` envelope, so this shape
+            //   now only appears in records an older binary wrote. Before
+            //   #1564 it collapsed onto the same `Complete` the happy path
+            //   above gets.
             //
             // Neither case has an envelope to consult, but both leave a
             // real signal on disk: `reconcile_mission_phases_terminal`
@@ -2015,9 +2085,22 @@ fn settled_lab_status(summary: &LabRunSummary) -> RunStatus {
 /// (#1621) How long a lab run's newest artifact may age before the run stops
 /// counting as live. Twice the runtime's inactivity budget — see
 /// [`lab_run_status`] for why that is the right anchor.
+///
+/// (#3074) A `0` inactivity budget means UNBOUNDED (the watchdog never
+/// fires), so no window can declare a run stale: it reads
+/// [`UNBOUNDED_STALE_AFTER_MS`] instead of a 0ms window that abandoned every
+/// live run. Every staleness decision derives its window here.
 pub(crate) fn stale_after_ms() -> u64 {
-    darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
+    match darkmux_types::config_access::inactivity_timeout_seconds() {
+        0 => UNBOUNDED_STALE_AFTER_MS,
+        seconds => seconds.saturating_mul(2_000),
+    }
 }
+
+/// The unbounded staleness window, `Number.MAX_SAFE_INTEGER` so the value
+/// survives the JSON wire to the viewer's `number` exactly (about 285,000
+/// years, far past any run).
+pub(crate) const UNBOUNDED_STALE_AFTER_MS: u64 = (1 << 53) - 1;
 
 /// (#2902 step 5) How long past its announced resume time a budget wait
 /// stays open with no further word from its waiter. A waiter still held at
@@ -2376,7 +2459,7 @@ impl SessionAgg {
         self.last_activity_ts = a.last_activity_ts.clone();
         self.wait_until_ms = a.wait_until_ms;
         self.terminal_status = ending.map(|e| e.status);
-        self.terminal_ts = a.close.as_ref().map(|(ts, _)| ts.clone());
+        self.terminal_ts = a.fold.close.as_ref().map(|(ts, _)| ts.clone());
         self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
     }
 
@@ -3503,9 +3586,9 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Complete);
     }
 
-    /// (#1564) The mint-failure backstop's actual on-disk shape:
-    /// `reconcile_mint_failure` (`crates/darkmux-crew/src/lifecycle.rs`)
-    /// closes a mission straight to `Finalized` — the SUCCESS terminal —
+    /// (#1564) The legacy mint-failure on-disk shape (since #3074
+    /// `reconcile_mint_failure` closes with an `Error` envelope instead): a mission closed
+    /// straight to `Finalized` — the SUCCESS terminal —
     /// after force-abandoning every phase it managed to mint, and writes NO
     /// envelope at all. Before this fix, the `Ok(None)` arm's blanket
     /// `RunStatus::Complete` collapsed that onto the exact same status a
@@ -4723,6 +4806,28 @@ mod tests {
             "the shipped default inactivity budget"
         );
         assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
+    }
+
+    /// (#3074) `0` on the inactivity bound means UNBOUNDED, so no run is ever
+    /// judged stale by it: a live run reads `running` however old its newest
+    /// artifact is, instead of abandoned at a 0ms window.
+    #[test]
+    #[serial_test::serial]
+    fn an_unbounded_inactivity_budget_never_reads_a_live_run_abandoned() {
+        let _budget = InactivityBudgetGuard::seconds(0);
+        assert_eq!(stale_after_ms(), UNBOUNDED_STALE_AFTER_MS, "0 is the unbounded reading, not a 0ms window");
+        assert_eq!(runs_policy().stale_after_ms, UNBOUNDED_STALE_AFTER_MS);
+        let summary = minimal_lab_summary("live/unbounded", false, false);
+        assert_eq!(
+            lab_run_status(&summary, FIXTURE_NOW_MS + 1_000, None),
+            RunStatus::Running,
+            "a live run under an unbounded inactivity budget must read running"
+        );
+        assert_eq!(
+            lab_run_status(&summary, FIXTURE_NOW_MS + 30 * 86_400_000, None),
+            RunStatus::Running,
+            "nothing bounds the quiet period, so age alone never abandons it"
+        );
     }
 
     // ── the lifecycle corpus: one spec, two executors ────────────────────
@@ -7248,6 +7353,39 @@ mod tests {
         );
     }
 
+    /// (#3087 review) A freeform launch writes `run.start` + `run.complete` on
+    /// the RUN session the moment it has minted, while the mission itself stays
+    /// Active for work by hand (`mission.start`, no `mission.close`). The launch
+    /// finishing is not the mission finishing: the mission's row must not read
+    /// Complete off the run session's bookend pair.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_3087_freeform_launch_bookends_do_not_complete_the_active_mission() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let id = "freeform-1000000000-abc123";
+        let active = minimal_mission(
+            id,
+            vec![],
+            Some(MissionSpec { config_id: "freeform".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&active).unwrap();
+        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(id).unwrap()).to_string();
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action":"mission.start","session_id":format!("mission-{id}"),"mission_id":id,"source":"mission_lifecycle"}),
+                serde_json::json!({"ts": now, "action":"run.start","session_id":run_session,"mission_id":id}),
+                serde_json::json!({"ts": now, "action":"run.complete","session_id":run_session,"mission_id":id}),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == id).expect("the freeform mission has a row");
+        assert_eq!(row.status, RunStatus::Running, "launch bookends must not complete an Active mission: {row:?}");
+    }
+
     /// (#2123) The SAME mission as above, once it later gets a `mission
     /// close` (the happy-path finalize, not the operator's actual `mission
     /// abort` — both terminals are covered elsewhere; this one locks in
@@ -8180,6 +8318,110 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Complete);
         assert!(row.completed_ts.is_some(), "a closed mission carries its completion stamp");
+        // (#3074) Peer mission resolves role and model from sessions just like local mission
+        assert_eq!(row.role.as_deref(), Some("azure-review"));
+        assert_eq!(row.model.as_deref(), Some("gpt-4o"));
+    }
+
+    /// (#3074) Peer mission accepts run.complete and run.error as terminal records.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_reads_run_complete_and_run_error_as_terminal() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let fleet_complete = vec![
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "run.complete",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs_complete = build_runs(flows.path(), None, &fleet_complete);
+        let row_complete = runs_complete.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row_complete.status, RunStatus::Complete);
+        assert!(row_complete.completed_ts.is_some());
+
+        let fleet_error = vec![
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(),
+                "action": "run.error",
+                "session_id": "mission-review-on-the-hub",
+                "mission_id": "review-on-the-hub",
+                "machine_id": "m1-max-32gb-studio",
+            }),
+        ];
+        let runs_error = build_runs(flows.path(), None, &fleet_error);
+        let row_error = runs_error.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row_error.status, RunStatus::Error);
+    }
+
+    /// (#3074) The peer row decides a mission's end through the same fold a
+    /// session's attempt uses (`run_lifecycle::CloseFold`): the generic
+    /// launcher writes `mission.close` and then `run.error` for a failed
+    /// mission, and the run's bookend is the outcome over the close. A role
+    /// execution's own `dispatch.complete` never closes the mission. The
+    /// shared spec (`tests/lifecycle/cases.json`) pins the same sequence for
+    /// the session row.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_run_error_after_mission_close_reads_error() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mission_rec = |action: &str, ts: &str| {
+            let mut r = peer_record(action, ts);
+            r["session_id"] = serde_json::json!("mission-review-on-the-hub");
+            r
+        };
+        let fleet = vec![
+            peer_record("dispatch.start", "2026-09-27T10:00:00Z"),
+            peer_record("dispatch.complete", "2026-09-27T10:01:00Z"),
+            mission_rec("mission.close", "2026-09-27T10:02:00Z"),
+            mission_rec("run.error", "2026-09-27T10:03:00Z"),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert_eq!(row.status, RunStatus::Error, "the run's bookend outranks the close: {row:?}");
+    }
+
+    /// (#3074) When dispatch.start has aged out, mission_to_run falls back to a session
+    /// that still has a role and model.
+    #[test]
+    #[serial_test::serial]
+    fn mission_with_aged_out_dispatch_start_falls_back_to_session_with_role_and_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "ts": darkmux_flow::ts_utc_now(),
+            "level": "info",
+            "category": "work",
+            "tier": "local",
+            "stage": "dispatch",
+            "action": "dispatch.complete",
+            "handle": "fallback-coder",
+            "model": "qwen3.6",
+            "session_id": "task-aged-1",
+            "mission_id": "mission-aged-out",
+        });
+        write_day_file(flows.path(), &today(), &[rec]);
+
+        let mission_dir = _g.join("missions").join("mission-aged-out");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let mission = serde_json::json!({
+            "id": "mission-aged-out",
+            "description": "aged mission",
+            "phase_ids": [],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "mission-aged-out").expect("mission row present");
+        assert_eq!(row.role.as_deref(), Some("fallback-coder"));
+        assert_eq!(row.model.as_deref(), Some("qwen3.6"));
     }
 
     /// A peer that fell asleep mid-mission must not leave a row claiming to
@@ -8261,6 +8503,43 @@ mod tests {
             Some(AbandonReason::Aborted),
             "a `mission abort` record must carry the Aborted reason on the wire, not just the collapsed status"
         );
+    }
+
+    /// #3089: at the mission grain an abort ranks first. A `mission.abort`
+    /// followed by a bookend terminal (`run.complete` Clean or `run.error`)
+    /// must still read Abandoned/Aborted on a peer row, as the owner's tracked
+    /// row does (#1627).
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_mission_abort_outranks_a_later_run_terminal() {
+        for (late, outcome) in [("run.complete", "Clean"), ("run.error", "")] {
+            let _g = CrewGuard::new();
+            let flows = TempDir::new().unwrap();
+            let rec = |action: &str| {
+                let mut v = serde_json::json!({
+                    "ts": darkmux_flow::ts_utc_now(),
+                    "action": action,
+                    "source": "mission_lifecycle",
+                    "session_id": "mission-abort-first",
+                    "mission_id": "abort-first",
+                    "machine_id": "m1-max-32gb-studio",
+                });
+                if !outcome.is_empty() {
+                    v["outcome"] = serde_json::json!(outcome);
+                }
+                v
+            };
+            let fleet = vec![
+                peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+                rec("mission.abort"),
+                rec(late),
+            ];
+            let runs = build_runs(flows.path(), None, &fleet);
+            let row = runs.iter().find(|r| r.id == "abort-first").unwrap();
+            assert_eq!(row.status, RunStatus::Abandoned, "abort then {late} must stay Abandoned");
+            assert_eq!(row.abandoned_reason, Some(AbandonReason::Aborted), "abort then {late}");
+            assert!(row.completed_ts.is_none(), "abort then {late} carries no completion stamp");
+        }
     }
 
     /// The fleet half must obey the same 14-day bound the local walk does.

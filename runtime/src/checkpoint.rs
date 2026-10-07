@@ -14,12 +14,16 @@
 //! `DARKMUX_RESUME_CHECKPOINT`) reloads one of these instead of starting
 //! from the system prompt.
 //!
-//! **Resume's real guarantee:** at most ONE tool call may be re-executed
-//! on a resume — the one that was in flight at kill time (see
-//! `RunCheckpoint::pending_tool_calls`'s own doc for why). Every tool a
-//! role can call must be safe to run twice with the same arguments.
+//! **Resume's real guarantee:** a tool call that can change the workspace is
+//! never replayed silently (#3074). Just before dispatching one, the loop
+//! writes a checkpoint with `pending_head_started` set; a resume that finds it
+//! hands the model a tool result saying the call was interrupted and may have
+//! taken effect, instead of running it again. A read-only call carries no
+//! marker and may be re-executed, as may a mutating call killed before its
+//! marker landed (the marker write itself is best-effort).
 
 use crate::lmstudio::{Message, ToolCall};
+use crate::tools::Tool;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -116,20 +120,16 @@ pub struct RunCheckpoint {
     /// has a tool-call batch in flight). A resume with this `Some` finishes
     /// dispatching exactly these calls before requesting the next turn.
     ///
-    /// **The real guarantee (#2114 finding N2): a resume may re-execute AT
-    /// MOST ONE tool call — the one in flight at kill time.** Every
-    /// COMPLETED call's result is recorded (in `messages`) and stamped out
-    /// of `pending_tool_calls` before the next call starts, so a kill
-    /// between tool N and tool N+1 never re-runs tool N. But a kill WHILE
-    /// tool N is still executing (inside `dispatch(...)`, before its
-    /// result lands) catches it mid-flight: nothing was recorded for it
-    /// yet, so it's still the head of `pending_tool_calls` and DOES get
-    /// re-dispatched on resume. Every tool a role can call must therefore
-    /// be safe to run twice with the same arguments — this is not a new
-    /// requirement `checkpoint.rs` introduces, it's the same
-    /// idempotent-under-retry expectation the cycle/failure-rate detectors
-    /// already assume of the tool surface, just now also exercised by a
-    /// kill-and-resume instead of only by the model repeating itself.
+    /// **The real guarantee (#2114 finding N2, #3074): a resume never
+    /// silently replays a call that had begun.** Every COMPLETED call's
+    /// result is recorded (in `messages`) and stamped out of
+    /// `pending_tool_calls` before the next call starts, so a kill between
+    /// tool N and tool N+1 never re-runs tool N. A kill WHILE tool N is
+    /// still executing leaves it at the head of `pending_tool_calls`, and
+    /// for a tool that can change the workspace `pending_head_started` says
+    /// it had begun: the resume surfaces that to the model rather than
+    /// running it again. A read-only head is simply dispatched again, which
+    /// is safe.
     ///
     /// NOT covered by this pass: detector state (cycle/failure-rate/
     /// reasoning-loop windows), `checkpoints_used`/`stall_recoveries_used`,
@@ -149,6 +149,17 @@ pub struct RunCheckpoint {
     /// when `pending_tool_calls` is `None`.
     #[serde(default)]
     pub pending_tool_calls_seq_base: u32,
+    /// (#3074) `pending_tool_calls[0]` had BEGUN executing when this was
+    /// written: a snapshot taken just before dispatching a tool that can
+    /// change the workspace (`Tool::may_change_workspace`). The next
+    /// post-result snapshot clears it. A resume that finds it set does not
+    /// run that call again: it hands the model a tool result saying the
+    /// call was interrupted and may have taken effect (see
+    /// `interrupted_call_notice`). A checkpoint without the field reads as
+    /// `false` and resumes exactly as before, so the schema version does not
+    /// move. Meaningless (left `false`) when `pending_tool_calls` is `None`.
+    #[serde(default)]
+    pub pending_head_started: bool,
     pub written_at_unix_ms: u64,
 }
 
@@ -308,6 +319,85 @@ pub fn validate_for_resume(
     Ok(())
 }
 
+/// (#3074) The state to record just BEFORE a tool call is dispatched, so a kill
+/// while that call runs leaves a checkpoint saying it had started.
+///
+/// Without it the only checkpoint on disk is the one from before the call, and a
+/// resume dispatches the call again: a `bash` that appended to a file appends
+/// twice. With it, the resume knows the head of `pending` began executing and
+/// hands the model `interrupted_call_notice` instead of replaying it.
+///
+/// Only a call that `Tool::may_change_workspace` is marked. Replaying a read is
+/// harmless, and a marker is a full checkpoint write (the whole transcript plus
+/// an fsync), so it is not paid for calls that do not need it.
+pub struct ToolStart<'a> {
+    pub out_dir: &'a Path,
+    pub role_id: &'a str,
+    pub messages: &'a [Message],
+    pub turns: u32,
+    pub total_completion_tokens: u32,
+    pub compactions: u32,
+    /// The calls of this turn not yet recorded, the one about to run first.
+    pub pending: &'a [ToolCall],
+    /// The `tool_seq` of `pending[0]`.
+    pub seq_base: u32,
+}
+
+impl ToolStart<'_> {
+    /// Best-effort, like every other checkpoint write: a failure is logged and
+    /// the dispatch continues without the marker.
+    pub fn write(&self) {
+        let Some(head) = self.pending.first() else { return };
+        let changes_workspace = Tool::from_name(&head.function.name).is_some_and(Tool::may_change_workspace);
+        if !changes_workspace {
+            return;
+        }
+        let snapshot = RunCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            role_id: self.role_id.to_string(),
+            messages: self.messages.to_vec(),
+            turns: self.turns,
+            total_completion_tokens: self.total_completion_tokens,
+            compactions: self.compactions,
+            pending_hand_back: None,
+            pending_tool_calls: Some(self.pending.to_vec()),
+            pending_tool_calls_seq_base: self.seq_base,
+            pending_head_started: true,
+            written_at_unix_ms: unix_ms(),
+        };
+        if let Err(e) = write_checkpoint(self.out_dir, &snapshot) {
+            eprintln!("darkmux-runtime: ⚠ failed to write checkpoint: {e} (continuing without one)");
+        }
+    }
+}
+
+/// (#3074) What a resume tells the model in place of re-running `call`, the
+/// `idx`-th of the checkpoint's pending calls, when that call had already
+/// started. `None` for every call a resume should simply dispatch.
+pub fn interrupted_call_notice(checkpoint: &RunCheckpoint, idx: usize, call: &ToolCall) -> Option<String> {
+    if idx != 0 || !checkpoint.pending_head_started {
+        return None;
+    }
+    let name = &call.function.name;
+    // `create_finding` / `create_mod` write to the output dir, not the
+    // workspace, so "inspect the workspace" would send the model nowhere. Their
+    // risk is a duplicate record.
+    let advice = match Tool::from_name(name) {
+        Some(Tool::CreateFinding | Tool::CreateMod) => "the report may already have been recorded \
+             and its result was lost. It was NOT re-run. Re-issue it only if you still need \
+             it; it may then be recorded twice."
+            .to_string(),
+        _ => "it may have changed the workspace and its result was lost. It was NOT re-run. \
+              Inspect the workspace to see whether its effect is already there, and re-issue \
+              the call only if it is not."
+            .to_string(),
+    };
+    Some(format!(
+        "[darkmux-runtime] This `{name}` call was interrupted: the run stopped while it was \
+         executing, so {advice}"
+    ))
+}
+
 pub fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -330,6 +420,7 @@ mod tests {
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
+            pending_head_started: false,
             written_at_unix_ms: unix_ms(),
         }
     }
@@ -501,5 +592,77 @@ mod tests {
         let checkpoint = sample();
         validate_for_resume(&checkpoint, &[], "sys")
             .expect("no pending tool calls means the allowlist check is a no-op");
+    }
+
+    // ─── #3074: started-marker ────────────────────────────────────────────
+
+    fn tool_start<'a>(out_dir: &'a Path, messages: &'a [Message], pending: &'a [ToolCall]) -> ToolStart<'a> {
+        ToolStart {
+            out_dir,
+            role_id: "coder",
+            messages,
+            turns: 2,
+            total_completion_tokens: 9,
+            compactions: 1,
+            pending,
+            seq_base: 3,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_without_the_started_marker_reads_as_not_started() {
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v.as_object_mut().unwrap().remove("pending_head_started");
+        let loaded: RunCheckpoint = serde_json::from_value(v).expect("an older checkpoint still resumes");
+        assert!(!loaded.pending_head_started);
+    }
+
+    #[test]
+    fn tool_start_marks_a_workspace_changing_call_as_started() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let pending = [tool_call("bash"), tool_call("read")];
+        tool_start(out_dir.path(), &[Message::system("sys")], &pending).write();
+        let loaded = read_checkpoint(&checkpoint_file_path(out_dir.path())).unwrap();
+        assert!(loaded.pending_head_started);
+        assert_eq!(loaded.pending_tool_calls.unwrap().len(), 2, "the started call stays pending");
+        assert_eq!(loaded.pending_tool_calls_seq_base, 3);
+        assert_eq!((loaded.turns, loaded.total_completion_tokens, loaded.compactions), (2, 9, 1));
+    }
+
+    #[test]
+    fn tool_start_writes_nothing_for_a_read_only_call() {
+        let out_dir = tempfile::tempdir().unwrap();
+        tool_start(out_dir.path(), &[Message::system("sys")], &[tool_call("read")]).write();
+        assert!(!checkpoint_file_path(out_dir.path()).exists(), "a replayed read is harmless");
+    }
+
+    /// (#3074 review) The notice is worded per tool kind: `create_finding` and
+    /// `create_mod` write to the output dir, not the workspace, so telling the
+    /// model to inspect the workspace for their effect sends it nowhere.
+    #[test]
+    fn interrupted_call_notice_is_worded_per_tool_kind() {
+        let mut checkpoint = sample();
+        checkpoint.pending_head_started = true;
+        for name in ["bash", "write", "edit"] {
+            let notice = interrupted_call_notice(&checkpoint, 0, &tool_call(name)).unwrap();
+            assert!(notice.contains("Inspect the workspace"), "{name}: {notice}");
+        }
+        for name in ["create_finding", "create_mod"] {
+            let notice = interrupted_call_notice(&checkpoint, 0, &tool_call(name)).unwrap();
+            assert!(!notice.contains("workspace"), "{name}: {notice}");
+            assert!(notice.contains("NOT re-run") && notice.contains(name), "{name}: {notice}");
+            assert!(notice.contains("recorded twice"), "{name}: {notice}");
+        }
+    }
+
+    #[test]
+    fn interrupted_call_notice_names_only_the_started_head() {
+        let mut checkpoint = sample();
+        checkpoint.pending_tool_calls = Some(vec![tool_call("bash"), tool_call("bash")]);
+        assert!(interrupted_call_notice(&checkpoint, 0, &tool_call("bash")).is_none(), "not started");
+        checkpoint.pending_head_started = true;
+        let notice = interrupted_call_notice(&checkpoint, 0, &tool_call("bash")).expect("started head");
+        assert!(notice.contains("bash") && notice.contains("NOT re-run"), "{notice}");
+        assert!(interrupted_call_notice(&checkpoint, 1, &tool_call("bash")).is_none(), "only the head");
     }
 }

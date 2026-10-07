@@ -436,6 +436,16 @@ fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool)> {
     if let Some(name) = computer_name() {
         cfg.machine_id = Some(name);
     }
+    let resolved_paths = resolve(ResolveScope::ForceUser);
+    let is_default_home = dirs::home_dir().map(|h| h.join(".darkmux")) == Some(resolved_paths.root.clone());
+    if !is_default_home {
+        if let Some(hooks) = cfg.hooks.as_mut() {
+            hooks.outbox_dir = Some(resolved_paths.root.join("hooks").display().to_string());
+        }
+        if let Some(audit) = cfg.audit.as_mut() {
+            audit.dir = Some(resolved_paths.root.join("audit").display().to_string());
+        }
+    }
     let mut json = serde_json::to_string_pretty(&cfg).context("serializing config.json")?;
     json.push('\n');
     fs::write(&config_path, json).with_context(|| format!("writing {}", config_path.display()))?;
@@ -765,6 +775,16 @@ mod tests {
         assert_eq!(cfg.redis.as_ref().and_then(|r| r.maxlen), Some(10_000));
         assert_eq!(cfg.redis.as_ref().and_then(|r| r.telemetry_maxlen), Some(10_000));
         assert_eq!(cfg.audit.as_ref().and_then(|a| a.enabled), Some(false));
+        assert_eq!(
+            cfg.audit.as_ref().and_then(|a| a.dir.as_deref()),
+            Some(tmp.path().join("audit").to_str().unwrap()),
+            "audit dir must resolve under DARKMUX_HOME, not literal ~/.darkmux"
+        );
+        assert_eq!(
+            cfg.hooks.as_ref().and_then(|h| h.outbox_dir.as_deref()),
+            Some(tmp.path().join("hooks").to_str().unwrap()),
+            "hooks outbox dir must resolve under DARKMUX_HOME, not literal ~/.darkmux"
+        );
         assert_eq!(
             cfg.runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds),
             Some(600)

@@ -53,6 +53,7 @@ mod host_sampler;
 pub mod machine_card;
 mod panel;
 mod redaction;
+mod redaction_stream;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
@@ -467,18 +468,13 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// (#881) Constant-time-ish equality (length-independent body) for comparing a
-/// presented token against the configured one — avoids a trivial early-return
-/// timing oracle. Hand-rolled to keep the dep set tiny (no `subtle`/`constant_time_eq`).
+/// (#881, #3073) Equality of a presented token against the configured one,
+/// compared as BLAKE3 digests so both sides are always 32 bytes: a wrong-length
+/// token takes the same path as a wrong-content one and the length is no oracle.
 fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
-    if presented.len() != expected.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in presented.iter().zip(expected.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    let (a, b) = (blake3::hash(presented), blake3::hash(expected));
+    // `blake3::Hash`'s `PartialEq` is constant-time.
+    a == b
 }
 
 /// (#881) Whether the request carries a valid `Authorization: Bearer <token>`

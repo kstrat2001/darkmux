@@ -2106,6 +2106,20 @@ fn effective_inactivity_timeout_seconds(
     }
 }
 
+/// What a configured inactivity budget of `0` stands for: a hundred years,
+/// far past any dispatch and small enough that adding it to an `Instant`
+/// cannot overflow (the failure mode #2639 recorded for very large values).
+const UNBOUNDED_INACTIVITY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+/// The inactivity deadline `extra` past `now + secs`. A budget of `0` means
+/// UNBOUNDED, the reading every darkmux zero-knob has (#3074): it used to put
+/// the deadline at `now`, so the watchdog killed the container on its first
+/// poll.
+fn inactivity_deadline_after(secs: u64, extra: Duration) -> Instant {
+    let budget = if secs == 0 { UNBOUNDED_INACTIVITY } else { Duration::from_secs(secs) };
+    Instant::now() + budget + extra
+}
+
 /// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
 /// from, including the one tier `darkmux_types::config_access::Source`
 /// deliberately does not model: `darkmux dispatch --timeout <n>`, typed at
@@ -4850,6 +4864,64 @@ fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyh
     }
 }
 
+type SamplerOutcome = (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary);
+
+/// (#3074) Join `handle`, giving up after `bound`. `None` means the thread was
+/// still running at the deadline and is detached, never waited on again.
+fn join_within<T>(handle: thread::JoinHandle<T>, bound: Duration) -> Option<thread::Result<T>> {
+    let deadline = Instant::now() + bound;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(JOIN_POLL);
+    }
+    Some(handle.join())
+}
+
+/// How often [`join_within`] checks whether the thread has finished.
+const JOIN_POLL: Duration = Duration::from_millis(10);
+
+/// (#3074) How long dispatch completion waits for the telemetry sampler after
+/// asking it to stop: the longest single tick it can be inside. A tier-5 eject
+/// lists residents (`lms ps`, run twice, each bounded by `DEFAULT_LIST_BOUND`)
+/// and unloads one (bounded by the model-load timeout), so the bound is
+/// `model_load_timeout_seconds() + 2 x DEFAULT_LIST_BOUND + 5s of slack`
+/// (665s by default). Derived from the same knobs those calls read, so raising
+/// the load timeout cannot leave this bound shorter than the call it waits on.
+/// Past it something is hung.
+fn sampler_join_bound() -> Duration {
+    darkmux_profiles::gestalt_host::resolved_load_deadline().0
+        + 2 * darkmux_profiles::gestalt_host::DEFAULT_LIST_BOUND
+        + SAMPLER_JOIN_SLACK
+}
+
+/// (#3074) Slack on top of the calls [`sampler_join_bound`] sums, for the
+/// sampler's own work around them.
+const SAMPLER_JOIN_SLACK: Duration = Duration::from_secs(5);
+
+/// (#3074) The sampler thread as its two exits hand it over: the stop flag
+/// that ends its loop, the handle to join, and how long to wait for it.
+struct SamplerThread<'a> {
+    stop: &'a AtomicBool,
+    handle: thread::JoinHandle<SamplerOutcome>,
+    bound: Duration,
+}
+
+/// (#3074) The sampler's readings once it has stopped. A panicked sampler and
+/// one still running at the deadline both yield `None` for the ladder, not a
+/// zeroed summary (#2774 review C3: `0 episodes / 0 ms` is not a possible live
+/// reading, so zeros would read as "never throttled").
+fn join_sampler(
+    handle: thread::JoinHandle<SamplerOutcome>,
+    bound: Duration,
+) -> (HostStats, HostExtras, Option<crate::thermal_governor::ThermalLadderSummary>) {
+    match join_within(handle, bound) {
+        Some(Ok((stats, extras, ladder))) => (stats, extras, Some(ladder)),
+        _ => (HostStats::default(), HostExtras::default(), None),
+    }
+}
+
 /// (#889, #2131) The teardown both early exits of `dispatch()` share (the
 /// failed wait and the interrupted or stopped run): tell the watchdog the
 /// wait is over, kill the container by name, stop and join the watchdog and
@@ -4859,16 +4931,15 @@ fn teardown_container_threads(
     container_name: &str,
     watchdog_done: &AtomicBool,
     watchdog_handle: thread::JoinHandle<WatchdogWake>,
-    sampler_stop: &AtomicBool,
-    sampler_handle: thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>,
+    sampler: SamplerThread<'_>,
     stop_flag: &AtomicBool,
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
 ) {
     watchdog_done.store(true, Ordering::SeqCst);
     docker_kill_by_name(container_name);
     let _ = watchdog_handle.join();
-    sampler_stop.store(true, Ordering::SeqCst);
-    let _ = sampler_handle.join();
+    sampler.stop.store(true, Ordering::SeqCst);
+    let _ = join_within(sampler.handle, sampler.bound);
     stop_flag.store(true, Ordering::SeqCst);
     let _ = tailer_handle.join();
 }
@@ -4917,28 +4988,20 @@ enum KillOutcome {
     /// a container being created right now (an `--image` still being pulled)
     /// looks exactly like this. (#2232, round 2)
     ///
-    /// **This variant DISCLOSES the pull window; it does not close it
-    /// ([#2252]).** When the inactivity deadline fires while `docker run` is
-    /// still pulling a BYO `--image`, the watchdog burns its budget against a
-    /// container that does not exist yet, settles here, warns — and then the
-    /// thread RETURNS. Nothing re-arms. The pull finishes, the container
-    /// starts UNWATCHED, and the main thread is still parked in
-    /// `wait_with_output()` with nothing left that can kill it, exactly as
-    /// before. What changed in round 2 is only that the operator is now told:
-    /// the outcome used to read `Confirmed { attempts: 1 }` at ~0s and lie.
+    /// **This is the pull window (#2252).** When the inactivity deadline
+    /// fires while `docker run` is still pulling a BYO `--image`, the watchdog
+    /// burns its budget against a container that does not exist yet and
+    /// settles here. It does NOT retire: `rearm_after_absent_kill` re-arms the
+    /// deadline for a full budget and the watchdog keeps watching, so the
+    /// container that eventually starts is still covered. The pull's own time
+    /// is therefore never charged against the dispatch, and a container that
+    /// never appears ends the watchdog when `docker run` returns and the main
+    /// thread sets `watchdog_done`.
     ///
-    /// Two limits on how far that disclosure reaches, so nobody mistakes this
-    /// for the fix:
-    ///
-    /// - The warning is an `eprintln!` from a process that may never exit. An
-    ///   unattended `mission launch` whose harness reads stderr only at
-    ///   process end shows the operator NOTHING.
-    /// - Nothing re-arms the deadline against the container that eventually
-    ///   starts, so the dispatch can still hang indefinitely.
-    ///
-    /// The real fixes — re-arming the watchdog once the container appears, or
-    /// pulling the image in a preflight step outside the inactivity budget —
-    /// are [#2252], deliberately NOT built here.
+    /// Before #2252 the thread returned here, the pull finished, and the
+    /// container ran UNWATCHED with the main thread parked in
+    /// `wait_with_output()` and nothing left that could kill it. The outcome
+    /// used to read `Confirmed { attempts: 1 }` at ~0s and lie (#2232 round 2).
     ///
     /// [#2252]: https://github.com/kstrat2001/darkmux/issues/2252
     Absent { attempts: u32 },
@@ -4959,14 +5022,13 @@ impl KillOutcome {
             // model load" alarm: docker told us, conclusively and repeatedly,
             // that there is no such container. What the operator needs to
             // know is the other thing — the watchdog had nothing to kill, so
-            // whatever the deadline fired against is not accounted for.
+            // whatever the deadline fired against is not accounted for yet.
             KillOutcome::Absent { attempts } => Some(format!(
                 "darkmux dispatch: ⚠ the inactivity watchdog found NO container named \
-                 `{container_name}` across {attempts} attempts — nothing was killed. If the \
-                 dispatch is still running, its container was created after the deadline fired \
-                 (an `--image` pulled inline by `docker run` can take longer than the inactivity \
-                 budget) and is now UNWATCHED; stop it with `docker ps` + `docker kill` if it \
-                 hangs. (#2232)"
+                 `{container_name}` across {attempts} attempts — nothing was killed. Its \
+                 container is probably still being created (an `--image` pulled inline by \
+                 `docker run` can take longer than the inactivity budget), so the watchdog \
+                 re-arms for a full budget and keeps watching it. (#2232, #2252)"
             )),
             KillOutcome::Unconfirmed { attempts, last_error } => Some(format!(
                 "darkmux dispatch: ⚠ the inactivity watchdog could not confirm container \
@@ -5342,67 +5404,111 @@ fn run_watchdog(
     watchdog_abandoned: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
+    inactivity_secs: u64,
 ) -> WatchdogWake {
-    let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
-    // Race window: a natural exit can land in the final 500ms sleep of the
-    // wait. Re-check before firing to avoid stamping a spurious timeout on a
-    // clean exit (QA finding 2026-05-25).
-    if watchdog_done.load(Ordering::SeqCst) {
-        return WatchdogWake::Done;
+    loop {
+        let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
+        // Race window: a natural exit can land in the final 500ms sleep of
+        // the wait. Re-check before firing to avoid stamping a spurious
+        // timeout on a clean exit (QA finding 2026-05-25).
+        if watchdog_done.load(Ordering::SeqCst) {
+            return WatchdogWake::Done;
+        }
+        match wake {
+            WatchdogWake::Done => return WatchdogWake::Done,
+            // Only a genuine deadline expiry earns the "no proof-of-work
+            // signal" framing that `inactivity_timeout_stderr` builds from
+            // `timeout_fired`. Mark it BEFORE the kill so the post-wait
+            // detection sees the flag.
+            WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
+            // A different cause (the main thread panicked, not that the
+            // dispatch stalled). No in-process reader ever inspects
+            // `timeout_fired` on this path, but this function stays honest
+            // about WHY it is killing regardless of who, if anyone, later
+            // looks.
+            WatchdogWake::Abandoned => {}
+        }
+        // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
+        // until the container is confirmed stopped or the attempts are
+        // exhausted; it used to fire one swallowed `docker kill` and return, so
+        // a single transient docker failure retired the only thing that could
+        // unblock the main thread's `wait_with_output()` — leaving a hung
+        // dispatch hung forever.
+        //
+        // Deliberately does NOT bail out on `watchdog_done`: the main thread
+        // sets that flag when its WAIT returns, which proves the docker CLI
+        // process ended, not that the container did (#2233's whole finding).
+        // Abandoning the kill there would re-open the orphan. The bound is the
+        // attempt budget instead, which keeps `dispatch`'s
+        // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
+        // ~3.75s of backoff plus however long the subprocesses take, and only
+        // on a dispatch that already timed out or was abandoned (a healthy one
+        // returns from the wait above without ever reaching this line).
+        //
+        // It is NOT a hard ceiling, and the ~3.75s figure covers only the
+        // sleeps. Every attempt is a blocking `Command::output()` and the
+        // docker CLI has no client-side timeout of its own, so a daemon that
+        // ACCEPTS a connection and never answers blocks this join for as long
+        // as the CLI hangs (measured against such a socket: `docker ps` still
+        // blocked at 41s, `docker kill` at 25s). Unchanged from before #2232 —
+        // in that hang class attempt 1 blocks and the retries are never
+        // reached, so the worst case is exactly the single fire-and-forget
+        // kill's. Bounding it means spawn-poll-kill instead of `output()`;
+        // `LmsHost`'s `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` handling (#1276)
+        // already does exactly that and is the pattern to copy. (#2232)
+        //
+        // The kill + publish + warn sequence lives in `watchdog_finalize_kill`
+        // rather than inline here, because a `thread::spawn` closure is
+        // unreachable from a unit test and these were the three statements
+        // that decided whether the operator is told the truth. (#2232, round
+        // 3)
+        if let Some(warning) =
+            watchdog_finalize_kill(&container_name, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
+        {
+            eprintln!("{warning}");
+        }
+        if !rearm_after_absent_kill(
+            wake,
+            &kill_disposition,
+            &watchdog_done,
+            &timeout_fired,
+            &inactivity_deadline,
+            inactivity_secs,
+        ) {
+            return wake;
+        }
     }
-    match wake {
-        WatchdogWake::Done => return WatchdogWake::Done,
-        // Only a genuine deadline expiry earns the "no proof-of-work
-        // signal" framing that `inactivity_timeout_stderr` builds from
-        // `timeout_fired`. Mark it BEFORE the kill so the post-wait
-        // detection sees the flag.
-        WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
-        // A different cause (the main thread panicked, not that the
-        // dispatch stalled). No in-process reader ever inspects
-        // `timeout_fired` on this path, but this function stays honest
-        // about WHY it is killing regardless of who, if anyone, later looks.
-        WatchdogWake::Abandoned => {}
+}
+
+/// (#2252) The deadline fired and the kill found NO container: `docker run` is
+/// still creating it (an inline `--image` pull can outlast the budget). Ending
+/// the watchdog there would leave the container, once it starts, with nothing
+/// able to stop it, so the deadline is re-armed for a full budget and the
+/// watchdog keeps watching. Returns whether it did; `false` for every other
+/// outcome (the container was killed, the kill is unconfirmed, the scope was
+/// abandoned) and once the main thread has proved the wait is over, in which
+/// case there is nothing left to watch.
+///
+/// `timeout_fired` is cleared on a re-arm: nothing has timed out yet, so the
+/// dispatch must not report an inactivity kill that never happened. The
+/// persistent kill itself is unchanged (see `run_watchdog`'s comment on why
+/// it must not bail on `watchdog_done`); only the decision to keep going is
+/// new.
+fn rearm_after_absent_kill(
+    wake: WatchdogWake,
+    kill_disposition: &AtomicU8,
+    watchdog_done: &AtomicBool,
+    timeout_fired: &AtomicBool,
+    inactivity_deadline: &Mutex<Instant>,
+    inactivity_secs: u64,
+) -> bool {
+    let absent = kill_disposition.load(Ordering::SeqCst) == KillDisposition::Absent.code();
+    if wake != WatchdogWake::DeadlineExpired || !absent || watchdog_done.load(Ordering::SeqCst) {
+        return false;
     }
-    // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
-    // until the container is confirmed stopped or the attempts are
-    // exhausted; it used to fire one swallowed `docker kill` and return, so
-    // a single transient docker failure retired the only thing that could
-    // unblock the main thread's `wait_with_output()` — leaving a hung
-    // dispatch hung forever.
-    //
-    // Deliberately does NOT bail out on `watchdog_done`: the main thread
-    // sets that flag when its WAIT returns, which proves the docker CLI
-    // process ended, not that the container did (#2233's whole finding).
-    // Abandoning the kill there would re-open the orphan. The bound is the
-    // attempt budget instead, which keeps `dispatch`'s
-    // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
-    // ~3.75s of backoff plus however long the subprocesses take, and only
-    // on a dispatch that already timed out or was abandoned (a healthy one
-    // returns from the wait above without ever reaching this line).
-    //
-    // It is NOT a hard ceiling, and the ~3.75s figure covers only the
-    // sleeps. Every attempt is a blocking `Command::output()` and the
-    // docker CLI has no client-side timeout of its own, so a daemon that
-    // ACCEPTS a connection and never answers blocks this join for as long
-    // as the CLI hangs (measured against such a socket: `docker ps` still
-    // blocked at 41s, `docker kill` at 25s). Unchanged from before #2232 —
-    // in that hang class attempt 1 blocks and the retries are never
-    // reached, so the worst case is exactly the single fire-and-forget
-    // kill's. Bounding it means spawn-poll-kill instead of `output()`;
-    // `LmsHost`'s `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` handling (#1276)
-    // already does exactly that and is the pattern to copy. (#2232)
-    //
-    // The kill + publish + warn sequence lives in `watchdog_finalize_kill`
-    // rather than inline here, because a `thread::spawn` closure is
-    // unreachable from a unit test and these were the three statements
-    // that decided whether the operator is told the truth. (#2232, round
-    // 3)
-    if let Some(warning) =
-        watchdog_finalize_kill(&container_name, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
-    {
-        eprintln!("{warning}");
-    }
-    wake
+    timeout_fired.store(false, Ordering::SeqCst);
+    *lock_deadline(inactivity_deadline) = inactivity_deadline_after(inactivity_secs, Duration::ZERO);
+    true
 }
 
 /// `run_watchdog`'s wait: poll every 500ms until the main thread is done,
@@ -5459,6 +5565,7 @@ fn spawn_guarded_watchdog(
     watchdog_done: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
+    inactivity_secs: u64,
 ) -> (StopFlagGuard, thread::JoinHandle<WatchdogWake>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -5477,6 +5584,7 @@ fn spawn_guarded_watchdog(
             abandoned,
             timeout_fired,
             kill_disposition,
+            inactivity_secs,
         )
     });
     (guard, handle)
@@ -6515,55 +6623,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
-            if let Some(window) = load_window {
-                if used_fallback {
-                    eprintln!(
-                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
-                         `internal.utility`; loading it at the primary model's context window \
-                         ({window}) as a fallback. Declare it once, for every profile: \
-                         `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
-                         in ~/.darkmux/profiles.json. (#1616, #2914)"
-                    );
-                }
-                // (#2536) `apply_compactor_residency` both ensures residency
-                // (delegating to `ensure_utility_resident`, unchanged) AND
-                // WRITES `compaction.compactor_model` — the SAME darkmux-
-                // namespaced identifier the residency load just created (or
-                // reused) it under, mirroring `managed_wire_model`'s
-                // treatment of the main dispatch model (#2240). Pre-#2536, this
-                // field kept whatever spelling `internal.utility` used (#1615
-                // tolerates a bare key OR an already-namespaced identifier), so
-                // an operator who wrote the bare key got a compactor LOADED
-                // under `darkmux:<key>` but ADDRESSED as `<key>` on the wire —
-                // the exact split #2240 closed one binding over.
-                //
-                // (#2536 review, blocker 1) The ASSIGNMENT lives INSIDE that
-                // function deliberately. The first cut of this fix left it here
-                // as a bare `compaction.compactor_model = wire_id;` beside a
-                // helper that merely RETURNED the id — and neutering that one
-                // statement to `let _ = wire_id;` restored the pre-fix bug
-                // verbatim while all 1559 tests stayed green, because every test
-                // stopped at the helper's return value. Moving the write into
-                // the tested function is what makes the effect observable.
-                //
-                // Still NOT covered, stated plainly: deleting this whole call
-                // compiles and stays green. Everything past it crosses the
-                // docker-spawn boundary, so covering it needs a dispatch()-level
-                // integration test this crate does not have — and the mock-model
-                // harness cannot supply one, since the enclosing
-                // `model_base_url_override.is_none()` gate skips this block.
-                // (#2914 review, C5) The compactor's window is the binding's
-                // (or the named fallback); the load message says which.
-                let source = if used_fallback { WindowSource::UtilityFallback } else { WindowSource::UtilityBinding };
-                if let Some(warning) = apply_compactor_residency(
-                    &mut compaction,
-                    &compactor_id,
-                    window,
-                    |pm| ensure_model_loaded_at_ctx_from(pm, source),
-                ) {
-                    eprintln!("{warning}");
-                }
-            }
+            // (#2536) Still NOT covered, stated plainly: deleting this whole
+            // call compiles and stays green. Everything past it crosses the
+            // docker-spawn boundary, so covering it needs a dispatch()-level
+            // integration test this crate does not have; the mock-model
+            // harness cannot supply one, since the enclosing
+            // `model_base_url_override.is_none()` gate skips this block.
+            let _ = apply_compactor_setup(
+                &mut compaction,
+                &compactor_id,
+                load_window,
+                used_fallback,
+                ensure_model_loaded_at_ctx_from,
+            );
         } else if let Some(warning) = compaction.unset_compactor_warning() {
             // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
             // all the way through `from_profile` + `apply_utility_model` —
@@ -6844,9 +6916,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // to wall clock would fire the watchdog on a healthy dispatch the
     // instant the operator's laptop woke up from an afternoon nap.
     let inactivity_secs = inactivity_timeout_seconds;
-    let inactivity_deadline = Arc::new(Mutex::new(
-        Instant::now() + Duration::from_secs(inactivity_secs),
-    ));
+    let inactivity_deadline = Arc::new(Mutex::new(inactivity_deadline_after(inactivity_secs, Duration::ZERO)));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     // (#2925) This dispatch's own stop: see `DispatchStop`.
@@ -6974,6 +7044,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Arc::clone(&watchdog_done),
         Arc::clone(&timeout_fired),
         Arc::clone(&kill_disposition),
+        inactivity_secs,
     );
 
     // (#557 slice 4 · #1064) Always-on lms + host-load telemetry sampler.
@@ -7107,8 +7178,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 &container_name,
                 &watchdog_done,
                 watchdog_handle,
-                &sampler_stop,
-                sampler_handle,
+                SamplerThread {
+                    stop: &sampler_stop,
+                    handle: sampler_handle,
+                    bound: sampler_join_bound(),
+                },
                 &stop_flag,
                 tailer_handle,
             );
@@ -7186,8 +7260,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             &container_name,
             &watchdog_done,
             watchdog_handle,
-            &sampler_stop,
-            sampler_handle,
+            SamplerThread {
+                stop: &sampler_stop,
+                handle: sampler_handle,
+                bound: sampler_join_bound(),
+            },
             &stop_flag,
             tailer_handle,
         );
@@ -7225,10 +7302,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // zeros here would be indistinguishable from "this run was never
     // throttled" — the same reason every sibling field in `host_window`
     // is already `Option`.
-    let (host_stats, host_extras, thermal_ladder_summary) = match sampler_handle.join() {
-        Ok((stats, extras, ladder)) => (stats, extras, Some(ladder)),
-        Err(_) => (HostStats::default(), HostExtras::default(), None),
-    };
+    let (host_stats, host_extras, thermal_ladder_summary) = join_sampler(sampler_handle, sampler_join_bound());
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -9414,50 +9488,42 @@ fn run_telemetry_sampler(
         // on that — before any config read, threshold comparison or file
         // write.
         if let Some(event) = tick_events.battery {
-            match event {
-                // The `state` string carries BOTH numbers the decision was
-                // made on — the observation and the operator's floor — so
-                // the flow record answers "why did this rest" without a
-                // reader having to go look up the config that was in force
-                // at the time.
-                crate::power_policy::BatteryEvent::Paused { charge_pct, floor_pct } => {
-                    emit_rest(
-                        crate::power_policy::PACE_REASON,
-                        &format!("{charge_pct}% (floor {floor_pct}%)"),
-                        true,
-                    );
-                }
-                crate::power_policy::BatteryEvent::Resumed { charge_pct, floor_pct } => {
-                    emit_rest(
-                        crate::power_policy::PACE_REASON,
-                        &format!("{charge_pct}% (floor {floor_pct}%)"),
-                        false,
-                    );
-                }
-                crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } => {
-                    // WARN, not Info: the operator asked for a pause and is
-                    // not getting one. Loud beats quiet — a silent
-                    // non-pause is exactly the "silently disables itself"
-                    // failure #2706 exists to prevent. Names the numbers
-                    // and the field, and gives no advice, same contract as
-                    // the start refusal.
-                    let mut payload = battery_pause_unsupported_payload(
-                        charge_pct,
-                        floor_pct,
-                        crate::host_source::provenance(),
-                    );
-                    merge_record_context(&mut payload, &record_context);
-                    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                        darkmux_flow::Level::Warn,
-                        darkmux_flow::FlowSource::Battery,
-                        &role_id,
-                        &session,
-                        &execution,
-                        Some(&model),
-                        phase_id.as_deref(),
-                        payload,
-                    ));
-                }
+            // The `state` string carries BOTH numbers the decision was made
+            // on (the observation and the operator's floor), or for a blind
+            // probe the charge it is holding at (#3074), so the flow record
+            // answers "why did this rest" without a reader having to go look
+            // up the config that was in force at the time.
+            if let Some((level, state, pause)) = event.rest_decision() {
+                emit_rest_with_extra(
+                    level,
+                    crate::power_policy::PACE_REASON,
+                    &state,
+                    pause,
+                    RestExtra::default(),
+                );
+            } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
+                // WARN, not Info: the operator asked for a pause and is
+                // not getting one. Loud beats quiet — a silent
+                // non-pause is exactly the "silently disables itself"
+                // failure #2706 exists to prevent. Names the numbers
+                // and the field, and gives no advice, same contract as
+                // the start refusal.
+                let mut payload = battery_pause_unsupported_payload(
+                    charge_pct,
+                    floor_pct,
+                    crate::host_source::provenance(),
+                );
+                merge_record_context(&mut payload, &record_context);
+                let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                    darkmux_flow::Level::Warn,
+                    darkmux_flow::FlowSource::Battery,
+                    &role_id,
+                    &session,
+                    &execution,
+                    Some(&model),
+                    phase_id.as_deref(),
+                    payload,
+                ));
             }
         }
 
@@ -10784,7 +10850,7 @@ impl TailerState {
     /// extra`. `None` in test fixtures that do not exercise the watchdog.
     fn reset_deadline(&self, extra: Duration) {
         if let Some(deadline) = &self.inactivity_deadline {
-            *lock_deadline(deadline) = Instant::now() + Duration::from_secs(self.inactivity_secs) + extra;
+            *lock_deadline(deadline) = inactivity_deadline_after(self.inactivity_secs, extra);
         }
     }
 
@@ -12591,6 +12657,62 @@ pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
     darkmux_gestalt::namespaced_identifier(bare_model_key(compactor_id), None)
 }
 
+/// (#3074) Resolve the compactor model's context window and residency, or
+/// refuse compaction if no context window could be resolved.
+///
+/// Pre-#3074, when neither the compactor binding nor the primary model declared
+/// an `n_ctx`, `apply_compactor_residency` was skipped, leaving
+/// `compaction.compactor_model` as a bare key. The runtime would accept an
+/// absolute `--compact-threshold-tokens`, causing LM Studio to JIT-load the
+/// compactor at default context.
+///
+/// Here, if no window resolves, compaction is refused for this dispatch by
+/// clearing `compaction.compactor_model` to `None` and emitting a loud warning.
+/// No bare key is ever posted on the container CLI or wire.
+pub(crate) fn apply_compactor_setup(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    compactor_id: &str,
+    load_window: Option<u32>,
+    used_fallback: bool,
+    ensure_resident: impl Fn(&darkmux_types::ProfileModel, WindowSource) -> Result<()>,
+) -> Option<String> {
+    if let Some(window) = load_window {
+        if used_fallback {
+            eprintln!(
+                "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
+                 `internal.utility`; loading it at the primary model's context window \
+                 ({window}) as a fallback. Declare it once, for every profile: \
+                 `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
+                 in ~/.darkmux/profiles.json. (#1616, #2914)"
+            );
+        }
+        let source = if used_fallback {
+            WindowSource::UtilityFallback
+        } else {
+            WindowSource::UtilityBinding
+        };
+        let warning = apply_compactor_residency(
+            compaction,
+            compactor_id,
+            window,
+            |pm| ensure_resident(pm, source),
+        );
+        if let Some(w) = &warning {
+            eprintln!("{w}");
+        }
+        warning
+    } else {
+        compaction.compactor_model = None;
+        let warning = format!(
+            "darkmux dispatch: compactor `{compactor_id}` has no resolved context window \
+             (neither `internal.utility.n_ctx` nor primary model context window is set); \
+             refusing compaction for this dispatch. Declare `n_ctx` in ~/.darkmux/profiles.json. (#1616, #2914, #3074)"
+        );
+        eprintln!("{warning}");
+        Some(warning)
+    }
+}
+
 /// (#2536) Ensure the compactor is resident AND write the wire id it was made
 /// resident under onto `compaction.compactor_model` — the field that becomes
 /// the container's `--compactor-model` flag and then the `model` field of the
@@ -12601,13 +12723,12 @@ pub(crate) fn compactor_wire_model_id(compactor_id: &str) -> String {
 /// call site untested, so deleting it restored the bug with a green suite.
 /// Everything the call site still has to do is print the returned warning.
 ///
-/// Both parameters are non-optional. The load's two preconditions — a
-/// configured compactor, and a window to load it at — are the caller's `if let
-/// Some(compactor_id)` and `if let Some(window)` guards, so an "ensured
-/// nothing, namespace nothing" arm inside here would be unreachable from the
-/// only call site (#2536 review, finding 2). When either guard fails, no load
-/// is attempted and this is simply not called: `compaction.compactor_model`
-/// keeps the configured spelling, exactly as pre-#2536.
+/// Both parameters are non-optional. Its caller, `apply_compactor_setup`,
+/// only calls it once a compactor is configured and a window resolved, so an
+/// "ensured nothing, namespace nothing" arm inside here would be unreachable
+/// (#2536 review, finding 2). When no window resolves, `apply_compactor_setup`
+/// does not call this: it clears `compaction.compactor_model` to `None` and
+/// compaction is refused for the dispatch (#3074).
 ///
 /// A load FAILURE still writes the namespaced id (alongside the warning): the
 /// load was attempted under that identifier, and addressing a bare key instead
@@ -12859,6 +12980,22 @@ fn ensure_model_resident(
     ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load)
 }
 
+/// (#3083) Unload the stale instance a reload replaces. It can vanish between
+/// `lms ps` and the unload; that is the end state the reload wants, so a
+/// not-resident answer is success and the caller goes on to load.
+fn unload_stale_for_reload(
+    unload: &dyn Fn(&str) -> Result<()>,
+    stale_identifier: &str,
+    n_ctx: u32,
+) -> Result<()> {
+    match unload(stale_identifier) {
+        Err(e) if darkmux_profiles::lms::is_not_resident(&e) => Ok(()),
+        other => other.with_context(|| {
+            format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
+        }),
+    }
+}
+
 fn ensure_model_resident_from(
     pm: &darkmux_types::ProfileModel,
     source: WindowSource,
@@ -12928,9 +13065,7 @@ fn ensure_model_resident_from(
                 source.describe(),
                 n_ctx
             );
-            unload(&stale_identifier).with_context(|| {
-                format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
-            })?;
+            unload_stale_for_reload(unload, &stale_identifier, n_ctx)?;
         }
         PreflightDecision::LoadFresh { foreign_identifier } => {
             // (#1609) A foreign resident of the same model is NOT an error and

@@ -1384,6 +1384,8 @@ pub fn build_mission_graph(
         steps_by_phase.insert(phase_id.clone(), steps);
     }
     let task_depth = layer_tasks_by_depth(&all_tasks);
+    let all_task_ids: std::collections::HashSet<String> =
+        all_tasks.iter().map(|t| t.id.clone()).collect();
 
     // (#1432 item 4) Every step id this mission declares, across all phases —
     // the correlation filter for the flow-record backfill below. Read once,
@@ -1554,6 +1556,11 @@ pub fn build_mission_graph(
             // retired along with the step nodes they connected; a real
             // Task dependency is now exactly one edge, no detour needed.
             for dep_task_id in &task.depends_on {
+                // (#3074) A depends_on edge can name a node not in the graph;
+                // emit the edge only when dep_task_id is among the emitted task nodes.
+                if !all_task_ids.contains(dep_task_id) {
+                    continue;
+                }
                 let edge_id = format!("depends_on:{dep_task_id}:{}", task.id);
                 if !seen_dep_edges.insert(edge_id.clone()) {
                     continue;
@@ -2776,5 +2783,42 @@ mod tests {
         // No mission dir at all under this id in the test's isolated
         // DARKMUX_HOME — the function must return None, not error.
         assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
+    }
+
+    /// (#3074) A task whose `depends_on` names a task that is not in the graph
+    /// gets no edge for it, while its real dependency keeps its edge. The
+    /// fixture goes through the lifecycle writers so it has the on-disk layout
+    /// the loader reads (`tasks/<phase>/<task>.json`): with the wrong layout
+    /// the graph has no nodes and the guard is never reached.
+    #[test]
+    #[serial_test::serial]
+    fn build_mission_graph_omits_depends_on_edge_to_missing_node() {
+        let _g = darkmux_types::test_isolation::IsolatedState::new();
+        let mission: Mission = serde_json::from_value(serde_json::json!({
+            "id": "m-missing-dep",
+            "description": "test mission",
+            "phase_ids": ["p1"],
+            "created_ts": 1_700_000_000u64,
+        }))
+        .unwrap();
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase: Phase = serde_json::from_value(serde_json::json!({
+            "id": "p1",
+            "mission_id": "m-missing-dep",
+            "description": "phase 1",
+            "created_ts": 1_700_000_000u64,
+            "task_ids": ["t-a", "t-c"],
+        }))
+        .unwrap();
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-a", &[], &[])).unwrap();
+        darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-c", &["t-a", "nonexistent-task"], &[])).unwrap();
+
+        let flows = tempfile::TempDir::new().unwrap();
+        let graph = build_mission_graph("m-missing-dep", flows.path()).unwrap().expect("graph emitted");
+        assert!(graph.nodes.iter().any(|n| n.id == "t-c"), "the fixture must reach the task nodes: {:?}", graph.nodes.len());
+        let dep_edges: Vec<&str> =
+            graph.edges.iter().filter(|e| e.kind == EdgeKind::DependsOn).map(|e| e.id.as_str()).collect();
+        assert_eq!(dep_edges, ["depends_on:t-a:t-c"], "only the real dependency gets an edge");
     }
 }

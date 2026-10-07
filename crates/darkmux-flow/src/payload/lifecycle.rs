@@ -39,6 +39,21 @@ pub struct StepStartPayload {
 
 impl Attribution for StepStartPayload {}
 
+/// A step completed: the payload of `step.complete`, written only when it carries the mark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct StepCompletePayload {
+    /// A later step of the same task is still planned, so the task's session is not over: the
+    /// record does not close it (#3074). Absent on the task's last step, and on archives written
+    /// before the mark existed, where the record closes as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub later_step_planned: Option<bool>,
+}
+
+impl Attribution for StepCompletePayload {}
+
 /// The widest cause a `step.error` record carries, in rendered columns.
 const STEP_ERROR_CAUSE_COLUMNS: usize = 400;
 
@@ -95,12 +110,8 @@ fn redact_credentials(text: &str) -> String {
 }
 
 fn redact_word(word: &str) -> String {
-    let word = match word.split_once("://") {
-        Some((scheme, rest)) => {
-            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let (authority, tail) = rest.split_at(end);
-            format!("{scheme}://{}{tail}", authority.rsplit('@').next().unwrap_or(authority))
-        }
+    let word = match darkmux_types::url_authority::UrlAuthority::parse(word) {
+        Some(url) => format!("{}://{}", url.scheme, url.host_and_tail),
         None => word.to_string(),
     };
     let mut out = String::with_capacity(word.len());
@@ -799,6 +810,18 @@ mod step_error_tests {
         assert!(p.cause.contains("https://github.com/x.git"), "{}", p.cause);
         assert!(p.cause.contains("api_key=<redacted>&x=1"), "{}", p.cause);
         assert!(p.cause.contains("git@github.com:o/r.git"), "ssh form untouched: {}", p.cause);
+    }
+
+    /// (#3074) A password holding `/`, `?` or `#` must not survive in a cause
+    /// that rides the fleet stream: the userinfo is split by the same parser
+    /// the connection-URL redactors use, not at the first delimiter.
+    #[test]
+    fn step_error_cause_redacts_a_password_holding_url_delimiters() {
+        for pw in ["pa/ss", "pa?ss", "pa#ss", "a#b/c?d"] {
+            let p = StepErrorPayload::from_message(&format!("hub failed: redis://kain:{pw}@hub.example:6379/0 refused"));
+            assert!(!p.cause.contains("kain") && !p.cause.contains(pw) && !p.cause.contains("ss@"), "{pw} leaked: {}", p.cause);
+            assert!(p.cause.contains("redis://hub.example:6379/0"), "{pw}: {}", p.cause);
+        }
     }
 
     /// (F9) The cause is one line with invisible and control characters gone,

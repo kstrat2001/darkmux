@@ -98,8 +98,8 @@ pub(crate) fn arm() {
 ///
 /// Returns a guard whose `Drop` stops the thread once the caller's own
 /// dispatch is over — hold it for exactly the scope that needs
-/// interruptibility, same as `mission_launch.rs`'s own
-/// `WatchdogStopGuard`. Skipped entirely under `cfg(test)` (no unit test
+/// interruptibility. This is the one reap watchdog `mission launch`,
+/// `dispatch` and `lab` share (#3087); `mission_launch.rs` has no copy. Skipped entirely under `cfg(test)` (no unit test
 /// needs a real background thread); a live signal-delivery proof spawns
 /// the compiled binary as a subprocess instead, where `cfg!(test)` is
 /// false regardless of how it was built.
@@ -128,15 +128,8 @@ pub(crate) fn spawn_reap_watchdog() -> WatchdogStopGuard {
 
 /// RAII stop-flag for [`spawn_reap_watchdog`]'s background thread.
 ///
-/// **NOT shared with `mission_launch.rs` — it still has its own inline
-/// `WatchdogStopGuard` and its own inline spawn.** An earlier version of this
-/// comment claimed the migration had happened; it has not, and saying so was
-/// worse than the duplication, because it invited a reader to assume one
-/// definition governs both. The two bodies were diffed and are semantically
-/// identical, so migrating `mission_launch` onto this one is safe — but it is
-/// its own change, kept out of #2262's diff so a working launcher was not
-/// touched by a signal-handling fix. Until then these two must stay in sync by
-/// discipline, which is exactly the reason to do the migration.
+/// Shared across launchers and CLI entry points (`mission_launch.rs`, `main.rs`,
+/// `lab_cli.rs`, `radio_cli.rs`).
 pub(crate) struct WatchdogStopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for WatchdogStopGuard {
@@ -150,9 +143,9 @@ impl Drop for WatchdogStopGuard {
 /// blocking call the signal is trying to escape) calls this ONCE its own
 /// terminal record is already durable on disk (i.e., right after
 /// [`LaunchFinalizeGuard::close`] returns). Reaps every registered child
-/// pid and force-exits with the conventional signal-terminated code (130 —
-/// 128 + SIGINT's own 2, reused for SIGTERM/SIGHUP too, matching
-/// `review_finalize_guard.rs`'s precedent) — `SIGKILL`ing a child pid does
+/// pid and force-exits with the conventional signal-terminated code,
+/// `128 + signo` (130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP; 130 when
+/// no OS signal was recorded) — `SIGKILL`ing a child pid does
 /// NOT end this process on its own, so the launcher must explicitly exit
 /// here rather than relying on a self-inclusion side effect.
 ///
@@ -193,12 +186,14 @@ pub(crate) fn reap_and_exit_on_signal() {
         return;
     }
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-    std::process::exit(130);
+    // (#3073-P3-1) Exit with 128 + signo (e.g. 130 for SIGINT, 143 for SIGTERM).
+    let signo = darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT);
+    std::process::exit(128 + signo);
 }
 
 /// [`reap_and_exit_on_signal`] for a call site whose only remaining output
 /// is the `Err` it is holding — it PRINTS that error first, then reaps and
-/// exits 130.
+/// exits `128 + signo`.
 ///
 /// (#2462 review) `main` returns `anyhow::Result<()>`, so an `Err` that
 /// propagates out of `run` is printed by std's own `Termination` impl as
@@ -315,6 +310,17 @@ pub(crate) fn wall_clock_exceeded() -> bool {
     WALL_CLOCK_EXCEEDED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// (#2678, #3074) Bail when an OPERATOR signal was observed, never when the
+/// run's own wall-clock bound fired: the bound sets the same interrupt flag
+/// by design, but its outcome is `Degraded` with the bound named, not an
+/// error.
+pub(crate) fn bail_if_operator_signal(context: &str) -> anyhow::Result<()> {
+    if wall_clock_exceeded() {
+        return Ok(());
+    }
+    darkmux_types::interrupt::bail_if_set(context)
+}
+
 /// Test-only: reset [`WALL_CLOCK_EXCEEDED`] between tests in the same
 /// process — mirrors `darkmux_types::interrupt::reset_for_test`'s own
 /// reasoning (a process-wide flag would otherwise contaminate whichever
@@ -407,11 +413,21 @@ pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_secon
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
-            darkmux_types::interrupt::mark_interrupted();
+            mark_bound_fired();
         });
     }
     Some(guard)
+}
+
+/// (#3074) The bound's deadline passed: record it as the cause, UNLESS an
+/// operator signal already landed. A Ctrl-C followed by the bound firing
+/// during wind-down is an operator interrupt (`run.error`), never a bound
+/// `Degraded`. Either way the run is told to stop.
+fn mark_bound_fired() {
+    if !darkmux_types::interrupt::is_set() {
+        WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    darkmux_types::interrupt::mark_interrupted();
 }
 
 /// (#2902 step 5) A run's wall-clock deadline: `started` plus its bound,
@@ -507,6 +523,28 @@ mod tests {
             spawn_wall_clock_watchdog(std::time::Instant::now(), 3600).is_some(),
             "a non-zero bound must return a live guard, not the zero-bound no-op"
         );
+    }
+
+    /// (#3074) The bound firing AFTER an operator signal must not read as a
+    /// bound abort; firing with no signal does.
+    #[test]
+    #[serial_test::serial]
+    fn the_bound_firing_after_an_operator_signal_is_not_recorded_as_the_cause() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        mark_bound_fired();
+        let after_signal = wall_clock_exceeded();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        mark_bound_fired();
+        let alone = wall_clock_exceeded();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(!after_signal, "(#3074) an operator signal came first: the bound is not the cause");
+        assert!(alone, "no signal: the bound is the cause");
     }
 
     /// (#2678) `wall_clock_exceeded` is the one extra bit that lets a
@@ -605,6 +643,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn arm_installs_real_sigterm_and_sighup_handlers() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         darkmux_types::interrupt::reset_for_test();
         let _restore = RestoreSignalsGuard;
         arm();

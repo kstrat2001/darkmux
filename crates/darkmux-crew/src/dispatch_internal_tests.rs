@@ -817,6 +817,7 @@
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+            600,
         );
         stop.kill_container(); // the shim fails this first kill
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -13758,6 +13759,59 @@
         );
     }
 
+    #[test]
+    fn apply_compactor_setup_refuses_compaction_when_no_window_resolves() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: None,
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_setup(
+            &mut compaction,
+            "util-4b",
+            None,
+            false,
+            |_pm, _src| Ok(()),
+        );
+        assert!(warning.is_some(), "must warn on refusal when neither window is set");
+        assert!(warning.as_ref().unwrap().contains("refusing compaction"));
+        assert_eq!(
+            compaction.compactor_model, None,
+            "compactor_model must be cleared to refuse compaction and avoid posting a bare key (#3074)"
+        );
+        assert_eq!(
+            compaction.compactor_context_window, None,
+            "compactor_context_window must stay None"
+        );
+        let mut args = Vec::new();
+        super::apply_compaction_flags(&mut args, &compaction);
+        assert!(
+            !args.iter().any(|a| a == "--compactor-model"),
+            "argv must not post a bare compactor key when window was unresolved"
+        );
+    }
+
+    #[test]
+    fn apply_compactor_setup_loads_and_namespaces_when_compactor_n_ctx_set() {
+        let mut compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_model: Some("util-4b".to_string()),
+            context_window: None,
+            ..Default::default()
+        };
+        let warning = super::apply_compactor_setup(
+            &mut compaction,
+            "util-4b",
+            Some(64_000),
+            false,
+            |_pm, _src| Ok(()),
+        );
+        assert!(warning.is_none());
+        assert_eq!(
+            compaction.compactor_model.as_deref(),
+            Some("darkmux:util-4b")
+        );
+    }
+
     /// The same write, followed all the way to the argv the container is
     /// actually spawned with — the flag whose value the compactor sends as its
     /// `model` field. Pins the two halves together: if either the store or the
@@ -15526,6 +15580,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     #[serial]
     fn run_tailer_kills_registered_children_on_interrupt_and_returns_promptly() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
         // A real integration proof of the tailer's own interrupt-check —
         // the ONE poll point the docker/coder/crawl dispatch path has
         // between spawning the container and the main thread's blocking
@@ -16141,6 +16197,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 watchdog_done_for_closure,
                 timeout_fired_for_closure,
                 kill_disposition_for_closure,
+                600,
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the watchdog's spawn and dispatch()'s own stores");
@@ -16555,9 +16612,10 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // existing yet, while `inactivity_deadline` is already armed. A pull
         // longer than the inactivity budget fires the watchdog against a
         // container that does not exist — and the watchdog retires. The pull
-        // then finishes and the dispatch runs UNWATCHED, with the main thread
-        // parked in `wait_with_output()` and nothing left that can kill it:
-        // #2232's own fail-open, reached through #2232's own fix.
+        // then finishes and the dispatch ran UNWATCHED, with the main thread
+        // parked in `wait_with_output()` and nothing left that could kill it:
+        // #2232's own fail-open, reached through #2232's own fix. (#2252: the
+        // watchdog now re-arms on an `Absent` kill instead of retiring.)
         //
         // `Confirmed` must mean "was observed running, now stopped". NEVER
         // OBSERVED is a different state, and its correct action is to keep
@@ -18005,6 +18063,51 @@ fn already_resident_refusal_recovers_by_reusing() {
         },
     );
     assert!(out.is_ok(), "expected reuse, got {:?}", out.err().map(|e| format!("{e:#}")));
+}
+
+#[test]
+#[serial_test::serial]
+fn reload_tolerates_a_stale_instance_that_vanished_before_the_unload() {
+    // (#3083 review) The stale resident can disappear between `lms ps` and
+    // `lms unload` (a TTL expiry, another shell). `lms unload` answers that
+    // with the not-resident shape; the end state the reload wants (nothing
+    // stale resident) already holds, so the dispatch must go on to LOAD, not
+    // fail where it used to succeed.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut small = ps_row_2318();
+    small.context = 4096;
+    let loads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| vec![small.clone()],
+        &|id| {
+            Err(anyhow::Error::new(darkmux_gestalt::HostError::NotResident {
+                identifier: id.to_string(),
+            }))
+        },
+        &|_key, _identifier, _n_ctx| {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(out.is_ok(), "expected the reload to proceed, got {:?}", out.err().map(|e| format!("{e:#}")));
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "the load must still run after a benign unload");
+}
+
+#[test]
+#[serial_test::serial]
+fn reload_still_fails_when_the_unload_genuinely_fails() {
+    // The tolerance is for NotResident ONLY; a stuck unload stays loud.
+    let mut small = ps_row_2318();
+    small.context = 4096;
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm_2318(),
+        &|| vec![small.clone()],
+        &|_| anyhow::bail!("lms unload failed: device busy"),
+        &|_key, _identifier, _n_ctx| Ok(()),
+    );
+    let err = format!("{:#}", out.expect_err("a stuck unload must fail the preflight"));
+    assert!(err.contains("device busy"), "got: {err}");
 }
 
 #[test]
@@ -19753,3 +19856,207 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         PreflightDecision::Reuse { .. }
     ));
 }
+
+    // ─── (#3074) an inactivity budget of 0 means unbounded ───────────────
+
+    /// `0` must not read as "expire immediately": the deadline lands far
+    /// beyond any real dispatch, while a real budget stays `now + secs`.
+    #[test]
+    fn a_zero_inactivity_budget_yields_a_deadline_that_never_expires_in_practice() {
+        let now = Instant::now();
+        let unbounded = inactivity_deadline_after(0, Duration::ZERO);
+        assert!(unbounded > now + Duration::from_secs(365 * 24 * 3600), "0 must be unbounded");
+        let bounded = inactivity_deadline_after(600, Duration::ZERO);
+        assert!(bounded > now + Duration::from_secs(599) && bounded < now + Duration::from_secs(700));
+    }
+
+    /// The watchdog's wake loop, handed the deadline a `0` budget produces,
+    /// does not report an expiry: a done flag is the only thing that wakes it.
+    #[test]
+    fn the_watchdog_does_not_expire_on_a_zero_budget_deadline() {
+        let deadline = Mutex::new(inactivity_deadline_after(0, Duration::ZERO));
+        let done = AtomicBool::new(false);
+        let abandoned = AtomicBool::new(false);
+        let done_ref = &done;
+        let wake = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(1200));
+                done_ref.store(true, Ordering::SeqCst);
+            });
+            wait_for_watchdog_wake(&deadline, &done, &abandoned)
+        });
+        assert!(matches!(wake, WatchdogWake::Done), "a zero budget must never expire the deadline");
+    }
+
+    // ─── (#2252) a late container is never left unwatched ───────────────
+
+    /// A `docker` whose `kill` fails and whose `ps` never lists anything:
+    /// the watchdog's kill finds NO container (`Absent`), which is exactly
+    /// what an inline `--image` pull looks like from outside.
+    fn install_docker_that_never_shows_the_container(dir: &TempDir) -> Option<String> {
+        let path = dir.path().join("docker");
+        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = kill ] && exit 1\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::process::Command::new(&path).arg("warm-up").status().unwrap();
+        let prev = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        prev
+    }
+
+    /// The deadline fires while `docker run` is still pulling: the kill sees
+    /// no container. The watchdog must NOT return then (the container would
+    /// start unwatched): it re-arms, keeps watching, and ends only when the
+    /// main thread proves the wait is over.
+    #[test]
+    #[serial]
+    fn the_watchdog_keeps_watching_after_its_kill_found_no_container() {
+        let dir = TempDir::new().unwrap();
+        let prev_path = install_docker_that_never_shows_the_container(&dir);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let (_guard, handle) = spawn_guarded_watchdog(
+            &abandoned,
+            "darkmux-test-late-container".to_string(),
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::clone(&done),
+            Arc::clone(&timeout_fired),
+            Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code())),
+            600,
+        );
+        // The kill cycle (five attempts with backoff) takes ~4s; wait past it.
+        thread::sleep(Duration::from_secs(6));
+        let still_watching = !handle.is_finished();
+        let fired_while_waiting = timeout_fired.load(Ordering::SeqCst);
+        done.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        restore_path(prev_path);
+        assert!(still_watching, "the watchdog returned after an Absent kill and left a later container unwatched");
+        assert!(!fired_while_waiting, "a re-armed watchdog has not timed out the dispatch");
+        assert_eq!(handle.join().unwrap(), WatchdogWake::Done);
+    }
+
+// (#3074) A hung sampler thread must not wedge dispatch completion.
+#[test]
+fn join_within_gives_up_on_a_thread_that_outlives_the_bound() {
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        let _ = parked.recv();
+        7
+    });
+    let started = Instant::now();
+    let joined = join_within(handle, Duration::from_millis(100));
+    let waited = started.elapsed();
+    drop(release);
+    assert!(joined.is_none(), "a thread still running at the bound is detached");
+    assert!(waited < Duration::from_secs(2), "the join returned at the bound, not at thread exit: {waited:?}");
+}
+
+#[test]
+fn join_within_returns_the_value_of_a_thread_that_finishes_in_time() {
+    let handle = thread::spawn(|| 7);
+    assert_eq!(join_within(handle, Duration::from_secs(5)).map(|r| r.ok()), Some(Some(7)));
+}
+
+#[test]
+fn join_within_reports_a_panicked_thread_as_joined_err() {
+    let handle = thread::spawn(|| -> u8 { panic!("sampler boom") });
+    let joined = join_within(handle, Duration::from_secs(5));
+    assert!(matches!(joined, Some(Err(_))), "a panic is a finished thread, not a timeout");
+}
+
+#[test]
+#[serial]
+fn the_sampler_join_bound_is_derived_from_the_load_timeout_and_the_list_bound() {
+    let k = "DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS";
+    let prev = std::env::var(k).ok();
+    let list = darkmux_profiles::gestalt_host::DEFAULT_LIST_BOUND;
+    unsafe { std::env::remove_var(k) };
+    // The default load timeout is 600s: 600 + 2 x 30 + 5 = 665s.
+    assert_eq!(sampler_join_bound(), Duration::from_secs(600) + 2 * list + Duration::from_secs(5));
+    unsafe { std::env::set_var(k, "45") };
+    assert_eq!(sampler_join_bound(), Duration::from_secs(45) + 2 * list + Duration::from_secs(5));
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
+// (#3074) join_sampler reports a sampler that finished as `Some(ladder)`, and a hung or panicked one
+// as `None`: zeros would read as "never throttled" (#2774 review C3).
+#[test]
+fn join_sampler_gives_a_ladder_only_for_a_sampler_that_finished() {
+    let ladder = crate::thermal_governor::ThermalLadderSummary { serious_episodes: 2, current_duty_delay_ms: 500 };
+    let done = thread::spawn(move || (HostStats::default(), HostExtras::default(), ladder));
+    assert_eq!(join_sampler(done, Duration::from_secs(5)).2, Some(ladder));
+
+    let panicked = thread::spawn(|| -> SamplerOutcome { panic!("sampler boom") });
+    assert_eq!(join_sampler(panicked, Duration::from_secs(5)).2, None);
+
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let hung = thread::spawn(move || {
+        let _ = parked.recv();
+        (HostStats::default(), HostExtras::default(), ladder)
+    });
+    let started = Instant::now();
+    assert_eq!(join_sampler(hung, Duration::from_millis(100)).2, None, "a hung sampler records no ladder");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(release);
+}
+
+// (#3074) The early-exit teardown bounds the sampler join too: a hung sampler must not wedge
+// the failed-wait and interrupted-run exits, and the tailer is still stopped and joined after.
+#[test]
+fn teardown_returns_at_the_sampler_bound_when_the_sampler_hangs() {
+    let done = AtomicBool::new(false);
+    let sampler_stop = AtomicBool::new(false);
+    let stop_flag = AtomicBool::new(false);
+    let watchdog = thread::spawn(|| WatchdogWake::Done);
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let sampler = thread::spawn(move || {
+        let _ = parked.recv();
+        (HostStats::default(), HostExtras::default(), crate::thermal_governor::ThermalLadderSummary::default())
+    });
+    let tailer = thread::spawn(TrajectorySummary::default);
+    let started = Instant::now();
+    teardown_container_threads(
+        "darkmux-test-no-such-container",
+        &done,
+        watchdog,
+        SamplerThread { stop: &sampler_stop, handle: sampler, bound: Duration::from_millis(100) },
+        &stop_flag,
+        tailer,
+    );
+    let waited = started.elapsed();
+    drop(release);
+    assert!(waited < Duration::from_secs(4), "teardown returned at the sampler bound, not at thread exit: {waited:?}");
+    assert!(done.load(Ordering::SeqCst) && sampler_stop.load(Ordering::SeqCst) && stop_flag.load(Ordering::SeqCst));
+}
+
+// (#3074) The three joins of the sampler thread all go through the bounded join. `dispatch()`
+// cannot be driven in-process, so reverting its completion join to an unbounded one would
+// leave every behavioral test above green; this pins the call sites physically.
+#[test]
+fn every_sampler_join_in_dispatch_is_the_bounded_one() {
+    let src = include_str!("dispatch_internal.rs");
+    assert!(!src.contains("sampler_handle.join()"), "an unbounded join of the sampler thread returned");
+    assert_eq!(
+        src.matches("join_sampler(sampler_handle, sampler_join_bound())").count(),
+        1,
+        "dispatch completion must join the sampler through join_sampler with the derived bound"
+    );
+    assert_eq!(
+        src.matches("bound: sampler_join_bound(),").count(),
+        2,
+        "both early-exit teardowns hand the sampler over with the derived bound"
+    );
+}
+

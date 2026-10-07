@@ -3971,6 +3971,9 @@ mod tests {
         //            so the viewer names the running call and its file.
         //   1.65.0 — (#2902 step 5) `endpoint_id` on usage records and the
         //            `budget.warn` / `budget.wait` / `budget.resume` / `budget.stop` actions.
+        //   2.1.0 — (5.0, #3074) additive: `step.complete.payload.later_step_planned`
+        //            (written only as `true`): a later step of the task is still
+        //            planned, so the record does not close its session.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -3982,7 +3985,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.1.0");
     }
 
     #[test]
@@ -5022,6 +5025,33 @@ mod tests {
         }
     }
 
+    /// (#3074) A unix-socket URL has no `@`. Its password lives in the query,
+    /// and that value is what a status line would print.
+    #[test]
+    fn redact_url_creds_masks_a_unix_socket_query_password() {
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?password=s3cret&db=1"),
+            "redis+unix:///tmp/x.sock?password=***&db=1"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?db=1&pass=s3cret#frag"),
+            "redis+unix:///tmp/x.sock?db=1&pass=***#frag"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix://:s3cret@/tmp/x.sock"),
+            "redis+unix://:***@/tmp/x.sock"
+        );
+        // A secret holding `@` is still one value: the `@` is not a boundary.
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?password=p@ss"),
+            "redis+unix:///tmp/x.sock?password=***"
+        );
+        assert_eq!(
+            redact_url_creds("redis+unix:///tmp/x.sock?pass=a:b@c&db=1"),
+            "redis+unix:///tmp/x.sock?pass=***&db=1"
+        );
+    }
+
     /// (#3074) `SinkInfo` carries the raw URL for the in-process probe; its
     /// `Debug` must not print it.
     #[test]
@@ -5998,6 +6028,99 @@ mod tests {
         assert!(torn_sidecars(&path).is_empty());
         let report = integrity_check_file(&path).unwrap();
         assert!(report.chain_valid && report.torn_tails.is_empty());
+    }
+
+    /// (#3073-1.3) Appending to a file larger than the 64 KiB tail window
+    /// uses the windowed read path.
+    #[test]
+    fn audit_append_windowed_read_on_large_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..6 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 64 * 1024, "file must exceed 64 KiB: {size} bytes");
+
+        append_one(&path, "tail-record");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 7);
+        assert!(report.torn_tails.is_empty());
+    }
+
+    /// (#3073-1.3) Torn-tail recovery on a file larger than 64 KiB works
+    /// and continues the chain.
+    #[test]
+    fn torn_tail_on_large_file_is_recovered_and_chain_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..6 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let before_size = std::fs::metadata(&path).unwrap().len();
+        assert!(before_size > 64 * 1024);
+
+        let mut torn = std::fs::read(&path).unwrap();
+        let half = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef {\"ts\":\"2025";
+        torn.extend_from_slice(half);
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "chain must verify: {report:?}");
+        assert_eq!(report.records_checked, 7);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+        assert_eq!(report.torn_tails.len(), 1);
+    }
+
+    /// (#3088) The 64 KiB tail window can start inside a multibyte character.
+    /// The partial line before the first newline is dropped before decoding,
+    /// so appends keep working instead of sticking on "tail is not valid UTF-8".
+    #[test]
+    fn audit_append_survives_window_starting_mid_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        // Vary the length per record so the window start lands on both a
+        // character boundary and mid-character across the appends.
+        for i in 0..12 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "\u{e9}".repeat(12_000 + i));
+            crate::integrity::audit_record_at(&rec, &path)
+                .unwrap_or_else(|e| panic!("append {i} failed: {e:#}"));
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024);
+        append_one(&path, "ascii-retry");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 13);
+    }
+
+    /// (#3088) Fails unless the append reads only the tail window: invalid
+    /// UTF-8 far before the window must not block an append (a full-file
+    /// read refuses it).
+    #[test]
+    fn audit_append_ignores_invalid_bytes_before_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..8 {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}-{}", "a".repeat(12_000));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 90 * 1024);
+        bytes[5_000] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        crate::integrity::audit_record_at(&minimal_record(), &path)
+            .expect("append must read only the tail window");
     }
 
     // (#1775) The exit-status belt, exercised directly rather than through a

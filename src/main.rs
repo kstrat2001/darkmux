@@ -737,7 +737,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
     for m in &uncovered {
         let bucket = heuristics::classify_size_from_meta(m);
         let suggested_class = match bucket {
-            heuristics::SizeBucket::Tiny => heuristics::TaskClass::Fast,
+            heuristics::SizeBucket::Unknown | heuristics::SizeBucket::Tiny => heuristics::TaskClass::Fast,
             heuristics::SizeBucket::Small => heuristics::TaskClass::Mid,
             heuristics::SizeBucket::Medium => heuristics::TaskClass::Long,
             heuristics::SizeBucket::Large => heuristics::TaskClass::Mid,
@@ -752,7 +752,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
         let bucket = heuristics::classify_size_from_meta(m);
         let arch = heuristics::classify_architecture(m);
         let suggested_class = match bucket {
-            heuristics::SizeBucket::Tiny => heuristics::TaskClass::Fast,
+            heuristics::SizeBucket::Unknown | heuristics::SizeBucket::Tiny => heuristics::TaskClass::Fast,
             heuristics::SizeBucket::Small => heuristics::TaskClass::Mid,
             heuristics::SizeBucket::Medium => heuristics::TaskClass::Long,
             heuristics::SizeBucket::Large => heuristics::TaskClass::Mid,

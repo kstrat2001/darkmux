@@ -337,22 +337,21 @@ pub(crate) fn run_bookend_record(
     run_record(level, config_id, run, payload)
 }
 
-/// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
-/// child-reaping watchdog thread — `Drop` sets the shared flag, so it
-/// fires on EVERY exit from `launch` (an early `?`-return, a panic, or
-/// the normal fall-through at the bottom) without needing a store call at
-/// each of that function's several return points. Without this, the
-/// watchdog thread spawned per `launch()` call ran for the rest of the
-/// PROCESS's lifetime (an interrupted run's reaping `loop` never exited;
-/// a clean run's waiting `while` never got a reason to either) — harmless
-/// on a real one-shot-per-invocation CLI process, but ~25 unit tests each
-/// leaving a background thread spinning is real, avoidable waste.
-struct WatchdogStopGuard(Arc<std::sync::atomic::AtomicBool>);
 
-impl Drop for WatchdogStopGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
+
+/// (#3087 review) Close the run's open bookend with `run.error` carrying the
+/// launch's own error text, so a post-mint refusal reads as what it was
+/// rather than as the Drop backstop's "terminated before completion".
+fn close_run_with_error<S: flow::BookendSink + ?Sized>(
+    bookend: &mut flow::BookendGuard<'_, S>,
+    config_id: &str,
+    run: &RunId,
+    err: &anyhow::Error,
+) {
+    bookend.close(
+        "run",
+        run_bookend_record(flow::Edge::Error, config_id, run, RunPayload::failed(format!("{err:#}"))),
+    );
 }
 
 /// The refusal every launch runs first: a stale or invalid user file the
@@ -855,6 +854,24 @@ pub fn launch(
             }
         };
 
+    // (#3074) The run's liveness bookend opens as soon as the mission is minted,
+    // so any post-mint error return (interpret, staffing check, unexecutable kinds)
+    // records run.error rather than leaving the run unclosed in the flow trail.
+    let mut run_sink = |record: flow::FlowRecord| {
+        let _ = flow::record(record);
+    };
+    let run_for_abort = run.clone();
+    let config_id_for_abort = config_id.to_string();
+    let mut bookend = flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
+        run_bookend_record(
+            flow::Edge::Error,
+            &config_id_for_abort,
+            &run_for_abort,
+            RunPayload::failed("run terminated before completion (early return or panic)"),
+        )
+    });
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
     // a bare `?` would leave the instance permanently Active with no envelope,
@@ -876,6 +893,7 @@ pub fn launch(
     {
         let mut no_steps = BTreeMap::new();
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+        close_run_with_error(&mut bookend, config_id, &run, &e);
         return Err(e);
     }
 
@@ -901,6 +919,7 @@ pub fn launch(
             Err(e) => {
                 let mut no_steps = BTreeMap::new();
                 reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &[], &mut no_steps, &e);
+                close_run_with_error(&mut bookend, config_id, &run, &e);
                 return Err(e);
             }
         };
@@ -938,6 +957,7 @@ pub fn launch(
         darkmux_types::config_access::role_profile(role)
     }) {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut all_steps, &e);
+        close_run_with_error(&mut bookend, config_id, &run, &e);
         return Err(e);
     }
 
@@ -1014,6 +1034,10 @@ pub fn launch(
                  darkmux mission abort {mission_id})"
             ))
         );
+        bookend.close(
+            "run",
+            run_bookend_record(flow::Edge::Complete, config_id, &run, RunPayload::default()),
+        );
         return Ok(0);
     }
 
@@ -1050,6 +1074,15 @@ pub fn launch(
                  can run it end to end (exit code 4).",
                 unknown.join(", ")
             ))
+        );
+        bookend.close(
+            "run",
+            run_bookend_record(
+                flow::Edge::Error,
+                config_id,
+                &run,
+                RunPayload::failed(format!("unexecutable step kind(s): {}", unknown.join(", "))),
+            ),
         );
         return Ok(4);
     }
@@ -1144,35 +1177,9 @@ pub fn launch(
     // path that registers a pid without its own poll seam) rather than
     // the sole mechanism the paragraph above originally described it as.
     //
-    // (#2131 review round 2, item 5) Bounded: `watchdog_stop` (set by
-    // `WatchdogStopGuard`'s `Drop`, above — fires on every exit from this
-    // function) is re-checked in BOTH loops below, so this thread exits
-    // once this `launch()` call is over instead of running for the rest
-    // of the process's lifetime. And skipped entirely under `cfg(test)` —
-    // `cfg!(test)` is true for the WHOLE crate whenever it's built by
-    // `cargo test` (not just inside `#[cfg(test)] mod tests`), so none of
-    // this module's ~25 unit tests that call `launch()` spin up a
-    // watchdog thread they have no use for.
-    let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _watchdog_stop_guard = WatchdogStopGuard(Arc::clone(&watchdog_stop));
-    if !cfg!(test) {
-        let watchdog_stop = Arc::clone(&watchdog_stop);
-        std::thread::spawn(move || {
-            while !darkmux_types::interrupt::is_set() {
-                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            loop {
-                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
-    }
+    // (#3073-P3-4) Shared reap watchdog — bounded background thread that reaps
+    // children when an interrupt is observed.
+    let _watchdog_stop_guard = crate::launch_guard::spawn_reap_watchdog();
 
     // Real execution — start every real phase that has tasks, run the
     // scheduler against `registry` (built once, at the top of this function,
@@ -1235,30 +1242,7 @@ pub fn launch(
         None
     };
 
-    // (#1877 "no blind runs", contract 8) The run bookend, opened for EVERY
-    // config that reaches this point, whether its graph dispatches a model
-    // or only runs procedural/shell steps. Host samples are not this
-    // function's job: the one machine-scoped sampler writes them and a
-    // reader joins them to this run by `machine_uid` and time.
-    let mut run_sink = |record: flow::FlowRecord| {
-        let _ = flow::record(record);
-    };
-    let run_for_abort = run.clone();
-    let config_id_for_abort = config_id.to_string();
-    // The guard's Drop writes `run.error` for any exit between `open` and a
-    // matching `close` (contract 2: RAII on every exit path): an early
-    // `?`-return, or a panic. Every KNOWN exit below (the scheduler error,
-    // the coder-phase gate and the gate-less finish) closes it explicitly
-    // with the real outcome; Drop is the backstop for the unexpected case.
-    let mut bookend = flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
-        run_bookend_record(
-            flow::Edge::Error,
-            &config_id_for_abort,
-            &run_for_abort,
-            RunPayload::failed("run terminated before completion (early return or panic)"),
-        )
-    });
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+
     // (#2877, pre-PR review) The mission's own run session beats presence for
     // as long as the launch runs. Its executions beat only while a model call
     // is live, so during the steps between them (a summary, a mod wait, a test
@@ -1637,6 +1621,12 @@ pub fn launch(
         &seed_artifacts,
         );
         collect_degraded(&graph_result, &mut degraded_steps);
+        // (#3074) A pass that returned `Ok` while a signal was observed (the
+        // scheduler starts no wave after one, and an interrupted step is only
+        // Degraded) is still an interrupted run: it ends here, so no later
+        // phase starts, and closes through the error path below rather than
+        // as a completed one.
+        graph_result = fail_if_interrupted(graph_result);
         if graph_result.is_err() {
             break;
         }
@@ -1688,6 +1678,11 @@ pub fn launch(
     // mission to a terminal Error status BEFORE propagating the failure.
     // The failure is still surfaced to the caller (loud, non-zero exit); the
     // mission board just no longer lies about a dead run being active.
+    // (#3074) A signal that landed after the last pass returned (so no pass
+    // observed it) is still an interrupted run: it closes through this error
+    // path, never as `run.complete`.
+    wait_for_late_signal_probe();
+    graph_result = fail_if_interrupted(graph_result);
     if let Err(e) = graph_result {
         // (#1877) Explicit close, not the Drop backstop — a scheduler
         // error is a KNOWN outcome with real error text worth carrying,
@@ -1875,6 +1870,41 @@ pub fn launch(
     crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
 }
+
+/// (#3074) A graph pass that returned `Ok` while a signal was observed is
+/// still an interrupted run: it must close as an error, never as a completed
+/// one. An `Err` passes through untouched.
+fn fail_if_interrupted(
+    result: Result<crew::scheduler::SchedulerReport>,
+) -> Result<crew::scheduler::SchedulerReport> {
+    let report = result?;
+    crate::launch_guard::bail_if_operator_signal("mission launch observed a signal before finalizing")?;
+    Ok(report)
+}
+
+/// Test seam for a signal that lands after the last step has returned and
+/// before the run is closed. In a debug build, when
+/// `DARKMUX_TEST_SIGNAL_AFTER_STEPS` names a path, write `ready` there and
+/// wait until an operator signal is observed, or 30s. Compiled out of a
+/// release binary (#3074): an environment variable must not be able to hold
+/// a shipped launch or make it write to an arbitrary path.
+#[cfg(debug_assertions)]
+fn wait_for_late_signal_probe() {
+    let Ok(path) = std::env::var("DARKMUX_TEST_SIGNAL_AFTER_STEPS") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(&path, b"ready");
+    let started = std::time::Instant::now();
+    while !darkmux_types::interrupt::is_set() && started.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_late_signal_probe() {}
 
 /// (#2300) Expand every `grow` template a phase declares, from the output
 /// an EARLIER phase's producing task already wrote.
@@ -2693,14 +2723,34 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
     let real_phase_ids: BTreeMap<String, String> = derive_phase_ids(mission_id, config);
 
     let mission_path = crew::lifecycle::mission_path(mission_id);
-    if mission_path.exists() {
-        bail!(
-            "mission launch: run id `{mission_id}` already exists on disk — this should be \
-             impossible (run ids are minted uniquely per launch, never derived from inputs, \
-             see `mint_run_id`); if you're hitting this, it's either a genuine id collision or \
-             a re-run against a copied/restored `.darkmux` directory. Rename or remove the \
-             existing record and relaunch — implicit reuse/reopen was removed in #1503."
-        );
+    if let Some(parent) = mission_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // (#3074) Atomic claim with create_new(true) (O_EXCL) prevents two launches
+    // racing on the same id from both passing an exists() check.
+    #[cfg(unix)]
+    let claim_res = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&mission_path)
+    };
+    #[cfg(not(unix))]
+    let claim_res = std::fs::OpenOptions::new().write(true).create_new(true).open(&mission_path);
+
+    match claim_res {
+        Ok(file) => drop(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "mission launch: run id `{mission_id}` already exists on disk — this should be \
+                 impossible (run ids are minted uniquely per launch, never derived from inputs, \
+                 see `mint_run_id`); if you're hitting this, it's either a genuine id collision or \
+                 a re-run against a copied/restored `.darkmux` directory. Rename or remove the \
+                 existing record and relaunch — implicit reuse/reopen was removed in #1503."
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("claiming {}", mission_path.display()));
+        }
     }
 
     let now = now_unix();
@@ -2725,7 +2775,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         // RUNS_FLOW_SCAN_WINDOW_DAYS-bounded flow join.
         machine: crate::flow::resolve_machine_id(),
     };
-    crew::lifecycle::save_mission(&mission).context("persisting mission.json")?;
+    save_claimed_mission(&mission_path, || crew::lifecycle::save_mission(&mission))?;
 
     for phase in &config.phases {
         let real_id = &real_phase_ids[&phase.id];
@@ -2747,6 +2797,16 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
     .context("starting the newly-minted mission")?;
 
     Ok(real_phase_ids)
+}
+
+/// (#3087 review) Persist the mission over the zero-byte claim file. When the
+/// save fails, remove the claim: left behind, it is an empty `mission.json`
+/// that `reconcile_mint_failure`'s `exists()` guard would mistake for a minted
+/// mission, and a retry would read it as an id collision.
+fn save_claimed_mission(mission_path: &Path, save: impl FnOnce() -> Result<()>) -> Result<()> {
+    save().context("persisting mission.json").inspect_err(|_| {
+        let _ = std::fs::remove_file(mission_path);
+    })
 }
 
 /// Build the [`LaunchParams`] `mission_config::interpret` needs: every
@@ -4810,6 +4870,24 @@ mod tests {
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
+    /// (#3074) An `Ok` graph pass is turned into an interrupt error once a
+    /// signal was observed, and left alone before one. An `Err` is never
+    /// replaced.
+    #[test]
+    #[serial_test::serial]
+    fn fail_if_interrupted_turns_an_ok_pass_into_an_error_only_after_a_signal() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).is_ok());
+        darkmux_types::interrupt::raise_for_test();
+        let err = fail_if_interrupted(Ok(crew::scheduler::SchedulerReport::default())).unwrap_err();
+        assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
+        let own = fail_if_interrupted(Err(anyhow!("its own failure"))).unwrap_err();
+        assert_eq!(own.to_string(), "its own failure");
+        darkmux_types::interrupt::reset_for_test();
+    }
+
     // ─── #2914: a task never runs on the machine's utility model ───────
 
     fn staffed_task(id: &str, role_id: Option<&str>, profile_name: Option<&str>, step_ids: &[&str]) -> crew::types::Task {
@@ -4904,6 +4982,65 @@ mod tests {
             MissionStatus::Finalized,
             "a refused launch closes the minted mission; it must never stay Active with no terminal"
         );
+        drop(guard);
+    }
+
+    /// The `run.*` records the launch wrote, as `(action, payload error text)`.
+    fn run_bookends_written() -> Vec<(String, Option<String>)> {
+        read_all_flow_records()
+            .iter()
+            .filter(|r| is_run_bookend(r))
+            .map(|r| {
+                let action = r["action"].as_str().unwrap_or_default().to_string();
+                let text = r["payload"]["error"].as_str().map(str::to_string);
+                (action, text)
+            })
+            .collect()
+    }
+
+    /// (#3087 review) The post-mint refusal closes the run with `run.error`
+    /// carrying the REAL refusal text, not the Drop backstop's "run terminated
+    /// before completion". Before the explicit close the pair was still
+    /// `run.start` + `run.error`, but the text was the backstop's.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refusal_on_the_utility_model_closes_the_run_with_the_real_error() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("util-probe", UTIL_PROBE_CONFIG);
+        let registry_dir = TempDir::new().unwrap();
+        let pf = registry_dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},"default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+        )
+        .unwrap();
+        let err = launch("util-probe", None, &[format!("profiles={}", pf.display())], None).unwrap_err();
+
+        let written = run_bookends_written();
+        let actions: Vec<&str> = written.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(actions, ["run.start", "run.error"], "{written:?}");
+        let text = written[1].1.clone().unwrap_or_default();
+        assert!(text.contains("stub-util"), "run.error must carry the refusal text, got {text:?}");
+        assert!(text.contains(&err.to_string()), "run.error text is the launch's own error: {text:?} vs {err}");
+        assert!(!text.contains("terminated before completion"), "not the Drop backstop's text: {text:?}");
+        drop(guard);
+    }
+
+    /// (#3087 review) A freeform launch has no graph to drive: it mints, writes
+    /// the launch's own `run.start` + `run.complete` pair, and leaves the
+    /// MISSION Active for work by hand. The pair says the launch finished; it
+    /// is not a verdict on the mission (see the serve-side
+    /// `build_runs_3087_freeform_launch_bookends_do_not_complete_the_active_mission`).
+    #[test]
+    #[serial_test::serial]
+    fn freeform_launch_writes_a_run_pair_and_leaves_the_mission_active() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
+        assert_eq!(launch("freeform-test-mission", None, &[], None).unwrap(), 0);
+        let written = run_bookends_written();
+        let actions: Vec<&str> = written.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(actions, ["run.start", "run.complete"], "{written:?}");
+        assert_eq!(mission_status_on_disk(&single_mission_id()), MissionStatus::Active);
         drop(guard);
     }
 
@@ -7893,6 +8030,48 @@ mod tests {
         assert_eq!(phase_status_on_disk(mission_id, p1), PhaseStatus::Complete);
     }
 
+    /// (#3087 review) The claim is zero bytes until `save_mission` lands. A
+    /// failed save must not leave it behind.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_mission_save_removes_the_zero_byte_claim() {
+        let _guard = LaunchTestGuard::new();
+        let path = crew::lifecycle::mission_path("claim-cleanup-test");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let err = save_claimed_mission(&path, || anyhow::bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "the cause must survive: {err:#}");
+        assert!(!path.exists(), "the claim must not outlive a failed save");
+    }
+
+    /// (#3087 review) Two launches racing on ONE id: exactly one claims it,
+    /// the other bails with the collision error, and the winner's record is
+    /// intact. (The sequential collision test goes red when `create_new`
+    /// becomes `create`; this one is the race itself.)
+    #[test]
+    #[serial_test::serial]
+    fn two_concurrent_mints_of_one_id_claim_it_exactly_once() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        let gate = std::sync::Barrier::new(2);
+        let results: Vec<Result<BTreeMap<String, String>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        ensure_mission_and_phases_with_provenance("race-test", &config, None, None)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(wins, 1, "exactly one launch claims the id: {results:?}");
+        let loser = results.iter().find_map(|r| r.as_ref().err()).expect("one loser");
+        assert!(loser.to_string().contains("already exists"), "{loser}");
+        assert_eq!(mission_status_on_disk("race-test"), MissionStatus::Active);
+    }
+
     /// (#1504) The strand-accumulation gap: `ensure_mission_and_phases_with_
     /// provenance`'s own `?` in `launch()` had NO reconcile — a partial mint
     /// (mission.json written, a later phase save fails) would strand a
@@ -7931,8 +8110,13 @@ mod tests {
         assert_eq!(
             mission_status_on_disk(mission_id),
             MissionStatus::Finalized,
-            "a partial mint must reconcile to terminal — one fresh mission, terminal, never an \
-             accumulating Active row (#1504)"
+            "a partial mint must reconcile to a terminal — one fresh mission, never an accumulating \
+             Active row (#1504)"
+        );
+        assert_eq!(
+            crew::lifecycle::load_envelope(mission_id).unwrap().expect("envelope").status,
+            crew::envelope::MissionOutcomeStatus::Error,
+            "and it reads as an Error outcome, never Aborted (a human teardown, #3074)"
         );
     }
 

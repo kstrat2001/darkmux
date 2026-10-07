@@ -727,6 +727,16 @@ pub trait StepKind: Send + Sync {
         SessionScope::Step
     }
 
+    /// (#3074) Whether the scheduler may still start this kind after an
+    /// operator signal was observed. Defaults to `false`: once a signal
+    /// lands no new work starts. `true` ONLY for a record-only kind that
+    /// does no new work and exists to write down how the run ended (the crawl
+    /// summary reads `interrupted` from the unit steps' own text, #2588), so
+    /// that the record of an interrupted run is not lost with the run.
+    fn runs_after_interrupt(&self) -> bool {
+        false
+    }
+
     /// (#2394) What this step CONSUMES — the seat it claims. **Required:
     /// there is no default body, on purpose.** The compiler is the
     /// completeness check: a new `StepKind` cannot compile without saying

@@ -428,6 +428,22 @@ mod tests {
     // mutate — without the serial guard this can observe
     // resolve_honors_darkmux_home_override's tempdir root and fail the
     // `.darkmux` suffix assertion.
+    /// (#3081) A tilde-prefixed `DARKMUX_HOME` resolves to a path under the
+    /// home directory. `expand_tilde` must not call back into `resolve`,
+    /// which reads `DARKMUX_HOME` through `expand_tilde` (unbounded
+    /// recursion, a stack overflow that aborts the process).
+    #[serial_test::serial]
+    #[test]
+    fn tilde_prefixed_darkmux_home_resolves_without_recursing() {
+        let _clear_home = ClearDarkmuxHomeGuard::new();
+        let home = dirs::home_dir().expect("home dir");
+        for (value, tail) in [("~/.darkmux", ".darkmux"), ("~/.darkmux/alt", ".darkmux/alt")] {
+            unsafe { env::set_var("DARKMUX_HOME", value) };
+            let paths = resolve(ResolveScope::ForceUser);
+            assert_eq!(paths.root, home.join(tail), "DARKMUX_HOME={value}");
+        }
+    }
+
     #[serial_test::serial]
     #[test]
     fn resolve_force_user_uses_home() {

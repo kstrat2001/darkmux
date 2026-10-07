@@ -208,6 +208,24 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
     }
 }
 
+/// (#3073) Gate resolution blocks this thread for as long as the operator
+/// takes (a tty prompt, an ACP round trip), so a gated ready step waits one
+/// pass behind ungated ready siblings: it stays `Ready`, is recorded in
+/// `deferred`, and is asked on the next pass, where it joins the wave.
+///
+/// ONE pass, not until nothing ungated is left: held behind every ungated
+/// ready step, a gated step sitting beside a long independent chain would be
+/// asked only once the chain ended (gated a -> a2 beside b1 -> b2 -> b3 took
+/// five passes where three suffice). A pass with no ungated step asks every
+/// gated one at once, as before.
+fn ungated_first(ready_ids: Vec<String>, steps: &BTreeMap<String, Step>, deferred: &mut HashSet<String>) -> Vec<String> {
+    let is_ungated = |id: &String| steps.get(id).is_some_and(|s| s.gate.is_none());
+    if !ready_ids.iter().any(is_ungated) {
+        return ready_ids;
+    }
+    ready_ids.into_iter().filter(|id| is_ungated(id) || !deferred.insert(id.clone())).collect()
+}
+
 /// `true` iff `step` is ready to run: itself `Planned`, AND —
 /// - if it's the FIRST step of `task` (or `task.step_ids` doesn't list it
 ///   at all — defensive): every Task named in `task.depends_on` OR
@@ -527,6 +545,29 @@ pub struct SchedulerReport {
     pub step_records: Vec<StepRecord>,
 }
 
+/// The ids ready to run in the next wave. (#3074) Once a signal was observed
+/// only a kind that declares `runs_after_interrupt` (a record-only step that
+/// does no new work) is ready: the run ends without starting any other work, the
+/// steps still `Planned` stay `Planned` (the launcher's phase-exit sweep
+/// abandons them), and the launcher, which sees the same signal, closes the
+/// run as an error rather than a completed one.
+fn next_wave_ready_ids(
+    steps: &BTreeMap<String, Step>,
+    tasks: &BTreeMap<String, Task>,
+    kinds: &StepKindRegistry,
+) -> Vec<String> {
+    let interrupted = darkmux_types::interrupt::is_set();
+    steps
+        .values()
+        .filter(|s| !interrupted || kinds.get(&s.kind).is_ok_and(|k| k.runs_after_interrupt()))
+        .filter(|s| {
+            let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
+            step_is_ready(s, &task, tasks, steps)
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 /// Walk `steps` to completion: each iteration computes every currently-
 /// ready node, marks them `Running`, fans them out through Packet 1's
 /// `run_bounded` (one call = one wave — see the module doc's Residency
@@ -746,16 +787,10 @@ pub fn run_step_graph(
     }
 
     let bus = std::sync::Arc::new(bus);
+    let mut gate_deferred: HashSet<String> = HashSet::new();
 
     loop {
-        let ready_ids: Vec<String> = steps
-            .values()
-            .filter(|s| {
-                let task = tasks.get(&s.task_id).cloned().unwrap_or_else(|| synthetic_task(s));
-                step_is_ready(s, &task, tasks, steps)
-            })
-            .map(|s| s.id.clone())
-            .collect();
+        let ready_ids = next_wave_ready_ids(steps, tasks, kinds);
 
         if ready_ids.is_empty() {
             break;
@@ -775,6 +810,8 @@ pub fn run_step_graph(
         // "step error" flow record, same durable `persist` call, same
         // "downstream dependent never becomes ready" consequence via
         // `step_is_ready`/`task_status`.
+        // (#3073) A gated step waits one pass behind an ungated ready sibling.
+        let ready_ids = ungated_first(ready_ids, steps, &mut gate_deferred);
         let ready_ids: Vec<String> = {
             let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
             for id in ready_ids {
@@ -1271,6 +1308,7 @@ fn apply_step_terminal(
     flow_records: Vec<FlowRecord>,
     degraded: Option<String>,
 ) {
+    let more_steps_follow = later_step_planned(id, tasks, steps);
     let step = steps.get_mut(id).expect("id came from ready_ids itself");
     for record in flow_records {
         emit(record);
@@ -1308,7 +1346,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Complete;
             step.completed_ts = Some(at);
             step.output = Some(output);
-            emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete));
+            emit(step_complete_record(run, step, more_steps_follow));
             persist(step);
             report.completed.push(id.to_string());
             if let Some(reason) = degraded {
@@ -1790,6 +1828,33 @@ fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
             Category::Work,
             Stage::Dispatch,
             darkmux_flow::Payload::StepError(darkmux_flow::payload::StepErrorPayload::from_message(message)),
+            step.id.clone(),
+        )
+    }
+}
+
+/// Whether a step after `id` in its task is still planned.
+fn later_step_planned(id: &str, tasks: &BTreeMap<String, Task>, steps: &BTreeMap<String, Step>) -> bool {
+    let Some(task) = steps.get(id).and_then(|s| tasks.get(&s.task_id)) else { return false };
+    let Some(at) = task.step_ids.iter().position(|s| s == id) else { return false };
+    task.step_ids[at + 1..].iter().any(|s| steps.get(s).is_some_and(|s| s.status == NodeStatus::Planned))
+}
+
+/// The `step.complete` record. It says so when a later step of the task is still planned, so
+/// the task's session is not read as over between the two steps (#3074); the task's last step
+/// carries no payload.
+fn step_complete_record(run: &RunId, step: &Step, later_step_planned: bool) -> FlowRecord {
+    if !later_step_planned {
+        return step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete);
+    }
+    FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Info,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepComplete(darkmux_flow::payload::StepCompletePayload { later_step_planned: Some(true) }),
             step.id.clone(),
         )
     }
@@ -2451,6 +2516,34 @@ mod tests {
         assert!(step_is_ready(&step1, &task, &tasks, &steps));
     }
 
+    /// (#3074) A task's session reads Complete between step N's `step.complete`
+    /// and step N+1's `step.start`, so a step that is NOT the task's last says
+    /// so on its record; the last step's record carries no such mark.
+    #[test]
+    fn step_complete_names_a_later_planned_step_of_its_task() {
+        let (mut task, step0) = task_and_step("multi", &[]);
+        task.step_ids = vec!["multi-0".to_string(), "multi-1".to_string()];
+        let mut step0 = step0;
+        step0.id = "multi-0".to_string();
+        let mut step1 = step0.clone();
+        step1.id = "multi-1".to_string();
+        let (tasks, mut steps) = graph(vec![(task, step0)]);
+        steps.insert(step1.id.clone(), step1);
+        let kinds = StepKindRegistry::with_builtins();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        run_step_graph(
+            &crate::test_run(), &mut steps, &tasks, &kinds, &Facts::default(), &est, &mock_host_factory,
+            &mut |r| emitted.push(r), &mut |_step| {}, None, None, &[],
+        )
+        .unwrap();
+        let completes: Vec<&FlowRecord> =
+            emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::StepComplete).collect();
+        assert_eq!(completes.len(), 2, "both steps complete");
+        assert_eq!(completes[0].payload_json()["later_step_planned"], true, "step 0 has step 1 still planned");
+        assert!(completes[1].payload.is_none(), "the last step's record carries no mark");
+    }
+
     // ─── the output ledger (#1619 — `Task.reads`) ───────────────────
 
     /// `task_and_step` with `reads` instead of `depends_on`.
@@ -2789,6 +2882,24 @@ mod tests {
         .unwrap()
     }
 
+    /// (#3074) Once a signal was observed no further wave starts: the graph
+    /// returns with the ready step still `Planned` and nothing completed. (The
+    /// launcher, which sees the same signal, closes the run as an error.)
+    #[test]
+    #[serial_test::serial]
+    fn run_step_graph_starts_no_wave_after_a_signal() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let (task_a, step_a) = task_and_step("a", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::raise_for_test();
+        let report = run_test_graph(&tasks, &mut steps);
+        darkmux_types::interrupt::reset_for_test();
+        assert!(report.completed.is_empty(), "no step may complete after the signal: {report:?}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Planned, "no step may start after the signal");
+    }
+
     // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────
     //
     // `gate::resolve_gate` itself is unit-tested in `crate::gate`'s own
@@ -2863,6 +2974,132 @@ mod tests {
         assert_eq!(steps["a-step"].status, NodeStatus::Complete, "an approved gated step must still run");
         assert_eq!(report.completed, vec!["a-step".to_string()]);
         assert!(steps["a-step"].started_ts.is_some(), "an approved step actually ran (started_ts set)");
+    }
+
+    /// (#3073 P2) A gated sibling's operator dialog must not hold an ungated
+    /// step of the same wave: the ungated step finishes BEFORE the gate
+    /// handler is ever asked.
+    #[test]
+    fn an_ungated_ready_step_runs_before_a_gated_sibling_is_asked() {
+        use std::cell::RefCell;
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (task_b, step_b) = task_and_step("b", &[]);
+        let (tasks, mut steps) = graph(vec![(task_a, step_a), (task_b, step_b)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut handler = |s: &Step, _f: &BTreeMap<String, String>| {
+            log.borrow_mut().push(format!("gate:{}", s.id));
+            crate::gate::GateDecision::Approved
+        };
+        let mut persist = |s: &Step| {
+            if s.status == NodeStatus::Complete {
+                log.borrow_mut().push(format!("done:{}", s.id));
+            }
+        };
+        run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut persist,
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        let log = log.into_inner();
+        let pos = |needle: &str| log.iter().position(|e| e == needle).unwrap_or_else(|| panic!("{needle} in {log:?}"));
+        assert!(pos("done:b-step") < pos("gate:a-step"), "ungated b must finish before the gate is asked: {log:?}");
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete, "the gated step still runs once approved");
+    }
+
+    /// (#3073, review) A gated step waits behind ungated siblings for ONE pass, not behind
+    /// every independent ungated chain: gated a -> a2 beside ungated b1 -> b2 -> b3 is three
+    /// passes, as without the deferral, so the gate is asked on the pass after b1 (before b2
+    /// ran), not after b3.
+    #[test]
+    fn a_gated_step_is_deferred_by_one_pass_not_behind_an_independent_chain() {
+        use std::cell::RefCell;
+        let (task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        let (task_a2, step_a2) = task_and_step("a2", &["a"]);
+        let (task_b1, step_b1) = task_and_step("b1", &[]);
+        let (task_b2, step_b2) = task_and_step("b2", &["b1"]);
+        let (task_b3, step_b3) = task_and_step("b3", &["b2"]);
+        let (tasks, mut steps) = graph(vec![
+            (task_a, step_a),
+            (task_a2, step_a2),
+            (task_b1, step_b1),
+            (task_b2, step_b2),
+            (task_b3, step_b3),
+        ]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut handler = |s: &Step, _f: &BTreeMap<String, String>| {
+            log.borrow_mut().push(format!("gate:{}", s.id));
+            crate::gate::GateDecision::Approved
+        };
+        let mut persist = |s: &Step| {
+            if s.status == NodeStatus::Complete {
+                log.borrow_mut().push(format!("done:{}", s.id));
+            }
+        };
+        run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut persist,
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        let log = log.into_inner();
+        let pos = |needle: &str| log.iter().position(|e| e == needle).unwrap_or_else(|| panic!("{needle} in {log:?}"));
+        assert!(pos("done:b1-step") < pos("gate:a-step"), "the gated step still waits one pass: {log:?}");
+        assert!(pos("gate:a-step") < pos("done:b2-step"), "and is asked on the next pass, not after the chain: {log:?}");
+        assert_eq!(steps["a2-step"].status, NodeStatus::Complete);
+    }
+
+    /// (#3073) The deferral itself: a pass of only gated steps asks them all at once and
+    /// defers nothing; a mixed pass runs the ungated and defers each gated step once; the
+    /// next pass holds it no longer.
+    #[test]
+    fn ungated_first_defers_a_gated_step_once_and_only_beside_an_ungated_one() {
+        let (_, mut gated) = task_and_step("g", &[]);
+        gated.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        let (_, open) = task_and_step("u", &[]);
+        let steps: BTreeMap<String, Step> =
+            [(gated.id.clone(), gated), (open.id.clone(), open)].into_iter().collect();
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut deferred = HashSet::new();
+
+        assert_eq!(ungated_first(ids(&["g-step"]), &steps, &mut deferred), ids(&["g-step"]), "only gated: asked now");
+        assert!(deferred.is_empty(), "nothing was deferred");
+
+        assert_eq!(ungated_first(ids(&["g-step", "u-step"]), &steps, &mut deferred), ids(&["u-step"]), "mixed: ungated first");
+        assert!(deferred.contains("g-step"));
+
+        assert_eq!(
+            ungated_first(ids(&["g-step", "u-step"]), &steps, &mut deferred),
+            ids(&["g-step", "u-step"]),
+            "one pass later the gated step joins the wave"
+        );
     }
 
     /// (F9) A step that errors says why on its `step.error` record: the cause
@@ -3677,6 +3914,57 @@ mod tests {
             vec![DegradedStep { step_id: "a-step".to_string(), reason: "1 of 2 item(s) failed".to_string() }]
         );
         assert!(report.errored.is_empty());
+    }
+
+    /// A record-only kind that declares it still runs after a signal.
+    struct RecordOnlyKind;
+    impl StepKind for RecordOnlyKind {
+        fn seat(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> SeatClaim {
+            SeatClaim::NoModel
+        }
+        fn id(&self) -> &'static str {
+            "test.record_only"
+        }
+        fn runs_after_interrupt(&self) -> bool {
+            true
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "recorded".to_string(), flow_records: vec![], degraded: None })
+        }
+    }
+
+    /// (#3074) After a signal only a kind that declares `runs_after_interrupt`
+    /// still runs; an ordinary step beside it stays `Planned`.
+    #[test]
+    #[serial_test::serial]
+    fn a_record_only_kind_still_runs_after_a_signal_and_an_ordinary_one_does_not() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let (tr, sr) = kinded_step("rec", "test.record_only", json!({}), &[]);
+        let (tn, sn) = task_and_step("ord", &[]);
+        let (tasks, mut steps) = graph(vec![(tr, sr), (tn, sn)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(RecordOnlyKind)).unwrap();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::raise_for_test();
+        let run = run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &Facts::default(),
+            &FixedEstimator::default(),
+            &mock_host_factory,
+            &mut |_| {},
+            &mut |_step| {},
+            None,
+            None,
+            &[],
+        );
+        darkmux_types::interrupt::reset_for_test();
+        run.unwrap();
+        assert_eq!(steps["rec-step"].status, NodeStatus::Complete, "the record-only kind must still run");
+        assert_eq!(steps["ord-step"].status, NodeStatus::Planned, "an ordinary step must not start");
     }
 
     // ─── #1530 Packet 0: the run-scoped `ArtifactBus` ──────────────────

@@ -2538,6 +2538,8 @@
 
     #[test]
     fn tokens_match_is_exact() {
+        assert!(!tokens_match(b"abcd", b"abc")); // longer presented token (#3073)
+        assert!(tokens_match(b"", b""));
         assert!(tokens_match(b"abc", b"abc"));
         assert!(!tokens_match(b"abc", b"abd"));
         assert!(!tokens_match(b"abc", b"abcd")); // length differs
@@ -7988,6 +7990,8 @@ fn join_host_samples_scans_both_days_when_the_run_spans_midnight() {
 #[test]
 #[serial_test::serial]
 fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
+    // (#3100) It raises the process-wide interrupt flag.
+    darkmux_types::run_in_own_process!();
     darkmux_types::child_registry::reset_for_test();
     darkmux_types::interrupt::reset_for_test();
 

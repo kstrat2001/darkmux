@@ -3823,8 +3823,8 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// this test needs the process to still be alive when SIGTERM lands, not
 /// racing an unrelated early exit), waits for it to be observably
 /// running, sends a real SIGTERM, and asserts it exits within a bound at
-/// the documented exit code (130 — `reap_on_host_shutdown`'s own
-/// `std::process::exit(130)`, matching the mission-launch SIGTERM
+/// the documented exit code (143, 128 + SIGTERM: `reap_on_host_shutdown`'s own
+/// `std::process::exit(shutdown_exit_code(..))`, matching the mission-launch SIGTERM
 /// precedent's exit code elsewhere in this file).
 ///
 /// RED-PROVED by hand: commenting out the `tokio::spawn(host_shutdown_
@@ -3832,7 +3832,7 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// test fail — the process then has no signal handler installed at all,
 /// SIGTERM takes default disposition (process-terminated-by-signal, no
 /// exit code), and `exit_status.code()` reports `None` instead of
-/// `Some(130)`, so the process also never got the chance to reap
+/// `Some(143)`, so the process also never got the chance to reap
 /// anything it might have had in flight.
 ///
 /// **Retries, growing the pre-signal wait, rather than one fixed sleep.**
@@ -3849,7 +3849,7 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
 /// up-front) keeps the common case fast while still tolerating a
 /// once-in-a-while slow scheduling round without flaking outright.
 #[test]
-fn acp_sigterm_reaps_children_and_exits_130() {
+fn acp_sigterm_reaps_children_and_exits_143() {
     const WAITS_MS: [u64; 4] = [1_000, 3_000, 6_000, 10_000];
     let mut last_debug = String::new();
 
@@ -3897,7 +3897,7 @@ fn acp_sigterm_reaps_children_and_exits_130() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
-        if exit_status.code() == Some(130) {
+        if exit_status.code() == Some(143) {
             return; // PASS — the documented signal-handling contract held.
         }
 
@@ -3926,7 +3926,7 @@ fn acp_sigterm_reaps_children_and_exits_130() {
     }
 
     panic!(
-        "darkmux acp never reached its documented SIGTERM exit code (130) across {} attempts \
+        "darkmux acp never reached its documented SIGTERM exit code (143) across {} attempts \
          with growing pre-signal waits (up to {}ms) — this is no longer plausibly scheduling \
          noise. Last attempt: {last_debug}",
         WAITS_MS.len(),
@@ -4211,7 +4211,8 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
         }
     }
     let _child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    // (#3100) A hang guard sized for a loaded host, like the fleet daemon's.
+    wait_for_serve_health(port, FLEET_TEST_HANG_BOUND);
     let body = ureq::get(&format!("http://127.0.0.1:{port}/health")).call().unwrap().into_string().unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let soft = v["open_file_limit"].as_u64().expect("the daemon reports its open-file limit to loopback");
@@ -4243,9 +4244,11 @@ fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit()
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    // (#3100) Hang guards sized for a loaded host, like the fleet daemon's:
+    // each poll returns the moment the daemon answers.
+    wait_for_serve_health(port, FLEET_TEST_HANG_BOUND);
     let record = std::path::Path::new(&darkmux_home).join("run/daemon.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     while !record.exists() {
         assert!(std::time::Instant::now() < deadline, "the daemon never recorded where it bound");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4523,23 +4526,12 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
 }
 
-/// (#2678) `runtime.mission_wall_clock_timeout_seconds` (here set via its
-/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` env override) must stop a
-/// grinding `mission launch <generic-graph-config>` on ITS OWN, with NO
-/// external signal ever sent — the exact scenario #2678 exists for: a CI
-/// job's `timeout-minutes` killing the whole process tree with nothing
-/// rendered. Bound to an explicit deadline throughout (this test sends no
-/// real signal and starts no thread of its own that could hang the suite).
-///
-/// Distinguishes itself from
-/// `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
-/// (above) in the one place that matters: a REAL operator signal still
-/// finalizes `error`, but the run's OWN bound must finalize `degraded`
-/// with a reason naming the bound — an honest partial outcome the
-/// operator opted into, not a failure (darkmux describes, never
-/// adjudicates: it never asserts why the run was slow).
-#[test]
-fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
+/// Spawns `mission launch` on a one-step hanging-dispatch graph with
+/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` set to `bound_seconds` (#2678),
+/// returning the stub endpoint, the temp dirs and the child.
+fn spawn_wall_clock_launch(
+    bound_seconds: &str,
+) -> (HangingStubServer, TempDir, TempDir, std::process::Child) {
     let stub = HangingStubServer::start();
 
     let home = TempDir::new().unwrap();
@@ -4568,7 +4560,7 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
     }"#;
     fs::write(config_dir.join("wall-clock-generic-test.json"), config_json).unwrap();
 
-    let mut child = darkmux_std_cmd()
+    let child = darkmux_std_cmd()
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
@@ -4576,39 +4568,78 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         // stays fast, and deliberately shorter than `--timeout` below so
         // the WALL-CLOCK bound is what fires, not the per-dispatch
         // inactivity cap.
-        .env("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", "1")
+        .env("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", bound_seconds)
         .args(["mission", "launch", "wall-clock-generic-test", "--timeout", "60"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawning darkmux mission launch wall-clock-generic-test");
+    (stub, home, flows, child)
+}
 
-    assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the generic-graph dispatch never reached a dispatch call to the stub server within 20s"
-    );
+/// (#2678) `runtime.mission_wall_clock_timeout_seconds` (here set via its
+/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` env override) must stop a
+/// grinding `mission launch <generic-graph-config>` on ITS OWN, with NO
+/// external signal ever sent — the exact scenario #2678 exists for: a CI
+/// job's `timeout-minutes` killing the whole process tree with nothing
+/// rendered. Bound to an explicit deadline throughout (this test sends no
+/// real signal and starts no thread of its own that could hang the suite).
+///
+/// Distinguishes itself from
+/// `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
+/// (above) in the one place that matters: a REAL operator signal still
+/// finalizes `error`, but the run's OWN bound must finalize `degraded`
+/// with a reason naming the bound — an honest partial outcome the
+/// operator opted into, not a failure (darkmux describes, never
+/// adjudicates: it never asserts why the run was slow).
+#[test]
+fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
+    let (stub, home, flows, mut child) = spawn_wall_clock_launch("1");
 
-    // NO signal is ever sent here — the process must stop itself.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // NO signal is ever sent here: the process must stop itself. The 1s
+    // bound is measured from process start, so on a slow host it fires
+    // during the mint and no wave ever starts; on a fast one the step
+    // connects first. Either is a valid run for this test, so the wait is
+    // on the exit, and the connection is checked afterwards (#3074).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let exit_status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "mission launch did not self-terminate within 15s of its 1s wall-clock bound (#2678 regression)"
+            "mission launch did not self-terminate within 60s of its 1s wall-clock bound (#2678 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
 
-    assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
-        "no `curl` connection to the stub server was ever torn down — the wall-clock watchdog \
-         must reap it the same way a real signal's watchdog does (#2678 regression)"
-    );
+    let records = flow_actions(&flows);
+    let step_starts = records.iter().filter(|r| r["action"] == "step.start").count();
+    if stub.wait_for_a_connection(std::time::Duration::ZERO) {
+        assert!(
+            stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+            "no `curl` connection to the stub server was ever torn down: the wall-clock watchdog \
+             must reap it the same way a real signal's watchdog does (#2678 regression)"
+        );
+    } else {
+        assert_eq!(
+            step_starts, 0,
+            "the bound fired before any dispatch connected, so no wave may have started (#3074)"
+        );
+    }
 
     assert_no_surviving_remote_curl(child.id(), "wall-clock");
+
+    // (#3074) The bound is a Degraded outcome, not a failure: the whole-run
+    // bookend closes `run.complete` naming Degraded, never `run.error`.
+    let run_closes: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "run.complete" || r["action"] == "run.error")
+        .collect();
+    assert_eq!(run_closes.len(), 1, "exactly one terminal run record: {run_closes:#?}");
+    assert_eq!(run_closes[0]["action"], "run.complete", "{run_closes:#?}");
+    assert_eq!(run_closes[0]["payload"]["status"], "Degraded", "{run_closes:#?}");
 
     let missions_dir = home.path().join("missions");
     let mission_id = fs::read_dir(&missions_dir)
@@ -4641,6 +4672,64 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         mission_json["status"], "finalized",
         "a wall-clock-bound run must reach a terminal mission status, never stay active: {mission_json}"
     );
+}
+
+/// (#2678) The mid-dispatch half of the wall-clock bound. The 1s test above
+/// may fire before the stub is ever contacted (slow host), so it cannot pin the
+/// reap. Here the test first WAITS for the stub to see a connection, so the
+/// bound provably fires mid-dispatch: the watchdog must tear the `curl` down,
+/// and the run must still close `run.complete` Degraded.
+///
+/// (#3100) The bound is measured from process start, and the mint before the
+/// dispatch took more than 5s on a loaded host, so a 6s bound left the test at
+/// the host's mercy. The bound is now far above any realistic mint, and the
+/// wait for the connection runs until shortly before it: a run whose dispatch
+/// connects at all connects inside that window, and one that never connects
+/// still fails here rather than passing without the bound firing mid-dispatch.
+#[test]
+fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let (stub, _home, flows, mut child) = spawn_wall_clock_launch(&BOUND.as_secs().to_string());
+
+    assert!(
+        stub.wait_for_a_connection((BOUND - MARGIN).saturating_sub(started.elapsed())),
+        "the dispatch never connected within {:?} of a {BOUND:?} bound, so the bound cannot be \
+         shown to fire mid-dispatch",
+        BOUND - MARGIN
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the launch must still be running, blocked on the dispatch, when the stub sees it"
+    );
+    let deadline = std::time::Instant::now() + BOUND + std::time::Duration::from_secs(60);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mission launch did not self-terminate within 60s past its {BOUND:?} wall-clock bound (#2678 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "the `curl` connection opened mid-dispatch was never torn down: the wall-clock watchdog \
+         must reap it (#2678 regression)"
+    );
+    assert_no_surviving_remote_curl(child.id(), "wall-clock-mid-dispatch");
+
+    let records = flow_actions(&flows);
+    let closes: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "run.complete" || r["action"] == "run.error")
+        .collect();
+    assert_eq!(closes.len(), 1, "exactly one terminal run record: {closes:#?}");
+    assert_eq!(closes[0]["action"], "run.complete", "{closes:#?}");
+    assert_eq!(closes[0]["payload"]["status"], "Degraded", "{closes:#?}");
 }
 
 /// (#2262) `kill <pid>` (SIGTERM) on a plain `darkmux dispatch <role>`
@@ -4731,19 +4820,19 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted dispatch must not exit 0");
-    // (#2462) The terminal mission record is already durable by the time
+    // (#2462, #3073-P3-1) The terminal mission record is already durable by the time
     // `dispatch_as_crew_of_one::dispatch` returns its `Err` (asserted via
     // `mission_json["status"]` below) — `main.rs`'s `cmd_dispatch` then
     // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
-    // force-exits 130 (128 + SIGTERM's conventional 2), the SAME code
-    // `mission launch` already exits with on a caught signal. Before this
+    // force-exits 143 (128 + SIGTERM 15), the SAME code
+    // `mission launch` already exits with on a caught SIGTERM. Before this
     // fix, the `Err` just propagated up to the default error handler,
     // which exits 1 — indistinguishable from a real endpoint failure to
     // any wrapper script reading the exit code alone.
     assert_eq!(
         exit_status.code(),
-        Some(130),
-        "a signal-interrupted dispatch must exit 130 (like `mission launch`), not the generic \
+        Some(143),
+        "a signal-interrupted dispatch must exit 143 (like `mission launch`), not the generic \
          error code 1 — a wrapper script can't otherwise tell an operator's Ctrl-C from a real \
          failure: {exit_status:?}"
     );
@@ -4907,18 +4996,18 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert!(!exit_status.success(), "a signal-interrupted lab run must not exit 0");
-    // (#2462) `lab_run`'s own `lifecycle.json` terminal write is already
+    // (#2462, #3073-P3-1) `lab_run`'s own `lifecycle.json` terminal write is already
     // durable by the time it returns its `Err` (asserted via
     // `lifecycle_json["status"]` below) — `lab_cli.rs`'s `cmd_lab` then
     // calls `launch_guard::reap_and_exit_on_signal()` on that `Err`, which
-    // force-exits 130, the SAME code `mission launch`/`dispatch` exit with
-    // on a caught signal. Before this fix the `Err` just propagated to the
+    // force-exits 143 (128 + SIGTERM 15), the SAME code `mission launch`/`dispatch` exit with
+    // on a caught SIGTERM. Before this fix the `Err` just propagated to the
     // default error handler (exit 1) — indistinguishable from a real
     // failure to any wrapper script reading the exit code alone.
     assert_eq!(
         exit_status.code(),
-        Some(130),
-        "a signal-interrupted lab run must exit 130, not the generic error code 1 — a wrapper \
+        Some(143),
+        "a signal-interrupted lab run must exit 143, not the generic error code 1 — a wrapper \
          script can't otherwise tell an operator's Ctrl-C from a real failure: {exit_status:?}"
     );
 
@@ -13155,7 +13244,7 @@ fn lab_verbs_exit_130_on_sigterm_mid_dispatch() {
         };
         assert_eq!(
             status.code(),
-            Some(130),
+            Some(143),
             "{verb:?}: {}",
             fs::read_to_string(&stderr_path).unwrap_or_default()
         );
@@ -13542,4 +13631,137 @@ fn sink_banners_stay_out_of_a_terminal_but_not_out_of_logs() {
     assert!(!screen.contains("AuditFileSink enabled"), "a terminal gets no banner: {screen}");
     let screen = stderr_on_a_pty(build(&["--verbose"]));
     assert!(screen.contains("flow: AuditFileSink enabled"), "--verbose restores it: {screen}");
+}
+
+// ── (#3074) An interrupted launch never closes as a success ──────────────
+
+/// A real SIGINT lands while phase one's shell step runs. The run must end
+/// as an error (never `run.complete`), phase two must never start (its
+/// marker file stays absent), and the process exits 130.
+#[test]
+#[cfg(unix)]
+fn mission_launch_sigint_closes_the_run_as_an_error_and_starts_no_later_phase() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let marker = home.path().join("phase-two-ran");
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = format!(
+        r#"{{
+        "id": "sigint-test", "name": "Sigint Test", "schema_version": "3.2",
+        "phases": [
+          {{"id": "one", "tasks": [{{"id": "t1", "steps": [{{"id": "s1", "kind": "procedural.shell", "config": {{"command": "sleep 30"}}}}]}}]}},
+          {{"id": "two", "tasks": [{{"id": "t2", "steps": [{{"id": "s2", "kind": "procedural.shell", "config": {{"command": "touch {marker}"}}}}]}}]}}
+        ]
+    }}"#,
+        marker = marker.display()
+    );
+    fs::write(config_dir.join("sigint-test.json"), config).unwrap();
+
+    let mut child = darkmux_std_cmd();
+    let mut child = child
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "sigint-test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait until phase one's step is actually running before signaling.
+    let started = std::time::Instant::now();
+    while !flow_actions(&flows).iter().any(|r| r["action"] == "step.start") {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the step never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exit = child.wait().unwrap();
+
+    assert_eq!(exit.code(), Some(130), "exit: {exit:?}");
+    assert!(!marker.exists(), "phase two must not start after the signal");
+    let actions: Vec<String> =
+        flow_actions(&flows).iter().filter_map(|r| r["action"].as_str().map(str::to_string)).collect();
+    let step_starts = actions.iter().filter(|a| *a == "step.start").count();
+    assert_eq!(step_starts, 1, "no step may start after the signal: {actions:?}");
+    assert!(actions.iter().any(|a| a == "run.error"), "expected run.error in {actions:?}");
+    assert!(!actions.iter().any(|a| a == "run.complete"), "an interrupted run must not complete: {actions:?}");
+}
+
+/// (#3074) A signal that lands just AFTER the only step exited 0 is still an
+/// interrupted run: it must close `run.error`, never `run.complete`. The
+/// launcher pauses at that window when `DARKMUX_TEST_SIGNAL_AFTER_STEPS`
+/// names a path, so the signal is delivered there rather than racing the
+/// process exit.
+#[test]
+#[cfg(unix)]
+// The seam this drives is compiled out of a release binary (#3074).
+#[cfg(debug_assertions)]
+fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let ready = home.path().join("signal-ready");
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "late-signal-test",
+        "name": "Late Signal Test",
+        "schema_version": "3.2",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "procedural.shell",
+                    "config": { "command": "true" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("late-signal-test.json"), config_json).unwrap();
+
+    let mut child = darkmux_std_cmd();
+    let mut child = child
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_TEST_SIGNAL_AFTER_STEPS", &ready)
+        .args(["mission", "launch", "late-signal-test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the close window never opened");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = std::process::Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap();
+    assert!(status.success());
+    let exit = child.wait().unwrap();
+    assert_eq!(exit.code(), Some(130), "exit: {exit:?}");
+
+    let mut all = String::new();
+    for e in walkdir_files(flows.path()) {
+        all.push_str(&fs::read_to_string(e).unwrap_or_default());
+    }
+    assert!(all.contains("\"run.error\""), "the interrupted run must close run.error: {all}");
+    assert!(!all.contains("\"run.complete\""), "an interrupted run must never close run.complete");
+}
+
+fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walkdir_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }

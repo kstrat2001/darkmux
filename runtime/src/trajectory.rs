@@ -89,6 +89,14 @@ pub fn runtime_dir() -> std::path::PathBuf {
     std::path::Path::new(RUNTIME_OUT_BASE).join(dt::TRAJECTORY_SUBDIR)
 }
 
+/// What a compaction installed: the summary's length, and whether the
+/// compactor's reply had to be lexically repaired first (#3074).
+#[derive(Debug, Clone, Copy)]
+pub struct InstalledSummary {
+    pub summary_chars: usize,
+    pub lexically_repaired: bool,
+}
+
 /// Trajectory recorder. Open at dispatch start; methods append events as
 /// they occur.
 pub struct Trajectory {
@@ -1135,10 +1143,11 @@ impl Trajectory {
         generation: u32,
         before_message_count: usize,
         after_message_count: usize,
-        summary_chars: usize,
+        installed: InstalledSummary,
         tokens_before: u32,
         tokens_after: u32,
     ) {
+        let InstalledSummary { summary_chars, lexically_repaired } = installed;
         self.write_event(dt::TrajectoryEvent::Compaction(dt::Compaction {
             generation: u64::from(generation),
             ts: unix_ms(),
@@ -1147,6 +1156,7 @@ impl Trajectory {
             summary_chars: summary_chars as u64,
             tokens_before: Some(u64::from(tokens_before)),
             tokens_after: Some(u64::from(tokens_after)),
+            lexically_repaired,
         }));
     }
 

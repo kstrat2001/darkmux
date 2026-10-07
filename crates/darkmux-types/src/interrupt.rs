@@ -55,9 +55,12 @@
 //! process, and darkmux's CLI is one-shot-per-invocation, so that
 //! limitation costs nothing today.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// (#3073-P3-1) The last OS signal received, or 0 if none.
+static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 /// How many SIGINTs this process has received since [`install`]. Exists
 /// purely to drive the second-signal escape hatch below — nothing reads
@@ -83,6 +86,7 @@ static SIGHUP_COUNT: AtomicU32 = AtomicU32::new(0);
 /// would forbid (`signal(2)` itself is on POSIX's async-signal-safe list).
 fn deliver(signum: libc::c_int, count: &AtomicU32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
+    LAST_SIGNAL.store(signum, Ordering::SeqCst);
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
     if n >= 2 {
         // (#1959 merge-gate finding 13) A caller that never polls `is_set`
@@ -160,11 +164,36 @@ pub fn install_hup() {
 /// its own; `mission_launch` reads it to tell the two apart.
 pub const INTERRUPTED_BY_SIGNAL: &str = "interrupted by an operator signal";
 
+/// (#3074) The launch-boundary guard: `Err` naming `context` once a signal
+/// has been observed, `Ok` otherwise. Called before each scheduler wave, each
+/// spawn and the launcher's finalize, so a run that was interrupted never
+/// starts more work and never closes as a success. The error carries
+/// [`INTERRUPTED_BY_SIGNAL`], the marker `mission_launch` already reads to
+/// tell an interrupted step from one that failed for its own reason.
+pub fn bail_if_set(context: &str) -> anyhow::Result<()> {
+    if is_set() {
+        anyhow::bail!("{INTERRUPTED_BY_SIGNAL}: {context}");
+    }
+    Ok(())
+}
+
 /// Whether SIGINT, SIGTERM, or SIGHUP has been received since [`install`]/
 /// [`install_term`]/[`install_hup`] was called. Never resets — see the
 /// module doc.
 pub fn is_set() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// (#3073-P3-1) The OS signal number that triggered the interrupt, if a real (or simulated)
+/// signal was received. Returns `None` if interrupted by `mark_interrupted`
+/// without an OS signal.
+pub fn received_signal() -> Option<i32> {
+    let s = LAST_SIGNAL.load(Ordering::SeqCst);
+    if s != 0 {
+        Some(s)
+    } else {
+        None
+    }
 }
 
 /// (#2476) Set [`INTERRUPTED`] directly, WITHOUT installing (or touching)
@@ -211,13 +240,36 @@ pub fn mark_interrupted() {
 /// feature on its dev-dependency to reach this.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sigint_for_test() {
+    assert_own_process();
     on_sigint(libc::SIGINT);
+}
+
+/// (#3100) Test-only: raise the flag the way [`mark_interrupted`] does, from
+/// a test that runs in a process of its own. The flag is read by code every
+/// other test in a shared `cargo test` process runs (the scheduler starts no
+/// wave once it is set), so a test raising it there fails its neighbors.
+#[cfg(any(test, feature = "test-support"))]
+pub fn raise_for_test() {
+    assert_own_process();
+    mark_interrupted();
+}
+
+/// (#3100) The guard every test-only raiser runs: refuse to raise the
+/// process-wide flag where other tests share the process.
+#[cfg(any(test, feature = "test-support"))]
+fn assert_own_process() {
+    assert!(
+        crate::test_isolation::is_own_process(),
+        "a test that raises the process-wide interrupt flag must run in a process of its own: \
+         start it with `darkmux_types::run_in_own_process!();` (#3100)"
+    );
 }
 
 /// (#2124) Test-only: deliver a simulated SIGTERM the same way
 /// [`simulate_sigint_for_test`] delivers a simulated SIGINT.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sigterm_for_test() {
+    assert_own_process();
     on_sigterm(libc::SIGTERM);
 }
 
@@ -225,6 +277,7 @@ pub fn simulate_sigterm_for_test() {
 /// [`simulate_sigint_for_test`] delivers a simulated SIGINT.
 #[cfg(any(test, feature = "test-support"))]
 pub fn simulate_sighup_for_test() {
+    assert_own_process();
     on_sighup(libc::SIGHUP);
 }
 
@@ -238,6 +291,7 @@ pub fn simulate_sighup_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     INTERRUPTED.store(false, Ordering::SeqCst);
+    LAST_SIGNAL.store(0, Ordering::SeqCst);
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
@@ -278,6 +332,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn is_set_reflects_a_raised_flag() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         // Reset for test isolation — other tests in this binary may have
         // already set the process-wide flag via a real SIGINT delivery
         // (there won't be one in CI, but the store is here for hygiene).
@@ -286,6 +342,21 @@ mod tests {
         on_sigint(libc::SIGINT);
         assert!(is_set());
         INTERRUPTED.store(false, Ordering::SeqCst);
+    }
+
+    /// (#3074) `bail_if_set` is `Ok` before a signal and an `Err` carrying
+    /// the interrupt marker and the caller's context after one.
+    #[test]
+    #[serial_test::serial]
+    fn bail_if_set_errs_with_the_marker_once_interrupted() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
+        reset_for_test();
+        assert!(bail_if_set("before wave").is_ok());
+        mark_interrupted();
+        let err = bail_if_set("before wave").unwrap_err().to_string();
+        assert!(err.contains(INTERRUPTED_BY_SIGNAL) && err.contains("before wave"), "{err}");
+        reset_for_test();
     }
 
     /// (#2476) `mark_interrupted` sets the SAME flag a real signal sets,
@@ -299,6 +370,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn mark_interrupted_sets_the_flag_without_touching_sigint_disposition() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         INTERRUPTED.store(false, Ordering::SeqCst);
         let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
         assert_eq!(before, libc::SIG_DFL, "SIGINT must already be at its default disposition before this test runs");
@@ -329,6 +402,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn second_sigint_restores_default_disposition_so_a_third_ctrl_c_kills_normally() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
         INTERRUPTED.store(false, Ordering::SeqCst);
         SIGINT_COUNT.store(0, Ordering::SeqCst);
         install();
@@ -355,5 +430,26 @@ mod tests {
         // Leave shared state clean for whichever test runs next.
         INTERRUPTED.store(false, Ordering::SeqCst);
         SIGINT_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn signal_handlers_record_received_signal_number() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
+        reset_for_test();
+        assert_eq!(received_signal(), None);
+
+        on_sigint(libc::SIGINT);
+        assert_eq!(received_signal(), Some(libc::SIGINT));
+
+        on_sigterm(libc::SIGTERM);
+        assert_eq!(received_signal(), Some(libc::SIGTERM));
+
+        on_sighup(libc::SIGHUP);
+        assert_eq!(received_signal(), Some(libc::SIGHUP));
+
+        reset_for_test();
+        assert_eq!(received_signal(), None);
     }
 }

@@ -170,6 +170,7 @@ pub fn run() -> DoctorReport {
         check_removed_radio_router_staffing(),
         check_renamed_budget_settings(),
         check_role_skill_references(),
+        check_inactivity_timeout(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -835,9 +836,14 @@ fn build_state_file_permissions_check(roots: &[ScanRoot], budget: usize) -> Chec
     }
 
     if violations == 0 {
+        let status = if truncated.is_empty() {
+            Status::Pass
+        } else {
+            Status::Warn
+        };
         return Check {
             name: STATE_FILE_PERMS_CHECK_NAME.into(),
-            status: Status::Pass,
+            status,
             message: format!(
                 "{checked} darkmux state file(s) checked; none are group- or world-readable{suffix}"
             ),
@@ -1243,25 +1249,23 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
     let Some(profile) = role_binding else {
         return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
     };
+    let paths = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
     Check {
         name,
         status: Status::Warn,
-        // (C6) No CLI removes a `role_profiles` binding (`config set`
-        // refuses a blank value like any other, and there is no `config
-        // unset`), so this is a hand edit, the way every other removed key's
-        // check says: name the file and the block.
         message: format!(
             "config.json binds `role_profiles.radio-router` to `{profile}`: the router has no profile; \
-             delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
+             delete the `radio-router` entry from the `role_profiles` block in {} by hand",
+            home_display(&paths.config)
         ),
-        hint: Some(
+        hint: Some(format!(
             "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
-             `internal.utility` in ~/.darkmux/profiles.json (with its `n_ctx`), never on a profile. \
+             `internal.utility` in {} (with its `n_ctx`), never on a profile. \
              This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
-             `role_profiles.radio-host`."
-                .into(),
-        ),
+             `role_profiles.radio-host`.",
+            home_display(&paths.profiles)
+        )),
     }
 }
 
@@ -1359,8 +1363,8 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
 /// `LoadedModel.context` against the declared `n_ctx` if that shape shows
 /// up in practice.
 fn check_unreachable_darkmux_residents() -> Check {
-    let registry = match darkmux_profiles::profiles::load_registry(None) {
-        Ok(r) => r.registry,
+    let (registry, registry_path) = match darkmux_profiles::profiles::load_registry(None) {
+        Ok(r) => (r.registry, r.path),
         Err(_) => {
             return Check {
                 name: "unreachable residents".into(),
@@ -1381,7 +1385,7 @@ fn check_unreachable_darkmux_residents() -> Check {
             };
         }
     };
-    unreachable_residents_status(&loaded, &registry)
+    unreachable_residents_status(&loaded, &registry, &registry_path)
 }
 
 /// Pure decision for [`check_unreachable_darkmux_residents`], split out so
@@ -1390,6 +1394,7 @@ fn check_unreachable_darkmux_residents() -> Check {
 fn unreachable_residents_status(
     loaded: &[darkmux_types::LoadedModel],
     registry: &darkmux_types::ProfileRegistry,
+    registry_path: &std::path::Path,
 ) -> Check {
     let name = "unreachable residents".to_string();
 
@@ -1461,7 +1466,8 @@ fn unreachable_residents_status(
             unreachable.join(", ")
         ),
         hint: Some(format!(
-            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (a doctor run in a project directory can be reading a different profiles.json than a dispatch run elsewhere — local `.darkmux.json`/`.darkmux/profiles.json` take precedence over `~/.darkmux/profiles.json`). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (this registry was loaded from {}). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            home_display(registry_path),
             unreachable[0],
             quarantine_note
         )),
@@ -2445,6 +2451,32 @@ fn check_step_command_timeout() -> Check {
     }
 }
 
+/// (#3074) Informational: the per-dispatch inactivity budget, resolved, with
+/// the tier that set it. `0` is UNBOUNDED (no watchdog deadline, no soft
+/// warning), the reading every darkmux zero-knob has; it used to kill the
+/// container on the first poll, so the row says which one the operator got.
+fn check_inactivity_timeout() -> Check {
+    let name = "runtime.inactivity_timeout_seconds";
+    let (seconds, source) = darkmux_types::config_access::inactivity_timeout_seconds_with_source();
+    let provenance = match source {
+        darkmux_types::config_access::Source::Env => "from DARKMUX_INACTIVITY_TIMEOUT_SECONDS env",
+        darkmux_types::config_access::Source::Config => "from config.json",
+        darkmux_types::config_access::Source::BuiltIn => "default",
+    };
+    let message = if seconds == 0 {
+        format!(
+            "0s ({provenance}) — unbounded; a dispatch runs until it finishes or darkmux is \
+             interrupted, and the runtime sends no inactivity warning"
+        )
+    } else {
+        format!(
+            "{seconds}s ({provenance}) — a dispatch with no proof-of-work signal for this long \
+             is killed by the host watchdog"
+        )
+    };
+    Check { name: name.into(), status: Status::Pass, message, hint: None }
+}
+
 /// (#2394) Informational: how many DISPATCH-FREE steps the scheduler runs
 /// at once — every step whose `StepKind::seat` claims `SeatClaim::NoModel`
 /// (`procedural.shell`, `procedural.noop`, `mods.gate`, `records.gather`,
@@ -2710,7 +2742,9 @@ fn check_turn_delay() -> Check {
             hint: None,
         };
     }
-    if ms.saturating_mul(2) >= timeout_ms {
+    // (#3074) `timeout_ms == 0` is an unbounded inactivity timeout: there is
+    // no deadline for a rest to approach, and the runtime does not clamp.
+    if timeout_ms != 0 && ms.saturating_mul(2) >= timeout_ms {
         let clamped = timeout_ms / 2;
         return Check {
             name: name.into(),
@@ -3135,7 +3169,8 @@ fn check_generation_checkpoint_interval() -> Check {
     }
     let inactivity_timeout_seconds = darkmux_types::config_access::inactivity_timeout_seconds();
     let seconds_to_generate = tokens as f64 / CONSERVATIVE_TOKENS_PER_SECOND;
-    if seconds_to_generate >= inactivity_timeout_seconds as f64 {
+    // (#3074) `0` is unbounded: no budget for a generation to outlast.
+    if inactivity_timeout_seconds != 0 && seconds_to_generate >= inactivity_timeout_seconds as f64 {
         let approx_seconds = seconds_to_generate.round() as u64;
         return Check {
             name: name.into(),
@@ -4342,6 +4377,13 @@ fn check_crew_role_prompt_coverage() -> Check {
         .into_iter()
         .filter(|id| !prompts.contains(id))
         .collect();
+    role_prompt_coverage_status(&missing)
+}
+
+/// Pure decision for [`check_crew_role_prompt_coverage`], split out so the
+/// missing-prompt arm (and its hint) is testable while every shipped prompt
+/// is present (#3081).
+fn role_prompt_coverage_status(missing: &[&str]) -> Check {
     if missing.is_empty() {
         Check {
             name: "crew role prompt coverage".into(),
@@ -4362,13 +4404,24 @@ fn check_crew_role_prompt_coverage() -> Check {
                 "{} role manifest(s) ship without `.md` prompts and cannot be dispatched: {list}",
                 missing.len()
             ),
-            hint: Some(
+            hint: Some(format!(
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
-                 add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
-                 override at `~/.darkmux/roles/<id>.md`."
-                    .into(),
-            ),
+                 add them to `BUILTIN_ROLE_PROMPTS` in `crates/darkmux-crew/src/loader.rs`. Operators can \
+                 override at `{}/<id>.md`.",
+                home_display(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles"))
+            )),
         }
+    }
+}
+
+/// A path for operator-facing text: the home prefix prints as `~` so doctor
+/// output pasted into an issue does not carry the account name (#3081). The
+/// resolved location is unchanged, and a path outside home prints in full.
+fn home_display(path: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -6850,9 +6903,8 @@ fn pick_active_profile<'a>(
     Some(matches[0])
 }
 
-fn check_platform_and_provider() -> Check {
-    let hw = hardware::detect();
-    let provider = heuristics::active_provider(&hw);
+fn platform_and_provider_status(hw: &hardware::HardwareSpec) -> Check {
+    let provider = heuristics::active_provider(hw);
     let summary = hw.one_line_summary();
     // Pass when a non-generic provider claims the hardware (i.e. we have
     // validated rules for it). Warn when only generic matched — heuristics
@@ -6882,8 +6934,12 @@ fn check_platform_and_provider() -> Check {
     }
 }
 
-fn check_power_state() -> Check {
-    match read_power_source() {
+fn check_platform_and_provider() -> Check {
+    platform_and_provider_status(&hardware::detect())
+}
+
+fn power_state_status(source: Option<PowerSource>, is_macos: bool) -> Check {
+    match source {
         Some(PowerSource::Ac) => Check {
             name: "power state".into(),
             status: Status::Pass,
@@ -6900,13 +6956,28 @@ fn check_power_state() -> Check {
                     .into(),
             ),
         },
-        None => Check {
-            name: "power state".into(),
-            status: Status::Pass,
-            message: "n/a (non-Apple Silicon? skipping)".into(),
-            hint: None,
-        },
+        None => {
+            if is_macos {
+                Check {
+                    name: "power state".into(),
+                    status: Status::Warn,
+                    message: "could not read power source (`pmset -g batt` returned no status)".into(),
+                    hint: Some("Check pmset permissions or power management daemon.".into()),
+                }
+            } else {
+                Check {
+                    name: "power state".into(),
+                    status: Status::Pass,
+                    message: "n/a (non-Apple Silicon? skipping)".into(),
+                    hint: None,
+                }
+            }
+        }
     }
+}
+
+fn check_power_state() -> Check {
+    power_state_status(read_power_source(), cfg!(target_os = "macos"))
 }
 
 /// Name of the mission-envelope readability check (#1881).
@@ -8612,6 +8683,78 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("unbounded"), "{}", check.message);
         assert!(!check.message.contains("killed at this bound"), "the old reading must be gone: {}", check.message);
+    }
+
+    // ─── (#3074) inactivity timeout: 0 is unbounded, and doctor says so ───
+
+    /// Scopes `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (and optionally another
+    /// variable) around one closure, restoring both afterward.
+    fn with_inactivity_env<T>(inactivity: Option<&str>, other: Option<(&str, &str)>, f: impl FnOnce() -> T) -> T {
+        let k = "DARKMUX_INACTIVITY_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        let prev_other = other.map(|(name, _)| (name, std::env::var(name).ok()));
+        unsafe {
+            match inactivity {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+            if let Some((name, v)) = other {
+                std::env::set_var(name, v);
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+            if let Some((name, prev)) = prev_other {
+                match prev {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        out
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_inactivity_timeout_zero_is_pass_and_says_unbounded() {
+        let check = with_inactivity_env(Some("0"), None, check_inactivity_timeout);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("unbounded") && check.message.contains("env"), "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_inactivity_timeout_names_the_value_and_its_provenance() {
+        let default = with_inactivity_env(None, None, check_inactivity_timeout);
+        assert!(default.message.contains("600s") && default.message.contains("default"), "{}", default.message);
+        let env = with_inactivity_env(Some("45"), None, check_inactivity_timeout);
+        assert!(env.message.contains("45s") && env.message.contains("env"), "{}", env.message);
+    }
+
+    /// With no deadline there is nothing for a rest to approach, so the
+    /// "at or above half the inactivity timeout" warning must stay quiet.
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_does_not_warn_against_an_unbounded_inactivity_timeout() {
+        let check = with_inactivity_env(Some("0"), Some(("DARKMUX_TURN_DELAY_MS", "3000")), check_turn_delay);
+        unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_does_not_warn_against_an_unbounded_inactivity_timeout() {
+        let check = with_inactivity_env(
+            Some("0"),
+            Some(("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "6000")),
+            check_generation_checkpoint_interval,
+        );
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL") };
+        assert_ne!(check.status, Status::Warn, "{}", check.message);
     }
 
     /// The middle tier the siblings above have no test for: the check sees
@@ -11608,8 +11751,10 @@ mod tests {
         // `run()`: the root crate appends it with the full step-kind catalog.
         //
         // (5.0) 69: `machine_uid_check` joined beside the machine_id row.
+        //
+        // (#3074) 66: `check_inactivity_timeout` joined beside the step-command row.
         let expected =
-            65 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -12016,6 +12161,7 @@ mod tests {
         // Budget smaller than the file count — the scan must stop early and
         // say it did not finish, rather than silently claiming a clean sweep.
         let check = build_state_file_permissions_check(&roots, 3);
+        assert_eq!(check.status, Status::Warn, "truncated scan must report Warn, not Pass");
         assert!(
             check.message.contains("budget") && check.message.contains("findings"),
             "must name the cost bound it hit: {}",
@@ -12103,6 +12249,37 @@ mod tests {
             "and a symlink must not be counted as a file that WAS checked: {}",
             check.message
         );
+    }
+
+    #[test]
+    fn power_state_warns_on_macos_when_read_fails() {
+        let check = power_state_status(None, true);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("could not read power source"));
+    }
+
+    #[test]
+    fn power_state_skips_on_non_macos_when_read_fails() {
+        let check = power_state_status(None, false);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("non-Apple Silicon"));
+    }
+
+    #[test]
+    fn platform_and_provider_warns_when_ram_is_unknown() {
+        let hw = darkmux_hardware::HardwareSpec {
+            platform: darkmux_hardware::Platform::AppleSilicon,
+            arch: "aarch64".into(),
+            total_ram_gb: 0,
+            physical_cores: 8,
+            performance_cores: None,
+            efficiency_cores: None,
+            has_unified_memory: true,
+        };
+        let check = platform_and_provider_status(&hw);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("unknown RAM"), "got: {}", check.message);
+        assert!(check.message.contains("generic"), "got: {}", check.message);
     }
 
     /// (#2411/#2450-class regression guard) The production check must
@@ -12581,8 +12758,45 @@ mod tests {
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
         let c = super::removed_radio_router_staffing_status(Some("radio"));
-        assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
+        let expected_config = super::home_display(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config);
+        assert!(c.message.contains(&expected_config), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
+    }
+
+    #[test]
+    fn crew_role_prompt_coverage_hint_points_to_correct_loader_and_roles_dir() {
+        let c = super::role_prompt_coverage_status(&["analyst"]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("`analyst`"), "{}", c.message);
+        let hint = c.hint.expect("a missing prompt carries a hint");
+        assert!(hint.contains("crates/darkmux-crew/src/loader.rs"), "loader path: {hint}");
+        assert!(!hint.contains("src/crew/loader.rs"), "stale loader path: {hint}");
+        let expected_roles = super::home_display(
+            &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("roles"),
+        );
+        assert!(hint.contains(&expected_roles), "roles dir: {hint}");
+        assert_eq!(super::role_prompt_coverage_status(&[]).status, Status::Pass);
+    }
+
+    /// (#3081) Doctor output gets pasted into issues: the home prefix prints
+    /// as `~`, a path outside home prints in full.
+    #[test]
+    fn home_display_prints_the_home_prefix_as_a_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(super::home_display(&home.join(".darkmux/profiles.json")), "~/.darkmux/profiles.json");
+        assert_eq!(super::home_display(&home), "~");
+        assert_eq!(super::home_display(std::path::Path::new("/srv/darkmux/profiles.json")), "/srv/darkmux/profiles.json");
+    }
+
+    /// (#3081) The unreachable-residents hint names the registry that was
+    /// actually loaded, not the default user location.
+    #[test]
+    fn unreachable_residents_hint_names_the_loaded_registry_path() {
+        let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        let loaded = [lm("darkmux:orphan", "orphan")];
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/srv/alt/profiles.json"));
+        let hint = c.hint.expect("hint");
+        assert!(hint.contains("/srv/alt/profiles.json"), "{hint}");
     }
 
     /// (#2914) The removed routing-seat binding `role_profiles.radio-router` is
@@ -12832,7 +13046,7 @@ mod tests {
     #[test]
     fn unreachable_residents_no_loaded_models_passes() {
         let registry = registry_with(&[]);
-        let c = super::unreachable_residents_status(&[], &registry);
+        let c = super::unreachable_residents_status(&[], &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass);
     }
 
@@ -12840,7 +13054,7 @@ mod tests {
     fn unreachable_residents_addressable_resident_passes() {
         let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
         let loaded = vec![lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass, "message: {}", c.message);
     }
 
@@ -12855,7 +13069,7 @@ mod tests {
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:qwen38-probe", "qwen/qwen3.8-27b"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("darkmux:qwen38-probe"), "names the orphan: {}", c.message);
         assert!(
@@ -12900,7 +13114,7 @@ mod tests {
             lm("predarkmux:orphan", "orphan"),
             lm("DARKMUX:orphan", "orphan"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(
             c.status,
             Status::Pass,
@@ -12928,7 +13142,7 @@ mod tests {
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),
         ];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Pass, "the utility binding is addressable, not orphaned: {}", c.message);
     }
 
@@ -12940,7 +13154,7 @@ mod tests {
     fn unreachable_residents_honors_an_explicit_identifier_override() {
         let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", Some("darkmux:my-alias"))])]);
         let loaded = vec![lm("darkmux:my-alias", "qwen/qwen3.8-27b")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(
             c.status,
             Status::Pass,
@@ -12964,7 +13178,7 @@ mod tests {
             error: "missing field `models`".to_string(),
         });
         let loaded = vec![lm("darkmux:orphan", "orphan")];
-        let c = super::unreachable_residents_status(&loaded, &registry);
+        let c = super::unreachable_residents_status(&loaded, &registry, std::path::Path::new("/x/profiles.json"));
         assert_eq!(c.status, Status::Warn);
         let hint = c.hint.expect("a warn carries a remedy");
         assert!(
@@ -12984,7 +13198,7 @@ mod tests {
         ] {
             registry.quarantined.push(darkmux_types::QuarantinedEntry { kind, name: name.into(), error: "x".into() });
         }
-        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry);
+        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry, std::path::Path::new("/x/profiles.json"));
         let hint = c.hint.expect("a warn carries a remedy");
         assert!(hint.contains("2 registry entries are currently quarantined"), "{hint}");
         assert!(hint.contains("profile \"broken-profile\"") && hint.contains("endpoint \"broken-endpoint\""), "{hint}");
