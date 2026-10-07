@@ -452,4 +452,50 @@ mod tests {
         reset_for_test();
         assert_eq!(received_signal(), None);
     }
+
+    /// (#3100) Each test-only raiser raises the flag it names, as the real
+    /// handler or `mark_interrupted` would: a caller in another crate relies on
+    /// it to drive its interrupt path, and a raiser that silently did nothing
+    /// would turn that caller's interrupt test into a no-signal run.
+    #[test]
+    #[serial_test::serial]
+    fn each_test_raiser_raises_the_flag_it_names() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
+        for (raise, signal) in [
+            (simulate_sigint_for_test as fn(), Some(libc::SIGINT)),
+            (simulate_sigterm_for_test, Some(libc::SIGTERM)),
+            (simulate_sighup_for_test, Some(libc::SIGHUP)),
+            (raise_for_test, None),
+        ] {
+            reset_for_test();
+            raise();
+            assert!(is_set(), "{signal:?}: the raiser did not raise the flag");
+            assert_eq!(received_signal(), signal);
+        }
+        reset_for_test();
+    }
+
+    /// (#3100) The raisers refuse, before raising anything, in a process other
+    /// tests share. Here that process is simulated by clearing both signals
+    /// `is_own_process` reads, which this test may do because it runs alone.
+    #[test]
+    #[serial_test::serial]
+    fn a_test_raiser_refuses_in_a_shared_process_before_raising() {
+        // (#3100) It would raise the process-wide interrupt flag.
+        crate::run_in_own_process!();
+        reset_for_test();
+        std::env::remove_var("NEXTEST_EXECUTION_MODE");
+        std::env::remove_var(crate::test_isolation::OWN_PROCESS_VAR);
+        for raise in [simulate_sigint_for_test as fn(), simulate_sigterm_for_test, simulate_sighup_for_test, raise_for_test] {
+            let refused = std::panic::catch_unwind(raise).expect_err("a raiser must refuse in a shared process");
+            let msg = refused
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| refused.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or_default();
+            assert!(msg.contains("run_in_own_process"), "{msg}");
+            assert!(!is_set(), "the refusal must come before the flag is raised");
+        }
+    }
 }

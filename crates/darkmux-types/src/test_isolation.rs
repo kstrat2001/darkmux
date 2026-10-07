@@ -1089,6 +1089,27 @@ mod tests {
         assert_eq!(ran.ok().as_deref(), Some("ran"), "the re-run never ran the body");
     }
 
+    /// (#3100) The parent path, under nextest too: with both signals cleared
+    /// (what plain `cargo test` leaves) the process is not its own, so the
+    /// re-run hands the body to a child, which runs it, and tells the caller
+    /// not to. The test first moves into a process of its own, so clearing the
+    /// signals touches no other test.
+    #[test]
+    #[cfg(unix)]
+    fn with_both_signals_cleared_the_process_is_shared_and_a_child_runs_the_body() {
+        crate::run_in_own_process!();
+        std::env::remove_var("NEXTEST_EXECUTION_MODE");
+        std::env::remove_var(super::OWN_PROCESS_VAR);
+        assert!(!super::is_own_process(), "with neither signal the process is shared");
+        let sentinel = std::env::temp_dir().join(format!("darkmux-own-process-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        let child = "test_isolation::tests::a_rerun_runs_the_body_in_a_child_and_the_parent_skips_it";
+        assert!(!super::rerun_in_own_process(child), "a shared process must hand the body to a child");
+        let ran = std::fs::read_to_string(&sentinel);
+        let _ = std::fs::remove_file(&sentinel);
+        assert_eq!(ran.ok().as_deref(), Some("ran"), "the child never ran the body");
+    }
+
     /// Calls that raise the process-wide interrupt flag. The test-only
     /// raisers also refuse at run time outside a process of their own; the
     /// production ones (`mark_interrupted` and the shutdown paths that call

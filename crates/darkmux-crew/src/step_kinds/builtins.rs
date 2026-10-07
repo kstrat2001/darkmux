@@ -4902,9 +4902,10 @@ mod tests {
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
             })
         });
-        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
+        let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
         assert!(!out.ok, "{out:?}");
         assert!(out.error.as_deref().unwrap_or_default().contains("local endpoint refused the draw"), "{out:?}");
+        assert_eq!(out.index, 3, "the result names its own item, which is how the step output and its usage records key it");
         assert_eq!(*calls.lock().unwrap(), 2);
     }
 
@@ -4919,8 +4920,9 @@ mod tests {
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
             })
         });
-        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
+        let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
         assert!(out.ok && out.error.is_none() && out.content.is_empty(), "{out:?}");
+        assert_eq!(out.index, 3, "{out:?}");
     }
 
     /// A named endpoint with a 1-token daily budget under `policy`.
