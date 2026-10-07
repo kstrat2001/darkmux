@@ -1365,6 +1365,24 @@ def floor_check_main(args: list[str]) -> int:
     listing) — recomputed once in the workflow, exactly as it always was;
     this function only ever receives the resulting integer, the same way
     `main()` already does via its own `--changed-lines` flag."""
+    # `--not-built N` / `--planned N` come from the plan job (`--plan`):
+    # mutants this platform does not compile, and every in-diff mutant the
+    # plan listed. Both optional, so the pre-plan call shape still works.
+    args = list(args)
+    extra: dict[str, int | None] = {"--not-built": None, "--planned": None}
+    for flag in extra:
+        if flag in args:
+            j = args.index(flag)
+            raw = args[j + 1] if j + 1 < len(args) else ""
+            try:
+                extra[flag] = int(raw)
+            except ValueError:
+                print(f"{flag} requires an integer, got {raw!r}", file=sys.stderr)
+                return 2
+            del args[j : j + 2]
+    not_built = extra["--not-built"] or 0
+    planned = extra["--planned"]
+
     i = args.index("--floor-check")
     rest = args[i + 1 :]
     if len(rest) < 2:
@@ -1391,8 +1409,31 @@ def floor_check_main(args: list[str]) -> int:
     lines.append("")
     for d, n in per_shard:
         lines.append(f"- `{d}`: " + (f"{n} evaluated" if n is not None else "no output directory found"))
+    if not_built:
+        lines += [
+            "",
+            f"{not_built} more mutant(s) in this diff are in code this platform does not "
+            "compile; the plan job lists them, untested (see its summary).",
+        ]
 
-    if changed_lines > 0 and total == 0:
+    if planned is not None and total + not_built != planned:
+        # The plan listed `planned` mutants; every one is either evaluated by
+        # a shard or listed as not built here. A shortfall means a shard was
+        # cut off, never uploaded, or the shard arithmetic dropped some.
+        lines += [
+            "",
+            f"**Only {total + not_built} of the {planned} mutant(s) the plan listed are "
+            "accounted for — this is not a pass.**",
+            "",
+            f"{total} evaluated across the shards above plus {not_built} not built on this "
+            "platform. A shard that was cancelled (its own `timeout-minutes`), failed before "
+            "uploading, or was given a different `--shard` total than the plan computed "
+            "leaves mutants unevaluated. Read the shard jobs above.",
+        ]
+        print("\n".join(lines))
+        return 1
+
+    if changed_lines > 0 and total + not_built == 0:
         lines += [
             "",
             "**This PR changed Rust code but the sharded root invocation evaluated ZERO "
@@ -1422,6 +1463,7 @@ def main(
     title: str,
     candidates: list[str],
     changed_lines: int = 0,
+    not_built: int = 0,
 ) -> int:
     out_dir = find_out_dir(candidates)
     meaning = EXIT_MEANING.get(exit_code, f"unrecognized exit code {exit_code}")
@@ -1611,6 +1653,17 @@ def main(
             ]
             print("\n".join(lines))
             return 1
+        if not_built > 0:
+            # The diff DID resolve to mutants (so not the wiring-broken
+            # shape below); every one is in code this platform does not
+            # compile, and the plan's summary lists them as not tested.
+            lines.append(
+                f"Nothing tested here: all {not_built} of this diff's mutant(s) in this scope are "
+                "in code this platform does not compile (listed, untested, in the plan section "
+                "above). That is not a pass for them."
+            )
+            print("\n".join(lines))
+            return 0
         if changed_lines > 0:
             lines += [
                 "**This PR changed Rust code but produced ZERO mutants — this is not a pass.**",
@@ -1686,6 +1739,676 @@ def main(
     elif not n_missed:
         lines.append("Every mutation this PR made testable was caught by a test.")
     print("\n".join(lines))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Platform split and shard plan for the PR-diff root mutation jobs.
+#
+# The PR-diff mutation jobs run on Linux runners. Some of this repo's code is
+# compiled only on macOS (`#[cfg(target_os = "macos")]` items, a module whose
+# file opens with `#![cfg(...)]`). cargo-mutants does not evaluate platform
+# `cfg` attributes (27.1.0 skips only `cfg(test)`, `#[test]`-like attributes
+# and `mutants::skip`, see its `src/visit.rs`), so it lists mutants inside
+# that code anyway. On Linux such a mutant changes a line the compiler never
+# sees: the build succeeds, every test passes, and cargo-mutants reports it
+# MISSED, a surviving mutant that is really "never built here". Testing it
+# also costs a full build and test cycle.
+#
+# `--plan` (below) separates those mutants BEFORE any shard runs. It reads the
+# platform's real cfg set from `rustc --print cfg` (the runner's own pinned
+# toolchain), scans every source file cargo-mutants walks for `cfg`
+# attributes, and marks a mutant "not built on this platform" when its whole
+# span lies inside an item, statement, expression, field or match arm whose
+# `cfg` predicate is FALSE for that cfg set. The shards exclude exactly those
+# mutants (by exact name, `--exclude-re`), and the summary lists them under
+# their own heading with their count. They are reported as not tested, never
+# dropped silently.
+#
+# Three-valued: a predicate on a key `rustc --print cfg` does not decide
+# (`test`, `feature = ...`, `debug_assertions`, any custom cfg) is UNKNOWN,
+# and an unknown predicate never excludes anything. `cfg(test)` code has no
+# mutants anyway, and `cfg(not(test))` code IS compiled in a test build (the
+# library integration tests link against). Only the target's own keys
+# (`target_os`, `unix`, `target_arch`, ...) can make a predicate false.
+#
+# This is a token scanner, not a Rust parser. Where it is unsure where an
+# attributed item ends it errs toward a SHORTER span, so the failure mode is
+# a mutant tested that did not need to be (it may read as a false survivor,
+# which is advisory), never a built mutant silently left out. Known shapes it
+# reads short: a non-item element whose type carries a generic comma at
+# depth 0 (`#[cfg(x)] f: HashMap<K, V>,` ends at the first comma).
+# ---------------------------------------------------------------------------
+
+# Keys whose value `rustc --print cfg` decides for the target. A predicate on
+# any other key is UNKNOWN.
+_TARGET_CFG_KEYS = {
+    "target_os",
+    "target_family",
+    "target_arch",
+    "target_env",
+    "target_vendor",
+    "target_endian",
+    "target_pointer_width",
+    "target_abi",
+    "target_has_atomic",
+    "panic",
+    "unix",
+    "windows",
+}
+
+# How an attributed element ends, by its first keyword (after any
+# visibility and `unsafe`/`async`/`extern "ABI"` qualifiers):
+#
+#   - `_SEMI_KEYWORDS` end at the `;` at bracket depth 0, whatever braces
+#     come first (`let x = S { .. };`, `const C: T = { .. };`).
+#   - `_BRACE_KEYWORDS` (items, and the block-like statements) end at their
+#     first closing brace at depth 0, or at a `;` before it (`struct S(u8);`,
+#     `mod x;`). An `if` chain continues through `else`. A block-like
+#     statement is a complete statement in Rust: what follows it (`*x = 1;`,
+#     `(a, b) = t;`) is the NEXT statement, never part of this one.
+#   - A bare `{` (a block statement) behaves the same.
+#   - Anything else (an expression statement, a struct field, an enum
+#     variant, a match arm) uses the general rule in `_item_end`.
+#
+# Neither of the first two ever ends at a comma: a generic parameter list's
+# comma sits at bracket depth 0, since `<>` is not tracked.
+_SEMI_KEYWORDS = {"use", "const", "static", "type", "let"}
+_BRACE_KEYWORDS = {
+    "fn", "impl", "struct", "enum", "union", "trait", "mod", "macro_rules",
+    "if", "match", "for", "while", "loop",
+}
+_QUALIFIERS = {"pub", "unsafe", "async", "extern", "default", "crate"}
+
+
+def parse_rustc_cfg(text: str) -> dict[str, set[str] | bool]:
+    """`rustc --print cfg` output -> {name: True} for bare names,
+    {key: {values}} for `key="value"` lines."""
+    cfg: dict[str, set[str] | bool] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            values = cfg.setdefault(key.strip(), set())
+            if isinstance(values, set):
+                values.add(value.strip().strip('"'))
+        else:
+            cfg[line] = True
+    return cfg
+
+
+def _rust_tokens(text: str) -> list[tuple[str, str, int, int]]:
+    """Lex Rust source into `(kind, text, line, col)` tokens (1-indexed line
+    and column, as cargo-mutants reports them). Comments (nested block
+    comments included) are dropped; string, raw string, byte and char
+    literals become one `lit` token so a brace or quote inside one is never
+    read as code. Kinds: `ident`, `lit`, `punct` (one char)."""
+    toks: list[tuple[str, str, int, int]] = []
+    i, n = 0, len(text)
+    line, col = 1, 1
+
+    def advance(to: int) -> None:
+        nonlocal i, line, col
+        while i < to:
+            if text[i] == "\n":
+                line += 1
+                col = 1
+            else:
+                col += 1
+            i += 1
+
+    def scan_quoted(j: int) -> int:
+        # j points just past the opening `"`; return the index past the close.
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"':
+                return j + 1
+            j += 1
+        return n
+
+    def scan_raw(j: int) -> int | None:
+        # j points at the `r`; return the index past a raw string, or None.
+        k = j + 1
+        hashes = 0
+        while k < n and text[k] == "#":
+            hashes += 1
+            k += 1
+        if k >= n or text[k] != '"':
+            return None
+        close = '"' + "#" * hashes
+        end = text.find(close, k + 1)
+        return n if end < 0 else end + len(close)
+
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            advance(i + 1)
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            advance(n if end < 0 else end)
+            continue
+        if text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            advance(j)
+            continue
+        start_line, start_col = line, col
+        # Raw strings and prefixed literals: r"..", r#".."#, br"..", cr"..",
+        # b"..", c"..", b'x'.
+        if ch in "bcr":
+            j = i + 1 if ch in "bc" and i + 1 < n and text[i + 1] == "r" else i
+            if text[j] == "r":
+                end = scan_raw(j)
+                if end is not None:
+                    toks.append(("lit", text[i:end], start_line, start_col))
+                    advance(end)
+                    continue
+            if ch in "bc" and i + 1 < n and text[i + 1] == '"':
+                end = scan_quoted(i + 2)
+                toks.append(("lit", text[i:end], start_line, start_col))
+                advance(end)
+                continue
+            if ch == "b" and i + 1 < n and text[i + 1] == "'":
+                m = _CHAR_LITERAL.match(text, i + 1)
+                if m:
+                    toks.append(("lit", text[i : m.end()], start_line, start_col))
+                    advance(m.end())
+                    continue
+        if ch == '"':
+            end = scan_quoted(i + 1)
+            toks.append(("lit", text[i:end], start_line, start_col))
+            advance(end)
+            continue
+        if ch == "'":
+            m = _CHAR_LITERAL.match(text, i)
+            if m:
+                toks.append(("lit", m.group(0), start_line, start_col))
+                advance(m.end())
+                continue
+            # Not a char literal: a lifetime's `'`, a lone punctuation token
+            # (its name lexes as an identifier next).
+            toks.append(("punct", ch, start_line, start_col))
+            advance(i + 1)
+            continue
+        if ch.isalpha() or ch == "_" or ord(ch) > 127:
+            j = i + 1
+            if ch == "r" and i + 1 < n and text[i + 1] == "#":
+                j = i + 2  # raw identifier r#name
+            while j < n and (text[j].isalnum() or text[j] == "_" or ord(text[j]) > 127):
+                j += 1
+            toks.append(("ident", text[i:j].removeprefix("r#"), start_line, start_col))
+            advance(j)
+            continue
+        if ch.isdigit():
+            j = i + 1
+            while j < n and (
+                text[j].isalnum()
+                or text[j] == "_"
+                or (text[j] == "." and j + 1 < n and text[j + 1].isdigit())
+            ):
+                j += 1
+            toks.append(("lit", text[i:j], start_line, start_col))
+            advance(j)
+            continue
+        toks.append(("punct", ch, start_line, start_col))
+        advance(i + 1)
+    return toks
+
+
+_OPEN = {"(": ")", "[": "]", "{": "}"}
+_CLOSE = {")", "]", "}"}
+
+
+def _match_brackets(toks) -> dict[int, int]:
+    """Index of every bracket token -> index of its partner (both ways).
+    Unbalanced input leaves the stray bracket unmatched."""
+    pairs: dict[int, int] = {}
+    stack: list[int] = []
+    for k, (kind, t, _l, _c) in enumerate(toks):
+        if kind != "punct":
+            continue
+        if t in _OPEN:
+            stack.append(k)
+        elif t in _CLOSE and stack:
+            o = stack.pop()
+            pairs[o] = k
+            pairs[k] = o
+    return pairs
+
+
+def _eval_cfg(toks, start: int, end: int, cfg) -> bool | None:
+    """Evaluate the cfg predicate in `toks[start:end]` against `cfg` (from
+    `parse_rustc_cfg`). True / False / None (unknown)."""
+
+    def parse(k: int) -> tuple[bool | None, int]:
+        kind, t, _l, _c = toks[k]
+        if kind != "ident":
+            return None, k + 1
+        nxt = toks[k + 1][1] if k + 1 < end else None
+        if t in ("all", "any", "not") and nxt == "(":
+            vals = []
+            j = k + 2
+            while j < end and toks[j][1] != ")":
+                v, j = parse(j)
+                vals.append(v)
+                if j < end and toks[j][1] == ",":
+                    j += 1
+            j += 1  # the `)`
+            if t == "not":
+                v = vals[0] if vals else None
+                return (None if v is None else not v), j
+            if t == "all":
+                if any(v is False for v in vals):
+                    return False, j
+                return (True if all(v is True for v in vals) else None), j
+            if any(v is True for v in vals):
+                return True, j
+            return (False if all(v is False for v in vals) else None), j
+        if nxt == "=" and k + 2 < end and toks[k + 2][0] == "lit":
+            value = toks[k + 2][1].strip('"')
+            if t not in _TARGET_CFG_KEYS:
+                return None, k + 3
+            values = cfg.get(t)
+            return (isinstance(values, set) and value in values), k + 3
+        if t not in _TARGET_CFG_KEYS:
+            return None, k + 1
+        return (cfg.get(t) is True), k + 1
+
+    if start >= end:
+        return None
+    value, _ = parse(start)
+    return value
+
+
+def _item_end(toks, pairs, j: int) -> int:
+    """Index of the last token of the item, statement, field or arm that
+    starts at token `j` (just past its attributes). See the section comment
+    for the shapes this reads short; where unsure it ends EARLY, never late."""
+    n = len(toks)
+    # Classify by the first keyword past any qualifiers (`pub(crate) unsafe
+    # fn`, `extern "C" fn`, `const fn` is a fn, `unsafe { .. }` a block).
+    k = j
+    while k < n and toks[k][0] == "ident" and toks[k][1] in _QUALIFIERS:
+        if toks[k][1] == "pub" and k + 1 < n and toks[k + 1][1] == "(":
+            k = pairs.get(k + 1, k + 1)
+        k += 1
+        if k < n and toks[k][0] == "lit":  # extern "ABI"
+            k += 1
+    head = toks[k] if k < n else None
+    if head and head[:2] == ("ident", "const") and k + 1 < n and toks[k + 1][1] in ("fn", "unsafe", "async", "extern"):
+        head = ("ident", "fn", 0, 0)
+    if head is None:
+        return n - 1
+    if head[0] == "ident" and head[1] in _SEMI_KEYWORDS:
+        mode = "semi"
+    elif (head[0] == "ident" and head[1] in _BRACE_KEYWORDS) or head[1] == "{" or k > j:
+        # `k > j`: only qualifiers before a `{` (`unsafe { .. }`, `async { .. }`).
+        mode = "brace"
+    else:
+        mode = "expr"
+
+    k = j
+    saw_arrow = False
+    while k < n:
+        kind, t, _l, _c = toks[k]
+        if kind == "punct":
+            if t in _OPEN:
+                close = pairs.get(k)
+                if close is None:
+                    return n - 1
+                if t == "{" and mode != "semi":
+                    nxt = toks[close + 1] if close + 1 < n else None
+                    nt = nxt[1] if nxt else None
+                    if mode == "brace":
+                        if nxt is not None and nxt[:2] == ("ident", "else"):
+                            k = close + 1
+                            continue
+                        return close
+                    # mode == "expr"
+                    if nt == ";":
+                        return close + 1
+                    if saw_arrow:
+                        return close + 1 if nt == "," else close
+                    if nt == ",":
+                        return close + 1
+                    # A struct literal or closure body inside a longer
+                    # expression continues only into a method call, `?` or a
+                    # cast; anything else starts something new.
+                    if nt in (".", "?") or (nxt is not None and nxt[:2] == ("ident", "as")):
+                        k = close + 1
+                        continue
+                    return close
+                k = close + 1
+                continue
+            if t in _CLOSE:
+                return k - 1  # closes the parent: the element ended before it
+            if t == ";":
+                return k
+            if t == "," and mode == "expr":
+                return k
+            if t == "=" and k + 1 < n and toks[k + 1][1] == ">":
+                saw_arrow = True
+        k += 1
+    return n - 1
+
+
+def cfg_false_spans(text: str, cfg) -> tuple[bool, list[tuple[tuple[int, int], tuple[int, int]]], list[tuple[int, int]]]:
+    """Scan one file. Returns `(whole_file_false, spans, mod_decl_lines)`:
+    `spans` are `((line, col), (line, col_end_exclusive))` regions whose cfg
+    is FALSE for `cfg`; `mod_decl_lines` are `(index, line)` of `mod name;`
+    declarations inside a false span (their files are not built either)."""
+    toks = _rust_tokens(text)
+    pairs = _match_brackets(toks)
+    n = len(toks)
+    spans = []
+    whole_file = False
+    # Innermost `{` enclosing each token, for inner attributes.
+    enclosing: list[int | None] = [None] * n
+    stack: list[int] = []
+    for k, (kind, t, _l, _c) in enumerate(toks):
+        enclosing[k] = stack[-1] if stack else None
+        if kind == "punct" and t == "{":
+            stack.append(k)
+        elif kind == "punct" and t == "}" and stack:
+            stack.pop()
+
+    def pos_end(k: int) -> tuple[int, int]:
+        _kind, t, l, c = toks[k]
+        lines = t.split("\n")
+        if len(lines) == 1:
+            return (l, c + len(t))
+        return (l + len(lines) - 1, len(lines[-1]) + 1)
+
+    k = 0
+    while k < n:
+        if toks[k][1] != "#" or toks[k][0] != "punct":
+            k += 1
+            continue
+        inner = k + 1 < n and toks[k + 1][1] == "!"
+        lb = k + 2 if inner else k + 1
+        if lb >= n or toks[lb][1] != "[" or lb not in pairs:
+            k += 1
+            continue
+        rb = pairs[lb]
+        is_cfg = (
+            lb + 2 < rb
+            and toks[lb + 1][:2] == ("ident", "cfg")
+            and toks[lb + 2][1] == "("
+            and pairs.get(lb + 2) == rb - 1
+        )
+        if is_cfg and _eval_cfg(toks, lb + 3, rb - 1, cfg) is False:
+            if inner:
+                o = enclosing[k]
+                if o is None:
+                    whole_file = True
+                else:
+                    c = pairs.get(o, n - 1)
+                    spans.append(((toks[o][2], toks[o][3]), pos_end(c)))
+            else:
+                j = rb + 1
+                while j < n and toks[j][1] == "#" and j + 1 < n and toks[j + 1][1] == "[" and (j + 1) in pairs:
+                    j = pairs[j + 1] + 1
+                if j < n:
+                    end = _item_end(toks, pairs, j)
+                    if end >= j:
+                        spans.append(((toks[k][2], toks[k][3]), pos_end(end)))
+        k = rb + 1
+    # Every `mod name;` declaration, false or not: a file is excluded only
+    # when no compiled declaration reaches it (see `platform_not_built`).
+    # Each carries the inline modules around it (`mod outer { mod inner; }`
+    # looks for `outer/inner.rs`) and its own `#[path = "..."]`, if any.
+    inline: list[tuple[int, int, str]] = []  # (open brace, close brace, name)
+    for k in range(n - 2):
+        if toks[k][:2] == ("ident", "mod") and toks[k + 1][0] == "ident" and toks[k + 2][1] == "{":
+            inline.append((k + 2, pairs.get(k + 2, n - 1), toks[k + 1][1]))
+    mod_decls = []
+    for k in range(n - 2):
+        if toks[k][:2] == ("ident", "mod") and toks[k + 1][0] == "ident" and toks[k + 2][1] == ";":
+            pos = (toks[k][2], toks[k][3])
+            is_false = whole_file or any(s <= pos < e for s, e in spans)
+            chain = [name for o, c, name in inline if o < k < c]
+            # Look back over this declaration's attributes for `#[path = ..]`.
+            path_attr = None
+            b = k - 1
+            while b >= 0 and toks[b][1] in ("pub", "crate", ")", "(", "self", "super", "in"):
+                b -= 1
+            while b >= 0 and toks[b][1] == "]" and b in pairs:
+                o = pairs[b]
+                if (
+                    o >= 2
+                    and toks[o - 1][1] == "#"
+                    and o + 3 < b
+                    and toks[o + 1][:2] == ("ident", "path")
+                    and toks[o + 2][1] == "="
+                    and toks[o + 3][0] == "lit"
+                ):
+                    path_attr = toks[o + 3][1].strip('"')
+                b = o - 2
+            mod_decls.append((toks[k + 1][1], chain, path_attr, is_false))
+    return whole_file, spans, mod_decls
+
+
+def _module_targets(decl_file: str, name: str, chain: list[str], path_attr: str | None) -> list[str]:
+    """Where `mod name;` in `decl_file` (inside inline modules `chain`) finds
+    its source: `<base>/name.rs` and `<base>/name/` (which also holds its own
+    children), or exactly the `#[path]` file. `<base>` is the declaring
+    file's directory for a crate root or a `mod.rs`, and `<dir>/<stem>/`
+    for any other file."""
+    p = Path(decl_file)
+    is_root_like = (
+        p.name in ("lib.rs", "main.rs", "mod.rs", "build.rs")
+        or p.parent.name in ("bin", "tests", "benches", "examples")
+    )
+    base = p.parent if is_root_like else p.parent / p.stem
+    for inner in chain:
+        base = base / inner
+    if path_attr is not None:
+        # Relative to the declaring file's directory (inside inline modules,
+        # to their directory). Its own children are not followed.
+        return [str(Path(str(p.parent if not chain else base)) / path_attr)]
+    return [str(base / f"{name}.rs"), str(base / name) + "/"]
+
+
+def platform_not_built(
+    mutants: list[dict], files: list[str], root: Path, cfg
+) -> tuple[set[str], list[str]]:
+    """Return `(names, unreadable)`: the names of mutants in code `cfg`'s
+    target does not compile, and any source file that could not be read
+    (reported, never guessed about: its mutants are kept)."""
+    false_files: set[str] = set()
+    false_prefixes: list[str] = []
+    built_targets: list[str] = []
+    spans_by_file: dict[str, list] = {}
+    unreadable: list[str] = []
+    for f in sorted(set(files) | {m.get("file", "") for m in mutants if m.get("file")}):
+        try:
+            text = (root / f).read_text(errors="replace")
+        except OSError:
+            unreadable.append(f)
+            continue
+        whole, spans, mod_decls = cfg_false_spans(text, cfg)
+        if whole:
+            false_files.add(f)
+        if spans:
+            spans_by_file[f] = spans
+        for name, chain, path_attr, is_false in mod_decls:
+            targets = _module_targets(f, name, chain, path_attr)
+            (false_prefixes if is_false else built_targets).extend(targets)
+
+    def under(f: str, pre: str) -> bool:
+        return f == pre or (pre.endswith("/") and f.startswith(pre))
+
+    def file_false(f: str) -> bool:
+        if f in false_files:
+            return True
+        # Excluded only when a false declaration reaches it and no compiled
+        # (or undecided) one does: the platform-dual idiom declares one module
+        # name twice, once per platform, sometimes with `#[path]`.
+        return any(under(f, pre) for pre in false_prefixes) and not any(
+            under(f, pre) for pre in built_targets
+        )
+
+    names: set[str] = set()
+    for m in mutants:
+        f = m.get("file", "")
+        span = m.get("span") or {}
+        try:
+            start = (int(span["start"]["line"]), int(span["start"]["column"]))
+            end = (int(span["end"]["line"]), int(span["end"]["column"]))
+        except (KeyError, TypeError, ValueError):
+            continue  # no span: cannot place it, so it is tested
+        if file_false(f) or any(s <= start and end <= e for s, e in spans_by_file.get(f, [])):
+            names.add(m["name"])
+    return names, unreadable
+
+
+# The characters `regex::escape` (the Rust crate cargo-mutants matches
+# `--exclude-re` with) escapes. Python's `re.escape` also escapes a space
+# and other characters the Rust `regex` crate rejects as unknown escapes, so
+# it is not used for a pattern Rust will compile.
+_RUST_REGEX_META = set("\\.+*?()|[]{}^$#&-~")
+
+
+def rust_regex_escape(s: str) -> str:
+    return "".join("\\" + ch if ch in _RUST_REGEX_META else ch for ch in s)
+
+
+def plan_shards(testable: int, per_shard: int, max_shards: int) -> int:
+    """How many shards the testable mutants need: `ceil(testable /
+    per_shard)`, at least one when there is anything to test, at most
+    `max_shards`."""
+    if testable <= 0:
+        return 0
+    return max(1, min(max_shards, -(-testable // per_shard)))
+
+
+def _flag_value(args: list[str], flag: str, required: bool = True) -> str | None:
+    if flag not in args:
+        if required:
+            raise SystemExit(f"{flag} is required\n{USAGE}")
+        return None
+    i = args.index(flag)
+    if i + 1 >= len(args):
+        raise SystemExit(f"{flag} requires a value")
+    return args[i + 1]
+
+
+def plan_main(args: list[str]) -> int:
+    """`--plan`: split this diff's mutants into testable and not-built-here,
+    and size the shard matrix. Writes:
+
+      - `--exclude-re-out`: one `--exclude-re` pattern per not-built mutant
+        (an exact, anchored name), for every shard to pass;
+      - `--summary-out`: the Markdown section naming the not-built mutants;
+
+    and prints `key=value` lines for `$GITHUB_OUTPUT`: `planned` (all
+    in-diff mutants), `not_built`, `testable`, `shard_count`, `shards` (a
+    JSON array of shard indexes, the matrix), `platform`."""
+    mutants_path = Path(_flag_value(args, "--mutants-json"))
+    files_path = Path(_flag_value(args, "--files-json"))
+    cfg_path = Path(_flag_value(args, "--rustc-cfg"))
+    exclude_out = Path(_flag_value(args, "--exclude-re-out"))
+    summary_out = Path(_flag_value(args, "--summary-out"))
+    # Shard sizing is optional: a scope that is not sharded (runtime/, the
+    # bundler) uses `--plan` only for its platform split.
+    per_shard_raw = _flag_value(args, "--per-shard", required=False)
+    max_shards_raw = _flag_value(args, "--max-shards", required=False)
+    if (per_shard_raw is None) != (max_shards_raw is None):
+        print("--per-shard and --max-shards go together", file=sys.stderr)
+        return 2
+    sharded = per_shard_raw is not None
+    per_shard = int(per_shard_raw) if sharded else 1
+    max_shards = int(max_shards_raw) if sharded else 1
+    root = Path(_flag_value(args, "--root", required=False) or ".")
+    scope = _flag_value(args, "--scope", required=False)
+    if per_shard <= 0 or max_shards <= 0:
+        print("--per-shard and --max-shards must be positive", file=sys.stderr)
+        return 2
+
+    # A missing or unparseable listing is a hard failure: the shard count
+    # would otherwise default to zero, which reads as "nothing to mutate".
+    try:
+        mutants = json.loads(mutants_path.read_text())
+        file_entries = json.loads(files_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"--plan cannot read its cargo-mutants listings: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(mutants, list) or not isinstance(file_entries, list):
+        print("--plan: a cargo-mutants listing is not a JSON array", file=sys.stderr)
+        return 2
+    files = [(e.get("path") or e.get("file")) if isinstance(e, dict) else str(e) for e in file_entries]
+    cfg = parse_rustc_cfg(cfg_path.read_text())
+    target_os = cfg.get("target_os")
+    platform = ", ".join(sorted(target_os)) if isinstance(target_os, set) and target_os else "unknown"
+
+    not_built, unreadable = platform_not_built(mutants, files, root, cfg)
+    planned = len(mutants)
+    testable = planned - len(not_built)
+    shards = plan_shards(testable, per_shard, max_shards)
+
+    exclude_out.write_text(
+        "".join(f"^{rust_regex_escape(name)}$\n" for name in sorted(not_built))
+    )
+    lines = [
+        f"## Mutation testing — not built on this platform ({platform})"
+        + (f" — {scope}" if scope else ""),
+        "",
+    ]
+    if not_built:
+        lines += [
+            f"**{len(not_built)} of {planned} mutant(s) in this diff are in code the {platform} "
+            "build does not compile** (a platform `cfg` attribute is false here), so they were "
+            "NOT tested. This is not a pass for them: cargo-mutants cannot see platform `cfg`, "
+            "and testing them here would only report each one as a false survivor. They are "
+            "tested where that code is built, or by the nightly sweep's own platform.",
+            "",
+            "```",
+            *sorted(not_built),
+            "```",
+        ]
+    else:
+        lines.append(
+            f"None: every one of this diff's {planned} mutant(s) is in code the {platform} "
+            "build compiles."
+        )
+    if unreadable:
+        lines += [
+            "",
+            f"{len(unreadable)} source file(s) could not be read for `cfg` attributes, so their "
+            "mutants are all tested: " + ", ".join(f"`{f}`" for f in unreadable),
+        ]
+    if sharded:
+        lines += [
+            "",
+            f"Shard plan: {testable} testable mutant(s), target {per_shard} per shard, at most "
+            f"{max_shards} shards -> **{shards} shard(s)**"
+            + (
+                f" (capped: about {-(-testable // shards)} per shard)."
+                if shards and -(-testable // per_shard) > max_shards
+                else "."
+            ),
+        ]
+    summary_out.write_text("\n".join(lines) + "\n")
+    print(f"planned={planned}")
+    print(f"not_built={len(not_built)}")
+    print(f"testable={testable}")
+    if sharded:
+        print(f"shard_count={shards}")
+        print(f"shards={json.dumps(list(range(shards)))}")
+    print(f"platform={platform}")
     return 0
 
 
@@ -1854,6 +2577,17 @@ SELF_TEST_CASES = [
         "expect_exit": 1,
         "must_contain": ["ZERO mutants", "42 added Rust line(s)"],
         "must_not_contain": ["nothing to mutate"],
+    },
+    {
+        # (2026-10-07) The diff resolved to mutants, every one in code this
+        # platform does not compile, so the plan excluded them all and the
+        # run evaluated none: not the wiring-broken zero above.
+        "name": "diff mode, zero evaluated, every in-diff mutant not built here — passes, says so",
+        "argv": ["0", "diff", "T", "--changed-lines", "42", "--not-built", "3"],
+        "files": None,
+        "expect_exit": 0,
+        "must_contain": ["all 3 of this diff's mutant(s)", "not compile"],
+        "must_not_contain": ["ZERO mutants"],
     },
     {
         "name": "diff mode with zero mutants and zero added Rust lines passes",
@@ -3429,6 +4163,57 @@ FLOOR_CHECK_SELF_TEST_CASES = [
         "must_contain": ["0 mutant(s) evaluated in total"],
         "must_not_contain": ["ZERO mutants across every shard"],
     },
+    {
+        "name": (
+            "every in-diff mutant is in code this platform does not compile, so the plan "
+            "started no shard — the diff DID resolve, so not the wiring-broken shape, passes"
+        ),
+        "changed_lines": 5,
+        "shards": [],
+        "extra_argv": ["--not-built", "3", "--planned", "3"],
+        "expect_exit": 0,
+        "must_contain": ["3 more mutant(s) in this diff are in code this platform does not compile"],
+        "must_not_contain": ["ZERO mutants", "not a pass"],
+    },
+    {
+        "name": "every planned mutant accounted for (evaluated + not built) — passes",
+        "changed_lines": 40,
+        "shards": [
+            {"outcomes": {"total_mutants": 25, "missed": 1, "caught": 24, "timeout": 0, "unviable": 0}},
+            {"outcomes": {"total_mutants": 24, "missed": 0, "caught": 24, "timeout": 0, "unviable": 0}},
+        ],
+        "extra_argv": ["--planned", "51", "--not-built", "2"],
+        "expect_exit": 0,
+        "must_contain": ["49 mutant(s) evaluated in total"],
+        "must_not_contain": ["accounted for"],
+    },
+    {
+        "name": (
+            "a shard cut off mid-run evaluated fewer than the plan gave it — fails, the "
+            "aggregate must not read a partial run as complete"
+        ),
+        "changed_lines": 40,
+        "shards": [
+            {"outcomes": {"total_mutants": 25, "missed": 0, "caught": 25, "timeout": 0, "unviable": 0}},
+            {"outcomes": {"total_mutants": 9, "missed": 0, "caught": 9, "timeout": 0, "unviable": 0}},
+        ],
+        "extra_argv": ["--planned", "49"],
+        "expect_exit": 1,
+        "must_contain": ["Only 34 of the 49 mutant(s) the plan listed are accounted for"],
+        "must_not_contain": [],
+    },
+    {
+        "name": "a shard whose artifact never landed — fails against the plan's count",
+        "changed_lines": 40,
+        "shards": [
+            {"outcomes": {"total_mutants": 25, "missed": 0, "caught": 25, "timeout": 0, "unviable": 0}},
+            {"missing": True},
+        ],
+        "extra_argv": ["--planned", "49"],
+        "expect_exit": 1,
+        "must_contain": ["Only 25 of the 49", "no output directory found"],
+        "must_not_contain": [],
+    },
 ]
 
 
@@ -3453,7 +4238,13 @@ def floor_check_self_test() -> list[str]:
                             "\n".join(f"line{k}" for k in range(n))
                         )
 
-            argv = ["--floor-check", str(case["changed_lines"]), "T", *shard_dirs]
+            argv = [
+                "--floor-check",
+                str(case["changed_lines"]),
+                "T",
+                *case.get("extra_argv", []),
+                *shard_dirs,
+            ]
             proc = _run_self(argv, cwd=tmp_path)
             problems = []
             if proc.returncode != case["expect_exit"]:
@@ -3475,6 +4266,325 @@ def floor_check_self_test() -> list[str]:
                     + "    --- output ---\n"
                     + "".join(f"    | {ln}\n" for ln in blob.splitlines())
                 )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Self-test, part 3: `--plan` (the platform split and the shard count).
+#
+# A real fixture tree and real cargo-mutants-shaped listings, run through the
+# script as a subprocess. Each mutant sits on a marker expression; the
+# expected set is what the compiler builds for each cfg set, written by hand.
+# Both directions are asserted: Linux excludes the macOS-only mutants, macOS
+# excludes the not-macOS ones, and a predicate the target does not decide
+# (`feature = ...`) excludes nothing on either.
+# ---------------------------------------------------------------------------
+
+_PLAN_LIB_RS = """#![allow(dead_code)]
+#[cfg(target_os = "macos")]
+mod mac_only;
+mod iokit;
+
+#[cfg(target_os = "macos")]
+fn mac_fn() -> u32 { M_MAC_FN }
+
+#[cfg(not(target_os = "macos"))]
+fn other_fn() -> u32 { M_OTHER_FN }
+
+#[cfg(unix)]
+fn unix_fn() -> u32 { M_UNIX_FN }
+
+#[cfg(feature = "extra")]
+fn feature_fn() -> u32 { M_FEATURE_FN }
+
+#[cfg(any(feature = "extra", target_os = "macos"))]
+fn any_fn() -> u32 { M_ANY_FN }
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn stacked() -> u32 { M_STACKED }
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+fn after_use() -> u32 { M_AFTER_USE }
+
+fn mixed() -> u32 {
+    #[cfg(target_os = "macos")]
+    let x = { M_MIXED_MAC };
+    #[cfg(not(target_os = "macos"))]
+    let x = M_MIXED_OTHER;
+    let s = "#[cfg(target_os = \\"linux\\")] { not code } '{'";
+    x + s.len() as u32 + M_MIXED_TAIL
+}
+
+fn arms(v: u8) -> u32 {
+    match (v, 1) {
+        #[cfg(target_os = "macos")]
+        (0, _) => { M_ARM_MAC }
+        (1, _) => M_ARM_ANY,
+        _ => 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn generic<A, B>(a: A, b: B) -> u32 { M_GENERIC_MAC }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod platform {
+    pub fn probe() -> u32 { M_PLATFORM_MAC }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+mod platform {
+    pub fn probe() -> u32 { M_PLATFORM_OTHER }
+}
+
+// Predicates the target does not decide never exclude anything.
+#[cfg(not(test))]
+fn not_test() -> u32 { M_NOT_TEST }
+
+#[cfg(debug_assertions)]
+fn debug_only() -> u32 { M_DEBUG }
+
+#[cfg(coverage)]
+fn coverage_only() -> u32 { M_COVERAGE }
+
+#[cfg(all(unix, feature = "x"))]
+fn all_unknown() -> u32 { M_ALL_UNKNOWN }
+
+// Literals and comments holding brackets must not move a span's end, and a
+// block-like statement ends at its brace: the statement after it is built.
+fn lexing<'a>(state: &'a mut u32) -> u32 {
+    let _c = '{';
+    let _s = "\\"{";
+    let _r = r#"}"#;
+    /* } /* { */ ) */
+    #[cfg(target_os = "macos")]
+    { M_BLOCK_MAC; }
+    *state = M_AFTER_BLOCK;
+    #[cfg(target_os = "macos")]
+    unsafe { M_UNSAFE_MAC; }
+    (a, b) = (M_AFTER_UNSAFE, 0);
+    M_LEX_TAIL
+}
+
+// A bracket inside a literal or a comment, ahead of the marker, would end
+// the attributed fn early (and leave its marker tested) if lexed as code.
+#[cfg(target_os = "macos")]
+fn char_mac() -> u32 { let _c = '}'; M_CHAR_MAC }
+#[cfg(target_os = "macos")]
+fn raw_mac() -> u32 { let _r = r#"say "}" now"#; M_RAW_MAC }
+#[cfg(target_os = "macos")]
+fn comment_mac() -> u32 { /* /* nested */ } */ M_COMMENT_MAC }
+
+// A cfg'd struct-literal field ends at its comma; the next field is built.
+fn fields() -> S {
+    S {
+        #[cfg(target_os = "macos")]
+        a: M_FIELD_MAC,
+        b: M_FIELD_BUILT,
+    }
+}
+
+// Module files: an inline module's `mod` resolves under its directory, a
+// `#[path]` names its file, and the platform-dual idiom declares one name
+// twice. A file any compiled declaration reaches is built.
+mod inner;
+#[cfg(target_os = "macos")]
+mod outer {
+    mod inner;
+}
+#[cfg(target_os = "macos")]
+#[path = "imp_mac.rs"]
+mod imp;
+#[cfg(not(target_os = "macos"))]
+mod imp;
+#[cfg(target_os = "macos")]
+mod shared;
+#[cfg(not(target_os = "macos"))]
+mod shared;
+"""
+
+_PLAN_MAC_ONLY_RS = "pub fn m() -> u32 { M_MAC_ONLY_FILE }\n"
+_PLAN_IOKIT_RS = '//! inner attribute gates the whole file\n#![cfg(target_os = "macos")]\npub fn k() -> u32 { M_IOKIT_FILE }\n'
+
+_PLAN_FILES = {
+    "crates/x/src/lib.rs": _PLAN_LIB_RS,
+    "crates/x/src/mac_only.rs": _PLAN_MAC_ONLY_RS,
+    "crates/x/src/iokit.rs": _PLAN_IOKIT_RS,
+    "crates/x/src/inner.rs": "pub fn i() -> u32 { M_INNER_BUILT }\n",
+    "crates/x/src/outer/inner.rs": "pub fn o() -> u32 { M_OUTER_INNER_MAC }\n",
+    "crates/x/src/imp_mac.rs": "pub fn p() -> u32 { M_IMP_MAC }\n",
+    "crates/x/src/imp.rs": "pub fn p() -> u32 { M_IMP_OTHER }\n",
+    "crates/x/src/shared.rs": "pub fn s() -> u32 { M_SHARED_BUILT }\n",
+}
+
+_LINUX_CFG = 'panic="unwind"\ntarget_arch="x86_64"\ntarget_family="unix"\ntarget_os="linux"\nunix\ndebug_assertions\n'
+_MAC_CFG = 'panic="unwind"\ntarget_arch="aarch64"\ntarget_family="unix"\ntarget_os="macos"\nunix\ndebug_assertions\n'
+
+_MAC_ONLY_MARKERS = {
+    "M_MAC_FN", "M_STACKED", "M_MIXED_MAC", "M_ARM_MAC", "M_PLATFORM_MAC",
+    "M_MAC_ONLY_FILE", "M_IOKIT_FILE", "M_GENERIC_MAC", "M_BLOCK_MAC", "M_UNSAFE_MAC",
+    "M_OUTER_INNER_MAC", "M_IMP_MAC", "M_CHAR_MAC", "M_RAW_MAC", "M_COMMENT_MAC",
+    "M_FIELD_MAC",
+}
+_NOT_MAC_MARKERS = {"M_OTHER_FN", "M_MIXED_OTHER", "M_PLATFORM_OTHER", "M_IMP_OTHER"}
+
+
+def _plan_fixture_mutants() -> list[dict]:
+    """One mutant per `M_*` marker, spanning the marker, plus a whole-body
+    FnValue mutant for `mixed` whose span STARTS inside a macOS-only
+    statement but covers the whole body: built everywhere, never excluded."""
+    mutants = []
+    for path, text in _PLAN_FILES.items():
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for m in re.finditer(r"M_[A-Z_]+", line):
+                col = m.start() + 1
+                mutants.append({
+                    "file": path,
+                    "name": f"{path}:{lineno}:{col}: replace {m.group(0)} -> u32 with 0",
+                    "span": {
+                        "start": {"line": lineno, "column": col},
+                        "end": {"line": lineno, "column": col + len(m.group(0))},
+                    },
+                })
+    lines = _PLAN_LIB_RS.splitlines()
+    first = next(i for i, ln in enumerate(lines, 1) if "fn mixed()" in ln) + 1
+    last = next(i for i, ln in enumerate(lines, 1) if "M_MIXED_TAIL" in ln)
+    mutants.append({
+        "file": "crates/x/src/lib.rs",
+        "name": f"crates/x/src/lib.rs:{first}:5: replace mixed -> u32 with 1",
+        "span": {"start": {"line": first, "column": 5}, "end": {"line": last, "column": 40}},
+    })
+    # No span at all, in a macOS-only file: it cannot be placed, so it is
+    # tested, never excluded.
+    mutants.append({"file": "crates/x/src/mac_only.rs", "name": "crates/x/src/mac_only.rs: M_NOSPAN"})
+    return mutants
+
+
+def _marker_of(name: str) -> str:
+    m = re.search(r"(M_[A-Z_]+)", name)
+    return m.group(1) if m else "FNVALUE_MIXED"
+
+
+PLAN_SELF_TEST_CASES = [
+    {
+        "name": "linux: every macOS-only mutant excluded, nothing else",
+        "cfg": _LINUX_CFG,
+        "expect_markers": _MAC_ONLY_MARKERS,
+        "per_shard": 25,
+        "max_shards": 20,
+        "expect_shards": 1,
+    },
+    {
+        "name": "macos (aarch64): the not-macOS mutants excluded instead, nothing else",
+        "cfg": _MAC_CFG,
+        "expect_markers": _NOT_MAC_MARKERS,
+        "per_shard": 5,
+        "max_shards": 20,
+        # 38 fixture mutants - 4 excluded = 34 testable -> ceil(34 / 5) = 7.
+        "expect_shards": 7,
+    },
+    {
+        "name": "the cap holds: more testable mutants than per_shard * max_shards",
+        "cfg": _LINUX_CFG,
+        "expect_markers": _MAC_ONLY_MARKERS,
+        "per_shard": 1,
+        "max_shards": 3,
+        "expect_shards": 3,
+    },
+]
+
+
+def plan_self_test() -> list[str]:
+    failures = []
+    mutants = _plan_fixture_mutants()
+    for case in PLAN_SELF_TEST_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, text in _PLAN_FILES.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            (root / "mutants.json").write_text(json.dumps(mutants))
+            (root / "files.json").write_text(
+                json.dumps([{"package": "x", "path": f} for f in _PLAN_FILES])
+            )
+            (root / "cfg.txt").write_text(case["cfg"])
+            proc = _run_self([
+                "--plan", "--mutants-json", "mutants.json", "--files-json", "files.json",
+                "--rustc-cfg", "cfg.txt", "--exclude-re-out", "exclude.txt",
+                "--summary-out", "summary.md", "--per-shard", str(case["per_shard"]),
+                "--max-shards", str(case["max_shards"]), "--root", str(root),
+            ], cwd=root)
+            problems = []
+            if proc.returncode != 0:
+                problems.append(f"exited {proc.returncode}: {proc.stderr.strip()}")
+            else:
+                outputs = dict(ln.split("=", 1) for ln in proc.stdout.splitlines() if "=" in ln)
+                patterns = (root / "exclude.txt").read_text().splitlines()
+                excluded = {
+                    m["name"] for m in mutants
+                    if any(re.fullmatch(pat, m["name"]) for pat in patterns)
+                }
+                got = {_marker_of(n) for n in excluded}
+                if got != case["expect_markers"]:
+                    problems.append(
+                        f"excluded {sorted(got)}, expected {sorted(case['expect_markers'])}"
+                    )
+                if len(patterns) != len(excluded):
+                    problems.append(f"{len(patterns)} patterns matched {len(excluded)} mutants")
+                expect_testable = len(mutants) - len(case["expect_markers"])
+                want = {
+                    "planned": str(len(mutants)),
+                    "not_built": str(len(case["expect_markers"])),
+                    "testable": str(expect_testable),
+                    "shard_count": str(case["expect_shards"]),
+                    "shards": json.dumps(list(range(case["expect_shards"]))),
+                }
+                for k, v in want.items():
+                    if outputs.get(k) != v:
+                        problems.append(f"{k}={outputs.get(k)!r}, expected {v!r}")
+                summary = (root / "summary.md").read_text()
+                for marker in case["expect_markers"]:
+                    if marker not in summary:
+                        problems.append(f"summary does not name excluded {marker}")
+            if problems:
+                failures.append(
+                    f"  [plan] {case['name']}\n" + "".join(f"    - {p}\n" for p in problems)
+                )
+
+    # Zero testable mutants is zero shards and an empty matrix, which the
+    # workflow reads as "skip the shard job" (a matrix over [] is an error).
+    if plan_shards(0, 25, 20) != 0 or plan_shards(1, 25, 20) != 1 or plan_shards(26, 25, 20) != 2:
+        failures.append("  [plan] plan_shards boundaries wrong (0 -> 0, 1 -> 1, 26 -> 2)")
+
+    # An unreadable listing is a hard failure, never a zero-mutant plan.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "mutants.json").write_text("")
+        (root / "files.json").write_text("[]")
+        (root / "cfg.txt").write_text(_LINUX_CFG)
+        proc = _run_self([
+            "--plan", "--mutants-json", "mutants.json", "--files-json", "files.json",
+            "--rustc-cfg", "cfg.txt", "--exclude-re-out", "x.txt", "--summary-out", "s.md",
+            "--per-shard", "25", "--max-shards", "20",
+        ], cwd=root)
+        if proc.returncode != 2 or "shard_count=0" in proc.stdout:
+            failures.append(
+                f"  [plan] an empty --mutants-json must exit 2 with no plan, got "
+                f"{proc.returncode}: {proc.stdout.strip()!r}"
+            )
+
+    # The escaper produces patterns the Rust `regex` crate accepts: only its
+    # own metacharacters are escaped (Rust rejects `\\ ` and `\\:`), and each
+    # pattern matches its own name and not a neighbor's.
+    name = "src/a.rs:12:5: replace Foo::bar -> Result<(), E> with Ok(()) & [x] {y} ~#-"
+    pat = "^" + rust_regex_escape(name) + "$"
+    if "\\ " in pat or "\\:" in pat or "\\/" in pat:
+        failures.append(f"  [plan] escaper produced an escape Rust's regex rejects: {pat}")
+    if not re.fullmatch(pat, name) or re.fullmatch(pat, name.replace(":12:", ":13:")):
+        failures.append(f"  [plan] escaped pattern does not match exactly its own name: {pat}")
     return failures
 
 
@@ -3516,22 +4626,31 @@ def self_test() -> int:
                 )
     failures += count_self_test()
     failures += floor_check_self_test()
+    failures += plan_self_test()
     if failures:
         print("ci-mutants-summary self-test FAILED:\n" + "\n".join(failures))
         return 1
-    total = len(SELF_TEST_CASES) + len(COUNT_SELF_TEST_CASES) + len(FLOOR_CHECK_SELF_TEST_CASES)
+    total = (
+        len(SELF_TEST_CASES)
+        + len(COUNT_SELF_TEST_CASES)
+        + len(FLOOR_CHECK_SELF_TEST_CASES)
+        + len(PLAN_SELF_TEST_CASES)
+    )
     print(f"ci-mutants-summary self-test passed: {total} cases")
     return 0
 
 
 USAGE = (
     "usage: ci-mutants-summary.py <exit_code> <diff|full> <title> "
-    "[--changed-lines N] [--job-status success|failure|cancelled] "
+    "[--changed-lines N] [--not-built N] [--job-status success|failure|cancelled] "
     "[out_dir_candidate ...]\n"
     "       ci-mutants-summary.py --count-changed-lines <unified.diff> "
     "[--manifest-path <Cargo.toml>] [--mutants-list <list.json>]\n"
     "       ci-mutants-summary.py --floor-check <changed_lines> <title> "
-    "[shard_dir ...]\n"
+    "[--not-built N] [--planned N] [shard_dir ...]\n"
+    "       ci-mutants-summary.py --plan --mutants-json <in-diff list> --files-json "
+    "<list-files> --rustc-cfg <rustc --print cfg> --exclude-re-out <file> "
+    "--summary-out <file> --per-shard N --max-shards N [--root <dir>] [--scope <label>]\n"
     "       ci-mutants-summary.py --self-test"
 )
 
@@ -3543,6 +4662,8 @@ if __name__ == "__main__":
         sys.exit(count_changed_lines_main(sys.argv[1:]))
     if "--floor-check" in sys.argv:
         sys.exit(floor_check_main(sys.argv[1:]))
+    if "--plan" in sys.argv:
+        sys.exit(plan_main(sys.argv[1:]))
 
     args = sys.argv[1:]
 
@@ -3570,6 +4691,21 @@ if __name__ == "__main__":
             print("--job-status requires a value", file=sys.stderr)
             sys.exit(2)
         job_status = args[i + 1]
+        del args[i : i + 2]
+
+    # `--not-built N`: mutants of this scope the plan (`--plan`) excluded as
+    # not compiled on this platform. Only consulted when the run evaluated
+    # zero mutants, to tell "the diff resolved, all of it to code not built
+    # here" from the wiring-broken zero.
+    not_built = 0
+    if "--not-built" in args:
+        i = args.index("--not-built")
+        raw = args[i + 1] if i + 1 < len(args) else ""
+        try:
+            not_built = int(raw)
+        except ValueError:
+            print(f"--not-built must be an integer, got {raw!r}", file=sys.stderr)
+            sys.exit(2)
         del args[i : i + 2]
 
     changed_lines = 0
@@ -3629,7 +4765,7 @@ if __name__ == "__main__":
             # it gets a real, distinguishable exit status and a report that
             # actually lands in $GITHUB_STEP_SUMMARY (this generic branch's
             # message, below, only ever went to stderr).
-            sys.exit(main(CANCELLED_SENTINEL, args[1], args[2], args[3:], changed_lines))
+            sys.exit(main(CANCELLED_SENTINEL, args[1], args[2], args[3:], changed_lines, not_built))
         print(
             "exit_code is empty — the mutation step did not run (skipped by an "
             "earlier failure or a cancelled job), not that it ran and failed",
@@ -3641,4 +4777,4 @@ if __name__ == "__main__":
     except ValueError:
         print(f"exit_code must be an integer, got {args[0]!r}", file=sys.stderr)
         sys.exit(2)
-    sys.exit(main(code, args[1], args[2], args[3:], changed_lines))
+    sys.exit(main(code, args[1], args[2], args[3:], changed_lines, not_built))

@@ -19488,18 +19488,22 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
     }
 
-    /// A trajectory the model made huge and sparse (1 PiB of holes). The
+    /// A trajectory the model made huge and sparse (1 TiB of holes). The
     /// tailer used to size one buffer from `fstat` and read to the end,
     /// which aborts the host process on allocation. It must read a bounded
     /// amount per poll, drop an unterminated line that outgrows its cap
     /// with ONE warning, and keep the process alive.
+    ///
+    /// 1 TiB, not the 1 PiB this used to use: ext4 (Linux CI runners) caps a
+    /// file at 16 TiB and refuses the larger `set_len` with EFBIG. 1 TiB is
+    /// still far past any buffer the old read-to-end could allocate.
     #[test]
     fn tailer_survives_a_huge_sparse_trajectory_with_one_warning() {
         let tmp = TempDir::new().unwrap();
         let rt = tmp.path().join("out/.darkmux-runtime");
         fs::create_dir_all(&rt).unwrap();
         let f = fs::File::create(rt.join("trajectory.jsonl")).unwrap();
-        f.set_len(1u64 << 50).unwrap();
+        f.set_len(1u64 << 40).unwrap();
         drop(f);
         let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let lines_c = lines.clone();

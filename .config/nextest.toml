@@ -44,3 +44,20 @@ final-status-level = "slow"
 slow-timeout = { period = "60s", terminate-after = 5 }
 retries = 0
 fail-fast = false
+
+[profile.mutants]
+# Used by cargo-mutants (`--test-tool nextest` in quality.yml's mutation jobs),
+# where every test run answers one question: does ANY test fail against this
+# mutant? So it stops at the first failure (`fail-fast`): one failing test
+# already catches the mutant, and running the rest of the suite after it only
+# costs time, once per caught mutant. One retry, so a flaky test has to fail
+# twice to count as catching a mutant, and cannot fail the unmutated baseline
+# on its own. The ship gate's flake policy is the `ci` profile's, not this.
+#
+# The per-test kill is 6 x 60s, one period LONGER than cargo-mutants' own
+# `--timeout 300` on the whole test run, so a mutant that hangs a test is
+# stopped by cargo-mutants and reported TIMEOUT (not adjudicated) rather than
+# killed here first and miscounted as caught. A plain hang is still bounded.
+slow-timeout = { period = "60s", terminate-after = 6 }
+retries = 1
+fail-fast = true

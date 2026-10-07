@@ -1177,7 +1177,17 @@ mod tests {
             .expect("an envelope.json must exist after finalize_mission");
         assert_eq!(persisted.mission_id, "m6");
         assert_eq!(persisted.status, MissionOutcomeStatus::Degraded);
-        assert_eq!(persisted.warnings, vec!["remote probe token budget exhausted".to_string()]);
+        // finalize appends its own records-emitted warning when the records
+        // carry no machine_uid, which is the case on every host but a Mac
+        // (`darkmux_hardware::machine_uid` reads the macOS IOPlatformUUID).
+        let mut expected = vec!["remote probe token budget exhausted".to_string()];
+        if darkmux_hardware::machine_uid().is_none() {
+            expected.push(
+                "records-emitted: mission `m6`'s records carry no machine_uid; host samples not joined"
+                    .to_string(),
+            );
+        }
+        assert_eq!(persisted.warnings, expected);
         assert_eq!(persisted.payload["confirmed"], serde_json::json!(2));
     }
 

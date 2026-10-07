@@ -2286,6 +2286,17 @@ mod tests {
         assert!(m2.sources[0].tree.join("a.txt").exists());
     }
 
+    /// Hold the directory at `path` open so its inode cannot be freed and
+    /// handed to a directory created later at the same path. The rebuild
+    /// tests below compare inode numbers to tell "rebuilt" from "reused";
+    /// that is only sound while the old inode stays allocated. ext4 (Linux)
+    /// hands a freed inode straight back to the next directory created in
+    /// the same place, so without the pin a genuine rebuild read as reuse
+    /// there; APFS happens not to reuse one this soon.
+    fn pin_inode(path: &Path) -> fs::File {
+        fs::File::open(path).expect("open the tree directory to pin its inode")
+    }
+
     /// (#2399 review) …but reuse never costs the pristine-tree guarantee:
     /// a tree someone has written into is torn down and rebuilt, exactly
     /// as before. This is the guard on the reuse check above.
@@ -2299,6 +2310,7 @@ mod tests {
         let m1 = materialize(&spec, RW).unwrap();
         let tree = m1.sources[0].tree.clone();
         let ino1 = fs::metadata(&tree).unwrap().ino();
+        let _pin = pin_inode(&tree);
         fs::write(tree.join("scribble.txt"), "someone wrote here\n").unwrap();
         fs::write(tree.join("a.txt"), "and edited a tracked file\n").unwrap();
         drop(m1);
@@ -2383,6 +2395,7 @@ mod tests {
         let m1 = materialize(&spec, RW).unwrap();
         let tree = m1.sources[0].tree.clone();
         let ino1 = fs::metadata(&tree).unwrap().ino();
+        let _pin = pin_inode(&tree);
         fs::write(tree.join("scribble.txt"), "untracked, nothing else\n").unwrap();
         drop(m1);
 
@@ -2408,6 +2421,7 @@ mod tests {
         let sha = m1.sources[0].sha.clone();
         let ours = workdir.path().join("mirror").join("app.git");
         let ino1 = fs::metadata(&tree).unwrap().ino();
+        let _pin = pin_inode(&tree);
         drop(m1);
 
         // Hand the tree path over to a second, unrelated bare mirror of the

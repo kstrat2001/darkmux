@@ -52,6 +52,18 @@ name: quality
 # CANCELLED verdict (with whatever partial progress cargo-mutants had
 # already written) instead of erroring to stderr. See
 # `scripts/ci-mutants-summary.py`'s own `CANCELLED_SENTINEL`.
+#
+# LINUX FOR THE PR-DIFF JOBS AND COVERAGE (2026-10-07). Every job in this file
+# used to run on `macos-latest`, competing with ci.yml's macOS build+test+lint
+# for the account's handful of concurrent macOS runners. On PR #3100's run
+# (quality run 37522837813) the six root shards and coverage QUEUED 21 to 182
+# minutes while every Linux job started at once, and each shard then ran into
+# its 45-minute timeout. The PR-diff mutation jobs and coverage now run on
+# `ubuntu-latest`; ci.yml's macOS jobs are untouched, and the nightly sweep
+# stays on macOS for now (it does not run on PRs). Code compiled only on macOS
+# is not built on Linux; the plan job finds those mutants and reports them as
+# NOT TESTED ON THIS PLATFORM, by name and count, instead of letting them read
+# as survivors (see `mutants-in-diff-plan` and `ci-mutants-summary.py --plan`).
 
 on:
   pull_request:
@@ -87,10 +99,22 @@ on:
     # measured a single real diff (PR #2731) at 167 mutants concentrated in
     # the tree's most expensive crate, enough to outrun that job's own
     # 60-minute budget on its own — it now gets the SAME sharding treatment
-    # (`mutants-in-diff`'s own 6-way `--shard` matrix), for the same reason,
-    # just sized against that job's own much smaller mutant counts.
+    # (`mutants-in-diff`'s own `--shard` matrix, 6-way then, sized from the
+    # diff's own mutant count since 2026-10-07), for the same reason.
     - cron: "23 7 * * *"
   workflow_dispatch:
+    inputs:
+      diff_base:
+        # The PR-diff jobs only run on a pull_request, so a change to them
+        # could only be measured on a PR whose diff happened to be large.
+        # This replays them against any range: dispatch on a ref whose HEAD
+        # is the change and name the commit it is measured from.
+        description: >-
+          Run the PR-diff mutation jobs against <diff_base>...HEAD of the
+          dispatched ref instead of the nightly sweep (a commit SHA or ref).
+          Empty runs the nightly sweep, as before.
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -115,7 +139,199 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  mutants-in-diff-plan:
+    # (2026-10-07) THE PLAN for the root PR-diff mutation shards below:
+    # count this diff's mutants once, split off the ones this platform does
+    # not compile, and size the shard matrix to the count.
+    #
+    # WHY THE COUNT DRIVES THE SHARDS. The shard count used to be a fixed 6
+    # (#2734, sized for #2731's 167 mutants). PR #3100's diff had 637 in-diff
+    # mutants: about 107 per shard against a 45-minute budget sized for
+    # about 28, and every shard was cancelled at its timeout (quality run
+    # 37522837813). A fixed count is only right for diffs of the size it was
+    # measured on. `cargo mutants --list` costs seconds and builds nothing, so
+    # the plan asks it first and gives every shard about the same load.
+    #
+    # PER_SHARD 25: #2734's own sizing (about 28 per shard fitting its budget
+    # with real headroom), rounded down. MAX_SHARDS 20: GitHub's concurrent-
+    # job limit on a Free account (Pro allows 40). A matrix wider than the
+    # account can run at once only queues its own tail behind its head, and
+    # every shard pays a fixed setup and baseline; past this cap the shards
+    # get larger instead, which `--plan` reports in its summary.
+    #
+    # NOT BUILT ON THIS PLATFORM. cargo-mutants ignores platform `cfg`, so on
+    # Linux it would list, and "test", mutants inside macOS-only code: each
+    # one a full build and test cycle that ends MISSED because the compiler
+    # never saw the change. `--plan` reads the runner's cfg set from `rustc
+    # --print cfg`, finds the mutants whose code that set compiles out, and
+    # writes them as exact `--exclude-re` patterns every shard passes. They
+    # are listed by name in this job's summary and counted in the floor
+    # check's: reported as not tested, never dropped silently.
+    #
+    # The root floor's input (`changed_lines`, #1716/#2605) is computed here
+    # too, once, rather than in the floor job: same commands, same
+    # independence from `--in-diff` (its listing call has no `--in-diff`).
+    # That leaves the floor job needing no Rust toolchain at all.
+    name: mutation — PR diff plan (count, platform split, shard matrix)
+    runs-on: ubuntu-latest
+    # (#2896) Only on a PR labeled `full-ci`. An ordinary PR is the light
+    # gate; merged code in the workspace crates is mutated by the nightly
+    # sweep below (which does NOT cover runtime/ or the bundler: those keep
+    # their PR-diff job on every PR). Every PR used to queue up to 7 of these
+    # jobs against a ~5-job macOS concurrency limit, measured at up to 13
+    # minutes of queueing. This job carries the gate for the shards and the
+    # floor check, which run only when it ran. A dispatch with `diff_base`
+    # replays the same jobs against that range (see `workflow_dispatch`).
+    if: (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')) || (github.event_name == 'workflow_dispatch' && inputs.diff_base != '')
+    timeout-minutes: 20
+    env:
+      DIFF_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.diff_base }}
+      PER_SHARD: "25"
+      MAX_SHARDS: "20"
+    outputs:
+      planned: ${{ steps.plan.outputs.planned }}
+      not_built: ${{ steps.plan.outputs.not_built }}
+      testable: ${{ steps.plan.outputs.testable }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+      shards: ${{ steps.plan.outputs.shards }}
+      platform: ${{ steps.plan.outputs.platform }}
+      changed_lines: ${{ steps.floor.outputs.changed_lines }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `--in-diff` needs the merge base to compute the changed lines.
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for the plan and every shard: what they reuse is the
+          # registry and the installed cargo-mutants. Their own builds happen
+          # in cargo-mutants' copied trees, never in this `target/`, so there
+          # is no target directory worth caching (#2734's per-shard keys
+          # assumed one; with a dynamic shard count they would also fill the
+          # repo's cache quota one key per shard).
+          shared-key: mutants-in-diff
+          cache-targets: "false"
+
+      - name: Install cargo-mutants
+        # (#1716) PINNED — see `mutants-in-diff-extra`'s install step for the
+        # rationale. Five sites read this version; bump them together.
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Diff against the merge base
+        run: |
+          mkdir -p plan
+          git diff "$DIFF_BASE"...HEAD -- '*.rs' > plan/pr.diff
+          echo "changed Rust lines (all, informational only): $(grep -cE '^\+([^+]|$)' plan/pr.diff || true)"
+
+      - name: Root floor input (changed lines in mutation scope)
+        # (#2734) Moved here unchanged from the floor job (which computed it
+        # there after every shard had finished). See #1716/#2499/#2544/
+        # #2605/#2606 for why each piece exists.
+        id: floor
+        run: |
+          # (#2605) The authoritative source, asked once: `cargo mutants
+          # --list --json` with NO `--in-diff`, so the floor does not share
+          # cargo-mutants' diff parser with the invocations it guards (a
+          # break there would zero both together). (#2606) Skipped when no
+          # `.rs` file changed.
+          MUTLIST_ROOT_FLAG=()
+          if [ -s plan/pr.diff ]; then
+            if cargo mutants --workspace --list --json > /tmp/mutlist-root.json 2>/tmp/mutlist-root.err; then
+              MUTLIST_ROOT_FLAG=(--mutants-list /tmp/mutlist-root.json)
+            else
+              echo "::warning::cargo mutants --workspace --list --json failed — the #2605 listing-based floor narrowing is skipped for the root invocation this run (falling back to the heuristic alone); see the job log below:"
+              cat /tmp/mutlist-root.err
+            fi
+          else
+            echo "(#2606) no changed .rs file anywhere in this PR — skipping the #2605 listing call for the root invocation (nothing for it to narrow)"
+          fi
+
+          CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines plan/pr.diff --manifest-path Cargo.toml "${MUTLIST_ROOT_FLAG[@]}")
+          echo "changed Rust lines (in workspace mutation scope, mutable-looking only): $CHANGED"
+          echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: List this diff's mutants and plan the shards
+        id: plan
+        run: |
+          # The plan's output is piped through `tee`; without pipefail a
+          # failed `--plan` would hide behind tee's exit status.
+          set -o pipefail
+          if [ -s plan/pr.diff ]; then
+            # A non-zero exit (5 FilterDiffMismatch, 6 FilterDiffInvalid, ...)
+            # means the listing itself failed: fail here, loudly, rather than
+            # plan zero shards. Exit 0 with NOTHING on stdout is cargo-mutants'
+            # "No mutants to filter": an empty list, which the floor check
+            # judges against `changed_lines` like any other zero.
+            if ! cargo mutants --workspace --in-diff plan/pr.diff --list --json > plan/mutants.json 2> plan/list.err; then
+              echo "::error::cargo mutants --list --in-diff failed; see below"
+              cat plan/list.err
+              exit 1
+            fi
+            [ -s plan/mutants.json ] || { cat plan/list.err; echo '[]' > plan/mutants.json; }
+            cargo mutants --workspace --list-files --json > plan/files.json
+          else
+            echo '[]' > plan/mutants.json
+            echo '[]' > plan/files.json
+          fi
+          rustc --print cfg > plan/rustc-cfg.txt
+          python3 scripts/ci-mutants-summary.py --plan \
+            --mutants-json plan/mutants.json --files-json plan/files.json \
+            --rustc-cfg plan/rustc-cfg.txt --exclude-re-out plan/exclude-re.txt \
+            --summary-out plan/summary.md \
+            --per-shard "$PER_SHARD" --max-shards "$MAX_SHARDS" | tee -a "$GITHUB_OUTPUT"
+          cat plan/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # Every shard reads the SAME diff and exclusions from here, so the
+          # plan's count and the shards' `--shard i/N` partition one list.
+          name: mutants-in-diff-plan
+          path: plan/
+
   mutants-in-diff:
+    # (2026-10-07) What changed here, and why; the #2734 record follows.
+    #
+    #   - The shard count comes from `mutants-in-diff-plan` (about 25
+    #     mutants per shard, at most 20 shards) instead of a fixed 6: see that
+    #     job's comment for the #3100 measurement behind it. `--shard i/N`
+    #     still partitions cargo-mutants' own filtered list, as #2734 proved
+    #     for the fixed count; the floor job now also checks the shards'
+    #     totals add up to the plan's count.
+    #   - `ubuntu-latest`, not `macos-latest` (see the file header). The
+    #     plan's exclusions keep macOS-only code from reading as survivors.
+    #   - `--test-tool nextest` under `.config/nextest.toml`'s `mutants`
+    #     profile. nextest runs each test in its own process, so the
+    #     shared-process races #3100's shard baselines hit under plain
+    #     `cargo test` (tests as threads of one process) cannot happen, a
+    #     hung test is terminated by the
+    #     per-test limit, and `fail-fast` stops a caught mutant's run at its
+    #     first failing test. nextest skips doctests; ci.yml runs the one
+    #     there is in its own step, and it is a `compile_fail` check no
+    #     mutant can reach.
+    #   - Each mutant build has no debug info (`CARGO_PROFILE_*_DEBUG=0`,
+    #     cargo-mutants' own performance advice: a mutant only needs its
+    #     tests to pass or fail): measured on Linux, the workspace's test
+    #     build is 2.0 GB without it against 9.2 GB with it, and `-j 4` keeps
+    #     four of those copies at once. Incremental compilation is back on
+    #     for the mutate step (`rust-cache` turns it off job-wide):
+    #     cargo-mutants rebuilds the same tree once per mutant in each worker,
+    #     which is the case incremental compilation exists for.
+    #   - Every test process runs under a 4 GiB data limit
+    #     (`scripts/ci-mutants-test-cap.sh`): the first real run lost a
+    #     shard's runner to a mutant that allocates without bound.
+    #   - The diff comes from the plan's artifact rather than each shard's
+    #     own `git diff`, so the checkout no longer needs full history
+    #     (`fetch-depth: 1`, like ci.yml's test job, which runs the same
+    #     suite), and the four `--copy-vcs` copies of `.git` stay small.
+    #
     # (#2734) SHARDED — the root/workspace `--in-diff` invocation used to be
     # one unsharded `cargo mutants --workspace --in-diff ... -j 4` call in
     # this same job, the same disease #2499 already fixed for the nightly
@@ -162,7 +378,7 @@ jobs:
     # is not "fast per mutant" when the diff concentrates in the tree's most
     # expensive crate — which #2731's genuinely did.
     #
-    # SHARDING AXIS: fixed-index `--shard i/6` over the SAME `--workspace
+    # SHARDING AXIS: `--shard i/N` (N was a fixed 6) over the SAME `--workspace
     # --in-diff` invocation (not package-first like the nightly) —
     # deliberately, because a per-PR diff touches an unpredictable SUBSET
     # of packages each time (this PR touched 5; the next might touch 1 or
@@ -175,7 +391,8 @@ jobs:
     # shard), so it partitions whatever the diff happens to touch without
     # needing to know the package layout up front.
     #
-    # SHARD COUNT: 6, sized against the REAL throughput above, not the
+    # SHARD COUNT (#2734; superseded 2026-10-07, the plan job sizes it
+    # from the diff now, see above): 6, sized against the REAL throughput above, not the
     # nightly's 21.4s/mutant (which would have undersized this by ~3x).
     # 167 mutants / 6 ~= 28/shard; at the measured ~62s/mutant that is
     # ~29 minutes of mutation-testing plus the ~7-minute baseline (paid
@@ -190,7 +407,8 @@ jobs:
     # this fixed shard count does not scale itself to the diff's actual
     # size, tracked as a deliberate, documented follow-up (dynamic shard
     # count / a genuine mutant CAP with honest partial reporting), not
-    # attempted here. What sharding already buys for that case regardless:
+    # attempted here. (Done 2026-10-07: `mutants-in-diff-plan`. #3100's 637
+    # mutants were that gap, at about 107 per shard.) What sharding already buys for that case regardless:
     # a shard that still overruns fails CLOSED on its own (see "Report
     # survivors" below) without silently discarding the other 5 shards'
     # real, complete results the way one giant cancelled invocation used
@@ -206,24 +424,23 @@ jobs:
     # out, to `mutants-in-diff-root-floor` below — see that job's own
     # comment for why a per-shard version of that check would itself be a
     # new false-failure source.
-    name: "mutation — tests that cannot fail (PR diff only, root, shard ${{ matrix.shard }}/6)"
-    runs-on: macos-latest
-    # (#2896) Only on a PR labeled `full-ci`. An ordinary PR is the light
-    # gate; merged code in the workspace crates is mutated by the nightly
-    # sweep below (which does NOT cover runtime/ or the bundler: those keep
-    # their PR-diff job on every PR). Every PR queued up to 7 of these macOS jobs against a ~5-job
-    # macOS concurrency limit, measured at up to 13 minutes of queueing.
-    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
+    name: "mutation — tests that cannot fail (PR diff only, root, shard ${{ matrix.shard }}/${{ needs.mutants-in-diff-plan.outputs.shard_count }})"
+    runs-on: ubuntu-latest
+    needs: mutants-in-diff-plan
+    # (#2896) The `full-ci` gate lives on the plan job; this job runs only
+    # when the plan ran and succeeded. A plan of zero shards (no testable
+    # mutant in the diff) skips it: a matrix over an empty list is an error,
+    # and the floor job still judges that zero against the diff.
+    if: needs.mutants-in-diff-plan.outputs.shard_count != '0'
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: ${{ fromJSON(needs.mutants-in-diff-plan.outputs.shards) }}
+    env:
+      SHARD_COUNT: ${{ needs.mutants-in-diff-plan.outputs.shard_count }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # `--in-diff` needs the merge base to compute the changed lines.
-          fetch-depth: 0
 
       - name: Install Rust stable toolchain
         run: |
@@ -231,41 +448,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Scoped per shard: 6 parallel jobs sharing ONE cache key would
-          # serialize on the cache lock / thrash each other's warm target
-          # dir for no benefit — each shard mutates a different slice of
-          # the same tree and gets no reuse from another shard's build.
-          key: mutants-in-diff-shard-${{ matrix.shard }}
+          # The plan job's cache (see its comment). It already saved one;
+          # N parallel shards saving the same key would only race.
+          shared-key: mutants-in-diff
+          cache-targets: "false"
+          save-if: "false"
 
       - name: Install cargo-mutants
-        # (#1716) PINNED — see `mutants-in-diff-extra`'s own install step
-        # below for the full rationale (that job carries the comment
-        # because it is the direct descendant of where this originally
-        # lived). Five install sites now read this SAME pinned version —
-        # this job, `mutants-in-diff-root-floor`, `mutants-in-diff-extra`,
-        # `mutants-full`, and `mutants-full-small` — bump all five together.
+        # (#1716) PINNED — see `mutants-in-diff-extra`'s install step. Bump
+        # all five install sites together.
         run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          # The version ci.yml's test job pins.
+          tool: cargo-nextest@0.9.140
 
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
 
-      - name: Diff against the merge base
-        # (#2734) Deliberately MINIMAL compared to the pre-sharding version
-        # of this step: this shard only needs `/tmp/pr.diff` for
-        # `--in-diff` below. The floor-check narrowing (`--list --json`,
-        # `--mutants-list`, `changed_lines`) moved to `mutants-in-diff-root-
-        # floor`'s own diff step, computed ONCE there instead of 6 times
-        # here — see that job's comment for why a per-shard floor would
-        # itself be a new false-failure source, not just redundant compute.
-        run: |
-          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr.diff
-          echo "changed Rust lines (all, informational only): $(grep -cE '^\+([^+]|$)' /tmp/pr.diff || true)"
+      - uses: actions/download-artifact@v4
+        with:
+          name: mutants-in-diff-plan
+          path: plan
 
-      - name: Mutate shard ${{ matrix.shard }}/6 of what this PR touched
+      - name: Mutate shard ${{ matrix.shard }}/${{ needs.mutants-in-diff-plan.outputs.shard_count }} of what this PR touched
         id: mutants
-        # (#2602 round 3) `!cancelled()` — matches the pre-sharding job's
-        # own reasoning verbatim: an earlier step's failure must not leave
-        # this step's `exit_code` output silently absent while "Report
+        # (#2602 round 3) `!cancelled()` — an earlier step's failure must not
+        # leave this step's `exit_code` output silently absent while "Report
         # survivors" below (`always()`) still reads it.
         if: ${{ !cancelled() }}
         run: |
@@ -276,56 +487,64 @@ jobs:
           # and panic without a real `.git` in the copied tree (#1716).
           #
           # `--workspace`: scopes mutation to the whole tree, not just the
-          # root `darkmux` package (#2499) — cargo-mutants' own baseline
-          # then narrows to `PackageSelection::Explicit(all_mutated_
-          # packages)`, only the packages this invocation's mutants
-          # actually touch, not the whole workspace.
+          # root `darkmux` package (#2499); cargo-mutants' baseline narrows to
+          # the packages this invocation's mutants touch.
           #
-          # `--timeout 300`: bounds both the baseline test phase and every
-          # mutant's own test phase (#2499's measurement). Per-mutant BUILD
-          # time is NOT bounded by this flag (cargo-mutants has no separate
-          # build timeout) — this job's own comment above names real
-          # samples up to 464.8s for a `darkmux-crew` mutant's build alone,
-          # which is why sharding, not a larger `--timeout`, is the actual
-          # fix here: raising this number moves the per-mutant cliff, it
-          # does not address 167 mutants queued behind one job's budget.
+          # `--timeout 300`: bounds the baseline test phase and every
+          # mutant's test phase (#2499). Build time is not bounded by it;
+          # sharding by count is what keeps a shard inside its budget.
           #
-          # `--shard ${{ matrix.shard }}/6`: this job's own reason to exist
-          # (#2734) — see the job-level comment above for the measurement
-          # behind the count and the proof this partitions cleanly.
+          # `--shard i/N` with N from the plan, over the plan's own diff and
+          # exclusions, so the shards partition exactly the list the plan
+          # counted (the floor job checks the sum).
+          #
+          # `--test-tool nextest` with the repo's `mutants` profile; the
+          # config file is named explicitly so the same flags work for the
+          # runtime/ and bundler workspaces, which have no `.config` of
+          # their own. `--no-tests=pass`: nextest exits 4 when a package
+          # has no tests, and cargo-mutants reads any non-zero test exit as
+          # "caught"; under `cargo test` such a mutant read as missed, which
+          # is the truth.
+          #
+          # Mutant builds go to the larger of `/` and `/mnt` (cargo-mutants
+          # copies the tree into `$TMPDIR` once per worker).
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan/exclude-re.txt)
+          echo "${#EXCLUDES[@]} mutant(s) excluded as not built on this platform"
+          export TMPDIR
+          TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
+          export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
-          cargo mutants --workspace --in-diff /tmp/pr.diff --shard ${{ matrix.shard }}/6 -j 4 --timeout 300 \
-            --copy-vcs true --output mutants-out
+          cargo mutants --workspace --in-diff plan/pr.diff --shard "${{ matrix.shard }}/$SHARD_COUNT" -j 4 --timeout 300 \
+            --copy-vcs true --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          df -h "$TMPDIR" || true
           exit 0
 
-      - name: Report survivors (shard ${{ matrix.shard }}/6)
+      - name: Report survivors (shard ${{ matrix.shard }}/${{ needs.mutants-in-diff-plan.outputs.shard_count }})
         # (#2550) `always()` — this step must report even a CANCELLED shard
         # (this shard's own `timeout-minutes` running out, or a manual
-        # cancel), same reasoning as the pre-sharding job's identically-
-        # named step. `--job-status` carries the same CANCELLED-vs-failure
+        # cancel). `--job-status` carries the CANCELLED-vs-failure
         # distinction.
         #
-        # (#2734) `--changed-lines 0`, ALWAYS, deliberately — this is the
-        # one deviation from the pre-sharding step's own arguments. A
-        # single shard cannot safely answer "should the WHOLE diff have
-        # produced at least one mutant" (a small diff spread across 6
-        # shards legitimately leaves some empty — see the false-failure
-        # this would otherwise cause, documented on `mutants-in-diff-root-
-        # floor` below and red-proven in `ci-mutants-summary.py`'s own
-        # `FLOOR_CHECK_SELF_TEST_CASES`). Passing 0 here disarms ONLY that
-        # one check in `main()`'s diff-mode branch — exit-code correctness,
-        # exit-code/count contradictions, and cancellation handling all
-        # stay fully armed per shard, completely unchanged. The floor
-        # itself did not go away; it moved to the aggregate job below,
-        # where "the whole invocation" is an answerable question again.
+        # (#2734) `--changed-lines 0`, ALWAYS, deliberately: a single shard
+        # cannot answer "should the WHOLE diff have produced at least one
+        # mutant" (a small diff legitimately leaves some shards empty). That
+        # one check moved to the floor job, where the whole invocation is an
+        # answerable question; exit-code correctness, exit-code/count
+        # contradictions and cancellation handling all stay armed per shard.
         if: ${{ always() }}
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants.outputs.exit_code }}" diff \
-            "Mutation testing — this PR's changed lines (root, shard ${{ matrix.shard }}/6)" \
+            "Mutation testing — this PR's changed lines (root, shard ${{ matrix.shard }}/$SHARD_COUNT)" \
             --changed-lines 0 \
             --job-status "${{ job.status }}" \
             mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
@@ -334,7 +553,7 @@ jobs:
         if: always()
         with:
           # v4 requires run-unique artifact names — the shard index makes
-          # each of the 6 matrix jobs distinct, and is also the name
+          # each matrix job distinct, and is also the name
           # `mutants-in-diff-root-floor` downloads by pattern below.
           name: mutants-in-diff-shard-${{ matrix.shard }}
           path: |
@@ -348,21 +567,24 @@ jobs:
     # unmodified. That floor's whole point is catching a WIRING defect
     # (`--in-diff` paths not resolving, an unparseable diff, a package
     # scope excluding the touched crate) by asserting the INVOCATION as a
-    # whole tested something. Sharding turns "the invocation" into 6
-    # invocations — and a small diff (say 3 real mutants) spread across 6
-    # shards legitimately leaves several of them with ZERO, for a reason
-    # that has nothing to do with wiring. Applying the old per-invocation
-    # floor to each shard individually would make THAT the new false-
-    # failure source #2734 opened by fixing the timeout — so each shard's
-    # own "Report survivors" step above disarms it (`--changed-lines 0`)
-    # and this job asks the SAME question, once, about the SUM of every
-    # shard's own total. Same assertion, same place it always logically
-    # lived (the whole invocation), just computed from 6 directories
-    # instead of 1 — see `ci-mutants-summary.py`'s own `floor_check_main`
-    # and `sum_shard_outcomes` for the mechanics, and
-    # `FLOOR_CHECK_SELF_TEST_CASES` for the case that is this job's entire
-    # reason to exist (a diff spread thinner than its shard count must NOT
-    # read as the wiring-broken shape).
+    # whole tested something. Sharding turns "the invocation" into N
+    # invocations — and a small diff spread across N shards legitimately
+    # leaves several of them with ZERO, for a reason that has nothing to do
+    # with wiring. So each shard's own "Report survivors" step disarms it
+    # (`--changed-lines 0`) and this job asks the SAME question, once, about
+    # the SUM of every shard's total. See `ci-mutants-summary.py`'s
+    # `floor_check_main`, `sum_shard_outcomes` and
+    # `FLOOR_CHECK_SELF_TEST_CASES`.
+    #
+    # (2026-10-07) Two inputs from the plan job. `--not-built`: mutants this
+    # platform does not compile count toward "the diff resolved" (a diff
+    # entirely inside macOS-only code legitimately leaves no shard to run,
+    # and must not read as broken wiring). `--planned`: every mutant the
+    # plan listed must be accounted for, evaluated by a shard or listed as
+    # not built; a shard cut off by its timeout, or never uploaded, now
+    # fails this aggregate too instead of passing it on a partial sum.
+    # `changed_lines` comes from the plan as well, so this job needs no
+    # Rust toolchain: it reads artifacts and runs Python.
     #
     # `needs:` + `if: !cancelled()`: this job must still report when one or
     # more shards failed, or were cut off by their own `timeout-minutes`
@@ -376,76 +598,26 @@ jobs:
     # concurrency group, and blocked the PR's next quality run behind it.
     # `!cancelled()` also lets the server cancel this job if it is already
     # running when the run is cancelled, where `always()` kept it running.
-    # `github.event_name == 'pull_request'` keeps it from running (and
-    # erroring on missing artifacts) on `push`/`schedule` triggers, where
-    # the shard matrix's own `if:` already skips it entirely.
+    #
+    # (#2896) The plan's `result == 'success'` carries the `full-ci` gate:
+    # on an unlabeled PR the plan is skipped, so this job is too, rather
+    # than failing on shard artifacts that were never made. A failed plan
+    # has already failed loudly; there is nothing for this job to sum.
     name: mutation — PR diff root floor check (aggregate across shards)
-    runs-on: macos-latest
-    needs: mutants-in-diff
-    # (#2896) Same `full-ci` gate as the shards: without it, the status
-    # function would start this job on an unlabeled PR whose shards were
-    # skipped (a skipped `needs:` job does not cancel the run), and it would
-    # fail on their missing artifacts.
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+    runs-on: ubuntu-latest
+    needs: [mutants-in-diff-plan, mutants-in-diff]
+    if: ${{ !cancelled() && needs.mutants-in-diff-plan.result == 'success' }}
     timeout-minutes: 15
+    env:
+      SHARD_COUNT: ${{ needs.mutants-in-diff-plan.outputs.shard_count }}
+      CHANGED_LINES: ${{ needs.mutants-in-diff-plan.outputs.changed_lines }}
+      NOT_BUILT: ${{ needs.mutants-in-diff-plan.outputs.not_built }}
+      PLANNED: ${{ needs.mutants-in-diff-plan.outputs.planned }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust stable toolchain
-        run: |
-          rustup toolchain install 1.97.1 --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: mutants-in-diff-root-floor
-
-      - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked --version 27.1.0
 
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
-
-      - name: Diff against the merge base (root floor input)
-        # (#2734) The EXACT computation the pre-sharding job's own "Diff
-        # against the merge base" step did for the root scope's
-        # `changed_lines` — relocated here unchanged, not reinvented. See
-        # that step's own history (#1716/#2499/#2544/#2605/#2606) for why
-        # each piece exists; this is a straight move, not a rewrite.
-        id: diff
-        run: |
-          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
-
-          # (#2605) The authoritative source, asked once, BEFORE the floor
-          # is computed: `cargo mutants --list --json`, with NO `--in-diff`
-          # — see `ci-mutants-summary.py`'s own module comment for why
-          # omitting `--in-diff` here is what keeps this independent of the
-          # circularity that sank an earlier `--list --in-diff` idea (it
-          # would share cargo-mutants' diff parser and path resolution with
-          # the very invocation it is meant to guard, so a break in one
-          # zeroes both together). Same reasoning applies unchanged now
-          # that the guarded invocation is sharded 6 ways: this listing
-          # call has no `--shard` in it either, for the identical reason.
-          #
-          # (#2606 also-fix) Gated on `/tmp/pr-scope.diff` actually having
-          # content — a PR touching no `.rs` file anywhere has no business
-          # paying this ~10s sweep.
-          MUTLIST_ROOT_FLAG=()
-          if [ -s /tmp/pr-scope.diff ]; then
-            if cargo mutants --workspace --list --json > /tmp/mutlist-root.json 2>/tmp/mutlist-root.err; then
-              MUTLIST_ROOT_FLAG=(--mutants-list /tmp/mutlist-root.json)
-            else
-              echo "::warning::cargo mutants --workspace --list --json failed — the #2605 listing-based floor narrowing is skipped for the root invocation this run (falling back to the heuristic alone); see the job log below:"
-              cat /tmp/mutlist-root.err
-            fi
-          else
-            echo "(#2606) no changed .rs file anywhere in this PR — skipping the #2605 listing call for the root invocation (nothing for it to narrow)"
-          fi
-
-          CHANGED=$(python3 scripts/ci-mutants-summary.py --count-changed-lines /tmp/pr-scope.diff --manifest-path Cargo.toml "${MUTLIST_ROOT_FLAG[@]}")
-          echo "changed Rust lines (in workspace mutation scope, mutable-looking only): $CHANGED"
-          echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
 
       - name: Download shard artifacts
         uses: actions/download-artifact@v4
@@ -453,24 +625,27 @@ jobs:
           pattern: mutants-in-diff-shard-*
           path: shard-artifacts
           # A shard whose own upload step never ran at all (an extremely
-          # early cancellation) leaves fewer than 6 artifacts to match.
-          # A `pattern` that matches fewer artifacts does not fail this
-          # step, and `sum_shard_outcomes` reports a missing directory as a
-          # real, visible absence. (download-artifact@v4 has no
+          # early cancellation) leaves fewer artifacts than shards. A
+          # `pattern` that matches fewer artifacts does not fail this step,
+          # and `sum_shard_outcomes` reports a missing directory as a real,
+          # visible absence. (download-artifact@v4 has no
           # `if-no-artifact-found` input; an earlier version of this step
           # set one, and the action ignored it.)
 
-      - name: Root floor check (aggregate across all 6 shards)
+      - name: Root floor check (aggregate across all shards)
         run: |
+          # One directory per shard the plan started, by index, so a shard
+          # whose artifact is missing is named as missing rather than
+          # silently absent from the list.
+          DIRS=()
+          for ((i = 0; i < SHARD_COUNT; i++)); do
+            DIRS+=("shard-artifacts/mutants-in-diff-shard-$i")
+          done
           python3 scripts/ci-mutants-summary.py --floor-check \
-            "${{ steps.diff.outputs.changed_lines }}" \
-            "Mutation testing — this PR's changed lines (root, floor check across all 6 shards)" \
-            shard-artifacts/mutants-in-diff-shard-0 \
-            shard-artifacts/mutants-in-diff-shard-1 \
-            shard-artifacts/mutants-in-diff-shard-2 \
-            shard-artifacts/mutants-in-diff-shard-3 \
-            shard-artifacts/mutants-in-diff-shard-4 \
-            shard-artifacts/mutants-in-diff-shard-5 \
+            "$CHANGED_LINES" \
+            "Mutation testing — this PR's changed lines (root, floor check across all $SHARD_COUNT shards)" \
+            --not-built "$NOT_BUILT" --planned "$PLANNED" \
+            "${DIRS[@]}" \
             >> "$GITHUB_STEP_SUMMARY"
 
   mutants-in-diff-extra:
@@ -496,15 +671,29 @@ jobs:
     # headroom than `runtime/` alone ever had before, not less — shrinking
     # it without re-measuring would have quietly reopened the #2550 shape
     # for exactly the scope #2602 already showed could fill it.
+    #
+    # (2026-10-07) `ubuntu-latest`, `--test-tool nextest`, and the same
+    # platform split as the root plan, for the same reasons (see
+    # `mutants-in-diff-plan` and `mutants-in-diff`). Linux is also where
+    # `runtime/` actually runs: it ships as the Linux binary inside the
+    # darkmux-runtime image. Neither workspace has macOS-only code today
+    # (their only platform gates are `unix`), so the split is expected to
+    # exclude nothing here; it runs anyway so a future macOS gate is
+    # reported as not tested rather than as a survivor. This job used to
+    # hold a macOS runner on EVERY PR (it is the one mutation job that is
+    # not `full-ci`-gated), which is the slot ci.yml's macOS jobs now get.
     name: mutation — tests that cannot fail (PR diff only, runtime/ + bundler/)
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     # (#2896) Deliberately on EVERY PR, unlike the root shards: the nightly
     # sweep excludes `runtime/` and `plugins/darkmux-bundler-rust/` (see
     # `mutants-full`'s SCOPE note), so this job is their ONLY mutation
     # coverage, and for the bundler the only place its tests run at all.
-    # It is one macOS job and its steps skip when the diff touches neither.
-    if: github.event_name == 'pull_request'
+    # It is one job and its steps skip when the diff touches neither.
+    # A dispatch with `diff_base` replays it (see `workflow_dispatch`).
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.diff_base != '')
     timeout-minutes: 60
+    env:
+      DIFF_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.diff_base }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -528,11 +717,16 @@ jobs:
         # mutate" at exit 2 over three real survivors. The summary script
         # now falls back to the `.txt` files and cross-checks the exit code,
         # so a rename degrades loudly rather than silently; the pin is what
-        # keeps the upgrade a deliberate, reviewed act. (#2734) Five sites
-        # read this SAME pinned version now — `mutants-in-diff`,
-        # `mutants-in-diff-root-floor`, this job, `mutants-full`, and
-        # `mutants-full-small` — bump all five together.
+        # keeps the upgrade a deliberate, reviewed act. Five sites read this
+        # SAME pinned version — `mutants-in-diff-plan`, `mutants-in-diff`,
+        # this job, `mutants-full`, and `mutants-full-small` (the floor job
+        # no longer installs it) — bump all five together.
         run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
 
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
@@ -553,7 +747,7 @@ jobs:
           # identical-looking one, since jobs run on separate runners with
           # no shared filesystem. Cheap (a `git diff`, not the `--list`
           # sweep) to recompute.
-          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
+          git diff "$DIFF_BASE"...HEAD -- '*.rs' > /tmp/pr-scope.diff
 
           # (#2605) Same mechanism as the root floor job's own listing call
           # — see that job's comment for the full non-circularity
@@ -569,7 +763,7 @@ jobs:
           # what actually matches; the repo-root-relative form silently
           # matches nothing ("No mutants to filter", exit 0) — confirmed
           # locally, #2606.
-          git diff "origin/${{ github.base_ref }}"...HEAD --relative=runtime -- 'runtime/*.rs' > /tmp/pr-runtime.diff
+          git diff "$DIFF_BASE"...HEAD --relative=runtime -- 'runtime/*.rs' > /tmp/pr-runtime.diff
 
           MUTLIST_RUNTIME_FLAG=()
           if [ -s /tmp/pr-runtime.diff ]; then
@@ -592,7 +786,7 @@ jobs:
           # comment on why. Small (a full `--list` sweep measures 224
           # mutants, baseline test suite ~0.5s), so a diff-scoped run on it
           # costs almost nothing.
-          git diff "origin/${{ github.base_ref }}"...HEAD --relative=plugins/darkmux-bundler-rust -- 'plugins/darkmux-bundler-rust/*.rs' > /tmp/pr-bundler.diff
+          git diff "$DIFF_BASE"...HEAD --relative=plugins/darkmux-bundler-rust -- 'plugins/darkmux-bundler-rust/*.rs' > /tmp/pr-bundler.diff
 
           MUTLIST_BUNDLER_FLAG=()
           if [ -s /tmp/pr-bundler.diff ]; then
@@ -610,6 +804,39 @@ jobs:
           echo "changed Rust lines (in plugins/darkmux-bundler-rust/ mutation scope, mutable-looking only): $BUNDLER_CHANGED"
           echo "bundler_changed_lines=$BUNDLER_CHANGED" >> "$GITHUB_OUTPUT"
 
+      - name: Plan runtime/ and bundler/ (platform split)
+        # (2026-10-07) The root plan's platform split, per workspace: which
+        # in-diff mutants this platform does not compile, as exclusions the
+        # Mutate steps pass and a summary section naming them. No shards
+        # here, so the shard outputs are not read.
+        id: plan
+        if: ${{ !cancelled() && (steps.diff.outputs.runtime_changed_lines != '0' || steps.diff.outputs.bundler_changed_lines != '0') }}
+        run: |
+          plan_scope() {  # <name> <manifest dir> <in-diff file>
+            local name=$1 dir=$2 diff=$3
+            mkdir -p "plan-$name"
+            if ! cargo mutants --manifest-path "$dir/Cargo.toml" --in-diff "$diff" --list --json > "plan-$name/mutants.json" 2> "plan-$name/list.err"; then
+              echo "::error::cargo mutants --list --in-diff failed for $dir; see below"
+              cat "plan-$name/list.err"
+              return 1
+            fi
+            [ -s "plan-$name/mutants.json" ] || echo '[]' > "plan-$name/mutants.json"
+            cargo mutants --manifest-path "$dir/Cargo.toml" --list-files --json > "plan-$name/files.json"
+            rustc --print cfg > "plan-$name/rustc-cfg.txt"
+            python3 scripts/ci-mutants-summary.py --plan --root "$dir" --scope "$dir/" \
+              --mutants-json "plan-$name/mutants.json" --files-json "plan-$name/files.json" \
+              --rustc-cfg "plan-$name/rustc-cfg.txt" --exclude-re-out "plan-$name/exclude-re.txt" \
+              --summary-out "plan-$name/summary.md" > "plan-$name/outputs.txt"
+            cat "plan-$name/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "${name}_not_built=$(sed -n 's/^not_built=//p' "plan-$name/outputs.txt")" >> "$GITHUB_OUTPUT"
+          }
+          if [ "${{ steps.diff.outputs.runtime_changed_lines }}" != "0" ]; then
+            plan_scope runtime runtime /tmp/pr-runtime.diff
+          fi
+          if [ "${{ steps.diff.outputs.bundler_changed_lines }}" != "0" ]; then
+            plan_scope bundler plugins/darkmux-bundler-rust /tmp/pr-bundler.diff
+          fi
+
       - name: Mutate runtime/ only what this PR touched
         id: mutants_runtime
         if: ${{ !cancelled() && steps.diff.outputs.runtime_changed_lines != '0' }}
@@ -622,9 +849,23 @@ jobs:
           # the host side — #2544 vendored a read-only copy into
           # `runtime/tests/fixtures/` for exactly that reason (see
           # `tests/runtime_fixtures_in_sync.rs`).
+          #
+          # (2026-10-07) nextest, the plan's exclusions and the build
+          # settings: see the root shards' Mutate step. runtime/ has no
+          # `.config/nextest.toml` of its own, hence the explicit file.
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-runtime/exclude-re.txt)
+          export TMPDIR
+          TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
+          export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
           cargo mutants --manifest-path runtime/Cargo.toml --in-diff /tmp/pr-runtime.diff -j 4 --timeout 300 \
-            --copy-vcs true --output mutants-runtime-out
+            --copy-vcs true --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-runtime-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -632,7 +873,7 @@ jobs:
 
       - name: Report survivors (runtime/)
         # (#2550) `!cancelled()` -> `always()`, matching each shard's own
-        # "Report survivors (shard N/6)" step in `mutants-in-diff` above —
+        # "Report survivors (shard i/N)" step in `mutants-in-diff` above —
         # see that step's comment for the full rationale. Kept in lockstep
         # with its OWN Mutate step, which stays on `!cancelled()` for the
         # same reason: don't start a brand-new baseline+mutation run once
@@ -644,6 +885,7 @@ jobs:
             "${{ steps.mutants_runtime.outputs.exit_code }}" diff \
             "Mutation testing — this PR's changed lines (runtime/)" \
             --changed-lines "${{ steps.diff.outputs.runtime_changed_lines }}" \
+            --not-built "${{ steps.plan.outputs.runtime_not_built || '0' }}" \
             --job-status "${{ job.status }}" \
             mutants-runtime-out/mutants.out mutants-runtime.out >> "$GITHUB_STEP_SUMMARY"
 
@@ -691,9 +933,19 @@ jobs:
         id: mutants_bundler
         if: ${{ !cancelled() && steps.diff.outputs.bundler_changed_lines != '0' }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-bundler/exclude-re.txt)
+          export TMPDIR
+          TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
+          export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
           cargo mutants --manifest-path plugins/darkmux-bundler-rust/Cargo.toml --in-diff /tmp/pr-bundler.diff -j 4 --timeout 300 \
-            --copy-vcs true --output mutants-bundler-out
+            --copy-vcs true --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-bundler-out "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -711,6 +963,7 @@ jobs:
             "${{ steps.mutants_bundler.outputs.exit_code }}" diff \
             "Mutation testing — this PR's changed lines (plugins/darkmux-bundler-rust/)" \
             --changed-lines "${{ steps.diff.outputs.bundler_changed_lines }}" \
+            --not-built "${{ steps.plan.outputs.bundler_not_built || '0' }}" \
             --job-status "${{ job.status }}" \
             mutants-bundler-out/mutants.out mutants-bundler.out >> "$GITHUB_STEP_SUMMARY"
 
@@ -738,7 +991,16 @@ jobs:
 
   coverage:
     name: coverage — which lines never execute
-    runs-on: macos-latest
+    # (2026-10-07) Linux, like the PR-diff mutation jobs (see the file
+    # header): on PR #3100's run this job queued 172 minutes for a macOS
+    # runner and then ran for under 10. The number it reports is now the
+    # Linux build's: code compiled only on macOS is not in it, and code
+    # compiled only off macOS is. The tests run under nextest (`cargo
+    # llvm-cov nextest`), the runner ci.yml's test job uses, with the same
+    # `ci` profile: process-per-test, and a hung test fails instead of
+    # running the job into its timeout. nextest skips doctests, which this
+    # job never measured (no `--doctests`).
+    runs-on: ubuntu-latest
     # (#2896) On main pushes and the schedule, and on a PR labeled `full-ci`.
     # It reports and gates nothing, and held a macOS slot for ~700s on
     # every PR.
@@ -764,6 +1026,11 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Coverage summary script self-test
         run: python3 scripts/ci-coverage-summary.py --self-test
 
@@ -774,7 +1041,9 @@ jobs:
       # steps run on `!cancelled()` and read the profile this step left,
       # whatever its verdict. `report` reuses that profile: the tests run once.
       - name: Measure the workspace
-        run: cargo llvm-cov --workspace --no-report --no-fail-fast
+        env:
+          NEXTEST_PROFILE: ci
+        run: cargo llvm-cov nextest --workspace --no-report --no-fail-fast
 
       # `cov.json` is the summary (the badge and the README number);
       # `cov-full.json` carries every function's execution count, which is
@@ -792,7 +1061,14 @@ jobs:
       # measures it. Measured on its own, whatever the workspace step said.
       - name: Measure runtime/
         if: ${{ !cancelled() }}
-        run: cargo llvm-cov --manifest-path runtime/Cargo.toml --no-report --no-fail-fast
+        # runtime/ has no `.config/nextest.toml` of its own; name the repo's.
+        # (The nextest profile goes in the environment: `--profile` on this
+        # command line is cargo-llvm-cov's own, the CARGO build profile.)
+        env:
+          NEXTEST_PROFILE: ci
+        run: |
+          cargo llvm-cov nextest --manifest-path runtime/Cargo.toml --no-report --no-fail-fast \
+            --config-file "$GITHUB_WORKSPACE/.config/nextest.toml"
 
       - name: Report runtime/, and name what never executes
         if: ${{ !cancelled() }}
@@ -1005,7 +1281,9 @@ jobs:
     # unchanged (dev/test infrastructure, not production code).
     name: mutation — full workspace sweep (nightly, sharded)
     runs-on: macos-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
+    # `workflow_dispatch`); without it, it runs this sweep, as before.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '')
     timeout-minutes: 300
     concurrency:
       # Scoped to scope+shard, not the whole job: a re-run of the SAME shard
@@ -1124,7 +1402,9 @@ jobs:
     # platform's 6-hour hard cap.
     name: mutation — full workspace sweep (nightly, small crates)
     runs-on: macos-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
+    # `workflow_dispatch`); without it, it runs this sweep, as before.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '')
     timeout-minutes: 270
     concurrency:
       group: mutants-full-small
