@@ -1368,6 +1368,51 @@
       "status": "complete"
     },
     {
+      "name": "skewed closes from before every start are placed in time order: a mission's own close beats a later mission-less one",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T09:59:50Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T09:59:51Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T09:59:52Z",
+          "action": "dispatch.error",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
       "name": "an untimed opener mid-stream is segmented after every timed record",
       "as_of": "2026-09-27T10:00:30Z",
       "records": [

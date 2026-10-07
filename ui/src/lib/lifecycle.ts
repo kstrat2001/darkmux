@@ -36,9 +36,10 @@
  *    that names a later step of its task still planned does not close it,
  *    #3074), `session.end`,
  *    `budget.stop`, `mission.close` or `mission.abort`. A closing record timestamped before anything opened
- *    (clock skew across machines, #1988) closes the first attempt left with
- *    no close of its own, and is marked `skewed`; with no attempt at all to
- *    close, it is not a run (phase `not_started`), but its session recorded
+ *    (clock skew across machines, #1988) closes the first attempt of its
+ *    mission (any, when it names none) left with no close of its own, and
+ *    is marked `skewed`; such closes are placed in time order, every
+ *    mission's together. With no attempt at all to close, it is not a run (phase `not_started`), but its session recorded
  *    its end, which the lifecycle carries as `close` and a status reads. A
  *    record with an unparsable `ts` is inside every as-of cut, so an untimed
  *    terminal still closes its run.
@@ -306,15 +307,16 @@ function homeFor(attempts: readonly Building[], r: NormRecord, m: string | null)
   return isClosing(r) ? (mine.find((a) => a.close === null) ?? null) : (mine[0] ?? null);
 }
 
-function placeStrays(attempts: Building[], strays: Map<string | null, NormRecord[]>): Map<string | null, NormRecord[]> {
+/** Places the strays, in time order across every mission (the order the
+ *  daemon's `place_orphans` places them in): a mission-less close does not
+ *  take an attempt from an earlier close that names its mission. */
+function placeStrays(attempts: Building[], strays: readonly (readonly [string | null, NormRecord])[]): Map<string | null, NormRecord[]> {
   const left = new Map<string | null, NormRecord[]>();
-  for (const [m, recs] of strays) {
-    for (const r of recs) {
-      const home = homeFor(attempts, r, m);
-      if (!home) pushStray(left, m, r);
-      else if (isClosing(r)) Object.assign(home, { close: r, skewed: true, records: [r, ...home.records] });
-      else home.records.unshift(r);
-    }
+  for (const [m, r] of strays) {
+    const home = homeFor(attempts, r, m);
+    if (!home) pushStray(left, m, r);
+    else if (isClosing(r)) Object.assign(home, { close: r, skewed: true, records: [r, ...home.records] });
+    else home.records.unshift(r);
   }
   return left;
 }
@@ -322,7 +324,7 @@ function placeStrays(attempts: Building[], strays: Map<string | null, NormRecord
 /** A session's records segmented into attempts (rule 1), time order. */
 export function segmentSession(records: readonly NormRecord[]): SessionSegments {
   const attempts: Building[] = [];
-  const strays = new Map<string | null, NormRecord[]>();
+  const strays: (readonly [string | null, NormRecord])[] = [];
   for (const r of [...records].sort(byTime)) {
     const m = r.mission_id || null;
     const x = isExecutionAction(r.action) ? (r.execution_id ?? null) : null;
@@ -332,7 +334,7 @@ export function segmentSession(records: readonly NormRecord[]): SessionSegments 
       attempts.push(target);
     }
     if (target) add(target, r, m, x);
-    else pushStray(strays, m, r);
+    else strays.push([m, r]);
   }
   return { attempts, strays: placeStrays(attempts, strays) };
 }
