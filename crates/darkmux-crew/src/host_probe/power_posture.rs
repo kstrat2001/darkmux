@@ -217,47 +217,70 @@ fn seconds_since(timestamp: &str, now: SystemTime) -> Option<u64> {
 fn pmset_timestamp_epoch(timestamp: &str) -> Option<i64> {
     let mut parts = timestamp.split_whitespace();
     let (date, time, offset) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || !offset.is_ascii() || offset.len() != 5 {
+    if parts.next().is_some() {
         return None;
     }
-    let num = |s: &str| -> Option<i64> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        s.parse().ok()
-    };
-    let fields = |s: &str, sep: char| -> Option<[i64; 3]> {
-        let mut it = s.split(sep).map(num);
-        let v = [it.next()??, it.next()??, it.next()??];
-        it.next().is_none().then_some(v)
-    };
-    let [year, month, day] = fields(date, '-')?;
-    let [hour, minute, second] = fields(time, ':')?;
+    let [year, month, day] = three_fields(date, '-')?;
+    let [hour, minute, second] = three_fields(time, ':')?;
+    let offset_seconds = utc_offset_seconds(offset)?;
+    if !is_real_date(year, month, day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let local = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(local - offset_seconds)
+}
+
+/// An unsigned run of ASCII digits. `str::parse::<i64>` alone would also
+/// take a sign.
+fn digits(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Exactly three `sep`-separated digit fields (`2026-07-10`, `23:16:05`).
+fn three_fields(s: &str, sep: char) -> Option<[i64; 3]> {
+    let mut it = s.split(sep).map(digits);
+    let v = [it.next()??, it.next()??, it.next()??];
+    it.next().is_none().then_some(v)
+}
+
+/// A `±HHMM` UTC offset, in seconds east of UTC.
+fn utc_offset_seconds(offset: &str) -> Option<i64> {
+    // Five ASCII characters, checked before any byte slicing (a multi-byte
+    // character would otherwise be split and panic).
+    if !offset.is_ascii() || offset.len() != 5 {
+        return None;
+    }
     let sign = match offset.as_bytes()[0] {
         b'+' => 1,
         b'-' => -1,
         _ => return None,
     };
-    let (off_h, off_m) = (num(&offset[1..3])?, num(&offset[3..5])?);
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if !(1..=12).contains(&month)
-        || !(1..=month_days[(month - 1) as usize]).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-        || off_h > 23
-        || off_m > 59
-    {
+    let (hours, minutes) = (digits(&offset[1..3])?, digits(&offset[3..5])?);
+    if hours > 23 || minutes > 59 {
         return None;
     }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
+/// Whether `year-month-day` is a day the Gregorian calendar has.
+fn is_real_date(year: i64, month: i64, day: i64) -> bool {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    (1..=12).contains(&month) && (1..=month_days[(month - 1) as usize]).contains(&day)
+}
+
+/// Days from 1970-01-01 to `year-month-day` (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let year_of_era = y - era * 400;
     let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - sign * (off_h * 3_600 + off_m * 60))
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(target_os = "macos")]
