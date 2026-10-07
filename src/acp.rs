@@ -5025,6 +5025,107 @@ mod tests {
         drop((t1, t2));
     }
 
+    /// (#3091) Dropping one prompt's ticket removes only that prompt's
+    /// entry: the other prompt on the session stays reachable by a cancel.
+    #[tokio::test]
+    async fn dropping_one_ticket_leaves_the_other_prompt_cancellable() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-drop-one-test");
+        let t1 = reserve_prompt(&in_flight, &session_id);
+        let t2 = reserve_prompt(&in_flight, &session_id);
+
+        drop(t1);
+        assert_eq!(abort_session_prompts(&in_flight, &session_id), 1);
+        assert!(reservation_cancelled(&t2), "the surviving prompt must still be reached by the cancel");
+    }
+
+    /// (#3091) The count a cancel reports (the `session/cancel` log line) is
+    /// every prompt it reached: a running prompt it aborts, and a reserved
+    /// prompt an earlier cancel already marked, which has not settled yet.
+    /// A running prompt already aborted is not counted again.
+    #[tokio::test]
+    async fn a_cancel_counts_every_prompt_it_reaches() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-count-test");
+
+        let running = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let t_running = reserve_prompt(&in_flight, &session_id);
+        assert!(!attach_abort_handle(&t_running, running.abort_handle()));
+        assert_eq!(abort_session_prompts(&in_flight, &session_id), 1, "one running prompt reached");
+        assert!(running.await.unwrap_err().is_cancelled());
+        drop(t_running);
+
+        let t_reserved = reserve_prompt(&in_flight, &session_id);
+        assert_eq!(abort_session_prompts(&in_flight, &session_id), 1, "one reservation reached");
+
+        let second = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        let t_second = reserve_prompt(&in_flight, &session_id);
+        assert!(!attach_abort_handle(&t_second, second.abort_handle()));
+        assert_eq!(
+            abort_session_prompts(&in_flight, &session_id),
+            2,
+            "the still-reserved prompt and the running one are both reached"
+        );
+        assert!(second.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            abort_session_prompts(&in_flight, &session_id),
+            1,
+            "the aborted prompt is not counted again; the unsettled reservation is"
+        );
+        drop((t_reserved, t_second));
+    }
+
+    /// The work [`a_panicking_prompt_task_is_reported_as_an_internal_error_not_a_cancel`]
+    /// runs: a command task that panics.
+    fn command_that_panics() -> Result<()> {
+        panic!("the command task blew up");
+    }
+
+    /// An agent whose only handler wraps a panicking command in the real
+    /// [`run_cancellable`], the way `serve()`'s `session/prompt` handler does.
+    fn spawn_panicking_prompt_agent() -> (DuplexStream, BufReader<DuplexStream>) {
+        let (test_writer, agent_reader) = tokio::io::duplex(64 * 1024);
+        let (agent_writer, test_reader) = tokio::io::duplex(64 * 1024);
+        let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                        let ticket = reserve_prompt(&in_flight, &request.session_id);
+                        let cx_task = cx.clone();
+                        cx.spawn(async move {
+                            let stop_reason =
+                                run_cancellable(ticket, request.session_id.clone(), cx_task, async { command_that_panics() })
+                                    .await;
+                            responder.respond(PromptResponse::new(stop_reason))
+                        })
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(transport)
+                .await;
+        });
+        (test_writer, BufReader::new(test_reader))
+    }
+
+    /// (#3091) Only a CANCELLED task reports "cancelled": a task that panics
+    /// ends the turn with the internal-error text, so the user is told the
+    /// command crashed rather than that they stopped it.
+    #[tokio::test]
+    async fn a_panicking_prompt_task_is_reported_as_an_internal_error_not_a_cancel() {
+        let (mut writer, mut reader) = spawn_panicking_prompt_agent();
+        send_prompt(&mut writer, "darkmux-acp-panic-test", "anything").await;
+
+        let chunk = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&chunk).contains("internal error — the command task panicked"),
+            "a panic must be reported as one, not as a cancel: {chunk}"
+        );
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
     /// (#2476) `spawn_registered` must register its child's pid BEFORE
     /// the wait can observe it — proven by starting a real, long-lived
     /// `sleep 30` through it, then reaching that SAME pid through
