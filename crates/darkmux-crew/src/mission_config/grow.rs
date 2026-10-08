@@ -197,8 +197,8 @@ pub fn grow_task(
 /// from. A step kind never reads it, and no document names it.
 pub const GROWN_FROM_KEY: &str = "grown_from";
 
-/// Merge the spec's rendered `config` templates plus `grown_from` into one
-/// step's config. A step whose config is `null` (the `procedural.noop`
+/// Render one step's own config for this copy, then merge the spec's
+/// rendered `config` templates plus `grown_from` into it. A step whose config is `null` (the `procedural.noop`
 /// default) becomes an object here rather than losing the merge.
 #[allow(clippy::too_many_arguments)]
 fn merge_grown_config(
@@ -212,6 +212,9 @@ fn merge_grown_config(
     if step_config.is_null() {
         *step_config = serde_json::json!({});
     }
+    // The step's own config renders per copy too, so a key only this step
+    // reads lives here rather than in `grow.config`, which every step gets.
+    *step_config = render_value(step_config, item, from_output, &format!("{}.steps.config", template.id))?;
     let Some(obj) = step_config.as_object_mut() else {
         bail!(
             "grow: task `{}` has a step whose `config` is not an object, so the grown values \
@@ -371,6 +374,48 @@ mod tests {
 
     /// The producing step's output — the path `{{from.output}}` renders.
     const PLAN_PATH: &str = "/runs/crawl-1/plan/r-a.json";
+
+    /// (5.0 release gate) The shipped `review` config's `create-mod` task
+    /// grows one copy per finding, and every step of a copy must pass its
+    /// kind's key gate. `grow.config` used to carry the shell step's
+    /// `env`/`command` and the gate step's `for_key`/`test_command` in one
+    /// object merged into BOTH steps, so every review that found anything
+    /// was refused at the phase boundary once 5.0 refused unknown keys.
+    #[test]
+    fn the_shipped_review_create_mod_copies_pass_the_step_key_gate() {
+        let config: crate::mission_config::MissionConfig =
+            serde_json::from_str(include_str!("../../../../templates/builtin/mission-configs/review.json")).unwrap();
+        // Both ways a finding's mod is staffed: the frontier (default) and
+        // the cloud dispatch (`create-mod-dispatch`, off by default).
+        for (id, first_kind) in [("create-mod", "procedural.shell"), ("create-mod-dispatch", "dispatch.internal")] {
+            let task = config.phases.iter().flat_map(|p| &p.tasks).find(|t| t.id == id).expect(id);
+            let spec = task.grow.as_ref().expect("a grow template");
+            let item = json!({ "id": "f1", "key": "exec-1/0", "tree_root": "/runs/review-1/tree" });
+            let growth = grow_task(task, spec, &[item], "/runs/review-1/summary.json").unwrap();
+            let steps: Vec<(&str, &str, &serde_json::Value)> =
+                growth.tasks[0].steps.iter().map(|s| (s.id.as_str(), s.kind.as_str(), &s.config)).collect();
+            crate::step_config::gate::check_resolved(steps).unwrap_or_else(|e| panic!("{id}: {e:#}"));
+            let by_kind = |kind: &str| &growth.tasks[0].steps.iter().find(|s| s.kind == kind).unwrap().config;
+            assert_eq!(by_kind("mods.gate")["for_key"], "exec-1/0", "{id}: the gate names its finding");
+            assert_eq!(by_kind(first_kind)["workdir"], "/runs/review-1/tree", "{id}: the first step runs in the tree");
+        }
+    }
+
+    /// A template step's own config renders `{{item.*}}` and `{{from.output}}`
+    /// for each copy, so keys only one step reads can live on that step
+    /// instead of in `grow.config`, which merges into every step.
+    #[test]
+    fn a_template_steps_own_config_renders_item_placeholders() {
+        let mut t = template();
+        t.steps[0].config = json!({ "only_mine": "{{item.id}}", "n": "{{item.est_tokens}}", "plan": "{{from.output}}", "input": "{{an_input}}" });
+        let spec = GrowSpec { config: json!({}), ..spec() };
+        let growth = grow_task(&t, &spec, &[json!({ "id": "u1", "est_tokens": 1200 })], PLAN_PATH).unwrap();
+        let cfg = &growth.tasks[0].steps[0].config;
+        assert_eq!(cfg["only_mine"], "u1");
+        assert_eq!(cfg["n"], 1200, "type-preserving, as in grow.config");
+        assert_eq!(cfg["plan"], PLAN_PATH);
+        assert_eq!(cfg["input"], "{{an_input}}", "a launch input stays for the launch's own pass");
+    }
 
     fn template() -> TaskConfig {
         TaskConfig {
