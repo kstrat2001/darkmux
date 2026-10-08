@@ -17672,6 +17672,42 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
     }
 
+    /// (#3121) A container dispatch a signal (or a scoped stop) ended: its
+    /// terminal names that error and counts the turns it finished, from the
+    /// same trajectory fold the clean path reads, instead of the bookend
+    /// guard's "early return or panic" with 0 turns.
+    #[test]
+    fn a_killed_dispatch_terminal_names_its_error_and_the_turns_it_finished() {
+        let mut summary = super::TrajectorySummary::default();
+        for seq in 1..=5 {
+            summary.fold.apply(&ev(serde_json::json!({
+                "type": "model.completed", "seq": seq, "finish_reason": "tool_calls",
+                "usage": { "prompt_tokens": 10, "completion_tokens": 2 },
+            })));
+        }
+        let err = "darkmux-runtime container dispatch interrupted by an operator signal \
+                   (SIGINT/SIGTERM/SIGHUP): the container `c` was killed mid-run";
+        let payload = serde_json::to_value(super::killed_mid_run_payload(err, 4200, &summary, None, None)).unwrap();
+        assert_eq!(payload["error"], err, "{payload}");
+        assert_eq!(payload["result_class"], "error", "{payload}");
+        assert_eq!(payload["total_turns"], 5, "the turns it finished: {payload}");
+        assert_eq!(payload["prompt_tokens"], 50, "{payload}");
+        assert_eq!(payload["wall_ms"], 4200, "{payload}");
+    }
+
+    /// (#3121) `dispatch()`'s killed branch closes its bookend with that
+    /// terminal before returning, so the guard's Drop fallback never writes
+    /// one for a signal.
+    #[test]
+    fn the_killed_branch_closes_its_bookend_with_the_killed_terminal() {
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").unwrap()];
+        let branch = &src[src.find("if run_was_killed(&local_stop, output.status.success()) {").unwrap()..];
+        let branch = &branch[..branch.find("return Err(").unwrap()];
+        assert!(branch.contains("killed_mid_run_payload("), "builds the killed terminal: {branch}");
+        assert!(branch.contains("bookend.close("), "writes it through the guard: {branch}");
+    }
+
     /// (#2903) Feed `model.completed` events through the REAL tailer, then
     /// build the complete payload from the summary it accumulated. Shared by
     /// the two tests below so both exercise the live accumulation path, not

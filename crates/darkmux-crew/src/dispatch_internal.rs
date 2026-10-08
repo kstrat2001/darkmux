@@ -4864,6 +4864,41 @@ fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyh
     }
 }
 
+/// (#3121) The terminal of a container dispatch [`killed_mid_run_error`]
+/// ended: that error, and what the execution did before it, read from the
+/// same trajectory fold the clean path's [`build_dispatch_complete_payload`]
+/// reads. Without it the bookend guard's Drop wrote "early return or panic"
+/// with 0 turns for a run someone deliberately stopped. The container was
+/// killed, so there is no exit code, output or host window to report.
+fn killed_mid_run_payload(
+    error: &str,
+    wall_ms: u64,
+    summary: &TrajectorySummary,
+    endpoint: Option<&str>,
+    resume_from: Option<&std::path::Path>,
+) -> DispatchEndPayload {
+    DispatchEndPayload {
+        error: Some(error.to_string()),
+        stdout_chars: None,
+        stderr_chars: None,
+        stderr_excerpt: None,
+        exit_code: None,
+        host_window: None,
+        ..build_dispatch_complete_payload(
+            wall_ms,
+            "",
+            "",
+            1,
+            summary,
+            endpoint,
+            &HostStats::default(),
+            &HostExtras::default(),
+            resume_from,
+            None,
+        )
+    }
+}
+
 type SamplerOutcome = (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary);
 
 /// (#3074) Join `handle`, giving up after `bound`. `None` means the thread was
@@ -4934,14 +4969,14 @@ fn teardown_container_threads(
     sampler: SamplerThread<'_>,
     stop_flag: &AtomicBool,
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
-) {
+) -> TrajectorySummary {
     watchdog_done.store(true, Ordering::SeqCst);
     docker_kill_by_name(container_name);
     let _ = watchdog_handle.join();
     sampler.stop.store(true, Ordering::SeqCst);
     let _ = join_within(sampler.handle, sampler.bound);
     stop_flag.store(true, Ordering::SeqCst);
-    let _ = tailer_handle.join();
+    tailer_handle.join().unwrap_or_default()
 }
 
 // (#2232) The inactivity watchdog is the UNATTENDED safety net, and its kill
@@ -7256,7 +7291,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
     if run_was_killed(&local_stop, output.status.success()) {
-        teardown_container_threads(
+        let trajectory_summary = teardown_container_threads(
             &container_name,
             &watchdog_done,
             watchdog_handle,
@@ -7280,7 +7315,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2925) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
-        return Err(killed_mid_run_error(&container_name, &local_stop));
+        let err = killed_mid_run_error(&container_name, &local_stop);
+        // (#3121) The terminal names that error and the turns finished before
+        // it, written through the guard so its Drop fallback never claims a
+        // panic for a run someone stopped.
+        let mut payload = darkmux_flow::Payload::DispatchError(killed_mid_run_payload(
+            &err.to_string(),
+            dispatch_start_instant.elapsed().as_millis() as u64,
+            &trajectory_summary,
+            unmanaged_endpoint_raw_label.as_deref(),
+            opts.resume_from.as_deref(),
+        ));
+        merge_record_context(&mut payload, &opts.record_context);
+        bookend.close(crate::dispatch::build_dispatch_record(
+            darkmux_flow::Level::Error,
+            &opts.role_id,
+            &session,
+            &execution,
+            Some(&model),
+            phase_id.as_deref(),
+            payload,
+        ));
+        return Err(err);
     }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
