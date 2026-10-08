@@ -1,0 +1,21 @@
+scenario: checkpoint_then_stop
+outcome: Stop
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  assistant chars=47 calls=0 "the first part of a long answer that ends here."
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=500 stream=null roles=[system,user]
+  #2 model="test-model" max_tokens=500 stream=null roles=[system,user,assistant]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"length","reported_model":"ignored-by-test","seq":1,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":500,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":600}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}
+  {"bound":{"kind":"max_tokens_per_call","source":"built-in","value":500},"checkpoint":1,"judged_chars":36,"policy":"conclude","seq":1,"slice_tokens":500,"tail_ratio":null,"type":"dispatch.checkpoint","verdict":"continue","would_conclude":false}
+  {"max":null,"seq":1,"type":"dispatch.context","used":120}
+  {"calls_planned":true,"finish_reason":"stop","reported_model":"ignored-by-test","seq":1,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":5,"prompt_tokens":120,"reasoning_tokens":null,"total_tokens":125}}

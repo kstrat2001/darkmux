@@ -18609,3 +18609,7 @@ mod checkpoint_regression_tests;
 #[cfg(test)]
 #[path = "tool_writing_tests.rs"]
 mod tool_writing_tests;
+
+#[cfg(test)]
+#[path = "loop_characterization_tests.rs"]
+mod loop_characterization_tests;

@@ -342,6 +342,66 @@ pub(crate) fn sse_server_scripted(script: Vec<(std::time::Duration, String)>) ->
     format!("http://{addr}/v1")
 }
 
+/// (#3136) A server that answers each request with the NEXT reply of a fixed
+/// script, in order, and records every request body it was sent. Built for
+/// the loop's characterization tests, whose scenarios are a SEQUENCE of
+/// model replies: httpmock matchers are `fn` pointers with no state to count
+/// with, so a sequence there has to be re-derived from each request's body,
+/// and that derivation is exactly the loop behavior those tests pin.
+///
+/// Each reply is `(delay, content_type, body)`; the delay is waited before
+/// answering, for the one scenario that needs real time to pass inside a
+/// model call (the inactivity clock). Every response closes its
+/// connection (`Connection: close`) so the client's pool never reuses a
+/// socket mid-script. A request past the end of the script gets a 500, which
+/// the loop surfaces as an error and the test then sees as a wrong outcome.
+pub(crate) fn json_server_sequenced(
+    script: Vec<(std::time::Duration, &'static str, String)>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    std::thread::spawn(move || {
+        let mut replies = script.into_iter();
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { return };
+            let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = head.read_exact(&mut body);
+            seen.lock().unwrap().push(String::from_utf8_lossy(&body).to_string());
+            let (status, content_type, payload) = match replies.next() {
+                Some((delay, ct, b)) => {
+                    std::thread::sleep(delay);
+                    ("200 OK", ct, b)
+                }
+                None => ("500 Internal Server Error", "text/plain", "script exhausted".to_string()),
+            };
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+        }
+    });
+    (format!("http://{addr}/v1"), requests)
+}
+
 mod self_tests {
     use super::*;
 

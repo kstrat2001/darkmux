@@ -1,0 +1,10 @@
+scenario: context_overflow
+outcome: Err(model returned finish_reason=length with partial…)
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"length","reported_model":"ignored-by-test","seq":1,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":50,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":150}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}

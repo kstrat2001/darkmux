@@ -1,0 +1,25 @@
+scenario: max_turns
+outcome: MaxTurns
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
+  #2 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":120}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":1,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"max":null,"seq":2,"type":"dispatch.context","used":120}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":2,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":120,"reasoning_tokens":null,"total_tokens":140}}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":2,"tool_name":"read","tool_seq":0,"type":"tool.completed"}

@@ -1,0 +1,26 @@
+scenario: empty_tool_calls
+outcome: EscalationTriggered(EmptyToolCallsExhausted)
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  system chars=174 calls=0 "[darkmux-runtime] Your previous response ended w…"
+  system chars=174 calls=0 "[darkmux-runtime] Your previous response ended w…"
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
+  #2 model="test-model" max_tokens=32000 stream=null roles=[system,user,system]
+  #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,system,system]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":120}}
+  {"bound":{"kind":"max_tokens_per_call","source":"built-in","value":32000},"completion_tokens":20,"recoveries_budget":2,"recoveries_used":1,"seq":1,"type":"dispatch.empty_tool_calls.recovered"}
+  {"max":null,"seq":2,"type":"dispatch.context","used":101}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":2,"tool_calls":[],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":101,"reasoning_tokens":null,"total_tokens":121}}
+  {"bound":{"kind":"max_tokens_per_call","source":"built-in","value":32000},"completion_tokens":20,"recoveries_budget":2,"recoveries_used":2,"seq":2,"type":"dispatch.empty_tool_calls.recovered"}
+  {"max":null,"seq":3,"type":"dispatch.context","used":102}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":3,"tool_calls":[],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":102,"reasoning_tokens":null,"total_tokens":122}}
+  {"model":"test-model","prompt_tokens":102,"reason":"escalation_empty_tool_calls","seq":3,"type":"dispatch.escalation.triggered"}
