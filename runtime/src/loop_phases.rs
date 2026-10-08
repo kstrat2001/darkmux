@@ -202,7 +202,7 @@ impl<'a> AgentLoop<'a> {
         // same audit note) — that one is macOS monotonic time, confirmed by
         // this audit to sit flat across a host sleep. This one is the guest
         // VM's clock, and its behavior across a host suspend is UNVERIFIED —
-        // see the `is_suspected_sleep_wake_jump` doc a few hundred lines below
+        // see the `is_suspected_sleep_wake_jump` doc in `loop_runner.rs`
         // (#2114), which already treats "this clock kept advancing through a
         // host suspend" as a live possibility worth re-anchoring against, not
         // a closed question. Don't read this comment as settling that;
@@ -654,8 +654,8 @@ impl<'a> AgentLoop<'a> {
         );
         // (#2190) `latest_prompt_tokens` is still its pre-loop 0
         // here — no real turn has completed yet in this resume
-        // catch-up path (see this fn's own note on the same
-        // limitation a few lines up).
+        // catch-up path (see the occupancy note above on the same
+        // limitation).
         let final_answer = self.turn.pending_answer();
         Some(self.escalate(EscalationReason::CompactionLimitReached, final_answer))
     }
@@ -677,7 +677,7 @@ impl<'a> AgentLoop<'a> {
              {after_count} messages) before the first post-resume request. (#2114)"
         );
         // (#2114 finding 1) Resume-compaction parity with the main
-        // loop's `tool_calls` arm (~:2680-2722): a compaction here is
+        // loop's `tool_calls` arm (`compact_thread`): a compaction here is
         // the SAME event with the SAME consequences, whichever site
         // triggered it. Queue the same post-compaction feedback nudge,
         // reset proof-of-work + the soft-warning flag the same way,
@@ -986,7 +986,7 @@ impl<'a> AgentLoop<'a> {
         self.trajectory.append_pre_send_bound(
             // (#2792 round-2) `turns` has NOT been incremented yet at
             // this point — the sequence for this request is computed
-            // six lines down. Stamping the raw `turns` put the event
+            // by `request_seq`, as in `send`. Stamping the raw `turns` put the event
             // one behind the `model.completed` it pairs with, which is
             // the #1221 off-by-one this file already learned once.
             request_seq(&self.state),
@@ -1475,8 +1475,8 @@ impl<'a> AgentLoop<'a> {
     fn salvage(&mut self, assistant_message: &mut Message, bound: &CallBound, cut: CutSource, completion_tokens: Option<u32>) {
         // (#2169 merge-gate CONSIDER 6) `salvaged_count` measures ONLY
         // JSON well-formedness (#479's own filter) — it is computed
-        // BEFORE the #2169 name-allowlist partition runs a few dozen
-        // lines below, in the shared `"tool_calls"` arm every source
+        // BEFORE the #2169 name-allowlist partition runs in
+        // `handle_tool_calls`, the shared `"tool_calls"` arm every source
         // of `calls` (including this salvage) routes through. A call
         // counted here as "salvaged" can still turn out to be
         // invalid-name or ungranted and never actually dispatch — the
@@ -1971,8 +1971,8 @@ impl<'a> AgentLoop<'a> {
         // every result recorded so far; `pending_tool_calls`
         // names the calls from THIS turn not yet dispatched —
         // `None` once the last one lands, matching a clean
-        // boundary. See the pre-loop resume block (top of
-        // `run_with_sleeper`) for the other half: dispatching
+        // boundary. See the pre-loop resume block
+        // (`resume_catch_up`) for the other half: dispatching
         // exactly these calls, and none already recorded,
         // when a resumed checkpoint carries them.
         // (#2114 finding N6) A fresh (non-resumed) turn's
@@ -2854,8 +2854,8 @@ impl<'a> AgentLoop<'a> {
         // (`TAIL_SAMPLE_INTERVALS * 1000`) instead of the 32000
         // its own interval implies — a 4x-narrower sample than
         // the detector was tuned for on that pathway. `per_call_cap`
-        // IS the governing interval: the cap-selection `if/else if/
-        // else` a few screens up already resolved it to whichever
+        // IS the governing interval: the cap selection (`call_bound`)
+        // already resolved it to whichever
         // bound this call carries (`reasoning_interval` /
         // `generation_interval` / `answer_max_tokens`), so no
         // lookup is needed to name it here — `active_bound` exists

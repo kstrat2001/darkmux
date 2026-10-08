@@ -24,6 +24,7 @@ requests:
   #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool]
   #4 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system]
   #5 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system,assistant,tool]
+checkpoint: turns=4 tokens=80 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system,assistant,tool]
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"max":null,"seq":1,"type":"dispatch.context","used":100}

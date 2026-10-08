@@ -6,9 +6,9 @@
 //! from rather than against a reading of it. A trace is everything the loop
 //! makes observable: the terminal outcome, the final message thread, every
 //! rest it took, every request it sent (how many tokens it allowed and which
-//! roles it carried), and every trajectory record it wrote. Only the
-//! timestamp (`ts`) is dropped, because it is the one field that differs
-//! between two runs of the same script.
+//! roles it carried), the checkpoint it left on disk, and every trajectory
+//! record it wrote. Only timestamps are dropped, because they are the one
+//! thing that differs between two runs of the same script.
 //!
 //! The goldens live in `runtime/testdata/loop-characterization/`. To accept a
 //! deliberate behavior change, rerun with `DARKMUX_BLESS_LOOP_TRACES=1` and
@@ -16,7 +16,15 @@
 //!
 //! Rules that are only about one decision (when to rest, which bound a call
 //! carries, when a budget escalates) are tested in `loop_deciders_tests.rs`;
-//! what stays here is the loop wiring that connects them.
+//! what stays here is the loop wiring that connects them. Six traces written
+//! with this file were about one rule each and moved to that rule's table
+//! once the split landed: `max_turns` and the cumulative cap
+//! (`budget_stop_table`), the context-overflow error (`length_effect_table`),
+//! malformed names (`tally_dispatch_table`), the generation budget
+//! (`draw_generation_budget_table`, `checkpoint_remedy_table`) and the
+//! compaction bound (`compaction_bounds_table`). Their wiring is still
+//! exercised end to end by the older loop tests in `loop_runner.rs`, each
+//! red-proven by a mutation of its effect when they moved.
 #![allow(clippy::too_many_arguments)]
 
 use super::tests::chat_response_json;
@@ -204,6 +212,30 @@ fn render_events(out_dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// The last checkpoint the run left on disk, without its timestamp: what a
+/// resume after a kill at the end of the run would start from.
+fn render_checkpoint(out_dir: &std::path::Path) -> String {
+    let Ok(body) = std::fs::read_to_string(checkpoint::checkpoint_file_path(out_dir)) else {
+        return "none".into();
+    };
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let roles: Vec<&str> = v["messages"]
+        .as_array()
+        .map(|a| a.iter().map(|m| m["role"].as_str().unwrap_or("?")).collect())
+        .unwrap_or_default();
+    format!(
+        "turns={} tokens={} compactions={} hand_back={} pending={} seq_base={} head_started={} roles=[{}]",
+        v["turns"],
+        v["total_completion_tokens"],
+        v["compactions"],
+        !v["pending_hand_back"].is_null(),
+        v["pending_tool_calls"].as_array().map(|a| a.len()).unwrap_or(0),
+        v["pending_tool_calls_seq_base"],
+        v["pending_head_started"],
+        roles.join(","),
+    )
+}
+
 /// Run `s` and render everything it made observable.
 fn trace(s: Scenario) -> String {
     clear_env();
@@ -262,6 +294,7 @@ fn trace(s: Scenario) -> String {
     out.push("requests:".into());
     let sent = requests.lock().unwrap().clone();
     out.extend(sent.iter().enumerate().map(|(i, b)| format!("  {}", render_request(i + 1, b))));
+    out.push(format!("checkpoint: {}", render_checkpoint(tmp.path())));
     out.push("events:".into());
     out.extend(render_events(tmp.path()).into_iter().map(|e| format!("  {e}")));
     mask_generated_call_ids(&(out.join("\n") + "\n"))
@@ -367,47 +400,10 @@ fn tool_turns_then_stop_rest_between_turns() {
 
 #[test]
 #[serial_test::serial]
-fn max_turns_ends_the_dispatch() {
-    let mut s = Scenario::new(
-        "max_turns",
-        vec![
-            reply(None, Some(read_x()), "tool_calls", 100, 20),
-            reply(None, Some(read_x()), "tool_calls", 120, 20),
-        ],
-    );
-    s.max_turns = Some(2);
-    assert_golden(s);
-}
-
-#[test]
-#[serial_test::serial]
-fn the_cumulative_token_cap_escalates() {
-    let mut s = Scenario::new(
-        "cumulative_tokens",
-        vec![
-            reply(None, Some(read_x()), "tool_calls", 100, 20),
-            reply(None, Some(read_x()), "tool_calls", 120, 20),
-        ],
-    );
-    s.max_cumulative_tokens = Some(30);
-    assert_golden(s);
-}
-
-#[test]
-#[serial_test::serial]
 fn an_unexpected_finish_reason_is_an_error() {
     assert_golden(Scenario::new(
         "unexpected_finish_reason",
         vec![reply(Some("filtered"), None, "content_filter", 100, 5)],
-    ));
-}
-
-#[test]
-#[serial_test::serial]
-fn a_length_finish_below_the_cap_is_a_context_overflow_error() {
-    assert_golden(Scenario::new(
-        "context_overflow",
-        vec![reply(Some("partial answer"), None, "length", 100, 50)],
     ));
 }
 
@@ -458,23 +454,6 @@ fn three_edits_to_one_file_fire_the_cadence_nudge() {
         (0..3).map(|i| reply(None, Some(calls(&[("edit", edit)])), "tool_calls", 100 + i, 20)).collect();
     replies.push(reply(Some("done"), None, "stop", 200, 5));
     assert_golden(Scenario::new("cadence_drift", replies));
-}
-
-#[test]
-#[serial_test::serial]
-fn ungranted_and_unknown_tool_names_escalate_after_the_bound() {
-    let replies = (0..3)
-        .map(|i| {
-            reply(
-                None,
-                Some(calls(&[("bash", r#"{"command":"ls"}"#), ("frobnicate", "{}")])),
-                "tool_calls",
-                100 + i,
-                20,
-            )
-        })
-        .collect();
-    assert_golden(Scenario::new("malformed_names", replies));
 }
 
 #[test]
@@ -559,21 +538,6 @@ fn a_reasoning_turn_checkpoints_on_the_reasoning_interval() {
 
 #[test]
 #[serial_test::serial]
-fn generation_checkpoints_exhaust_their_budget() {
-    let replies = (0..6)
-        .map(|i| {
-            let body = format!("section {i} of a long but varied document with distinct text {}. ", i * 7);
-            reply(Some(&body), None, "length", 100 + i, 200)
-        })
-        .collect();
-    let mut s = Scenario::new("generation_budget", replies);
-    s.max_tokens_per_call = Some(800);
-    s.generation_interval = Some(200);
-    assert_golden(s);
-}
-
-#[test]
-#[serial_test::serial]
 fn a_repeating_stream_is_concluded_then_handed_off() {
     let looped: String = "the same thing over and over ".repeat(400);
     let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
@@ -637,22 +601,6 @@ fn a_refused_compaction_is_skipped_not_fatal() {
     );
     s.initial = padded_thread();
     s.cfg = compaction_cfg(None);
-    s.tools = vec![Tool::Read];
-    assert_golden(s);
-}
-
-#[test]
-#[serial_test::serial]
-fn the_compaction_bound_escalates() {
-    let mut s = Scenario::new(
-        "compaction_bail",
-        vec![
-            reply(None, Some(read_x()), "tool_calls", 5000, 50),
-            reply(Some(SUMMARY), None, "stop", 500, 30),
-        ],
-    );
-    s.initial = padded_thread();
-    s.cfg = compaction_cfg(Some(1));
     s.tools = vec![Tool::Read];
     assert_golden(s);
 }

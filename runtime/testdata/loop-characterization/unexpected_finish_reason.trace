@@ -3,6 +3,7 @@ outcome: Err(unexpected finish_reason: content_filter — runti…)
 sleeps: []
 requests:
   #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
+checkpoint: none
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"max":null,"seq":1,"type":"dispatch.context","used":100}

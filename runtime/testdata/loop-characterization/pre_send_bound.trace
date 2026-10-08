@@ -13,6 +13,7 @@ messages:
 sleeps: []
 requests:
   #1 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,user]
+checkpoint: none
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"declared_window":3000,"fits":true,"results_trimmed":1,"tokens_after":2993,"tokens_before":15497,"turn":1,"type":"dispatch.pre_send_bound"}

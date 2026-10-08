@@ -13,6 +13,7 @@ requests:
   #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
   #2 model="test-model" max_tokens=32000 stream=null roles=[system,user,system]
   #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,system,system]
+checkpoint: turns=2 tokens=40 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,system,system]
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"max":null,"seq":1,"type":"dispatch.context","used":100}

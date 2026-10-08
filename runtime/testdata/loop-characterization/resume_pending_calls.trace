@@ -13,6 +13,7 @@ messages:
 sleeps: []
 requests:
   #1 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,tool]
+checkpoint: turns=1 tokens=20 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,assistant,tool,tool]
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":1,"tool_name":"read","tool_seq":1,"type":"tool.completed"}

@@ -14,6 +14,7 @@ sleeps: []
 requests:
   #1 model="test-model" max_tokens=500 stream=null roles=[system,user]
   #2 model="test-model" max_tokens=500 stream=null roles=[system,user,assistant,tool,system]
+checkpoint: turns=1 tokens=500 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,assistant,tool,system]
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"max":null,"seq":1,"type":"dispatch.context","used":100}

@@ -10,6 +10,7 @@ messages:
 sleeps: []
 requests:
   #1 model="test-model" max_tokens=32000 stream=true roles=[system,user]
+checkpoint: none
 events:
   {"schema_version":"1.0","type":"trajectory.header"}
   {"prompt_chars":11,"seq":1,"system_chars":11,"type":"model.streaming.start"}
