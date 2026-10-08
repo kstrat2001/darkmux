@@ -236,8 +236,18 @@ fn render_checkpoint(out_dir: &std::path::Path) -> String {
     )
 }
 
-/// Run `s` and render everything it made observable.
-fn trace(s: Scenario) -> String {
+/// What one scripted run left behind.
+struct Ran {
+    name: &'static str,
+    result: Result<LoopOutcome>,
+    sleeps: Vec<u64>,
+    /// Every request body the server received, in order.
+    requests: Vec<String>,
+    out_dir: tempfile::TempDir,
+}
+
+/// Run `s` against its script.
+fn run_scenario(s: Scenario) -> Ran {
     clear_env();
     if let Some(ms) = s.turn_delay_ms {
         std::env::set_var("DARKMUX_TURN_DELAY_MS", ms);
@@ -277,8 +287,15 @@ fn trace(s: Scenario) -> String {
     );
     drop(traj);
     clear_env();
+    let sleeps = sleeper.calls.borrow().clone();
+    let requests = requests.lock().unwrap().clone();
+    Ran { name: s.name, result, sleeps, requests, out_dir: tmp }
+}
 
-    let mut out = vec![format!("scenario: {}", s.name)];
+/// Run `s` and render everything it made observable.
+fn trace(s: Scenario) -> String {
+    let Ran { name, result, sleeps, requests: sent, out_dir: tmp } = run_scenario(s);
+    let mut out = vec![format!("scenario: {name}")];
     match &result {
         Ok(o) => {
             out.push(format!("outcome: {:?}", o.terminal_reason));
@@ -290,9 +307,8 @@ fn trace(s: Scenario) -> String {
         }
         Err(e) => out.push(format!("outcome: Err({})", short(&e.to_string()))),
     }
-    out.push(format!("sleeps: {:?}", sleeper.calls.borrow()));
+    out.push(format!("sleeps: {sleeps:?}"));
     out.push("requests:".into());
-    let sent = requests.lock().unwrap().clone();
     out.extend(sent.iter().enumerate().map(|(i, b)| format!("  {}", render_request(i + 1, b))));
     out.push(format!("checkpoint: {}", render_checkpoint(tmp.path())));
     out.push("events:".into());
@@ -656,4 +672,115 @@ fn a_resume_dispatches_only_the_pending_calls_then_continues() {
         written_at_unix_ms: 0,
     });
     assert_golden(s);
+}
+
+// ─── the structured compactor's budget ───────────────────────────────────
+//
+// A structured-slot compaction renders a budget block into the SYSTEM
+// message it installs, so the model paces itself against it. The block's
+// per-call line comes from `BudgetSnapshot::max_tokens_per_call`, which the
+// two compaction sites fill differently: the main loop passes the cap the
+// call it just made carried on the wire, the resume catch-up (which has made
+// no call yet) passes the answer ceiling. The numbers below keep the three
+// candidate values apart (answer 10,000, generation check-in 4,000, and the
+// 32,000 built-in) so a site passing the wrong one reads as a different line.
+
+const STRUCTURED_SUMMARY: &str = r#"{"objective": "finish", "current_truth": {}, "compaction_metadata": {"schema_version": "0.1", "generation": 1, "source_message_count": 3}, "completed_decisions": "decision one"}"#;
+
+fn structured_cfg() -> compaction::CompactionConfig {
+    compaction::CompactionConfig { strategy: compaction::CompactionStrategy::StructuredSlot, ..compaction_cfg(None) }
+}
+
+/// The thread a structured compaction can shrink: one heavy message in the
+/// middle, the preserved head and tail around it.
+fn heavy_thread() -> Vec<Message> {
+    vec![
+        Message::system("test system"),
+        Message::user("seed"),
+        Message::user("y".repeat(40_000)),
+        Message::assistant("ok"),
+        Message::user("go"),
+        Message::assistant("sure"),
+        Message::user("one"),
+        Message::assistant("two"),
+    ]
+}
+
+/// The per-call line of the budget block the request carried, if any.
+fn per_call_line(request: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(request).unwrap();
+    v["messages"].as_array()?.iter().find_map(|m| {
+        let content = m["content"].as_str()?;
+        content.lines().find(|l| l.contains("Per-call token cap")).map(str::to_string)
+    })
+}
+
+#[test]
+#[serial_test::serial]
+fn the_main_loop_tells_the_structured_compactor_the_cap_its_call_carried() {
+    let mut s = Scenario::new(
+        "structured_budget_main_loop",
+        vec![
+            reply(None, Some(read_x()), "tool_calls", 6_000, 50),
+            reply(Some(STRUCTURED_SUMMARY), None, "stop", 500, 30),
+            reply(Some("done"), None, "stop", 300, 5),
+        ],
+    );
+    s.initial = heavy_thread();
+    s.cfg = structured_cfg();
+    s.tools = vec![Tool::Read];
+    s.max_tokens_per_call = Some(10_000);
+    s.generation_interval = Some(4_000);
+    let ran = run_scenario(s);
+    assert!(ran.result.is_ok(), "{:?}", ran.result.err());
+    assert_eq!(ran.requests.len(), 3, "turn, compactor, turn");
+    assert_eq!(
+        per_call_line(&ran.requests[2]).as_deref(),
+        Some("- Per-call token cap: 4000 (per-turn emission ceiling)"),
+        "a non-streamed call carries the generation check-in on the wire, and that is the \
+         cap the compacted thread reports"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn the_resume_catch_up_tells_the_structured_compactor_the_answer_cap() {
+    let call = serde_json::from_value::<Vec<ToolCall>>(read_x()).unwrap();
+    let mut assistant = Message::assistant("");
+    assistant.content = None;
+    assistant.tool_calls = Some(call.clone());
+    let mut messages = heavy_thread();
+    messages.push(assistant);
+    let mut s = Scenario::new(
+        "structured_budget_resume",
+        vec![
+            reply(Some(STRUCTURED_SUMMARY), None, "stop", 500, 30),
+            reply(Some("done"), None, "stop", 300, 5),
+        ],
+    );
+    s.cfg = structured_cfg();
+    s.tools = vec![Tool::Read];
+    s.max_tokens_per_call = Some(10_000);
+    s.generation_interval = Some(4_000);
+    s.resume_from = Some(checkpoint::RunCheckpoint {
+        schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+        role_id: "test-role".into(),
+        messages,
+        turns: 1,
+        total_completion_tokens: 50,
+        compactions: 0,
+        pending_hand_back: None,
+        pending_tool_calls: Some(call),
+        pending_tool_calls_seq_base: 0,
+        pending_head_started: false,
+        written_at_unix_ms: 0,
+    });
+    let ran = run_scenario(s);
+    assert!(ran.result.is_ok(), "{:?}", ran.result.err());
+    assert_eq!(ran.requests.len(), 2, "compactor, then the first post-resume turn");
+    assert_eq!(
+        per_call_line(&ran.requests[1]).as_deref(),
+        Some("- Per-call token cap: 10000 (per-turn emission ceiling)"),
+        "before any call this process has made, the catch-up reports the answer ceiling"
+    );
 }
