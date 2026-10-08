@@ -254,6 +254,73 @@ fn step_managed_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types:
     crate::target::step_managed_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
 }
 
+/// The hosted arm of a `dispatch.single_shot` call: both budgets before the
+/// network, the call, its spend settled, and its `step.result` record pushed
+/// onto `flow_records`.
+fn hosted_single_shot_reply(
+    step: &Step,
+    req: &crate::single_shot::HostedSingleShotRequest<'_>,
+    endpoint_label: Option<&str>,
+    session: &SessionId,
+    budget_caller: &crate::budget::BudgetCaller<'_>,
+    ctx: Option<&StepRunCtx>,
+    flow_records: &mut Vec<darkmux_flow::FlowRecord>,
+) -> Result<crate::single_shot::SingleShotReply> {
+    // (#2902 step 5) Both budgets before the network, never after:
+    // the endpoint's window, then this call's dispatch cap. A breach
+    // warns; an endpoint `wait` holds the call (the step stays live,
+    // its heartbeat beating) until there is room. Nothing is clamped.
+    crate::budget::admit_endpoint(req.endpoint, budget_caller)?;
+    let dispatch_bucket =
+        std::sync::Mutex::new(DispatchBudget::for_endpoint(req.endpoint).map_err(|e| anyhow::anyhow!(e))?);
+    let budget = dispatch_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
+
+    let reply = match crate::single_shot::single_shot_chat_hosted(req) {
+        Ok(reply) => reply,
+        Err(e) => {
+            charge_failed_hosted_step_call(
+                &e,
+                req,
+                &dispatch_bucket,
+                budget_caller,
+                ctx,
+                (&step.id, endpoint_label.unwrap_or_default()),
+            );
+            return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
+        }
+    };
+    crate::budget::settle_dispatch_live(
+        &dispatch_bucket,
+        crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), req.max_tokens, &req.body()?),
+        &step.id,
+        budget_caller,
+    );
+
+    // (#1412) Surface actual spend the same way `dispatch_unmanaged`
+    // embeds totals in its `dispatch complete` record, so a hosted
+    // single-shot step's token usage is visible even without the
+    // full per-step bucket regime.
+    flow_records.push(darkmux_flow::FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        model: Some(req.model.to_string()),
+        ..darkmux_flow::FlowRecord::for_session_with(
+            session,
+            darkmux_flow::Level::Info,
+            darkmux_flow::Category::Work,
+            darkmux_flow::Stage::Dispatch,
+            darkmux_flow::Payload::StepResult(hosted_single_shot_step_payload(
+                &step.id,
+                budget,
+                req.max_tokens,
+                req.max_tokens,
+                &reply,
+            )),
+            step.id.clone(),
+        )
+    });
+    Ok(reply)
+}
+
 /// The LOCAL arm of `dispatch.single_shot` (#3035): a local step whose
 /// `config.endpoint` names a MANAGED endpoint answers to that endpoint's
 /// limits like any other: its window gate, then this call's dispatch cap.
@@ -1016,7 +1083,7 @@ impl DispatchSingleShotStepKind {
         input: &BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        use crate::single_shot::{single_shot_chat_hosted, HostedSingleShotRequest};
+        use crate::single_shot::HostedSingleShotRequest;
         // Records go out live through the scheduler's emitter when there is
         // one, else batch into the outcome (see `StepBookend`).
         let ctx = run_ctx.live();
@@ -1097,72 +1164,27 @@ impl DispatchSingleShotStepKind {
             phase_id: Some(&task.phase_id),
             profiles_file: call.config_path.as_deref(),
         };
-        let reply = if let Some(endpoint) = &endpoint {
-
-            // (#2902 step 5) Both budgets before the network, never after:
-            // the endpoint's window, then this call's dispatch cap. A breach
-            // warns; an endpoint `wait` holds the call (the step stays live,
-            // its heartbeat beating) until there is room. Nothing is clamped.
-            crate::budget::admit_endpoint(endpoint, &budget_caller)?;
-            let dispatch_bucket =
-                std::sync::Mutex::new(DispatchBudget::for_endpoint(endpoint).map_err(|e| anyhow::anyhow!(e))?);
-            let budget = dispatch_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
-
-            let req = HostedSingleShotRequest {
-                endpoint,
-                model: wire_model.as_ref(),
-                system,
-                user: &user,
-                max_tokens,
-                timeout_seconds,
-            };
-            let reply = match single_shot_chat_hosted(&req) {
-                Ok(reply) => reply,
-                Err(e) => {
-                    charge_failed_hosted_step_call(
-                        &e,
-                        &req,
-                        &dispatch_bucket,
-                        &budget_caller,
-                        ctx,
-                        (&step.id, endpoint_label.as_deref().unwrap_or_default()),
-                    );
-                    return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
-                }
-            };
-            crate::budget::settle_dispatch_live(
-                &dispatch_bucket,
-                crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens, &req.body()?),
-                &step.id,
+        // (#3121) A failed call ends the execution with ITS error: the
+        // terminal names it (a signal, a refused budget, an endpoint error)
+        // instead of the guard's "early return or panic".
+        let attempt = match &endpoint {
+            Some(endpoint) => hosted_single_shot_reply(
+                step,
+                &HostedSingleShotRequest {
+                    endpoint,
+                    model: wire_model.as_ref(),
+                    system,
+                    user: &user,
+                    max_tokens,
+                    timeout_seconds,
+                },
+                endpoint_label.as_deref(),
+                session,
                 &budget_caller,
-            );
-
-            // (#1412) Surface actual spend the same way `dispatch_unmanaged`
-            // embeds totals in its `dispatch complete` record, so a hosted
-            // single-shot step's token usage is visible even without the
-            // full per-step bucket regime.
-            flow_records.push(darkmux_flow::FlowRecord {
-                source: Some(darkmux_flow::FlowSource::Scheduler),
-                model: Some(wire_model.to_string()),
-                ..darkmux_flow::FlowRecord::for_session_with(
-                    session,
-                    darkmux_flow::Level::Info,
-                    darkmux_flow::Category::Work,
-                    darkmux_flow::Stage::Dispatch,
-                    darkmux_flow::Payload::StepResult(hosted_single_shot_step_payload(
-                        &step.id,
-                        budget,
-                        max_tokens,
-                        max_tokens,
-                        &reply,
-                    )),
-                    step.id.clone(),
-                )
-            });
-
-            reply
-        } else {
-            local_single_shot_reply(
+                ctx,
+                &mut flow_records,
+            ),
+            None => local_single_shot_reply(
                 step,
                 managed_endpoint.as_ref(),
                 call,
@@ -1171,7 +1193,17 @@ impl DispatchSingleShotStepKind {
                 &user,
                 (max_tokens, timeout_seconds),
                 &budget_caller,
-            )?
+            ),
+        };
+        let reply = match attempt {
+            Ok(reply) => reply,
+            Err(e) => {
+                if let Some(em) = session_emitter.take() {
+                    em.stop();
+                }
+                bookend.fail(&e, call_started.elapsed().as_millis() as u64);
+                return Err(e);
+            }
         };
 
         // (#2902 step 1a) The one usage record for this one model call, from
@@ -2107,13 +2139,35 @@ impl<'a> StepBookend<'a> {
             c.emit(finished);
         }
     }
+
+    /// (#3121) Emit the abort terminal naming `error`, the failure that ended
+    /// the execution, and how long it ran, then disarm. The Drop fallback's
+    /// generic text is for a panic or an unexplained early return only.
+    fn fail(&mut self, error: &anyhow::Error, wall_ms: u64) {
+        if let Some(mut rec) = self.on_abort.take() {
+            if let Some(darkmux_flow::Payload::DispatchError(p)) = rec.payload.as_mut() {
+                p.error = Some(format!("{error:#}"));
+                p.wall_ms = Some(wall_ms);
+            }
+            self.on_abort = Some(rec);
+        }
+        self.emit_abort();
+    }
+
+    /// Emit the armed abort terminal, stamped now: it was built when the
+    /// guard opened, and a terminal carrying its start time reads as a
+    /// zero-length execution (#3121).
+    fn emit_abort(&mut self) {
+        if let (Some(mut rec), Some(c)) = (self.on_abort.take(), self.ctx) {
+            rec.ts = darkmux_flow::ts_utc_now();
+            c.emit(rec);
+        }
+    }
 }
 
 impl Drop for StepBookend<'_> {
     fn drop(&mut self) {
-        if let (Some(rec), Some(c)) = (self.on_abort.take(), self.ctx) {
-            c.emit(rec);
-        }
+        self.emit_abort();
     }
 }
 
@@ -3824,6 +3878,103 @@ mod tests {
              actually addressed, not the bare config.model: {:?}",
             error_bookends[0]
         );
+    }
+
+    /// (#3121) A `dispatch.single_shot` whose call fails writes a
+    /// `dispatch.error` naming that failure and how long the call ran, not the
+    /// guard's "early return or panic". A signal stopping a mission landed
+    /// here: `step.error` named the signal while the execution's own terminal
+    /// called it a panic.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn a_failed_single_shot_call_writes_its_own_error_into_the_execution_terminal() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(400).header("content-type", "application/json").json_body(json!({
+                "error": { "message": "Model \"darkmux:qwen3-4b\" not found" },
+            }));
+        });
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(),
+            Some(tx),
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        let err = format!("{:#}", result.expect_err("the mocked 400 fails the step"));
+        mock.assert_hits(1);
+        let terminal = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .find(|r| r.action == darkmux_flow::FlowAction::DispatchError)
+            .expect("the execution has a terminal");
+        let payload = terminal.payload_json();
+        let recorded = payload["error"].as_str().unwrap_or_default();
+        assert!(!recorded.contains("early return or panic"), "the guard's fallback, not the cause: {payload}");
+        assert!(recorded.contains("not found"), "names the failure the step returned ({err}): {payload}");
+        assert!(payload["wall_ms"].is_u64(), "how long the call ran: {payload}");
+    }
+
+    /// (#3121) The guard's terminal is stamped when it is written, not when
+    /// the guard opened: a terminal stamped with its start time reads as a
+    /// zero-length execution.
+    #[test]
+    fn a_step_bookend_stamps_its_abort_terminal_when_it_writes_it() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(),
+            Some(tx),
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
+        );
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "m", "user": "hi" }));
+        let session = crate::test_session("sess-3121");
+        let execution = ExecutionId::mint();
+        let records = ExecutionBookends {
+            kind: "dispatch.single_shot",
+            session: &session,
+            execution: &execution,
+            step: &s,
+            model: "m",
+            endpoint_label: None,
+        };
+        let mut start = records.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchStart(records.start_payload(None)));
+        start.ts = "2000-01-01T00:00:00Z".to_string();
+        let mut abort = records.record(
+            darkmux_flow::Level::Error,
+            darkmux_flow::Payload::DispatchError(records.end_payload(0)),
+        );
+        abort.ts = "2000-01-01T00:00:00Z".to_string();
+        drop(StepBookend::new(Some(&ctx), start, abort));
+        drop(ctx);
+        let terminal = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .find(|r| r.action == darkmux_flow::FlowAction::DispatchError)
+            .expect("the dropped guard writes its terminal");
+        let written = darkmux_flow::parse_ts_utc(&terminal.ts).expect("a record ts");
+        let now = darkmux_flow::parse_ts_utc(&darkmux_flow::ts_utc_now()).unwrap();
+        assert!(now - written <= 5, "stamped at write time, not at open: {}", terminal.ts);
     }
 
     #[serial_test::serial]

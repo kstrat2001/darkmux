@@ -4864,6 +4864,47 @@ fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyh
     }
 }
 
+/// (#3121) The terminal of a container dispatch that ended mid-run, by a
+/// signal or scoped stop ([`killed_mid_run_error`]) or a failed wait: a
+/// `dispatch.error` at `Error` level carrying that error, and what the
+/// execution did before it, read from the same trajectory fold the clean
+/// path's [`build_dispatch_complete_payload`] reads. Without it the bookend
+/// guard's Drop wrote "early return or panic" with 0 turns for a run someone
+/// deliberately stopped. The container did not finish, so there is no exit
+/// code or output to report, and the host window is not read (the sampler
+/// is stopped and its window dropped at teardown).
+fn ended_mid_run_terminal(
+    error: &str,
+    wall_ms: u64,
+    summary: &TrajectorySummary,
+    endpoint: Option<&str>,
+    resume_from: Option<&std::path::Path>,
+) -> (darkmux_flow::Payload, darkmux_flow::Level) {
+    let payload = DispatchEndPayload {
+        error: Some(error.to_string()),
+        stdout_chars: None,
+        stderr_chars: None,
+        stderr_excerpt: None,
+        exit_code: None,
+        host_window: None,
+        // A non-zero exit code is what makes the builder's `result_class`
+        // `Error`; the code itself is cleared above.
+        ..build_dispatch_complete_payload(
+            wall_ms,
+            "",
+            "",
+            1,
+            summary,
+            endpoint,
+            &HostStats::default(),
+            &HostExtras::default(),
+            resume_from,
+            None,
+        )
+    };
+    (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error)
+}
+
 type SamplerOutcome = (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary);
 
 /// (#3074) Join `handle`, giving up after `bound`. `None` means the thread was
@@ -4934,14 +4975,14 @@ fn teardown_container_threads(
     sampler: SamplerThread<'_>,
     stop_flag: &AtomicBool,
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
-) {
+) -> TrajectorySummary {
     watchdog_done.store(true, Ordering::SeqCst);
     docker_kill_by_name(container_name);
     let _ = watchdog_handle.join();
     sampler.stop.store(true, Ordering::SeqCst);
     let _ = join_within(sampler.handle, sampler.bound);
     stop_flag.store(true, Ordering::SeqCst);
-    let _ = tailer_handle.join();
+    tailer_handle.join().unwrap_or_default()
 }
 
 // (#2232) The inactivity watchdog is the UNATTENDED safety net, and its kill
@@ -6525,6 +6566,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         dispatch_start_payload,
     ));
     let dispatch_start_instant = std::time::Instant::now();
+    // (#3121) A run that ended mid-way closes with the error that ended it
+    // and the turns it finished, never the guard's "early return or panic".
+    let close_ended_mid_run =
+        |bookend: &mut DispatchBookendGuard<'_>, err: &anyhow::Error, summary: &TrajectorySummary| {
+            let (mut payload, level) = ended_mid_run_terminal(
+                &format!("{err:#}"),
+                dispatch_start_instant.elapsed().as_millis() as u64,
+                summary,
+                unmanaged_endpoint_raw_label.as_deref(),
+                opts.resume_from.as_deref(),
+            );
+            merge_record_context(&mut payload, &opts.record_context);
+            bookend.close(crate::dispatch::build_dispatch_record(
+                level,
+                &opts.role_id,
+                &session,
+                &execution,
+                Some(&model),
+                phase_id.as_deref(),
+                payload,
+            ));
+        };
 
     // (#638) Session liveness heartbeat. While THIS dispatch process lives,
     // refresh a short-TTL `darkmux:session-presence:<sid>` Redis key so the
@@ -7174,7 +7237,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // thread leaked: its own loop only exits on `stop_flag` or a
             // caught signal, neither of which this branch used to touch, so
             // it polled `trajectory.jsonl` forever in the background.
-            teardown_container_threads(
+            let trajectory_summary = teardown_container_threads(
                 &container_name,
                 &watchdog_done,
                 watchdog_handle,
@@ -7186,6 +7249,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 &stop_flag,
                 tailer_handle,
             );
+            let err = anyhow::Error::from(e).context("waiting for darkmux-runtime container");
+            close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
             // (#2131 review round 2, NEW-2) No explicit deregister here —
             // `container_child_registration` (declared at the spawn
             // site) deregisters on Drop, which fires when this early
@@ -7193,7 +7258,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // why an explicit call at every exit path was the wrong
             // shape (a leaked registration on a future `?` return this
             // function grows).
-            return Err(e).context("waiting for darkmux-runtime container");
+            return Err(err);
         }
     };
 
@@ -7256,7 +7321,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
     if run_was_killed(&local_stop, output.status.success()) {
-        teardown_container_threads(
+        let trajectory_summary = teardown_container_threads(
             &container_name,
             &watchdog_done,
             watchdog_handle,
@@ -7280,7 +7345,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2925) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
-        return Err(killed_mid_run_error(&container_name, &local_stop));
+        let err = killed_mid_run_error(&container_name, &local_stop);
+        close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
+        return Err(err);
     }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after

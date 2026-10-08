@@ -106,7 +106,7 @@ const ROSTER: &[CallSite] = &[
     },
     CallSite {
         file: "src/step_kinds/builtins.rs",
-        caller: "run_single_shot",
+        caller: "hosted_single_shot_reply",
         transport: "single_shot_chat_hosted(",
         duty: Duty::Emits {
             writer_in: ("src/step_kinds/builtins.rs", "run_single_shot"),
@@ -357,8 +357,8 @@ fn every_hosted_call_site_passes_the_budget_gates() {
             ),
         ),
         (
-            "run_single_shot",
-            Budget::Gated { gate_in: ("src/step_kinds/builtins.rs", "run_single_shot"), call: "single_shot_chat_hosted(" },
+            "hosted_single_shot_reply",
+            Budget::Gated { gate_in: ("src/step_kinds/builtins.rs", "hosted_single_shot_reply"), call: "single_shot_chat_hosted(" },
         ),
         (
             "map_hosted_dispatch",

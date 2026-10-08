@@ -17672,6 +17672,57 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
     }
 
+    /// (#3121) A container dispatch that ended mid-run (a signal, a scoped
+    /// stop, a failed wait): its terminal is a `dispatch.error` at `Error`
+    /// level naming that error and counting the turns it finished, from the
+    /// same trajectory fold the clean path reads, instead of the bookend
+    /// guard's "early return or panic" with 0 turns.
+    #[test]
+    fn a_dispatch_ended_mid_run_closes_as_an_error_naming_it_with_the_turns_it_finished() {
+        let mut summary = super::TrajectorySummary::default();
+        for seq in 1..=5 {
+            summary.fold.apply(&ev(serde_json::json!({
+                "type": "model.completed", "seq": seq, "finish_reason": "tool_calls",
+                "usage": { "prompt_tokens": 10, "completion_tokens": 2 },
+            })));
+        }
+        let err = "darkmux-runtime container dispatch interrupted by an operator signal \
+                   (SIGINT/SIGTERM/SIGHUP): the container `c` was killed mid-run";
+        let (payload, level) = super::ended_mid_run_terminal(err, 4200, &summary, None, None);
+        assert_eq!(payload.action(), darkmux_flow::FlowAction::DispatchError, "never a completion");
+        assert!(matches!(level, darkmux_flow::Level::Error), "{level:?}");
+        let payload = serde_json::to_value(payload).unwrap();
+        assert_eq!(payload["error"], err, "{payload}");
+        assert_eq!(payload["result_class"], "error", "{payload}");
+        assert_eq!(payload["total_turns"], 5, "the turns it finished: {payload}");
+        assert_eq!(payload["prompt_tokens"], 50, "{payload}");
+        assert_eq!(payload["wall_ms"], 4200, "{payload}");
+        for absent in ["exit_code", "stdout_chars", "stderr_chars", "stderr_excerpt", "host_window"] {
+            assert!(payload.get(absent).is_none_or(|v| v.is_null()), "the container did not finish: {absent} in {payload}");
+        }
+    }
+
+    /// (#3121) Both mid-run exits of `dispatch()` close their bookend through
+    /// that terminal before returning, so the guard's Drop fallback never
+    /// writes one for them. Source-pinned: both need a live container.
+    #[test]
+    fn both_mid_run_exits_close_their_bookend_with_the_ended_terminal() {
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").unwrap()];
+        let closure = &src[src.find("let close_ended_mid_run =").unwrap()..];
+        let closure = &closure[..closure.find("};").unwrap()];
+        assert!(closure.contains("ended_mid_run_terminal("), "{closure}");
+        assert!(closure.contains("bookend.close(crate::dispatch::build_dispatch_record(\n                level,"), "{closure}");
+        for start in [
+            "if run_was_killed(&local_stop, output.status.success()) {",
+            "let err = anyhow::Error::from(e).context(\"waiting for darkmux-runtime container\");",
+        ] {
+            let branch = &src[src.find(start).unwrap_or_else(|| panic!("{start}"))..];
+            let branch = &branch[..branch.find("return Err(").unwrap()];
+            assert!(branch.contains("close_ended_mid_run(&mut bookend, &err, &trajectory_summary);"), "{branch}");
+        }
+    }
+
     /// (#2903) Feed `model.completed` events through the REAL tailer, then
     /// build the complete payload from the summary it accumulated. Shared by
     /// the two tests below so both exercise the live accumulation path, not
