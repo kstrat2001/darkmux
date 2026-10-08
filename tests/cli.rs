@@ -10855,12 +10855,17 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
         .iter()
         .find(|t| t["id"] == serde_json::json!("create-mod-dispatch"))
         .expect("the create-mod-dispatch template");
-    assert_eq!(dispatch["grow"]["config"]["message"], serde_json::json!(review));
+    // On the dispatch step itself: `grow.config` reaches the gate step too.
+    assert_eq!(dispatch["steps"][0]["config"]["message"], serde_json::json!(review));
     let wait = tasks
         .iter()
         .find(|t| t["id"] == serde_json::json!("create-mod"))
         .expect("the create-mod wait template");
-    assert!(wait["grow"]["config"]["message"].is_null(), "the wait template carries no message");
+    assert!(
+        wait["grow"]["config"]["message"].is_null()
+            && wait["steps"].as_array().unwrap().iter().all(|s| s["config"]["message"].is_null()),
+        "the wait template carries no message"
+    );
     for needle in [
         "relative to the repository root",
         "exactly as they appear",
@@ -11182,9 +11187,9 @@ fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
         .iter()
         .find(|p| p["id"] == serde_json::json!("create-mods"))
         .expect("a create-mods phase");
-    let raw = phase["tasks"][0]["grow"]["config"]["command"]
+    let raw = phase["tasks"][0]["steps"][0]["config"]["command"]
         .as_str()
-        .expect("the create-mod task's grow config carries a shell command");
+        .expect("the create-mod task's wait step carries a shell command");
     // The shipped command reads both values from the environment the step's
     // `env` sets (#3074), so the test sets them the same way: quoted, and
     // exported ahead of the unchanged command text.
