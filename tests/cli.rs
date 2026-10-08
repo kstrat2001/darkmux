@@ -10855,12 +10855,17 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
         .iter()
         .find(|t| t["id"] == serde_json::json!("create-mod-dispatch"))
         .expect("the create-mod-dispatch template");
-    assert_eq!(dispatch["grow"]["config"]["message"], serde_json::json!(review));
+    // On the dispatch step itself: `grow.config` reaches the gate step too.
+    assert_eq!(dispatch["steps"][0]["config"]["message"], serde_json::json!(review));
     let wait = tasks
         .iter()
         .find(|t| t["id"] == serde_json::json!("create-mod"))
         .expect("the create-mod wait template");
-    assert!(wait["grow"]["config"]["message"].is_null(), "the wait template carries no message");
+    assert!(
+        wait["grow"]["config"]["message"].is_null()
+            && wait["steps"].as_array().unwrap().iter().all(|s| s["config"]["message"].is_null()),
+        "the wait template carries no message"
+    );
     for needle in [
         "relative to the repository root",
         "exactly as they appear",
@@ -10915,8 +10920,11 @@ fn review_ships_both_mod_seat_templates_and_validates_clean() {
     // The seat is pinned by the step's own `profile_name` override — the
     // key `dispatch.internal` reads (`builtins::task_or_config_str`) — fed
     // from the `mod_seat_profile` input.
+    // It lives on that step, not in `grow.config`, which every step of the
+    // copy gets and the gate step would refuse.
+    let dispatch_step = seat.steps.iter().find(|s| s.kind == "dispatch.internal").expect("the dispatch step");
     assert_eq!(
-        seat.grow.as_ref().expect("grow").config["profile_name"],
+        dispatch_step.config["profile_name"],
         serde_json::json!("{{mod_seat_profile}}"),
         "the endpoint seat pins its profile through the step config `dispatch.internal` reads"
     );
@@ -11179,9 +11187,9 @@ fn create_mod_wait_command(finding_key: &str, bound: &str) -> String {
         .iter()
         .find(|p| p["id"] == serde_json::json!("create-mods"))
         .expect("a create-mods phase");
-    let raw = phase["tasks"][0]["grow"]["config"]["command"]
+    let raw = phase["tasks"][0]["steps"][0]["config"]["command"]
         .as_str()
-        .expect("the create-mod task's grow config carries a shell command");
+        .expect("the create-mod task's wait step carries a shell command");
     // The shipped command reads both values from the environment the step's
     // `env` sets (#3074), so the test sets them the same way: quoted, and
     // exported ahead of the unchanged command text.
@@ -11304,11 +11312,14 @@ fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
         task.get("role_id").is_none(),
         "the create-mod task staffs no seat: {task}"
     );
-    assert!(
-        task["grow"]["config"].get("message").is_none()
-            && task["grow"]["config"].get("brief_refs").is_none(),
-        "a dispatch brief here would mean a local coder is still being asked to write the kit: {task}"
-    );
+    let configs = std::iter::once(&task["grow"]["config"])
+        .chain(task["steps"].as_array().unwrap().iter().map(|s| &s["config"]));
+    for config in configs {
+        assert!(
+            config.get("message").is_none() && config.get("brief_refs").is_none(),
+            "a dispatch brief here would mean a local coder is still being asked to write the kit: {task}"
+        );
+    }
     let kinds: Vec<&str> =
         task["steps"].as_array().unwrap().iter().map(|s| s["kind"].as_str().unwrap()).collect();
     assert_eq!(
@@ -11316,8 +11327,11 @@ fn review_create_mods_waits_for_a_mod_instead_of_dispatching_a_coder() {
         vec!["procedural.shell", "mods.gate"],
         "wait then gate: no dispatch step: {task}"
     );
-    let command = task["grow"]["config"]["command"].as_str().unwrap();
-    let env = &task["grow"]["config"]["env"];
+    // The wait's keys live on the wait step: `grow.config` reaches the gate
+    // step too, which refuses them.
+    let wait_config = &task["steps"][0]["config"];
+    let command = wait_config["command"].as_str().unwrap();
+    let env = &wait_config["env"];
     assert_eq!(env["DARKMUX_FINDING_KEY"], serde_json::json!("{{item.key}}"), "{env}");
     assert_eq!(env["DARKMUX_MOD_WAIT_SECONDS"], serde_json::json!("{{mod_wait_seconds}}"), "{env}");
     for needle in ["$DARKMUX_FINDING_KEY", "$DARKMUX_MOD_WAIT_SECONDS", "mod list --for", "DARKMUX_BIN"] {
