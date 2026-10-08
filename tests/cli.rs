@@ -13788,8 +13788,14 @@ fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
     }
     let status = std::process::Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap();
     assert!(status.success());
+    let signaled = std::time::Instant::now();
     let exit = child.wait().unwrap();
     assert_eq!(exit.code(), Some(130), "exit: {exit:?}");
+    // The seam releases the launch as soon as the signal is observed, not at
+    // its 30s bound: one that sat out the bound would still close run.error,
+    // but by timing out rather than by reacting to the signal.
+    let closed_after = signaled.elapsed();
+    assert!(closed_after < std::time::Duration::from_secs(20), "the run closed {closed_after:?} after the signal");
 
     let mut all = String::new();
     for e in walkdir_files(flows.path()) {

@@ -1084,6 +1084,17 @@ mod tests {
         }
     }
 
+    /// (#3079) A bracketed host is an IPv6 literal only when it has a colon AND
+    /// holds nothing but hex digits, colons and dots; anything else fails closed.
+    #[test]
+    fn url_host_accepts_a_bracketed_host_only_when_it_is_an_ipv6_literal() {
+        assert_eq!(url_host("http://[fe80::1]/v1").as_deref(), Some("[fe80::1]"));
+        assert_eq!(url_host("http://[::ffff:127.0.0.1]:80/v1").as_deref(), Some("[::ffff:127.0.0.1]:80"));
+        for malformed in ["http://[beef]:80/v1", "http://[proxy:example]/v1", "http://[::1]x/v1", "http://[::1/v1"] {
+            assert_eq!(url_host(malformed), None, "{malformed}");
+        }
+    }
+
     #[test]
     fn validate_refuses_what_cannot_work_and_names_it() {
         let bad = ModelEndpoint { url: Some("example.azure.com".into()), ..Default::default() };

@@ -937,6 +937,23 @@ mod tests {
         assert_eq!(pace_json(dir.path())["pause"], true);
     }
 
+    /// The same rule when thermal takes the file on the very tick the ceiling is
+    /// reached, while this governor still owns its pause: the release yields to
+    /// thermal and leaves its hold in place.
+    #[test]
+    fn the_ceiling_reached_as_thermal_takes_over_leaves_thermals_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true))
+            .with_restamp_interval_ms(1)
+            .with_blind_ceiling_ms(2_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        crate::pace_file::write(dir.path(), true, "thermal", "hot");
+        assert_eq!(g.on_sample(None, 2_000, dir.path(), true), Some(BatteryEvent::ProbeCeiling { held_pct: 40 }));
+        assert!(!g.is_pacing());
+        assert_eq!(pace_json(dir.path())["reason"], "thermal");
+        assert_eq!(pace_json(dir.path())["pause"], true, "thermal's hold must survive the battery release");
+    }
+
     #[test]
     fn the_blind_ceiling_is_derived_from_the_runtime_max_pause() {
         let g = BatteryGovernor::new(cfg(50, true, true));

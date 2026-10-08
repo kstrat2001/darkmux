@@ -8637,6 +8637,80 @@ mod tests {
         }
     }
 
+    /// #3089, the other order: an abort ranks first wherever the stream puts
+    /// it. A `mission.abort` that lands AFTER a `run.complete`, a `run.error`
+    /// or a `mission.close` still reads Abandoned/Aborted on a peer row, not
+    /// the earlier record's verdict.
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_mission_abort_outranks_an_earlier_terminal() {
+        for (early, outcome) in [("run.complete", "Clean"), ("run.error", ""), ("mission.close", "")] {
+            let _g = CrewGuard::new();
+            let flows = TempDir::new().unwrap();
+            let rec = |action: &str| {
+                let mut v = serde_json::json!({
+                    "ts": darkmux_flow::ts_utc_now(),
+                    "action": action,
+                    "source": "mission_lifecycle",
+                    "session_id": "mission-abort-last",
+                    "mission_id": "abort-last",
+                    "machine_id": "m1-max-32gb-studio",
+                });
+                if !outcome.is_empty() && action == early {
+                    v["outcome"] = serde_json::json!(outcome);
+                }
+                v
+            };
+            let fleet = vec![
+                peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+                rec(early),
+                rec("mission.abort"),
+            ];
+            let runs = build_runs(flows.path(), None, &fleet);
+            let row = runs.iter().find(|r| r.id == "abort-last").unwrap();
+            assert_eq!(row.status, RunStatus::Abandoned, "{early} then abort must read Abandoned");
+            assert_eq!(row.abandoned_reason, Some(AbandonReason::Aborted), "{early} then abort");
+            assert!(row.completed_ts.is_none(), "{early} then abort carries no completion stamp");
+        }
+    }
+
+    /// A peer mission's span is the EARLIEST and LATEST of its records'
+    /// stamps, whatever order they arrive in: the fleet stream and the
+    /// day-files interleave, so arrival order is not time order.
+    #[test]
+    #[serial_test::serial]
+    fn a_flow_mission_row_spans_its_earliest_to_its_latest_record_in_any_order() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix();
+        let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
+        let rec = |secs_ago: u64, action: &str| {
+            serde_json::json!({ "ts": at(secs_ago), "action": action, "session_id": "span-session", "mission_id": "span-mission", "handle": "coder" })
+        };
+        // Middle first, then the earliest, then the latest.
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[rec(600, "dispatch.start"), rec(900, "dispatch.turn"), rec(300, "dispatch.turn")],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "span-mission").unwrap_or_else(|| panic!("no row: {runs:?}"));
+        assert_eq!(row.started_ts, parse_flow_ts(&at(900)), "started is the earliest record, not the first to arrive: {row:?}");
+        assert_eq!(row.updated_ts, parse_flow_ts(&at(300)), "updated is the latest record, not the first to arrive: {row:?}");
+    }
+
+    /// A mission's session list names each session once, and an empty
+    /// `session_id` is no session: it grows with the sessions a mission has,
+    /// never with how many records it wrote.
+    #[test]
+    fn a_flow_mission_lists_each_session_once_and_no_empty_one() {
+        let mut agg = FlowMissionAgg::default();
+        for sid in ["s1", "s1", "", "s2", "s1", "", "s2"] {
+            agg.fold_record(&serde_json::json!({ "ts": "2026-01-01T00:00:00Z", "action": "dispatch.turn", "session_id": sid, "mission_id": "m" }));
+        }
+        assert_eq!(agg.session_ids, ["s1", "s2"]);
+    }
+
     /// The fleet half must obey the same 14-day bound the local walk does.
     /// `XADD MAXLEN ~` trims lazily — only on write — so a quiet fleet keeps
     /// month-old records that would otherwise resurface as rows that never

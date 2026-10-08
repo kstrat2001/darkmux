@@ -501,6 +501,13 @@ mod tests {
         assert!(!classify_outcome("edit", edit).tool_worked());
         assert_eq!(classify_outcome("write", "Wrote 12 bytes to /workspace/a.rs"), ToolOutcome::Ok);
         assert_eq!(classify_outcome("bash", write), ToolOutcome::Ok);
+        // The `edit` arm is scoped both ways too: a real edit stays Ok, and
+        // `NOT EDITED` from another tool is that tool's text, not a refusal.
+        assert_eq!(
+            classify_outcome("edit", "Edited /workspace/a.rs (1 edit applied; 1 replacement total)"),
+            ToolOutcome::Ok
+        );
+        assert_eq!(classify_outcome("bash", edit), ToolOutcome::Ok);
     }
 
     #[test]
