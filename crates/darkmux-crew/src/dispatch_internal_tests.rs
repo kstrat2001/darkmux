@@ -11738,6 +11738,33 @@
         assert!(json.get("sampler_us").is_none() && json.get("forward_us").is_none(), "milliseconds only: {json}");
     }
 
+    /// The stamped observer cost covers every send the channel makes: a
+    /// utility job's two edges are sends too, so they count in `sampler_us`,
+    /// which therefore never reads below `forward_us` (the sends alone). A
+    /// release-mode run once stamped 170 against 189.
+    #[test]
+    #[serial]
+    fn utility_sends_count_in_the_stamped_sampler_cost() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("live.sock");
+        let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut st = TailerState::new(tmp.path().join("trajectory.jsonl"), crate::test_session("u-sess"), darkmux_types::execution_id::ExecutionId::mint(), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
+            .with_live(Some(darkmux_flow::live::LiveSender::to_path(sock)), 250);
+        let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+        for job in 0..200 {
+            st.live_utility(serde_json::json!({ "event": "start", "job_id": job }), Some("util-4b"));
+            while rx.recv(&mut buf).is_ok() {}
+        }
+        st.finish_live();
+        let live = &st.summary.live;
+        assert_eq!(live.samples_sent, 200, "{live:?}");
+        assert!(live.forward_us > 0, "200 sends take measurable time: {live:?}");
+        assert!(live.sampler_us >= live.forward_us, "the utility sends are missing from the stamped cost: {live:?}");
+    }
+
     /// (#2928 review, MF1) Through a silent tool-call write the HOST keeps
     /// the live view fresh: each post-poll flush past the cadence re-sends
     /// the writing state stamped with the host's clock, and it stops at the

@@ -65,6 +65,11 @@ its own: every entry below labeled 5.0 ships together.
 
 ### Fixed (5.0): found in the release test pass
 
+- **The live channel's stamped cost covers all of its work.** `dispatch.complete`'s
+  `payload.live.sampler_ms` left out the sends of a utility job's start and end, and
+  rounded each call down to a whole microsecond before summing, so in an optimized
+  build it could read below `forward_ms`, the sends' share of it. It now times
+  every send and sums in nanoseconds.
 - **A review that finds something finishes** (#3129). Every `review` run with at
   least one finding failed when it grew its `create-mod` steps: one shared config was
   merged into every step of each copy, and 5.0 refuses a key a step does not take.
