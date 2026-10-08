@@ -116,24 +116,25 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
-          # `every`: a file counts only if it matches ALL patterns, so the
-          # positive set is one brace list and each `!` line excludes. In the
-          # default `some` mode a `!` line matches every file outside it,
-          # which is how `!runtime/**` made this job run on every PR (a
-          # formula-only PR ran it for 698 s). Root files are listed
-          # explicitly: `**/Cargo.lock` inside a brace list does not match
-          # the root `Cargo.lock`.
-          # (#1868) `ui/src/lenses/mission/graph.ts` is in the list because a
-          # Rust test reads it directly (the `graph_ts_status_actions_map` pin
-          # ties its STATUS_ACTIONS map to the emitter's own list), so a
-          # UI-only edit to it must run this job.
-          # `CLAUDE.md` files are agent instructions, never compiled.
+          # Fail open: this job runs on ANY change except files proven inert
+          # (no Rust build embeds them and no Rust test reads them). A list of
+          # what counts as Rust input would miss what the binary embeds or a
+          # test reads: skills/*/SKILL.md, config.example.json, the viewer
+          # bundle, fixtures, docs/ENVIRONMENT.md, DESIGN.md (src/cli_json.rs
+          # reads it), packaging/homebrew/darkmux-serve-wrapped (tests/cli.rs).
+          # Add a path below only after checking nothing in Rust reads it.
+          # `every`: a file must match ALL patterns, so each `!` line excludes.
+          # (In the default `some` mode a `!` line matches every file outside
+          # it: the old `'!runtime/**'` line made this job run on every PR by
+          # accident.)
           predicate-quantifier: 'every'
           filters: |
             rust:
-              - '{*.rs,**/*.rs,Cargo.toml,**/Cargo.toml,Cargo.lock,**/Cargo.lock,templates/**,.github/workflows/ci.yml,ui/src/lenses/mission/graph.ts}'
-              - '!runtime/**'
+              - '**'
               - '!**/CLAUDE.md'
+              - '!docs/agents/**'
+              - '!{README.md,CONTRIBUTING.md,CHANGELOG.md,DISCLAIMER.md,SECURITY.md,LICENSE}'
+              - '!docs/{ENGAGEMENTS,OPERATIONS}.md'
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
