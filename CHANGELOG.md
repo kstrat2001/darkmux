@@ -65,6 +65,13 @@ its own: every entry below labeled 5.0 ships together.
 
 ### Fixed (5.0): found in the release test pass
 
+- **A review that finds something finishes** (#3129). Every `review` run with at
+  least one finding failed when it grew its `create-mod` steps: one shared config was
+  merged into every step of each copy, and 5.0 refuses a key a step does not take.
+  Each grown step now carries only its own keys, a template step's own config may use
+  `{{item.*}}` and `{{from.output}}`, and the static gate (preflight and `darkmux
+  doctor`) refuses a grow key that a step of the template does not take, so a config
+  that would fail mid-run is refused before it launches.
 - **A stopped run is recorded as stopped, with the work it did** (#3121). A dispatch
   ended by a signal or a scoped stop, or whose container wait failed, used to close
   with `dispatch.error` "terminated before completion (early return or panic)" and
