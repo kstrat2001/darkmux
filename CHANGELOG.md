@@ -12,11 +12,10 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
-## [Unreleased]
+## [5.0.0] - 2026-10-08
 
-This is the 5.0.0 release. The version jumps from 3.13.0 because the work that began as
-4.0 was never tagged on its own: every entry below labeled 5.0 ships together, and
-the `4.0.0-rc.1` in `Cargo.toml` is renamed at release.
+The version jumps from 3.13.0 because the work that began as 4.0 was never tagged on
+its own: every entry below labeled 5.0 ships together.
 
 ### Added
 
@@ -63,6 +62,52 @@ the `4.0.0-rc.1` in `Cargo.toml` is renamed at release.
   under an errored step, and `mission show --json` carries it as the step row's
   `error` (additive, absent for a step that did not error;
   `tests/cli-json.golden` regenerated for the new field).
+
+### Fixed (5.0): found in the release test pass
+
+- **A review that finds something finishes** (#3129). Every `review` run with at
+  least one finding failed when it grew its `create-mod` steps: one shared config was
+  merged into every step of each copy, and 5.0 refuses a key a step does not take.
+  Each grown step now carries only its own keys, a template step's own config may use
+  `{{item.*}}` and `{{from.output}}`, and the static gate (preflight and `darkmux
+  doctor`) refuses a grow key that a step of the template does not take, so a config
+  that would fail mid-run is refused before it launches.
+- **A stopped run is recorded as stopped, with the work it did** (#3121). A dispatch
+  ended by a signal or a scoped stop, or whose container wait failed, used to close
+  with `dispatch.error` "terminated before completion (early return or panic)" and
+  `total_turns: 0`. Its terminal now names the error that ended it and carries the
+  turns, tools and tokens the execution recorded. A failed `dispatch.single_shot`
+  step closes its execution with its own error and wall time, and that terminal is
+  stamped when it is written, not when the step started.
+- **Radio answers questions that name a command, and never calls a real command
+  invalid** (#3123). A catalog id in backticks used as a name ("The `review`
+  mission") and an HTTP route from the grounding (`GET /runs`) no longer discard
+  the answer. When an answer is discarded, the error names what tripped the check,
+  and the fallback says it could not check its answer and points at
+  `darkmux --help`, instead of repeating the router's reason as fact. A fence line
+  that runs `darkmux` is now checked as well.
+- **Cancelling a panel launch closes its run** (#3117). The editor panel stopped a
+  cancelled `/mission launch` with SIGKILL, which skipped the launch's finalize and
+  left its run `running`. It now sends SIGTERM and keeps reading the launch's
+  output until it exits.
+- **A wedged Docker no longer hangs `doctor` or a dispatch preflight** (#3115).
+  `docker version` is bounded at 15 s and a timeout reads as Docker not answering.
+- **The runs board and the viewer agree on a run whose closes came first** (#3103).
+  With clock-skewed closes before every start in a shared session, the daemon and
+  the viewer placed them differently; both now place them in time order.
+- **`mission config` validation agrees with what a launch prunes** (#3104). A task
+  pruned because every step is disabled, or every dependency is pruned, now counts
+  as never minted: `outcome_from` naming it is refused at validate time, and an
+  `excludes` pair whose other side is pruned is no longer a false error.
+- **A repeated panel cancel counts only prompts it newly reaches** (#3108).
+
+### Changed (5.0): found in the release test pass
+
+- **Radio answers here when the answering seat's machine cannot be reached** (#3116).
+  When the peer's route check gets no answer, nothing has been sent, so radio
+  answers once on this machine's seat and labels the answer with the reason.
+- **A run's kind is an icon on the runs board** (#3110), with a tooltip, so "Lab"
+  no longer reads as a status.
 
 ### Fixed (5.0): isolation
 - **A remote read is redacted as it streams, with no size cap, and the serve token compares as digests** (#3073).
@@ -2971,6 +3016,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.0.0
 [3.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.13.0
 [3.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.12.0
 [3.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.11.0

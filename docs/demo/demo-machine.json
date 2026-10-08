@@ -4,7 +4,7 @@
     "attribution_note": "4 worker(s) for 4 resident(s) \u2014 per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker <-> largest weights)",
     "cache_ttl_ms": 2000,
     "gather_ms": 303,
-    "generated_at_ms": 1790328465946,
+    "generated_at_ms": 1791448537902,
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
     "load": {
@@ -40,7 +40,7 @@
           "gpu": 2516,
           "total": 4641
         },
-        "sampled_at_ms": 1790328439610,
+        "sampled_at_ms": 1791448253282,
         "sampler_cost_ms": 3,
         "thermal": {
           "cpu_speed_limit_pct": 100,
@@ -172,9 +172,10 @@
   },
   "specs": {
     "cpu_brand": "Apple M5 Ultra",
-    "darkmux_version": "3.13.0",
+    "darkmux_version": "5.0.0",
     "flow_schema_version": "1.20.0",
-    "generated_at_ms": 1790328465946,
+    "generated_at_ms": 1791448537900,
+    "hub_configured": true,
     "lms_unreachable": false,
     "loaded_models": [
       {
@@ -207,15 +208,12 @@
       }
     ],
     "machine_id": "Workstation",
-    "machine_uid": null,
     "os": "macos aarch64",
     "ram_free_for_ai_bytes": 98725027315,
     "ram_total_bytes": 274877906944,
-    "hub_configured": true,
     "utility_model": {
       "id": "darkmux:qwen3-4b-instruct-2507",
-      "loaded": true,
-      "n_ctx": null
+      "loaded": true
     }
   }
 }

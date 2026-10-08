@@ -46,7 +46,13 @@ jobs:
     # timeout 25 and is fine, which is not a counterexample: that job is DEV
     # profile with no separate build step. Optimized builds are the whole cost here, and they
     # are the entire point of this gate. See #2828.
-    timeout-minutes: 60
+    #
+    # 120, not 60 (5.0.0, 2026-10-08). The last passing run (2026-09-25) took
+    # 34 minutes; by the 5.0 release the build step alone took 26-29 and the
+    # test step's compile another 27, so a passing run no longer fit in 60. It
+    # was killed at the cap with every test binary so far green, again
+    # recorded as "cancelled".
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4

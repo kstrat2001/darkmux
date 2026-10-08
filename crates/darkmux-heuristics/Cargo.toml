@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-heuristics"
-version = "4.0.0-rc.1"
+version = "5.0.0"
 edition = "2021"
 description = "darkmux per-tier heuristic profiles (M-series + generic)"
 license = "MIT"

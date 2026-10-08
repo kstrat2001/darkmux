@@ -20,6 +20,18 @@ import argparse, http.server, json, os, pathlib, re, signal, socket, subprocess,
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
+
+
+def path_spellings(p):
+    """`p` as darkmux may print it: absolute, and `~`-relative when it sits
+    under the home directory (doctor's hints print `~` since #3081, so a
+    scrub keyed on the absolute path alone let the demo home leak)."""
+    out = [str(p)]
+    try:
+        out.append(f"~/{pathlib.Path(p).relative_to(pathlib.Path.home())}")
+    except ValueError:
+        pass
+    return out
 sys.path.insert(0, str(HERE))
 from lib_identity_scrub import scrub as _identity_scrub, FORBIDDEN  # noqa: E402
 from lib_demo_env import without_retired_env  # noqa: E402
@@ -150,10 +162,12 @@ def make_handler(inner, fx, hero, demo_uids, home):
                 text = data.decode()
             except UnicodeDecodeError:
                 return data
-            if str(home) not in text and str(ROOT) not in text and "/Users/" not in text \
+            spellings = path_spellings(home) + path_spellings(ROOT)
+            if not any(sp in text for sp in spellings) and "/Users/" not in text \
                     and not any(p.search(text) for p, _ in FORBIDDEN):
                 return data
-            text = text.replace(str(home), "/home/demo/.darkmux")
+            for spelled in path_spellings(home):
+                text = text.replace(spelled, "/home/demo/.darkmux")
             # Same repo-checkout-path leak `build.py::canned_doctor` guards
             # against, live here: `lab fixture list` names the built-in
             # fixture's real path under `ROOT` (`templates/builtin/lab-
@@ -162,7 +176,8 @@ def make_handler(inner, fx, hero, demo_uids, home):
             # whatever comes after, including a worktree's session-scoped
             # directory name. `home` is replaced first because it nests
             # under `ROOT`; replacing `ROOT` first would corrupt that match.
-            text = text.replace(str(ROOT), "/home/demo/darkmux")
+            for spelled in path_spellings(ROOT):
+                text = text.replace(spelled, "/home/demo/darkmux")
             text = _identity_scrub(text)
             for pat, what in FORBIDDEN:
                 m = pat.search(text)
@@ -355,7 +370,12 @@ def main():
     print("\nctrl-c to stop")
 
     def bye(*_):
-        srv.shutdown(); daemon.terminate(); sys.exit(0)
+        # The handler runs on the thread inside `serve_forever`, and
+        # `shutdown()` waits for that loop to exit, so calling it here
+        # deadlocks: SIGTERM left the server and its daemon running. Ask
+        # from another thread; `serve_forever` then returns into `finally`.
+        import threading
+        threading.Thread(target=srv.shutdown, daemon=True).start()
     signal.signal(signal.SIGINT, bye)
     signal.signal(signal.SIGTERM, bye)
     try:

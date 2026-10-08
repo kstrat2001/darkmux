@@ -13819,6 +13819,8 @@ fn mission_launch_signal_after_a_clean_step_closes_run_error_not_complete() {
     assert!(!all.contains("\"run.complete\""), "an interrupted run must never close run.complete");
 }
 
+// Same gate as its one caller, so a release-profile build has no dead code.
+#[cfg(all(unix, debug_assertions))]
 fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for e in fs::read_dir(dir).into_iter().flatten().flatten() {

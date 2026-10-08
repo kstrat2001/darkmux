@@ -94,32 +94,28 @@ Next steps:
     <p><code>doctor</code> asks "is my setup correct": registry, models, RAM, daemon, flow sinks, skills. Pass, warn, or fail per check, with the fix under each warning; exit 1 only on a fail. <code>machine status</code> asks the other question, "what is loaded right now".</p>
     <div class="session">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-out">darkmux doctor — 56 checks
+      <div class="cmd-out">darkmux doctor — 79 checks
 
-● needs attention — flow sink health: LocalFile · warnings: flows_dir_absent
+● needs attention — audit integrity: no audit files under ~/.darkmux/audit
 
-  ✓ build                  darkmux 3.13.0 (2c3ee0fd) · flow schema 1.56.0
+  ✓ build                  darkmux 5.0.0 (83905f180) · flow schema 2.1.0
   ✓ daemon reachable       reachable · viewer http://127.0.0.1:8765/ · phone
                            http://&lt;tailnet-hostname&gt;/
-  ✓ 51 more checks passed — <code>-v</code> for detail
-  ⚠ flow sink health       LocalFile · warnings: flows_dir_absent
-        → Run <code>darkmux flow status</code> for full detail. Common fixes: start Redis (`brew services start
-          redis<code>) if </code>redis_unreachable<code>; raise </code>DARKMUX_REDIS_MAXLEN` if
-          <code>redis_stream_near_maxlen</code>; upgrade the lagging writer in the fleet if
-          <code>schema_skew_detected</code>.
+  ✓ 75 more checks passed — <code>-v</code> for detail
   ⚠ audit integrity        no audit files under ~/.darkmux/audit
         → AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log
           whose edits <code>darkmux flow integrity-check</code> detects (absent a full re-chain — the chain is
           un-anchored), alongside the casual LocalFile sink.
   ⚠ utility model          utility model <code>qwen3-4b-instruct-2507</code> registered but NOT loaded
-        → No verb needs this loaded first — the binding's only job is to name the compactor, and
-          every dispatch path self-loads it at its declared <code>n_ctx</code> under the <code>darkmux:</code> namespace
-          (#1616). Loading it by hand just pays that cost now instead of during the first dispatch;
-          if you do, keep the namespace and the context — `lms load &lt;id&gt; --context-length &lt;n&gt;
-          --identifier darkmux:&lt;id&gt;<code> — since a bare </code>lms load` creates a resident darkmux won't
-          reuse and <code>machine eject</code> can't reclaim. (#590, #1616, #1675)
+        → No verb needs this loaded first: the binding names the model darkmux's own jobs run on
+          (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it
+          at the binding's <code>n_ctx</code> under the <code>darkmux:</code> namespace (#1616). Loading it by hand just
+          pays that cost now instead of during the first dispatch or route; if you do, keep the
+          namespace and the context: <code>lms load &lt;id&gt; --context-length &lt;n&gt; --identifier darkmux:&lt;id&gt;</code>:
+          since a bare <code>lms load</code> creates a resident darkmux won't reuse and <code>machine eject</code> can't
+          reclaim. (#590, #1616, #1675, #2914)
 
-53 pass, 3 warn — workable but worth a look</div>
+77 pass, 2 warn — workable but worth a look</div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux machine status</span><button class="copy-btn" data-copy="darkmux machine status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-out">registry: ~/.darkmux/profiles.json
 
