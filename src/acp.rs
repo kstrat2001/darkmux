@@ -84,13 +84,12 @@
 //!   (registered in that map for the duration of `session/prompt`'s
 //!   `cx.spawn`'d closure from Packet 2) rather than directly inline in that
 //!   closure — `cx.spawn` alone never hands back an abort handle, so
-//!   cancellation needed a genuinely abortable task underneath it. Because
-//!   [`run_launch_command`]'s subprocess `Command`s set
-//!   `kill_on_drop(true)`, aborting the task — which drops the `Child`
-//!   mid-`.wait()`/`.output()` — sends the OS process a real kill rather
-//!   than orphaning it (the exact defect this packet's own audit named: an
-//!   aborted ACP-side future used to leave the `darkmux mission launch`
-//!   child running with nothing left to stop it). On cancellation the
+//!   cancellation needed a genuinely abortable task underneath it.
+//!   Aborting the task stops [`run_launch_command`]'s `mission launch`
+//!   child with SIGTERM (#3117, [`spawn_registered`]), which the launch
+//!   finalizes on, so its run closes as aborted. (An aborted future first
+//!   left that child running with nothing to stop it; then `kill_on_drop`
+//!   SIGKILLed it, skipping the finalize.) On cancellation the
 //!   `session/prompt` response now carries `StopReason::Cancelled`, per
 //!   spec.
 //!
@@ -143,16 +142,12 @@
 //!   the request handler now reserves the prompt in `InFlight` before
 //!   `cx.spawn` (`TaskState::Reserved`), so a cancel in that window marks
 //!   that one prompt and the command aborts itself the instant it
-//!   registers, instead of racing ahead uncancelled. (2) A `kill_on_drop`'d SIGKILL has no
-//!   finalize step — a cancelled `run_launch_command` mission
-//!   is left permanently `Active` (`darkmux mission status` will flag it;
-//!   a manual `mission abort` reconciles it), and the temp diff file
-//!   `run_launch_command` writes is never cleaned up (`tokio::fs::remove_file`
-//!   sits AFTER `child.wait().await`, a line a cancel never reaches).
-//!   Neither is fixable by anything short of a completion-independent
-//!   cleanup path; named here so a stop-button user isn't surprised by
-//!   drift accumulating in `mission status` or stray files under the
-//!   workspace.
+//!   registers, instead of racing ahead uncancelled. (2) (#3117 —
+//!   RESOLVED) A cancelled `run_launch_command` used to be SIGKILLed
+//!   (`kill_on_drop`), which has no finalize step: the mission stayed
+//!   `active` and its run read `running`. It now gets SIGTERM and is
+//!   waited on in its own task, which keeps its output pipes open while
+//!   it finalizes ([`spawn_registered`]).
 //! - (#2476 — RESOLVED, revised in review round 2) This file had NO OS
 //!   signal handling at all — a SIGINT/SIGTERM to `darkmux acp` itself (as
 //!   opposed to an ACP-protocol `session/cancel`, covered above) killed
@@ -189,10 +184,12 @@
 //!   6) — named explicitly rather than left implicit.** This entry only
 //!   ever closed the SIGNAL gap. Three other ways this process's
 //!   `run()` future can end are still uncovered by
-//!   [`reap_on_host_shutdown`]/[`spawn_registered`]'s RAII guard, and a
-//!   `mission launch` child in flight when any of them fires gets no
-//!   grace at all — its `Child` simply drops, and `kill_on_drop(true)`
-//!   sends it a bare SIGKILL:
+//!   [`reap_on_host_shutdown`], and a `mission launch` child in flight
+//!   when any of them fires is not signaled at all: its wait task drops
+//!   with the runtime before it can act on the cancel. Since #3117 (no
+//!   `kill_on_drop`) the child is not SIGKILLed either; it runs on with its
+//!   output pipes closed, so its next write fails, and nothing here reaps
+//!   it. Whether it then still writes its run's terminal is unverified:
 //!   1. **`serve()` returning on client EOF** (the editor quits) —
 //!      plausibly the single MOST common way this process ends in
 //!      practice, and the one this doc previously left unnamed. No
@@ -206,8 +203,7 @@
 //!      held.
 //!
 //!   Closing these needs a completion-independent cleanup path (the
-//!   SAME gap this doc's #1684-remainder entry above already names for
-//!   `kill_on_drop`'s SIGKILL having no finalize step), not more signal
+//!   kind of path #3117 gave a cancel), not more signal
 //!   handling — tracked as follow-up, not forced into this fix's scope.
 //! - The `case_id` passed to the review mission is derived from the diff's
 //!   content hash + the cwd's directory name (see [`derive_case_id`]) —
@@ -2410,6 +2406,7 @@ static LAUNCH_CHILDREN: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std:
 /// ::kill_pid`'s own doc warns a caller about. RAII closes that: `Drop`
 /// runs on every exit path, abort included, the same guarantee
 /// `PidRegistration` gives `dispatch_internal.rs`'s docker/curl children.
+/// (#3117) It is dropped when the child is reaped ([`wait_stopping_on_cancel`]).
 struct SpawnedLaunchChild(u32);
 
 impl SpawnedLaunchChild {
@@ -2438,10 +2435,8 @@ impl Drop for SpawnedLaunchChild {
 /// `crew::dispatch` spawns (see that struct's own doc, and
 /// `SpawnedLaunchChild`'s doc for why THIS function now uses an RAII
 /// guard too rather than a plain register/deregister pair).
-/// [`run_launch_command`]'s `mission launch` subprocess already had
-/// `.kill_on_drop(true)` for ACP-level `session/cancel` aborts (dropping
-/// the awaiting task drops the `Child`), but an OS SIGINT/SIGTERM to
-/// `darkmux acp` ITSELF never reached that `Drop` at all before this fix —
+/// An OS SIGINT/SIGTERM to `darkmux acp` ITSELF never reached any `Drop`
+/// at all before this fix —
 /// an unhandled signal tore the whole process down before any Rust
 /// destructor could run, orphaning this subprocess. Registering here is
 /// what lets this file's own host shutdown handling
@@ -2450,11 +2445,72 @@ impl Drop for SpawnedLaunchChild {
 /// through `darkmux-crew`'s own `remote_chat_attempt`/
 /// `dispatch_local_single_shot`, shared, unmodified code this file
 /// already calls.
+///
+/// (#3117) The child is waited on in its OWN task
+/// ([`wait_stopping_on_cancel`]), which owns the `Child`, its output pipes
+/// and its registration. A cancel aborts only this function's future, and
+/// the wait task stops the child with SIGTERM.
 async fn spawn_registered(mut cmd: Command) -> std::io::Result<std::process::Output> {
     let child = cmd.spawn()?;
-    let pid = child.id();
-    let _guard = pid.map(SpawnedLaunchChild::new);
-    child.wait_with_output().await
+    // Registered here, synchronously, so host shutdown finds the pid even
+    // before the wait task first runs.
+    let registration = child.id().map(SpawnedLaunchChild::new);
+    // Dropped unsent when this future is cancelled; the wait task reads that
+    // as the cancel.
+    let (_cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(wait_stopping_on_cancel(child, registration, cancelled))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// (#3117) The wait half of [`spawn_registered`], run as its own task so a
+/// cancel (`session/cancel`, `session/close` aborting the prompt's task)
+/// cannot drop it. On the cancel it sends the child SIGTERM, the signal the
+/// launch finalizes on and the one host shutdown forwards
+/// ([`reap_on_host_shutdown`]); never SIGKILL, which skips the launch's
+/// `LaunchFinalizeGuard` and run bookends and left the run reading
+/// `running`. It keeps reading the output pipes meanwhile (a closed pipe
+/// would kill the launch with SIGPIPE mid-finalize).
+///
+/// Pid safety: the signal goes to `child.id()`, which tokio returns as
+/// `None` once the child is reaped, so a freed pid is never signaled; and
+/// `registration` is dropped (the pid deregistered) as soon as the child is
+/// reaped, not when its pipes close, which a grandchild holding them can
+/// delay indefinitely.
+async fn wait_stopping_on_cancel(
+    mut child: tokio::process::Child,
+    registration: Option<SpawnedLaunchChild>,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut buf).await?;
+        }
+        Ok(buf)
+    }
+    let stdout = read_all(child.stdout.take());
+    let stderr = read_all(child.stderr.take());
+    let status = async {
+        let status = tokio::select! {
+            status = child.wait() => status,
+            _ = cancelled => {
+                if let Some(pid) = child.id() {
+                    if let Err(e) = darkmux_types::child_registry::kill_pid(pid, darkmux_types::child_registry::SIGTERM) {
+                        if e.raw_os_error() != Some(darkmux_types::child_registry::ESRCH) {
+                            eprintln!("[darkmux-acp] could not stop the cancelled `mission launch` (pid {pid}): {e}");
+                        }
+                    }
+                }
+                child.wait().await
+            }
+        };
+        drop(registration);
+        status
+    };
+    let (status, stdout, stderr) = tokio::try_join!(status, stdout, stderr)?;
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// (#2476) Wait for SIGINT or SIGTERM — mirrors `darkmux-serve`'s own
@@ -2615,11 +2671,7 @@ async fn run_launch_command(
     sessions: &Sessions,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["mission", "launch", config_id]);
-    for param in params {
-        cmd.args(["--param", param]);
-    }
+    let cmd = launch_command(&exe, config_id, params, cwd);
 
     eprintln!(
         "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` cwd={}",
@@ -2627,18 +2679,9 @@ async fn run_launch_command(
     );
     let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: launching `{config_id}`…")));
 
-    cmd.current_dir(cwd)
-        .stdin(ProcStdio::null())
-        .stdout(ProcStdio::piped())
-        .stderr(ProcStdio::piped())
-        // (#1684 remainder — cancellation) A `session/cancel`-driven abort
-        // drops this `Child` mid-`.output()`; `kill_on_drop(true)` sends the
-        // OS process a real kill rather than orphaning it.
-        .kill_on_drop(true);
     // (#2476) `spawn_registered` (not a plain `.output()`) so this pid is
-    // also reachable from `child_registry::kill_all` — see its own doc
-    // for why `kill_on_drop` alone isn't enough for an OS-signal-driven
-    // shutdown of this process.
+    // also reachable from `child_registry::kill_all`, and so a cancel
+    // stops it with SIGTERM (#3117) — see its own doc.
     let output = spawn_registered(cmd)
         .await
         .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
@@ -2660,6 +2703,25 @@ async fn run_launch_command(
     session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(config_id, args, &text));
     cx.send_notification(agent_chunk(session_id, text))?;
     Ok(())
+}
+
+/// The `mission launch` subprocess [`run_launch_command`] runs: this same
+/// binary, `mission launch <config_id> --param <p>...`, in `cwd`, output
+/// captured.
+fn launch_command(exe: &Path, config_id: &str, params: &[String], cwd: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(["mission", "launch", config_id]);
+    for param in params {
+        cmd.args(["--param", param]);
+    }
+    cmd.current_dir(cwd)
+        .stdin(ProcStdio::null())
+        .stdout(ProcStdio::piped())
+        .stderr(ProcStdio::piped());
+    // (#3117) No `kill_on_drop`: a cancel's SIGKILL skipped the launch's
+    // finalize and left its run reading `running`. [`spawn_registered`]'s
+    // guard sends SIGTERM instead, which the launch finalizes on.
+    cmd
 }
 
 fn extract_text(prompt: &[ContentBlock]) -> String {
@@ -4621,76 +4683,9 @@ mod tests {
         assert!(text.contains("slow-output-marker"), "{text}");
     }
 
-    /// (#1777 merge gate — the headline mechanism, previously untested)
-    /// The existing cancel tests
-    /// (`session_cancel_aborts_an_in_flight_command_and_reports_cancelled`,
-    /// the `session/close` sibling above) only prove the WIRE contract —
-    /// `StopReason::Cancelled` comes back promptly — over the no-slash
-    /// ROUTER path, which is precisely the path where nothing is
-    /// killable (a plain synchronous call, no `Child` anywhere). The
-    /// actual promise `kill_on_drop(true)` makes for `run_launch_command`'s
-    /// real subprocess `Command`s — that the OS PROCESS itself dies, not
-    /// just that the Rust future resolves — has rested on drop-topology
-    /// reasoning alone until now.
-    ///
-    /// This proves that half directly: `tokio::spawn` a task that spawns
-    /// a real, observably long-lived child (`sleep 30`, with
-    /// `.kill_on_drop(true)` — the IDENTICAL flag `run_launch_command`
-    /// sets on its own `Command`) and holds it
-    /// across an in-place `.await` on `child.wait()` — the SAME "own the
-    /// `Child` across an await point, get a real abort handle from
-    /// `tokio::spawn`" shape those two functions use, and the exact shape
-    /// `run_cancellable` wraps every `session/prompt` branch in. Aborting
-    /// that task must leave the process GONE, polled via `kill -0 <pid>`
-    /// (fails once the process is reaped) rather than trusted from
-    /// reasoning about `Drop` order.
-    ///
-    /// RED-proved by hand: removing `.kill_on_drop(true)` from the
-    /// `Command` below makes this test fail (timeout waiting for the
-    /// process to disappear, since a plain `sleep 30` outlives the
-    /// aborted task) — confirming the assertion actually exercises the
-    /// flag, not just the task's own bookkeeping.
-    #[tokio::test]
-    async fn cancelling_a_task_holding_a_child_actually_kills_the_os_process() {
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("30");
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().expect("spawning `sleep 30`");
-        let pid = child.id().expect("a freshly spawned child has a pid");
-
-        assert!(process_is_alive(pid), "the child must be running before cancellation");
-
-        let handle = tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
-        // Let the spawned task actually get polled at least once before
-        // aborting it — otherwise this could abort a task that was never
-        // even scheduled yet, proving nothing about `kill_on_drop`.
-        tokio::task::yield_now().await;
-
-        handle.abort();
-        let _ = handle.await;
-
-        // `kill_on_drop`'s SIGKILL isn't necessarily synchronous with the
-        // abort — poll with a bound rather than checking exactly once.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if !process_is_alive(pid) {
-                return; // PASS — the OS process is genuinely gone.
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "process {pid} (`sleep 30`) is still alive 5s after aborting the task holding \
-                     its Child — kill_on_drop did not terminate it"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     /// `kill -0 <pid>` — exits 0 iff a process with that pid exists and is
     /// signalable by this user; used only to observe the REAL OS process
-    /// state in [`cancelling_a_task_holding_a_child_actually_kills_the_os_process`],
+    /// state in [`spawn_registered_deregisters_on_cancel_abort_not_just_on_completion`],
     /// never to affect it.
     fn process_is_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
@@ -5155,11 +5150,7 @@ mod tests {
     /// `sleep 30` through it, then reaching that SAME pid through
     /// `darkmux_types::child_registry::kill_all` (the exact call
     /// `host_shutdown_reap_loop`'s production closure makes) and
-    /// confirming the process actually died from it, not from its own
-    /// `.kill_on_drop(true)` (also set, matching `run_launch_command`'s
-    /// real `Command`, but this test wants to see `kill_all` do the
-    /// killing — see the timing note below for why that's the thing
-    /// under test).
+    /// confirming the process actually died from it.
     #[tokio::test]
     #[serial_test::serial]
     async fn spawn_registered_pid_is_reachable_via_child_registry_kill_all() {
@@ -5167,7 +5158,6 @@ mod tests {
 
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("30");
-        cmd.kill_on_drop(true);
 
         let handle = tokio::spawn(spawn_registered(cmd));
         // Give the spawned task a chance to actually reach `cmd.spawn()`
@@ -5191,29 +5181,18 @@ mod tests {
         darkmux_types::child_registry::reset_for_test();
     }
 
-    /// (#2476 review round 2, MUST FIX 1) `session/cancel`'s and
-    /// `session/close`'s abort path drops `run_launch_command`'s awaited
-    /// future AT its suspended `.await` inside `spawn_registered` — the
-    /// ORIGINAL `spawn_registered` deregistered via a plain statement
-    /// placed AFTER that await, which an abort never reaches, leaking the
-    /// pid in a process-wide registry forever (the pid becomes recyclable
-    /// the moment `kill_on_drop` reaps the underlying process, per
-    /// `child_registry::kill_pid`'s own doc — a long-lived host signaling
-    /// that stale entry later could hit an unrelated process). This
-    /// proves the RAII fix directly: abort a task mid-`spawn_registered`
-    /// the SAME way `handle.abort()` does at both real call sites
-    /// (`session/cancel`, `session/close`), and show the pid is gone from
-    /// `LAUNCH_CHILDREN` afterward — the bookkeeping cleaned up, not just
-    /// the OS process (that half is `kill_on_drop`, already proven by
-    /// `cancelling_a_task_holding_a_child_actually_kills_the_os_process`,
-    /// above).
+    /// (#2476 review round 2, MUST FIX 1; reshaped by #3117) A cancel
+    /// (`session/cancel`, `session/close`: `handle.abort()` on the prompt's
+    /// task) must not leak the launch child's pid in [`LAUNCH_CHILDREN`],
+    /// where a long-lived host could later signal a recycled pid
+    /// (`child_registry::kill_pid`'s own doc). Since #3117 the pid leaves
+    /// the registry when the child is REAPED, not at the abort: the
+    /// cancelled child gets SIGTERM and finalizes first. So this aborts a
+    /// `spawn_registered` wait on `sleep 30`, then shows both that the
+    /// process is gone and that its pid was deregistered.
     ///
-    /// RED-proved by hand: reverting `spawn_registered` to the pre-fix
-    /// plain register/deregister pair (deregister placed after the
-    /// awaited `wait_with_output()`, as it read before this fix) makes
-    /// this test fail — the pid stays in `LAUNCH_CHILDREN` after the
-    /// abort, since the statement that would have removed it is never
-    /// reached.
+    /// Red if the cancel does not signal the child (`sleep 30` stays alive
+    /// and registered) or if the wait task never deregisters.
     #[tokio::test]
     #[serial_test::serial]
     async fn spawn_registered_deregisters_on_cancel_abort_not_just_on_completion() {
@@ -5222,27 +5201,129 @@ mod tests {
 
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("30");
-        cmd.kill_on_drop(true);
 
         let handle = tokio::spawn(spawn_registered(cmd));
-        // Let the task actually reach `cmd.spawn()` (and register) before
-        // aborting it — otherwise this could abort a task that never got
-        // that far, proving nothing about the fix.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !LAUNCH_CHILDREN.lock().unwrap().is_empty(),
-            "the spawned child must have registered before this test aborts its task"
-        );
+        let pid = *LAUNCH_CHILDREN
+            .lock()
+            .unwrap()
+            .iter()
+            .next()
+            .expect("the spawned child must have registered before this test aborts its task");
 
         handle.abort();
         let _ = handle.await;
 
-        assert!(
-            LAUNCH_CHILDREN.lock().unwrap().is_empty(),
-            "an aborted spawn_registered task must deregister its pid via Drop — a plain \
-             register/deregister pair (deregister placed after the awaited wait) never \
-             reaches that statement when the future is dropped mid-await, leaking the pid"
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_alive(pid) || !LAUNCH_CHILDREN.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "5s after the cancel: alive={} registered={:?}",
+                process_is_alive(pid),
+                LAUNCH_CHILDREN.lock().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// (#3117) Cancelling a panel `mission launch` must let the launch close
+    /// its own run. A SIGKILL (what `kill_on_drop` sends) skips the launch's
+    /// `LaunchFinalizeGuard` and run bookend guard, so the run read
+    /// `running` forever. The launch's own handler finalizes on SIGTERM, so
+    /// the aborted wait forwards SIGTERM and lets the child finish.
+    ///
+    /// Drives the REAL command builder [`launch_command`] with a stand-in
+    /// executable that, like `mission launch`, finalizes on SIGTERM and
+    /// otherwise keeps running. Its finalize prints to stdout and stderr
+    /// before writing its marker, as the launch's does: a cancel that
+    /// closed the output pipes would kill it there (SIGPIPE) before the
+    /// marker. Red for each way of getting this wrong, each tried: SIGKILL
+    /// on cancel (`kill_on_drop` with the `Child` held in the cancelled
+    /// future, as before), no signal at all (the child runs on), and
+    /// waiting in place so the cancel drops the pipes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_a_panel_launch_sends_sigterm_so_the_launch_can_finalize() {
+        darkmux_types::child_registry::reset_for_test();
+        LAUNCH_CHILDREN.lock().unwrap().clear();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("finalized");
+        let exe = dir.path().join("fake-darkmux");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\ntrap 'sleep 0.2; echo run aborted; echo closing >&2; echo \"$@\" > {0}; exit 143' TERM\necho > {0}.ready\nwhile :; do sleep 0.05; done\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let cmd = launch_command(&exe, "review", &["base=main".to_string()], dir.path());
+        let handle = tokio::spawn(spawn_registered(cmd));
+        // Cancel only once the child has installed its trap: the first exec
+        // of a freshly written script can take seconds on macOS.
+        let ready = dir.path().join("finalized.ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "the stand-in launch never started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!LAUNCH_CHILDREN.lock().unwrap().is_empty(), "the launch child must be running before the cancel");
+
+        handle.abort();
+        let _ = handle.await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cancelled launch got no SIGTERM it could finalize on (SIGKILLed, or never signaled)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let argv = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(argv.trim(), "mission launch review --param base=main", "the builder's argv");
+
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// (#3117 review) A launch child leaves the registry when it is REAPED,
+    /// not when its output pipes close. A grandchild that inherits the
+    /// launch's stdout (a backgrounded process in a shell step) holds the
+    /// pipes open after the launch itself exited; while the pid stayed
+    /// registered, host shutdown or a cancel could signal a pid the kernel
+    /// had already freed. Red when deregistration waits for the pipes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_launch_child_is_deregistered_once_reaped_even_while_a_grandchild_holds_its_pipes() {
+        darkmux_types::child_registry::reset_for_test();
+        LAUNCH_CHILDREN.lock().unwrap().clear();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 3 & exit 0"])
+            .stdin(ProcStdio::null())
+            .stdout(ProcStdio::piped())
+            .stderr(ProcStdio::piped());
+        let handle = tokio::spawn(spawn_registered(cmd));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if LAUNCH_CHILDREN.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited launch is still registered while its grandchild holds the pipes"
+            );
+        }
+        assert!(!handle.is_finished(), "the wait is still reading the grandchild-held pipes");
+        let output = handle.await.unwrap().unwrap();
+        assert!(output.status.success());
 
         darkmux_types::child_registry::reset_for_test();
     }
