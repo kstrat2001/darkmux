@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # complexity-ratchet.py (4.0): no new function above cyclomatic complexity
-# 15, and no function's complexity rises.
+# 10, and no function's complexity rises. (The limit was 15 until 5.x,
+# #3136; every function then at 11-15 was added to the baseline at its
+# complexity, so only new code meets the lower limit.)
 #
 # Measured per language (`--lang`):
 #   rust  rust-code-analysis-cli (RCA_BIN, default `rust-code-analysis-cli`)
@@ -10,7 +12,7 @@
 #         not a closure's own entry, and not a nested named fn (that is its
 #         own function). The same reading as the CRAP sweep.
 #   ts    ESLint's core `complexity` rule over ui/src (tests, test helpers
-#         and the generated bindings excluded), run from ui/ at 15, so only
+#         and the generated bindings excluded), run from ui/ at the limit, so only
 #         the functions above it are reported.
 #
 # A function is keyed by name, never by position, so an edit above it does not
@@ -28,12 +30,12 @@
 #
 # Two files, each split by language:
 #   scripts/complexity-baseline.json   the debt measured when the ratchet was
-#       set: every function then above 15, at its complexity then. Only
+#       set: every function then above the limit, at its complexity then. Only
 #       `--prune` rewrites it, and prune only lowers an entry or drops it.
 #   scripts/complexity-allowlist.json  deliberate exceptions, by hand:
 #       {"<key>": {"max": <= 25, "reason": "..."}}.
 #
-# It fails only when a function in neither file is above 15, or one is above
+# It fails only when a function in neither file is above the limit, or one is above
 # its baseline or allowlist max. A gain never fails: a baseline entry whose
 # function fell, or is gone (split, renamed, deleted), passes with a notice
 # naming `--prune`, which lowers or drops it so the gain is kept.
@@ -52,7 +54,7 @@ from rust_source import cfgs_above, is_rust_test_file, mod_blocks, test_lines
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "complexity-baseline.json")
 ALLOWLIST = os.path.join(ROOT, "scripts", "complexity-allowlist.json")
-LIMIT = 15
+LIMIT = 10
 CEILING = 25
 RUST_ROOTS = ("src/", "crates/", "runtime/", "plugins/")
 TS_MESSAGE = re.compile(r"^(?:.*?'(?P<name>[^']+)'|[^']*?) has a complexity of (?P<cc>\d+)")
@@ -375,8 +377,8 @@ def rust_self_test():
 
 def self_test():
     assert not judge({"a::f": 3, "a::g": 20}, {"a::g": 20}, {}), "a baseline function at its baseline passes"
-    assert judge({"a::f": 16}, {}, {}), "a new function above the limit fails"
-    assert not judge({"a::f": 15}, {}, {}), "a new function at the limit passes"
+    assert judge({"a::f": LIMIT + 1}, {}, {}), "a new function above the limit fails"
+    assert not judge({"a::f": LIMIT}, {}, {}), "a new function at the limit passes"
     assert judge({"a::g": 21}, {"a::g": 20}, {}), "a rise above the baseline fails"
     assert not judge({"a::g": 19}, {"a::g": 20}, {}), "a fall passes"
     assert not judge({}, {"a::g": 20}, {}), "a gone function passes"
@@ -386,7 +388,7 @@ def self_test():
     assert judge({"a::h": 23}, {}, {"a::h": {"max": 22, "reason": "x"}}), "above an allowlisted max fails"
     assert judge({}, {}, {"a::h": {"max": 30, "reason": "x"}}), "an allowlist max above the ceiling fails"
     assert judge({}, {}, {"a::h": {"max": 20}}), "an allowlist entry without a reason fails"
-    assert pruned({"a::g": 18, "a::k": 12}, {"a::g": 20, "a::k": 30, "a::x": 40}) == {"a::g": 18}
+    assert pruned({"a::g": 18, "a::k": LIMIT}, {"a::g": 20, "a::k": 30, "a::x": 40}) == {"a::g": 18}
     assert pruned({"a::g": 25}, {"a::g": 20}) == {"a::g": 20}, "prune never raises"
 
     rust_self_test()

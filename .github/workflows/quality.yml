@@ -1079,6 +1079,31 @@ jobs:
           python3 scripts/ci-coverage-summary.py cov-runtime.json --functions cov-runtime-full.json \
             --title "Coverage (runtime/)" >> "$GITHUB_STEP_SUMMARY"
 
+      # (#3136) Every Rust function with CRAP over 10, worst first, from the
+      # two coverage exports above and the complexity ratchet's own reading.
+      # It reports and gates nothing: a broken report must not hide the
+      # coverage badge, so the steps continue on error.
+      - name: Cache rust-code-analysis
+        if: ${{ !cancelled() }}
+        id: rca-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rust-code-analysis-cli
+          key: rust-code-analysis-cli-0.0.25-${{ runner.os }}
+      - name: Install rust-code-analysis
+        if: ${{ !cancelled() && steps.rca-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: cargo install rust-code-analysis-cli --version 0.0.25 --locked
+      - name: CRAP report (functions over 10)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          python3 scripts/crap-report.py --coverage cov-full.json --coverage cov-runtime-full.json \
+            --threshold 10 --json crap.json --markdown crap.md
+          python3 scripts/crap-report.py --coverage cov-full.json --coverage cov-runtime-full.json \
+            --threshold 10 --markdown crap-top.md --top 50 > /dev/null
+          cat crap-top.md >> "$GITHUB_STEP_SUMMARY"
+
       # The coverage run builds with every feature, so the `ts-export` tests
       # regenerate `ui/src/types/generated/*.ts` from the Rust types. A field
       # added to an exported struct without regenerating leaves the committed
@@ -1153,6 +1178,15 @@ jobs:
         with:
           name: coverage-runtime-full-json
           path: cov-runtime-full.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crap-report
+          path: |
+            crap.json
+            crap.md
           if-no-files-found: ignore
 
   mutants-full:
