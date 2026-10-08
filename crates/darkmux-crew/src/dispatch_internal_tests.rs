@@ -20103,3 +20103,59 @@ fn every_sampler_join_in_dispatch_is_the_bounded_one() {
     );
 }
 
+
+    /// Runs `probe_docker_daemon` with a fake `docker` (the given shell body)
+    /// first on PATH; returns the result and how long the probe took.
+    fn probe_with_fake_docker(body: &str, timeout: Duration) -> (Option<DockerRuntimeStatus>, Duration) {
+        let dir = TempDir::new().unwrap();
+        let docker = dir.path().join("docker");
+        std::fs::write(&docker, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev = std::env::var("PATH").ok();
+        // SAFETY: callers are #[serial].
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        let started = Instant::now();
+        let got = probe_docker_daemon(timeout);
+        let took = started.elapsed();
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        (got, took)
+    }
+
+    /// A wedged Docker Desktop leaves `docker version` hanging. Doctor and the
+    /// dispatch preflight both ask it first, so an unbounded probe hung doctor
+    /// for good (seen on an 8 GB peer, 2026-10-07). It must give up and say so.
+    #[test]
+    #[serial]
+    fn a_docker_version_that_hangs_is_bounded_and_reads_as_unreachable() {
+        let (got, took) = probe_with_fake_docker("exec sleep 8", Duration::from_millis(300));
+        assert!(took < Duration::from_secs(5), "the probe waited {took:?} on a docker that never answers");
+        match got {
+            Some(DockerRuntimeStatus::DaemonUnreachable(why)) => {
+                assert!(why.contains("did not answer"), "the reason must say docker did not answer: {why}")
+            }
+            other => panic!("a hung docker must read as DaemonUnreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_docker_version_that_fails_reports_its_stderr() {
+        let (got, _) = probe_with_fake_docker("echo 'Cannot connect to the Docker daemon' >&2; exit 1", Duration::from_secs(5));
+        assert_eq!(got, Some(DockerRuntimeStatus::DaemonUnreachable("Cannot connect to the Docker daemon".into())));
+    }
+
+    #[test]
+    #[serial]
+    fn a_docker_version_that_answers_means_the_daemon_is_up() {
+        let (got, _) = probe_with_fake_docker("echo 27.3.1", Duration::from_secs(5));
+        assert_eq!(got, None);
+    }

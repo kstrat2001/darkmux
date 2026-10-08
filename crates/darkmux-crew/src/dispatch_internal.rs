@@ -11805,17 +11805,8 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
 #[cfg(not(test))]
 fn docker_runtime_status_live() -> DockerRuntimeStatus {
     // Step 1: docker binary exists + daemon is reachable.
-    match Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {} // Docker daemon up — fall through
-        Ok(out) => {
-            return DockerRuntimeStatus::DaemonUnreachable(
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            );
-        }
-        Err(_) => return DockerRuntimeStatus::BinaryMissing,
+    if let Some(down) = probe_docker_daemon(crate::runtime_image::INSPECT_TIMEOUT) {
+        return down;
     }
 
     // Step 2: a darkmux runtime image is present locally — either the dev-built
@@ -11834,6 +11825,26 @@ fn docker_runtime_status_live() -> DockerRuntimeStatus {
         env!("CARGO_PKG_VERSION"),
         None,
     ))
+}
+
+/// `docker version`, bounded: `None` when the daemon answered, otherwise why
+/// not. A wedged Docker Desktop leaves this call hanging, so an unbounded
+/// probe would hang doctor and every dispatch preflight with it.
+fn probe_docker_daemon(timeout: Duration) -> Option<DockerRuntimeStatus> {
+    use crate::bounded_command::{run_bounded, Bounded};
+    let mut cmd = Command::new("docker");
+    cmd.args(["version", "--format", "{{.Server.Version}}"]);
+    match run_bounded(cmd, timeout) {
+        Bounded::Finished { success: true, .. } => None,
+        Bounded::Finished { stderr, .. } => Some(DockerRuntimeStatus::DaemonUnreachable(
+            String::from_utf8_lossy(&stderr).trim().to_string(),
+        )),
+        Bounded::TimedOut { seconds } => Some(DockerRuntimeStatus::DaemonUnreachable(format!(
+            "`docker version` did not answer within {seconds}s; Docker Desktop may be stuck (quit and reopen it)"
+        ))),
+        Bounded::Interrupted => Some(DockerRuntimeStatus::ProbeError("`docker version` was interrupted".into())),
+        Bounded::SpawnFailed(_) => Some(DockerRuntimeStatus::BinaryMissing),
+    }
 }
 
 /// Pure: the default-image plan → the status doctor shows. A plan dispatch
