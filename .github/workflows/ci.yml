@@ -911,6 +911,8 @@ jobs:
       # TypeScript half runs in the ui job.
       - name: Complexity ratchet self-test
         run: python3 scripts/complexity-ratchet.py --self-test
+      - name: CRAP report self-test
+        run: python3 scripts/crap-report.py --self-test
       - name: Cache rust-code-analysis
         id: rca-cache
         uses: actions/cache@v4
