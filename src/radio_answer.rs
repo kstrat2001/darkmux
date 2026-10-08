@@ -1495,8 +1495,10 @@ pub fn answer(
     surface: RadioSurface,
     call: &mut AnswererCall<'_>,
 ) -> Result<AnswerOutcome> {
+    note_fallback(None);
     let raw = ask_answering_seat(text, catalog, shelf, fleet, scope, surface, call)
         .map_err(|e| anyhow::Error::new(SeatUnavailable { why: format!("{e:#}") }))?;
+    let fallback_note = FALLBACK_NOTE.with(|n| n.borrow_mut().take());
     let reply = raw.trim().to_string();
     // (#1861 defects 1 + 2, rebuilt by #2050) The mechanical backstop.
     // A reply that names a command the operator cannot actually run here
@@ -1532,6 +1534,10 @@ pub fn answer(
         format!("{reply}\n\n{listing}")
     } else {
         reply.clone()
+    };
+    let rendered = match fallback_note {
+        Some(note) => format!("{note}\n\n{rendered}"),
+        None => rendered,
     };
     Ok(AnswerOutcome { text: reply, rendered })
 }
@@ -1710,6 +1716,15 @@ impl SeatProvenance {
         Self { seat, source }
     }
 
+    /// [`SeatProvenance::of`], naming an unaddressed seat by the
+    /// `role_profiles.radio-host` binding it came from.
+    fn of_with_binding(seat: &AnsweringSeat, source: SeatSource, binding: Option<&str>) -> Self {
+        match (seat, binding) {
+            (AnsweringSeat::Here { explicit: None }, Some(b)) => Self { seat: b.to_string(), source },
+            _ => Self::of(seat, source),
+        }
+    }
+
     /// `deep@studio, fleet default from the hub, last seen 3m ago`.
     pub(crate) fn describe(&self, now_ms: u64) -> String {
         use crate::fleet_defaults::HubDefaultOrigin;
@@ -1809,7 +1824,10 @@ pub fn answer_text(stdout: &str, cap: u32) -> Result<String> {
 ///   budget, never prompt text: the PEER builds the persona from ITS OWN
 ///   `radio-host` template (so this machine's override of that template does
 ///   not reach a peer) and runs the exchange under the smaller of the
-///   budget sent here and its own `runtime.max_tokens_per_call`.
+///   budget sent here and its own `runtime.max_tokens_per_call`. (#3116)
+///   When that machine cannot be reached (nothing was sent), the question
+///   is answered on this machine's own seat instead, once, labeled
+///   ([`with_local_fallback`], [`local_fallback_seat`]).
 pub fn dispatch_answerer_call_with(
     user_message: &str,
     overrides: &AnswererOverrides,
@@ -1819,22 +1837,100 @@ pub fn dispatch_answerer_call_with(
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
     let (seat, source) = resolve_answering(overrides, crate::fleet_defaults::hub_default)
         .map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
-    darkmux_types::diag_eprintln!("radio: answering seat: {}", SeatProvenance::of(&seat, source).describe(darkmux_flow::presence::now_ms()));
+    let binding = darkmux_types::config_access::role_profile(crate::crew::loader::RADIO_HOST_ROLE_ID);
+    darkmux_types::diag_eprintln!(
+        "radio: answering seat: {}",
+        SeatProvenance::of_with_binding(&seat, source, binding.as_deref()).describe(darkmux_flow::presence::now_ms())
+    );
     let cap = answer_token_cap();
-    let (profile_name, machine, system_prompt_override, single_shot, seat_label) = match &seat {
-        AnsweringSeat::Here { explicit } => {
-            (explicit.clone(), None, Some(answering_system_prompt(humor, surface)?), None, None)
-        }
-        AnsweringSeat::Peer { profile, machine } => (
-            Some(profile.clone()),
-            Some(machine.clone()),
-            None,
-            Some(crate::fleet::SingleShotJob { humor, surface, max_completion_tokens: cap }),
-            Some(format!("{profile}@{machine}")),
-        ),
+    let run_here = |profile_name: Option<String>| -> Result<String> {
+        let opts = answerer_opts(user_message, cap, profile_name, None, Some(answering_system_prompt(humor, surface)?));
+        let result =
+            crate::fleet::dispatch_routed_single_shot(opts, None, boundary, crate::crew::dispatch::dispatch_local_single_shot)?;
+        answer_text(&result.stdout, cap)
     };
+    match &seat {
+        AnsweringSeat::Here { explicit } => run_here(explicit.clone()),
+        AnsweringSeat::Peer { profile, machine } => {
+            let address = format!("{profile}@{machine}");
+            let ask_peer = || -> Result<String> {
+                let opts = answerer_opts(user_message, cap, Some(profile.clone()), Some(machine.clone()), None);
+                let job = crate::fleet::SingleShotJob { humor, surface, max_completion_tokens: cap };
+                let submit = || {
+                    crate::fleet::dispatch_routed_single_shot(
+                        opts,
+                        Some(job),
+                        boundary,
+                        crate::crew::dispatch::dispatch_local_single_shot,
+                    )
+                };
+                let result = submit_after_check(
+                    &address,
+                    crate::crew::loader::RADIO_HOST_ROLE_ID,
+                    boundary,
+                    crate::fleet::check_route,
+                    submit,
+                )
+                .map_err(|e| e.context(format!("the answering seat `{address}`")))?;
+                answer_text(&result.stdout, cap)
+            };
+            with_local_fallback(
+                &address,
+                ask_peer,
+                || local_fallback_seat(binding.as_deref(), overrides),
+                |p| run_here(Some(p.to_string())),
+            )
+        }
+    }
+}
 
-    let opts = crate::crew::dispatch::DispatchOpts {
+/// (#3116) The production fallback seat for [`with_local_fallback`]:
+/// [`local_fallback_profile`] over this machine's binding and registry,
+/// refused when it would send this machine's state to a hosted endpoint
+/// (the question was grounded for a fleet peer, [`GroundingScope::Full`])
+/// or when its model is busy (#2917).
+fn local_fallback_seat(binding: Option<&str>, overrides: &AnswererOverrides) -> Result<String, String> {
+    use crate::crew::dispatch::{routing_decision, RoutingDecision};
+    let here = darkmux_flow::resolve_machine_id();
+    let default_profile =
+        darkmux_profiles::profiles::load_registry_quiet(None).ok().and_then(|l| l.registry.default_profile);
+    let names_here = |m: &str| matches!(routing_decision(Some(m), here.as_deref()), RoutingDecision::Local { .. });
+    usable_local_seat(
+        local_fallback_profile(binding, default_profile.as_deref(), names_here),
+        |p| crate::crew::dispatch::dispatch_resolves_unmanaged(crate::crew::loader::RADIO_HOST_ROLE_ID, Some(p), None),
+        |p| {
+            let local = AnswererOverrides { profile_name: Some(p.to_string()), humor: overrides.humor };
+            crate::radio_busy::answering_seat_busy(&local).is_some()
+        },
+    )
+}
+
+/// (#3116) Whether `profile` may answer here instead: never a hosted
+/// endpoint (the question was grounded for a fleet peer, with this
+/// machine's state), never a busy model (#2917). `Err` says why not.
+fn usable_local_seat(
+    profile: Option<String>,
+    hosted: impl Fn(&str) -> bool,
+    busy: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    match profile {
+        None => Err("no local profile is set (`role_profiles.radio-host` or `default_profile`)".to_string()),
+        Some(p) if hosted(&p) => Err(format!("`{p}` runs on a hosted endpoint, and this question carries this machine's state")),
+        Some(p) if busy(&p) => Err(format!("`{p}`'s model is busy")),
+        Some(p) => Ok(p),
+    }
+}
+
+/// The answering seat's [`crate::crew::dispatch::DispatchOpts`]: one
+/// tool-less single exchange of `user_message` as the `radio-host` role.
+fn answerer_opts(
+    user_message: &str,
+    cap: u32,
+    profile_name: Option<String>,
+    machine: Option<String>,
+    system_prompt_override: Option<String>,
+) -> crate::crew::dispatch::DispatchOpts {
+    crate::crew::dispatch::DispatchOpts {
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -1872,16 +1968,7 @@ pub fn dispatch_answerer_call_with(
         model_base_url_override: None,
         step_id: None,
         system_prompt_override,
-    };
-    let submit = || {
-        crate::fleet::dispatch_routed_single_shot(opts, single_shot, boundary, crate::crew::dispatch::dispatch_local_single_shot)
-    };
-    let result = match &seat_label {
-        None => submit()?,
-        Some(address) => submit_after_check(address, crate::crew::loader::RADIO_HOST_ROLE_ID, boundary, crate::fleet::check_route, submit)
-            .map_err(|e| e.context(format!("the answering seat `{address}`")))?,
-    };
-    answer_text(&result.stdout, cap)
+    }
 }
 
 /// Submit a job to the peer seat `address` only after the receiver has said
@@ -1901,7 +1988,7 @@ fn submit_after_check<T>(
     match check(address, role, boundary) {
         CheckOutcome::Routable { .. } => submit(),
         CheckOutcome::Refused { code, reason } => Err(crate::fleet::SubmitRefused { code, reason }.into()),
-        CheckOutcome::Unanswered { detail } => Err(anyhow::anyhow!("the route could not be checked: {detail}")),
+        CheckOutcome::Unanswered { detail } => Err(SeatUnreachable { detail }.into()),
     }
 }
 
@@ -1921,6 +2008,90 @@ impl std::fmt::Display for SeatUnavailable {
 }
 
 impl std::error::Error for SeatUnavailable {}
+
+/// (#3116) The answering seat's machine could not be asked whether it would
+/// take the job (its listener is off, or the route check got no answer), so
+/// nothing was sent. The one failure radio answers past, on this machine's
+/// own seat ([`with_local_fallback`]); a refusal, an empty reply and a
+/// rejected reply mean something else and are reported as they are.
+#[derive(Debug)]
+pub struct SeatUnreachable {
+    detail: String,
+}
+
+impl std::fmt::Display for SeatUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the route could not be checked: {}", self.detail)
+    }
+}
+
+impl std::error::Error for SeatUnreachable {}
+
+/// (#3116) This machine's own answering seat, the one radio uses when no
+/// machine is named: the `role_profiles.radio-host` binding when it names
+/// no other machine, else `default_profile`. `names_here` says whether a
+/// machine id is this machine.
+fn local_fallback_profile(
+    binding: Option<&str>,
+    default_profile: Option<&str>,
+    names_here: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let local_binding = binding
+        .and_then(|b| darkmux_types::profile_address::ProfileAddress::parse(b).ok())
+        .filter(|a| a.machine.as_deref().is_none_or(&names_here))
+        .map(|a| a.profile);
+    local_binding.or_else(|| default_profile.map(str::to_string))
+}
+
+/// (#3116) Ask the peer seat `address` (`primary`). When its machine could
+/// not be reached ([`SeatUnreachable`]: nothing was sent), answer on this
+/// machine's own seat instead (`fallback`, run by `run_local`), and record
+/// the line radio shows above that answer ([`note_fallback`]), naming why
+/// the peer was not reached: that reason can be a missing fleet token or a
+/// peer pin mismatch, which must not be answered around silently. One step
+/// only. Every other failure is returned as it was; an unreachable seat
+/// with no local seat to use says why (`fallback`'s `Err`).
+fn with_local_fallback(
+    address: &str,
+    primary: impl FnOnce() -> Result<String>,
+    fallback: impl FnOnce() -> Result<String, String>,
+    run_local: impl FnOnce(&str) -> Result<String>,
+) -> Result<String> {
+    let e = match primary() {
+        Ok(text) => return Ok(text),
+        Err(e) => e,
+    };
+    let Some(unreachable) = e.chain().find_map(|c| c.downcast_ref::<SeatUnreachable>()) else {
+        return Err(e);
+    };
+    let profile = match fallback() {
+        Ok(profile) => profile,
+        Err(why) => return Err(anyhow::anyhow!("{e:#}; no seat here could answer instead: {why}")),
+    };
+    match run_local(&profile) {
+        Ok(text) => {
+            note_fallback(Some(format!(
+                "Answered here by `{profile}`, because `{address}` could not be reached ({}).",
+                unreachable.detail
+            )));
+            Ok(text)
+        }
+        Err(local) => Err(anyhow::anyhow!("{e:#}; this machine's own seat, `{profile}`, also failed: {local:#}")),
+    }
+}
+
+thread_local! {
+    /// (#3116) The line [`with_local_fallback`] produced for the answer now
+    /// being asked, if radio answered on this machine's seat. Set by the
+    /// production [`AnswererCall`], taken by [`answer`] on the same thread
+    /// (the call runs synchronously inside it), so the reply itself stays
+    /// the seat's own words.
+    static FALLBACK_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn note_fallback(note: Option<String>) {
+    FALLBACK_NOTE.with(|n| *n.borrow_mut() = note);
+}
 
 /// What to tell the user when `e` is a [`SeatUnavailable`]: that the seat
 /// was unavailable and why, and that the question went unanswered. Nothing
@@ -2408,6 +2579,137 @@ mod tests {
         let mut invented = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Run `darkmux zzz-invented` now.".into()) };
         let err = answer("hi", &fixture_catalog(), &shelf, None, GroundingScope::Full, RadioSurface::Cli, &mut invented).unwrap_err();
         assert_eq!(seat_unavailable_notice(&err), None, "a rejected reply is not an unavailable seat: {err:#}");
+    }
+
+    /// (#3116) An unanswered route check is typed as unreachable (nothing
+    /// was sent), and keeps its wording.
+    #[test]
+    fn an_unanswered_route_check_is_typed_as_unreachable() {
+        let unanswered = crate::fleet::CheckOutcome::Unanswered { detail: "studio did not answer".into() };
+        let err = submit_after_check("host@studio", "radio-host", None, |_, _, _| unanswered, || Ok("sent")).unwrap_err();
+        assert!(err.chain().any(|c| c.downcast_ref::<SeatUnreachable>().is_some()), "{err:#}");
+        assert_eq!(format!("{err:#}"), "the route could not be checked: studio did not answer");
+        let refused = crate::fleet::CheckOutcome::Refused { code: crate::fleet::RefusalCode::Busy, reason: "busy".into() };
+        let err = submit_after_check("host@studio", "radio-host", None, |_, _, _| refused, || Ok("sent")).unwrap_err();
+        assert!(err.chain().all(|c| c.downcast_ref::<SeatUnreachable>().is_none()), "a refusal is not unreachable: {err:#}");
+    }
+
+    /// (#3116) The local seat is the one radio uses with no machine named:
+    /// a binding that names no other machine, else `default_profile`.
+    #[test]
+    fn the_local_fallback_is_this_machines_own_seat() {
+        let here = |m: &str| m == "macbook";
+        assert_eq!(local_fallback_profile(Some("phi4"), Some("deep"), here).as_deref(), Some("phi4"));
+        assert_eq!(local_fallback_profile(Some("phi4@macbook"), Some("deep"), here).as_deref(), Some("phi4"));
+        assert_eq!(local_fallback_profile(Some("phi4-review@studio"), Some("deep"), here).as_deref(), Some("deep"));
+        assert_eq!(local_fallback_profile(None, Some("deep"), here).as_deref(), Some("deep"));
+        assert_eq!(local_fallback_profile(Some("a@b@c"), Some("deep"), here).as_deref(), Some("deep"));
+        assert_eq!(local_fallback_profile(None, None, here), None);
+        assert_eq!(local_fallback_profile(Some("x@studio"), None, here), None);
+    }
+
+    fn taken_note() -> Option<String> {
+        FALLBACK_NOTE.with(|n| n.borrow_mut().take())
+    }
+
+    /// (#3116) Only an unreachable seat is answered past, once, on the local
+    /// seat. The label, which [`with_local_fallback`] records itself (the
+    /// production path), names the seat that answered, the one that was not
+    /// reached, and why it was not.
+    #[test]
+    fn an_unreachable_seat_is_answered_here_and_nothing_else_is() {
+        let unreachable = || -> Result<String> {
+            Err(anyhow::Error::new(SeatUnreachable { detail: "no fleet token is set".into() }).context("the answering seat `p@studio`"))
+        };
+        let local_ran = std::cell::RefCell::new(Vec::new());
+        let run_local = |p: &str| -> Result<String> {
+            local_ran.borrow_mut().push(p.to_string());
+            Ok("local answer".into())
+        };
+
+        note_fallback(None);
+        let text = with_local_fallback("p@studio", unreachable, || Ok("phi4".into()), run_local).unwrap();
+        assert_eq!(text, "local answer");
+        assert_eq!(
+            taken_note().as_deref(),
+            Some("Answered here by `phi4`, because `p@studio` could not be reached (no fleet token is set).")
+        );
+        assert_eq!(local_ran.borrow().as_slice(), ["phi4"]);
+
+        // A peer that answered, refused, or failed after the job was sent is
+        // never answered past, and leaves no label.
+        local_ran.borrow_mut().clear();
+        let text = with_local_fallback("p@studio", || Ok("peer answer".into()), || Ok("phi4".into()), run_local).unwrap();
+        assert_eq!((text.as_str(), taken_note()), ("peer answer", None));
+        let refused = || -> Result<String> { Err(refused(crate::fleet::RefusalCode::Busy)) };
+        let err = with_local_fallback("p@studio", refused, || Ok("phi4".into()), run_local).unwrap_err();
+        assert!(err.downcast_ref::<crate::fleet::SubmitRefused>().is_some(), "{err:#}");
+        let after_send = || -> Result<String> { Err(anyhow::anyhow!("the job timed out on studio")) };
+        let err = with_local_fallback("p@studio", after_send, || Ok("phi4".into()), run_local).unwrap_err();
+        assert_eq!(format!("{err:#}"), "the job timed out on studio");
+        assert!(local_ran.borrow().is_empty(), "nothing but an unreachable seat runs the local seat");
+        assert_eq!(taken_note(), None);
+
+        // No local seat to use: the failure, and why nothing here answered.
+        let err = with_local_fallback("p@studio", unreachable, || Err("`cloud` runs on a hosted endpoint".into()), run_local).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "the answering seat `p@studio`: the route could not be checked: no fleet token is set; \
+             no seat here could answer instead: `cloud` runs on a hosted endpoint"
+        );
+        assert!(local_ran.borrow().is_empty());
+
+        // Both fail: one error names both seats.
+        let err = with_local_fallback("p@studio", unreachable, || Ok("phi4".into()), |_| Err(anyhow::anyhow!("LM Studio is not running")))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no fleet token is set") && msg.contains("`phi4`") && msg.contains("LM Studio is not running"), "{msg}");
+        assert_eq!(taken_note(), None);
+    }
+
+    /// (#3116) The local seat is refused when it would send this machine's
+    /// state to a hosted endpoint, or when its model is busy, and the reason
+    /// names the profile.
+    #[test]
+    fn a_hosted_or_busy_local_seat_is_not_answered_on() {
+        let no = |_: &str| false;
+        assert_eq!(usable_local_seat(Some("phi4".into()), no, no), Ok("phi4".into()));
+        let hosted = usable_local_seat(Some("cloud".into()), |p| p == "cloud", no).unwrap_err();
+        assert!(hosted.contains("`cloud`") && hosted.contains("hosted"), "{hosted}");
+        let busy = usable_local_seat(Some("phi4".into()), no, |p| p == "phi4").unwrap_err();
+        assert!(busy.contains("`phi4`") && busy.contains("busy"), "{busy}");
+        let none = usable_local_seat(None, no, no).unwrap_err();
+        assert!(none.contains("radio-host") && none.contains("default_profile"), "{none}");
+    }
+
+    /// (#3116) The fallback line is shown above the answer; the reply itself
+    /// stays the seat's own words, and a later answer carries no stale line.
+    #[test]
+    fn a_fallback_answer_is_rendered_under_its_label() {
+        let shelf = ArtifactShelf::default();
+        let mut call = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> {
+            note_fallback(Some("Answered here by `phi4`, because `p@studio` could not be reached (studio is off).".into()));
+            Ok("Profiles name a model and a context.".into())
+        };
+        let out = answer("what is a profile?", &fixture_catalog(), &shelf, None, GroundingScope::Full, RadioSurface::Cli, &mut call).unwrap();
+        assert_eq!(out.text, "Profiles name a model and a context.");
+        assert_eq!(
+            out.rendered,
+            "Answered here by `phi4`, because `p@studio` could not be reached (studio is off).\n\nProfiles name a model and a context."
+        );
+        let mut plain = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Plain.".into()) };
+        let out = answer("again?", &fixture_catalog(), &shelf, None, GroundingScope::Full, RadioSurface::Cli, &mut plain).unwrap();
+        assert_eq!(out.rendered, "Plain.");
+    }
+
+    /// (#3116) A seat named by the radio-host setting is labeled with that
+    /// profile, not as the default profile.
+    #[test]
+    fn a_radio_host_binding_is_labeled_by_name() {
+        let bound = SeatProvenance::of_with_binding(&AnsweringSeat::Here { explicit: None }, SeatSource::OwnSetting, Some("phi4"));
+        assert_eq!(bound.describe(0), "phi4, this machine's setting");
+        let none = SeatProvenance::of_with_binding(&AnsweringSeat::Here { explicit: None }, SeatSource::BuiltIn, None);
+        assert_eq!(none.describe(0), "this machine's default profile, built-in");
     }
 
     #[test]
