@@ -603,6 +603,9 @@ pub struct TaskConfig {
 /// **Templating.** `id` renders into the copy's task-id SUFFIX
 /// (`<template id>-<rendered>`; each step id gets the same suffix), and
 /// every key of `config` is merged into EVERY step's `config` in the copy.
+/// Each template step's OWN `config` renders the same placeholders, so a
+/// key only one step reads belongs on that step: a step kind refuses a key
+/// it does not know.
 /// `{{item.<field>}}` substitutes the item's own top-level SCALAR fields
 /// (string/number/bool); naming an object or array field is an error, not
 /// a stringified blob.
