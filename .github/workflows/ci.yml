@@ -675,7 +675,7 @@ jobs:
           # reaches every user), and CLAUDE.md/DISCLAIMER.md are
           # agent/user-facing surfaces that each carried 2.0 identity drift a
           # doc-only set missed.
-          SCAN="README.md CONTRIBUTING.md DESIGN.md CLAUDE.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
+          SCAN="README.md CONTRIBUTING.md DESIGN.md CLAUDE.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/agents/ docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/ ui/CLAUDE.md runtime/CLAUDE.md crates/darkmux-types/CLAUDE.md crates/darkmux-fleet/CLAUDE.md crates/darkmux-crew/src/step_kinds/CLAUDE.md crates/darkmux-eureka/CLAUDE.md crates/darkmux-profiles/CLAUDE.md"
           # (#2589) One mktemp'd stderr file per scan below, cleaned up on
           # exit regardless of which scan fires it — a runner is ephemeral so
           # a leaked /tmp/*.err here was harmless, but a fixed name is still
