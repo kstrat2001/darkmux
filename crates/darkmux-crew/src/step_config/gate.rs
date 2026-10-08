@@ -6,8 +6,10 @@
 //!
 //! A task's `grow.config` is merged into every step of each grown copy, so a
 //! step is checked as its own `config` overlaid with the grow keys ITS kind
-//! names. A grow key no step of the task names is refused at
-//! `grow.config.<key>`; a grow key's problems are reported there too.
+//! names, and a grow key any step's kind does not take is refused at
+//! `grow.config.<key>`, naming that step (growth would refuse it there). A
+//! grow key no step of the task names is refused there too, with the closest
+//! key; a grow key's problems are reported there as well.
 
 use super::ConfigKind;
 use crate::mission_config::grow::GROWN_FROM_KEY;
@@ -73,6 +75,7 @@ pub(super) fn tasks(doc: &Value) -> Vec<(String, &Value)> {
 fn task_issues(path: &str, task: &Value, out: &mut Vec<KeyIssue>) {
     let grow = task.pointer("/grow/config").and_then(Value::as_object);
     let mut kinds = Vec::new();
+    let mut judged = Vec::new();
     let mut every_kind_known = true;
     let steps = task.get("steps").and_then(Value::as_array).into_iter().flatten().enumerate();
     for (i, step) in steps {
@@ -80,10 +83,14 @@ fn task_issues(path: &str, task: &Value, out: &mut Vec<KeyIssue>) {
         match step_kind(step, &step_path, out) {
             Some(kind) => {
                 kinds.push(kind);
+                judged.push((step, kind));
                 out.extend(step_issues(&step_path, step, kind, grow, path));
             }
             None => every_kind_known = false,
         }
+    }
+    if let Some(grow) = grow {
+        out.extend(grow_keys_a_step_does_not_take(path, grow, &judged, &kinds));
     }
     if let (Some(grow), true) = (grow, every_kind_known) {
         out.extend(unnamed_grow_keys(path, grow, &kinds));
@@ -168,6 +175,35 @@ fn relocate(mut issue: KeyIssue, config_path: &str, grow_path: &str, from_grow: 
         issue.path = format!("{grow_path}.{key}{rest}");
     }
     issue
+}
+
+/// Growth merges every `grow.config` key into EVERY step of a copy, and the
+/// copy's steps are checked at the grow boundary, so a key one step reads
+/// and another does not is refused there, after a phase has already run.
+/// Refused here instead, at the grow key, naming the step that does not take
+/// it. A key no step takes is [`unnamed_grow_keys`]'s, with its did-you-mean.
+fn grow_keys_a_step_does_not_take(
+    path: &str,
+    grow: &Map<String, Value>,
+    judged: &[(&Value, ConfigKind)],
+    kinds: &[ConfigKind],
+) -> Vec<KeyIssue> {
+    let taken_by_some: Vec<String> = kinds.iter().flat_map(|k| k.keys()).collect();
+    let mut out = Vec::new();
+    for key in grow.keys().filter(|k| k.as_str() != COMMENT_KEY && taken_by_some.contains(k)) {
+        for (step, kind) in judged.iter().filter(|(_, kind)| !kind.keys().contains(key)) {
+            let step_id = step.get("id").and_then(Value::as_str).unwrap_or("?");
+            out.push(KeyIssue {
+                path: format!("{path}.grow.config.{key}"),
+                issue: Issue::Rule(format!(
+                    "grow merges it into every step of each copy, and {} does not take it: move it into \
+                     the `config` of the step that reads it",
+                    kind.step_label(step_id)
+                )),
+            });
+        }
+    }
+    out
 }
 
 /// The grow keys no step of the task reads: each with the closest key any of

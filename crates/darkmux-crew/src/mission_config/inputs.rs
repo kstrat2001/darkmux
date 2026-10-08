@@ -196,9 +196,9 @@ pub(crate) fn grow_namespace_hint(name: &str) -> &'static str {
         // contract stays "only for a MISTYPED grow reference".
         ""
     } else if name.starts_with("from.") {
-        " (this looks like a mistyped grow namespace: the only producer-output placeholder is `{{from.output}}`, valid only inside a `grow.config` template)"
+        " (this looks like a mistyped grow namespace: the only producer-output placeholder is `{{from.output}}`, valid only inside a grow template: its `grow.config` or one of its steps' `config`)"
     } else if name.starts_with("item.") {
-        " (this looks like a mistyped grow namespace: `{{item.<field>}}` is valid only inside a `grow.config` template, never in a static step's config)"
+        " (this looks like a mistyped grow namespace: `{{item.<field>}}` is valid only inside a grow template, in its `grow.config` or one of its steps' `config`, never in a task that does not grow)"
     } else {
         ""
     }
@@ -229,8 +229,8 @@ pub fn find_unsubstituted_braces(value: &Value, path: &str, out: &mut Vec<String
 /// document's STATIC graph — every step's `config` AND every task's
 /// `grow.config` (the two places [`substitute_step_config`] ever runs) —
 /// that names neither grow's own namespace (`item.*`/`from.output`, valid
-/// only inside a `grow.config` template and resolved by `grow.rs`, never
-/// by this module) nor a name in `config.inputs`. One entry per bad
+/// only inside a grow template, its `grow.config` or a step's `config`, and
+/// resolved by `grow.rs`, never by this module) nor a name in `config.inputs`. One entry per bad
 /// occurrence: `(location, placeholder_name)`. A `grow.id` template string
 /// (e.g. `"{{item.id}}"`) is NOT scanned — it is exclusively `item.*`/
 /// `from.output` by convention and by [`super::GrowSpec`]'s own contract,

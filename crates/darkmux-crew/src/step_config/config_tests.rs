@@ -164,12 +164,46 @@ fn a_grown_step_is_checked_with_its_grow_keys() {
     assert!(rendered(&step_config_issues(&missing)).join("\n").contains("missing required key"), "grow does not supply `unit`");
 }
 
+/// (5.0 release gate) `grow.config` is merged into EVERY step of a grown
+/// copy, so a grow key one step reads and a sibling does not is refused at
+/// grow time on the sibling. The gate used to overlay only the keys each
+/// kind names, so it passed this shape at preflight and the run died at the
+/// grow boundary (the shipped `review` config did exactly this). It is now
+/// refused at the grow key, naming the step that does not take it.
 #[test]
-fn a_grow_key_a_sibling_step_reads_is_not_refused_on_this_step() {
+fn a_grow_key_a_sibling_step_does_not_take_is_refused_at_the_grow_key() {
     let doc = json!({"id": "d", "name": "d", "phases": [{"id": "p", "tasks": [{"id": "t",
         "grow": {"from": "x", "items": "i", "id": "{{item.id}}", "config": {"command": "true", "for_key": "k"}},
         "steps": [{"id": "a", "kind": "procedural.shell", "config": {}}, {"id": "b", "kind": "mods.gate", "config": {}}]}]}]});
-    assert_eq!(rendered(&step_config_issues(&doc)), Vec::<String>::new());
+    let text = rendered(&step_config_issues(&doc)).join("\n");
+    assert!(text.contains("`phases[0].tasks[0].grow.config.command`") && text.contains("`b`"), "{text}");
+    assert!(text.contains("`phases[0].tasks[0].grow.config.for_key`") && text.contains("`a`"), "{text}");
+    assert!(text.contains("config` of the step"), "says where the key belongs: {text}");
+}
+
+/// The gate and growth agree: a document the gate passes grows copies whose
+/// steps pass the grow-time check, and one growth refuses is refused by the
+/// gate first.
+#[test]
+fn the_gate_refuses_exactly_what_growth_refuses() {
+    let cases = [
+        (json!({"command": "true", "for_key": "k"}), json!({}), json!({})),
+        (json!({}), json!({"command": "true"}), json!({"for_key": "k"})),
+        (json!({"workdir": "/w"}), json!({"command": "true"}), json!({"for_key": "k"})),
+    ];
+    for (grow_config, shell, gate) in cases {
+        let doc = json!({"id": "d", "name": "d", "phases": [{"id": "p", "tasks": [{"id": "t",
+            "grow": {"from": "x", "items": "i", "id": "{{item.id}}", "config": grow_config},
+            "steps": [{"id": "a", "kind": "procedural.shell", "config": shell}, {"id": "b", "kind": "mods.gate", "config": gate}]}]}]});
+        let static_ok = step_config_issues(&doc).is_empty();
+        let config: crate::mission_config::MissionConfig = serde_json::from_value(doc.clone()).unwrap();
+        let task = &config.phases[0].tasks[0];
+        let growth = crate::mission_config::grow::grow_task(task, task.grow.as_ref().unwrap(), &[json!({"id": "1"})], "/p").unwrap();
+        let steps: Vec<(&str, &str, &Value)> =
+            growth.tasks[0].steps.iter().map(|s| (s.id.as_str(), s.kind.as_str(), &s.config)).collect();
+        let grown_ok = crate::step_config::gate::check_resolved(steps).is_ok();
+        assert_eq!(static_ok, grown_ok, "gate and growth disagree on {doc}");
+    }
 }
 
 #[test]
