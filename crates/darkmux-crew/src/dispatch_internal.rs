@@ -9979,6 +9979,10 @@ struct LiveChannel {
     sender: darkmux_flow::live::LiveSender,
     gate: crate::live_gate::LiveGate,
     cadence_ms: u64,
+    /// Every nanosecond the channel spent on this execution. Summed before
+    /// any rounding, so the stamped `sampler_us` can never read below the
+    /// sender's `forward_us`, which is rounded once from its own sum.
+    spent_ns: u64,
 }
 
 /// (#2928) The live channel's own cost for one execution, stamped on its
@@ -9986,8 +9990,8 @@ struct LiveChannel {
 /// number in the artifact rather than an assumption. `sampler_ms` is ALL the
 /// time the channel spent on this execution (building each chunk's sample,
 /// the sampler's decision, and the sends); `forward_ms` is the sends' share.
-/// Both are counted in microseconds and written as fractional milliseconds,
-/// like every other duration on the wire.
+/// Both are summed in nanoseconds, held in microseconds and written as
+/// fractional milliseconds, like every other duration on the wire.
 /// Drops are split by cause: `dropped_no_receiver` (no daemon, or a stale
 /// socket nobody reads) and `dropped_full` (a daemon too slow to drain).
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -10163,6 +10167,7 @@ impl TailerState {
             sender,
             gate: crate::live_gate::LiveGate::new(cadence_ms),
             cadence_ms,
+            spent_ns: 0,
         });
         self
     }
@@ -10187,8 +10192,11 @@ impl TailerState {
     }
 
     fn add_sampler_time(&mut self, t0: Instant) {
-        let us = t0.elapsed().as_micros() as u64;
-        self.summary.live.sampler_us = self.summary.live.sampler_us.saturating_add(us);
+        let ns = t0.elapsed().as_nanos() as u64;
+        if let Some(live) = self.live.as_mut() {
+            live.spent_ns = live.spent_ns.saturating_add(ns);
+            self.summary.live.sampler_us = live.spent_ns / 1_000;
+        }
     }
 
     /// (#2928) After a poll, on the host's clock `now_ms`: send the sampler's
@@ -10248,6 +10256,7 @@ impl TailerState {
     /// `at_ms` is the host's send time (C-6); the job's own times ride in
     /// `started_at_ms` / `ended_at_ms`.
     fn live_utility(&mut self, fields: serde_json::Value, model: Option<&str>) {
+        let t0 = Instant::now();
         let Some(live) = self.live.as_mut() else { return };
         let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, crate::usage::unix_ms_now(), live.cadence_ms);
         s.session_id = Some(self.session.wire());
@@ -10257,6 +10266,7 @@ impl TailerState {
             s.fields = map;
         }
         live.sender.send(&s);
+        self.add_sampler_time(t0);
     }
 
     /// (#2928) Fold the sender's own counters into the summary. Called once,
