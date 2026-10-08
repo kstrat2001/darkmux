@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v3.8.0)
+#   brew install darkmux                # stable release (v5.0.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,14 +17,11 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v3.13.0: the tok/s scope gets one look per state (a
-  # wave for GEN with a violet shimmer while the model thinks, a brain for
-  # PROMPT, a wrench over "tool gen" while a tool call is generated, a
-  # breathing ring for REST and idle), the degeneracy gate's findings on the
-  # run page, fleet cards that page through concurrent runs, and the
-  # pepper-grinder built-in workload.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.13.0.tar.gz"
-  sha256 "a286a913ed44300f3ec1898777e5d6bd8fdf4564d7268b4660733b5749c930b0"
+  # Stable release: v5.0.0, a breaking release: a retired config key, setting
+  # value or environment variable is refused, naming its replacement, and
+  # `darkmux doctor` names each one to fix. See CHANGELOG.md.
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.0.0.tar.gz"
+  sha256 "a1f910044145d66e5467c254c472d6d40e3233a40d89bfbf731443055a979bb4"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
