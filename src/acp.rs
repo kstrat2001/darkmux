@@ -1751,18 +1751,13 @@ async fn run_prepared_launch(
 /// slash invocation uses, so a routed `pr-merge` still hits its own
 /// sign-off dialog too.
 ///
-/// **On [`crate::radio::RouteDecision::Refuse`]:** the refusal reason is
-/// rendered VERBATIM (persona-bearing operator content — the operator's
-/// own TARS-persona role override, when one is installed, speaks here
-/// exactly as it does on the CLI; see `radio-router.md`'s own doc on "the
-/// voice may only live where prose already lives") followed by the live
-/// command listing — same TWO-PART SHAPE `radio_cli.rs::run`'s own refusal
-/// rendering uses (reason, then listing), though the listing's own wording
-/// differs: this panel path reuses `acp_panel::not_a_command_message`
-/// ("darkmux acp doesn't recognize that as a command. Available commands:
-/// …"), while the CLI's `advertised_list_message` is plainer ("Available
-/// commands: …") — each surface's EXISTING listing helper, not a new
-/// third rendering invented for this channel.
+/// **On [`crate::radio::RouteDecision::Refuse`]:** the text goes to the
+/// answering seat (`answer_no_slash_refusal`). The router's reason is never
+/// shown (#3123): it is a routing model's free text about which mission to
+/// launch, and shown as an answer it called real commands invalid. When the
+/// answer is rejected, the panel says what it checked: why no launch is
+/// possible when every launch is refused, else a fixed line and the live
+/// command listing, the same shape the CLI prints.
 ///
 /// **Never blocks other sessions:** the routing dispatch itself
 /// (`router_call` — `crate::radio::dispatch_router_call` in production,
@@ -1801,12 +1796,12 @@ async fn run_no_slash_route(
         // (#1698 Packet B2, scope A) A router refusal no longer prints the
         // bare reason + listing directly — it goes to the ANSWERING seat
         // for a grounded, in-persona reply, with the session's real
-        // artifact shelf + config-option overrides. The bare reason +
-        // listing is now the LAST RESORT, rendered only when the
-        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
-        // own doc.
-        crate::radio::RouteDecision::Refuse { reason } => {
-            answer_no_slash_refusal(session_id, text, &reason, cx, seat, sessions).await
+        // artifact shelf + config-option overrides. The listing is the
+        // LAST RESORT, rendered only when the answering dispatch itself
+        // fails — see `answer_no_slash_refusal`'s own doc. The reason is
+        // not shown (#3123).
+        crate::radio::RouteDecision::Refuse { .. } => {
+            answer_no_slash_refusal(session_id, text, cx, seat, sessions).await
         }
         // Not a refusal: the routing seat could not run at all. The answering
         // seat would fail the same way, so say it once and stop.
@@ -1932,14 +1927,13 @@ async fn confirm_then_execute(
 /// (#1698 Packet B2, scope A) Route a router refusal to the ANSWERING seat.
 /// Runs on `spawn_blocking` — the answering dispatch is a synchronous,
 /// potentially slow call (same shape/reason as the routing dispatch above
-/// and `run_ephemeral`'s own doc). Falls back to the bare refusal reason +
+/// and `run_ephemeral`'s own doc). Falls back to a checked line (#3123) +
 /// live command listing (the pre-B2 behavior) ONLY when the answering
 /// dispatch itself errors (e.g. no model loaded) — never silently drops the
 /// operator's message.
 async fn answer_no_slash_refusal(
     session_id: &SessionId,
     text: &str,
-    refusal_reason: &str,
     cx: &ConnectionTo<Client>,
     seat: SeatCalls,
     sessions: &Sessions,
@@ -1979,8 +1973,11 @@ async fn answer_no_slash_refusal(
         let fleet = (scope == crate::radio_answer::GroundingScope::Full).then(|| fleet_call()).flatten();
         // A launch refusal that empties the catalog is already the reason
         // this turn is answering, so the answer is grounded on no commands.
-        let catalog = crate::radio::compile_catalog().unwrap_or_default();
-        crate::radio_answer::answer(
+        let (catalog, launch_refusal) = match crate::radio::compile_catalog() {
+            Ok(catalog) => (catalog, None),
+            Err(refusal) => (Vec::new(), Some(format!("{refusal:#}"))),
+        };
+        let answered = crate::radio_answer::answer(
             &text_owned,
             &catalog,
             &shelf,
@@ -1988,10 +1985,12 @@ async fn answer_no_slash_refusal(
             scope,
             crate::radio::RadioSurface::Panel,
             &mut |m: &str, boundary| (seat.call)(m, &overrides, boundary),
-        )
+        );
+        (answered, launch_refusal)
     })
     .await
     .context("joining the radio answering task")?;
+    let (outcome, launch_refusal) = outcome;
 
     match outcome {
         Ok(outcome) => {
@@ -2002,19 +2001,24 @@ async fn answer_no_slash_refusal(
             );
             Ok(cx.send_notification(agent_chunk(session_id, outcome.rendered))?)
         }
-        Err(e) => {
-            let text = match crate::radio_answer::seat_unavailable_notice(&e) {
-                Some(notice) => {
-                    eprintln!("[darkmux-acp] radio answering seat unavailable: {e:#}");
-                    notice
-                }
-                None => {
-                    eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
-                    format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message())
-                }
-            };
-            Ok(cx.send_notification(agent_chunk(session_id, text))?)
-        }
+        Err(e) => Ok(cx.send_notification(agent_chunk(session_id, failed_answer_text(&e, launch_refusal.as_deref())))?),
+    }
+}
+
+/// What the panel says when the answering step failed: an unavailable seat
+/// says so and why; otherwise, when every launch is refused, darkmux's own
+/// checked reason (the words the CLI prints for it), else a fixed line and
+/// the listing. Never the router's reason (#3123), which called real
+/// commands invalid.
+fn failed_answer_text(e: &anyhow::Error, launch_refusal: Option<&str>) -> String {
+    if let Some(notice) = crate::radio_answer::seat_unavailable_notice(e) {
+        eprintln!("[darkmux-acp] radio answering seat unavailable: {e:#}");
+        return notice;
+    }
+    eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
+    match launch_refusal {
+        Some(refusal) => format!("darkmux: no mission config can be launched right now.\n{refusal}"),
+        None => format!("darkmux {}\n\n{}", crate::radio_cli::UNCHECKED_ANSWER, crate::acp_panel::command_listing()),
     }
 }
 
@@ -3703,8 +3707,9 @@ mod tests {
     }
 
     /// A seat that answered with text radio rejects (it named a command that
-    /// cannot be run) is not an unavailable seat: the plain refusal and the
-    /// live listing stay the fallback.
+    /// cannot be run) is not an unavailable seat: a checked line and the live
+    /// listing are the fallback. Not the router's reason (#3123): that is a
+    /// routing model's free text, and it called real commands invalid.
     #[tokio::test]
     #[serial_test::serial]
     async fn no_slash_refusal_falls_back_to_the_plain_listing_when_the_reply_is_rejected() {
@@ -3726,8 +3731,44 @@ mod tests {
 
         let fallback = recv_json(&mut reader).await;
         let text = chunk_text(&fallback);
-        assert!(text.contains("that's outside the scope of mission comms"), "{text}");
-        assert!(text.contains("/mission launch <config>"), "the live command listing follows the reason: {text}");
+        assert!(!text.contains("outside the scope"), "not the router's reason: {text}");
+        assert!(text.contains(crate::radio_cli::UNCHECKED_ANSWER), "{text}");
+        assert!(text.contains("/mission launch <config>"), "the live command listing follows: {text}");
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// (#3123 review) When every launch is refused (here: a stale user-tier
+    /// mission config with the retired `panel` key), the refusal is darkmux's
+    /// own checked text, not a routing model's guess, and a rejected answer
+    /// still shows it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_rejected_answer_still_shows_why_no_launch_is_possible() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        std::fs::create_dir_all(crew_tmp.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            crew_tmp.path().join("mission-configs/old-style.json"),
+            r#"{"id": "old-style", "name": "Old", "panel": {}, "phases": []}"#,
+        )
+        .unwrap();
+        assert!(crate::radio::compile_catalog().is_err(), "the fixture blocks every launch");
+
+        let router = |_msg: &str| -> Result<String> { panic!("no catalog, so nothing is routed") };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
+            Ok("Try `darkmux zzz-invented --now` for that.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+
+        let fallback = recv_json(&mut reader).await;
+        let text = chunk_text(&fallback);
+        assert!(text.contains("old-style"), "the checked refusal, naming the stale file: {text}");
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);

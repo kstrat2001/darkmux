@@ -751,7 +751,7 @@ pub struct AnswerOutcome {
     /// defect 2 had made it a rewritten copy). Nothing is edited out of a
     /// reply any more, because a reply naming a command that cannot be run
     /// on this surface never becomes an `AnswerOutcome` at all — see
-    /// [`names_an_unrunnable_command`] and [`answer`]'s own fallback.
+    /// [`unrunnable_reference`] and [`answer`]'s own fallback.
     pub text: String,
     /// `text` plus the live command listing, appended ONLY when `text`
     /// itself names an advertised `/command` AND the seat is speaking to
@@ -771,8 +771,10 @@ fn answer_references_a_command(text: &str) -> bool {
 }
 
 /// The mechanical backstop for #1861 defects 1 and 2, as #2050 rebuilt it
-/// and its review sweep generalized it: a DETECTOR, not a repair. `true`
-/// iff `reply` names a command that cannot actually be run on `surface`.
+/// and its review sweep generalized it: a DETECTOR, not a repair. The first
+/// reference in `reply` to a command that cannot actually be run on
+/// `surface`, as the reply wrote it, so a discarded reply says what it was
+/// discarded for (#3123); `None` when every reference is runnable.
 ///
 /// The persona's own "never invent a command" rule (radio-host.md rule 2)
 /// is honored only as well as whichever model is loaded that day honors an
@@ -844,24 +846,22 @@ fn answer_references_a_command(text: &str) -> bool {
 /// surface that renders cleanly and misleads, and the fallback is the
 /// output the operator measured as the best line of the original run.
 /// That cost is also why widening the scan to bare prose came WITH a
-/// narrowing ([`FILESYSTEM_ROOT_SEGMENTS`]) and two framing gates: a
+/// narrowing (a `/path` with a second segment or an extension is a path,
+/// [`slash_candidate_id`]; one after an HTTP method is a route,
+/// [`is_an_http_method`]) and two framing gates: a
 /// discarded reply is invisible — it looks exactly like an ordinary
 /// refusal — so the false-positive direction gets the same pinning as the
 /// false-negative one.
 ///
 /// **Known coverage limits, pinned by tests so they are decisions.**
 ///
-/// - **A fenced code block is not scanned at all, and by likelihood this
-///   is the DOMINANT residual — not a narrow one.** `index % 2 == 0` drops
-///   every fence body, closed or unclosed, and handing over a command
-///   inside a fence is the most idiomatic way a model answers "how do I do
-///   X". The exclusion predates this detector's rebuild and is kept here
-///   deliberately rather than revisited in passing: a fence is quoted
-///   material (sample output, a transcript), and a truncated fence — the
-///   seat hitting its token cap mid-block — is a real output whose body
-///   read as prose would discard good replies. It wants its own change
-///   with its own measurement; earlier wording in this doc called it "one
-///   documented coverage limit", which understated it.
+/// - **A fenced code block is scanned for one shape only:** a line that
+///   starts with `darkmux` ([`fenced_unrunnable_command`], #3123, after the
+///   seat was measured handing over an invented `darkmux review` in a
+///   fence). Everything else in a fence, including a `/id`, is quoted
+///   material (sample output, a transcript), and a truncated fence (the
+///   seat hitting its token cap mid-block) is a real output whose body read
+///   as prose would discard good replies.
 /// - An invented `darkmux <verb>` in bare prose with NO invocation cue and
 ///   no markup — *"darkmux machine roster sounds like a good feature"* — is
 ///   read as description and passes.
@@ -873,19 +873,64 @@ fn answer_references_a_command(text: &str) -> bool {
 /// - An unadvertised `/id` that nothing frames — *"the command is
 ///   /machine"* — is read as prose. That is the price of not discarding
 ///   *"mounted at /workspace"*; see [`token_is_framed`].
+fn unrunnable_reference(
+    reply: &str,
+    catalog: &[CatalogEntry],
+    verb_index: &[crate::radio_index::VerbEntry],
+    surface: RadioSurface,
+) -> Option<String> {
+    // Fences first, so a fence body is excluded DETERMINISTICALLY rather
+    // than by whatever parity the inline scan happens to land on.
+    reply.split("```").enumerate().find_map(|(i, chunk)| {
+        if i % 2 == 0 {
+            chunk_unrunnable_reference(chunk, catalog, verb_index, surface)
+        } else {
+            fenced_unrunnable_command(chunk, verb_index)
+        }
+    })
+}
+
+/// (#3123) The one shape judged inside a fence: a line that starts with
+/// `darkmux` (after any shell prompt, [`is_a_shell_prompt_word`], or as a
+/// path such as `./darkmux`) is a command to type,
+/// whatever else the fence holds. The rest of the fence stays quoted
+/// material, so sample output and a fence truncated mid-block are not read
+/// as prose. A first word ending in `:` is a log line (`darkmux dispatch:
+/// runtime=...`), not a command. The fence's info string (`sh`) is its own
+/// first line and never starts with `darkmux`.
+fn fenced_unrunnable_command(fence: &str, verb_index: &[crate::radio_index::VerbEntry]) -> Option<String> {
+    fence.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let k = words.iter().position(|w| !is_a_shell_prompt_word(w))?;
+        let binary = words[k];
+        let is_darkmux = binary.eq_ignore_ascii_case("darkmux")
+            || binary.rsplit('/').next().is_some_and(|b| b.eq_ignore_ascii_case("darkmux") && binary.contains('/'));
+        if !is_darkmux || words.get(k + 1).is_some_and(|w| w.ends_with(':')) {
+            return None;
+        }
+        let rest = words[k + 1..].join(" ");
+        (!darkmux_reference_is_valid(&rest, verb_index)).then(|| line.trim().to_string())
+    })
+}
+
+/// A word a shell prompt puts before a command (`$`, `%`, `user@host`,
+/// `~/dir`, a trailing `$`/`%`/`>`/`#`) or `sudo`.
+fn is_a_shell_prompt_word(word: &str) -> bool {
+    word == "sudo"
+        || word.contains('@')
+        || word.starts_with('~')
+        || word.ends_with(['$', '%', '>', '#'])
+}
+
+/// [`unrunnable_reference`] as a yes/no, for the tests that judge a verdict.
+#[cfg(test)]
 fn names_an_unrunnable_command(
     reply: &str,
     catalog: &[CatalogEntry],
     verb_index: &[crate::radio_index::VerbEntry],
     surface: RadioSurface,
 ) -> bool {
-    // Fences first, so a fence body is excluded DETERMINISTICALLY rather
-    // than by whatever parity the inline scan happens to land on.
-    reply
-        .split("```")
-        .enumerate()
-        .filter(|(i, _)| i % 2 == 0)
-        .any(|(_, chunk)| chunk_names_an_unrunnable_command(chunk, catalog, verb_index, surface))
+    unrunnable_reference(reply, catalog, verb_index, surface).is_some()
 }
 
 /// One outside-a-fence chunk. Two passes, and the split between them is
@@ -896,36 +941,55 @@ fn names_an_unrunnable_command(
 ///    as an instruction. No backtick parity is consulted, so an unmatched
 ///    delimiter cannot hide anything from this pass.
 /// 2. **Closed inline-code spans only** — the two shapes whose only signal
-///    that they are an instruction IS the markup: a bare catalog id, and a
+///    that they are an instruction IS the markup: a bare catalog id (unless
+///    a noun names it, [`span_is_named`]), and a
 ///    `darkmux ...` reference with any first word. A span is a span only
 ///    when it CLOSES ([`closed_code_spans`]); an unmatched trailing
 ///    backtick simply opens nothing, and pass 1 has already covered the
 ///    text either way.
-fn chunk_names_an_unrunnable_command(
+fn chunk_unrunnable_reference(
     chunk: &str,
     catalog: &[CatalogEntry],
     verb_index: &[crate::radio_index::VerbEntry],
     surface: RadioSurface,
-) -> bool {
+) -> Option<String> {
     let undecorated = decoration_stripped(chunk);
     let tokens = tokenize(&undecorated);
-    if slash_reference_is_unrunnable(&undecorated, &tokens, catalog, surface) {
-        return true;
+    if let Some(found) = unrunnable_slash_reference(&undecorated, &tokens, catalog, surface) {
+        return Some(found);
     }
-    if prose_darkmux_reference_is_unrunnable(&undecorated, &tokens, verb_index) {
-        return true;
+    if let Some(found) = unrunnable_prose_darkmux_reference(&undecorated, &tokens, verb_index) {
+        return Some(found);
     }
-    for span in closed_code_spans(chunk) {
-        let span = span.trim();
+    for raw in closed_code_spans(chunk) {
+        let span = raw.trim();
         if let Some(rest) = strip_darkmux_prefix(span) {
             if !darkmux_reference_is_valid(rest, verb_index) {
-                return true;
+                return Some(span.to_string());
             }
-        } else if is_a_bare_catalog_id(span, catalog) {
-            return true;
+        } else if is_a_bare_catalog_id(span, catalog) && !span_is_named(chunk, raw) {
+            return Some(span.to_string());
         }
     }
-    false
+    None
+}
+
+/// Nouns that, right after a backticked catalog id, say the span NAMES a
+/// config rather than handing it over to type: "The `review` mission".
+const CATALOG_NAME_NOUNS: &[&str] =
+    &["mission", "missions", "config", "configs", "configuration", "pipeline", "workflow"];
+
+/// (#3123) `true` iff a [`CATALOG_NAME_NOUNS`] word follows the code span
+/// `span`, a subslice of `chunk`. A cue list in front ("Run `review`") was
+/// tried first and review proved it misses most handovers ("Use the
+/// following command: `review`", a bullet, "Next, `review`."), while the
+/// name shape is narrow and easy to tell.
+fn span_is_named(chunk: &str, span: &str) -> bool {
+    let offset = span.as_ptr() as usize - chunk.as_ptr() as usize;
+    // Past the span and its closing backtick.
+    let after = chunk.get(offset + span.len() + 1..).unwrap_or_default();
+    let word: String = after.trim_start_matches(' ').chars().take_while(|c| c.is_alphabetic()).collect();
+    CATALOG_NAME_NOUNS.contains(&word.to_ascii_lowercase().as_str())
 }
 
 /// Decoration that FRAMES a reference — inline-code backticks, markdown
@@ -1197,22 +1261,34 @@ fn slash_candidate_id(token: &str) -> Option<String> {
 /// it is unrunnable everywhere: a config runs as `/mission launch <id>`.
 /// Anything else has to be [`token_is_framed`] before it counts as a
 /// reference at all.
-fn slash_reference_is_unrunnable(
+fn unrunnable_slash_reference(
     chars: &[char],
     tokens: &[Token],
     catalog: &[CatalogEntry],
     surface: RadioSurface,
-) -> bool {
-    tokens.iter().enumerate().any(|(k, token)| {
-        let Some(id) = slash_candidate_id(&token.text) else { return false };
+) -> Option<String> {
+    tokens.iter().enumerate().find_map(|(k, token)| {
+        let id = slash_candidate_id(&token.text)?;
+        if k > 0 && is_an_http_method(&tokens[k - 1].text) && !is_an_advertised_id(&id, catalog) {
+            return None;
+        }
         if id.eq_ignore_ascii_case(crate::acp_panel::MISSION_COMMAND) {
-            return surface != RadioSurface::Panel || !mission_verb_is_runnable(&tokens[k + 1..], catalog);
+            let unrunnable = surface != RadioSurface::Panel || !mission_verb_is_runnable(&tokens[k + 1..], catalog);
+            // Named with the words that made it unrunnable: `/mission`
+            // itself is real on the panel.
+            let args: String = (k + 1..k + 3).filter_map(|i| bare_word(tokens.get(i))).map(|w| format!(" {w}")).collect();
+            return unrunnable.then(|| format!("/{id}{args}"));
         }
-        if is_an_advertised_id(&id, catalog) {
-            return true;
-        }
-        token_is_framed(chars, tokens, k)
+        (is_an_advertised_id(&id, catalog) || token_is_framed(chars, tokens, k)).then(|| format!("/{id}"))
     })
+}
+
+/// (#3123) `true` iff `word` is an HTTP method, so the `/path` after it is a
+/// route the daemon serves (the CLI's own help names `GET /runs`), not a
+/// command anyone types. Not for an advertised id, which is a command
+/// whatever precedes it.
+fn is_an_http_method(word: &str) -> bool {
+    ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].contains(&word)
 }
 
 /// A word with the sentence punctuation a reply glues to it removed.
@@ -1295,11 +1371,11 @@ fn names_a_verb_node(path: &str, verb_index: &[crate::radio_index::VerbEntry]) -
 /// so the sentence shipped verbatim. The tokens arrive decoration-aware, so
 /// the same sentence with a stray backtick anywhere in front of it is the
 /// identical input.
-fn prose_darkmux_reference_is_unrunnable(
+fn unrunnable_prose_darkmux_reference(
     chars: &[char],
     tokens: &[Token],
     verb_index: &[crate::radio_index::VerbEntry],
-) -> bool {
+) -> Option<String> {
     for (k, token) in tokens.iter().enumerate() {
         let name = token.text.trim_end_matches(is_trailing_punctuation);
         if !name.eq_ignore_ascii_case("darkmux") || !token_is_framed(chars, tokens, k) {
@@ -1331,10 +1407,10 @@ fn prose_darkmux_reference_is_unrunnable(
         }
         let path = candidate.join(" ");
         if !darkmux_reference_is_valid(&path, verb_index) && !names_a_verb_node(&path, verb_index) {
-            return true;
+            return Some(format!("{name} {path}"));
         }
     }
-    false
+    None
 }
 /// `true` iff `span` is EXACTLY an advertised command id, with no
 /// `/` and no `darkmux ` in front of it (#2050, third measurement).
@@ -1369,11 +1445,13 @@ fn prose_darkmux_reference_is_unrunnable(
 /// your diff" and "the review config" are untouched; only `` `review` ``
 /// is a claim about something to type.
 ///
-/// The residual false positive, stated: a legitimate MENTION in backticks
-/// — "`review` takes no arguments" — is read as an instruction and costs
-/// the reply. Accepted on the same ordering as the rest of this module:
-/// the fallback is honest and unhelpful, and the alternative is telling a
-/// user to run something that errors.
+/// **Except when it is named (#3123).** "The `review` mission needs a diff"
+/// is a NAME, and an earlier revision read it as an instruction. The 5.0
+/// test pass measured the cost: every answer about the review mission was
+/// discarded. So a span followed by a noun saying what it is
+/// ([`span_is_named`]) passes. The residual, stated: a bare mention with no
+/// such noun, "`review` takes no arguments", still reads as something to
+/// type and costs the reply.
 fn is_a_bare_catalog_id(span: &str, catalog: &[CatalogEntry]) -> bool {
     let id = span.trim();
     !id.is_empty() && catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
@@ -1517,10 +1595,10 @@ pub fn answer(
     if reply.is_empty() {
         anyhow::bail!("the answering seat returned no usable text");
     }
-    if names_an_unrunnable_command(&reply, catalog, &command_verb_index(), surface) {
+    if let Some(found) = unrunnable_reference(&reply, catalog, &command_verb_index(), surface) {
         anyhow::bail!(
-            "the answering seat's reply named a command that cannot be run on this surface, \
-             and the rest of the reply was written around it"
+            "the answering seat's reply named `{found}`, a command that cannot be run on this \
+             surface, and the rest of the reply was written around it"
         );
     }
     // (#1698 Packet B2 gate) The bare LISTING, not `not_a_command_message`
@@ -3592,6 +3670,31 @@ mod tests {
         assert!(!detects("Like this:\n```\n/machine\n```\nThat is the shape.", RadioSurface::Cli));
     }
 
+    /// (#3123) A fence line that starts with `darkmux` is a command to type,
+    /// whatever else the fence holds. Measured live on this branch: asked
+    /// what the review mission needs, the seat answered "To execute this
+    /// mission, you would use the command:" over a fence holding
+    /// `darkmux review`, which does not exist, and it shipped because no
+    /// fence was scanned.
+    #[test]
+    fn a_darkmux_command_line_in_a_fence_is_checked() {
+        let live = command_verb_index();
+        let judged = |reply: &str| names_an_unrunnable_command(reply, &fixture_catalog(), &live, RadioSurface::Cli);
+        assert!(judged("To execute it:\n\n```\ndarkmux review\n```\n"), "an invented command in a fence");
+        assert!(judged("Like so:\n```sh\n$ darkmux review --now\n```"), "behind a shell prompt");
+        for prompt in ["./darkmux review", "kain@mac ~ % darkmux review", "sudo darkmux review", "/usr/local/bin/darkmux review"] {
+            assert!(judged(&format!("```\n{prompt}\n```")), "after a prompt or path: {prompt}");
+        }
+        for reply in [
+            "```\ndarkmux run list --json\n```",
+            "```\n$ darkmux mission launch review\n```",
+            "Output:\n```\ndarkmux dispatch: runtime=internal\n```",
+            "```\nreview finished\n```",
+        ] {
+            assert!(!judged(reply), "a real command, or not a command: {reply}");
+        }
+    }
+
     // ── (#2050, third measurement) a bare catalog id is not an invocation ──
 
     #[test]
@@ -3641,6 +3744,84 @@ mod tests {
         ] {
             assert!(!detects(reply, RadioSurface::Cli), "prose must never trip the fallback: {reply}");
         }
+    }
+
+    /// (#3123) A catalog id in backticks is a NAME when a noun naming what it
+    /// is follows it ("The `review` mission"), and something to type
+    /// otherwise. The test pass on build 7 lost every answer about the review
+    /// mission to the first shape. A cue list in front was tried first and
+    /// review proved it let "Use the following command: `review`" through.
+    #[test]
+    fn a_backticked_catalog_id_used_as_a_name_is_not_an_instruction() {
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            for reply in [
+                "The `review` mission reviews a diff and needs a `diff` input.",
+                "Use the `review` mission for that.",
+                "The `review` config's inputs are a diff and a head commit.",
+            ] {
+                assert!(!detects(reply, surface), "a name, not an instruction, on {surface:?}: {reply}");
+            }
+            for reply in [
+                "Run `review` to execute the pipeline.",
+                "Use the following command: `review`",
+                "The command is `review`.",
+                "Start it with:\n\n`review`",
+                "Steps:\n- `review`",
+                "Next, `review`.",
+                // The residual, stated: a bare mention with no noun after it
+                // still reads as something to type.
+                "`review` takes no arguments.",
+            ] {
+                assert!(detects(reply, surface), "something to type on {surface:?}: {reply}");
+            }
+        }
+    }
+
+    /// (#3123 review) What a discarded reply names is what tripped the check:
+    /// `/mission` is runnable on the panel, `launch nope` is not.
+    #[test]
+    fn the_named_reference_is_what_tripped_the_check() {
+        let found = |reply: &str, surface| unrunnable_reference(reply, &fixture_catalog(), &fixture_verb_index(), surface);
+        assert_eq!(found("Try /mission launch nope here.", RadioSurface::Panel).as_deref(), Some("/mission launch nope"));
+        assert_eq!(found("Run Darkmux machine roster.", RadioSurface::Cli).as_deref(), Some("Darkmux machine roster"));
+    }
+
+    /// (#3123) An HTTP route the grounding itself names is not a command.
+    /// `run list --help` says it serves "the same union `GET /runs`
+    /// serves"; the seat repeated that, and the whole answer was discarded
+    /// for `/runs`, measured live on this branch.
+    #[test]
+    fn an_http_route_is_not_a_slash_command() {
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            for reply in [
+                "It lists every run, the same union `GET /runs` serves.",
+                "The daemon answers POST /fleet/work for that.",
+            ] {
+                assert!(!detects(reply, surface), "a route, on {surface:?}: {reply}");
+            }
+            assert!(detects("Run `/runs` to see them.", surface), "still a command when nothing says route");
+            assert!(detects("Type GET /review to start.", surface), "an advertised id is a command whatever precedes it");
+        }
+    }
+
+    /// (#3123) A discarded reply is invisible to the operator, so the error
+    /// names what the backstop matched: the next look is a read, not a guess.
+    #[test]
+    fn a_discarded_reply_names_the_reference_it_was_discarded_for() {
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
+            Ok("You can list your crew. Run `darkmux machine roster` to see it.".to_string())
+        };
+        let err = answer(
+            "who is on my crew?",
+            &fixture_catalog(),
+            &ArtifactShelf::default(),
+            None,
+            GroundingScope::Full,
+            RadioSurface::Cli,
+            &mut call,
+        )
+        .expect_err("an invented verb is discarded");
+        assert!(format!("{err:#}").contains("darkmux machine roster"), "names the match: {err:#}");
     }
 
     #[test]
@@ -4381,4 +4562,3 @@ mod tests {
         assert_eq!(answer_text("Run `darkmux machine status`.", 4096).unwrap(), "Run `darkmux machine status`.");
     }
 }
-
