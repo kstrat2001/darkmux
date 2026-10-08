@@ -13833,3 +13833,228 @@ fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+// ─── (#3136) `darkmux init`: what it prints, run the way an operator runs it ──
+//
+// `src/init_tests.rs` drives `init::init` in-process; these read the
+// child's stdout, which is the only place `cmd_init`'s report exists.
+// Every spawn names its own `HOME` and `DARKMUX_HOME` (the pair
+// `isolated_roots` hands out, so a second spawn can see what the first
+// wrote) and a stub `lms`, so no run can reach the operator's home or a
+// real LM Studio.
+
+/// A stub `lms` in `dir` that answers `ls --json` with `catalog` and
+/// `ps --json` with nothing loaded.
+#[cfg(unix)]
+fn init_lms_stub(dir: &std::path::Path, catalog: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("ls.json"), catalog).unwrap();
+    let lms = dir.join("lms");
+    fs::write(
+        &lms,
+        "#!/bin/sh\ncase \"$1\" in\n  ls) cat \"$(dirname \"$0\")/ls.json\" ;;\n  ps) echo '[]' ;;\n  *) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&lms, fs::Permissions::from_mode(0o755)).unwrap();
+    lms
+}
+
+#[cfg(unix)]
+/// `darkmux init <args>` against a fixed `(home, darkmux_home)` and `lms`.
+fn init_in(home: &std::path::Path, darkmux_home: &std::path::Path, lms: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = darkmux_cmd();
+    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home).env("DARKMUX_LMS_BIN", lms);
+    cmd.arg("init").args(args).output().unwrap()
+}
+
+#[cfg(unix)]
+fn stdout_of(out: &std::process::Output) -> String {
+    assert!(
+        out.status.success(),
+        "init exited {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn init_first_run_reports_what_it_created_and_the_models_it_chose() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    let claude_md = home.join("proj").join("CLAUDE.md");
+    let agents_md = home.join("proj").join("AGENTS.md");
+    let out = stdout_of(&init_in(
+        &home,
+        &dm,
+        &lms,
+        &["--with-hook", "--with-claude-md", claude_md.to_str().unwrap(), "--with-agents-md", agents_md.to_str().unwrap()],
+    ));
+    let reg = dm.join("profiles.json");
+    for want in [
+        format!("profile registry: created at {}\n", reg.display()),
+        format!("worker model: `only-llm` (LM Studio has it; every worker profile now names it, edit {} to change)\n", reg.display()),
+        format!("utility model: `only-llm` (the registry named one LM Studio does not have; this is the closest downloaded match, edit {} to change)\n", reg.display()),
+        format!("config: created at {} (machine_id seeded", dm.join("config.json").display()),
+        format!("skills targets: {}\n", home.join(".claude").join("skills").display()),
+        "  installed (".to_string(),
+        format!("hook: added to {}\n", home.join(".claude").join("settings.json").display()),
+        format!("CLAUDE.md: integration section appended to {}\n", claude_md.display()),
+        format!("AGENTS.md: integration section appended to {}\n", agents_md.display()),
+        "\nNext steps:\n  1. First answer, no Docker needed".to_string(),
+        "  2. Check the setup: `darkmux doctor`\n".to_string(),
+        "  3. With Docker running, a first dispatch".to_string(),
+    ] {
+        assert!(out.contains(&want), "missing {want:?} in:\n{out}");
+    }
+    // The worker was filled, so there is no "edit the registry" step.
+    assert!(!out.contains("Edit ~/.darkmux/profiles.json"), "{out}");
+    assert!(!out.contains("[DRY RUN"), "{out}");
+    assert!(!out.contains("already"), "{out}");
+    assert!(fs::read_to_string(&reg).unwrap().contains("\"only-llm\""));
+    assert!(home.join(".claude").join("settings.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_re_run_reports_every_piece_already_present() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    let claude_md = home.join("CLAUDE.md");
+    let agents_md = home.join("AGENTS.md");
+    let args = ["--with-hook", "--with-claude-md", claude_md.to_str().unwrap(), "--with-agents-md", agents_md.to_str().unwrap()];
+    stdout_of(&init_in(&home, &dm, &lms, &args));
+    let reg_before = fs::read_to_string(dm.join("profiles.json")).unwrap();
+
+    let out = stdout_of(&init_in(&home, &dm, &lms, &args));
+
+    for want in [
+        format!("profile registry: already present at {}\n", dm.join("profiles.json").display()),
+        format!("config: already present at {}\n", dm.join("config.json").display()),
+        "  overwritten (".to_string(),
+        format!("hook: already present in {}\n", home.join(".claude").join("settings.json").display()),
+        format!("CLAUDE.md: already integrated at {}\n", claude_md.display()),
+        format!("AGENTS.md: already integrated at {}\n", agents_md.display()),
+        "Next steps:".to_string(),
+    ] {
+        assert!(out.contains(&want), "missing {want:?} in:\n{out}");
+    }
+    for absent in ["worker model:", "utility model:", "created at", "  installed (", "kept as-is"] {
+        assert!(!out.contains(absent), "unexpected {absent:?} in:\n{out}");
+    }
+    assert_eq!(fs::read_to_string(dm.join("profiles.json")).unwrap(), reg_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_dry_run_says_so_and_writes_nothing() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    let claude_md = home.join("CLAUDE.md");
+
+    let out = stdout_of(&init_in(&home, &dm, &lms, &["--dry-run", "--with-hook", "--with-claude-md", claude_md.to_str().unwrap()]));
+
+    for want in [
+        format!("profile registry: created at {}\n", dm.join("profiles.json").display()),
+        format!("config: created at {}", dm.join("config.json").display()),
+        format!("hook: added to {}\n", home.join(".claude").join("settings.json").display()),
+        format!("CLAUDE.md: integration section appended to {}\n", claude_md.display()),
+        "[DRY RUN — nothing was written]\n".to_string(),
+    ] {
+        assert!(out.contains(&want), "missing {want:?} in:\n{out}");
+    }
+    assert!(!out.contains("Next steps"), "{out}");
+    assert!(!out.contains("worker model:"), "a dry run never asks LM Studio: {out}");
+    for p in [dm.join("profiles.json"), dm.join("config.json"), home.join(".claude"), claude_md] {
+        assert!(!p.exists(), "dry run wrote {}", p.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_without_a_usable_model_says_why_and_tells_the_operator_to_edit_the_registry() {
+    // No `lms` at all: the worker reason, and the "edit the registry" step.
+    let (home, dm) = isolated_roots();
+    let out = stdout_of(&init_in(&home, &dm, &home.join("no-such-lms"), &[]));
+    assert!(out.contains("worker model: not set. could not ask LM Studio what is downloaded"), "{out}");
+    assert!(!out.contains("utility model:"), "the worker line already reported lms: {out}");
+    assert!(out.contains("Next steps:\n  1. Edit ~/.darkmux/profiles.json to point at a downloaded model"), "{out}");
+    assert!(out.contains("  2. First answer, no Docker needed"), "{out}");
+
+    // The worker is set, but only a toy is downloaded for the utility seat.
+    let (home, dm) = isolated_roots();
+    let example = fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles.example.json")).unwrap();
+    fs::write(dm.join("profiles.json"), example.replace("<your-worker-model-id>", "mine")).unwrap();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"toy","sizeBytes":500000000,"type":"llm"}]"#);
+    let out = stdout_of(&init_in(&home, &dm, &lms, &[]));
+    assert!(out.contains("utility model: not verified. the registry's utility model `"), "{out}");
+    assert!(out.contains("is not downloaded and no LLM of at least 1 GB is"), "{out}");
+    assert!(!out.contains("worker model:"), "{out}");
+    assert!(!out.contains("Edit ~/.darkmux/profiles.json"), "the registry was not created by this run: {out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_names_an_edited_skill_it_kept_and_says_what_force_discarded() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    stdout_of(&init_in(&home, &dm, &lms, &[]));
+    let skills = home.join(".claude").join("skills");
+    let name = fs::read_dir(&skills)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("darkmux-"))
+        .min()
+        .unwrap();
+    fs::write(skills.join(&name).join("SKILL.md"), "my edit\n").unwrap();
+
+    let kept = stdout_of(&init_in(&home, &dm, &lms, &[]));
+    assert!(kept.contains(&format!("  kept as-is, not refreshed (1): {name}\n")), "{kept}");
+    assert!(kept.contains("    to take this binary's version: `darkmux init --force`"), "{kept}");
+    assert!(!kept.contains("--force overwrote"), "{kept}");
+
+    let forced = stdout_of(&init_in(&home, &dm, &lms, &["--force"]));
+    assert!(forced.contains(&format!("  --force overwrote without proof they were unmodified (1): {name}\n")), "{forced}");
+    assert!(forced.contains("    any local edit in those is gone."), "{forced}");
+    assert!(!forced.contains("kept as-is"), "{forced}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_force_over_a_malformed_block_fails_and_names_the_missing_marker() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), "[]");
+    let doc = home.join("CLAUDE.md");
+    fs::write(&doc, "mine\n<!-- darkmux:integration:start -->\nno end\n").unwrap();
+    let out = init_in(&home, &dm, &lms, &["--force", "--with-claude-md", doc.to_str().unwrap()]);
+    assert!(!out.status.success(), "a malformed block must fail init");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the end marker `<!-- darkmux:integration:end -->` is missing"), "{stderr}");
+    assert_eq!(fs::read_to_string(&doc).unwrap(), "mine\n<!-- darkmux:integration:start -->\nno end\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_lists_a_skill_that_is_not_darkmux_s_as_skipped_and_leaves_it_alone() {
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), "[]");
+    // A skills source holding one skill that is not a `darkmux-*` name, and the
+    // operator's own copy of it already installed.
+    let source = home.join("skills-src");
+    fs::create_dir_all(source.join("my-skill")).unwrap();
+    fs::write(source.join(".darkmux-skills"), "").unwrap();
+    fs::write(source.join("my-skill").join("SKILL.md"), "bundled\n").unwrap();
+    let installed = home.join(".claude").join("skills").join("my-skill").join("SKILL.md");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::write(&installed, "the operator's\n").unwrap();
+
+    let mut cmd = darkmux_cmd();
+    cmd.env("HOME", &home).env("DARKMUX_HOME", &dm).env("DARKMUX_LMS_BIN", &lms).env("DARKMUX_SKILLS_DIR", &source);
+    let out = stdout_of(&cmd.arg("init").output().unwrap());
+
+    assert!(out.contains("  skipped (1): my-skill\n"), "{out}");
+    assert_eq!(fs::read_to_string(&installed).unwrap(), "the operator's\n");
+}

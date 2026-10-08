@@ -1228,3 +1228,7 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+#[path = "init_tests.rs"]
+mod init_tests;
