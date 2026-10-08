@@ -254,6 +254,73 @@ fn step_managed_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types:
     crate::target::step_managed_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
 }
 
+/// The hosted arm of a `dispatch.single_shot` call: both budgets before the
+/// network, the call, its spend settled, and its `step.result` record pushed
+/// onto `flow_records`.
+fn hosted_single_shot_reply(
+    step: &Step,
+    req: &crate::single_shot::HostedSingleShotRequest<'_>,
+    endpoint_label: Option<&str>,
+    session: &SessionId,
+    budget_caller: &crate::budget::BudgetCaller<'_>,
+    ctx: Option<&StepRunCtx>,
+    flow_records: &mut Vec<darkmux_flow::FlowRecord>,
+) -> Result<crate::single_shot::SingleShotReply> {
+    // (#2902 step 5) Both budgets before the network, never after:
+    // the endpoint's window, then this call's dispatch cap. A breach
+    // warns; an endpoint `wait` holds the call (the step stays live,
+    // its heartbeat beating) until there is room. Nothing is clamped.
+    crate::budget::admit_endpoint(req.endpoint, budget_caller)?;
+    let dispatch_bucket =
+        std::sync::Mutex::new(DispatchBudget::for_endpoint(req.endpoint).map_err(|e| anyhow::anyhow!(e))?);
+    let budget = dispatch_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
+
+    let reply = match crate::single_shot::single_shot_chat_hosted(req) {
+        Ok(reply) => reply,
+        Err(e) => {
+            charge_failed_hosted_step_call(
+                &e,
+                req,
+                &dispatch_bucket,
+                budget_caller,
+                ctx,
+                (&step.id, endpoint_label.unwrap_or_default()),
+            );
+            return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
+        }
+    };
+    crate::budget::settle_dispatch_live(
+        &dispatch_bucket,
+        crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), req.max_tokens, &req.body()?),
+        &step.id,
+        budget_caller,
+    );
+
+    // (#1412) Surface actual spend the same way `dispatch_unmanaged`
+    // embeds totals in its `dispatch complete` record, so a hosted
+    // single-shot step's token usage is visible even without the
+    // full per-step bucket regime.
+    flow_records.push(darkmux_flow::FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        model: Some(req.model.to_string()),
+        ..darkmux_flow::FlowRecord::for_session_with(
+            session,
+            darkmux_flow::Level::Info,
+            darkmux_flow::Category::Work,
+            darkmux_flow::Stage::Dispatch,
+            darkmux_flow::Payload::StepResult(hosted_single_shot_step_payload(
+                &step.id,
+                budget,
+                req.max_tokens,
+                req.max_tokens,
+                &reply,
+            )),
+            step.id.clone(),
+        )
+    });
+    Ok(reply)
+}
+
 /// The LOCAL arm of `dispatch.single_shot` (#3035): a local step whose
 /// `config.endpoint` names a MANAGED endpoint answers to that endpoint's
 /// limits like any other: its window gate, then this call's dispatch cap.
@@ -1016,7 +1083,7 @@ impl DispatchSingleShotStepKind {
         input: &BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
-        use crate::single_shot::{single_shot_chat_hosted, HostedSingleShotRequest};
+        use crate::single_shot::HostedSingleShotRequest;
         // Records go out live through the scheduler's emitter when there is
         // one, else batch into the outcome (see `StepBookend`).
         let ctx = run_ctx.live();
@@ -1100,84 +1167,34 @@ impl DispatchSingleShotStepKind {
         // (#3121) A failed call ends the execution with ITS error: the
         // terminal names it (a signal, a refused budget, an endpoint error)
         // instead of the guard's "early return or panic".
-        let attempt = (|| -> Result<crate::single_shot::SingleShotReply> {
-            if let Some(endpoint) = &endpoint {
-
-                // (#2902 step 5) Both budgets before the network, never after:
-                // the endpoint's window, then this call's dispatch cap. A breach
-                // warns; an endpoint `wait` holds the call (the step stays live,
-                // its heartbeat beating) until there is room. Nothing is clamped.
-                crate::budget::admit_endpoint(endpoint, &budget_caller)?;
-                let dispatch_bucket =
-                    std::sync::Mutex::new(DispatchBudget::for_endpoint(endpoint).map_err(|e| anyhow::anyhow!(e))?);
-                let budget = dispatch_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
-
-                let req = HostedSingleShotRequest {
+        let attempt = match &endpoint {
+            Some(endpoint) => hosted_single_shot_reply(
+                step,
+                &HostedSingleShotRequest {
                     endpoint,
                     model: wire_model.as_ref(),
                     system,
                     user: &user,
                     max_tokens,
                     timeout_seconds,
-                };
-                let reply = match single_shot_chat_hosted(&req) {
-                    Ok(reply) => reply,
-                    Err(e) => {
-                        charge_failed_hosted_step_call(
-                            &e,
-                            &req,
-                            &dispatch_bucket,
-                            &budget_caller,
-                            ctx,
-                            (&step.id, endpoint_label.as_deref().unwrap_or_default()),
-                        );
-                        return Err(e).with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id));
-                    }
-                };
-                crate::budget::settle_dispatch_live(
-                    &dispatch_bucket,
-                    crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens, &req.body()?),
-                    &step.id,
-                    &budget_caller,
-                );
-
-                // (#1412) Surface actual spend the same way `dispatch_unmanaged`
-                // embeds totals in its `dispatch complete` record, so a hosted
-                // single-shot step's token usage is visible even without the
-                // full per-step bucket regime.
-                flow_records.push(darkmux_flow::FlowRecord {
-                    source: Some(darkmux_flow::FlowSource::Scheduler),
-                    model: Some(wire_model.to_string()),
-                    ..darkmux_flow::FlowRecord::for_session_with(
-                        session,
-                        darkmux_flow::Level::Info,
-                        darkmux_flow::Category::Work,
-                        darkmux_flow::Stage::Dispatch,
-                        darkmux_flow::Payload::StepResult(hosted_single_shot_step_payload(
-                            &step.id,
-                            budget,
-                            max_tokens,
-                            max_tokens,
-                            &reply,
-                        )),
-                        step.id.clone(),
-                    )
-                });
-
-                Ok(reply)
-            } else {
-                local_single_shot_reply(
-                    step,
-                    managed_endpoint.as_ref(),
-                    call,
-                    wire_model.as_ref(),
-                    system,
-                    &user,
-                    (max_tokens, timeout_seconds),
-                    &budget_caller,
-                )
-            }
-        })();
+                },
+                endpoint_label.as_deref(),
+                session,
+                &budget_caller,
+                ctx,
+                &mut flow_records,
+            ),
+            None => local_single_shot_reply(
+                step,
+                managed_endpoint.as_ref(),
+                call,
+                wire_model.as_ref(),
+                system,
+                &user,
+                (max_tokens, timeout_seconds),
+                &budget_caller,
+            ),
+        };
         let reply = match attempt {
             Ok(reply) => reply,
             Err(e) => {
