@@ -891,7 +891,8 @@ fn unrunnable_reference(
 }
 
 /// (#3123) The one shape judged inside a fence: a line that starts with
-/// `darkmux` (after an optional `$`, `%` or `>` prompt) is a command to type,
+/// `darkmux` (after any shell prompt, [`is_a_shell_prompt_word`], or as a
+/// path such as `./darkmux`) is a command to type,
 /// whatever else the fence holds. The rest of the fence stays quoted
 /// material, so sample output and a fence truncated mid-block are not read
 /// as prose. A first word ending in `:` is a log line (`darkmux dispatch:
@@ -899,13 +900,26 @@ fn unrunnable_reference(
 /// first line and never starts with `darkmux`.
 fn fenced_unrunnable_command(fence: &str, verb_index: &[crate::radio_index::VerbEntry]) -> Option<String> {
     fence.lines().find_map(|line| {
-        let line = line.trim().trim_start_matches(['$', '%', '>']).trim_start();
-        let rest = strip_darkmux_prefix(line)?;
-        if rest.split_whitespace().next().is_some_and(|w| w.ends_with(':')) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let k = words.iter().position(|w| !is_a_shell_prompt_word(w))?;
+        let binary = words[k];
+        let is_darkmux = binary.eq_ignore_ascii_case("darkmux")
+            || binary.rsplit('/').next().is_some_and(|b| b.eq_ignore_ascii_case("darkmux") && binary.contains('/'));
+        if !is_darkmux || words.get(k + 1).is_some_and(|w| w.ends_with(':')) {
             return None;
         }
-        (!darkmux_reference_is_valid(rest, verb_index)).then(|| line.to_string())
+        let rest = words[k + 1..].join(" ");
+        (!darkmux_reference_is_valid(&rest, verb_index)).then(|| line.trim().to_string())
     })
+}
+
+/// A word a shell prompt puts before a command (`$`, `%`, `user@host`,
+/// `~/dir`, a trailing `$`/`%`/`>`/`#`) or `sudo`.
+fn is_a_shell_prompt_word(word: &str) -> bool {
+    word == "sudo"
+        || word.contains('@')
+        || word.starts_with('~')
+        || word.ends_with(['$', '%', '>', '#'])
 }
 
 /// [`unrunnable_reference`] as a yes/no, for the tests that judge a verdict.
@@ -927,8 +941,8 @@ fn names_an_unrunnable_command(
 ///    as an instruction. No backtick parity is consulted, so an unmatched
 ///    delimiter cannot hide anything from this pass.
 /// 2. **Closed inline-code spans only** — the two shapes whose only signal
-///    that they are an instruction IS the markup: a bare catalog id (and
-///    only when a cue hands it over, [`span_is_cued`]), and a
+///    that they are an instruction IS the markup: a bare catalog id (unless
+///    a noun names it, [`span_is_named`]), and a
 ///    `darkmux ...` reference with any first word. A span is a span only
 ///    when it CLOSES ([`closed_code_spans`]); an unmatched trailing
 ///    backtick simply opens nothing, and pass 1 has already covered the
@@ -953,26 +967,29 @@ fn chunk_unrunnable_reference(
             if !darkmux_reference_is_valid(rest, verb_index) {
                 return Some(span.to_string());
             }
-        } else if is_a_bare_catalog_id(span, catalog) && span_is_cued(chunk, raw) {
+        } else if is_a_bare_catalog_id(span, catalog) && !span_is_named(chunk, raw) {
             return Some(span.to_string());
         }
     }
     None
 }
 
-/// (#3123) `true` iff an invocation cue ([`REFERENCE_INVOCATION_CUES`])
-/// comes right before the code span `span`, a subslice of `chunk`:
-/// "Run `review`" hands `review` over to type, while "The `review` mission"
-/// names it.
-fn span_is_cued(chunk: &str, span: &str) -> bool {
+/// Nouns that, right after a backticked catalog id, say the span NAMES a
+/// config rather than handing it over to type: "The `review` mission".
+const CATALOG_NAME_NOUNS: &[&str] =
+    &["mission", "missions", "config", "configs", "configuration", "pipeline", "workflow"];
+
+/// (#3123) `true` iff a [`CATALOG_NAME_NOUNS`] word follows the code span
+/// `span`, a subslice of `chunk`. A cue list in front ("Run `review`") was
+/// tried first and review proved it misses most handovers ("Use the
+/// following command: `review`", a bullet, "Next, `review`."), while the
+/// name shape is narrow and easy to tell.
+fn span_is_named(chunk: &str, span: &str) -> bool {
     let offset = span.as_ptr() as usize - chunk.as_ptr() as usize;
-    // Up to the span's opening backtick, then one placeholder token for the
-    // span itself: a space keeps the placeholder from reading as framed by
-    // decoration, so only the cue words before it decide.
-    let before = format!("{} x", &chunk[..offset.saturating_sub(1)]);
-    let chars = decoration_stripped(&before);
-    let tokens = tokenize(&chars);
-    !tokens.is_empty() && token_is_framed(&chars, &tokens, tokens.len() - 1)
+    // Past the span and its closing backtick.
+    let after = chunk.get(offset + span.len() + 1..).unwrap_or_default();
+    let word: String = after.trim_start_matches(' ').chars().take_while(|c| c.is_alphabetic()).collect();
+    CATALOG_NAME_NOUNS.contains(&word.to_ascii_lowercase().as_str())
 }
 
 /// Decoration that FRAMES a reference — inline-code backticks, markdown
@@ -1252,21 +1269,24 @@ fn unrunnable_slash_reference(
 ) -> Option<String> {
     tokens.iter().enumerate().find_map(|(k, token)| {
         let id = slash_candidate_id(&token.text)?;
-        if k > 0 && is_an_http_method(&tokens[k - 1].text) {
+        if k > 0 && is_an_http_method(&tokens[k - 1].text) && !is_an_advertised_id(&id, catalog) {
             return None;
         }
-        let unrunnable = if id.eq_ignore_ascii_case(crate::acp_panel::MISSION_COMMAND) {
-            surface != RadioSurface::Panel || !mission_verb_is_runnable(&tokens[k + 1..], catalog)
-        } else {
-            is_an_advertised_id(&id, catalog) || token_is_framed(chars, tokens, k)
-        };
-        unrunnable.then(|| format!("/{id}"))
+        if id.eq_ignore_ascii_case(crate::acp_panel::MISSION_COMMAND) {
+            let unrunnable = surface != RadioSurface::Panel || !mission_verb_is_runnable(&tokens[k + 1..], catalog);
+            // Named with the words that made it unrunnable: `/mission`
+            // itself is real on the panel.
+            let args: String = (k + 1..k + 3).filter_map(|i| bare_word(tokens.get(i))).map(|w| format!(" {w}")).collect();
+            return unrunnable.then(|| format!("/{id}{args}"));
+        }
+        (is_an_advertised_id(&id, catalog) || token_is_framed(chars, tokens, k)).then(|| format!("/{id}"))
     })
 }
 
 /// (#3123) `true` iff `word` is an HTTP method, so the `/path` after it is a
 /// route the daemon serves (the CLI's own help names `GET /runs`), not a
-/// command anyone types.
+/// command anyone types. Not for an advertised id, which is a command
+/// whatever precedes it.
 fn is_an_http_method(word: &str) -> bool {
     ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].contains(&word)
 }
@@ -1387,7 +1407,7 @@ fn unrunnable_prose_darkmux_reference(
         }
         let path = candidate.join(" ");
         if !darkmux_reference_is_valid(&path, verb_index) && !names_a_verb_node(&path, verb_index) {
-            return Some(format!("darkmux {path}"));
+            return Some(format!("{name} {path}"));
         }
     }
     None
@@ -1425,13 +1445,13 @@ fn unrunnable_prose_darkmux_reference(
 /// your diff" and "the review config" are untouched; only `` `review` ``
 /// is a claim about something to type.
 ///
-/// **A cue is required too (#3123).** A legitimate MENTION in backticks,
-/// "The `review` mission needs a diff" or "`review` takes no arguments", is
-/// a name, and an earlier revision read it as an instruction. The 5.0 test
-/// pass measured the cost: every answer about the review mission was
-/// discarded. So the caller judges a bare id only when an invocation cue
-/// ([`span_is_cued`]) hands it over to type, which the measured
-/// "Run `review` ..." still is.
+/// **Except when it is named (#3123).** "The `review` mission needs a diff"
+/// is a NAME, and an earlier revision read it as an instruction. The 5.0
+/// test pass measured the cost: every answer about the review mission was
+/// discarded. So a span followed by a noun saying what it is
+/// ([`span_is_named`]) passes. The residual, stated: a bare mention with no
+/// such noun, "`review` takes no arguments", still reads as something to
+/// type and costs the reply.
 fn is_a_bare_catalog_id(span: &str, catalog: &[CatalogEntry]) -> bool {
     let id = span.trim();
     !id.is_empty() && catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
@@ -3662,6 +3682,9 @@ mod tests {
         let judged = |reply: &str| names_an_unrunnable_command(reply, &fixture_catalog(), &live, RadioSurface::Cli);
         assert!(judged("To execute it:\n\n```\ndarkmux review\n```\n"), "an invented command in a fence");
         assert!(judged("Like so:\n```sh\n$ darkmux review --now\n```"), "behind a shell prompt");
+        for prompt in ["./darkmux review", "kain@mac ~ % darkmux review", "sudo darkmux review", "/usr/local/bin/darkmux review"] {
+            assert!(judged(&format!("```\n{prompt}\n```")), "after a prompt or path: {prompt}");
+        }
         for reply in [
             "```\ndarkmux run list --json\n```",
             "```\n$ darkmux mission launch review\n```",
@@ -3723,25 +3746,44 @@ mod tests {
         }
     }
 
-    /// (#3123) A catalog id in backticks is a NAME unless an invocation cue
-    /// hands it over to type. The test pass on build 7 lost every answer
-    /// about the review mission to this: "The `review` mission ..." was read
-    /// as "run `review`", and the operator got only the fallback.
+    /// (#3123) A catalog id in backticks is a NAME when a noun naming what it
+    /// is follows it ("The `review` mission"), and something to type
+    /// otherwise. The test pass on build 7 lost every answer about the review
+    /// mission to the first shape. A cue list in front was tried first and
+    /// review proved it let "Use the following command: `review`" through.
     #[test]
     fn a_backticked_catalog_id_used_as_a_name_is_not_an_instruction() {
         for surface in [RadioSurface::Cli, RadioSurface::Panel] {
             for reply in [
                 "The `review` mission reviews a diff and needs a `diff` input.",
-                "`review` takes no arguments.",
                 "Use the `review` mission for that.",
+                "The `review` config's inputs are a diff and a head commit.",
             ] {
                 assert!(!detects(reply, surface), "a name, not an instruction, on {surface:?}: {reply}");
             }
-            // Still caught when a cue hands it over to type.
-            for reply in ["Run `review` to execute the pipeline.", "Just launch `review`."] {
-                assert!(detects(reply, surface), "an instruction on {surface:?}: {reply}");
+            for reply in [
+                "Run `review` to execute the pipeline.",
+                "Use the following command: `review`",
+                "The command is `review`.",
+                "Start it with:\n\n`review`",
+                "Steps:\n- `review`",
+                "Next, `review`.",
+                // The residual, stated: a bare mention with no noun after it
+                // still reads as something to type.
+                "`review` takes no arguments.",
+            ] {
+                assert!(detects(reply, surface), "something to type on {surface:?}: {reply}");
             }
         }
+    }
+
+    /// (#3123 review) What a discarded reply names is what tripped the check:
+    /// `/mission` is runnable on the panel, `launch nope` is not.
+    #[test]
+    fn the_named_reference_is_what_tripped_the_check() {
+        let found = |reply: &str, surface| unrunnable_reference(reply, &fixture_catalog(), &fixture_verb_index(), surface);
+        assert_eq!(found("Try /mission launch nope here.", RadioSurface::Panel).as_deref(), Some("/mission launch nope"));
+        assert_eq!(found("Run Darkmux machine roster.", RadioSurface::Cli).as_deref(), Some("Darkmux machine roster"));
     }
 
     /// (#3123) An HTTP route the grounding itself names is not a command.
@@ -3758,6 +3800,7 @@ mod tests {
                 assert!(!detects(reply, surface), "a route, on {surface:?}: {reply}");
             }
             assert!(detects("Run `/runs` to see them.", surface), "still a command when nothing says route");
+            assert!(detects("Type GET /review to start.", surface), "an advertised id is a command whatever precedes it");
         }
     }
 

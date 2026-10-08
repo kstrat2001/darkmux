@@ -169,10 +169,9 @@ fn print_answer_failure(out: &AnswerFailureOutput) -> i32 {
 }
 
 /// The output for a failed answering step. A seat that could not answer says
-/// so and why, and nothing about darkmux: the router's refusal reason and the
-/// command listing answer a question that WAS judged unanswerable, not this
-/// one. Any other failure (a reply radio rejected) keeps the router's reason
-/// and the listing, with the failure on stderr.
+/// so and why, and nothing about darkmux. Any other failure (a reply radio
+/// rejected) prints a fixed line and the listing, with the failure on
+/// stderr; never the router's reason (#3123).
 fn answer_failure_output(e: &anyhow::Error, catalog: &[CatalogEntry]) -> AnswerFailureOutput {
     match crate::radio_answer::seat_unavailable_notice(e) {
         Some(notice) => AnswerFailureOutput { answer: notice, diagnostic: None },
