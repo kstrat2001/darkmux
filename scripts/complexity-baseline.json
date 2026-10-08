@@ -26,7 +26,7 @@
   "crates/darkmux-crew/src/index.rs::status_at": 28,
   "crates/darkmux-crew/src/lessons.rs::import_json": 16,
   "crates/darkmux-crew/src/mission_config/interpret.rs::interpret": 25,
-  "crates/darkmux-crew/src/mission_config/mod.rs::MissionConfig::validate": 85,
+  "crates/darkmux-crew/src/mission_config/mod.rs::MissionConfig::validate": 83,
   "crates/darkmux-crew/src/mission_config/prune.rs::prune_with_selection": 24,
   "crates/darkmux-crew/src/mods.rs::strip_kit_source_prefix": 16,
   "crates/darkmux-crew/src/records_emitted.rs::aggregate_records_emitted": 22,

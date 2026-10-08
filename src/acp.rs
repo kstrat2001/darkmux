@@ -2001,30 +2001,24 @@ async fn answer_no_slash_refusal(
             );
             Ok(cx.send_notification(agent_chunk(session_id, outcome.rendered))?)
         }
-        Err(e) => {
-            let text = match crate::radio_answer::seat_unavailable_notice(&e) {
-                Some(notice) => {
-                    eprintln!("[darkmux-acp] radio answering seat unavailable: {e:#}");
-                    notice
-                }
-                None => {
-                    eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
-                    match &launch_refusal {
-                        // Every launch is refused: darkmux's own checked
-                        // reason, the words the CLI prints for it.
-                        Some(refusal) => format!("darkmux: no mission config can be launched right now.\n{refusal}"),
-                        // (#3123) Not the router's reason, which called real
-                        // commands invalid; the same checked line the CLI prints.
-                        None => format!(
-                            "darkmux {}\n\n{}",
-                            crate::radio_cli::UNCHECKED_ANSWER,
-                            crate::acp_panel::command_listing()
-                        ),
-                    }
-                }
-            };
-            Ok(cx.send_notification(agent_chunk(session_id, text))?)
-        }
+        Err(e) => Ok(cx.send_notification(agent_chunk(session_id, failed_answer_text(&e, launch_refusal.as_deref())))?),
+    }
+}
+
+/// What the panel says when the answering step failed: an unavailable seat
+/// says so and why; otherwise, when every launch is refused, darkmux's own
+/// checked reason (the words the CLI prints for it), else a fixed line and
+/// the listing. Never the router's reason (#3123), which called real
+/// commands invalid.
+fn failed_answer_text(e: &anyhow::Error, launch_refusal: Option<&str>) -> String {
+    if let Some(notice) = crate::radio_answer::seat_unavailable_notice(e) {
+        eprintln!("[darkmux-acp] radio answering seat unavailable: {e:#}");
+        return notice;
+    }
+    eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
+    match launch_refusal {
+        Some(refusal) => format!("darkmux: no mission config can be launched right now.\n{refusal}"),
+        None => format!("darkmux {}\n\n{}", crate::radio_cli::UNCHECKED_ANSWER, crate::acp_panel::command_listing()),
     }
 }
 
