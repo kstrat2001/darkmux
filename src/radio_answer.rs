@@ -1874,14 +1874,12 @@ pub fn dispatch_answerer_call_with(
                 .map_err(|e| e.context(format!("the answering seat `{address}`")))?;
                 answer_text(&result.stdout, cap)
             };
-            let (text, note) = with_local_fallback(
+            with_local_fallback(
                 &address,
                 ask_peer,
                 || local_fallback_seat(binding.as_deref(), overrides),
                 |p| run_here(Some(p.to_string())),
-            )?;
-            note_fallback(note);
-            Ok(text)
+            )
         }
     }
 }
@@ -1897,21 +1895,30 @@ fn local_fallback_seat(binding: Option<&str>, overrides: &AnswererOverrides) -> 
     let default_profile =
         darkmux_profiles::profiles::load_registry_quiet(None).ok().and_then(|l| l.registry.default_profile);
     let names_here = |m: &str| matches!(routing_decision(Some(m), here.as_deref()), RoutingDecision::Local { .. });
-    let why = match local_fallback_profile(binding, default_profile.as_deref(), names_here) {
-        None => "no local profile is set (`role_profiles.radio-host` or `default_profile`)".to_string(),
-        Some(p) if crate::crew::dispatch::dispatch_resolves_unmanaged(crate::crew::loader::RADIO_HOST_ROLE_ID, Some(&p), None) => {
-            format!("`{p}` runs on a hosted endpoint, and this question carries this machine's state")
-        }
-        Some(p) => {
-            let local = AnswererOverrides { profile_name: Some(p.clone()), humor: overrides.humor };
-            match crate::radio_busy::answering_seat_busy(&local) {
-                None => return Ok(p),
-                Some(_) => format!("`{p}`'s model is busy"),
-            }
-        }
-    };
-    darkmux_types::diag_eprintln!("radio: no local seat to answer on instead: {why}");
-    Err(why)
+    usable_local_seat(
+        local_fallback_profile(binding, default_profile.as_deref(), names_here),
+        |p| crate::crew::dispatch::dispatch_resolves_unmanaged(crate::crew::loader::RADIO_HOST_ROLE_ID, Some(p), None),
+        |p| {
+            let local = AnswererOverrides { profile_name: Some(p.to_string()), humor: overrides.humor };
+            crate::radio_busy::answering_seat_busy(&local).is_some()
+        },
+    )
+}
+
+/// (#3116) Whether `profile` may answer here instead: never a hosted
+/// endpoint (the question was grounded for a fleet peer, with this
+/// machine's state), never a busy model (#2917). `Err` says why not.
+fn usable_local_seat(
+    profile: Option<String>,
+    hosted: impl Fn(&str) -> bool,
+    busy: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    match profile {
+        None => Err("no local profile is set (`role_profiles.radio-host` or `default_profile`)".to_string()),
+        Some(p) if hosted(&p) => Err(format!("`{p}` runs on a hosted endpoint, and this question carries this machine's state")),
+        Some(p) if busy(&p) => Err(format!("`{p}`'s model is busy")),
+        Some(p) => Ok(p),
+    }
 }
 
 /// The answering seat's [`crate::crew::dispatch::DispatchOpts`]: one
@@ -2038,28 +2045,37 @@ fn local_fallback_profile(
 
 /// (#3116) Ask the peer seat `address` (`primary`). When its machine could
 /// not be reached ([`SeatUnreachable`]: nothing was sent), answer on this
-/// machine's own seat instead (`fallback`, run by `run_local`), and say so:
-/// the second value is the line radio shows above that answer. One step
-/// only. Every other failure, and an unreachable seat with no local seat to
-/// use (`fallback`'s `Err` says why), is returned as it was.
+/// machine's own seat instead (`fallback`, run by `run_local`), and record
+/// the line radio shows above that answer ([`note_fallback`]), naming why
+/// the peer was not reached: that reason can be a missing fleet token or a
+/// peer pin mismatch, which must not be answered around silently. One step
+/// only. Every other failure is returned as it was; an unreachable seat
+/// with no local seat to use says why (`fallback`'s `Err`).
 fn with_local_fallback(
     address: &str,
     primary: impl FnOnce() -> Result<String>,
     fallback: impl FnOnce() -> Result<String, String>,
     run_local: impl FnOnce(&str) -> Result<String>,
-) -> Result<(String, Option<String>)> {
+) -> Result<String> {
     let e = match primary() {
-        Ok(text) => return Ok((text, None)),
+        Ok(text) => return Ok(text),
         Err(e) => e,
     };
-    if !e.chain().any(|c| c.downcast_ref::<SeatUnreachable>().is_some()) {
-        return Err(e);
-    }
-    let Ok(profile) = fallback() else {
+    let Some(unreachable) = e.chain().find_map(|c| c.downcast_ref::<SeatUnreachable>()) else {
         return Err(e);
     };
+    let profile = match fallback() {
+        Ok(profile) => profile,
+        Err(why) => return Err(anyhow::anyhow!("{e:#}; no seat here could answer instead: {why}")),
+    };
     match run_local(&profile) {
-        Ok(text) => Ok((text, Some(format!("Answered here by `{profile}`, because `{address}` could not be reached.")))),
+        Ok(text) => {
+            note_fallback(Some(format!(
+                "Answered here by `{profile}`, because `{address}` could not be reached ({}).",
+                unreachable.detail
+            )));
+            Ok(text)
+        }
         Err(local) => Err(anyhow::anyhow!("{e:#}; this machine's own seat, `{profile}`, also failed: {local:#}")),
     }
 }
@@ -2592,12 +2608,18 @@ mod tests {
         assert_eq!(local_fallback_profile(Some("x@studio"), None, here), None);
     }
 
+    fn taken_note() -> Option<String> {
+        FALLBACK_NOTE.with(|n| n.borrow_mut().take())
+    }
+
     /// (#3116) Only an unreachable seat is answered past, once, on the local
-    /// seat, and the line says which seat answered and why.
+    /// seat. The label, which [`with_local_fallback`] records itself (the
+    /// production path), names the seat that answered, the one that was not
+    /// reached, and why it was not.
     #[test]
     fn an_unreachable_seat_is_answered_here_and_nothing_else_is() {
         let unreachable = || -> Result<String> {
-            Err(anyhow::Error::new(SeatUnreachable { detail: "studio is off".into() }).context("the answering seat `p@studio`"))
+            Err(anyhow::Error::new(SeatUnreachable { detail: "no fleet token is set".into() }).context("the answering seat `p@studio`"))
         };
         let local_ran = std::cell::RefCell::new(Vec::new());
         let run_local = |p: &str| -> Result<String> {
@@ -2605,17 +2627,20 @@ mod tests {
             Ok("local answer".into())
         };
 
-        let (text, note) = with_local_fallback("p@studio", unreachable, || Ok("phi4".into()), run_local).unwrap();
+        note_fallback(None);
+        let text = with_local_fallback("p@studio", unreachable, || Ok("phi4".into()), run_local).unwrap();
         assert_eq!(text, "local answer");
-        let note = note.expect("a fallback answer is labeled");
-        assert!(note.contains("`phi4`") && note.contains("`p@studio`") && note.contains("could not be reached"), "{note}");
+        assert_eq!(
+            taken_note().as_deref(),
+            Some("Answered here by `phi4`, because `p@studio` could not be reached (no fleet token is set).")
+        );
         assert_eq!(local_ran.borrow().as_slice(), ["phi4"]);
 
         // A peer that answered, refused, or failed after the job was sent is
-        // never answered past.
+        // never answered past, and leaves no label.
         local_ran.borrow_mut().clear();
-        let (text, note) = with_local_fallback("p@studio", || Ok("peer answer".into()), || Ok("phi4".into()), run_local).unwrap();
-        assert_eq!((text.as_str(), note), ("peer answer", None));
+        let text = with_local_fallback("p@studio", || Ok("peer answer".into()), || Ok("phi4".into()), run_local).unwrap();
+        assert_eq!((text.as_str(), taken_note()), ("peer answer", None));
         let refused = || -> Result<String> { Err(refused(crate::fleet::RefusalCode::Busy)) };
         let err = with_local_fallback("p@studio", refused, || Ok("phi4".into()), run_local).unwrap_err();
         assert!(err.downcast_ref::<crate::fleet::SubmitRefused>().is_some(), "{err:#}");
@@ -2623,18 +2648,38 @@ mod tests {
         let err = with_local_fallback("p@studio", after_send, || Ok("phi4".into()), run_local).unwrap_err();
         assert_eq!(format!("{err:#}"), "the job timed out on studio");
         assert!(local_ran.borrow().is_empty(), "nothing but an unreachable seat runs the local seat");
+        assert_eq!(taken_note(), None);
 
-        // No local seat to use: the original failure, unchanged.
-        let err = with_local_fallback("p@studio", unreachable, || Err("hosted".into()), run_local).unwrap_err();
-        assert_eq!(format!("{err:#}"), "the answering seat `p@studio`: the route could not be checked: studio is off");
+        // No local seat to use: the failure, and why nothing here answered.
+        let err = with_local_fallback("p@studio", unreachable, || Err("`cloud` runs on a hosted endpoint".into()), run_local).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "the answering seat `p@studio`: the route could not be checked: no fleet token is set; \
+             no seat here could answer instead: `cloud` runs on a hosted endpoint"
+        );
         assert!(local_ran.borrow().is_empty());
 
-        // Both fail: one error names both seats, and it is still a seat that
-        // could not answer.
+        // Both fail: one error names both seats.
         let err = with_local_fallback("p@studio", unreachable, || Ok("phi4".into()), |_| Err(anyhow::anyhow!("LM Studio is not running")))
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("studio is off") && msg.contains("`phi4`") && msg.contains("LM Studio is not running"), "{msg}");
+        assert!(msg.contains("no fleet token is set") && msg.contains("`phi4`") && msg.contains("LM Studio is not running"), "{msg}");
+        assert_eq!(taken_note(), None);
+    }
+
+    /// (#3116) The local seat is refused when it would send this machine's
+    /// state to a hosted endpoint, or when its model is busy, and the reason
+    /// names the profile.
+    #[test]
+    fn a_hosted_or_busy_local_seat_is_not_answered_on() {
+        let no = |_: &str| false;
+        assert_eq!(usable_local_seat(Some("phi4".into()), no, no), Ok("phi4".into()));
+        let hosted = usable_local_seat(Some("cloud".into()), |p| p == "cloud", no).unwrap_err();
+        assert!(hosted.contains("`cloud`") && hosted.contains("hosted"), "{hosted}");
+        let busy = usable_local_seat(Some("phi4".into()), no, |p| p == "phi4").unwrap_err();
+        assert!(busy.contains("`phi4`") && busy.contains("busy"), "{busy}");
+        let none = usable_local_seat(None, no, no).unwrap_err();
+        assert!(none.contains("radio-host") && none.contains("default_profile"), "{none}");
     }
 
     /// (#3116) The fallback line is shown above the answer; the reply itself
@@ -2643,14 +2688,14 @@ mod tests {
     fn a_fallback_answer_is_rendered_under_its_label() {
         let shelf = ArtifactShelf::default();
         let mut call = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> {
-            note_fallback(Some("Answered here by `phi4`, because `p@studio` could not be reached.".into()));
+            note_fallback(Some("Answered here by `phi4`, because `p@studio` could not be reached (studio is off).".into()));
             Ok("Profiles name a model and a context.".into())
         };
         let out = answer("what is a profile?", &fixture_catalog(), &shelf, None, GroundingScope::Full, RadioSurface::Cli, &mut call).unwrap();
         assert_eq!(out.text, "Profiles name a model and a context.");
         assert_eq!(
             out.rendered,
-            "Answered here by `phi4`, because `p@studio` could not be reached.\n\nProfiles name a model and a context."
+            "Answered here by `phi4`, because `p@studio` could not be reached (studio is off).\n\nProfiles name a model and a context."
         );
         let mut plain = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Plain.".into()) };
         let out = answer("again?", &fixture_catalog(), &shelf, None, GroundingScope::Full, RadioSurface::Cli, &mut plain).unwrap();
