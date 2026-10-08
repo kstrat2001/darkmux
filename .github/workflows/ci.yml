@@ -116,21 +116,25 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          # Fail open: this job runs on ANY change except files proven inert
+          # (no Rust build embeds them and no Rust test reads them). A list of
+          # what counts as Rust input would miss what the binary embeds or a
+          # test reads: skills/*/SKILL.md, config.example.json, the viewer
+          # bundle, fixtures, docs/ENVIRONMENT.md, DESIGN.md (src/cli_json.rs
+          # reads it), packaging/homebrew/darkmux-serve-wrapped (tests/cli.rs).
+          # Add a path below only after checking nothing in Rust reads it.
+          # `every`: a file must match ALL patterns, so each `!` line excludes.
+          # (In the default `some` mode a `!` line matches every file outside
+          # it: the old `'!runtime/**'` line made this job run on every PR by
+          # accident.)
+          predicate-quantifier: 'every'
           filters: |
             rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-              - 'templates/**'
-              - '.github/workflows/ci.yml'
-              # (#1868) A Rust test reads this TS file directly (the
-              # `graph_ts_status_actions_map` pin ties `graph.ts`'s
-              # STATUS_ACTIONS map to the emitter's own list), so a UI-only
-              # edit to it must run the rust job. Without this line the pin's
-              # own gate skips and reports green on exactly the PR that
-              # breaks it.
-              - 'ui/src/lenses/mission/graph.ts'
-              - '!runtime/**'
+              - '**'
+              - '!**/CLAUDE.md'
+              - '!docs/agents/**'
+              - '!{README.md,CONTRIBUTING.md,CHANGELOG.md,DISCLAIMER.md,SECURITY.md,LICENSE}'
+              - '!docs/{ENGAGEMENTS,OPERATIONS}.md'
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
@@ -263,15 +267,12 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          # `every` + one brace list: see the build-test-lint filter.
+          predicate-quantifier: 'every'
           filters: |
             rust:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'src/**'
-              - 'crates/**'
-              - 'tests/**'
-              - 'templates/**'
-              - '.github/workflows/ci.yml'
+              - '{Cargo.toml,Cargo.lock,src/**,crates/**,tests/**,templates/**,.github/workflows/ci.yml}'
+              - '!**/CLAUDE.md'
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
@@ -394,11 +395,12 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          # `every` + one brace list: see the build-test-lint filter.
+          predicate-quantifier: 'every'
           filters: |
             runtime:
-              - 'runtime/**'
-              - 'crates/darkmux-trajectory/**'
-              - '.github/workflows/ci.yml'
+              - '{runtime/**,crates/darkmux-trajectory/**,.github/workflows/ci.yml}'
+              - '!**/CLAUDE.md'
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.runtime == 'true'
@@ -464,14 +466,12 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          # `every` + one brace list: see the build-test-lint filter.
+          predicate-quantifier: 'every'
           filters: |
             rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-              - 'templates/**'
-              - 'scripts/ci-msrv-check.sh'
-              - '.github/workflows/ci.yml'
+              - '{*.rs,**/*.rs,Cargo.toml,**/Cargo.toml,Cargo.lock,**/Cargo.lock,templates/**,scripts/ci-msrv-check.sh,.github/workflows/ci.yml}'
+              - '!**/CLAUDE.md'
 
       # The pinned DEV toolchain, only so `cargo metadata` can run under
       # rust-toolchain.toml. The MSRV toolchains are installed by the script.
@@ -675,7 +675,9 @@ jobs:
           # reaches every user), and CLAUDE.md/DISCLAIMER.md are
           # agent/user-facing surfaces that each carried 2.0 identity drift a
           # doc-only set missed.
-          SCAN="README.md CONTRIBUTING.md DESIGN.md CLAUDE.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
+          # Every CLAUDE.md in the repo is found, not listed, so adding one
+          # never needs an edit here.
+          SCAN="README.md CONTRIBUTING.md DESIGN.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/agents/ docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/ $(git ls-files -- 'CLAUDE.md' '**/CLAUDE.md' | tr '\n' ' ')"
           # (#2589) One mktemp'd stderr file per scan below, cleaned up on
           # exit regardless of which scan fires it — a runner is ephemeral so
           # a leaked /tmp/*.err here was harmless, but a fixed name is still
@@ -1019,21 +1021,16 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          # `every` + one brace list: see the build-test-lint filter.
+          # (#2212) the slop-chop survey/oracle scripts resolve `typescript`
+          # from ui/node_modules, so they test in this job; the TypeScript
+          # half of the complexity ratchet (the complexity-* and
+          # ts-function-key files) runs here too.
+          predicate-quantifier: 'every'
           filters: |
             ui:
-              - 'ui/**'
-              - 'tests/parity/**'
-              - 'crates/darkmux-serve/assets/**'
-              - '.github/workflows/ci.yml'
-              # (#2212) the slop-chop survey/oracle scripts resolve
-              # `typescript` from ui/node_modules, so they test in this job.
-              - 'scripts/slop-chop/**'
-              # The TypeScript half of the complexity ratchet runs here.
-              - 'scripts/complexity-ratchet.py'
-              - 'scripts/complexity-baseline.json'
-              - 'scripts/complexity-allowlist.json'
-              - 'scripts/ts-function-key.mjs'
-              - 'scripts/ts-function-key.test.mjs'
+              - '{ui/**,tests/parity/**,crates/darkmux-serve/assets/**,.github/workflows/ci.yml,scripts/slop-chop/**,scripts/complexity-ratchet.py,scripts/complexity-baseline.json,scripts/complexity-allowlist.json,scripts/ts-function-key.mjs,scripts/ts-function-key.test.mjs}'
+              - '!**/CLAUDE.md'
 
       - name: Install bun
         if: steps.filter.outputs.ui == 'true'
