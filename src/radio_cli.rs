@@ -104,7 +104,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         // limitation, not a bug). The bare reason + listing becomes the
         // LAST RESORT, printed only when the answering dispatch itself
         // fails (e.g. no model loaded) — never silently swallowed.
-        RouteDecision::Refuse { reason } => {
+        RouteDecision::Refuse { .. } => {
             let shelf = crate::radio_answer::ArtifactShelf::default();
             let overrides = crate::radio_answer::AnswererOverrides::default();
             match crate::radio_answer::answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli) {
@@ -123,7 +123,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                 }
                 // The model was reached for routing but not for answering: the
                 // user got a degraded reply, and a script must be able to tell.
-                Err(e) => Ok(print_answer_failure(&answer_failure_output(&e, &reason, &catalog))),
+                Err(e) => Ok(print_answer_failure(&answer_failure_output(&e, &catalog))),
             }
         }
         // The routing seat never ran. Nothing downstream can do better with
@@ -173,15 +173,24 @@ fn print_answer_failure(out: &AnswerFailureOutput) -> i32 {
 /// command listing answer a question that WAS judged unanswerable, not this
 /// one. Any other failure (a reply radio rejected) keeps the router's reason
 /// and the listing, with the failure on stderr.
-fn answer_failure_output(e: &anyhow::Error, reason: &str, catalog: &[CatalogEntry]) -> AnswerFailureOutput {
+fn answer_failure_output(e: &anyhow::Error, catalog: &[CatalogEntry]) -> AnswerFailureOutput {
     match crate::radio_answer::seat_unavailable_notice(e) {
         Some(notice) => AnswerFailureOutput { answer: notice, diagnostic: None },
+        // (#3123) Not the router's reason: that is a routing model's free
+        // text about which mission to launch, and shown here it called real
+        // commands invalid. Only what was checked is said.
         None => AnswerFailureOutput {
-            answer: format!("radio: {reason}\n{}", advertised_list_message(catalog)),
+            answer: format!("radio: {UNCHECKED_ANSWER}\n{}", advertised_list_message(catalog)),
             diagnostic: Some(format!("radio: the answering seat failed ({e:#}); falling back to the plain refusal")),
         },
     }
 }
+
+/// (#3123) What radio says when it has no answer it could check: true of
+/// every failure, and pointing at the whole CLI rather than only the
+/// missions radio can launch.
+pub(crate) const UNCHECKED_ANSWER: &str =
+    "couldn't answer that with a reply it could check. `darkmux --help` lists every command.";
 
 /// A human-readable fallback list of what can be launched.
 fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
@@ -620,21 +629,32 @@ mod tests {
         .context("the answering seat `host@studio`");
         let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), None, crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
             .unwrap_err();
-        let out = answer_failure_output(&err, "Darkmux does not define profiles", &catalog());
+        let out = answer_failure_output(&err, &catalog());
         assert!(out.answer.contains("the answering seat was unavailable"), "{}", out.answer);
         assert!(out.answer.contains("studio does not accept work from laptop"), "{}", out.answer);
         assert!(!out.answer.contains("does not define") && !out.answer.contains("mission launch"), "{}", out.answer);
         assert_eq!(out.diagnostic, None);
     }
 
-    /// Any other failure (a reply radio rejected) keeps the router's reason
-    /// and the listing.
+    /// Any other failure (a reply radio rejected) keeps the listing, with a
+    /// pointer to the whole CLI.
     #[test]
     fn any_other_failure_keeps_the_plain_refusal() {
-        let out = answer_failure_output(&anyhow::anyhow!("the reply named a command that cannot be run"), "not a command", &catalog());
-        assert!(out.answer.contains("radio: not a command"), "{}", out.answer);
+        let out = answer_failure_output(&anyhow::anyhow!("the reply named a command that cannot be run"), &catalog());
         assert!(out.answer.contains("`darkmux mission launch pr-list`"), "{}", out.answer);
+        assert!(out.answer.contains("`darkmux --help`"), "points at the whole CLI: {}", out.answer);
         assert!(out.diagnostic.is_some());
+    }
+
+    /// (#3123) The router's refusal reason is a routing model's free text
+    /// about which MISSION to launch. Shown as the answer, it told the
+    /// operator that `darkmux run list`, a real verb, "is not a valid
+    /// command". The fallback states nothing it has not checked.
+    #[test]
+    fn the_fallback_does_not_repeat_the_routers_claims_as_fact() {
+        let out = answer_failure_output(&anyhow::anyhow!("the reply named a command that cannot be run"), &catalog());
+        assert!(out.answer.contains(UNCHECKED_ANSWER), "{}", out.answer);
+        assert!(!out.answer.contains("not a valid command"), "{}", out.answer);
     }
 
     /// (#1861 review) This file's PRODUCTION half — everything ahead of
