@@ -474,6 +474,12 @@ export function prefillStallAfterMs(promptChars: number): number {
   return Math.max(STALL_AFTER_MS, PREFILL_FLOOR_MS + (Math.max(0, promptChars) / PREFILL_CHARS_PER_SEC) * 1000);
 }
 
+/** (#3145) Whether this heartbeat shows the model generating: text or a
+ *  tool call being written. An empty chunk does not count. */
+function producedOutput(b: HeartbeatSample): boolean {
+  return b.chars !== 0 || b.writingTool !== undefined;
+}
+
 /** (#3145) The current turn's opener, when the model has produced nothing
  *  since it: every sample after it in the same turn is a 0-char chunk (an
  *  engine may send an empty first chunk the moment the request lands) and
@@ -485,7 +491,7 @@ function prefillOpener(beats: HeartbeatSample[]): { atMs: number; promptChars: n
   if (last === undefined) return null;
   for (let i = beats.length - 1; i >= 0; i--) {
     const b = beats[i];
-    if (b.turn !== last.turn || b.chars !== 0 || b.writingTool !== undefined) return null;
+    if (b.turn !== last.turn || producedOutput(b)) return null;
     if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars };
   }
   return null;
