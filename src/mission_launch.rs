@@ -339,6 +339,15 @@ pub(crate) fn run_bookend_record(
 
 
 
+/// The gate-less finish's `run.complete`/`run.error` payload: whether the run
+/// did what it was launched to do, and its outcome status as it renders. The
+/// lifecycle rule reads a `run.complete` whose status is
+/// [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row reads its
+/// `Degraded` envelope, so the spelling here is that constant's.
+fn run_close_payload(status: crew::envelope::MissionOutcomeStatus, ok: bool) -> RunPayload {
+    RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(ok) }
+}
+
 /// (#3087 review) Close the run's open bookend with `run.error` carrying the
 /// launch's own error text, so a post-mint refusal reads as what it was
 /// rather than as the Drop backstop's "terminated before completion".
@@ -1862,7 +1871,7 @@ pub fn launch(
             if exit_code == 0 { flow::Edge::Complete } else { flow::Edge::Error },
             config_id,
             &run,
-            RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(exit_code == 0) },
+            run_close_payload(status, exit_code == 0),
         ),
     );
     // (#2131) A no-op unless a signal was actually observed.
@@ -9114,6 +9123,18 @@ mod tests {
             // The action names the grain; nothing else has to.
             assert_eq!(rec.source, None);
         }
+    }
+
+    /// A run cut off by its own wall-clock bound closes `run.complete` with its
+    /// `Degraded` status; the lifecycle rule (both executors) reads that
+    /// spelling as degraded, as the run's row reads its envelope. A clean run
+    /// does not.
+    #[test]
+    fn a_degraded_runs_close_payload_reads_degraded() {
+        use crew::envelope::MissionOutcomeStatus as S;
+        assert!(run_close_payload(S::Degraded, true).is_degraded());
+        assert!(!run_close_payload(S::Clean, true).is_degraded());
+        assert!(!run_close_payload(S::Error, false).is_degraded());
     }
 
     // ── #1877 QA must-fix 3 — the coder branch's terminal bookend must ──

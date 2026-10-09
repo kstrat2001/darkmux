@@ -223,18 +223,28 @@ its own: every entry below labeled 5.0 ships together.
   no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
   the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
   an endpoint's host split the URL with one parser.
-- **A run's status reads the same on every view** (operator, 2026-10-07). A lab run stopped
-  with SIGTERM read "aborted" on the runs board and "error" on its run page and its fleet
-  timeline bar: the board reads the lab run's own record, and the other two re-derived the
-  status from the execution's flow terminal, which said only `result_class: error`. Now an
-  execution's `dispatch.error` written after darkmux caught a signal names it
-  (`stop_reason`, flow schema 2.1.0, additive), and the daemon and the viewer read such a
-  terminal as aborted. A run page and a timeline bar for a run the runs board lists (a lab
-  run, a dispatch) show that row's status, at the live edge and once the run has ended in
-  playback, rather than deriving one. A terminal written before this names no stop and,
-  without a row, still reads as an error. The status colors are one table: a running bar is
-  now the running chip's teal rather than amber, and degraded and escalated bars take the
-  warn color their chips already had.
+- **A run's status is decided once and reads the same on every view** (operator,
+  2026-10-07). A lab run stopped with SIGTERM read "aborted" on the runs board and "error"
+  on its run page and its fleet timeline bar: the board reads the lab run's own record, and
+  the other two re-derived the status from the execution's flow terminal, which said only
+  `result_class: error`. A `darkmux dispatch` or a `mission launch` stopped the same way read
+  "error" everywhere. Now an operator's stop is decided once, where the run ends
+  (`interrupt::stop_reason`), and named on every record of that ending: the execution's
+  `dispatch.error` and the run's `run.error` carry `stop_reason` (flow schema 2.1.0,
+  additive), the mission envelope carries it (envelope schema 1.6, additive), and the lab
+  run's record reads the same decider. The runs board, `darkmux run list`, the run page and
+  the timeline bar all read such a run as aborted, for every run kind, with the row and from
+  the flow alone (a peer's run). A run's own wall-clock bound is never named as a stop: it
+  reads degraded, and the execution it cut reads as the error it was. A `run.complete` whose
+  status is `Degraded` reads degraded in the daemon and the viewer, as the run's row does.
+  A run page and a timeline bar show the status of the board's row for that run (a lab run,
+  a dispatch, and a mission's own run session), at the live edge and once the run has ended
+  in playback; the page's tiles state that shown ending (an ABORTED run no longer says
+  "errored" under its time), and a page whose run has just closed asks the daemon for its row
+  at once rather than reading "running" until the next poll. A terminal written before this
+  names no stop and, without a row, still reads as an error. The status colors are one
+  table: a running bar is now the running chip's teal rather than amber, and degraded and
+  escalated bars take the warn color their chips already had.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record

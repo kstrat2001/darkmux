@@ -931,7 +931,7 @@ impl FlowMissionAgg {
         ) {
             return;
         }
-        let Some(ending) = crate::run_lifecycle::ending_of(&action, false) else { return };
+        let Some(ending) = crate::run_lifecycle::ending_of_record(v) else { return };
         let bookend_terminal = matches!(action, FlowAction::RunComplete | FlowAction::RunError);
         self.close.fold(ts, ending, bookend_terminal);
         self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
@@ -1482,7 +1482,7 @@ fn mission_to_run(
     // reads it directly rather than re-deriving the same decision from
     // `status` (which can no longer tell the two apart once collapsed).
     let abandoned_reason = if status == RunStatus::Abandoned {
-        Some(if mission.status == MissionStatus::Aborted { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+        Some(if mission_stopped_by_operator(mission) { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
     } else {
         None
     };
@@ -1732,6 +1732,21 @@ fn mission_run_status_and_evidence(
     }
 }
 
+/// Whether an operator tore the mission down: `mission abort`
+/// (`MissionStatus::Aborted`), or a run that ended on the operator's stop
+/// (its envelope names it). The two arms of [`mission_run_status_and_evidence`]
+/// that read `Abandoned` for a deliberate teardown; every other `Abandoned`
+/// means no ending was recorded.
+fn mission_stopped_by_operator(mission: &Mission) -> bool {
+    match mission.status {
+        MissionStatus::Aborted => true,
+        MissionStatus::Finalized => {
+            matches!(darkmux_crew::lifecycle::load_envelope(&mission.id), Ok(Some(e)) if e.stop_reason.is_some())
+        }
+        MissionStatus::Active | MissionStatus::Unknown => false,
+    }
+}
+
 /// The `Finalized`-arm half of [`mission_run_status_and_evidence`], split
 /// out only so that function's `match` can wrap this whole arm's result in
 /// `(_, None)` without repeating the inner match's own arms three times.
@@ -1804,6 +1819,12 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
                     RunStatus::Abandoned
                 }
             }
+            // The run ended on the operator's stop, recorded where it ended
+            // (`finalize_mission_with_payload`, from the one decider its
+            // `run.error` and `dispatch.error` name it from): the operator
+            // tore it down, so it reads as the flow's lifecycle rule reads
+            // those terminals, never as the error the envelope's status says.
+            Ok(Some(envelope)) if envelope.stop_reason.is_some() => RunStatus::Abandoned,
             Ok(Some(envelope)) => {
                 // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
                 // `RunOutcome::Partial` is NOT read here: `status` already
@@ -8719,6 +8740,73 @@ mod tests {
             Some(AbandonReason::Aborted),
             "a `mission abort` record must carry the Aborted reason on the wire, not just the collapsed status"
         );
+    }
+
+    /// The operator's rule (2026-10-07): a run's status is decided once, and
+    /// every view renders it. A run's row and its flow terminal must name the
+    /// same ending. A mission or a `darkmux dispatch` stopped with SIGTERM
+    /// finalizes an `Error` envelope that names the stop (the same decider
+    /// its `run.error` and `dispatch.error` name it from): its row reads
+    /// abandoned/aborted, never error, as a lab run stopped the same way does.
+    /// An `Error` envelope naming no stop still reads error.
+    #[test]
+    #[serial_test::serial]
+    fn a_finalized_run_the_operator_stopped_reads_aborted_for_a_mission_and_a_dispatch() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let finalize = |id: &str, config: &str, stop: Option<&str>| {
+            let m = minimal_mission(id, vec![], Some(MissionSpec { config_id: config.to_string(), inputs_fingerprint: "fp".to_string(), origin: None }));
+            darkmux_crew::lifecycle::save_mission(&m).unwrap();
+            let env = MissionEnvelope { stop_reason: stop.map(str::to_string), ..MissionEnvelope::new(id, MissionOutcomeStatus::Error, &[]) };
+            darkmux_crew::envelope::finalize_mission(&env);
+        };
+        finalize("m-stopped", "review", Some("SIGTERM"));
+        finalize("d-stopped", "dispatch", Some("SIGTERM"));
+        finalize("m-failed", "review", None);
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row {id}"));
+        assert_eq!(row("d-stopped").kind, RunKind::Dispatch);
+        for id in ["m-stopped", "d-stopped"] {
+            assert_eq!((row(id).status, row(id).abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::Aborted)), "{id}");
+        }
+        assert_eq!((row("m-failed").status, row("m-failed").abandoned_reason), (RunStatus::Error, None));
+    }
+
+    /// The same decision read from the flow alone (a peer's mission): a
+    /// `run.error` naming the operator's stop is abandoned/aborted, and a
+    /// `run.complete` whose status is `Degraded` (the run's own wall-clock
+    /// bound) is degraded, as the owning machine's row reads them.
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_runs_terminal_reads_as_its_owner_decided_it() {
+        for (action, payload, want) in [
+            ("run.error", serde_json::json!({"result_class": "error", "stop_reason": "SIGTERM"}), (RunStatus::Abandoned, Some(AbandonReason::Aborted))),
+            ("run.error", serde_json::json!({"result_class": "error"}), (RunStatus::Error, None)),
+            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Degraded"}), (RunStatus::Degraded, None)),
+            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Clean"}), (RunStatus::Complete, None)),
+        ] {
+            let _g = CrewGuard::new();
+            let flows = TempDir::new().unwrap();
+            let run_rec = |action: &str, payload: serde_json::Value| {
+                serde_json::json!({
+                    "ts": darkmux_flow::ts_utc_now(),
+                    "level": "info",
+                    "category": "work",
+                    "stage": "dispatch",
+                    "action": action,
+                    "handle": "review",
+                    "session_id": "review-on-the-hub.run",
+                    "mission_id": "review-on-the-hub",
+                    "machine_id": "m1-max-32gb-studio",
+                    "machine_uid": "PEER-UID-1",
+                    "payload": payload,
+                })
+            };
+            let fleet = vec![run_rec("run.start", serde_json::json!({})), run_rec(action, payload.clone())];
+            let runs = build_runs(flows.path(), None, &fleet);
+            let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+            assert_eq!((row.status, row.abandoned_reason), want, "{action} {payload}");
+        }
     }
 
     /// #3089: at the mission grain an abort ranks first. A `mission.abort`

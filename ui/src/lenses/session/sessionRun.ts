@@ -749,7 +749,7 @@ function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; activeE
     runWallMs,
     activeElapsed: ctx.done && activeMs !== null ? fmtElapsed(activeMs) : wallElapsed,
     wallBase: ctx.done ? wallElapsed : `${wallElapsed} so far`,
-    wallSub: errorOutcome(ctx.l?.close?.edge),
+    wallSub: errorOutcome(ctx.state, ctx.l?.close?.edge),
   };
 }
 
@@ -1542,9 +1542,14 @@ function toolExtras(r: LiveStateReading): Partial<LiveTokScope> {
   };
 }
 
-/** How an errored run ended, for the run-time tile's sub line. */
-function errorOutcome(edge: CloseEdge | undefined): string | undefined {
-  if (edge?.kind !== "error") return undefined;
+/** How an errored run ended, for the run-time tile's sub line: only when the
+ *  run shows as errored (`state`, the one shown state the pill reads), with
+ *  the flow close's detail (killed, the exit code) when that close is the
+ *  error. A run whose row decided another ending (an operator's stop the flow
+ *  terminal did not name) never says "errored" under an ABORTED pill. */
+function errorOutcome(state: RunState, edge: CloseEdge | undefined): string | undefined {
+  if (state.status !== "error") return undefined;
+  if (edge?.kind !== "error") return "errored";
   if (edge.killed) return "killed (timeout)";
   return `errored${edge.exitCode != null ? ` (exit ${edge.exitCode})` : ""}`;
 }

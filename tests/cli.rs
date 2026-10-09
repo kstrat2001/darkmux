@@ -4570,6 +4570,23 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         saw_a_phase = true;
     }
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
+
+    // The operator's rule (2026-10-07): a run's status is decided once, where
+    // it ends, and every view renders it. The SIGTERM is named on the
+    // envelope (the row's source), the run's `run.error` and its execution's
+    // `dispatch.error` (what a view with only the flow reads), and the row
+    // reads aborted, the word a dispatch or lab run stopped the same way
+    // reads. Before, the run read "error" on every view.
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["stop_reason"], "SIGTERM", "{envelope}");
+    let records = flow_actions(&flows);
+    assert_eq!(stops_named(&records, "run.error"), [serde_json::json!("SIGTERM")], "the run's own terminal names the stop");
+    let execution_stops = stops_named(&records, "dispatch.error");
+    assert!(!execution_stops.is_empty() && execution_stops.iter().all(|s| s == "SIGTERM"), "{execution_stops:?}");
+    let row = run_list_row(&home, &flows, &mission_id);
+    assert_eq!((&row["status"], &row["abandoned_reason"]), (&serde_json::json!("abandoned"), &serde_json::json!("aborted")), "{row}");
+    assert_eq!(row["dispatch_id"], format!("{mission_id}.run"), "a mission row names its own run session: {row}");
 }
 
 /// Spawns `mission launch` on a one-step hanging-dispatch graph with
@@ -4737,7 +4754,7 @@ fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
     const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
     const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
     let started = std::time::Instant::now();
-    let (stub, _home, flows, mut child) = spawn_wall_clock_launch(&BOUND.as_secs().to_string());
+    let (stub, home, flows, mut child) = spawn_wall_clock_launch(&BOUND.as_secs().to_string());
 
     assert!(
         stub.wait_for_a_connection((BOUND - MARGIN).saturating_sub(started.elapsed())),
@@ -4776,6 +4793,18 @@ fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
     assert_eq!(closes.len(), 1, "exactly one terminal run record: {closes:#?}");
     assert_eq!(closes[0]["action"], "run.complete", "{closes:#?}");
     assert_eq!(closes[0]["payload"]["status"], "Degraded", "{closes:#?}");
+
+    // The bound is not the operator's stop ("aborted" means a human tore it
+    // down, #2462): the execution the bound cut names none, so it reads as
+    // the error it was, never aborted; and the run reads degraded on its row
+    // as its `run.complete` says.
+    let execution_stops = stops_named(&records, "dispatch.error");
+    assert!(!execution_stops.is_empty(), "the bound cut the execution mid-dispatch: {records:#?}");
+    assert!(execution_stops.iter().all(serde_json::Value::is_null), "the bound named as a stop: {execution_stops:?}");
+    let mission_id = closes[0]["mission_id"].as_str().unwrap().to_string();
+    let row = run_list_row(&home, &flows, &mission_id);
+    assert_eq!(row["status"], "degraded", "{row}");
+    assert_eq!(row["dispatch_id"], format!("{mission_id}.run"), "a mission row names its own run session: {row}");
 }
 
 /// (#2262) `kill <pid>` (SIGTERM) on a plain `darkmux dispatch <role>`
@@ -4948,6 +4977,18 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         !stderr_text.contains("curl exit -1"),
         "stderr must not blame the endpoint for darkmux killing its own child: {stderr_text:?}"
     );
+
+    // The operator's rule (2026-10-07): a run's status is decided once and
+    // every view renders it. The execution's `dispatch.error` (what a view
+    // with only the flow reads) and the envelope (the row's source) name the
+    // same stop, so the row reads aborted as the flow does. Before, the row
+    // read "error" while the flow read "aborted": the run page and timeline
+    // bar answered differently with the row and without it.
+    assert_eq!(envelope_json["stop_reason"], "SIGTERM", "{envelope_json}");
+    assert_eq!(stops_named(&flow_actions(&flows), "dispatch.error"), [serde_json::json!("SIGTERM")]);
+    let row = run_list_row(&home, &flows, &mission_id);
+    assert_eq!(row["kind"], "dispatch", "{row}");
+    assert_eq!((&row["status"], &row["abandoned_reason"]), (&serde_json::json!("abandoned"), &serde_json::json!("aborted")), "{row}");
 }
 
 /// (#2262) `kill <pid>` (SIGTERM) on `darkmux lab run <workload>` blocked
@@ -5116,6 +5157,13 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
         !stderr_text.contains("curl exit -1"),
         "stderr must not blame the endpoint for darkmux killing its own child: {stderr_text:?}"
     );
+
+    // The operator's rule (2026-10-07): the lab record (the row's source) and
+    // the execution's flow terminal name the same stop, so the row and a view
+    // with only the flow both read aborted.
+    assert_eq!(stops_named(&flow_actions(&flows), "dispatch.error"), [serde_json::json!("SIGTERM")]);
+    let row = run_list_row(&home, &flows, &run_id);
+    assert_eq!((&row["status"], &row["abandoned_reason"]), (&serde_json::json!("abandoned"), &serde_json::json!("aborted")), "{row}");
 }
 
 /// (#2463) `kill <pid>` (SIGTERM) on `darkmux radio "<text>"` blocked
@@ -9748,6 +9796,32 @@ fn flow_actions(flows: &TempDir) -> Vec<serde_json::Value> {
     out
 }
 
+/// The run's row as `darkmux run list --json` (and the runs board, the same
+/// `build_runs`) states it, over the run's own darkmux root and flows.
+fn run_list_row(home: &TempDir, flows: &TempDir, id: &str) -> serde_json::Value {
+    let out = darkmux_cmd()
+        .args(["run", "list", "--json", "--all"])
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env_remove("DARKMUX_REDIS_URL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run list --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["runs"]
+        .as_array()
+        .expect("run list --json always emits a runs array")
+        .iter()
+        .find(|r| r["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no run list row for {id}: {json}"))
+}
+
+/// The `stop_reason` each `action` record names (`Null` where none).
+fn stops_named(records: &[serde_json::Value], action: &str) -> Vec<serde_json::Value> {
+    records.iter().filter(|r| r["action"] == action).map(|r| r["payload"]["stop_reason"].clone()).collect()
+}
+
 #[test]
 fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
     let (home, flows, plan_path) = grow_fixture(
@@ -12237,8 +12311,8 @@ fn mission_launch_records_the_run_wall_clock_in_the_envelope() {
 
     assert_eq!(
         envelope.get("schema_version").and_then(|v| v.as_str()),
-        Some("1.5"),
-        "adding wall_ms is an additive field ⇒ minor bump: {envelope}"
+        Some("1.6"),
+        "the envelope's current schema (1.5 added wall_ms, 1.6 stop_reason; each additive ⇒ minor): {envelope}"
     );
 }
 

@@ -171,7 +171,7 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const widthPct = Math.max(0.6, w.pct(end) - w.pct(cst));
   const leftPct = Math.max(0, Math.min(w.pct(cst), 100 - widthPct)); // never spill past the right edge
   const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
-  const state = shownRunState(l, ownRowOf(w.rows, g.sessionId, g.missionId), w.live);
+  const state = shownRunState(l, ownRowOf(w.rows, g.sessionId, g.missionId, g.grain), w.live);
   const silent = state.status === "running" && (w.notReporting.has(g.sessionId) || (g.missionId !== null && w.notReporting.has(g.missionId)));
   const status: RunBadgeStatus = silent ? NOT_REPORTING_STATUS : state.status;
   const word = runStatusWord(status, state.abandonReason);

@@ -100,7 +100,7 @@ pub enum LifecycleStatus {
     /// The process exited without finishing the run — `Drop` fired on an
     /// early return, a `?`, or an unwinding panic — OR the run's own error
     /// path explicitly detected that a caught SIGINT/SIGTERM/SIGHUP was the
-    /// cause (`darkmux_types::interrupt::is_set()`) and called
+    /// cause (`darkmux_types::interrupt::stop_reason()`) and called
     /// [`RunLifecycle::finish_interrupted`] rather than
     /// [`RunLifecycle::finish_error`] (#2462). The two entry paths share
     /// this one status deliberately: both mean "did not finish on its
@@ -305,7 +305,7 @@ impl RunLifecycle {
     /// container, or the hosted `curl`) — the `Err` this run's dispatch
     /// returned is real, but its CAUSE was the operator's own signal, not
     /// the endpoint or the model. Callers decide when this applies by
-    /// checking `darkmux_types::interrupt::is_set()` themselves; this
+    /// checking `darkmux_types::interrupt::stop_reason()` themselves; this
     /// method just records the distinction once they have. Recording
     /// `Error` here would archive an operator's Ctrl-C as "the endpoint
     /// broke" — exactly the misattribution #2462 is about.

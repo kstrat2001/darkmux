@@ -806,6 +806,40 @@ describe("SessionReplay", () => {
     const pill = () => document.querySelector(".session-run__header .pill");
     await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
     expect(pill()).toHaveAttribute("data-status-kind", "stopped");
+    // Every tile and sub-line states the shown ending, never the flow's own
+    // close: the ACTIVE TIME tile said "errored" under the ABORTED pill.
+    expect(activeSub()).not.toMatch(/errored|killed/);
+  });
+
+  // At the live edge the row lags the flow by up to one `/runs` poll
+  // (`PRESENCE_POLL_MS`): the run's terminal is in, its row still says
+  // running. The page asks the daemon again as the run closes instead of
+  // showing "running" for the rest of the poll, and never shows an ending of
+  // its own: the ending is the row's.
+  it("a run whose terminal arrives before its row asks the daemon again, not after a poll", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "m-9.run";
+    const records = [
+      { ts: at(60_000), action: "run.start", session_id: sid, mission_id: "m-9", machine_id: "M", handle: "review", payload: {} },
+      { ts: at(1_000), action: "run.error", session_id: sid, mission_id: "m-9", machine_id: "M", handle: "review", payload: { result_class: "error", stop_reason: "SIGTERM" } },
+    ];
+    const rowOf = (status: string, extra: Record<string, unknown> = {}) => ({ id: "m-9", kind: "mission", status, tracked: true, receive_key: 0, dispatch_id: sid, ...extra });
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (!String(url).includes("/runs")) return Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }));
+        runsCalls += 1;
+        const runs = [runsCalls === 1 ? rowOf("running") : rowOf("abandoned", { abandoned_reason: "aborted" })];
+        return Promise.resolve(new Response(JSON.stringify({ runs }), { status: 200 }));
+      }),
+    );
+    renderReplay(sid);
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(runsCalls).toBeGreaterThan(0));
+    // Well inside one poll interval (`waitFor`'s 1s default against a 5s poll).
+    await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
+    expect(runsCalls).toBe(2);
   });
 
   // (5.0 R3) A run recorded as running on a peer that is down has no live

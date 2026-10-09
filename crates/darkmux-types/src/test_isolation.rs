@@ -1127,6 +1127,7 @@ mod tests {
         "reap_dispatch_children_on_shutdown(",
         "reap_on_host_shutdown(",
         "mark_bound_fired(",
+        "mark_bound_exceeded(",
         " arm();",
         "launch_guard::arm();",
         "= arm();",

@@ -3978,8 +3978,9 @@ mod tests {
         //            planned, so the record does not close its session.
         //   2.2.0 — (#3124) additive: `mission.start.payload.config_id`, so
         //            a flow-only run reads the same kind on every machine.
-        //            Also additive: `dispatch.error.payload.stop_reason`, the
-        //            operator's stop that ended the execution.
+        //            Also additive: `dispatch.error.payload.stop_reason` and
+        //            `run.error.payload.stop_reason`, the operator's stop that
+        //            ended the execution or the run.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

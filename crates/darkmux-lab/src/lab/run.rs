@@ -344,7 +344,10 @@ impl OneRun<'_> {
         .and_then(|r| r);
         match result {
             Ok(r) => Ok(ProviderRun::Completed(Box::new((r, lifecycle)))),
-            Err(e) if darkmux_types::interrupt::is_set() => {
+            // The operator's stop, by the one decider every record of a
+            // run's ending names it from (never the run's own bound), so this
+            // record and the run's flow terminal read the same ending.
+            Err(e) if darkmux_types::interrupt::stop_reason().is_some() => {
                 lifecycle.finish_interrupted(&e);
                 Err(e)
             }

@@ -7,7 +7,7 @@ import { LampForm } from "../../lib/lamp";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
@@ -501,6 +501,21 @@ function useRunSilence(hasRecords: boolean, row: Run | null, endedByPresence: bo
   return { notReporting, stopped: endedByPresence || (hasRecords && notReporting) };
 }
 
+/** At the live edge, a run's row (`/runs`, polled every `PRESENCE_POLL_MS`)
+ *  can lag its flow terminal: the run closed, its row still reads in flight.
+ *  The row decides how the run ended, so the page never shows an ending of
+ *  its own; it asks the daemon again as the run closes, once per close,
+ *  rather than reading "running" for the rest of the poll. `closed`: a
+ *  closing record of this run has arrived (not a run gone quiet, which the
+ *  row's own staleness rule decides), at the live edge. */
+function useRowCatchUp(closed: boolean, row: Run | null): void {
+  const queryClient = useQueryClient();
+  const lagging = closed && row !== null && (row.status === "running" || row.status === "planned");
+  useEffect(() => {
+    if (lagging) void queryClient.invalidateQueries({ queryKey: queryKeys.runs() });
+  }, [lagging, queryClient]);
+}
+
 export function SessionReplay({
   sessionId,
   missionId = null,
@@ -629,10 +644,9 @@ export function SessionReplay({
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   // The run's row on the board: a later step of a mission is found by its mission id.
   const runRow = useRunRow(sessionId, ownMissionId, playhead === null);
-  // The row whose run IS this session (a lab run, a dispatch): the pill shows
-  // its status, decided once by the daemon, as the runs board does.
+  // The board's rows: the one whose run IS this session (a lab run, a
+  // dispatch, a mission's own run session) decides its status (`ownRow`, below).
   const runRows = useRunRows(playhead === null);
-  const ownRow = useMemo(() => ownRowOf(runRows, sessionId, ownMissionId), [runRows, sessionId, ownMissionId]);
   const relay = relayOf(runRow);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
@@ -733,12 +747,16 @@ export function SessionReplay({
   const wallNow = Date.now();
   const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
+  // The row whose run IS this session: the pill and the tiles show its
+  // status, decided once where the run ended, as the runs board does.
+  const ownRow = ownRowOf(runRows, sessionId, ownMissionId, pageRun?.group.grain ?? null);
   // (5.0 R3) A run on a machine the fleet view holds as down has no live
   // evidence and no terminal record can arrive: it is not plausibly running,
   // so nothing ticks or pulses, and the pill says unknown.
   const { notReporting, stopped } = useRunSilence(hasRecords, runRow, endedByPresence);
-  const plausiblyRunning =
-    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !stopped;
+  const pageLifecycle = pageRun !== null ? lifecycleAt(pageRun, clockNow, policy, presence) : null;
+  const plausiblyRunning = pageLifecycle !== null && isRunning(pageLifecycle) && !stopped;
+  useRowCatchUp(playhead === null && pageLifecycle?.phase === "closed", ownRow);
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;

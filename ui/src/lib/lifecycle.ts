@@ -47,8 +47,9 @@
  *    it has one (a `session.end` that lands first does not erase a clean
  *    `run.complete` or `dispatch.complete`), else from the closing record
  *    itself. A terminal that names the operator's stop (a `budget.stop`'s
- *    `reason`, a `dispatch.error`'s `stop_reason`) is abandoned as aborted,
- *    never an error.
+ *    `reason`, a `dispatch.error`'s or `run.error`'s `stop_reason`) is
+ *    abandoned as aborted, never an error; a `run.complete` whose status is
+ *    `Degraded` is degraded.
  * 4. Waiting. A `budget.wait` with no `budget.resume` or closing record
  *    after it holds the run `waiting` until its announced resume time plus
  *    `budgetWaitGraceMs`; past that the staleness clock runs from there.
@@ -65,7 +66,7 @@
 
 import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, isExecutionAction, endPayloadOf, latestByTime, payloadOf, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
-import type { RunGroup, RunRecords } from "./runRef";
+import type { Grain, RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
 import type { Run } from "../types/generated/Run";
 
@@ -82,9 +83,14 @@ export type CloseEdge =
    *  abandoned phase). */
   | { readonly kind: "budget_stop"; readonly byOperator: boolean }
   | { readonly kind: "mission_abort" }
-  /** An execution the operator stopped: its `dispatch.error` names the stop
-   *  (`stop_reason`: a caught signal). Not a failure. */
-  | { readonly kind: "operator_stop" };
+  /** A run or an execution the operator stopped: its `run.error` or
+   *  `dispatch.error` names the stop (`stop_reason`: a caught signal, never
+   *  the run's own wall-clock bound). Not a failure. */
+  | { readonly kind: "operator_stop" }
+  /** A run that completed, but not cleanly: its `run.complete` says
+   *  `status: "Degraded"` (its own wall-clock bound, a degraded step), as its
+   *  row does. */
+  | { readonly kind: "degraded" };
 
 export interface LifecyclePolicy {
   /** How long an open run may go silent before it reads as stopped. The
@@ -210,25 +216,30 @@ const hasReason = (r: NormRecord): boolean => {
   return typeof reason === "string" && reason.length > 0;
 };
 
-/** Whether an execution's error terminal names the operator's stop. */
+/** Whether a run's or an execution's error terminal names the operator's
+ *  stop. */
 const namesAStop = (r: NormRecord): boolean => {
-  const reason = payloadOf(r, ACTION.DispatchError)?.stop_reason;
+  const reason = (payloadOf(r, ACTION.DispatchError) ?? payloadOf(r, ACTION.RunError))?.stop_reason;
   return typeof reason === "string" && reason.length > 0;
 };
+
+/** The `status` a run's `run.complete` carries when it completed degraded
+ *  (`RunPayload::DEGRADED_STATUS`). */
+const DEGRADED_STATUS = "Degraded";
 
 /** The edge a closing record implies; `null` for any other record. */
 function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
     case ACTION.RunComplete:
+      return payloadOf(r, ACTION.RunComplete)?.status === DEGRADED_STATUS ? { kind: "degraded" } : { kind: "complete" };
     case ACTION.DispatchComplete:
     case ACTION.MissionClose:
       return { kind: "complete" };
     case ACTION.StepComplete:
       return payloadOf(r, ACTION.StepComplete)?.later_step_planned === true ? null : { kind: "complete" };
     case ACTION.DispatchError:
-      if (namesAStop(r)) return { kind: "operator_stop" };
-      return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
     case ACTION.RunError:
+      if (namesAStop(r)) return { kind: "operator_stop" };
       return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
     case ACTION.StepError:
       return { kind: "error", killed: false, exitCode: null };
@@ -459,6 +470,8 @@ function closedState(edge: CloseEdge): RunState {
   switch (edge.kind) {
     case "complete":
       return { status: "complete" };
+    case "degraded":
+      return { status: "degraded" };
     case "error":
       return { status: "error" };
     case "session_end":
@@ -486,14 +499,23 @@ export function toRunState(l: Lifecycle): RunState {
   }
 }
 
-/** The `/runs` row whose run IS this session's: a lab run or a dispatch, each
- *  one role execution, its session named by `dispatch_id`. A mission's row is
- *  never one: the session it names is one of its executions, whose status is
- *  that execution's, not the mission's. `missionId`: the mission the session's
- *  records name, which a dispatch row's id must be (or the session itself, for
- *  a dispatch the daemon read from the flow alone). */
-export function ownRowOf(rows: readonly Run[], sessionId: string, missionId: string | null): Run | null {
-  return rows.find((r) => r.kind !== "mission" && r.dispatch_id === sessionId && (missionId === null || r.id === missionId || r.id === sessionId)) ?? null;
+/** The `/runs` row whose run IS this session's, matched by `dispatch_id`:
+ *  - a lab run's or a dispatch's (one role execution each): the row names the
+ *    execution's session, and its id is the mission the session's records
+ *    name (`missionId`), or the session itself for a dispatch the daemon read
+ *    from the flow alone;
+ *  - a mission's: the row names the mission's own run session (`<M>.run`,
+ *    `grain` `run`) and its id is `missionId`. A mission row that names an
+ *    execution's session (its run session outside the daemon's window, or a
+ *    mission from before runs had one) is never that execution's: the
+ *    execution's status is its own, not the mission's. */
+export function ownRowOf(rows: readonly Run[], sessionId: string, missionId: string | null, grain: Grain | null): Run | null {
+  return rows.find((r) => r.dispatch_id === sessionId && rowIsTheSessions(r, sessionId, missionId, grain)) ?? null;
+}
+
+function rowIsTheSessions(r: Run, sessionId: string, missionId: string | null, grain: Grain | null): boolean {
+  if (r.kind === "mission") return grain === "run" && r.id === missionId;
+  return missionId === null || r.id === missionId || r.id === sessionId;
 }
 
 /** The run's state as every view shows it. The operator (2026-10-07): "the

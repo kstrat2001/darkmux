@@ -62,6 +62,11 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// (#3073-P3-1) The last OS signal received, or 0 if none.
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Whether the run's own wall-clock bound raised [`INTERRUPTED`] (no signal
+/// had landed before it): see [`mark_bound_exceeded`]. Never resets in
+/// production, like [`INTERRUPTED`].
+static BOUND_EXCEEDED: AtomicBool = AtomicBool::new(false);
+
 /// How many SIGINTs this process has received since [`install`]. Exists
 /// purely to drive the second-signal escape hatch below — nothing reads
 /// the count itself.
@@ -196,12 +201,19 @@ pub fn received_signal() -> Option<i32> {
     }
 }
 
-/// The operator's stop, as a terminal record names it: the signal that set the
-/// flag (`SIGINT`, `SIGTERM`, `SIGHUP`), or `interrupted` when it was raised
-/// without one ([`mark_interrupted`]: a long-lived host's own shutdown, or a
-/// run's wall-clock bound). `None` while nothing has stopped this process.
+/// The operator's stop, as every record of a run's ending names it: the
+/// signal that set the flag (`SIGINT`, `SIGTERM`, `SIGHUP`), or `interrupted`
+/// when a long-lived host raised it on its own shutdown ([`mark_interrupted`]).
+/// `None` while nothing has stopped this process, and `None` when the run's
+/// own wall-clock bound raised the flag ([`mark_bound_exceeded`]): a bound is
+/// not an operator's stop ("aborted" means a human tore the run down, #2462).
+///
+/// The ONE decider of "the operator stopped this": an execution's
+/// `dispatch.error`, a run's `run.error`, a mission's envelope and a lab run's
+/// record each name the stop from it when the ending they record is not clean,
+/// so the run's row and the flow's lifecycle rule read the same ending.
 pub fn stop_reason() -> Option<&'static str> {
-    if !is_set() {
+    if !is_set() || bound_exceeded() {
         return None;
     }
     Some(match received_signal() {
@@ -243,6 +255,32 @@ pub fn stop_reason() -> Option<&'static str> {
 /// the two production call sites.
 pub fn mark_interrupted() {
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// (#2678, #3074) The run's own wall-clock bound fired: raise the flag the way
+/// [`mark_interrupted`] does, so the run winds down through the same graceful
+/// abort a signal drives, and record the bound as the cause UNLESS a signal
+/// already landed (a Ctrl-C followed by the bound firing during wind-down is
+/// the operator's stop). [`bound_exceeded`] reads the cause; [`stop_reason`]
+/// names no stop for it.
+pub fn mark_bound_exceeded() {
+    if !is_set() {
+        BOUND_EXCEEDED.store(true, Ordering::SeqCst);
+    }
+    mark_interrupted();
+}
+
+/// Whether the run's own wall-clock bound, not an operator, raised the flag
+/// ([`mark_bound_exceeded`]).
+pub fn bound_exceeded() -> bool {
+    BOUND_EXCEEDED.load(Ordering::SeqCst)
+}
+
+/// Test-only: set or clear [`bound_exceeded`] without raising the flag, for a
+/// test that exercises "the bound already fired" without a watchdog thread.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_bound_exceeded_for_test(exceeded: bool) {
+    BOUND_EXCEEDED.store(exceeded, Ordering::SeqCst);
 }
 
 /// Test-only: deliver a simulated SIGINT without installing a real signal
@@ -307,6 +345,7 @@ pub fn simulate_sighup_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     INTERRUPTED.store(false, Ordering::SeqCst);
+    BOUND_EXCEEDED.store(false, Ordering::SeqCst);
     LAST_SIGNAL.store(0, Ordering::SeqCst);
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
