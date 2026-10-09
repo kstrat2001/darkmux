@@ -1015,7 +1015,16 @@ pub(crate) fn read_reply_lines(
     };
     let mut last: Option<SubmissionReply> = None;
     for line in std::io::BufReader::new(body).lines() {
-        let line = line.map_err(|e| AnswerLost { detail: format!("the answer from {where_} broke off: {e}") })?;
+        let line = match line {
+            Ok(line) => line,
+            // (#3130) The final answer already arrived whole (only a `queued`
+            // line may be followed by another), so a failing read after it is
+            // the connection's cleanup, not the answer: ureq clears the
+            // socket's timeouts after the last byte, which macOS refuses with
+            // EINVAL once the peer has reset the connection.
+            Err(_) if last.as_ref().is_some_and(|r| r.status != ReplyStatus::Queued) => break,
+            Err(e) => return Err(AnswerLost { detail: format!("the answer from {where_} broke off: {e}") }.into()),
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -2449,5 +2458,37 @@ mod tests {
         let newer = read_reply_lines("x", 200, "{\"status\":\"deferred\"}\n".as_bytes(), &mut |_| {}).unwrap_err();
         assert!(newer.downcast_ref::<AnswerLost>().is_some(), "{newer}");
         assert!(newer.to_string().contains("unknown reply status `deferred` from x (a newer darkmux?)"), "{newer}");
+    }
+
+    /// (#3130) A body whose bytes all arrive, followed by a read error.
+    struct ThenFails(std::io::Cursor<&'static str>);
+    impl std::io::Read for ThenFails {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::from_raw_os_error(22)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// (#3130) After the last byte of a reply, ureq clears the socket's
+    /// timeouts with `setsockopt`; on macOS that fails with EINVAL when the
+    /// peer has reset the connection, so a complete 401 read as "broke off".
+    /// A complete final line is the answer, whatever the read after it says.
+    /// A line that is incomplete, or only `queued`, is still an answer lost.
+    #[test]
+    fn a_read_error_after_the_final_reply_line_keeps_the_answer() {
+        let refused = ThenFails(std::io::Cursor::new("{\"status\":\"refused\",\"reason\":\"wrong token\"}\n"));
+        let (code, r) = read_reply_lines("x", 401, refused, &mut |_| {}).unwrap();
+        assert_eq!((code, r.status), (401, ReplyStatus::Refused));
+        assert_eq!(r.reason.as_deref(), Some("wrong token"));
+
+        let queued_only = ThenFails(std::io::Cursor::new("{\"status\":\"queued\",\"reason\":\"busy\"}\n"));
+        let e = read_reply_lines("x", 200, queued_only, &mut |_| {}).unwrap_err();
+        assert!(e.downcast_ref::<AnswerLost>().is_some() && e.to_string().contains("broke off"), "{e}");
+
+        let cut = ThenFails(std::io::Cursor::new("{\"status\":\"refused\""));
+        let e = read_reply_lines("x", 401, cut, &mut |_| {}).unwrap_err();
+        assert!(e.downcast_ref::<AnswerLost>().is_some() && e.to_string().contains("broke off"), "{e}");
     }
 }
