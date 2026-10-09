@@ -1968,22 +1968,26 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
     if !loaded.registry.endpoints.is_empty() {
         println!("\n{}", darkmux_types::style::accent("endpoints"));
         for (id, ep) in &loaded.registry.endpoints {
-            let what = match ep.kind() {
-                Ok(darkmux_types::EndpointKind::Managed(_)) => "managed (lmstudio)".to_string(),
-                // (5.0) A remote console viewer is not shown where requests
-                // go: the host is an address whatever it is spelled like.
-                Ok(darkmux_types::EndpointKind::Unmanaged) if darkmux_types::panel_audience::remote() => {
-                    format!("unmanaged @ {}", darkmux_types::panel_audience::WITHHELD)
-                }
-                Ok(darkmux_types::EndpointKind::Unmanaged) => {
-                    format!("unmanaged @ {}", ep.host().unwrap_or_else(|| "?".to_string()))
-                }
-                Err(e) => format!("unusable: {e}"),
-            };
-            println!("  - {id}: {what}");
+            println!("  - {id}: {}", endpoint_label(ep));
         }
     }
     Ok(0)
+}
+
+/// `profile list`'s line for one endpoint: what kind it is and where it is.
+fn endpoint_label(ep: &darkmux_types::ModelEndpoint) -> String {
+    match ep.kind() {
+        Ok(darkmux_types::EndpointKind::Managed(_)) => "managed (lmstudio)".to_string(),
+        // (5.0) A remote console viewer is not shown where requests
+        // go: the host is an address whatever it is spelled like.
+        Ok(darkmux_types::EndpointKind::Unmanaged) if darkmux_types::panel_audience::remote() => {
+            format!("unmanaged @ {}", darkmux_types::panel_audience::WITHHELD)
+        }
+        Ok(darkmux_types::EndpointKind::Unmanaged) => {
+            format!("unmanaged @ {}", ep.host().unwrap_or_else(|| "?".to_string()))
+        }
+        Err(e) => format!("unusable: {e}"),
+    }
 }
 
 /// `profile list`'s `@ …` for one model: its window, or (#2902) its

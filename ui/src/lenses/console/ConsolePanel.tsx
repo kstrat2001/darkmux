@@ -444,7 +444,7 @@ function CliPanelView({
         ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
         exitCode={loadedBody ? loadedBody.exit_code : null}
         stderrTail={loadedBody ? loadedBody.stderr_tail || "" : ""}
-        withheld={loadedBody ? loadedBody.withheld || "" : ""}
+        withheld={withheldNotice(loadedBody)}
         onPanelSwitch={onPanelSwitch}
       />
     </div>
@@ -914,6 +914,72 @@ function PanelBody(props: ComponentProps<typeof PanelBodyBase> & { keptOutput: b
   );
 }
 
+/** A panel's output once the verb has run: stdout, then stderr (or why
+ * there is none), then the withheld notice. */
+function RenderedOutput({
+  ansiText,
+  exitCode,
+  stderrTail,
+  withheld,
+  staleClass,
+  onPanelSwitch,
+}: {
+  ansiText: string;
+  exitCode: number | null;
+  stderrTail: string;
+  withheld: string;
+  staleClass: string;
+  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
+}) {
+  const failed = typeof exitCode !== "number" || exitCode !== 0;
+  const hasStdout = ansiText !== "";
+  const hasStderr = stderrTail !== "";
+  const hasNotice = withheld !== "";
+  const isEmptyCleanOutput = !failed && !hasStdout && !hasStderr && !hasNotice;
+
+  if (isEmptyCleanOutput) return <div className={`panelout${staleClass}`}>no output</div>;
+
+  return (
+    <>
+      {hasStdout && (
+        <pre className={`panelout${staleClass}`}>
+          <AnsiText text={ansiText} onPanelSwitch={onPanelSwitch} />
+        </pre>
+      )}
+      {(hasStderr || failed) && <StderrLine failed={failed} stderrTail={stderrTail} exitCode={exitCode} staleClass={staleClass} />}
+      {hasNotice && <div className={`panelnote${staleClass}`}>{withheld}</div>}
+    </>
+  );
+}
+
+/** A panel's stderr, or why there is none: an error when the verb failed,
+ * a warning when it succeeded and still wrote to stderr. */
+function StderrLine({
+  failed,
+  stderrTail,
+  exitCode,
+  staleClass,
+}: {
+  failed: boolean;
+  stderrTail: string;
+  exitCode: number | null;
+  staleClass: string;
+}) {
+  return <div className={`${failed ? "panelerr" : "panelwarn"}${staleClass}`}>{stderrTail || silentExitText(exitCode)}</div>;
+}
+
+/** The daemon's withheld notice for a loaded body, empty when none. */
+function withheldNotice(body: { withheld?: string | null } | null): string {
+  return body?.withheld ?? "";
+}
+
+/** What a failed panel says when it printed nothing to stderr. */
+function silentExitText(exitCode: number | null): string {
+  return typeof exitCode === "number"
+    ? `command exited with status ${exitCode} and printed nothing to stderr`
+    : "command did not exit cleanly (killed) and printed nothing to stderr";
+}
+
 /** Legacy `renderConsole()`'s body switch (`.panelout`/`.panelerr`,
  * loading > error > loaded > not-yet-run precedence). The loaded branch is
  * the ONLY one using a real `<pre>` element — see `styles.css`'s module doc
@@ -987,7 +1053,7 @@ function PanelBodyBase({
   ansiText,
   exitCode,
   stderrTail,
-  withheld = "",
+  withheld,
   onPanelSwitch,
 }: {
   loading: boolean;
@@ -996,39 +1062,22 @@ function PanelBodyBase({
   ansiText: string | null;
   exitCode: number | null;
   stderrTail: string;
-  withheld?: string;
+  withheld: string;
   onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
 }) {
   const staleClass = stale ? " pc-body-stale" : "";
   if (loading) return <div className="panelout">running…</div>;
   if (errorMessage) return <div className={`panelerr${staleClass}`}>{errorMessage}</div>;
   if (ansiText !== null) {
-    const failed = typeof exitCode !== "number" || exitCode !== 0;
-    const hasStdout = ansiText !== "";
-    const hasStderr = stderrTail !== "";
-    const hasNotice = withheld !== "";
-    const isEmptyCleanOutput = !failed && !hasStdout && !hasStderr && !hasNotice;
-
-    if (isEmptyCleanOutput) return <div className={`panelout${staleClass}`}>no output</div>;
-
     return (
-      <>
-        {hasStdout && (
-          <pre className={`panelout${staleClass}`}>
-            <AnsiText text={ansiText} onPanelSwitch={onPanelSwitch} />
-          </pre>
-        )}
-        {(hasStderr || failed) && (
-          <div className={`${failed ? "panelerr" : "panelwarn"}${staleClass}`}>
-            {hasStderr
-              ? stderrTail
-              : typeof exitCode === "number"
-                ? `command exited with status ${exitCode} and printed nothing to stderr`
-                : "command did not exit cleanly (killed) and printed nothing to stderr"}
-          </div>
-        )}
-        {hasNotice && <div className={`panelnote${staleClass}`}>{withheld}</div>}
-      </>
+      <RenderedOutput
+        ansiText={ansiText}
+        exitCode={exitCode}
+        stderrTail={stderrTail}
+        withheld={withheld}
+        staleClass={staleClass}
+        onPanelSwitch={onPanelSwitch}
+      />
     );
   }
   return <div className="panelout">not run yet — this panel probes the machine, so it runs only when you ask.</div>;

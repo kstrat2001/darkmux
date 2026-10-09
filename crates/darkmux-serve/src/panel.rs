@@ -1159,21 +1159,10 @@ async fn run_panel(
     // width is a cosmetic misread, a wrong option is a different command.
     let cols = clamp_cols(parse_cols(&params));
 
-    // Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
-    // — see `admit_manual_run`'s own doc for why that must never be the
-    // variant key — and by audience. A remote caller inside its window is
-    // answered with the last remote run, never a new probe: polling from
-    // the tailnet can neither close this machine's window nor make it probe
-    // more than once per window.
-    let audience = if remote { Audience::Remote } else { Audience::Local };
-    let claim = if spec.auto_refresh {
-        None
-    } else {
-        match admit_manual_run(&state.panels, id, audience).await {
-            Ok(claim) => Some(claim),
-            Err(refused) if remote => return last_remote_run(&state.panels, &key).await.ok_or(refused),
-            Err(refused) => return Err(refused),
-        }
+    // Manual-only panels are floored per audience ([`admit_run`]).
+    let claim = match admit_run(state, &spec, remote, &key).await? {
+        Admitted::Run(claim) => claim,
+        Admitted::Answer(body) => return Ok(body),
     };
 
     // Serve fresh-enough cache without spawning.
@@ -1212,8 +1201,108 @@ async fn run_panel(
     let exe = child_exe(&state.panels).map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("resolving current_exe: {e}\n"))
     })?;
+    let cmd = panel_command(exe, &final_argv, cols, id, remote, fleet_snapshot.as_ref());
+
+    let output = run_child(&state.panels, &spec, claim, cmd).await?;
+
+    let gather_ms = started.elapsed().as_millis() as u64;
+    let ansi_text = capped_stdout(&String::from_utf8_lossy(&output.stdout));
+    let stderr_tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
+
+    let body = PanelResponse {
+        panel: id.to_string(),
+        argv: final_argv.clone(),
+        opts: opts_echo,
+        captured_ts_ms: current_millis(),
+        gather_ms,
+        exit_code: output.status.code(),
+        ansi_text,
+        // Non-empty only when something went to stderr — surfaced so a
+        // failing verb is diagnosable from the panel itself, not just logs.
+        stderr_tail,
+        withheld: String::new(),
+        cols,
+        cache_ttl_ms: spec.cache_ttl.as_millis() as u64,
+        age_ms: 0,
+        auto_refresh: spec.auto_refresh,
+    };
+    finish_run(state, &spec, remote, key, body).await
+}
+
+/// A rendered body, redacted for a remote caller, then kept. A remote body
+/// is redacted BEFORE it is cached, against the sets as they stand when it
+/// was rendered, so no cached remote body ever holds a raw value: redacting
+/// on serve instead would use the CURRENT sets, and a value rotated out of
+/// the configuration inside the TTL would be in none of them (5.0 security
+/// re-review N2).
+async fn finish_run(
+    state: &AppState,
+    spec: &PanelSpec,
+    remote: bool,
+    key: String,
+    mut body: PanelResponse,
+) -> Result<PanelResponse, (StatusCode, String)> {
+    if remote {
+        redact_fresh_for_remote(&mut body).await?;
+    }
+    keep_panel_run(state, spec, remote, key, &body).await;
+    Ok(body)
+}
+
+/// What [`admit_run`] decided: run the verb (with a manual panel's claim on
+/// its floor), or answer with a body already in hand.
+enum Admitted {
+    Run(Option<ManualClaim>),
+    Answer(PanelResponse),
+}
+
+/// Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
+/// — see `admit_manual_run`'s own doc for why that must never be the
+/// variant key — and by audience. A remote caller inside its window is
+/// answered with the last remote run, never a new probe: polling from the
+/// tailnet can neither close this machine's window nor make it probe more
+/// than once per window.
+async fn admit_run(state: &AppState, spec: &PanelSpec, remote: bool, key: &str) -> Result<Admitted, (StatusCode, String)> {
+    if spec.auto_refresh {
+        return Ok(Admitted::Run(None));
+    }
+    let audience = if remote { Audience::Remote } else { Audience::Local };
+    match admit_manual_run(&state.panels, spec.id, audience).await {
+        Ok(claim) => Ok(Admitted::Run(Some(claim))),
+        Err(refused) if remote => last_remote_run(&state.panels, key).await.map(Admitted::Answer).ok_or(refused),
+        Err(refused) => Err(refused),
+    }
+}
+
+/// Keep a finished run where the next caller will find it.
+async fn keep_panel_run(state: &AppState, spec: &PanelSpec, remote: bool, key: String, body: &PanelResponse) {
+    if spec.cache_ttl.is_zero() && !remote {
+        // Manual panel: nothing cached (an explicit run is a real run), but
+        // the floor's clock advances so the next caller is bounded. Keyed
+        // by BASE id — see `admit_manual_run`'s own doc.
+        // (#1919) No record here any more — `admit_manual_run` claimed the
+        // window when it admitted this run. Recording again on completion
+        // would extend the floor by the spawn's own duration.
+        return;
+    }
+    // A manual panel's REMOTE run is kept (under its remote key) as the
+    // last remote run, which a remote caller inside the window reads
+    // ([`last_remote_run`]); `cached_if_fresh` never serves it, TTL 0.
+    let mut cache = state.panels.cache.lock().await;
+    cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
+}
+
+/// The child command that renders panel `id`.
+fn panel_command(
+    exe: std::path::PathBuf,
+    final_argv: &[String],
+    cols: u16,
+    id: &'static str,
+    remote: bool,
+    fleet_snapshot: Option<&tempfile::NamedTempFile>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(&final_argv)
+    cmd.args(final_argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1244,60 +1333,13 @@ async fn run_panel(
     if remote {
         cmd.env(panel_audience::AUDIENCE_ENV, panel_audience::REMOTE);
     }
-    if let Some(file) = &fleet_snapshot {
+    if let Some(file) = fleet_snapshot {
         // (#1914) Opt-in by the SAME construction as `DARKMUX_PANEL` above:
         // a bare terminal invocation never has this env var set, so it
         // takes the exact same live-Redis path it always has.
         cmd.env(crate::FLEET_SNAPSHOT_ENV_VAR, file.path());
     }
-
-    let output = run_child(&state.panels, &spec, claim, cmd).await?;
-
-    let gather_ms = started.elapsed().as_millis() as u64;
-    let ansi_text = capped_stdout(&String::from_utf8_lossy(&output.stdout));
-    let stderr_tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
-
-    let mut body = PanelResponse {
-        panel: id.to_string(),
-        argv: final_argv.clone(),
-        opts: opts_echo,
-        captured_ts_ms: current_millis(),
-        gather_ms,
-        exit_code: output.status.code(),
-        ansi_text,
-        // Non-empty only when something went to stderr — surfaced so a
-        // failing verb is diagnosable from the panel itself, not just logs.
-        stderr_tail,
-        withheld: String::new(),
-        cols,
-        cache_ttl_ms: spec.cache_ttl.as_millis() as u64,
-        age_ms: 0,
-        auto_refresh: spec.auto_refresh,
-    };
-    // A remote body is redacted BEFORE it is cached, against the sets as they
-    // stand when it was rendered, so no cached remote body ever holds a raw
-    // value: redacting on serve instead would use the CURRENT sets, and a
-    // value rotated out of the configuration inside the TTL would be in none
-    // of them (5.0 security re-review N2).
-    if remote {
-        redact_fresh_for_remote(&mut body).await?;
-    }
-
-    if spec.cache_ttl.is_zero() && !remote {
-        // Manual panel: nothing cached (an explicit run is a real run), but
-        // the floor's clock advances so the next caller is bounded. Keyed
-        // by BASE id — see `admit_manual_run`'s own doc.
-        // (#1919) No record here any more — `admit_manual_run` claimed the
-        // window when it admitted this run. Recording again on completion
-        // would extend the floor by the spawn's own duration.
-    } else {
-        // A manual panel's REMOTE run is kept (under its remote key) as the
-        // last remote run, which a remote caller inside the window reads
-        // ([`last_remote_run`]); `cached_if_fresh` never serves it, TTL 0.
-        let mut cache = state.panels.cache.lock().await;
-        cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
-    }
-    Ok(body)
+    cmd
 }
 
 /// The program a panel spawns: the daemon's own binary (a test may substitute

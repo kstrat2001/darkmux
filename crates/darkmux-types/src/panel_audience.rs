@@ -322,26 +322,29 @@ impl At {
 /// keys, and the values it shows, stay. Returns whether anything was
 /// withheld.
 pub fn shape_config_json(root: &mut Value) -> bool {
-    fn walk(v: &mut Value, at: &At, wrong: &std::collections::HashSet<String>) -> bool {
-        let withhold = |v: &mut Value| {
-            *v = Value::String(WITHHELD.to_string());
-            true
-        };
+    type Wrong = std::collections::HashSet<String>;
+    fn withhold(v: &mut Value) -> bool {
+        *v = Value::String(WITHHELD.to_string());
+        true
+    }
+    fn walk(v: &mut Value, at: &At, wrong: &Wrong) -> bool {
         if !at.pattern.is_empty() && (withheld_whole(&at.pattern) || wrong.contains(&at.display)) {
             return withhold(v);
         }
         match v {
             Value::Object(map) => map.iter_mut().fold(false, |any, (k, child)| walk(child, &at.key(k), wrong) | any),
-            Value::Array(items) => items.iter_mut().enumerate().fold(false, |any, (i, item)| {
-                let at = at.item(i);
-                let shown = match item {
-                    Value::Object(_) => return walk(item, &at, wrong) | any,
-                    _ => !withheld_whole(&at.pattern) && !wrong.contains(&at.display) && at.verdict() == Verdict::Shown,
-                };
-                (!shown && withhold(item)) | any
-            }),
+            Value::Array(items) => items.iter_mut().enumerate().fold(false, |any, (i, item)| shape_item(item, &at.item(i), wrong) | any),
             _ => (config_verdict(&at.pattern) != Verdict::Shown || bad_enum_token(&at.pattern, v)) && withhold(v),
         }
+    }
+    /// One array item: an object is walked; anything else is shown only
+    /// when its path is shown and its type is right.
+    fn shape_item(item: &mut Value, at: &At, wrong: &Wrong) -> bool {
+        if let Value::Object(_) = item {
+            return walk(item, at, wrong);
+        }
+        let shown = !withheld_whole(&at.pattern) && !wrong.contains(&at.display) && at.verdict() == Verdict::Shown;
+        !shown && withhold(item)
     }
     let wrong = wrong_typed(root);
     walk(root, &At::root(), &wrong)
@@ -373,29 +376,29 @@ pub fn config_scrub_values(root: &Value) -> Vec<String> {
             _ => {}
         }
     }
-    fn walk(v: &Value, at: &At, wrong: &std::collections::HashSet<String>, out: &mut Vec<String>) {
+    type Wrong = std::collections::HashSet<String>;
+    fn walk(v: &Value, at: &At, wrong: &Wrong, out: &mut Vec<String>) {
         if !at.pattern.is_empty() && wrong.contains(&at.display) {
             return every_string(v, out);
         }
         match v {
-            Value::Object(map) => map.iter().for_each(|(k, child)| {
-                let at = at.key(k);
-                if location_like_key(k) && config_verdict(&at.pattern) == Verdict::Withheld(None) {
-                    out.push(k.clone());
-                }
-                walk(child, &at, wrong, out)
-            }),
-            Value::Array(items) => {
-                for (i, item) in items.iter().enumerate() {
-                    let at = at.item(i);
-                    match item {
-                        Value::Object(_) => walk(item, &at, wrong, out),
-                        _ if wrong.contains(&at.display) || scrubbed(at.verdict()) => every_string(item, out),
-                        _ => {}
-                    }
-                }
-            }
+            Value::Object(map) => map.iter().for_each(|(k, child)| walk_key(k, child, at, wrong, out)),
+            Value::Array(items) => items.iter().enumerate().for_each(|(i, item)| walk_item(item, &at.item(i), wrong, out)),
             Value::String(s) if scrubbed(config_verdict(&at.pattern)) || bad_enum_token(&at.pattern, v) => out.push(s.clone()),
+            _ => {}
+        }
+    }
+    fn walk_key(k: &str, child: &Value, at: &At, wrong: &Wrong, out: &mut Vec<String>) {
+        let at = at.key(k);
+        if location_like_key(k) && config_verdict(&at.pattern) == Verdict::Withheld(None) {
+            out.push(k.to_string());
+        }
+        walk(child, &at, wrong, out)
+    }
+    fn walk_item(item: &Value, at: &At, wrong: &Wrong, out: &mut Vec<String>) {
+        match item {
+            Value::Object(_) => walk(item, at, wrong, out),
+            _ if wrong.contains(&at.display) || scrubbed(at.verdict()) => every_string(item, out),
             _ => {}
         }
     }
@@ -572,10 +575,7 @@ fn replace_whole(text: &str, needle: &str) -> String {
 /// Each span runs from the head's first byte to the tail's last. Shared by
 /// [`Withheld::scrub`] and the daemon's address redaction.
 pub fn cut_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
-    // Byte offsets of every char boundary in the needle, and its char count.
-    let bounds: Vec<usize> = needle.char_indices().map(|(i, _)| i).chain([needle.len()]).collect();
-    let chars = bounds.len() - 1;
-    let ci = |a: &str, b: &str| a.as_bytes().eq_ignore_ascii_case(b.as_bytes());
+    let cut = NeedleCut::new(needle);
     let mut out = Vec::new();
     let mut last = 0;
     for (e, _) in text.match_indices(CUT) {
@@ -583,34 +583,64 @@ pub fn cut_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
             continue;
         }
         let (before, after) = (&text[last..e], &text[e + CUT.len_utf8()..]);
-        // `k` chars of the needle's head end `before`; `j` of its tail start `after`.
-        let head_ok = |k: usize| {
-            let hb = bounds[k];
-            hb <= before.len()
-                && before.is_char_boundary(before.len() - hb)
-                && ci(&before[before.len() - hb..], &needle[..hb])
-                && (k == 0 || !(before[..before.len() - hb].chars().next_back().is_some_and(word_char) && needle.starts_with(word_char)))
-        };
-        let tail_ok = |j: usize| {
-            let tb = needle.len() - bounds[chars - j];
-            tb <= after.len()
-                && after.is_char_boundary(tb)
-                && ci(&after[..tb], &needle[needle.len() - tb..])
-                && (j == 0 || !(after[tb..].chars().next().is_some_and(word_char) && needle.ends_with(word_char)))
-        };
-        // The cut that shows the most of the needle, and never all of it.
-        let best = (0..chars)
-            .filter(|&k| head_ok(k))
-            .filter_map(|k| (0..chars - k).rev().find(|&j| tail_ok(j)).map(|j| (k, j)))
-            .max_by_key(|(k, j)| (k + j, *k));
-        if let Some((k, j)) = best.filter(|(k, j)| k + j >= MIN_CUT_CHARS) {
-            let start = e - bounds[k];
-            let end = e + CUT.len_utf8() + (needle.len() - bounds[chars - j]);
+        if let Some((k, j)) = cut.best(before, after).filter(|(k, j)| k + j >= MIN_CUT_CHARS) {
+            let start = e - cut.bounds[k];
+            let end = e + CUT.len_utf8() + cut.tail_bytes(j);
             out.push((start, end));
             last = end;
         }
     }
     out
+}
+
+/// A needle as [`cut_spans`] matches it: the byte offset of every char
+/// boundary, and its char count.
+struct NeedleCut<'a> {
+    needle: &'a str,
+    bounds: Vec<usize>,
+    chars: usize,
+}
+
+impl<'a> NeedleCut<'a> {
+    fn new(needle: &'a str) -> Self {
+        let bounds: Vec<usize> = needle.char_indices().map(|(i, _)| i).chain([needle.len()]).collect();
+        let chars = bounds.len() - 1;
+        Self { needle, bounds, chars }
+    }
+
+    /// The bytes of the needle's last `j` chars.
+    fn tail_bytes(&self, j: usize) -> usize {
+        self.needle.len() - self.bounds[self.chars - j]
+    }
+
+    /// Whether `before` ends with the needle's first `k` chars, not glued to
+    /// a longer word.
+    fn head_shows(&self, before: &str, k: usize) -> bool {
+        let hb = self.bounds[k];
+        hb <= before.len()
+            && before.is_char_boundary(before.len() - hb)
+            && before.as_bytes()[before.len() - hb..].eq_ignore_ascii_case(&self.needle.as_bytes()[..hb])
+            && (k == 0 || !(before[..before.len() - hb].chars().next_back().is_some_and(word_char) && self.needle.starts_with(word_char)))
+    }
+
+    /// Whether `after` starts with the needle's last `j` chars, not glued to
+    /// a longer word.
+    fn tail_shows(&self, after: &str, j: usize) -> bool {
+        let tb = self.tail_bytes(j);
+        tb <= after.len()
+            && after.is_char_boundary(tb)
+            && after.as_bytes()[..tb].eq_ignore_ascii_case(&self.needle.as_bytes()[self.needle.len() - tb..])
+            && (j == 0 || !(after[tb..].chars().next().is_some_and(word_char) && self.needle.ends_with(word_char)))
+    }
+
+    /// The cut around one `…` that shows the most of the needle, and never
+    /// all of it: `(k, j)` chars of head and tail.
+    fn best(&self, before: &str, after: &str) -> Option<(usize, usize)> {
+        (0..self.chars)
+            .filter(|&k| self.head_shows(before, k))
+            .filter_map(|k| (0..self.chars - k).rev().find(|&j| self.tail_shows(after, j)).map(|j| (k, j)))
+            .max_by_key(|(k, j)| (k + j, *k))
+    }
 }
 
 /// `text` with each [`cut_spans`] occurrence of `needle` replaced by

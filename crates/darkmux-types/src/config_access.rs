@@ -2495,6 +2495,11 @@ mod location_guard {
     /// with why. A new accessor that returns text is in neither list and
     /// fails [`every_accessor_that_can_name_a_location_is_read`].
     const NOT_LOCATIONS: &[(&str, &str)] = &[
+        ("SERVE_BIND_DEFAULT", "the default bind, public in the source; the bind in effect is read through `serve_bind`"),
+        ("FLEET_BUSY_POLICY_DEFAULT", "the default busy policy token, public in the source (the policy in effect is withheld where printed)"),
+        ("FLEET_IDENTITY_PROVIDER_DEFAULT", "the default provider's name"),
+        ("REDIS_TELEMETRY_STREAM_SUFFIX", "a stream name's suffix"),
+        ("LOCATION_ACCESSORS", "this table itself: accessor names and functions, no value"),
         ("machine_id", "this machine's public name, which every viewer reads"),
         ("fleet_mode", "an enum value"),
         ("declared_fleet_mode", "an enum value"),
@@ -2527,13 +2532,87 @@ mod location_guard {
         ("set_config_for_test", "a test hook that installs a config"),
     ];
 
-    /// Every public function in `src`'s production code (`pub`, `pub(crate)`
-    /// or `pub(super)`; with or without arguments, `&self` and generics
-    /// included) that returns something, as `(NAME, TYPE, TAKES_ARGUMENTS)`,
+    /// `src` without its `#[cfg(test)] mod` blocks, wherever they sit, so
+    /// production code after a test module is still scanned.
+    fn production_of(src: &str) -> String {
+        const MARK: &str = "\n#[cfg(test)]\nmod ";
+        let mut out = String::new();
+        let mut rest = src;
+        while let Some(at) = rest.find(MARK) {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + MARK.len()..];
+            // `mod name;` (a file module) ends at its semicolon; an inline one
+            // at the brace that closes its body.
+            let end = match (after.find('{'), after.find(';')) {
+                (Some(open), semi) if semi.is_none_or(|s| open < s) => {
+                    let mut depth = 0usize;
+                    after[open..].char_indices().find_map(|(i, c)| {
+                        depth = if c == '{' { depth + 1 } else if c == '}' { depth - 1 } else { depth };
+                        (c == '}' && depth == 0).then_some(open + i + 1)
+                    })
+                }
+                (_, semi) => semi.map(|s| s + 1),
+            };
+            rest = &after[end.unwrap_or(after.len())..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Whether the text before an item's keyword makes it public: `pub` or
+    /// any `pub(...)`, ahead of `const`, `async`, `unsafe` or `extern "…"`.
+    fn is_public(before: &str) -> bool {
+        const QUALIFIERS: &[&str] = &["const", "async", "unsafe", "extern"];
+        let mut b = before.trim_end();
+        loop {
+            let word_start = b.rfind(' ').map_or(0, |i| i + 1);
+            let word = &b[word_start..];
+            // An ABI string (`extern "C"`) is dropped with its `extern`.
+            let abi = word.starts_with('"') && b[..word_start].trim_end().ends_with("extern");
+            if !(QUALIFIERS.contains(&word) || abi) {
+                break;
+            }
+            b = b[..word_start].trim_end();
+        }
+        if b == "pub" || b.ends_with(" pub") {
+            return true;
+        }
+        // `pub(crate)`, `pub(super)`, `pub(in a::b)`: the last `pub(` whose
+        // parentheses close exactly at the end.
+        b.rfind("pub(").is_some_and(|i| {
+            let tail = &b[i..];
+            (i == 0 || b[..i].ends_with(' ')) && tail.ends_with(')') && tail.matches('(').count() == tail.matches(')').count()
+        })
+    }
+
+    /// Every public `static` or `const` item in `production` (whitespace
+    /// collapsed), as `(NAME, TYPE, false)`.
+    fn items_in(production: &str) -> Vec<(String, String, bool)> {
+        let mut out = Vec::new();
+        for kw in [" static ", " const "] {
+            for (at, _) in production.match_indices(kw) {
+                if !is_public(&production[..at]) {
+                    continue;
+                }
+                let rest = production[at + kw.len()..].trim_start_matches("mut ");
+                let Some((name, ty)) = rest.split_once(':') else { continue };
+                if name.contains(['(', ' ']) {
+                    continue; // `const fn`, handled as a function
+                }
+                let ty = ty.split(['=', ';']).next().unwrap_or("").trim().to_string();
+                out.push((name.trim().to_string(), ty, false));
+            }
+        }
+        out
+    }
+
+    /// Every public item in `src`'s production code that hands out a value:
+    /// each function (any `pub` visibility, any qualifier; with or without
+    /// arguments, `&self` and generics included) that returns something,
+    /// and each `static` or `const`, as `(NAME, TYPE, TAKES_ARGUMENTS)`,
     /// signatures spanning lines included.
     fn accessors_in(src: &str) -> Vec<(String, String, bool)> {
-        let production: String =
-            src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(src).split_whitespace().collect::<Vec<_>>().join(" ");
+        let production: String = production_of(src).split_whitespace().collect::<Vec<_>>().join(" ");
         // The index just past the bracket that closes the one at `open`.
         let close = |s: &str, open: usize, (o, c): (char, char)| -> Option<usize> {
             let mut depth = 0usize;
@@ -2552,7 +2631,7 @@ mod location_guard {
         let mut out = Vec::new();
         for (at, _) in production.match_indices(" fn ") {
             let before = &production[..at];
-            if !["pub", "pub(crate)", "pub(super)"].iter().any(|v| before.ends_with(&format!(" {v}")) || before == *v) {
+            if !is_public(before) {
                 continue;
             }
             let rest = &production[at + 4..];
@@ -2570,6 +2649,7 @@ mod location_guard {
             let ty = ty.split(['{', ';']).next().unwrap_or("").split(" where ").next().unwrap_or("").trim().to_string();
             out.push((name, ty, takes_args));
         }
+        out.extend(items_in(&production));
         out.sort();
         out.dedup();
         out
@@ -2649,6 +2729,16 @@ mod location_guard {
             ("pub fn templated<T: Into<String>>(\n    t: T,\n) -> String {\n    x()\n}\n", "templated"),
             ("pub(super) fn method_url(&self) -> String {\n    x()\n}\n", "method_url"),
             ("pub fn orphan_with_source() -> (String, Source) {\n    x()\n}\n", "orphan_with_source"),
+            // (re-check of fix pass 2) qualifiers, a scoped visibility, and
+            // items that are not functions at all.
+            ("pub const fn const_dir() -> &'static str {\n    \"/x\"\n}\n", "const_dir"),
+            ("pub async fn async_url() -> String {\n    x()\n}\n", "async_url"),
+            ("pub unsafe fn raw_path() -> String {\n    x()\n}\n", "raw_path"),
+            ("pub(in crate::config_access) fn scoped_dir() -> String {\n    x()\n}\n", "scoped_dir"),
+            ("pub static STATIC_DIR: &str = \"/x\";\n", "STATIC_DIR"),
+            ("pub const CONST_URL: &str = \"http://x\";\n", "CONST_URL"),
+            // Production code after a test module is still production code.
+            ("pub fn early_dir() -> String {\n}\n\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n\npub fn late_dir() -> String {\n}\n", "late_dir"),
         ] {
             let found = accessors_in(src);
             let got = unclassified(&found, &[], &[]);

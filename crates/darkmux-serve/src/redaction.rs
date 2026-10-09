@@ -372,26 +372,30 @@ fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
             continue;
         }
         let start = i;
-        while i < b.len() && (b[i].is_ascii_hexdigit() || b[i] == b':') {
-            i += 1;
-        }
+        i += b[i..].iter().take_while(|c| c.is_ascii_hexdigit() || **c == b':').count();
         if b.get(i).is_some_and(|c| word_byte(*c)) {
             continue;
         }
         let glued = start > 0 && word_byte(b[start - 1]);
         if let Some(mut span) = v6_in_run(text, start, i, glued) {
-            // A zone (`%en0`, or `%25en0` in a URL) names this machine's
-            // interface: it goes with the address.
-            if span.end == i && b.get(i) == Some(&b'%') {
-                let zone = b[i + 1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-')).count();
-                if zone > 0 {
-                    span.end = i + 1 + zone;
-                    i = span.end;
-                }
+            if span.end == i {
+                span.end += zone_len(&b[i..]);
+                i = span.end;
             }
             out.push(span);
         }
     }
+}
+
+/// The bytes of an IPv6 zone at the start of `rest` (`%en0`, or `%25en0` in
+/// a URL), which names this machine's interface and so goes with the
+/// address; 0 when there is none.
+fn zone_len(rest: &[u8]) -> usize {
+    if rest.first() != Some(&b'%') {
+        return 0;
+    }
+    let zone = rest[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-')).count();
+    if zone > 0 { 1 + zone } else { 0 }
 }
 
 /// The host-fact IPv6 literal in the run `start..end`, if any: the whole run,
@@ -687,31 +691,8 @@ pub fn panel_withheld() -> Withheld {
     }
     public.extend(darkmux_flow::resolve_machine_id());
 
-    // The profile registry's endpoints: where each lives and where its key is.
-    let mut credentials: Vec<String> = Vec::new();
-    if let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) {
-        locations.push(path_str(reg_path.clone()));
-        let registry = read_json(&reg_path);
-        for section in ["profiles", "endpoints"] {
-            public.extend(registry.as_ref().and_then(|r| r.get(section)?.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>())).unwrap_or_default());
-        }
-        let endpoints = registry.as_ref().and_then(|r| r.get("endpoints").and_then(|e| e.as_object()).cloned());
-        for ep in endpoints.iter().flat_map(|m| m.values()) {
-            locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
-            for key in ["keychain", "key_env"] {
-                credentials.extend(ep.pointer(&format!("/auth/{key}")).and_then(|v| v.as_str()).map(str::to_string));
-            }
-        }
-    }
-
-    let homes: Vec<String> = ["HOME", "DARKMUX_HOME"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .map(|h| h.trim_end_matches('/').to_string())
-        .filter(|h| h.len() > 1)
-        .collect();
-    let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
-    let outside = |vs: Vec<String>| vs.into_iter().filter(|v| !under_a_home(v)).collect::<Vec<_>>();
+    let credentials = registry_sets(&mut locations, &mut public);
+    let outside = outside_the_homes;
     // An enum setting's value that is not one of its tokens is bad config,
     // which doctor's refusal quotes, whether it was set in `config.json` or
     // the environment: what it holds is not what the key means.
@@ -721,6 +702,41 @@ pub fn panel_withheld() -> Withheld {
         .merged(Withheld::from_values(credentials))
         .merged(Withheld::from_values(outside(bad_enum.collect())))
         .sparing(&public)
+}
+
+/// The profile registry's part of [`panel_withheld`]: the registry's own
+/// path and each endpoint's URL go into `locations`, its profile and
+/// endpoint names into `public`; returns each endpoint's credential pointer.
+fn registry_sets(locations: &mut Vec<String>, public: &mut Vec<String>) -> Vec<String> {
+    let mut credentials: Vec<String> = Vec::new();
+    let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) else { return credentials };
+    locations.push(reg_path.to_string_lossy().to_string());
+    let registry: Option<serde_json::Value> =
+        std::fs::read_to_string(&reg_path).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let Some(registry) = registry else { return credentials };
+    for section in ["profiles", "endpoints"] {
+        public.extend(registry.get(section).and_then(|m| m.as_object()).into_iter().flat_map(|m| m.keys().cloned()));
+    }
+    for ep in registry.get("endpoints").and_then(|e| e.as_object()).into_iter().flat_map(|m| m.values()) {
+        locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
+        for key in ["keychain", "key_env"] {
+            credentials.extend(ep.pointer(&format!("/auth/{key}")).and_then(|v| v.as_str()).map(str::to_string));
+        }
+    }
+    credentials
+}
+
+/// `values` without those under `HOME` or `DARKMUX_HOME` (or spelled with
+/// `~`), which the home-prefix redaction already rewrites.
+fn outside_the_homes(values: Vec<String>) -> Vec<String> {
+    let homes: Vec<String> = ["HOME", "DARKMUX_HOME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|h| h.trim_end_matches('/').to_string())
+        .filter(|h| h.len() > 1)
+        .collect();
+    let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
+    values.into_iter().filter(|v| !under_a_home(v)).collect()
 }
 
 /// What [`panel_withheld`] read, so a cached set is reused only while it is
@@ -1172,12 +1188,12 @@ mod tests {
         }
         // A tailnet name: cut in the middle with its `s.net` kept, or at its
         // end with its `.ts` kept.
-        let name = "box.tail-fake.ts.net";
+        let name = "box.tailnet-example.ts.net";
         for max in 11..name.chars().count() {
             let cut = middle_cut(name, max);
             assert_eq!(r.line(&format!("peer {cut}:8765")), format!("peer {ADDRESS_HIDDEN}:8765"), "{cut}");
         }
-        for head in ["box.tail-fake.ts…", "box.tail-fake.ts.n…"] {
+        for head in ["box.tailnet-example.ts…", "box.tailnet-example.ts.n…"] {
             assert_eq!(r.line(&format!("peer {head} up")), format!("peer {ADDRESS_HIDDEN} up"), "{head}");
         }
         // Text that names neither keeps its `…`.
