@@ -14,10 +14,23 @@ result_class?: ResultClass,
  */
 error?: string, 
 /**
- * The graph's final status, as it renders.
+ * The graph's final status, as it renders (`Clean`, `Degraded`, ...).
+ * The lifecycle rule reads a `run.complete` whose status is
+ * [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row does.
  */
 status?: string, 
 /**
  * The gate the run ended at (`coder-phase`), when it has one.
  */
-gate?: string, };
+gate?: string, 
+/**
+ * On a `run.error` only: the operator's stop that ended the run, named
+ * (`SIGINT`, `SIGTERM`, `SIGHUP`, or `interrupted` when a host raised its
+ * own interrupt), the same fact and spelling a `dispatch.error`'s
+ * `stop_reason` carries. Present means the operator stopped it: the
+ * lifecycle rule reads it as abandoned, aborted, never as an error.
+ * Absent (every terminal written before flow schema 2.2.0) means darkmux
+ * did not record a stop, never that there was none. A run's own
+ * wall-clock bound is never named here.
+ */
+stop_reason?: string, };

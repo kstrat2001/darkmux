@@ -32,6 +32,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           spec, has no key, and its flow-only run reads `mission` as it
 //           did before. Absence means "this darkmux did not record the
 //           config", never "it was not a dispatch".
+//
+//           Also 2.2.0: `dispatch.error`, `run.error` and `step.error` gain
+//           `payload.stop_reason`: the operator's stop that ended the
+//           execution, the run or the step (`SIGINT`, `SIGTERM`, `SIGHUP`, or
+//           `interrupted` for an interrupt a host raised itself; never the
+//           run's own wall-clock bound). Written on every such error terminal
+//           built after the process caught one
+//           (`FlowRecord::naming_operator_stop`, the scheduler's
+//           `step.error`). The lifecycle rule reads a terminal that names one
+//           as abandoned, aborted, the way it reads a `budget.stop` that
+//           names a reason, and reads a `run.complete` whose `status` is
+//           `Degraded` as degraded. ADDITIVE: a reader that does not know the
+//           key reads the terminal as an error, as before, and every terminal
+//           written before 2.2.0 names none and still reads as an error;
+//           archives are not rewritten.
 //   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
 //           bool written ONLY as `true`: a later step of the same task is
 //           still planned, so this record is not the end of the task's
@@ -44,6 +59,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           simply has a `null` payload and closes the session as it always
 //           did. Absence means "this darkmux did not record a later step",
 //           never "there is none" (the 1.41.0 `seat_class` convention).
+
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           (5.0, #3035, folded in, unreleased: "remote" was the wrong axis,
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
@@ -2505,6 +2521,7 @@ impl FlowRecord {
     ) -> Self {
         let action = payload.action();
         FlowRecord { payload: Some(payload), ..FlowRecord::for_session(session, level, category, stage, action, handle) }
+            .naming_operator_stop()
     }
 
     /// The payload as the JSON it serializes to, `Null` when the record has
@@ -2560,6 +2577,30 @@ impl FlowRecord {
     ) -> Self {
         let action = payload.action();
         FlowRecord { payload: Some(payload), ..FlowRecord::for_execution(session, execution, level, category, stage, action, handle) }
+            .naming_operator_stop()
+    }
+
+    /// This record, with a run's or an execution's error terminal
+    /// (`run.error`, `dispatch.error`) naming the operator's stop when the
+    /// process has one ([`darkmux_types::interrupt::stop_reason`], the one
+    /// decider: never the run's own wall-clock bound) and its producer named
+    /// none. The run's row reads the same decider where the run ends (the
+    /// mission envelope, the lab run's record), so the row and the one
+    /// lifecycle rule read the same ending. Every session and execution
+    /// record is built through [`FlowRecord::for_session_with`] or
+    /// [`FlowRecord::for_execution_with`], which call it; a terminal built
+    /// BEFORE the stop and written after it (a bookend guard's armed abort)
+    /// calls it again when it is written.
+    pub fn naming_operator_stop(mut self) -> Self {
+        let stop = match self.payload.as_mut() {
+            Some(crate::payload::Payload::DispatchError(p)) => &mut p.stop_reason,
+            Some(crate::payload::Payload::RunError(p)) => &mut p.stop_reason,
+            _ => return self,
+        };
+        if stop.is_none() {
+            *stop = darkmux_types::interrupt::stop_reason().map(str::to_string);
+        }
+        self
     }
 }
 
@@ -2891,5 +2932,107 @@ mod forward_compat_tests {
             .expect("a record with the removed `orchestrator` key must still deserialize");
         assert_eq!(rec.handle, "h1");
         assert_eq!(rec.machine_id.as_deref(), Some("studio"));
+    }
+}
+
+#[cfg(test)]
+mod operator_stop_tests {
+    use super::*;
+    use crate::payload::{DispatchEndPayload, Payload, RunPayload};
+    use darkmux_types::execution_id::ExecutionId;
+    use darkmux_types::interrupt;
+    use darkmux_types::session_id::{RunId, SessionId};
+
+    fn record(payload: Payload) -> FlowRecord {
+        let session = SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n");
+        FlowRecord::for_execution_with(&session, &ExecutionId::mint(), Level::Error, Category::Work, Stage::Dispatch, payload, "coder")
+    }
+
+    fn stop_of(r: &FlowRecord) -> Option<String> {
+        match &r.payload {
+            Some(Payload::DispatchError(p) | Payload::DispatchComplete(p)) => p.stop_reason.clone(),
+            _ => None,
+        }
+    }
+
+    /// An execution's error terminal built once the operator has stopped the
+    /// process names the stop, so every view's one lifecycle rule reads the
+    /// execution as aborted, not failed: the pepper-grinder lab run stopped
+    /// with SIGTERM read "aborted" on the runs board (its lab record) and
+    /// "error" on the fleet timeline and its run page (its flow terminal,
+    /// which said nothing of the stop). Before the stop, the same terminal
+    /// names none; a clean `dispatch.complete` never names one; and a
+    /// producer's own reason is kept.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    fn an_execution_error_built_after_an_operator_stop_names_the_stop() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        interrupt::reset_for_test();
+        let before = record(Payload::DispatchError(DispatchEndPayload::aborted(None)));
+        interrupt::simulate_sigterm_for_test();
+        let after = record(Payload::DispatchError(DispatchEndPayload::aborted(None)));
+        let complete = record(Payload::DispatchComplete(DispatchEndPayload::new(1)));
+        let own = record(Payload::DispatchError(DispatchEndPayload {
+            stop_reason: Some("phase abandoned".to_string()),
+            ..DispatchEndPayload::aborted(None)
+        }));
+        interrupt::reset_for_test();
+        assert_eq!(stop_of(&before), None, "nothing stopped the process yet");
+        assert_eq!(stop_of(&after).as_deref(), Some("SIGTERM"));
+        assert_eq!(stop_of(&complete), None, "a clean end is never a stop");
+        assert_eq!(stop_of(&own).as_deref(), Some("phase abandoned"), "a producer's own reason wins");
+    }
+
+    fn run_record(payload: Payload) -> FlowRecord {
+        let session = SessionId::run(RunId::mission("m-1").unwrap());
+        FlowRecord::for_session_with(&session, Level::Error, Category::Work, Stage::Dispatch, payload, "pepper")
+    }
+
+    fn run_stop_of(r: &FlowRecord) -> Option<String> {
+        match &r.payload {
+            Some(Payload::RunError(p) | Payload::RunComplete(p)) => p.stop_reason.clone(),
+            _ => None,
+        }
+    }
+
+    /// A mission the operator stopped with SIGTERM closes its run session
+    /// with `run.error`, which said only `result_class: error`, so the run read
+    /// "error" on every view while a dispatch or lab run stopped the same way
+    /// read "aborted". The same act gets the same word: the run's terminal
+    /// names the stop as an execution's does. A clean `run.complete` never
+    /// names one, and neither does a terminal built before the stop.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    fn a_run_error_built_after_an_operator_stop_names_the_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        interrupt::reset_for_test();
+        let before = run_record(Payload::RunError(RunPayload::failed("boom")));
+        interrupt::simulate_sigterm_for_test();
+        let after = run_record(Payload::RunError(RunPayload::failed("interrupted by an operator signal")));
+        let complete = run_record(Payload::RunComplete(RunPayload::ended(true)));
+        interrupt::reset_for_test();
+        assert_eq!(run_stop_of(&before), None, "nothing stopped the process yet");
+        assert_eq!(run_stop_of(&after).as_deref(), Some("SIGTERM"));
+        assert_eq!(run_stop_of(&complete), None, "a clean end is never a stop");
+    }
+
+    /// The run's own wall-clock bound is not the operator's stop: an
+    /// execution's error and a run's error built after it name none, so the
+    /// bound reads as what the run decided (degraded, or an error), never as
+    /// aborted.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    fn a_terminal_built_after_the_runs_own_bound_names_no_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        interrupt::reset_for_test();
+        interrupt::mark_bound_exceeded();
+        let execution = record(Payload::DispatchError(DispatchEndPayload::aborted(None)));
+        let run = run_record(Payload::RunError(RunPayload::failed("bound")));
+        interrupt::reset_for_test();
+        assert_eq!(stop_of(&execution), None);
+        assert_eq!(run_stop_of(&run), None);
     }
 }

@@ -93,6 +93,8 @@ describe("buildActivityTimeline — lanes and bars", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60, false, 0, TMAX, undefined, null, [], undefined, silent);
     const title = (sid: string) => tl.lanes[0].bars.find((b) => b.sid === sid)!.title;
     expect(title("s1")).toContain("not reporting");
+    // Its status, and so its class and color, is the board badge's.
+    expect(tl.lanes[0].bars.find((b) => b.sid === "s1")!.status).toBe("not_reporting");
     expect(title("s2")).toContain("complete");
     const plain = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     expect(plain.lanes[0].bars.find((b) => b.sid === "s1")!.title).toContain("running");

@@ -834,6 +834,7 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
       <div className="labrunmain">
         <WorkStatus
           status={runBadgeStatus(run)}
+          abandonReason={run.abandoned_reason}
           label={runStatusLabel(run)}
           className="labbadge"
           title={notReporting ? NOT_REPORTING_TITLE : undefined}

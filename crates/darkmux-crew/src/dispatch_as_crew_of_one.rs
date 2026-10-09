@@ -51,6 +51,7 @@
 use crate::dispatch::{DispatchOpts, DispatchResult};
 use darkmux_types::session_id::{RunId, SessionId};
 use crate::envelope::{MissionEnvelope, MissionOutcomeStatus, RunTally};
+use darkmux_flow::payload::ResultClass;
 use crate::lifecycle;
 use crate::step_kinds::{FixedEstimator, RawDispatchOutcome, StepKindRegistry};
 use crate::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step, Task};
@@ -73,6 +74,14 @@ pub fn dispatch_as_crew_of_one(opts: DispatchOpts) -> Result<DispatchResult> {
         &StepKindRegistry::with_builtins(),
         &crate::concurrent_dispatch::lms_host_factory,
     )
+}
+
+/// The step's status as this run reports it: a step an operator's stop ended
+/// is `Abandoned` naming the stop (`Step::end_unfinished`), which reports
+/// the same failed ending as `Error`, with the same error and reason; the
+/// run's envelope names the stop.
+fn outcome_status(step: &crate::types::Step) -> NodeStatus {
+    if step.ended_as_failure() { NodeStatus::Error } else { step.status }
 }
 
 /// The injectable core of [`dispatch_as_crew_of_one`] — `registry` and
@@ -198,7 +207,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         .get(&step_id)
         .ok_or_else(|| anyhow!("dispatch: step `{step_id}` vanished from the run graph"))?;
 
-    match step.status {
+    match outcome_status(step) {
         NodeStatus::Complete => {
             let raw: RawDispatchOutcome = serde_json::from_str(step.output.as_deref().unwrap_or_default())
                 .context("dispatch: could not parse the crew-of-one step's packed DispatchResult")?;
@@ -212,20 +221,27 @@ pub(crate) fn dispatch_as_crew_of_one_with(
                 // The packed step output carries the envelope, not the fold.
                 trajectory: None,
             };
-            // A non-zero dispatch exit is real, postable output (the dispatch
-            // RAN, it just didn't finish cleanly) — `Degraded`, which
-            // `MissionOutcomeStatus::phase_outcome` maps to phase `Complete`,
-            // same as `Clean`. `Error` is reserved for the two arms below,
-            // where the step itself never produced a `RawDispatchOutcome` at
-            // all.
+            // This run IS its one execution, so it ended as the execution did,
+            // and the execution's terminal already recorded that from its exit
+            // code (`ResultClass::of_exit`: a non-zero exit is its
+            // `dispatch.error`). The run reads the same rule, so its row and a
+            // view with only the flow give one answer. The step is tallied the
+            // way `mission launch` tallies the same step: a non-zero exit is an
+            // errored step (`DispatchInternalStepKind` bails on it there), which
+            // `decide` reads as `Error`. The exit code itself stays data on the
+            // returned result.
+            let errored = ResultClass::of_exit(result.exit_code) == ResultClass::Error;
             let status = MissionOutcomeStatus::decide(&RunTally {
-                completed: 1,
-                degraded: usize::from(result.exit_code != 0),
+                completed: usize::from(!errored),
+                errored: usize::from(errored),
                 ..Default::default()
             });
             finalize(&mission_id, &phase_id, status, step_result_reason(result.exit_code));
             Ok(result)
         }
+        // A step an operator's stop ended is `Abandoned` naming the stop
+        // (`Step::end_unfinished`), not `Error`: the same failed ending, the
+        // same error and reason, and the run's envelope names the stop.
         NodeStatus::Error => {
             // `dispatch()` itself returned an `Err` (preflight/model
             // resolution/etc — see `DispatchInternalStepKind`'s
@@ -383,6 +399,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     };
 
     (mission, phase, task, step)
@@ -564,6 +581,19 @@ mod tests {
     use tempfile::TempDir;
 
     // ── Test fixtures ───────────────────────────────────────────────────
+
+    /// The run reports a step an operator's stop ended (abandoned, naming the
+    /// stop) through the failure arm, as it reports an error; an abandoned
+    /// step that names no stop, and every other status, report as they are.
+    #[test]
+    fn a_step_the_operator_stopped_reports_as_a_failure() {
+        let (_, _, _, base) = build_graph(&test_opts("coder", "hi"), "dispatch-coder-1-abc");
+        let step = |status: NodeStatus, stop: Option<&str>| Step { status, stop_reason: stop.map(str::to_string), ..base.clone() };
+        assert_eq!(outcome_status(&step(NodeStatus::Abandoned, Some("SIGTERM"))), NodeStatus::Error);
+        assert_eq!(outcome_status(&step(NodeStatus::Error, None)), NodeStatus::Error);
+        assert_eq!(outcome_status(&step(NodeStatus::Abandoned, None)), NodeStatus::Abandoned);
+        assert_eq!(outcome_status(&step(NodeStatus::Complete, None)), NodeStatus::Complete);
+    }
 
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
@@ -1413,6 +1443,48 @@ mod tests {
         assert_eq!(result.exit_code, 2);
         assert_eq!(result.stdout, "partial output");
         assert_eq!(result.stderr, "some warning on stderr");
+    }
+
+    /// The operator's rule (2026-10-07): a run's status is decided once, and
+    /// every surface renders it. A `darkmux dispatch` run IS its one role
+    /// execution, and the execution's terminal records how it ended from its
+    /// exit code (`ResultClass::of_exit`: non-zero is a `dispatch.error`, which
+    /// the lifecycle rule reads as error). The run's envelope, which its row
+    /// reads, must carry that same outcome. When it said `Degraded`, the runs
+    /// board read "degraded" while a view with only the flow (a peer, a ghost,
+    /// /runs not yet loaded) read the terminal as "error".
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_runs_envelope_carries_the_outcome_its_executions_terminal_records() {
+        fn envelope_after(exit_code: i32) -> MissionOutcomeStatus {
+            let _guard = RunGuard::new();
+            let kind = FakeDispatchKind {
+                exit_code,
+                stdout: "partial output".to_string(),
+                stderr: String::new(),
+                should_err: false,
+                placement: placement(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let registry = test_registry(kind);
+            let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+            let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(SharedMockHost(host.clone())) };
+            let result = dispatch_as_crew_of_one_with(test_opts("coder", "build the thing"), &registry, &host_factory).unwrap();
+            assert_eq!(result.exit_code, exit_code, "a non-zero exit stays data on the result");
+            let mission_id = std::fs::read_dir(crate::loader::missions_dir()).unwrap().next().unwrap().unwrap().file_name();
+            crate::lifecycle::load_envelope(&mission_id.to_string_lossy()).unwrap().expect("envelope persisted").status
+        }
+        use darkmux_flow::payload::ResultClass;
+        // The execution's terminal says error; so does the run.
+        assert_eq!(ResultClass::of_exit(2), ResultClass::Error);
+        assert_eq!(
+            envelope_after(2),
+            MissionOutcomeStatus::Error,
+            "the run's envelope reads the outcome its execution's terminal records, not a second decision"
+        );
+        // CONTROL: a clean exit is a `dispatch.complete` and a clean run.
+        assert_eq!(ResultClass::of_exit(0), ResultClass::Ok);
+        assert_eq!(envelope_after(0), MissionOutcomeStatus::Clean);
     }
 
     #[test]

@@ -5977,6 +5977,7 @@
             turns_final: None,
             model: None,
             error: None,
+            abandoned_reason: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "dispatch.internal");
@@ -6011,6 +6012,7 @@
             turns_final: None,
             model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
             error: None,
+            abandoned_reason: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["model"], "darkmux:qwen/qwen3.6-27b");
@@ -6175,6 +6177,7 @@
             started_ts: Some(1),
             completed_ts: Some(2),
             output: None,
+            stop_reason: None,
         };
         let step_b = darkmux_crew::types::Step {
             id: "task-b-step".to_string(),
@@ -6186,6 +6189,7 @@
             started_ts: Some(1),
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let step_c = darkmux_crew::types::Step {
             id: "task-c-step".to_string(),
@@ -6197,6 +6201,7 @@
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         for s in [&step_a, &step_b, &step_c] {
             darkmux_crew::lifecycle::save_step(mission_id, "p1", s).unwrap();
@@ -6342,6 +6347,7 @@
                 started_ts: Some(1),
                 completed_ts: if *status == darkmux_crew::types::NodeStatus::Complete { Some(2) } else { None },
                 output: None,
+                stop_reason: None,
             };
             darkmux_crew::lifecycle::save_step(mission_id, "p1", &step).unwrap();
         }
@@ -6435,6 +6441,7 @@
             started_ts: Some(1),
             completed_ts: Some(2),
             output: None,
+            stop_reason: None,
         };
         darkmux_crew::lifecycle::save_step(mission_id, "p1", &map_step).unwrap();
 
@@ -6450,6 +6457,7 @@
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         darkmux_crew::lifecycle::save_step(mission_id, "p1", &collect_step).unwrap();
 
@@ -6861,6 +6869,7 @@
             started_ts: Some(now_unix()),
             completed_ts: if status == NodeStatus::Complete { Some(now_unix()) } else { None },
             output: None,
+            stop_reason: None,
         };
         darkmux_crew::lifecycle::save_task(mission_id, &mk_task("ran-task", "ran-step")).unwrap();
         darkmux_crew::lifecycle::save_task(mission_id, &mk_task("idle-task", "idle-step")).unwrap();
@@ -6961,6 +6970,7 @@
                 started_ts: Some(now_unix()),
                 completed_ts: Some(now_unix()),
                 output: None,
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -7043,6 +7053,7 @@
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         )
         .unwrap();

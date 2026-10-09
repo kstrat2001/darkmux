@@ -56,15 +56,16 @@
  * token sums (a caller-side gate, not a change to this file).
  */
 
-import { runStatusWord } from "../../lib/runStatusWord";
+import type { AbandonReason } from "../../types/generated/AbandonReason";
+import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { displayNameOf } from "../../lib/machineIdentity";
 import type { RosterName, SelfIdentity } from "../../lib/machineIdentity";
 import { clkhm } from "../../lib/format";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 import type { NormRecord } from "../../lib/ingest";
-import type { RunStatus } from "../../types/generated/RunStatus";
-import { DEFAULT_POLICY, endMs, lifecycleAt, spanOf, toRunState, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, endMs, lifecycleAt, ownRowOf, shownRunState, spanOf, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import type { Run } from "../../types/generated/Run";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { dispatchHash } from "../../lib/route";
 import { maxOf } from "../../lib/numbers";
@@ -99,8 +100,13 @@ interface TimelineBar {
   hash: string;
   leftPct: number;
   widthPct: number;
-  /** (#2813) The canonical run status: the bar's CSS class too (`.sbar.<status>`). */
-  status: RunStatus;
+  /** (#2813) The run's status as the board's badge states it (`not_reporting`
+   *  for a running run on a machine that is not reporting): the bar's CSS
+   *  class, and its color through `workStatusKind`, as the chip's. */
+  status: RunBadgeStatus;
+  /** The reason beside an `abandoned` status (`aborted`: a person stopped
+   *  it), read with `status` by `workStatusKind` for the bar's color. */
+  abandonReason?: AbandonReason;
   title: string;
 }
 
@@ -144,6 +150,23 @@ interface BarWindow {
   presence: Presence;
   /** Ids (session or mission) of runs the daemon marks `not_reporting`. */
   notReporting: ReadonlySet<string>;
+  /** The daemon's `/runs` rows: a bar for a run it lists shows the row's
+   *  status (`shownRunState`). */
+  rows: readonly Run[];
+  /** Whether the playhead is the live edge. */
+  live: boolean;
+}
+
+/** Where a bar ends: a running run reaches the playhead, anything else its
+ * own end (or the playhead when it has none yet). */
+function barEnd(state: { status: string }, l: Parameters<typeof endMs>[0], playheadT: number): number {
+  if (state.status === "running") return playheadT;
+  return endMs(l, playheadT) ?? playheadT;
+}
+
+/** A bar's `abandonReason`, present only on an abandoned bar that has one. */
+function abandonReasonField(status: RunBadgeStatus, reason: AbandonReason | undefined): { abandonReason?: AbandonReason } {
+  return status === "abandoned" && reason ? { abandonReason: reason } : {};
 }
 
 /** One run's bar, or `null` when it draws none: bookkeeping-only sessions
@@ -156,7 +179,10 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   if (g.grain === "lifecycle" || !first) return null;
   const l = lifecycleAt(currentRun(g, w.playheadT), w.playheadT, w.policy, w.presence);
   if (l.phase === "not_started") return null;
-  const end = endMs(l, w.playheadT) ?? w.playheadT;
+  const state = shownRunState(l, ownRowOf(w.rows, g.sessionId, g.missionId, g.grain), w.live);
+  // A run its row says is still running (a lab run verifying after its
+  // dispatch ended) reaches the playhead, as any running bar does.
+  const end = barEnd(state, l, w.playheadT);
   if (end < w.tlMin) return null;
   // Clip a straddling start to the window edge; an untimed start draws from
   // the edge, visible rather than dropped.
@@ -164,11 +190,26 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const widthPct = Math.max(0.6, w.pct(end) - w.pct(cst));
   const leftPct = Math.max(0, Math.min(w.pct(cst), 100 - widthPct)); // never spill past the right edge
   const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
-  const state = toRunState(l);
   const silent = state.status === "running" && (w.notReporting.has(g.sessionId) || (g.missionId !== null && w.notReporting.has(g.missionId)));
-  const word = silent ? runStatusWord(NOT_REPORTING_STATUS) : runStatusWord(state.status, state.abandonReason);
+  const status: RunBadgeStatus = silent ? NOT_REPORTING_STATUS : state.status;
+  const word = runStatusWord(status, state.abandonReason);
   const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
-  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${word}` };
+  return {
+    sid: g.sessionId,
+    key,
+    hash: dispatchHash(g.sessionId, g.missionId),
+    leftPct,
+    widthPct,
+    status,
+    ...abandonReasonField(status, state.abandonReason),
+    title: `${role} · ${g.sessionId} · ${word}`,
+  };
+}
+
+/** The timeline's window: the fixed range when one is given, else the
+ * `windowMinutes` ending at the playhead. */
+function windowBounds(fixedRange: [number, number] | undefined, playheadT: number, windowMinutes: number): [number, number] {
+  return fixedRange ?? [playheadT - windowMinutes * 60000, playheadT];
 }
 
 export function buildActivityTimeline(
@@ -229,14 +270,17 @@ export function buildActivityTimeline(
   /** Ids of runs the daemon marks `not_reporting` (`Run.not_reporting`): their
    *  bar titles say so, as the board does. */
   notReporting: ReadonlySet<string> = NO_IDS,
+  /** The daemon's `/runs` rows: a bar for a run it lists shows the row's
+   *  status, decided once (`shownRunState`). */
+  rows: readonly Run[] = [],
+  /** Whether `playheadT` is the live edge (no parked playhead). */
+  live = false,
 ): ActivityTimeline {
-  const winMs = windowMinutes * 60000;
-  const tlMax = fixedRange ? fixedRange[1] : playheadT;
-  const tlMin = fixedRange ? fixedRange[0] : tlMax - winMs;
+  const [tlMin, tlMax] = windowBounds(fixedRange, playheadT, windowMinutes);
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
-  const window: BarWindow = { tlMin, pct, playheadT, policy, presence, notReporting };
+  const window: BarWindow = { tlMin, pct, playheadT, policy, presence, notReporting, rows, live };
   const lanes: TimelineLane[] = uids.map((m) => {
     // (#2125) One bar per RUN, a `(session, mission)` pair (`runRef.ts`),
     // not per bare session id: a review mission's step session id is reused

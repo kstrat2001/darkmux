@@ -129,13 +129,27 @@
   --panel-3: #1c1c22;
   --panel-4: #1a2030;
 
-  /* (U2-3) IN-FLIGHT, and deliberately not `--warn`. There were three
-     ambers outside this block: `#ffd166` (a session bar that is RUNNING,
-     plus the mission lens's own `--ml-run`), `#ffb86b` (stale panels,
-     abandoned bars, lab warnings) and `--warn` itself. The last two are the
-     same concept and are now one; the first is not — a run in progress is
-     not a warning, and collapsing it would say so on every fleet screen. */
-  --run: #ffd166;
+  /* THE status palette (operator, 2026-10-07: "the color of the status
+     should be a one time status setting so it should not even have a chance
+     of being different across views"). A status word maps to its kind once
+     (`WorkStatus.tsx`'s `workStatusKind`) and a kind to its color once, here;
+     `[data-status-kind]` below hands it to an element as `--status-color`. The
+     work-status chip, the fleet timeline's bar and the fleet card's lamp read
+     it and name no color of their own. A run in progress is the accent: the
+     chip's color since it existed, and no longer an amber bar beside a teal
+     chip or the mission lens's own amber (`--ml-run`, folded in). */
+  --status-running: var(--accent);
+  --status-done: var(--good);
+  --status-error: var(--bad);
+  --status-degraded: var(--warn);
+  --status-stopped: var(--warn);
+  /* (operator, 2026-10-07) A person stopped it: its own neutral tone, not
+     degraded's caution amber. A muted gray-violet: 6.8:1 on `--panel` and
+     7.2:1 on `--bg` (WCAG AA for small text), far enough in hue and
+     saturation from `--dim`'s blue-gray (idle) and from the running teal. */
+  --status-aborted: #a594d6;
+  --status-idle: var(--dim);
+  --status-unknown: var(--dim);
 
   /* (U2-3) The one raw rgba outside this block (`.phasegroup.s-complete`'s
      border). Promoted as-is rather than mixed from `--good`: its hue is a
@@ -2801,6 +2815,18 @@ body {
 .labrunmeta.dim {
   color: var(--dim);
 }
+/* The kind-to-color lookup: the ONE place a status kind becomes a color. */
+[data-status-kind="running"] { --status-color: var(--status-running); }
+[data-status-kind="done"] { --status-color: var(--status-done); }
+[data-status-kind="error"] { --status-color: var(--status-error); }
+[data-status-kind="degraded"] { --status-color: var(--status-degraded); }
+[data-status-kind="stopped"] { --status-color: var(--status-stopped); }
+[data-status-kind="aborted"] { --status-color: var(--status-aborted); }
+/* A chip with no kind yet (a loading placeholder) is idle. */
+[data-status-kind="idle"],
+.wstatus:not([data-status-kind]) { --status-color: var(--status-idle); }
+[data-status-kind="unknown"] { --status-color: var(--status-unknown); }
+
 /* ─── The ONE work-status chip (components/WorkStatus.tsx) ──────────────────
    Every scope — mission, phase, task, step, run — renders its status through
    this. Five kinds, one palette, one pulse. A call site may add a LAYOUT
@@ -2815,30 +2841,16 @@ body {
   text-transform: uppercase;
   padding: 3px 7px;
   border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--dim);
+  border: 1px solid var(--status-color);
+  color: var(--status-color);
   white-space: nowrap;
 }
-/* (U2-3) `var(--accent)` directly. This named `--run`, which THIS SHEET
-   NEVER DEFINED, so the chip has always rendered the accent fallback.
-   Naming what it renders is the whole fix — and it is deliberately NOT
-   pointed at the new `--run` token, because that would silently repaint
-   every running chip amber. Flagged rather than changed: a running session
-   is a teal CHIP here and an amber BAR on the activity lane, which is a
-   real inconsistency and an operator call, not a refactor's to make. */
-.wstatus.is-running { color: var(--accent); border-color: var(--accent); }
-.wstatus.is-done { color: var(--good); border-color: var(--good); }
-.wstatus.is-error { color: var(--bad); border-color: var(--bad); }
-/* (#2406) Same `--warn` token `.is-stopped` and `.fleetcov`
-   already use for "a caution, not a failure" — a mixed terminal is a
-   caution, not a failure, same as an operator/budget stop. Reusing the
-   existing warn palette on purpose (no new color for an existing concept);
-   `degraded` stays its own KIND so the raw status word, not the color,
-   tells it apart from `stopped`. */
-.wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-idle,
-.wstatus.is-unknown { color: var(--dim); border-color: var(--border); }
+/* An idle or unknown chip keeps the quiet panel border; its word stays the
+   kind's color. (#2406: `degraded` and `stopped` share the warn color and stay
+   apart by their raw word.) */
+.wstatus[data-status-kind="idle"],
+.wstatus[data-status-kind="unknown"],
+.wstatus:not([data-status-kind]) { border-color: var(--border); }
 
 .labbadge {
   flex: 0 0 auto;
@@ -3937,7 +3949,8 @@ body {
    the line's box: a padding the same size as a negative margin gives the glow
    room and moves nothing. */
 .mach .stat {
-  --lit: var(--accent);
+  /* Lit work is the running color, from the one status palette. */
+  --lit: var(--status-running);
   --lamp-unlit: var(--dim);
   --lamp-size: 8px;
   padding: 4px 8px;
@@ -4440,7 +4453,7 @@ body {
   position: absolute;
   top: 5px;
   height: 18px;
-  background: var(--dim);
+  background: var(--status-color);
   border-radius: 3px;
   min-width: 2px;
   /* (drill-in packet) Clickable — see `FleetLens.tsx`'s own doc on the bar's
@@ -4477,18 +4490,9 @@ body {
     min-width: 24px;
   }
 }
-.sbar.running {
-  background-color: var(--run);
-  box-shadow: 0 0 6px var(--run);
-}
-.sbar.complete {
-  background-color: var(--good);
-}
-.sbar.abandoned {
-  background-color: var(--warn);
-}
-.sbar.error {
-  background-color: var(--error);
+/* A bar's color is its status kind's (`[data-status-kind]`), as the chip's is. */
+.sbar[data-status-kind="running"] {
+  box-shadow: 0 0 6px var(--status-color);
 }
 .tltrack .ph {
   position: absolute;
@@ -6744,8 +6748,14 @@ body {
    else in this file. Colors are mapped onto this file's OWN `:root`
    palette (`--fg`/`--dim`/`--border`/`--accent`/`--accent-dim`/`--good`/
    `--warn`/`--bad`) rather than reintroducing mission-graph.html's parallel
-   `--text`/`--muted`/`--line` names; `--ml-bg2`/`--ml-panel`/`--ml-run` are
-   the three colors that file's palette has no equivalent for here.
+   `--text`/`--muted`/`--line` names; `--ml-bg2`/`--ml-panel` are the two
+   colors that file's palette has no equivalent for here. A node's, a step
+   row's and a timeline card's STATUS color is the one status table's
+   (`[data-status-kind]` sets `--status-color` on the element, from
+   `workStatusKind`): the lens had its own (`--ml-run` amber for running,
+   `--dim` for abandoned) until the operator's rule that a status's color is
+   decided once (2026-10-07). The rules below keep the FORM per status (a
+   pulse, a dashed border, a lowered opacity) and take the color from it.
    Deliberately NOT a pixel-exact port of that file's extensive mobile
    safe-area/100dvh/sticky-nav handling — this lens lives inside the app
    shell's own document flow (a real `<Masthead>`/`<NavChrome>` already sits
@@ -6754,7 +6764,6 @@ body {
 .missionlens {
   --ml-bg2: #131316;
   --ml-panel: var(--panel-3);
-  --ml-run: var(--run);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -6864,7 +6873,7 @@ body {
   font-weight: 700;
 }
 .missionlens .mproc .hot {
-  color: var(--ml-run);
+  color: var(--status-running);
 }
 .missionlens .mctl {
   margin-left: auto;
@@ -7014,11 +7023,11 @@ body {
   border-color: var(--border);
 }
 .missionlens .mnode.s-running {
-  border-color: var(--ml-run);
-  box-shadow: 0 0 0 1px var(--ml-run);
+  border-color: var(--status-color);
+  box-shadow: 0 0 0 1px var(--status-color);
 }
 .missionlens .mnode.s-running .mn-label {
-  color: var(--ml-run);
+  color: var(--status-color);
 }
 .missionlens .mnode.s-running::after {
   content: "";
@@ -7028,7 +7037,7 @@ body {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--ml-run);
+  background: var(--status-color);
   animation: var(--beat);
 }
 /* (#2343) ADMITTED to a wave, not yet dispatching. The IDLE family on
@@ -7041,26 +7050,28 @@ body {
    to a planned one. Deliberately no new color token and no new keyframe for
    a concept the idle palette already covers. */
 .missionlens .mnode.s-waiting {
-  border-color: var(--dim);
+  border-color: var(--status-color);
 }
 .missionlens .mnode.s-waiting .mn-kind {
-  color: var(--dim);
+  color: var(--status-color);
 }
 .missionlens .mnode.s-complete {
-  border-color: var(--good);
+  border-color: var(--status-color);
 }
 .missionlens .mnode.s-complete .mn-kind {
-  color: var(--good);
+  color: var(--status-color);
 }
 .missionlens .mnode.s-error {
-  border-color: var(--bad);
+  border-color: var(--status-color);
 }
 .missionlens .mnode.s-error .mn-label {
-  color: var(--bad);
+  color: var(--status-color);
 }
+/* An abandoned node is no longer faded: its color (the one table's `stopped`
+   amber, or `aborted` gray-violet when a person stopped it) says what it is,
+   and a lowered opacity pulled that color toward the idle gray. */
 .missionlens .mnode.s-abandoned {
-  border-color: var(--dim);
-  opacity: 0.6;
+  border-color: var(--status-color);
 }
 .missionlens .mnode .mn-steps {
   margin-top: 6px;
@@ -7177,23 +7188,23 @@ body {
   text-overflow: ellipsis;
 }
 .missionlens .phasegroup.s-running {
-  border-color: var(--ml-run);
+  border-color: var(--status-color);
 }
 .missionlens .phasegroup.s-running .pg-name {
-  color: var(--ml-run);
+  color: var(--status-color);
 }
 /* (#2343) See `.mnode.s-waiting` above — the idle family, one level up. */
 .missionlens .phasegroup.s-waiting {
-  border-color: var(--dim);
+  border-color: var(--status-color);
 }
 .missionlens .phasegroup.s-complete {
-  border-color: var(--good-soft);
+  border-color: color-mix(in srgb, var(--status-color) 45%, transparent);
 }
 .missionlens .phasegroup.s-error {
-  border-color: var(--bad);
+  border-color: var(--status-color);
 }
 .missionlens .phasegroup.s-error .pg-name {
-  color: var(--bad);
+  color: var(--status-color);
 }
 /* (#2406) Mixed terminal — real output shipped, some of it did not. Same
    `--warn` token the timeline/`WorkStatus` chip use for this concept
@@ -7202,14 +7213,14 @@ body {
    below — a degraded phase produced real work and should not read as
    de-emphasized the way a fully abandoned one does. */
 .missionlens .phasegroup.s-degraded {
-  border-color: var(--warn);
+  border-color: var(--status-color);
 }
 .missionlens .phasegroup.s-degraded .pg-name {
-  color: var(--warn);
+  color: var(--status-color);
 }
 .missionlens .phasegroup.s-abandoned {
+  border-color: var(--status-color);
   border-style: dashed;
-  opacity: 0.6;
 }
 .missionlens .react-flow__minimap {
   background: var(--ml-bg2) !important;
@@ -7270,18 +7281,17 @@ body {
   box-sizing: border-box;
 }
 .missionlens .steprow.s-running .sring {
-  border-color: var(--ml-run);
+  border-color: var(--status-color);
   animation: var(--beat);
 }
 .missionlens .steprow.s-complete .sring {
-  border-color: var(--good);
+  border-color: var(--status-color);
 }
 .missionlens .steprow.s-error .sring {
-  border-color: var(--bad);
+  border-color: var(--status-color);
 }
 .missionlens .steprow.s-abandoned .sring {
-  border-color: var(--dim);
-  opacity: 0.55;
+  border-color: var(--status-color);
 }
 .missionlens .steprow .slead {
   flex: 0 0 auto;
@@ -7303,10 +7313,10 @@ body {
   white-space: nowrap;
 }
 .missionlens .steprow.s-running .sname {
-  color: var(--ml-run);
+  color: var(--status-color);
 }
 .missionlens .steprow.s-error .sname {
-  color: var(--bad);
+  color: var(--status-color);
 }
 .missionlens .steprow .smodel {
   flex: 0 1 auto;
@@ -7351,14 +7361,14 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: var(--ml-run);
+  color: var(--status-running);
   font-weight: 700;
 }
 .missionlens .mn-step-meter .genpulse {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--ml-run);
+  background: var(--status-running);
   animation: var(--beat);
 }
 .missionlens .mnode .steprow {
@@ -7495,27 +7505,27 @@ body {
   background: var(--border);
 }
 .missionlens .tlphase.s-running .tlph-dot {
-  background: var(--ml-run);
+  background: var(--status-color);
   animation: var(--beat);
 }
 /* (#2343) See `.mnode.s-waiting` — a solid dim dot, and pointedly NOT
    `var(--beat)`: nothing is executing, so nothing pulses. */
 .missionlens .tlphase.s-waiting .tlph-dot {
-  background: var(--dim);
+  background: var(--status-color);
 }
 .missionlens .tlphase.s-complete .tlph-dot {
-  background: var(--good);
+  background: var(--status-color);
 }
 .missionlens .tlphase.s-error .tlph-dot {
-  background: var(--bad);
+  background: var(--status-color);
 }
 /* (#2406) Same reasoning as `.phasegroup.s-degraded` above: warn color,
    full opacity — a degraded phase shipped real output. */
 .missionlens .tlphase.s-degraded .tlph-dot {
-  background: var(--warn);
+  background: var(--status-color);
 }
-.missionlens .tlphase.s-abandoned {
-  opacity: 0.6;
+.missionlens .tlphase.s-abandoned .tlph-dot {
+  background: var(--status-color);
 }
 .missionlens .tlphase .tlph-hd .tlph-name {
   font: 600 calc(13px * var(--fs-scale))/1.3 var(--font-mono);
@@ -7529,7 +7539,6 @@ body {
   font: calc(10px * var(--fs-scale))/1 var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--dim);
 }
 /* (#2406, post-review) The task-count breakdown, as REAL TEXT rather than
    a `title=` — tooltips do not exist on touch, and this viewer is driven
@@ -7592,35 +7601,38 @@ body {
   background: var(--border);
 }
 .missionlens .tltask.s-running {
-  border-color: var(--ml-run);
+  border-color: var(--status-color);
 }
 .missionlens .tltask.s-running .tlt-dot {
-  background: var(--ml-run);
+  background: var(--status-color);
   animation: var(--beat);
 }
 .missionlens .tltask.s-running .tlt-name {
-  color: var(--ml-run);
+  color: var(--status-color);
 }
 /* (#2343) See `.mnode.s-waiting`. The task card renders no status WORD of
    its own (unlike the phase header, which carries a `WorkStatus` chip), so
    without this rule a waiting task was pixel-identical to a planned one. */
 .missionlens .tltask.s-waiting {
-  border-color: var(--dim);
+  border-color: var(--status-color);
 }
 .missionlens .tltask.s-waiting .tlt-dot {
-  background: var(--dim);
+  background: var(--status-color);
 }
 .missionlens .tltask.s-complete {
-  border-color: var(--good);
+  border-color: var(--status-color);
 }
 .missionlens .tltask.s-complete .tlt-dot {
-  background: var(--good);
+  background: var(--status-color);
 }
 .missionlens .tltask.s-error {
-  border-color: var(--bad);
+  border-color: var(--status-color);
 }
 .missionlens .tltask.s-abandoned {
-  opacity: 0.6;
+  border-color: var(--status-color);
+}
+.missionlens .tltask.s-abandoned .tlt-dot {
+  background: var(--status-color);
 }
 .missionlens .tltask .tlt-name {
   grid-area: name;

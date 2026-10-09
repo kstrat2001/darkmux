@@ -216,6 +216,7 @@ DebriefPhase
   description: string
   status: DebriefPhaseStatus
   reason: string | null
+  abandoned_reason?: AbandonReason | null
 DebriefPhaseStatus = "planned" | "running" | "complete" | "degraded" | "abandoned" | "unknown"
 DebriefReport
   mission: DebriefMission
@@ -433,6 +434,7 @@ GraphNode
   description?: string | null
   steps?: StepRow[] | null
   statusNote?: string | null
+  abandonedReason?: AbandonReason | null
 GraphNodeStatus = TaskDisplayStatus | PhaseDisplayStatus
 Grown
   phase: string
@@ -1119,6 +1121,7 @@ StepRow
   turnsFinal?: uint64 | null
   model?: string | null
   error?: string | null
+  abandonedReason?: AbandonReason | null
 StrayDrainOutput
   file: string
   to: string

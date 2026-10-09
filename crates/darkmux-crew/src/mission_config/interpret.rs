@@ -524,6 +524,7 @@ fn push_step(
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     };
     // (#1284 review round 2, consider 5) The steps BTreeMap would silently
     // keep exactly one of two same-id steps — detect the collision on the

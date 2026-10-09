@@ -339,6 +339,15 @@ pub(crate) fn run_bookend_record(
 
 
 
+/// The gate-less finish's `run.complete`/`run.error` payload: whether the run
+/// did what it was launched to do, and its outcome status as it renders. The
+/// lifecycle rule reads a `run.complete` whose status is
+/// [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row reads its
+/// `Degraded` envelope, so the spelling here is that constant's.
+fn run_close_payload(status: crew::envelope::MissionOutcomeStatus, ok: bool) -> RunPayload {
+    RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(ok) }
+}
+
 /// (#3087 review) Close the run's open bookend with `run.error` carrying the
 /// launch's own error text, so a post-mint refusal reads as what it was
 /// rather than as the Drop backstop's "terminated before completion".
@@ -1862,7 +1871,7 @@ pub fn launch(
             if exit_code == 0 { flow::Edge::Complete } else { flow::Edge::Error },
             config_id,
             &run,
-            RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(exit_code == 0) },
+            run_close_payload(status, exit_code == 0),
         ),
     );
     // (#2131) A no-op unless a signal was actually observed.
@@ -4198,12 +4207,23 @@ fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::Ph
             PhaseOutcomeKind::Degraded,
             Some(format!("{completed} of {total} task(s) completed, {errored} errored, {abandoned} abandoned")),
         )
-    } else if errored > 0 {
-        (PhaseOutcomeKind::Abandoned, Some(format!("{errored} task(s) errored")))
-    } else if !any_started {
-        (PhaseOutcomeKind::Abandoned, Some("phase never started (scheduler did not reach it)".to_string()))
     } else {
-        (PhaseOutcomeKind::Abandoned, Some("phase did not complete (steps left non-terminal)".to_string()))
+        (PhaseOutcomeKind::Abandoned, Some(abandoned_phase_reason(phase_steps, errored, any_started)))
+    }
+}
+
+/// Why a phase that did not complete is abandoned, most specific first.
+fn abandoned_phase_reason(phase_steps: &[&crew::types::Step], errored: usize, any_started: bool) -> String {
+    if let Some(stop) = phase_steps.iter().find(|s| s.stopped_by_operator()).and_then(|s| s.stop_reason.as_deref()) {
+        // An operator's stop ended this phase's work: say so, not "errored"
+        // or "steps left non-terminal".
+        format!("stopped by the operator ({stop})")
+    } else if errored > 0 {
+        format!("{errored} task(s) errored")
+    } else if !any_started {
+        "phase never started (scheduler did not reach it)".to_string()
+    } else {
+        "phase did not complete (steps left non-terminal)".to_string()
     }
 }
 
@@ -4289,6 +4309,20 @@ fn launch_outcome_warning(errored: usize, never_ran: usize, total: usize) -> Opt
     }
 }
 
+/// The steps an operator's stop ended (`Step::stopped_by_operator`): abandoned,
+/// so they are in the never-ran bucket, but they did not simply never run, and
+/// the warning says so rather than "never ran".
+fn stopped_steps(steps: &BTreeMap<String, crew::types::Step>) -> Vec<&crew::types::Step> {
+    steps.values().filter(|s| s.stopped_by_operator()).collect()
+}
+
+/// The one-line warning for the steps an operator's stop ended, naming the
+/// stop. `None` when none was.
+fn stopped_warning(stopped: &[&crew::types::Step], total: usize) -> Option<String> {
+    let reason = stopped.first()?.stop_reason.as_deref().unwrap_or("interrupted");
+    Some(format!("{} of {total} step(s) stopped by the operator ({reason})", stopped.len()))
+}
+
 /// Append the steps a scheduler pass reported as completed-but-degraded.
 fn collect_degraded(
     result: &Result<crew::scheduler::SchedulerReport>,
@@ -4349,7 +4383,9 @@ fn build_envelope(
     // old guard also required a completed step, so a run that errored
     // everything carried no warning at all. (F2) Only the non-zero halves
     // are named; see `launch_outcome_warning`.
-    envelope.warnings.extend(launch_outcome_warning(errored.len(), never_ran.len(), steps.len()));
+    let stopped = stopped_steps(steps);
+    envelope.warnings.extend(launch_outcome_warning(errored.len(), never_ran.len() - stopped.len(), steps.len()));
+    envelope.warnings.extend(stopped_warning(&stopped, steps.len()));
     // A degraded step is `Complete`, so the counts above never see it; each
     // names its own reason, so the envelope says which step lost what.
     envelope.warnings.extend(degraded.iter().map(|d| format!("step `{}` completed degraded: {}", d.step_id, d.reason)));
@@ -4622,7 +4658,9 @@ fn finalize_reconciled_mission(
     let mut reconciled = 0usize;
     for step in steps.values_mut() {
         if step.status == NodeStatus::Running {
-            step.status = NodeStatus::Error;
+            // An operator's stop ends it abandoned (aborted), anything else
+            // an error: the one decider the scheduler's terminal reads too.
+            step.end_unfinished();
             if step.output.is_none() {
                 step.output = Some(reconciled_step_output());
             }
@@ -4651,8 +4689,8 @@ fn finalize_reconciled_mission(
     envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
     envelope.reason = Some(wall_clock_bound_reason(status, &tally).unwrap_or(reason));
     if reconciled > 0 {
-        envelope.warnings =
-            vec![format!("{reconciled} running step(s) reconciled to error on the failure path")];
+        let ended = if darkmux_types::interrupt::stop_reason().is_some() { "abandoned (the operator stopped the run)" } else { "error" };
+        envelope.warnings = vec![format!("{reconciled} running step(s) reconciled to {ended} on the failure path")];
     }
     // (F2, from #2374's review) The SAME three buckets the happy path
     // reports, off the same helper. This path omitted `abandoned_steps`
@@ -4665,9 +4703,9 @@ fn finalize_reconciled_mission(
     // path emits, so an operator reading `warnings` learns about the steps
     // that never ran on the path where that is most common — not only a
     // reader of the payload key.
-    if let Some(w) = launch_outcome_warning(errored.len(), never_ran.len(), steps.len()) {
-        envelope.warnings.push(w);
-    }
+    let stopped = stopped_steps(steps);
+    envelope.warnings.extend(launch_outcome_warning(errored.len(), never_ran.len() - stopped.len(), steps.len()));
+    envelope.warnings.extend(stopped_warning(&stopped, steps.len()));
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
         "errored_steps": errored,
@@ -4918,6 +4956,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -5186,6 +5225,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some(output.to_string()),
+                stop_reason: None,
             };
             let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
             run_summary_payload(&cfg, &real_phase_ids, std::slice::from_ref(&task), &steps)
@@ -5256,6 +5296,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: Some(body.to_string()),
+            stop_reason: None,
         };
         let steps: BTreeMap<String, Step> = [
             ("first-step".to_string(), mk_step("first-step", "first-task", r#"{"from":"first"}"#)),
@@ -5338,6 +5379,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: Some(r#"{"from":"live"}"#.to_string()),
+            stop_reason: None,
         };
         let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
 
@@ -6557,6 +6599,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         );
 
@@ -6631,6 +6674,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         );
         let registry = crew::step_kinds::StepKindRegistry::with_builtins();
@@ -6860,6 +6904,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -7804,6 +7849,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         crew::lifecycle::save_step(mission_id, &order[0], &step).unwrap();
 
@@ -7857,6 +7903,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let errored_step = crew::types::Step {
             id: format!("{}-s2", order[0]),
@@ -7868,6 +7915,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         crew::lifecycle::save_step(mission_id, &order[0], &complete_step).unwrap();
         crew::lifecycle::save_step(mission_id, &order[0], &errored_step).unwrap();
@@ -8809,6 +8857,57 @@ mod tests {
         assert_eq!(persisted.status, MissionOutcomeStatus::Error, "a hard scheduler Err finalizes to Error status");
     }
 
+    /// A step still running when an operator's signal reached the launcher's
+    /// failure path was reconciled to Error and read "error" on every node
+    /// view under a run whose row read aborted. It ends abandoned naming the
+    /// stop (`Step::end_unfinished`, the scheduler's own decider), and the
+    /// steps the run never reached name it too (the phase-exit sweep).
+    #[test]
+    #[serial_test::serial]
+    fn reconcile_after_an_operator_stop_abandons_the_running_step_naming_the_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3stop";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+        seed_mission_with_phases(
+            mid,
+            &[(&rp1, PhaseStatus::Running), (&rp2, PhaseStatus::Running), (&rp3, PhaseStatus::Planned)],
+        );
+        let tasks =
+            vec![task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step"), task_with_step(&rp3, "p3-step")];
+        let mut steps = BTreeMap::new();
+        steps.insert("p1-step".to_string(), scripted_step("p1-step", NodeStatus::Complete));
+        steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Running));
+        steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
+        for t in &tasks {
+            for sid in &t.step_ids {
+                crew::lifecycle::save_step(mid, &t.phase_id, &steps[sid]).unwrap();
+            }
+        }
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        let err = anyhow::anyhow!("{}: before wave", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL);
+        reconcile_and_finalize_on_error(mid, &config, &real, &tasks, &mut steps, &err);
+        darkmux_types::interrupt::reset_for_test();
+        let on_disk = |phase: &str, id: &str| {
+            let s = crew::lifecycle::load_step(mid, phase, id).unwrap();
+            (s.status, s.stop_reason)
+        };
+        let stopped = (NodeStatus::Abandoned, Some("SIGTERM".to_string()));
+        assert_eq!(on_disk(&rp2, "p2-step"), stopped, "the running step");
+        assert_eq!(on_disk(&rp3, "p3-step"), stopped, "the step the run never reached");
+        assert_eq!(on_disk(&rp1, "p1-step"), (NodeStatus::Complete, None), "the completed step");
+        let persisted = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
+        assert!(
+            persisted.warnings.iter().any(|w| w.contains("stopped by the operator (SIGTERM)")),
+            "{:?}",
+            persisted.warnings
+        );
+    }
+
     /// (F2, from #2374's review) The failure path's envelope must name the
     /// steps that NEVER RAN, same as the happy path. `p3-step` is
     /// `Planned` when the scheduler `Err`s — a step the config declared
@@ -9075,6 +9174,33 @@ mod tests {
     /// (F2, from #2374's review) The warning names only the halves that
     /// happened. Leading with "0 of 2 step(s) errored" on the COMMON
     /// abandoned-only case pointed the eye at a zero.
+    /// A phase and a run an operator stopped say so: the phase's envelope
+    /// reason read "1 task(s) errored" (or "steps left non-terminal" once the
+    /// step was abandoned) and the run's warning said the step "never ran".
+    #[test]
+    fn a_phase_and_a_run_an_operator_stopped_say_so() {
+        let mut step = Step {
+            id: "s1".into(),
+            task_id: "t1".into(),
+            gate: None,
+            kind: "dispatch.internal".into(),
+            status: NodeStatus::Abandoned,
+            config: serde_json::Value::Null,
+            started_ts: Some(1),
+            completed_ts: Some(2),
+            output: Some("hosted dispatch interrupted".into()),
+            stop_reason: Some("SIGTERM".into()),
+        };
+        let (outcome, reason) = phase_finalization(&[&step]);
+        assert_eq!((outcome, reason.as_deref()), (crew::envelope::PhaseOutcomeKind::Abandoned, Some("stopped by the operator (SIGTERM)")));
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step.clone())].into();
+        let stopped = stopped_steps(&steps);
+        assert_eq!(stopped_warning(&stopped, 1).as_deref(), Some("1 of 1 step(s) stopped by the operator (SIGTERM)"));
+        step.stop_reason = None;
+        let steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into();
+        assert!(stopped_steps(&steps).is_empty(), "an abandoned step no stop ended is not a stopped one");
+    }
+
     #[test]
     fn the_launch_warning_omits_a_zero_clause() {
         assert_eq!(launch_outcome_warning(0, 0, 3), None, "a clean run carries no warning");
@@ -9114,6 +9240,18 @@ mod tests {
             // The action names the grain; nothing else has to.
             assert_eq!(rec.source, None);
         }
+    }
+
+    /// A run cut off by its own wall-clock bound closes `run.complete` with its
+    /// `Degraded` status; the lifecycle rule (both executors) reads that
+    /// spelling as degraded, as the run's row reads its envelope. A clean run
+    /// does not.
+    #[test]
+    fn a_degraded_runs_close_payload_reads_degraded() {
+        use crew::envelope::MissionOutcomeStatus as S;
+        assert!(run_close_payload(S::Degraded, true).is_degraded());
+        assert!(!run_close_payload(S::Clean, true).is_degraded());
+        assert!(!run_close_payload(S::Error, false).is_degraded());
     }
 
     // ── #1877 QA must-fix 3 — the coder branch's terminal bookend must ──
@@ -9481,6 +9619,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let mut steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
         let tasks: BTreeMap<String, crew::types::Task> = [(task.id.clone(), task)].into_iter().collect();
@@ -9668,6 +9807,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -9846,6 +9986,7 @@ mod tests {
                     started_ts: None,
                     completed_ts: None,
                     output: None,
+                    stop_reason: None,
                 },
             );
         }
@@ -9918,6 +10059,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some(plan_path.to_string_lossy().to_string()),
+                stop_reason: None,
             },
         );
 

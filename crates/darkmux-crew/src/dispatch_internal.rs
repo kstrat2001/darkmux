@@ -4829,12 +4829,13 @@ impl DispatchStop {
 }
 
 /// The terminal record's payload and level for a container dispatch: a clean
-/// exit is a `dispatch.complete` at info, any other a `dispatch.error`.
+/// exit is a `dispatch.complete` at info, any other a `dispatch.error`. The
+/// one rule is `ResultClass::of_exit`, which a `darkmux dispatch` run's own
+/// envelope reads too (`dispatch_as_crew_of_one`).
 fn terminal_payload(exit_code: i32, payload: DispatchEndPayload) -> (darkmux_flow::Payload, darkmux_flow::Level) {
-    if exit_code == 0 {
-        (darkmux_flow::Payload::DispatchComplete(payload), darkmux_flow::Level::Info)
-    } else {
-        (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error)
+    match ResultClass::of_exit(exit_code) {
+        ResultClass::Ok => (darkmux_flow::Payload::DispatchComplete(payload), darkmux_flow::Level::Info),
+        ResultClass::Error | ResultClass::Unknown => (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error),
     }
 }
 
@@ -8560,7 +8561,7 @@ fn build_dispatch_complete_payload(
         stderr_excerpt: (exit_code != 0)
             .then(|| crate::dispatch::tail_excerpt(stderr, crate::dispatch::STDERR_EXCERPT_MAX)),
         exit_code: Some(i64::from(exit_code)),
-        result_class: Some(if exit_code == 0 { ResultClass::Ok } else { ResultClass::Error }),
+        result_class: Some(ResultClass::of_exit(exit_code)),
         total_tools: Some(fold.tool_calls() as u64),
         // (#2169) What `total_tools` alone conflated: a dispatched call that
         // came back `ok: false`, versus structured calls that never ran,

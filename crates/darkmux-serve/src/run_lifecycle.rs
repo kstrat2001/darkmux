@@ -26,6 +26,10 @@
 //! 3. Outcome. A bookend terminal (`run.complete` / `run.error`,
 //!    `dispatch.complete` / `dispatch.error`) is the outcome when the
 //!    attempt has one, even when a `session.end` closed it first.
+//!    A terminal that names the operator's stop (a `budget.stop`'s
+//!    `reason`, a `dispatch.error`'s, `run.error`'s or `step.error`'s `stop_reason`) is
+//!    abandoned as aborted, never an error; a `run.complete` whose status
+//!    is `Degraded` is degraded.
 //! 4. Waiting. An open `budget.wait` holds the attempt live until its
 //!    announced resume time plus the grace; the staleness clock then runs
 //!    from there.
@@ -62,10 +66,14 @@ struct Folded {
     ts: String,
     /// Its `ts` as epoch seconds; `None` when unparsable.
     at: Option<u64>,
-    /// Whether the payload names a non-empty `reason`: every reason a
-    /// `budget.stop` producer writes is an operator's stop (an interrupt,
-    /// `mission abort`/`finalize`, an abandoned phase).
+    /// Whether the payload names the operator's stop: a `budget.stop`'s
+    /// non-empty `reason` (every reason its producers write is an operator's
+    /// stop: an interrupt, `mission abort`/`finalize`, an abandoned phase), or
+    /// a `dispatch.error`'s, `run.error`'s or `step.error`'s non-empty `stop_reason` (a caught
+    /// signal).
     names_a_reason: bool,
+    /// A `run.complete` whose status says the run completed degraded.
+    degraded: bool,
     /// A `budget.wait`'s announced wait, milliseconds.
     wait_ms: u64,
     /// A `step.complete` that names a later step of its task still planned: the task's session
@@ -75,12 +83,17 @@ struct Folded {
 
 impl Folded {
     fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
+        let named = |r: &Option<String>| r.as_deref().is_some_and(|r| !r.is_empty());
         let (names_a_reason, wait_ms, later_step_planned) = match darkmux_flow::reader::payload_of(v) {
-            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0, false),
+            Some(darkmux_flow::Payload::BudgetStop(p)) => (named(&p.reason), 0, false),
+            Some(darkmux_flow::Payload::DispatchError(p)) => (named(&p.stop_reason), 0, false),
+            Some(darkmux_flow::Payload::RunError(p)) => (named(&p.stop_reason), 0, false),
+            Some(darkmux_flow::Payload::StepError(p)) => (named(&p.stop_reason), 0, false),
             Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
             Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
             _ => (false, 0, false),
         };
+        let degraded = matches!(darkmux_flow::reader::payload_of(v), Some(darkmux_flow::Payload::RunComplete(p)) if p.is_degraded());
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
@@ -88,6 +101,7 @@ impl Folded {
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason,
+            degraded,
             wait_ms,
             later_step_planned,
         }
@@ -99,7 +113,7 @@ impl Folded {
         if *action == FlowAction::StepComplete && self.later_step_planned {
             return None;
         }
-        ending_of(action, self.names_a_reason)
+        ending_of(action, self.names_a_reason, self.degraded)
     }
 
     /// A bookend terminal: the outcome over any other close (rule 3).
@@ -108,25 +122,53 @@ impl Folded {
     }
 }
 
+/// The ending a closing record implies (rule 2), read off its action and
+/// payload: the one reading every fold shares (a session's attempts, a
+/// peer's mission row). `None` for a record that closes nothing.
+pub(crate) fn ending_of_record(v: &serde_json::Value) -> Option<Ending> {
+    let action = darkmux_flow::reader::action_of(v)?;
+    Folded::of(Some(&action), None, "", v).ending()
+}
+
 /// The ending `action` implies when it is a closing record (rule 2).
-/// `names_a_reason` is a `budget.stop`'s payload fact.
-pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
+/// `names_a_reason` is the payload's naming of an operator's stop (a
+/// `budget.stop`'s `reason`, a `dispatch.error`'s or `run.error`'s
+/// `stop_reason`): a terminal that names one is the operator's stop, abandoned
+/// as aborted, not a failure. `degraded`: a `run.complete` whose status says
+/// the run completed degraded (its own wall-clock bound, a degraded step),
+/// which the run's row reads as degraded too.
+pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool, degraded: bool) -> Option<Ending> {
+    action
+        .bookend()
+        .and_then(|b| bookend_ending(&b.edge, names_a_reason, degraded))
+        .or_else(|| closing_ending(action, names_a_reason))
+}
+
+/// A bookend terminal's ending; `None` for a start, which ends nothing.
+fn bookend_ending(edge: &Edge, names_a_reason: bool, degraded: bool) -> Option<Ending> {
+    let (status, reason) = match edge {
+        Edge::Complete if degraded => (RunStatus::Degraded, None),
+        Edge::Complete => (RunStatus::Complete, None),
+        Edge::Error if names_a_reason => (RunStatus::Abandoned, Some(AbandonReason::Aborted)),
+        Edge::Error => (RunStatus::Error, None),
+        Edge::Start => return None,
+    };
+    Some(Ending { status, reason })
+}
+
+/// The ending a closing record that is not a bookend implies.
+fn closing_ending(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
     let ended = |status, reason| Some(Ending { status, reason });
-    match action.bookend().map(|b| b.edge) {
-        Some(Edge::Complete) => return ended(RunStatus::Complete, None),
-        Some(Edge::Error) => return ended(RunStatus::Error, None),
-        Some(Edge::Start) | None => {}
-    }
     if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
         return ended(RunStatus::Complete, None);
     }
-    if *action == FlowAction::StepError {
+    if *action == FlowAction::StepError && !names_a_reason {
         return ended(RunStatus::Error, None);
     }
     if *action == FlowAction::SessionEnd {
         return ended(RunStatus::Abandoned, Some(AbandonReason::NoTerminal));
     }
-    if *action == FlowAction::MissionAbort || (*action == FlowAction::BudgetStop && names_a_reason) {
+    if *action == FlowAction::MissionAbort || (matches!(action, FlowAction::BudgetStop | FlowAction::StepError) && names_a_reason) {
         return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted));
     }
     (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
@@ -357,6 +399,23 @@ pub(crate) fn quiet_clock_live(last_activity_ts: Option<&str>, wait_until_ms: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operator's stop reads the same on every terminal that names it:
+    /// `step.error` carries `stop_reason` as `dispatch.error` and `run.error`
+    /// do, so a step a person stopped is abandoned as aborted from the flow
+    /// alone, as its row reads it. One that names no stop is an error.
+    #[test]
+    fn every_terminal_naming_the_operators_stop_reads_aborted() {
+        let rec = |action: &str, payload: serde_json::Value| serde_json::json!({"action": action, "payload": payload});
+        let aborted = Some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::Aborted) });
+        let error = Some(Ending { status: RunStatus::Error, reason: None });
+        for action in ["dispatch.error", "run.error", "step.error"] {
+            // `cause` is `step.error`'s required field; the others ignore it.
+            let stopped = serde_json::json!({"cause": "interrupted", "stop_reason": "SIGTERM"});
+            assert_eq!(ending_of_record(&rec(action, stopped)), aborted, "{action} naming a stop");
+            assert_eq!(ending_of_record(&rec(action, serde_json::json!({"cause": "boom"}))), error, "{action} naming none");
+        }
+    }
 
     fn fold(f: &mut RunFold, action: FlowAction, mission: &str, ts: &str) {
         f.fold(Some(&action), Some(mission), ts, &serde_json::json!({}));

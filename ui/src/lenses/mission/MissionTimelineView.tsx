@@ -9,7 +9,7 @@
  */
 import type { StepPhases } from "./graph";
 import { StepMeterEl, StepRow } from "./StepRow";
-import { WorkStatus } from "../../components/WorkStatus";
+import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { groupTimeline, type TaskAggMetrics } from "./timeline";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
 import { onIntentClick } from "../../lib/clickIntent";
@@ -40,7 +40,7 @@ function TaskCard({
   onSelectStep?: (stepId: string) => void;
 }) {
   return (
-    <div className={`tltask s-${task.status}${open ? " open" : ""}`}>
+    <div className={`tltask s-${task.status}${open ? " open" : ""}`} data-status-kind={workStatusKind(task.status, task.abandonedReason)}>
       <div
         className="tlt-hd"
         role="button"
@@ -115,13 +115,13 @@ export function MissionTimelineView({
     <div className="timeline missionlens__timeline">
       {note ? <div className="tlnote">{note}</div> : null}
       {groups.map(({ phase, tasks }) => (
-        <div key={phase.id} className={`tlphase s-${phase.status}`}>
+        <div key={phase.id} className={`tlphase s-${phase.status}`} data-status-kind={workStatusKind(phase.status, phase.abandonedReason)}>
           <div className="tlph-hd">
             <span className="tlph-dot" />
             <span className="tlph-name" title={phase.description || phase.label}>
               {phase.label}
             </span>
-            <WorkStatus status={phase.status} className="tlph-tag" />
+            <WorkStatus status={phase.status} abandonReason={phase.abandonedReason} className="tlph-tag" />
             {/* (#2406, post-review) The counts breakdown ("7 complete · 1
                errored · 4 running") renders as REAL TEXT, not a `title=`:
                tooltips do not exist on touch and this viewer is driven from

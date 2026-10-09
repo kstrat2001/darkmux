@@ -3761,6 +3761,7 @@ line two
                         started_ts: None,
                         completed_ts: None,
                         output: None,
+                        stop_reason: None,
                     },
                 )
                 .unwrap();
@@ -3926,6 +3927,7 @@ line two
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = darkmux_crew::types::Task {
             id: "deliver".into(),
@@ -3960,6 +3962,7 @@ line two
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input, &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let payload: darkmux_crew::step_kinds::DeliverOutcome =

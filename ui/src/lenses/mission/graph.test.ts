@@ -268,6 +268,19 @@ describe("statusFromRecord / applyFlowRecord", () => {
     expect(g.nodes[1].status).toBe("running"); // untouched by the step flip
   });
 
+  // A step an operator's signal ended is abandoned, aborted (its `step.error`
+  // names the stop), the word the run's row and the daemon's graph give it.
+  // It flipped to "error" on the live tail.
+  it("a step.error naming an operator's stop flips the row to abandoned, aborted; one naming none to error", () => {
+    const idx = indexGraph(baseGraph());
+    const running = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, status: "running" as const, steps: [{ ...TASK_A.steps![0], status: "running" as const }] }, TASK_B] };
+    const stopped = applyFlowRecord(running, rec({ action: "step.error", handle: "a-step", payload: { cause: "interrupted", stop_reason: "SIGTERM" } }), idx, "m1");
+    expect(stopped.nodes[1].steps![0]).toMatchObject({ status: "abandoned", abandonedReason: "aborted" });
+    const failed = applyFlowRecord(running, rec({ action: "step.error", handle: "a-step", payload: { cause: "boom" } }), idx, "m1");
+    expect(failed.nodes[1].steps![0].status).toBe("error");
+    expect(failed.nodes[1].steps![0].abandonedReason).toBeUndefined();
+  });
+
   it("a record stamped for a DIFFERENT mission never flips this mission's status", () => {
     const idx = indexGraph(baseGraph());
     const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1", mission_id: "other-mission" }), idx, "m1");

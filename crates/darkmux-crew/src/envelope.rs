@@ -195,7 +195,13 @@ use serde::{Deserialize, Serialize};
 /// run wall-clock. Additive + `Option` + `skip_serializing_if` ⇒ MINOR by
 /// the documented rule; an older reader ignores the field, and an older
 /// envelope deserializes with `wall_ms: None`.
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.5";
+///
+/// 1.5 -> 1.6: added the optional [`MissionEnvelope::stop_reason`], the
+/// operator's stop that ended the run. Additive + `Option` +
+/// `skip_serializing_if` ⇒ MINOR: an older reader ignores it and reads the
+/// envelope's `status` (`Error`) as before; an older envelope deserializes
+/// with `stop_reason: None`.
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.6";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
@@ -574,6 +580,17 @@ pub struct MissionEnvelope {
     /// mission still `Active`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// (schema 1.6) The operator's stop that ended the run, named (`SIGINT`,
+    /// `SIGTERM`, `SIGHUP`, or `interrupted` when a host raised its own
+    /// interrupt): the same fact and spelling the run's `run.error` and its
+    /// executions' `dispatch.error` carry as `stop_reason`, from the same
+    /// decider (`darkmux_types::interrupt::stop_reason`, never the run's own
+    /// wall-clock bound). [`finalize_mission_with_payload`] stamps it on an
+    /// envelope that did not end clean, so the run's row (`darkmux run list`,
+    /// the runs board) reads the run as aborted, as the flow's lifecycle rule
+    /// does. `None`: darkmux did not record a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl MissionEnvelope {
@@ -607,6 +624,8 @@ impl MissionEnvelope {
             // (#2678) Not measured at construction — the launcher stamps it
             // from its own `Instant` once the run has actually finished.
             wall_ms: None,
+            // Stamped at finalization, when the run has ended.
+            stop_reason: None,
         }
     }
 
@@ -734,6 +753,15 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
     finalize_mission_with_payload(envelope, None)
 }
 
+/// The run ends here: an ending that is not clean, while the operator has
+/// stopped this process, is that stop (the one decider, the same one the
+/// run's `run.error` and its executions' `dispatch.error` name it from).
+fn stamp_operator_stop(envelope: &mut MissionEnvelope) {
+    if envelope.stop_reason.is_none() && envelope.status != MissionOutcomeStatus::Clean {
+        envelope.stop_reason = darkmux_types::interrupt::stop_reason().map(str::to_string);
+    }
+}
+
 /// (#2301) [`finalize_mission`] with a `mission close` PAYLOAD.
 ///
 /// A generic graph's last phase can produce a run summary (the crawl's
@@ -750,6 +778,7 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
     // function only ever needed a shared borrow, so this clone changes
     // nothing about the finalize decision itself, only what gets saved.
     let mut envelope = envelope.clone();
+    stamp_operator_stop(&mut envelope);
     for phase in &envelope.phases {
         let result = match phase.outcome {
             // (#2406) `Degraded` drives the phase to the SAME lifecycle
@@ -1069,6 +1098,41 @@ mod tests {
     fn mission_status(mission_id: &str) -> MissionStatus {
         let text = std::fs::read_to_string(lifecycle::mission_path(mission_id)).unwrap();
         serde_json::from_str::<Mission>(&text).unwrap().status
+    }
+
+    /// The run's row reads its ending off the envelope, so the envelope must
+    /// name the operator's stop the run's own terminals name. A `darkmux
+    /// dispatch` stopped with SIGTERM finalized an `Error` envelope that said
+    /// nothing of the stop: its row read "error" while its execution's
+    /// `dispatch.error` named the stop and read "aborted", so the run page and
+    /// the timeline bar answered differently with and without the row. Any
+    /// ending that is not clean names the stop; a clean one never does.
+    #[serial_test::serial]
+    #[test]
+    fn an_envelope_finalized_after_an_operator_stop_names_the_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let _g = CrewGuard::new();
+        darkmux_types::interrupt::reset_for_test();
+        let stop_of = |id: &str, status| {
+            seed_mission(id);
+            finalize_mission(&MissionEnvelope::new(id, status, &[]));
+            lifecycle::load_envelope(id).unwrap().unwrap().stop_reason
+        };
+        let before = stop_of("m-before", MissionOutcomeStatus::Error);
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        let error = stop_of("m-error", MissionOutcomeStatus::Error);
+        let degraded = stop_of("m-degraded", MissionOutcomeStatus::Degraded);
+        let clean = stop_of("m-clean", MissionOutcomeStatus::Clean);
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::mark_bound_exceeded();
+        let bound = stop_of("m-bound", MissionOutcomeStatus::Degraded);
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!(before, None, "nothing stopped the process yet");
+        assert_eq!(error.as_deref(), Some("SIGTERM"));
+        assert_eq!(degraded.as_deref(), Some("SIGTERM"), "a crew-of-one dispatch the stop cut short (a non-zero exit) is Degraded");
+        assert_eq!(clean, None, "a clean end is never a stop");
+        assert_eq!(bound, None, "the run's own bound is not the operator's stop");
     }
 
     #[serial_test::serial]

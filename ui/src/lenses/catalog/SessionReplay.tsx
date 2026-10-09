@@ -7,14 +7,14 @@ import { LampForm } from "../../lib/lamp";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
-import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, judgementAt, lifecycleAt, ownRowOf, shownRunState, type Lifecycle, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
-import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
+import { sessionRouteRecords, sessionRun, type Grain } from "../../lib/runRef";
 import { CATEGORY, ingest, isBookendStart, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
@@ -32,7 +32,7 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import type { Run } from "../../types/generated/Run";
 import type { RunRelay } from "../../types/generated/RunRelay";
-import { useRunRow } from "../../hooks/useRunRow";
+import { useRunRow, useRunRows } from "../../hooks/useRunRow";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
@@ -501,6 +501,38 @@ function useRunSilence(hasRecords: boolean, row: Run | null, endedByPresence: bo
   return { notReporting, stopped: endedByPresence || (hasRecords && notReporting) };
 }
 
+/** The grain of the page's run, `null` when there is none. */
+function grainOf(run: { group: { grain: Grain } } | null): Grain | null {
+  return run?.group.grain ?? null;
+}
+
+/** Running as the page shows it (`shownRunState`): at the live edge a row the
+ * daemon lists decides, and presence seeing the session go does not outrank
+ * it (a lab run verifies after its dispatch session ends); only a silent
+ * machine stops it. Without a row, the lifecycle's own reading, stopped by
+ * presence or a silent machine. */
+function plausiblyRunningOf(l: Lifecycle | null, row: Run | null, live: boolean, silentMachine: boolean, stopped: boolean): boolean {
+  if (l === null) return false;
+  const rowDecides = row !== null && live;
+  return shownRunState(l, row, live).status === "running" && !(rowDecides ? silentMachine : stopped);
+}
+
+/** At the live edge, a run's row (`/runs`, polled every `PRESENCE_POLL_MS`)
+ *  can lag its flow terminal: the run closed, its row still reads in flight.
+ *  The row decides how the run ended, so the page never shows an ending of
+ *  its own; it asks the daemon again as the run closes, once per close,
+ *  rather than reading "running" for the rest of the poll. `closed`: a
+ *  closing record of this run has arrived (not a run gone quiet, which the
+ *  row's own staleness rule decides), at the live edge. */
+function useRowCatchUp(live: boolean, l: Lifecycle | null, row: Run | null): void {
+  const queryClient = useQueryClient();
+  const closed = live && l?.phase === "closed";
+  const lagging = closed && row !== null && (row.status === "running" || row.status === "planned");
+  useEffect(() => {
+    if (lagging) void queryClient.invalidateQueries({ queryKey: queryKeys.runs() });
+  }, [lagging, queryClient]);
+}
+
 export function SessionReplay({
   sessionId,
   missionId = null,
@@ -629,6 +661,9 @@ export function SessionReplay({
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   // The run's row on the board: a later step of a mission is found by its mission id.
   const runRow = useRunRow(sessionId, ownMissionId, playhead === null);
+  // The board's rows: the one whose run IS this session (a lab run, a
+  // dispatch, a mission's own run session) decides its status (`ownRow`, below).
+  const runRows = useRunRows(playhead === null);
   const relay = relayOf(runRow);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
@@ -729,12 +764,17 @@ export function SessionReplay({
   const wallNow = Date.now();
   const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
+  // The row whose run IS this session: the pill and the tiles show its
+  // status, decided once where the run ended, as the runs board does.
+  const ownRow = ownRowOf(runRows, sessionId, ownMissionId, grainOf(pageRun));
   // (5.0 R3) A run on a machine the fleet view holds as down has no live
   // evidence and no terminal record can arrive: it is not plausibly running,
   // so nothing ticks or pulses, and the pill says unknown.
   const { notReporting, stopped } = useRunSilence(hasRecords, runRow, endedByPresence);
-  const plausiblyRunning =
-    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !stopped;
+  const pageLifecycle = pageRun && lifecycleAt(pageRun, clockNow, policy, presence);
+  const atLiveEdge = playhead === null;
+  const plausiblyRunning = plausiblyRunningOf(pageLifecycle, ownRow, atLiveEdge, hasRecords && notReporting, stopped);
+  useRowCatchUp(atLiveEdge, pageLifecycle, ownRow);
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
@@ -830,7 +870,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid, notReporting);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid, notReporting, ownRow, playhead === null);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -852,6 +892,7 @@ export function SessionReplay({
             invisible on screen and unmissable to the golden. */}
         <WorkStatus
           status={view.header.status}
+          abandonReason={view.header.abandonReason}
           label={view.header.pillLabel}
           live={liveness.state}
           className="pill"

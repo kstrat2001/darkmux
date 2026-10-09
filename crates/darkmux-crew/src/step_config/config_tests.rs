@@ -330,6 +330,7 @@ fn a_config_that_is_not_an_object_is_refused_not_read_as_empty() {
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     };
     let err = load::<NoopConfig>(&step, ConfigKind::ProceduralNoop).map(|c| c.output).unwrap_err();
     assert!(err.to_string().contains("must be an object"), "{err}");

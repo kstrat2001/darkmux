@@ -52,9 +52,11 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
+import type { AbandonReason } from "../../types/generated/AbandonReason";
 import { computeTMax, type RunState } from "../../lib/flow";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
-import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, lifecycleAt, recordedActiveMs, recordedWallMs, shownRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import type { Run } from "../../types/generated/Run";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
@@ -106,6 +108,9 @@ interface SessionHeader {
   /** (#2813) The canonical run status; the pill's look reads it. `not_reporting` (5.0
    *  R3): the run reads running but the machine it ran on is not reporting. */
   status: RunBadgeStatus;
+  /** The reason beside an `abandoned` status (`aborted`: a person stopped
+   *  it), so the pill's color kind is the board chip's (`workStatusKind`). */
+  abandonReason?: AbandonReason;
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
@@ -620,9 +625,9 @@ interface RunContext {
   state: RunState;
 }
 
-function runContext(data: NormRecord[], sid: string, nowMs: number, policy: LifecyclePolicy, presence: Presence): RunContext {
+function runContext(data: NormRecord[], sid: string, nowMs: number, policy: LifecyclePolicy, presence: Presence, row: Run | null, live: boolean): RunContext {
   const run = sessionRun(data, sid, nowMs);
-  return run ? contextOf(run, lifecycleAt(run, nowMs, policy, presence), nowMs) : noRunContext(nowMs);
+  return run ? contextOf(run, lifecycleAt(run, nowMs, policy, presence), nowMs, row, live) : noRunContext(nowMs);
 }
 
 /** A session with no records in the window: nothing opened, nothing to
@@ -644,10 +649,15 @@ function noRunContext(nowMs: number): RunContext {
   };
 }
 
-function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
+function contextOf(run: RunRecords, l: Lifecycle, nowMs: number, row: Run | null, live: boolean): RunContext {
   const members = new Set<NormRecord>(run.attempt ? run.attempt.records : run.group.records);
   const firstSessRec = run.group.records[0] ?? null;
-  const done = !isRunning(l);
+  // The page is in flight while the run it shows is running: the shown state
+  // (the row's, when the daemon lists the run), not the flow's own close, so a
+  // lab run verifying after its dispatch ended keeps its clock and its pulse.
+  // Without a row this is the lifecycle's own `isRunning`.
+  const state = shownRunState(l, row, live);
+  const done = state.status !== "running";
   return {
     run,
     l,
@@ -657,7 +667,7 @@ function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
     inAttempt: (r) => members.has(r),
     endTs: done ? endMs(l, nowMs) : null,
     done,
-    state: toRunState(l),
+    state,
     ...closeFacts(l.close),
   };
 }
@@ -748,7 +758,7 @@ function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; activeE
     runWallMs,
     activeElapsed: ctx.done && activeMs !== null ? fmtElapsed(activeMs) : wallElapsed,
     wallBase: ctx.done ? wallElapsed : `${wallElapsed} so far`,
-    wallSub: errorOutcome(ctx.l?.close?.edge),
+    wallSub: errorOutcome(ctx.state, ctx.l?.close?.edge),
   };
 }
 
@@ -766,12 +776,12 @@ function ranOn(d: NormRecord | null, first: NormRecord | null | undefined): { na
 function pillOf(
   state: RunState,
   notReporting: boolean | undefined,
-): { status: SessionHeader["status"]; label: string; open: string } {
+): { status: SessionHeader["status"]; abandonReason?: AbandonReason; label: string; open: string } {
   if (state.status === "running" && notReporting) {
     const word = runStatusWord(NOT_REPORTING_STATUS);
     return { status: NOT_REPORTING_STATUS, label: word, open: word };
   }
-  return { status: state.status, label: runStatusWord(state.status, state.abandonReason), open: "running" };
+  return { status: state.status, abandonReason: state.abandonReason, label: runStatusWord(state.status, state.abandonReason), open: "running" };
 }
 
 /** Whether the run executed on the machine showing it. `viewerUid` is the page's
@@ -1541,11 +1551,33 @@ function toolExtras(r: LiveStateReading): Partial<LiveTokScope> {
   };
 }
 
-/** How an errored run ended, for the run-time tile's sub line. */
-function errorOutcome(edge: CloseEdge | undefined): string | undefined {
-  if (edge?.kind !== "error") return undefined;
+/** How an errored run ended, for the run-time tile's sub line: only when the
+ *  run shows as errored (`state`, the one shown state the pill reads), with
+ *  the flow close's detail (killed, the exit code) when that close is the
+ *  error. A run whose row decided another ending (an operator's stop the flow
+ *  terminal did not name) never says "errored" under an ABORTED pill. */
+function errorOutcome(state: RunState, edge: CloseEdge | undefined): string | undefined {
+  if (state.status !== "error") return undefined;
+  if (edge?.kind !== "error") return "errored";
   if (edge.killed) return "killed (timeout)";
   return `errored${edge.exitCode != null ? ` (exit ${edge.exitCode})` : ""}`;
+}
+
+/** A figure for a metric tile: formatted, or a dash when there is none. */
+function dashOr(v: number | null | undefined, fmt: (n: number) => string): string {
+  return v != null ? fmt(v) : "—";
+}
+
+/** The header's `abandonReason`, present only when the pill has one. */
+function abandonReasonField(reason: AbandonReason | undefined): { abandonReason?: AbandonReason } {
+  return reason ? { abandonReason: reason } : {};
+}
+
+/** Whether the run reads as ended: its lifecycle closed AND the status shown
+ * is not running (a row can still say running after its session closed, as a
+ * lab run verifying its work does). */
+function endedAndShown(l: Lifecycle | null | undefined, done: boolean): boolean {
+  return l?.close != null && done;
 }
 
 /** `runRegions()`, minus the two SVG chart regions
@@ -1606,6 +1638,11 @@ export function runRegions(
   /** (5.0 R3) Whether the machine a run executed on is not reporting. A run
    *  that reads running there has no live evidence, so its status is unknown. */
   notReporting?: boolean,
+  /** The daemon's `/runs` row whose run IS this session (`ownRowOf`): the
+   *  pill shows its status, decided once (`shownRunState`). */
+  row: Run | null = null,
+  /** Whether `nowOverride` is the live edge (no parked playhead). */
+  liveEdge = false,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
@@ -1614,7 +1651,7 @@ export function runRegions(
   // (`lib/lifecycle.ts`) every surface reads: its attempt as of `nowMs`
   // (the latest start, #1988's skewed close honored and flagged), its close
   // edge, and whether it is still in flight.
-  const ctx = runContext(data, sid, nowMs, policy, presence);
+  const ctx = runContext(data, sid, nowMs, policy, presence, row, liveEdge);
   const { run, l, d, firstSessRec, startTs, inAttempt, endTs, c, done, skewedClose, state } = ctx;
   const visible = recordsAsOf(data, nowMs);
   const { tel, lms, procs, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
@@ -1735,7 +1772,7 @@ export function runRegions(
   const armed = restArmed(sp.bounds);
   // (#2890) The MODEL section's cells, in the order the operator reads them:
   // turns, tool calls, active time, tokens in, tokens out, context.
-  push(modelIdx, { value: effTurnsValue != null ? String(effTurnsValue) : "—", label: "TURNS" });
+  push(modelIdx, { value: dashOr(effTurnsValue, String), label: "TURNS" });
   if (activeInModel) {
     // The tool calls of the same executions the turn and token counts
     // describe (this run's attempt, or its mission's executions when those
@@ -1748,8 +1785,8 @@ export function runRegions(
   // board shows; the part that is darkmux's own utility calls is named in the
   // tiles' hover text (no layout of its own).
   const utilityHint = tokenHintOf({ tokIn: effTokIn, tokOut: effTokOut, tokTotal: effTokTotal, tokUtility: effTokUtility });
-  push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN", hintTitle: utilityHint });
-  push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT", hintTitle: utilityHint });
+  push(modelIdx, { value: dashOr(effTokIn, fmtC), label: "TOKENS IN", hintTitle: utilityHint });
+  push(modelIdx, { value: dashOr(effTokOut, fmtC), label: "TOKENS OUT", hintTitle: utilityHint });
   // A single-shot call records no `telemetry.context` sample and neither
   // bookend names the model's window, so its prompt has nothing to be a share
   // of: the tile reads a dash rather than a guessed window.
@@ -1842,6 +1879,7 @@ export function runRegions(
     header: {
       pillLabel: pill.label.toUpperCase(),
       status: pill.status,
+      ...abandonReasonField(pill.abandonReason),
       role,
       sid,
       machineName: on.name,
@@ -1863,7 +1901,7 @@ export function runRegions(
     // and never shown.
     hasModelWork: effHasModelWork,
     live: !done,
-    ended: l?.close != null,
+    ended: endedAndShown(l, done),
     lastBeatMs,
     signalsLabel,
     signalGroups,

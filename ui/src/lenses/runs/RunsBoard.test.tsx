@@ -236,8 +236,10 @@ describe("RunsBoard", () => {
     renderBoard();
     await waitFor(() => expect(screen.getByText("aborted-1")).toBeInTheDocument());
 
+    // A person stopped it: its own kind and color, never "no ending"'s
+    // caution amber (operator, 2026-10-07).
     const abortedBadge = screen.getByText("aborted");
-    expect(abortedBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");
+    expect(abortedBadge).toHaveClass("wstatus", "is-aborted", "s-abandoned");
 
     const staleBadge = screen.getByText("no ending");
     expect(staleBadge).toHaveClass("wstatus", "is-stopped", "s-abandoned");

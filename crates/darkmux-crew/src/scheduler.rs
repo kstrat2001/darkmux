@@ -1354,13 +1354,17 @@ fn apply_step_terminal(
             }
         }
         Err(message) => {
-            step.status = NodeStatus::Error;
+            // An operator's stop ends the step abandoned (aborted), not
+            // errored: `Step::end_unfinished` is the one decider.
+            step.end_unfinished();
             step.completed_ts = Some(at);
             step.output = Some(message.clone());
             emit(step_error_record(run, step, &message));
             persist(step);
-            report.errored.push(id.to_string());
-            errored = Some((id.to_string(), message));
+            if step.status == NodeStatus::Error {
+                report.errored.push(id.to_string());
+                errored = Some((id.to_string(), message));
+            }
         }
     }
     // (#2310 P4a) "At the moment the error lands, in the same scheduler
@@ -1827,7 +1831,10 @@ fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
             Level::Warn,
             Category::Work,
             Stage::Dispatch,
-            darkmux_flow::Payload::StepError(darkmux_flow::payload::StepErrorPayload::from_message(message)),
+            darkmux_flow::Payload::StepError(darkmux_flow::payload::StepErrorPayload {
+                stop_reason: step.stop_reason.clone(),
+                ..darkmux_flow::payload::StepErrorPayload::from_message(message)
+            }),
             step.id.clone(),
         )
     }
@@ -1943,6 +1950,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -2006,6 +2014,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         (task, step)
     }
@@ -2498,6 +2507,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: Some("step0 out".to_string()),
+            stop_reason: None,
         };
         let step1 = Step {
             id: "multi-1".to_string(),
@@ -2509,6 +2519,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let tasks: BTreeMap<String, Task> = [("multi".to_string(), task.clone())].into_iter().collect();
         let steps: BTreeMap<String, Step> =
@@ -2707,6 +2718,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: Some("step0 out".to_string()),
+            stop_reason: None,
         };
         let step1 = Step {
             id: "multi-1".to_string(),
@@ -2718,6 +2730,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let tasks: BTreeMap<String, Task> = [("multi".to_string(), task.clone())].into_iter().collect();
         let steps: BTreeMap<String, Step> =
@@ -2763,6 +2776,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: Some("step0 out".to_string()),
+            stop_reason: None,
         };
         let step1 = Step {
             id: "multi-1".to_string(),
@@ -2774,6 +2788,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let tasks: BTreeMap<String, Task> =
             [("a".to_string(), task_a), ("multi".to_string(), task.clone())].into_iter().collect();
@@ -2921,6 +2936,59 @@ mod tests {
         darkmux_types::interrupt::reset_for_test();
         assert!(report.completed.is_empty(), "no step may complete after the signal: {report:?}");
         assert_eq!(steps["a-step"].status, NodeStatus::Planned, "no step may start after the signal");
+    }
+
+    /// A step an operator's signal cut off did not fail: a person stopped it.
+    /// Its node read "error" in `mission show`, its `--json`, the mission graph
+    /// and the debrief while the run's row read aborted. It now ends
+    /// `Abandoned` naming the stop (`Step::end_unfinished`, from
+    /// `interrupt::stop_reason`), its `step.error` names the stop, and it is
+    /// not counted errored. Under the run's own wall-clock bound, which is not
+    /// an operator's stop, the same ending stays an error.
+    #[test]
+    #[serial_test::serial]
+    fn a_step_an_operator_stop_ends_is_abandoned_naming_the_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let end = |raise: &dyn Fn()| {
+            let (task_a, step_a) = task_and_step("a", &[]);
+            let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+            let mut report = SchedulerReport::default();
+            let mut emitted: Vec<FlowRecord> = Vec::new();
+            darkmux_types::interrupt::reset_for_test();
+            raise();
+            apply_step_terminal(
+                &crate::test_run(),
+                &mut steps,
+                &tasks,
+                &mut report,
+                &mut |r| emitted.push(r),
+                &mut |_s| {},
+                "a-step",
+                1,
+                None,
+                Err("hosted dispatch interrupted by an operator signal".to_string()),
+                Vec::new(),
+                None,
+            );
+            darkmux_types::interrupt::reset_for_test();
+            let stop = emitted.iter().find_map(|r| match &r.payload {
+                Some(darkmux_flow::Payload::StepError(p)) => Some(p.stop_reason.clone()),
+                _ => None,
+            });
+            let step = &steps["a-step"];
+            (step.status, step.stop_reason.clone(), stop, report.errored.len())
+        };
+        let signal = end(&|| darkmux_types::interrupt::simulate_sigterm_for_test());
+        let bound = end(&|| darkmux_types::interrupt::mark_bound_exceeded());
+        let nothing = end(&|| {});
+        assert_eq!(
+            signal,
+            (NodeStatus::Abandoned, Some("SIGTERM".to_string()), Some(Some("SIGTERM".to_string())), 0),
+            "an operator's stop"
+        );
+        assert_eq!(bound, (NodeStatus::Error, None, Some(None), 1), "the run's own bound");
+        assert_eq!(nothing, (NodeStatus::Error, None, Some(None), 1), "a failure of its own");
     }
 
     // ─── run_step_graph gate wiring (#1684 Packet 2) ───────────────────

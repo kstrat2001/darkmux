@@ -1528,6 +1528,136 @@
       "status": "error"
     },
     {
+      "name": "a run the operator stopped (its run.error names the stop) is aborted, not an error",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.error",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "error",
+            "error": "interrupted by an operator signal",
+            "stop_reason": "SIGTERM"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted"
+    },
+    {
+      "name": "a run.error whose stop is empty names no stop, and is an error",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.error",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "error",
+            "stop_reason": ""
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "a run that completed degraded (its run.complete says Degraded: its own wall-clock bound) is degraded",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.complete",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "ok",
+            "status": "Degraded"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "degraded"
+    },
+    {
+      "name": "a run.complete whose status is Clean is complete",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.complete",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "ok",
+            "status": "Clean"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
       "name": "a run's own session silent past the window has stopped with no ending recorded",
       "as_of": "2026-09-27T10:20:01Z",
       "run": {
@@ -1934,6 +2064,87 @@
       },
       "phase": "open",
       "status": "running"
+    },
+    {
+      "name": "an execution the operator stopped (its terminal names the stop) is aborted, not an error",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0,
+            "stop_reason": "SIGTERM"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted"
+    },
+    {
+      "name": "an execution terminal that names no stop is an error (every archive written before terminals named one)",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "an execution terminal whose stop is empty names no stop, and is an error",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0,
+            "stop_reason": ""
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
     }
   ]
 }

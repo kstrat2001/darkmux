@@ -93,14 +93,16 @@ pub const THERMAL_STOP: &str = "thermal_stop";
 /// mission is interrupted afterward; only a failure that coincides with an
 /// already-observed interrupt earns this label.
 ///
-/// A step kind's `Err` return always lands the STEP at `NodeStatus::Error`
-/// (`apply_step_terminal`, `darkmux-crew/src/scheduler.rs`) — nothing
-/// plumbs a distinct terminal status through for this. So this label alone,
-/// embedded in the `partial` `UnitOutcome` this fn returns Err with, is what
+/// A step kind's `Err` return lands the STEP at `NodeStatus::Error`, or at
+/// `NodeStatus::Abandoned` naming the stop when an operator's signal ended it
+/// (`Step::end_unfinished`, called by `apply_step_terminal` in
+/// `darkmux-crew/src/scheduler.rs`), which [`errored_row`] reads as
+/// interrupted. Under the run's own wall-clock bound the step stays `Error`
+/// (the bound is not an operator's stop), so this label, embedded in the
+/// `partial` `UnitOutcome` this fn returns Err with, is still what
 /// [`errored_row`] recovers from the step's own persisted error text (via
-/// [`INTERRUPTED_MARKER`]) — `step.status` can't tell `"interrupted"` from
-/// an ordinary `"error"` on its own the way it can for `NodeStatus::
-/// Abandoned` (`mission abort`/the phase-abandon backstop).
+/// [`INTERRUPTED_MARKER`]), as it is for a step file written before the
+/// scheduler abandoned stopped steps.
 const INTERRUPTED_RESULT: &str = "interrupted";
 
 /// The exact JSON key/value the `partial` `UnitOutcome` in `run` serializes
@@ -2105,12 +2107,11 @@ fn errored_row(step: &Step) -> UnitOutcome {
         source: String::new(),
         result: match step.status {
             darkmux_crew::types::NodeStatus::Abandoned => INTERRUPTED_RESULT.to_string(),
-            // (#2593) A step kind's `Err` return always lands here — the
-            // scheduler has no distinct terminal status for "failed while
-            // an operator interrupt was already observed" (see
-            // `INTERRUPTED_RESULT`'s own doc) — so an interrupt-coincident
-            // failure is recovered from the step's own persisted error
-            // text, and everything else genuinely reads `error`.
+            // (#2593) A step kind's `Err` with no operator's stop lands here
+            // (see `INTERRUPTED_RESULT`'s own doc): an interrupt-coincident
+            // failure (the run's own bound, or a step file written before the
+            // scheduler abandoned stopped steps) is recovered from the step's
+            // own persisted error text, and everything else reads `error`.
             darkmux_crew::types::NodeStatus::Error => {
                 if step.output.as_deref().is_some_and(|o| o.contains(INTERRUPTED_MARKER)) {
                     INTERRUPTED_RESULT.to_string()

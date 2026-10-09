@@ -785,6 +785,106 @@ describe("SessionReplay", () => {
     expect(pillEl?.getAttribute("title")).toBe("finished");
   });
 
+  // The operator's rule (2026-10-07): a run's status is decided once, on its
+  // `/runs` row, and the run page renders that decision. The lab run stopped
+  // with SIGTERM: its board row reads aborted; its flow terminal, written
+  // before terminals named a stop, reads error if re-derived.
+  it("a lab run's page shows its board row's status, not one re-derived from its records", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "pg-1.lab.adhoc.coder.pepper-grinder";
+    const records = [
+      { ts: at(60_000), action: "dispatch.start", session_id: sid, machine_id: "M", handle: "coder", payload: {} },
+      { ts: at(30_000), action: "dispatch.error", session_id: sid, machine_id: "M", payload: { result_class: "error", error: "dispatch terminated before completion (early return or panic)", total_turns: 0 } },
+    ];
+    const runs = [{ id: "pg-1", kind: "lab", status: "abandoned", abandoned_reason: "aborted", tracked: true, receive_key: 0, dispatch_id: sid }];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+    );
+    renderReplay(sid);
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
+    expect(pill()).toHaveAttribute("data-status-kind", "aborted");
+    // Every tile and sub-line states the shown ending, never the flow's own
+    // close: the ACTIVE TIME tile said "errored" under the ABORTED pill.
+    expect(activeSub()).not.toMatch(/errored|killed/);
+  });
+
+  // At the live edge the row lags the flow by up to one `/runs` poll
+  // (`PRESENCE_POLL_MS`): the run's terminal is in, its row still says
+  // running. The page asks the daemon again as the run closes instead of
+  // showing "running" for the rest of the poll, and never shows an ending of
+  // its own: the ending is the row's.
+  it("a run whose terminal arrives before its row asks the daemon again, not after a poll", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "m-9.run";
+    const records = [
+      { ts: at(60_000), action: "run.start", session_id: sid, mission_id: "m-9", machine_id: "M", handle: "review", payload: {} },
+      { ts: at(1_000), action: "run.error", session_id: sid, mission_id: "m-9", machine_id: "M", handle: "review", payload: { result_class: "error", stop_reason: "SIGTERM" } },
+    ];
+    const rowOf = (status: string, extra: Record<string, unknown> = {}) => ({ id: "m-9", kind: "mission", status, tracked: true, receive_key: 0, dispatch_id: sid, ...extra });
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (!String(url).includes("/runs")) return Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }));
+        runsCalls += 1;
+        const runs = [runsCalls === 1 ? rowOf("running") : rowOf("abandoned", { abandoned_reason: "aborted" })];
+        return Promise.resolve(new Response(JSON.stringify({ runs }), { status: 200 }));
+      }),
+    );
+    renderReplay(sid);
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(runsCalls).toBeGreaterThan(0));
+    // Well inside one poll interval (`waitFor`'s 1s default against a 5s poll).
+    await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
+    expect(runsCalls).toBe(2);
+  });
+
+  // A lab run is running until its own record ends, verify included. Its
+  // dispatch session has closed (`dispatch.complete`) and its row, the lab
+  // record, still says running while it verifies. The page shows the row's
+  // running: the pill, and its pulse is a running one, never "finished" or
+  // "may be abandoned" from the session's own close.
+  it("a lab run verifying after its dispatch ended reads running on its page", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "pg-2.lab.adhoc.coder.pepper-grinder";
+    const records = [
+      { ts: at(60_000), action: "dispatch.start", session_id: sid, machine_id: "M", handle: "coder", payload: {} },
+      { ts: at(20_000), action: "dispatch.complete", session_id: sid, machine_id: "M", handle: "coder", payload: { result_class: "ok", total_turns: 3 } },
+    ];
+    const runs = [{ id: "pg-2", kind: "lab", status: "running", tracked: true, receive_key: 0, dispatch_id: sid }];
+    let runsCalls = 0;
+    // Presence saw the dispatch session live, then saw it go: evidence the
+    // SESSION ended, which the row (the run's own record) outranks.
+    let presenceCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const u = String(url);
+        if (u.startsWith("/fleet/dispatches/live")) {
+          presenceCalls += 1;
+          return Promise.resolve(new Response(JSON.stringify({ dispatches: presenceCalls === 1 ? [{ session_id: sid }] : [], meta: {} }), { status: 200 }));
+        }
+        if (u.includes("/runs")) runsCalls += 1;
+        return Promise.resolve(new Response(JSON.stringify(u.includes("/runs") ? { runs } : { records }), { status: 200 }));
+      }),
+    );
+    renderReplay(sid);
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(presenceCalls).toBeGreaterThan(1), { timeout: 9000 });
+    await waitFor(() => expect(pill()?.textContent).toBe("running"));
+    expect(pill()).toHaveAttribute("data-status-kind", "running");
+    // A running pulse (quiet: the dispatch's last record is 20s old), never
+    // the session's own "finished" or "may be abandoned".
+    expect(pill()).toHaveAttribute("data-live", "quiet");
+    expect(pill()?.getAttribute("title")).toMatch(/^running/);
+    // The row's catch-up asks once as the session closes, never in a loop
+    // while the run verifies.
+    expect(runsCalls).toBeLessThanOrEqual(3);
+  }, 12_000);
+
   // (5.0 R3) A run recorded as running on a peer that is down has no live
   // evidence and no terminal record can arrive: the pill says UNKNOWN, in the
   // place the page already states its status, instead of RUNNING.

@@ -66,6 +66,16 @@ pub struct StepErrorPayload {
     /// Why the step errored: the error's message on one line, control and
     /// invisible characters dropped, bounded to a few hundred columns.
     pub cause: String,
+    /// The operator's stop that ended the step (`SIGINT`, `SIGTERM`, `SIGHUP`
+    /// or `interrupted`), named by the one decider
+    /// (`darkmux_types::interrupt::stop_reason`) as on a `dispatch.error` and a
+    /// `run.error`: present means a person stopped it, so the step is abandoned
+    /// (aborted), not errored. Absent for a step that failed on its own, under
+    /// the run's own wall-clock bound, and on every record written before this
+    /// (flow schema 2.2.0, additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub stop_reason: Option<String>,
 }
 
 /// Query keys whose values are credentials, compared case-insensitively after
@@ -146,7 +156,7 @@ impl StepErrorPayload {
         // would otherwise survive the redactor and be stripped afterward,
         // rejoining the secret's key.
         let cause = redact_credentials(&crate::hooks::sanitize_reason_text(&spaced));
-        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS) }
+        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS), stop_reason: None }
     }
 }
 
@@ -469,7 +479,9 @@ pub struct RunPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub error: Option<String>,
-    /// The graph's final status, as it renders.
+    /// The graph's final status, as it renders (`Clean`, `Degraded`, ...).
+    /// The lifecycle rule reads a `run.complete` whose status is
+    /// [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub status: Option<String>,
@@ -477,12 +489,33 @@ pub struct RunPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub gate: Option<String>,
+    /// On a `run.error` only: the operator's stop that ended the run, named
+    /// (`SIGINT`, `SIGTERM`, `SIGHUP`, or `interrupted` when a host raised its
+    /// own interrupt), the same fact and spelling a `dispatch.error`'s
+    /// `stop_reason` carries. Present means the operator stopped it: the
+    /// lifecycle rule reads it as abandoned, aborted, never as an error.
+    /// Absent (every terminal written before flow schema 2.2.0) means darkmux
+    /// did not record a stop, never that there was none. A run's own
+    /// wall-clock bound is never named here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub stop_reason: Option<String>,
 }
 
 impl Attribution for RunPayload {}
 
 
 impl RunPayload {
+    /// The `status` a run that completed but not cleanly writes (a run cut
+    /// off by its own wall-clock bound, a run with a degraded step): the
+    /// mission's outcome status as it renders.
+    pub const DEGRADED_STATUS: &'static str = "Degraded";
+
+    /// Whether this run completed degraded ([`RunPayload::DEGRADED_STATUS`]).
+    pub fn is_degraded(&self) -> bool {
+        self.status.as_deref() == Some(Self::DEGRADED_STATUS)
+    }
+
     /// A run that ended in an error: `result_class: error` and why.
     pub fn failed(error: impl Into<String>) -> Self {
         Self { result_class: Some(ResultClass::Error), error: Some(error.into()), ..Self::default() }

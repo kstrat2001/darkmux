@@ -1127,7 +1127,7 @@ fn render_ephemeral_result(
         .ok_or_else(|| anyhow::anyhow!("panel command graph's terminal step `{last_step_id}` vanished"))?;
 
     let output = terminal.output.clone().unwrap_or_default();
-    if terminal.status == NodeStatus::Error {
+    if terminal.ended_as_failure() {
         return Ok(EphemeralOutcome {
             text: format!("darkmux: command failed:\n\n{output}"),
             success: false,
@@ -2266,6 +2266,7 @@ pub(crate) mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some("done".to_string()),
+                stop_reason: None,
             },
         );
         let report = SchedulerReport::default();
@@ -2318,6 +2319,7 @@ pub(crate) mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some("terminal step's own clean output".to_string()),
+                stop_reason: None,
             },
         );
         let report = SchedulerReport {

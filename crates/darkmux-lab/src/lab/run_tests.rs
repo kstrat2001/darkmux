@@ -450,6 +450,26 @@ fn a_provider_error_under_a_signal_records_the_run_interrupted() {
     assert_eq!(lifecycle::read(&dir).unwrap().status, lifecycle::LifecycleStatus::Interrupted);
 }
 
+/// A run's own wall-clock bound raises the same flag a signal does, but it is
+/// not the operator's stop: the run is recorded as what it was (an error),
+/// never as interrupted, by the one decider every record of a run's ending
+/// names a stop from (`interrupt::stop_reason`), so the lab record and the
+/// run's flow terminals cannot disagree about it.
+#[test]
+#[serial_test::serial]
+fn a_provider_error_under_the_runs_own_bound_is_an_error_not_an_operator_stop() {
+    // It raises the process-wide interrupt flag.
+    darkmux_types::run_in_own_process!();
+    let lab = Lab::scripted(&["wb"]);
+    script(Script { run_err: true, ..Default::default() });
+    darkmux_types::interrupt::reset_for_test();
+    darkmux_types::interrupt::mark_bound_exceeded();
+    let out = lab.run("wb", 1);
+    darkmux_types::interrupt::reset_for_test();
+    let o = out.expect("a provider error that is no operator's stop fails the run, not the batch").remove(0);
+    assert_eq!(lifecycle::read(&o.run_dir).unwrap().status, lifecycle::LifecycleStatus::Error);
+}
+
 /// With a source sandbox, the run works on a clone of it (run-artifact dirs
 /// pruned) and the manifest records the canonical source path and the
 /// clone's hash; without one, the per-run sandbox starts empty and the

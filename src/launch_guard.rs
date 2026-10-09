@@ -186,9 +186,21 @@ pub(crate) fn reap_and_exit_on_signal() {
         return;
     }
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-    // (#3073-P3-1) Exit with 128 + signo (e.g. 130 for SIGINT, 143 for SIGTERM).
-    let signo = darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT);
-    std::process::exit(128 + signo);
+    if let Some(code) = signal_exit_code() {
+        std::process::exit(code);
+    }
+}
+
+/// The exit code a run an operator stopped ends with: `128 + signo` (130 for
+/// SIGINT, 143 for SIGTERM, 129 for SIGHUP; 130 when a host raised the flag on
+/// its own shutdown with no OS signal, #3073-P3-1). `None` when no operator
+/// stopped it, which includes the run's own wall-clock bound: the bound raises
+/// the same flag, but it is not a signal, and the run exits as its decided
+/// status says (a `degraded` generic run exits 0), never 130. Reads the one
+/// decider of an operator's stop, `interrupt::stop_reason`.
+fn signal_exit_code() -> Option<i32> {
+    darkmux_types::interrupt::stop_reason()?;
+    Some(128 + darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT))
 }
 
 /// [`reap_and_exit_on_signal`] for a call site whose only remaining output
@@ -220,7 +232,11 @@ pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     if !darkmux_types::interrupt::is_set() {
         return;
     }
-    eprintln!("Error: {err:?}");
+    // No operator stop (the run's own bound raised the flag): nothing exits
+    // here, so the `Err` reaches `main`, which prints it once.
+    if signal_exit_code().is_some() {
+        eprintln!("Error: {err:?}");
+    }
     reap_and_exit_on_signal();
 }
 
@@ -286,28 +302,20 @@ impl<A: FnMut()> Drop for LaunchFinalizeGuard<A> {
     }
 }
 
-/// (#2678) Set once a run-level wall-clock bound (`darkmux_types::
-/// config_access::mission_wall_clock_timeout_seconds`) has actually fired
-/// in THIS process — distinct from `darkmux_types::interrupt::is_set()`
-/// (which [`spawn_wall_clock_watchdog`]'s thread ALSO sets, via
-/// `mark_interrupted`, once its deadline passes). `is_set()` alone cannot
-/// tell "the run's own bound expired" apart from "an operator actually
-/// sent a signal" — both look identical to every existing `is_set()`
-/// consumer, which is the point (a bound-triggered stop reuses the exact
-/// same graceful-abort machinery a real SIGTERM already drives, rather
-/// than duplicating it). This flag is the one extra bit
-/// `mission_launch.rs`'s abort writer reads so it can report the honest,
-/// specific reason — darkmux describes, never adjudicates — instead of
-/// collapsing both causes into a generic "aborted".
+/// (#2678) Whether a run-level wall-clock bound (`darkmux_types::
+/// config_access::mission_wall_clock_timeout_seconds`) has actually fired in
+/// THIS process, distinct from `darkmux_types::interrupt::is_set()` (which
+/// [`spawn_wall_clock_watchdog`]'s thread ALSO sets, so a bound-triggered stop
+/// reuses the graceful-abort machinery a real SIGTERM drives). The cause lives
+/// in `darkmux_types::interrupt` beside the flag (`bound_exceeded`), so the one
+/// decider of an operator's stop (`interrupt::stop_reason`) names none for
+/// it, and `mission_launch.rs`'s abort writer reports the bound by name:
+/// darkmux describes, never adjudicates.
 ///
 /// Never resets in production, matching `interrupt::is_set()`'s own
 /// never-cleared contract (darkmux's CLI is one-shot-per-invocation).
-static WALL_CLOCK_EXCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether [`spawn_wall_clock_watchdog`]'s deadline has fired. See
-/// [`WALL_CLOCK_EXCEEDED`]'s own doc.
 pub(crate) fn wall_clock_exceeded() -> bool {
-    WALL_CLOCK_EXCEEDED.load(std::sync::atomic::Ordering::SeqCst)
+    darkmux_types::interrupt::bound_exceeded()
 }
 
 /// (#2678, #3074) Bail when an OPERATOR signal was observed, never when the
@@ -321,23 +329,23 @@ pub(crate) fn bail_if_operator_signal(context: &str) -> anyhow::Result<()> {
     darkmux_types::interrupt::bail_if_set(context)
 }
 
-/// Test-only: reset [`WALL_CLOCK_EXCEEDED`] between tests in the same
+/// Test-only: reset [`wall_clock_exceeded`] between tests in the same
 /// process — mirrors `darkmux_types::interrupt::reset_for_test`'s own
 /// reasoning (a process-wide flag would otherwise contaminate whichever
 /// test runs next in the same binary).
 #[cfg(test)]
 pub(crate) fn reset_wall_clock_exceeded_for_test() {
-    WALL_CLOCK_EXCEEDED.store(false, std::sync::atomic::Ordering::SeqCst);
+    darkmux_types::interrupt::set_bound_exceeded_for_test(false);
 }
 
-/// Test-only: flip [`WALL_CLOCK_EXCEEDED`] without spawning a real
+/// Test-only: flip [`wall_clock_exceeded`] without spawning a real
 /// watchdog thread or waiting out a real deadline — the production twin
 /// of `darkmux_types::interrupt::simulate_sigterm_for_test`, for a test
 /// that wants to exercise "the bound already fired" without a multi-
 /// second sleep.
 #[cfg(test)]
 pub(crate) fn mark_wall_clock_exceeded_for_test() {
-    WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    darkmux_types::interrupt::set_bound_exceeded_for_test(true);
 }
 
 /// RAII stop-flag for [`spawn_wall_clock_watchdog`]'s background thread.
@@ -424,10 +432,7 @@ pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_secon
 /// during wind-down is an operator interrupt (`run.error`), never a bound
 /// `Degraded`. Either way the run is told to stop.
 fn mark_bound_fired() {
-    if !darkmux_types::interrupt::is_set() {
-        WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    darkmux_types::interrupt::mark_interrupted();
+    darkmux_types::interrupt::mark_bound_exceeded();
 }
 
 /// (#2902 step 5) A run's wall-clock deadline: `started` plus its bound,
@@ -547,12 +552,63 @@ mod tests {
         assert!(alone, "no signal: the bound is the cause");
     }
 
+    /// A run's own wall-clock bound is not an operator's stop: "aborted"
+    /// means a human tore the run down (#2462). The bound raises the same
+    /// interrupt flag a signal does, so every terminal built after it named
+    /// `stop_reason: "interrupted"` and read aborted on every view while the
+    /// run's row read degraded. A signal that came first is still named.
+    #[test]
+    #[serial_test::serial]
+    fn a_wall_clock_bound_is_never_named_as_the_operators_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        mark_bound_fired();
+        let bound = darkmux_types::interrupt::stop_reason();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        mark_bound_fired();
+        let signal_then_bound = darkmux_types::interrupt::stop_reason();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!(bound, None, "the run's own bound fired: nobody stopped it");
+        assert_eq!(signal_then_bound, Some("SIGTERM"), "the operator's signal came first: it is the stop");
+    }
+
+    /// A run's own wall-clock bound is not an operator signal, so it is not a
+    /// signal's exit code: the launch exited 130 (SIGINT's) after finalizing
+    /// `degraded`, because the reap at its end read the raised flag as a
+    /// signal. A signal, and a host's own shutdown, still exit `128 + signo`.
+    #[test]
+    #[serial_test::serial]
+    fn a_wall_clock_bound_is_not_a_signals_exit_code() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        let none = signal_exit_code();
+        mark_bound_fired();
+        let bound = signal_exit_code();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        let sigterm = signal_exit_code();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::raise_for_test();
+        let host_shutdown = signal_exit_code();
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!((none, bound, sigterm, host_shutdown), (None, None, Some(143), Some(130)));
+    }
+
     /// (#2678) `wall_clock_exceeded` is the one extra bit that lets a
     /// caller tell "the run's own bound expired" apart from "an operator
     /// sent a real signal" — both set `darkmux_types::interrupt::is_set()`
     /// identically, by design (see `spawn_wall_clock_watchdog`'s own doc),
     /// so this flag is the ONLY place that distinction is observable.
-    /// `#[serial_test::serial]`: `WALL_CLOCK_EXCEEDED` is a process-wide
+    /// `#[serial_test::serial]`: the bound flag is a process-wide
     /// static, same reasoning as `darkmux_types::interrupt`'s own tests.
     #[test]
     #[serial_test::serial]
@@ -869,6 +925,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let mut steps: std::collections::BTreeMap<String, crew::types::Step> =
             [(step.id.clone(), step)].into_iter().collect();

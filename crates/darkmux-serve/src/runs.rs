@@ -642,12 +642,12 @@ fn build_runs_in(
             // the bounded flow-scan window — leaves `lab_run_status` on
             // its artifact-mtime fallback, which is the honest degradation
             // rather than a fabricated verdict.
-            let session_live = summary
+            let session = summary
                 .session_id
                 .as_deref()
                 .and_then(|sid| flow_index.get(sid))
-                .map(|agg| session_is_live(agg, now_ms));
-            let run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
+                .map(|agg| LabSession::of(agg, now_ms));
+            let run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session);
             // (#2902 step 2b) The session the run's provider recorded, read
             // whole. A finished tool-bench row publishes no `session_id`
             // (its trials each ran under their own session — see
@@ -931,7 +931,7 @@ impl FlowMissionAgg {
         ) {
             return;
         }
-        let Some(ending) = crate::run_lifecycle::ending_of(&action, false) else { return };
+        let Some(ending) = crate::run_lifecycle::ending_of_record(v) else { return };
         let bookend_terminal = matches!(action, FlowAction::RunComplete | FlowAction::RunError);
         self.close.fold(ts, ending, bookend_terminal);
         self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
@@ -1482,7 +1482,7 @@ fn mission_to_run(
     // reads it directly rather than re-deriving the same decision from
     // `status` (which can no longer tell the two apart once collapsed).
     let abandoned_reason = if status == RunStatus::Abandoned {
-        Some(if mission.status == MissionStatus::Aborted { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+        Some(if mission_stopped_by_operator(mission) { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
     } else {
         None
     };
@@ -1732,6 +1732,21 @@ fn mission_run_status_and_evidence(
     }
 }
 
+/// Whether an operator tore the mission down: `mission abort`
+/// (`MissionStatus::Aborted`), or a run that ended on the operator's stop
+/// (its envelope names it). The two arms of [`mission_run_status_and_evidence`]
+/// that read `Abandoned` for a deliberate teardown; every other `Abandoned`
+/// means no ending was recorded.
+fn mission_stopped_by_operator(mission: &Mission) -> bool {
+    match mission.status {
+        MissionStatus::Aborted => true,
+        MissionStatus::Finalized => {
+            matches!(darkmux_crew::lifecycle::load_envelope(&mission.id), Ok(Some(e)) if e.stop_reason.is_some())
+        }
+        MissionStatus::Active | MissionStatus::Unknown => false,
+    }
+}
+
 /// The `Finalized`-arm half of [`mission_run_status_and_evidence`], split
 /// out only so that function's `match` can wrap this whole arm's result in
 /// `(_, None)` without repeating the inner match's own arms three times.
@@ -1792,40 +1807,60 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             // `Complete`, unchanged — a genuinely dataless mint/dispatch-
             // shape mission, the same "no data, don't invent a verdict"
             // reasoning this arm has always applied.
-            Ok(None) => {
-                let phases: Vec<Phase> = darkmux_crew::loader::load_phases()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|p| p.mission_id == mission.id)
-                    .collect();
-                if phases.is_empty() || phases.iter().any(|p| p.status == PhaseStatus::Complete) {
-                    RunStatus::Complete
-                } else {
-                    RunStatus::Abandoned
-                }
-            }
-            Ok(Some(envelope)) => {
-                // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
-                // `RunOutcome::Partial` is NOT read here: `status` already
-                // collapses `Partial` into `Degraded`
-                // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
-                // its own `RunStatus` (F10/F11), so a cut-off or partial run
-                // never reads `Complete`.
-                //
-                // (#1881) `envelope.status` itself can be
-                // `MissionOutcomeStatus::Unknown` (a status value this
-                // binary doesn't recognize, degraded via `#[serde(other)]`
-                // rather than failing the whole parse). That is exactly the
-                // "this binary cannot tell you what happened" case
-                // `Unparseable` exists for, so it gets its own arm.
-                match envelope.status {
-                    MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
-                    MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
-                    MissionOutcomeStatus::Degraded => RunStatus::Degraded,
-                    MissionOutcomeStatus::Clean => RunStatus::Complete,
-                }
-            }
+            Ok(None) => envelope_less_status(mission),
+            // The run ended on the operator's stop, recorded where it ended
+            // (`finalize_mission_with_payload`, from the one decider its
+            // `run.error` and `dispatch.error` name it from): the operator
+            // tore it down, so it reads as the flow's lifecycle rule reads
+            // those terminals, never as the error the envelope's status says.
+            Ok(Some(envelope)) => envelope_status(&envelope),
         }
+}
+
+/// A Finalized mission with no envelope (see the `Ok(None)` arm above):
+/// complete when it has no phases or any phase completed, else abandoned.
+fn envelope_less_status(mission: &Mission) -> RunStatus {
+    let phases: Vec<Phase> = darkmux_crew::loader::load_phases()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.mission_id == mission.id)
+        .collect();
+    if phases.is_empty() || phases.iter().any(|p| p.status == PhaseStatus::Complete) {
+        RunStatus::Complete
+    } else {
+        RunStatus::Abandoned
+    }
+}
+
+/// A Finalized mission's status from its envelope.
+fn envelope_status(envelope: &darkmux_crew::envelope::MissionEnvelope) -> RunStatus {
+    // The run ended on the operator's stop, recorded where it ended
+    // (`finalize_mission_with_payload`, from the one decider its
+    // `run.error` and `dispatch.error` name it from): the operator
+    // tore it down, so it reads as the flow's lifecycle rule reads
+    // those terminals, never as the error the envelope's status says.
+    if envelope.stop_reason.is_some() {
+        return RunStatus::Abandoned;
+    }
+    // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
+    // `RunOutcome::Partial` is NOT read here: `status` already
+    // collapses `Partial` into `Degraded`
+    // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
+    // its own `RunStatus` (F10/F11), so a cut-off or partial run
+    // never reads `Complete`.
+    //
+    // (#1881) `envelope.status` itself can be
+    // `MissionOutcomeStatus::Unknown` (a status value this
+    // binary doesn't recognize, degraded via `#[serde(other)]`
+    // rather than failing the whole parse). That is exactly the
+    // "this binary cannot tell you what happened" case
+    // `Unparseable` exists for, so it gets its own arm.
+    match envelope.status {
+        MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
+        MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
+        MissionOutcomeStatus::Degraded => RunStatus::Degraded,
+        MissionOutcomeStatus::Clean => RunStatus::Complete,
+    }
 }
 
 /// (#2682 fix-pass MUST FIX 1/2/3/5) The dispatch-liveness verdict for
@@ -1887,10 +1922,10 @@ fn lab_summary_to_run(
     summary: &LabRunSummary,
     machine: Option<String>,
     now_ms: u64,
-    session_live: Option<bool>,
+    session: Option<LabSession>,
 ) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
-    let status = lab_run_status(summary, now_ms, session_live);
+    let status = lab_run_status(summary, now_ms, session);
     // (#1907, corrected #2462/#1946) `lab_run_status` used to have no abort
     // concept at all — every `Abandoned` arm was the staleness gate (the
     // run's artifact trail went quiet past the budget with no
@@ -2012,6 +2047,34 @@ fn lab_summary_to_run(
     }
 }
 
+/// What a lab run's own dispatch session (#2812) says about the RUN, as
+/// [`lab_run_status`] reads it. Three states, because a session that ended is
+/// not a run that ended: a lab run verifies its work after its dispatch, and
+/// is running until its own record (`lifecycle.json`) ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabSession {
+    /// No terminal, and emitting within the quiet budget: the run is live.
+    Live,
+    /// No terminal, and quiet past the budget: observed-dead.
+    Silent,
+    /// The dispatch ended, at `at_ms` (0 when its time is unreadable): the
+    /// run's own record decides from here.
+    Ended { at_ms: u64 },
+}
+
+impl LabSession {
+    fn of(agg: &SessionAgg, now_ms: u64) -> Self {
+        if agg.terminal_status.is_some() {
+            let at_s = agg.terminal_ts.as_deref().or(agg.last_activity_ts.as_deref()).and_then(parse_flow_ts);
+            LabSession::Ended { at_ms: at_s.map_or(0, |s| s.saturating_mul(1000)) }
+        } else if session_is_live(agg, now_ms) {
+            LabSession::Live
+        } else {
+            LabSession::Silent
+        }
+    }
+}
+
 /// Map a lab run's own `finished`/`degenerate` fields to the flat
 /// [`RunStatus`]. A `degenerate` run (every probe drew nothing usable — see
 /// `darkmux_lab::lab::review`'s own doc) reached its terminal artifact
@@ -2020,10 +2083,12 @@ fn lab_summary_to_run(
 /// step-4 lens can special-case `degenerate` directly off the richer
 /// `/lab/runs` payload if finer granularity turns out to matter).
 ///
-/// (#2812) `session_live` is the run's OWN flow session judged by
-/// [`session_is_live`] — `Some(true)`/`Some(false)` when the run named a
-/// session id and that session is in the flow index, `None` when it named
-/// none or the session has aged out of the scan window. It is POSITIVE
+/// (#2812) `session` is the run's OWN flow session ([`LabSession`]): live,
+/// silent (no terminal, quiet past [`session_is_live`]'s budget) or ended,
+/// when the run named a session id and that session is in the flow index;
+/// `None` when it named none or the session has aged out of the scan window.
+/// An ended session is the dispatch's end, not the run's: the run verifies
+/// after it, and is running until its own record ends. It is POSITIVE
 /// evidence and outranks the artifact-mtime heuristic below, because the
 /// heuristic's premise ("a live run keeps writing artifacts") is simply
 /// false for the providers that write everything at the end: a
@@ -2036,7 +2101,7 @@ fn lab_summary_to_run(
 /// `flow_mission_to_run` and `ghost_runs` already make. Lab was the one
 /// `/runs` source not participating in the liveness axis that function's
 /// own doc claims every source shares.
-fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<bool>) -> RunStatus {
+fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session: Option<LabSession>) -> RunStatus {
     // (#1930) The run's OWN terminal record wins over every inference below.
     // `finished` only ever meant "scores.json exists", so a run that ERRORED
     // never set it and fell through to the idle heuristic — reporting
@@ -2046,24 +2111,10 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // `Running` and `Unknown` deliberately fall THROUGH to the staleness check
     // below: the first may be a hard-killed run whose `Drop` never ran (the one
     // gap RAII cannot close), and the second must never be read as a verdict.
-    use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
-    match summary.lifecycle_status {
-        // (#2860) `Complete` says the HARNESS ran to the end, not how the
-        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
-        // dispatch errored was listed complete while its own detail view
-        // said errored. Every other run kind already reports its outcome.
-        Some(Lc::Complete) => return settled_lab_status(summary),
-        Some(Lc::Error) => return RunStatus::Error,
-        Some(Lc::Interrupted) => return RunStatus::Abandoned,
-        // (#2860) No lifecycle verdict (a run from before the record existed):
-        // a manifest is written only when the run ends, so its `ok` is a
-        // terminal record too, and outranks the staleness guess below.
-        None if summary.run_ok.is_some() => return settled_lab_status(summary),
-        _ => {}
+    if let Some(status) = lab_own_verdict(summary) {
+        return status;
     }
-    if summary.finished {
-        return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
-    }
+
     // (#2812) The run's own flow session, when there is one, answers the
     // liveness question directly — see this function's doc for why it
     // outranks the artifact heuristic below rather than merely feeding it.
@@ -2071,9 +2122,17 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // IS indexed and has gone quiet past the same `stale_after_ms()` budget
     // is observed-dead, and falling through to the mtime heuristic for it
     // would only re-derive the same verdict from worse evidence.
-    if let Some(live) = session_live {
-        return if live { RunStatus::Running } else { RunStatus::Abandoned };
-    }
+    //
+    // A session that ENDED is not the run ending: the run still verifies the
+    // work after its dispatch, and is running until its own record ends. Its
+    // dispatch's end is then the newest evidence it was alive, so the quiet
+    // clock below runs from there (or from a newer artifact).
+    let last_alive_ms = match session {
+        Some(LabSession::Live) => return RunStatus::Running,
+        Some(LabSession::Silent) => return RunStatus::Abandoned,
+        Some(LabSession::Ended { at_ms }) => summary.mtime_ms.max(at_ms),
+        None => summary.mtime_ms,
+    };
     // (#1621) Unfinished is NOT the same as running, and treating it as such
     // is what made the `running` filter useless: 49 of 52 rows it returned
     // were long-dead bench runs, and the three live ones were lost in them.
@@ -2090,7 +2149,7 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // Measured when this landed: all 49 unfinished lab runs on the operator's
     // machine were untouched for over an hour, the freshest 2.6h. Not one was
     // plausibly live.
-    let idle_ms = now_ms.saturating_sub(summary.mtime_ms);
+    let idle_ms = now_ms.saturating_sub(last_alive_ms);
     if idle_ms > stale_after_ms() {
         // It left a trail and the trail STOPS — that is evidence of
         // abandonment, not absence of evidence, so `Abandoned` is honest here
@@ -2098,6 +2157,28 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         return RunStatus::Abandoned;
     }
     RunStatus::Running
+}
+
+/// The verdict a lab run's own records give, before any liveness inference
+/// ([`lab_run_status`]'s first rule): its lifecycle record, its manifest's
+/// `ok`, or its scores. `None` when they say nothing settled.
+fn lab_own_verdict(summary: &LabRunSummary) -> Option<RunStatus> {
+    use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+    match summary.lifecycle_status {
+        // (#2860) `Complete` says the HARNESS ran to the end, not how the
+        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
+        // dispatch errored was listed complete while its own detail view
+        // said errored. Every other run kind already reports its outcome.
+        Some(Lc::Complete) => return Some(settled_lab_status(summary)),
+        Some(Lc::Error) => return Some(RunStatus::Error),
+        Some(Lc::Interrupted) => return Some(RunStatus::Abandoned),
+        // (#2860) No lifecycle verdict (a run from before the record existed):
+        // a manifest is written only when the run ends, so its `ok` is a
+        // terminal record too, and outranks the staleness guess below.
+        None if summary.run_ok.is_some() => return Some(settled_lab_status(summary)),
+        _ => {}
+    }
+    summary.finished.then_some(if summary.degenerate { RunStatus::Error } else { RunStatus::Complete })
 }
 
 /// (#2860, F2) The status of a lab run that ENDED and wrote a manifest: an
@@ -3384,6 +3465,7 @@ mod tests {
             started_ts: Some(now_unix()),
             completed_ts: Some(now_unix()),
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -4480,14 +4562,14 @@ mod tests {
     fn a_manifest_is_a_terminal_record_when_there_is_no_lifecycle() {
         let now = 1_700_000_000_000u64 + 30 * 24 * 3600 * 1000; // long stale
         let old = |ok: Option<bool>| LabRunSummary { run_ok: ok, ..minimal_lab_summary("d", false, false) };
-        assert_eq!(lab_run_status(&old(Some(true)), now, Some(false)), RunStatus::Complete);
-        assert_eq!(lab_run_status(&old(Some(false)), now, Some(false)), RunStatus::Error);
+        assert_eq!(lab_run_status(&old(Some(true)), now, Some(LabSession::Silent)), RunStatus::Complete);
+        assert_eq!(lab_run_status(&old(Some(false)), now, Some(LabSession::Silent)), RunStatus::Error);
         // A degenerate run is an error even when its manifest says ok:
         // tool-bench always writes `ok: true`.
         let degenerate = LabRunSummary { degenerate: true, ..old(Some(true)) };
-        assert_eq!(lab_run_status(&degenerate, now, Some(false)), RunStatus::Error);
+        assert_eq!(lab_run_status(&degenerate, now, Some(LabSession::Silent)), RunStatus::Error);
         // CONTROL: no manifest outcome keeps the old inference.
-        assert_eq!(lab_run_status(&old(None), now, Some(false)), RunStatus::Abandoned);
+        assert_eq!(lab_run_status(&old(None), now, Some(LabSession::Silent)), RunStatus::Abandoned);
     }
 
     /// (#1930) The run's own terminal record outranks every inference.
@@ -8721,6 +8803,73 @@ mod tests {
         );
     }
 
+    /// The operator's rule (2026-10-07): a run's status is decided once, and
+    /// every view renders it. A run's row and its flow terminal must name the
+    /// same ending. A mission or a `darkmux dispatch` stopped with SIGTERM
+    /// finalizes an `Error` envelope that names the stop (the same decider
+    /// its `run.error` and `dispatch.error` name it from): its row reads
+    /// abandoned/aborted, never error, as a lab run stopped the same way does.
+    /// An `Error` envelope naming no stop still reads error.
+    #[test]
+    #[serial_test::serial]
+    fn a_finalized_run_the_operator_stopped_reads_aborted_for_a_mission_and_a_dispatch() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let finalize = |id: &str, config: &str, stop: Option<&str>| {
+            let m = minimal_mission(id, vec![], Some(MissionSpec { config_id: config.to_string(), inputs_fingerprint: "fp".to_string(), origin: None }));
+            darkmux_crew::lifecycle::save_mission(&m).unwrap();
+            let env = MissionEnvelope { stop_reason: stop.map(str::to_string), ..MissionEnvelope::new(id, MissionOutcomeStatus::Error, &[]) };
+            darkmux_crew::envelope::finalize_mission(&env);
+        };
+        finalize("m-stopped", "review", Some("SIGTERM"));
+        finalize("d-stopped", "dispatch", Some("SIGTERM"));
+        finalize("m-failed", "review", None);
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row {id}"));
+        assert_eq!(row("d-stopped").kind, RunKind::Dispatch);
+        for id in ["m-stopped", "d-stopped"] {
+            assert_eq!((row(id).status, row(id).abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::Aborted)), "{id}");
+        }
+        assert_eq!((row("m-failed").status, row("m-failed").abandoned_reason), (RunStatus::Error, None));
+    }
+
+    /// The same decision read from the flow alone (a peer's mission): a
+    /// `run.error` naming the operator's stop is abandoned/aborted, and a
+    /// `run.complete` whose status is `Degraded` (the run's own wall-clock
+    /// bound) is degraded, as the owning machine's row reads them.
+    #[test]
+    #[serial_test::serial]
+    fn a_peer_runs_terminal_reads_as_its_owner_decided_it() {
+        for (action, payload, want) in [
+            ("run.error", serde_json::json!({"result_class": "error", "stop_reason": "SIGTERM"}), (RunStatus::Abandoned, Some(AbandonReason::Aborted))),
+            ("run.error", serde_json::json!({"result_class": "error"}), (RunStatus::Error, None)),
+            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Degraded"}), (RunStatus::Degraded, None)),
+            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Clean"}), (RunStatus::Complete, None)),
+        ] {
+            let _g = CrewGuard::new();
+            let flows = TempDir::new().unwrap();
+            let run_rec = |action: &str, payload: serde_json::Value| {
+                serde_json::json!({
+                    "ts": darkmux_flow::ts_utc_now(),
+                    "level": "info",
+                    "category": "work",
+                    "stage": "dispatch",
+                    "action": action,
+                    "handle": "review",
+                    "session_id": "review-on-the-hub.run",
+                    "mission_id": "review-on-the-hub",
+                    "machine_id": "m1-max-32gb-studio",
+                    "machine_uid": "PEER-UID-1",
+                    "payload": payload,
+                })
+            };
+            let fleet = vec![run_rec("run.start", serde_json::json!({})), run_rec(action, payload.clone())];
+            let runs = build_runs(flows.path(), None, &fleet);
+            let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+            assert_eq!((row.status, row.abandoned_reason), want, "{action} {payload}");
+        }
+    }
+
     /// #3089: at the mission grain an abort ranks first. A `mission.abort`
     /// followed by a bookend terminal (`run.complete` Clean or `run.error`)
     /// must still read Abandoned/Aborted on a peer row, as the owner's tracked
@@ -8935,8 +9084,10 @@ mod tests {
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Planned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Running) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Complete) => true,
-            // (F10/F11) The mission envelope's `degraded` status; a dispatch
-            // is a crew-of-one mission, whose non-zero exit finalizes degraded.
+            // (F10/F11) The mission envelope's `degraded` status. A dispatch
+            // is a crew-of-one mission; its non-zero exit now finalizes `Error`
+            // (its execution's terminal), so a degraded dispatch row comes
+            // only from an envelope written before 5.0, read as written.
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Degraded) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Abandoned) => true,
@@ -9215,8 +9366,73 @@ mod tests {
         assert_ne!(activity_key(row), 0, "and it must still be orderable: {row:?}");
     }
 
-    /// The inverted case, and the reason `session_live` is a three-valued
-    /// signal rather than a boolean. Without this, the test above would
+    /// The operator's rule (2026-10-07): a lab run is RUNNING until its own
+    /// record ends, verify included. Its dispatch session ends first (its
+    /// `dispatch.complete`), then the run verifies the work, then the run's
+    /// own record (`lifecycle.json`) ends. In between, the row read the ended
+    /// session as the run gone quiet: abandoned, "no ending", on the runs board
+    /// and, through the row, on the run page and the timeline bar too.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lab_run_verifying_after_its_dispatch_ended_reads_running() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-pepper-grinder-verify-1";
+        write_lifecycle_only_lab_run(lab.path(), "pepper-grinder-verify-1", "running", Some(sid));
+        // Hours in, as a real coding-task run is: its run directory has not
+        // moved since it started.
+        backdate_lab_run_artifacts(lab.path(), "pepper-grinder-verify-1");
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.complete", "session_id": sid, "handle": "coder", "payload": {"result_class": "ok"}}),
+            ],
+        );
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!(
+            (row.status, row.abandoned_reason),
+            (RunStatus::Running, None),
+            "the dispatch ended, the run has not: it is verifying: {row:?}"
+        );
+    }
+
+    /// The backstop the rule above keeps: a run whose record still says
+    /// running (a hard kill leaves it so, `Drop` never ran) and whose dispatch
+    /// ended long ago is abandoned, with no ending recorded. The quiet clock
+    /// runs from the dispatch's end, its newest evidence of life.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lab_run_whose_dispatch_ended_long_ago_with_no_ending_of_its_own_is_abandoned() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-pepper-grinder-killed-1";
+        write_lifecycle_only_lab_run(lab.path(), "pepper-grinder-killed-1", "running", Some(sid));
+        backdate_lab_run_artifacts(lab.path(), "pepper-grinder-killed-1");
+        // The dispatch ended a minute past the quiet budget ago, measured from
+        // the real clock `build_runs` judges by.
+        let ended_ago = stale_after_ms() / 1000 + 60;
+        let at = |ago: u64| darkmux_flow::ts_utc_at(now_unix().saturating_sub(ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": at(ended_ago + 600), "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": at(ended_ago), "action": "dispatch.complete", "session_id": sid, "handle": "coder"}),
+            ],
+        );
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!((row.status, row.abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)), "{row:?}");
+    }
+
+    /// The inverted case, and the reason the session fact is more than a
+    /// boolean. Without this, the test above would
     /// pass just as well if `lab_run_status` had been changed to return
     /// `Running` for every lifecycle-only run — which would resurrect
     /// #1621 (49 of 52 rows the `running` filter returned were long-dead

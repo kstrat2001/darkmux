@@ -147,6 +147,15 @@ pub struct GraphNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub status_note: Option<String>,
+    /// Why an `abandoned` node was abandoned, in the run row's own vocabulary
+    /// (`Run::abandoned_reason`): `aborted` when an operator's stop ended a step
+    /// under this node ([`abandoned_reason_of`]), so the node reads "aborted"
+    /// as the run's row does. Absent for every other status, and for a node
+    /// abandoned for another reason (a failed dependency, a phase that stopped
+    /// early on its own). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub abandoned_reason: Option<crate::runs::AbandonReason>,
 }
 
 /// One row inside a Task node's card (#1401). Same `camelCase` wire
@@ -245,6 +254,45 @@ pub struct StepRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub error: Option<String>,
+    /// `aborted` for a step an operator's stop ended (`Step::stop_reason`,
+    /// beside `status: abandoned`): the step reads "aborted", as the run's
+    /// row does. Absent otherwise. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub abandoned_reason: Option<crate::runs::AbandonReason>,
+}
+
+/// The one roll-up of an operator's stop onto a graph node: an `abandoned`
+/// node reads `aborted` when an operator's stop ended any step under it
+/// (`Step::stopped_by_operator`), so a step, its task and its phase read the
+/// word the run's row reads. Any other status names no reason.
+pub fn abandoned_reason_of<'a>(
+    abandoned: bool,
+    steps: impl IntoIterator<Item = &'a Step>,
+) -> Option<crate::runs::AbandonReason> {
+    (abandoned && steps.into_iter().any(Step::stopped_by_operator)).then_some(crate::runs::AbandonReason::Aborted)
+}
+
+impl GraphNode {
+    /// The word this node reads as on every surface: `aborted` for an
+    /// abandoned node an operator's stop ended, otherwise its status word.
+    pub fn status_word(&self) -> String {
+        shown_word(&self.status, self.abandoned_reason)
+    }
+}
+
+impl StepRow {
+    /// See [`GraphNode::status_word`].
+    pub fn status_word(&self) -> String {
+        shown_word(&self.status, self.abandoned_reason)
+    }
+}
+
+fn shown_word<T: Serialize>(status: &T, reason: Option<crate::runs::AbandonReason>) -> String {
+    if reason == Some(crate::runs::AbandonReason::Aborted) {
+        return "aborted".to_string();
+    }
+    serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -1501,6 +1549,7 @@ pub fn build_mission_graph(
                             // Tier 3 kinds don't).
                             model: step_model_from_config(&step.config),
                             error: step_error_cause(step),
+                            abandoned_reason: abandoned_reason_of(true, [step]),
                         },
                         None => {
                             // A synthesized (not-yet-persisted) step is by
@@ -1526,6 +1575,7 @@ pub fn build_mission_graph(
                                 // config; omit cleanly.
                                 model: None,
                                 error: None,
+                                abandoned_reason: None,
                             }
                         }
                     }
@@ -1547,6 +1597,7 @@ pub fn build_mission_graph(
                 // (`derive_task_status`, unchanged) — a task genuinely IS
                 // one unit of work, so there is no mix to name here.
                 status_note: None,
+                abandoned_reason: abandoned_reason_of(status == TaskDisplayStatus::Abandoned, persisted.iter().copied()),
             });
 
             // (#1401) Cross-task dependency edges connect TASK nodes
@@ -1582,6 +1633,10 @@ pub fn build_mission_graph(
         // tasks and one errored one from reading `error` while the rest are
         // still running, or `abandoned` once finalized.
         let (phase_display, phase_counts) = phase_display_status(phase.status, &task_statuses);
+        let phase_abandoned_reason = abandoned_reason_of(
+            phase_display == PhaseDisplayStatus::Abandoned,
+            tasks.iter().flat_map(|t| t.step_ids.iter().filter_map(|sid| steps.get(sid))),
+        );
         // (#1472, #2406) A phase that now derives Complete OR Degraded
         // should carry a truthful `completed_ts` — the max of its tasks' —
         // when the persisted phase record doesn't already have one (it
@@ -1613,6 +1668,7 @@ pub fn build_mission_graph(
             // (#2406) Only `running`/`degraded` phases get a note — see
             // `phase_status_note`'s own doc.
             status_note: phase_status_note(phase_display, &phase_counts),
+            abandoned_reason: phase_abandoned_reason,
         });
         nodes.extend(task_nodes);
     }
@@ -2726,6 +2782,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: output.map(String::from),
+            stop_reason: None,
         };
         let long = format!("reading workspace spec /x: Is a directory\n{}", "y".repeat(5000));
         let cause = step_error_cause(&step(NodeStatus::Error, Some(&long))).unwrap();

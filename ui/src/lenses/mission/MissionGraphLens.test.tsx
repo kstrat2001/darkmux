@@ -153,6 +153,44 @@ describe("MissionGraphLens", () => {
     expect(screen.getByRole("alert").textContent).toMatch(/darkmux mission graph:/i);
   });
 
+  // (operator, 2026-10-07) A step an operator's signal ended reads ABORTED,
+  // and its task and phase roll up from it, in the one status color table's
+  // aborted kind (never degraded's amber). The mission lens had its own
+  // node-status colors; every node, row, chip and timeline card now carries
+  // the one table's kind.
+  it("a node an operator's stop ended reads aborted, in the aborted kind, on the canvas and the timeline", async () => {
+    const aborted = { status: "abandoned" as const, abandonedReason: "aborted" as const };
+    mockFetch({
+      graph: {
+        ...GRAPH,
+        nodes: [
+          { id: "p1", label: "Investigate", kind: "phase", depth: 0, ...aborted },
+          {
+            id: "a",
+            label: "bundle",
+            kind: "task",
+            parentId: "p1",
+            depth: 0,
+            ...aborted,
+            steps: [{ id: "a-step", label: "Shell", kind: "procedural.shell", ...aborted }],
+          },
+        ],
+      },
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    for (const sel of [".phasegroup", ".mnode.k-task", ".steprow", ".phasegroup .wstatus"]) {
+      expect(document.querySelector(sel), sel).toHaveAttribute("data-status-kind", "aborted");
+    }
+    expect(document.querySelector(".phasegroup .wstatus")?.textContent).toBe("aborted");
+    fireEvent.click(screen.getByTitle("switch renderer"));
+    await waitFor(() => expect(document.querySelector(".tlphase")).not.toBeNull());
+    for (const sel of [".tlphase", ".tltask", ".tlphase .wstatus"]) {
+      expect(document.querySelector(sel), sel).toHaveAttribute("data-status-kind", "aborted");
+    }
+    expect(document.querySelector(".tlphase .wstatus")?.textContent).toBe("aborted");
+  });
+
   it("the view-mode toggle switches between the canvas and the mobile timeline", async () => {
     mockFetch();
     renderLens();

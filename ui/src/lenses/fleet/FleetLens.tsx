@@ -33,6 +33,7 @@ import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW
 import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { workStatusKind } from "../../components/WorkStatus";
 
 /** `sc()`. One token-class chip (value over label).
  *
@@ -343,6 +344,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
               <div
                 key={bar.key}
                 className={`sbar ${bar.status}`}
+                data-status-kind={workStatusKind(bar.status, bar.abandonReason)}
                 style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
                 title={bar.title}
                 data-act="session"
@@ -890,9 +892,12 @@ export function FleetLens({
         roster,
         policy,
         notReportingIds,
+        // A bar for a run the daemon lists shows the row's status, decided once.
+        runs,
+        playhead == null,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, laneUids, notReportingIds, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
+    [flowWindow.data, liveMachines, laneUids, notReportingIds, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy, runs, playhead == null],
   );
 
   // (5.0 R3) Names, not a count: the hero's tooltip says WHICH machines its

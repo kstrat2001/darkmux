@@ -198,6 +198,7 @@ mod tests {
                     description: Some("Bundle, probe, dedup".to_string()),
                     steps: None,
                     status_note: None,
+                    abandoned_reason: None,
                 },
                 GraphNode {
                     // (#1637) The adjudicate phase MUST exist: the contract
@@ -219,6 +220,7 @@ mod tests {
                     description: None,
                     steps: None,
                     status_note: None,
+                    abandoned_reason: None,
                 },
                 GraphNode {
                     id: "task-judge".to_string(),
@@ -245,6 +247,7 @@ mod tests {
                             turns_final: Some(1),
                             model: Some("gpt-oss-120b".to_string()),
                             error: None,
+                            abandoned_reason: None,
                         },
                         StepRow {
                             id: "judge-local".to_string(),
@@ -258,6 +261,7 @@ mod tests {
                             turns_final: Some(1),
                             model: Some("qwen3.6-35b-a3b".to_string()),
                             error: None,
+                            abandoned_reason: None,
                         },
                         StepRow {
                             // Neither flag: an errored hosted seat is
@@ -274,6 +278,7 @@ mod tests {
                             turns_final: None,
                             model: None,
                             error: None,
+                            abandoned_reason: None,
                         },
                         StepRow {
                             // Never started: no tokens, no clock (#1481).
@@ -288,9 +293,11 @@ mod tests {
                             turns_final: None,
                             model: None,
                             error: None,
+                            abandoned_reason: None,
                         },
                     ]),
                     status_note: None,
+                    abandoned_reason: None,
                 },
             ],
             edges: vec![GraphEdge {

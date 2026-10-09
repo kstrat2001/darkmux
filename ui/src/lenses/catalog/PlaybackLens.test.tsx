@@ -242,6 +242,8 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
     await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
     expect(document.querySelector(".sbar")).toHaveClass("complete");
+    // Its color is the one status table's (`styles.status.test.ts`), keyed by kind.
+    expect(document.querySelector(".sbar")).toHaveAttribute("data-status-kind", "done");
     // (#2834) One figure now; there is no separate unattributed tile to be
     // zero. The scrubbing property this test guards is unchanged.
 

@@ -3370,6 +3370,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             };
             crew::lifecycle::save_step("m1", "m1-p1", &s).unwrap();
         };
@@ -4409,6 +4410,7 @@ mod tests {
             started_ts: Some(1_700_000_000),
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         crew::lifecycle::save_step("dispatch-crashed-2682", "p-crash", &step).unwrap();
 

@@ -14,6 +14,14 @@ import type { RunsResponse } from "../types/generated/RunsResponse";
  * not in the window. A mission row carries only its earliest session as
  * `dispatch_id`, so a later step's page finds it by `missionId`. */
 export function useRunRow(sessionId: string, missionId: string | null, poll = false): Run | null {
+  return useRunRows(poll).find((r) => r.dispatch_id === sessionId || r.id === sessionId || (missionId !== null && r.id === missionId)) ?? null;
+}
+
+const NO_ROWS: readonly Run[] = [];
+
+/** The runs board's rows, from its own query and cache (see `useRunRow`);
+ *  empty when `/runs` has not answered. */
+export function useRunRows(poll = false): readonly Run[] {
   const q = useQuery({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>(runsSrc()),
@@ -22,7 +30,7 @@ export function useRunRow(sessionId: string, missionId: string | null, poll = fa
     // has (a deep link straight to a session).
     ...(poll ? { staleTime: PRESENCE_POLL_MS, refetchInterval: PRESENCE_POLL_MS } : { staleTime: Infinity, refetchOnMount: false, refetchOnWindowFocus: false }),
   });
-  // `?? []`: a malformed 200 (a test double, API drift) is no row, not a throw.
-  if (!q.data?.ok) return null;
-  return (q.data.data.runs ?? []).find((r) => r.dispatch_id === sessionId || r.id === sessionId || (missionId !== null && r.id === missionId)) ?? null;
+  // `?? NO_ROWS`: a malformed 200 (a test double, API drift) is no row, not a throw.
+  if (!q.data?.ok) return NO_ROWS;
+  return q.data.data.runs ?? NO_ROWS;
 }

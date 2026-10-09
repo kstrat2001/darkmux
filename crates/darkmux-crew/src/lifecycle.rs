@@ -771,6 +771,9 @@ fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) -> Vec<Strin
         }
         let was_running = step.status == NodeStatus::Running;
         step.status = NodeStatus::Abandoned;
+        // Abandoned because an operator stopped the run: named, so the step
+        // reads "aborted" as the run's row does (`Step::stop_reason`).
+        step.stop_reason = darkmux_types::interrupt::stop_reason().map(str::to_string);
         if step.completed_ts.is_none() {
             step.completed_ts = Some(now_unix());
         }
@@ -1541,6 +1544,7 @@ mod tests {
             started_ts: Some(1_700_000_100),
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         save_step(mission_id, phase_id, &s).unwrap();
         s
@@ -1595,6 +1599,32 @@ mod tests {
     /// steps_terminal` returns the ids it actually warned about (the
     /// `Running` ones) so this is observable without scraping stderr.
     #[serial_test::serial]
+    /// The steps a run abandons because an operator stopped it name the stop,
+    /// so they read "aborted" as the run's row does; with no stop they name
+    /// none and read "abandoned".
+    #[test]
+    #[serial_test::serial]
+    fn a_step_abandoned_after_an_operator_stop_names_the_stop() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let _g = CrewGuard::new();
+        seed_phase("p-stop", PhaseStatus::Running);
+        seed_step("test-mission", "p-stop", "stopped-step", crate::types::NodeStatus::Planned);
+        seed_phase("p-plain", PhaseStatus::Running);
+        seed_step("test-mission", "p-plain", "plain-step", crate::types::NodeStatus::Planned);
+        darkmux_types::interrupt::reset_for_test();
+        reconcile_phase_steps_terminal("test-mission", "p-plain");
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        reconcile_phase_steps_terminal("test-mission", "p-stop");
+        darkmux_types::interrupt::reset_for_test();
+        let stopped = load_step("test-mission", "p-stop", "stopped-step").unwrap();
+        let plain = load_step("test-mission", "p-plain", "plain-step").unwrap();
+        assert_eq!(stopped.stop_reason.as_deref(), Some("SIGTERM"));
+        assert!(stopped.stopped_by_operator());
+        assert_eq!(plain.stop_reason, None);
+        assert!(!plain.stopped_by_operator());
+    }
+
     #[test]
     fn reconcile_phase_steps_terminal_warns_only_for_running_not_planned() {
         let _g = CrewGuard::new();
@@ -2112,6 +2142,7 @@ mod task_step_storage_tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 

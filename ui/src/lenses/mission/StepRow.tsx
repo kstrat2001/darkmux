@@ -6,6 +6,7 @@
  * sub-item markup is byte-identical between the two renderers, matching the
  * legacy page's own "one shared block, two callers" design.
  */
+import { workStatusKind } from "../../components/WorkStatus";
 import type { ReactNode } from "react";
 import { fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type StepMeter } from "./graph";
 import { fmtElapsed } from "../../lib/format";
@@ -117,6 +118,7 @@ export function StepRow({
   return (
     <div
       className={`steprow ${extraClass} s-${step.status}${selected ? " selected" : ""}`}
+      data-status-kind={workStatusKind(step.status, step.abandonedReason)}
       title={step.label}
       data-act={clickable ? "step-row" : undefined}
       data-selected={selected ? "1" : undefined}
