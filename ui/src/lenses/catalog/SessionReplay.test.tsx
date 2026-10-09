@@ -805,7 +805,7 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     const pill = () => document.querySelector(".session-run__header .pill");
     await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
-    expect(pill()).toHaveAttribute("data-status-kind", "stopped");
+    expect(pill()).toHaveAttribute("data-status-kind", "aborted");
     // Every tile and sub-line states the shown ending, never the flow's own
     // close: the ACTIVE TIME tile said "errored" under the ABORTED pill.
     expect(activeSub()).not.toMatch(/errored|killed/);

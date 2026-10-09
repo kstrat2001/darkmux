@@ -62,6 +62,7 @@
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             };
             let claim = kind.seat(&step, &task, &std::collections::BTreeMap::new(), &ctx);
             match (claim, no_model) {
@@ -1548,6 +1549,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = test_task("s1-worktree");
 
@@ -1632,6 +1634,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = test_task("s1-verify");
         let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new(), &run_ctx);

@@ -104,6 +104,7 @@ fn unit_step(config: serde_json::Value) -> Step {
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     }
 }
 
@@ -1317,6 +1318,7 @@ fn save_unit_step(mission: &str, phase: &str, id: &str, status: NodeStatus, outp
             started_ts: None,
             completed_ts: None,
             output: output.map(String::from),
+            stop_reason: None,
         },
     )
     .unwrap();
@@ -1932,6 +1934,7 @@ fn an_errored_unit_never_refuses_the_whole_summary() {
         started_ts: None,
         completed_ts: None,
         output: Some("`dispatch.unit`: unit `u-0002` ended `error`: container refused".into()),
+        stop_reason: None,
     };
     darkmux_crew::lifecycle::save_step(MISSION, PHASE, &errored).unwrap();
 
@@ -2123,6 +2126,7 @@ fn the_summary_names_the_rule_whose_plan_step_errored() {
             started_ts: None,
             completed_ts: None,
             output: Some("workspace_spec::materialize failed: no such source".into()),
+            stop_reason: None,
         },
     )
     .unwrap();
@@ -2158,6 +2162,7 @@ fn the_summary_names_the_rule_whose_plan_sites_step_errored() {
             started_ts: None,
             completed_ts: None,
             output: Some("workspace_spec::materialize failed: no such source".into()),
+            stop_reason: None,
         },
     )
     .unwrap();
@@ -2205,6 +2210,7 @@ fn graph_step(id: &str, task_id: &str, kind: &str, config: serde_json::Value) ->
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     }
 }
 
@@ -2505,12 +2511,13 @@ fn an_interrupt_coincident_dispatch_failure_reads_interrupted_through_the_real_s
     );
     assert!(darkmux_types::interrupt::is_set(), "the simulated SIGINT must have set the flag");
 
-    // Same observed shape as the confirmed live run: the unit step still
-    // ends in `NodeStatus::Error`, never `Abandoned` — this fix does not
-    // touch the scheduler's terminal-status mapping, only how the summary
-    // reads an `Error` step's own persisted text.
+    // The scheduler ends a step an operator's signal cut off `Abandoned`
+    // naming the stop (`Step::end_unfinished`, operator 2026-10-07: it reads
+    // "aborted" on every node view), not `Error`. The summary reads that
+    // status as interrupted, as it reads the persisted text below.
     let unit_a = &steps["unit-a-step"];
-    assert_eq!(unit_a.status, NodeStatus::Error, "a step kind's Err always lands here, signal or not");
+    assert_eq!(unit_a.status, NodeStatus::Abandoned, "an operator's stop abandons the step");
+    assert_eq!(unit_a.stop_reason.as_deref(), Some("SIGINT"), "naming the stop");
     let text = unit_a.output.as_deref().expect("the scheduler records the error text as the output");
     assert!(text.contains(INTERRUPTED_MARKER), "the interrupted label must ride in the persisted text: {text}");
 

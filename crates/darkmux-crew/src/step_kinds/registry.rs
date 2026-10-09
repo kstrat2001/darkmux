@@ -261,6 +261,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             };
             let task = Task {
                 run_on: crate::types::default_run_on(),

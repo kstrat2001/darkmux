@@ -727,6 +727,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 
@@ -1029,6 +1030,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some(unit_output),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1046,6 +1048,7 @@ mod tests {
                 completed_ts: None,
                 // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1091,6 +1094,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output,
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1351,6 +1355,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let outcome =
             super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
@@ -1452,6 +1457,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
 
@@ -1492,6 +1498,7 @@ mod tests {
                 completed_ts: None,
                 // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1531,6 +1538,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: Some("ok".into()),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1577,6 +1585,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1595,6 +1604,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1636,6 +1646,7 @@ mod tests {
                 completed_ts: None,
                 // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1652,6 +1663,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1697,6 +1709,7 @@ mod tests {
                 completed_ts: None,
                 // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
+                stop_reason: None,
             },
         )
         .unwrap();
@@ -1742,6 +1755,7 @@ mod tests {
                 // Not valid `Output::read`-able JSON — the runtime wrote a
                 // malformed/truncated envelope.
                 output: Some("{ this is not json".into()),
+                stop_reason: None,
             },
         )
         .unwrap();

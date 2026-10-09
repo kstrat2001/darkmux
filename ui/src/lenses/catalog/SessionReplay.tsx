@@ -882,6 +882,7 @@ export function SessionReplay({
             invisible on screen and unmissable to the golden. */}
         <WorkStatus
           status={view.header.status}
+          abandonReason={view.header.abandonReason}
           label={view.header.pillLabel}
           live={liveness.state}
           className="pill"

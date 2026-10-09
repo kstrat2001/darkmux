@@ -66,6 +66,16 @@ pub struct StepErrorPayload {
     /// Why the step errored: the error's message on one line, control and
     /// invisible characters dropped, bounded to a few hundred columns.
     pub cause: String,
+    /// The operator's stop that ended the step (`SIGINT`, `SIGTERM`, `SIGHUP`
+    /// or `interrupted`), named by the one decider
+    /// (`darkmux_types::interrupt::stop_reason`) as on a `dispatch.error` and a
+    /// `run.error`: present means a person stopped it, so the step is abandoned
+    /// (aborted), not errored. Absent for a step that failed on its own, under
+    /// the run's own wall-clock bound, and on every record written before this
+    /// (flow schema 2.1.0, additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub stop_reason: Option<String>,
 }
 
 /// Query keys whose values are credentials, compared case-insensitively after
@@ -146,7 +156,7 @@ impl StepErrorPayload {
         // would otherwise survive the redactor and be stripped afterward,
         // rejoining the secret's key.
         let cause = redact_credentials(&crate::hooks::sanitize_reason_text(&spaced));
-        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS) }
+        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS), stop_reason: None }
     }
 }
 

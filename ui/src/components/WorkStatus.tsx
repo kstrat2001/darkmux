@@ -24,7 +24,13 @@
  *              different facts (a mix that shipped real output vs. an
  *              operator/budget kill) and must stay distinguishable by the
  *              raw status word even though they share a color family.
- *   stopped  — an operator or budget terminal: abandoned / escalated
+ *   stopped  — a terminal that is neither a person's stop nor a failure:
+ *              abandoned with no ending recorded (or no named reason), a
+ *              budget stop, or an escalation. Warn color.
+ *   aborted  — a person stopped it (operator, 2026-10-07): a mission the
+ *              operator aborted, or any `abandoned` status whose reason is
+ *              `aborted` (a run row, a graph node). Its OWN neutral tone, never
+ *              degraded's caution amber, never dim (idle) or teal (running).
  *   idle     — not started, or not claimable: planned / waiting / unparseable /
  *              not_reporting (a run on a machine that is not reporting, 5.0 R3)
  *   unknown  — a word this map does not list (a status newer than this build,
@@ -38,6 +44,7 @@
  */
 import type { LivenessState } from "./LivenessPulse";
 import type { RunBadgeStatus } from "../lib/runStatusWord";
+import type { AbandonReason } from "../types/generated/AbandonReason";
 import type { GraphNodeStatus } from "../types/generated/GraphNodeStatus";
 import type { MissionStatus } from "../types/generated/MissionStatus";
 
@@ -57,7 +64,7 @@ import type { MissionStatus } from "../types/generated/MissionStatus";
  * (operator, 2026-09-04: "live is a separate idea from a running job.")
  */
 export const RUNNING_WORD = "running";
-export type WorkStatusKind = "running" | "done" | "error" | "degraded" | "stopped" | "idle" | "unknown";
+export type WorkStatusKind = "running" | "done" | "error" | "degraded" | "stopped" | "aborted" | "idle" | "unknown";
 
 /** Every status word a scope hands this chip: a run's (with `not_reporting`),
  *  a mission's, a phase's or task's. Typed from the generated unions, so a new
@@ -75,7 +82,10 @@ const KIND: Record<WorkStatusWord, WorkStatusKind> = {
   // why the two must stay distinguishable by word even though they share
   // a color.
   degraded: "degraded",
-  aborted: "stopped",
+  // A mission the operator aborted (`mission abort`): a person stopped it.
+  aborted: "aborted",
+  // Abandoned for a reason this word does not carry; `workStatusKind` reads
+  // the reason beside it, so one abandoned by a person is `aborted`.
   abandoned: "stopped",
   // (F2) A deliberate hand-off to a higher tier: unfinished by design, so a
   // caution like `stopped`, never the error color.
@@ -89,9 +99,14 @@ const KIND: Record<WorkStatusWord, WorkStatusKind> = {
 
 const isWorkStatusWord = (raw: string): raw is WorkStatusWord => Object.hasOwn(KIND, raw);
 
-/** The chip's kind. A word the map does not list is `unknown`, never `idle`:
- *  an unrecognized status must not read as "nothing is happening". */
-export function workStatusKind(raw: string | undefined): WorkStatusKind {
+/** The chip's kind: THE status-to-color decision every surface reads (the
+ *  chip, the timeline bar, the mission lens's nodes and rows). A word the map
+ *  does not list is `unknown`, never `idle`: an unrecognized status must not
+ *  read as "nothing is happening". `abandonReason` is the reason the wire sets
+ *  beside an `abandoned` status (a run row's `abandoned_reason`, a graph
+ *  node's `abandonedReason`); `aborted` there means a person stopped it. */
+export function workStatusKind(raw: string | undefined, abandonReason?: AbandonReason): WorkStatusKind {
+  if (raw === "abandoned" && abandonReason === "aborted") return "aborted";
   return raw !== undefined && isWorkStatusWord(raw) ? KIND[raw] : "unknown";
 }
 
@@ -101,9 +116,13 @@ export function WorkStatus({
   live,
   className,
   title,
+  abandonReason,
 }: {
   /** The status word from the data (`active`, `running`, `complete`, …). */
   status: WorkStatusWord | undefined;
+  /** The reason beside an `abandoned` status: `aborted` makes the chip the
+   *  aborted kind, worded "aborted" unless `label` says otherwise. */
+  abandonReason?: AbandonReason;
   /** Override the visible text of a NON-running chip (a terminal's scope-specific
    *  word). A running chip always says `RUNNING_WORD`; the override is ignored. */
   label?: string;
@@ -112,12 +131,13 @@ export function WorkStatus({
   className?: string;
   title?: string;
 }) {
-  const kind = workStatusKind(status);
+  const kind = workStatusKind(status, abandonReason);
   const raw = status ?? "unknown";
+  const word = label ?? (kind === "aborted" ? "aborted" : raw);
   const cls = ["wstatus", `is-${kind}`, `s-${raw}`, className].filter(Boolean).join(" ");
   return (
     <span className={cls} data-status-kind={kind} data-live={kind === "running" ? (live ?? "beating") : undefined} title={title}>
-      {kind === "running" ? RUNNING_WORD : (label ?? raw)}
+      {kind === "running" ? RUNNING_WORD : word}
     </span>
   );
 }

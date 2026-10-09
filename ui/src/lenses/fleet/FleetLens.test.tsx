@@ -510,7 +510,8 @@ describe("FleetLens", () => {
     renderFleetLens();
     const bar = () => document.querySelector(`.sbar[data-arg="${sid}"]`);
     await waitFor(() => expect(bar()).not.toBeNull());
-    await waitFor(() => expect(bar()).toHaveAttribute("data-status-kind", "stopped"));
+    // Aborted (a person stopped it) is its own kind and color, never degraded's amber.
+    await waitFor(() => expect(bar()).toHaveAttribute("data-status-kind", "aborted"));
     expect(bar()).toHaveClass("abandoned");
     expect(bar()?.getAttribute("title")).toMatch(/· aborted$/);
   });

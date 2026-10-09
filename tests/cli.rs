@@ -4587,6 +4587,42 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     let row = run_list_row(&home, &flows, &mission_id);
     assert_eq!((&row["status"], &row["abandoned_reason"]), (&serde_json::json!("abandoned"), &serde_json::json!("aborted")), "{row}");
     assert_eq!(row["dispatch_id"], format!("{mission_id}.run"), "a mission row names its own run session: {row}");
+
+    // Step and task nodes read the same decided word (operator, 2026-10-07).
+    // The step the signal cut off read "error" in `mission show`, its `--json`
+    // (the mission graph's own payload) and the debrief, under a run whose row
+    // read aborted. It is abandoned with the aborted reason, as a run's row
+    // is, and its task and phase roll up from it.
+    assert_eq!(stops_named(&records, "step.error"), [serde_json::json!("SIGTERM")], "the step's own terminal names the stop");
+    let cli = |args: &[&str]| {
+        let out = darkmux_cmd()
+            .args(args)
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .env_remove("DARKMUX_REDIS_URL")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let show: serde_json::Value = serde_json::from_str(&cli(&["mission", "show", &mission_id, "--json"])).unwrap();
+    let nodes = show["graph"]["nodes"].as_array().expect("the graph's nodes");
+    let node = |kind: &str| nodes.iter().find(|n| n["kind"] == kind).unwrap_or_else(|| panic!("no {kind} node: {show}"));
+    let word = |v: &serde_json::Value| (v["status"].clone(), v["abandonedReason"].clone());
+    let aborted = (serde_json::json!("abandoned"), serde_json::json!("aborted"));
+    assert_eq!(word(&node("task")["steps"][0]), aborted, "the step: {show}");
+    assert_eq!(word(node("task")), aborted, "the task rolls up from it: {show}");
+    assert_eq!(word(node("phase")), aborted, "the phase rolls up from it: {show}");
+    let text = cli(&["mission", "show", &mission_id]);
+    for line in ["s1 [dispatch.internal] aborted", "t1 aborted", "-p1 aborted"] {
+        assert!(text.contains(line), "`mission show` text names {line:?}:\n{text}");
+    }
+    assert!(!text.contains(" error"), "no node reads error:\n{text}");
+    let debrief: serde_json::Value = serde_json::from_str(&cli(&["mission", "debrief", &mission_id, "--json"])).unwrap();
+    let phase = &debrief["phases"][0];
+    assert_eq!((phase["status"].clone(), phase["abandoned_reason"].clone()), aborted, "the debrief's phase: {debrief}");
+    let debrief_text = cli(&["mission", "debrief", &mission_id]);
+    assert!(debrief_text.contains("[aborted]"), "the debrief text reads aborted:\n{debrief_text}");
 }
 
 /// Spawns `mission launch` on a one-step hanging-dispatch graph with

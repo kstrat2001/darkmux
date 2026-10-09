@@ -2455,6 +2455,23 @@ pub(crate) struct DebriefPhase {
     /// The envelope's own provenance line for this phase's outcome, when it
     /// recorded one.
     reason: Option<String>,
+    /// `aborted` when an operator's stop ended a step under this abandoned
+    /// phase, as the mission graph's phase node and the run's row say it
+    /// (`mission_graph::abandoned_reason_of`, the one roll-up). Absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    abandoned_reason: Option<darkmux_serve::AbandonReason>,
+}
+
+impl DebriefPhase {
+    /// The word this phase reads: `aborted` for an abandoned phase an
+    /// operator's stop ended, otherwise its status word.
+    fn word(&self) -> &'static str {
+        match (self.status, self.abandoned_reason) {
+            (DebriefPhaseStatus::Abandoned, Some(darkmux_serve::AbandonReason::Aborted)) => "aborted",
+            (status, _) => status.word(),
+        }
+    }
 }
 
 /// Print a bullet list, or a dim "(none)" when empty — the debrief's
@@ -2573,11 +2590,17 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
             .iter()
             .map(|s| {
                 let outcome = phase_outcomes.get(s.id.as_str());
+                let status = phase_label_with_outcome(s.status, outcome.map(|o| o.outcome));
+                let steps = crew::lifecycle::load_steps_for_phase(mission_id, &s.id).unwrap_or_default();
                 DebriefPhase {
                     id: s.id.clone(),
                     description: s.description.lines().next().unwrap_or("").trim().to_string(),
-                    status: phase_label_with_outcome(s.status, outcome.map(|o| o.outcome)),
+                    status,
                     reason: outcome.and_then(|o| o.reason.clone()),
+                    abandoned_reason: darkmux_serve::mission_graph::abandoned_reason_of(
+                        status == DebriefPhaseStatus::Abandoned,
+                        &steps,
+                    ),
                 }
             })
             .collect(),
@@ -2641,7 +2664,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
             println!(
                 "  {} [{}] {}",
                 style::accent(&p.id),
-                p.status.word(),
+                p.word(),
                 style::dim(&p.description)
             );
             // (#2406) The mix, named. `[degraded]` alone is the same word

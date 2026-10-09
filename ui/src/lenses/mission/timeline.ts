@@ -132,7 +132,7 @@ export interface TimelinePhase {
   /** (#2406) `statusNote` widened in — `phaseList` below is really a
    *  `GraphNode[]` (or the synthetic single-phase fallback, which carries
    *  none), so the field is already present at runtime; this just types it. */
-  phase: { id: string; label: string; status: GraphNodeStatus; description?: string; statusNote?: string };
+  phase: { id: string; label: string; status: GraphNodeStatus; description?: string; statusNote?: string; abandonedReason?: GraphNode["abandonedReason"] };
   tasks: TimelineTask[];
 }
 

@@ -199,8 +199,12 @@ describe("a run's status is decided once and every view renders it", () => {
   ];
 
   /** The status, word and color kind one view shows. */
-  const shown = (status: string | undefined, word: string | undefined) => ({ status, word, kind: workStatusKind(status) });
-  const board = (r: Run) => shown(runBadgeStatus(r), runStatusLabel(r));
+  const shown = (status: string | undefined, word: string | undefined, reason?: Run["abandoned_reason"]) => ({
+    status,
+    word,
+    kind: workStatusKind(status, reason),
+  });
+  const board = (r: Run) => shown(runBadgeStatus(r), runStatusLabel(r), r.abandoned_reason);
 
   /** What every view shows for the run on `sid` at `t`, judged `live` (the
    *  live edge) or in playback, with the board's `rows`. */
@@ -211,8 +215,8 @@ describe("a run's status is decided once and every view renders it", () => {
     const page = runRegions(flowToRenderModel(recordsAsOf(data, t)), sid, t, true, null, null, NO_PRESENCE, DEFAULT_POLICY, null, false, ownRowOf(rows, sid, missionId, grain), live);
     const card = buildFleetCard(data, new Map(), null, new Set(), false, U, t);
     return {
-      timeline: shown(bar?.status, bar?.title.split(" · ").at(-1)),
-      page: shown(page.header.status, page.header.pillLabel.toLowerCase()),
+      timeline: shown(bar?.status, bar?.title.split(" · ").at(-1), bar?.abandonReason),
+      page: shown(page.header.status, page.header.pillLabel.toLowerCase(), page.header.abandonReason),
       activeTimeSub: page.metrics.find((m) => m.label === "ACTIVE TIME")?.sub,
       pageLive: page.live,
       cardRunning: card.runningSessionIds.includes(sid),
@@ -222,7 +226,7 @@ describe("a run's status is decided once and every view renders it", () => {
   for (const f of aborted) {
     it(`a ${f.kind} the operator stopped reads aborted on every view, with its row and without it`, () => {
       const expected = board(f.row);
-      expect(expected).toEqual({ status: "abandoned", word: "aborted", kind: "stopped" });
+      expect(expected).toEqual({ status: "abandoned", word: "aborted", kind: "aborted" });
       for (const [label, rows] of [["with its row", [f.row]], ["without a row", []]] as const) {
         for (const live of [true, false]) {
           const v = views(f.records, rows, f.session, f.missionId, AFTER, live);
@@ -374,5 +378,31 @@ describe("a run's status is decided once and every view renders it", () => {
     const failed = views(clean, [row("lab", "pg-1", LAB_S, "error")], LAB_S, null, AFTER, true);
     expect(failed.page.status).toBe("error");
     expect(failed.activeTimeSub).toBe("errored");
+  });
+
+  // (operator, 2026-10-07) A status's color is decided once: whatever the
+  // row says, the board's chip, the timeline bar and the run page's pill are
+  // one kind, so one color. Aborted and degraded are different kinds.
+  it("each status reads one color kind on the board's chip, the timeline bar and the run page", () => {
+    const states: Array<[Run["status"], Run["abandoned_reason"] | undefined, string]> = [
+      ["complete", undefined, "done"],
+      ["degraded", undefined, "degraded"],
+      ["error", undefined, "error"],
+      ["escalated", undefined, "stopped"],
+      ["abandoned", "aborted", "aborted"],
+      ["abandoned", "noterminal", "stopped"],
+    ];
+    const ended = normAll([lab(0, "dispatch.start"), lab(END_S, "dispatch.complete", { payload: { result_class: "ok", total_turns: 3 } })]);
+    for (const [status, reason, kind] of states) {
+      const labRow = row("lab", "pg-1", LAB_S, status, reason);
+      const expected = board(labRow);
+      expect(expected.kind, `${status}/${reason}: the board's chip`).toBe(kind);
+      for (const live of [true, false]) {
+        const v = views(ended, [labRow], LAB_S, null, AFTER, live);
+        expect(v.timeline.kind, `${status}/${reason} live=${live}: the timeline bar`).toBe(kind);
+        expect(v.page.kind, `${status}/${reason} live=${live}: the run page`).toBe(kind);
+      }
+    }
+    expect(board(row("lab", "pg-1", LAB_S, "abandoned", "aborted")).kind).not.toBe(board(row("lab", "pg-1", LAB_S, "degraded")).kind);
   });
 });

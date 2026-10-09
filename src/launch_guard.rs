@@ -925,6 +925,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let mut steps: std::collections::BTreeMap<String, crew::types::Step> =
             [(step.id.clone(), step)].into_iter().collect();

@@ -344,7 +344,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
               <div
                 key={bar.key}
                 className={`sbar ${bar.status}`}
-                data-status-kind={workStatusKind(bar.status)}
+                data-status-kind={workStatusKind(bar.status, bar.abandonReason)}
                 style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
                 title={bar.title}
                 data-act="session"

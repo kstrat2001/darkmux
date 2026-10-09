@@ -373,6 +373,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         }
     }
 

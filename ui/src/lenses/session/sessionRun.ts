@@ -52,6 +52,7 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
+import type { AbandonReason } from "../../types/generated/AbandonReason";
 import { computeTMax, type RunState } from "../../lib/flow";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { DEFAULT_POLICY, NO_PRESENCE, endMs, lifecycleAt, recordedActiveMs, recordedWallMs, shownRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
@@ -107,6 +108,9 @@ interface SessionHeader {
   /** (#2813) The canonical run status; the pill's look reads it. `not_reporting` (5.0
    *  R3): the run reads running but the machine it ran on is not reporting. */
   status: RunBadgeStatus;
+  /** The reason beside an `abandoned` status (`aborted`: a person stopped
+   *  it), so the pill's color kind is the board chip's (`workStatusKind`). */
+  abandonReason?: AbandonReason;
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
@@ -772,12 +776,12 @@ function ranOn(d: NormRecord | null, first: NormRecord | null | undefined): { na
 function pillOf(
   state: RunState,
   notReporting: boolean | undefined,
-): { status: SessionHeader["status"]; label: string; open: string } {
+): { status: SessionHeader["status"]; abandonReason?: AbandonReason; label: string; open: string } {
   if (state.status === "running" && notReporting) {
     const word = runStatusWord(NOT_REPORTING_STATUS);
     return { status: NOT_REPORTING_STATUS, label: word, open: word };
   }
-  return { status: state.status, label: runStatusWord(state.status, state.abandonReason), open: "running" };
+  return { status: state.status, abandonReason: state.abandonReason, label: runStatusWord(state.status, state.abandonReason), open: "running" };
 }
 
 /** Whether the run executed on the machine showing it. `viewerUid` is the page's
@@ -1858,6 +1862,7 @@ export function runRegions(
     header: {
       pillLabel: pill.label.toUpperCase(),
       status: pill.status,
+      ...(pill.abandonReason ? { abandonReason: pill.abandonReason } : {}),
       role,
       sid,
       machineName: on.name,

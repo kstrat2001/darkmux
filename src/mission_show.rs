@@ -164,7 +164,7 @@ fn config_lines(config: &ShownConfig) -> Vec<String> {
 }
 
 fn step_line(step: &StepRow) -> String {
-    let mut line = format!("      {} [{}] {}", step.id, step.kind, wire_word(&step.status));
+    let mut line = format!("      {} [{}] {}", step.id, step.kind, step.status_word());
     if let Some(tokens) = step.tokens_final {
         line.push_str(&format!(" · {} tokens", crate::run_list::grouped(tokens)));
     }
@@ -181,7 +181,7 @@ fn step_line(step: &StepRow) -> String {
 }
 
 fn task_lines(task: &GraphNode) -> Vec<String> {
-    let mut lines = vec![format!("    {} {}", task.label, wire_word(&task.status))];
+    let mut lines = vec![format!("    {} {}", task.label, task.status_word())];
     lines.extend(task.steps.iter().flatten().map(step_line));
     lines
 }
@@ -190,7 +190,7 @@ fn graph_lines(graph: &MissionGraph) -> Vec<String> {
     let mut lines = vec!["Phases:".to_string()];
     for phase in graph.nodes.iter().filter(|n| n.kind == NodeKind::Phase) {
         let note = phase.status_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
-        lines.push(format!("  {} {}{note}", phase.label, wire_word(&phase.status)));
+        lines.push(format!("  {} {}{note}", phase.label, phase.status_word()));
         for task in graph.nodes.iter().filter(|n| n.parent_id.as_deref() == Some(phase.id.as_str())) {
             lines.extend(task_lines(task));
         }
@@ -347,6 +347,7 @@ mod tests {
             turns_final: None,
             model: None,
             error: error.map(String::from),
+            abandoned_reason: None,
         };
         let failed = row(darkmux_crew::types::NodeStatus::Error, Some("reading workspace spec /x: Is a directory (os error 21)"));
         let line = step_line(&failed);

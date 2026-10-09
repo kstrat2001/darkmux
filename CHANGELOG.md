@@ -259,6 +259,27 @@ its own: every entry below labeled 5.0 ships together.
   says for any generic run; it exited 130, a SIGINT's code, because the reap at the end of
   the launch read the raised interrupt flag as a signal. Only an operator's stop
   (`interrupt::stop_reason`) exits `128 + signo` now.
+  A step an operator's signal ends now ends `abandoned` naming the stop (`Step.stop_reason`,
+  additive; `Step::end_unfinished` is the one decider the scheduler's terminal and the
+  launcher's reconcile share), and the steps the stopped run never reached name it too. It
+  read "error" in `mission show`, its `--json`, the mission graph and the debrief under a run
+  whose row read aborted. Its task and phase roll up from it by the existing rules. The words
+  stay the existing ones: `mission show --json` and `/mission/:id/graph.json` nodes and step
+  rows gain an additive `abandonedReason: "aborted"` beside `status: "abandoned"`, `mission
+  debrief --json` phases gain `abandoned_reason`, and `step.error` gains `stop_reason` (flow
+  schema 2.1.0, additive); text reads "aborted" (`tests/cli-json.golden` regenerated). The
+  envelope's phase reason says "stopped by the operator (SIGTERM)" and its warning counts the
+  stopped steps rather than calling them "never ran". A step the run's own wall-clock bound
+  cuts off stays an error.
+  "Aborted" (a person stopped it) has its own color, a muted gray-violet (`--status-aborted`,
+  #a594d6: 6.8:1 on the panel, 7.2:1 on the page background), distinct from degraded's amber,
+  from idle's gray and from running's teal. The kind is decided once (`workStatusKind`, which
+  now reads an `abandoned` status's reason) and the board's chip, the timeline bar, the run
+  page's pill and the mission lens's nodes, step rows, timeline cards and legend all render it.
+  The mission lens's own status colors are folded into the one table: a running node is the
+  running teal rather than its own amber (`--ml-run` and `--run` retired), an abandoned node
+  takes the table's color rather than a faded gray, and the timeline's phase chip no longer
+  overrides its text with the dim gray.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record

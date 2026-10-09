@@ -23,7 +23,7 @@ const css = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
 /** Every rule as [selector, body]. */
 const rules: [string, string][] = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => [m[1].trim(), m[2]]);
 
-const KINDS: readonly WorkStatusKind[] = ["running", "done", "error", "degraded", "stopped", "idle", "unknown"];
+const KINDS: readonly WorkStatusKind[] = ["running", "done", "error", "degraded", "stopped", "aborted", "idle", "unknown"];
 const RUN_STATUSES = ["planned", "running", "complete", "degraded", "error", "escalated", "abandoned", "unparseable"];
 
 const sets = (body: string, prop: string) => new RegExp(`(^|;|\\s)${prop}\\s*:`).test(body);
@@ -55,5 +55,50 @@ describe("one status-to-color table", () => {
     const stat = rules.filter(([s]) => s === ".mach .stat").map(([, b]) => b).join(";");
     expect(stat).toMatch(/--lit:\s*var\(--status-running\)/);
     expect(rules.some(([s, b]) => s.includes(':root') && /--status-running:/.test(b))).toBe(true);
+  });
+
+  /** A `:root` custom property's value, following `var(--x)` to a literal. */
+  const rootValue = (name: string): string => {
+    const body = rules.filter(([sel]) => sel === ":root").map(([, b]) => b).join(";");
+    const m = new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`).exec(body);
+    expect(m, `${name} is defined on :root`).not.toBeNull();
+    const v = m![1].trim();
+    const ref = /^var\((--[\w-]+)\)$/.exec(v);
+    return ref ? rootValue(ref[1]) : v.toLowerCase();
+  };
+
+  // (operator, 2026-10-07) "Aborted" (a person stopped it) and "degraded" (a
+  // caution) shared one amber. Aborted has its own neutral tone, which must not
+  // read as idle/dim or as running teal either.
+  it("gives aborted its own color: not degraded's amber, not dim, not running, error or complete", () => {
+    const aborted = rootValue("--status-aborted");
+    expect(aborted).toMatch(/^#[0-9a-f]{6}$/);
+    for (const other of ["--status-degraded", "--status-idle", "--status-running", "--status-error", "--status-done", "--status-stopped"]) {
+      expect(aborted, `--status-aborted vs ${other}`).not.toBe(rootValue(other));
+    }
+    expect(rootValue("--status-degraded"), "degraded keeps the caution amber").toBe(rootValue("--warn"));
+  });
+
+  // The mission lens had its own node-status color table (`--ml-run` amber for
+  // running, `--dim` for abandoned). Its status-keyed rules take their color
+  // from the one table now, as the chip and the bar do.
+  it("the mission lens colors its nodes, steps and timeline from the same table", () => {
+    expect(css.replace(/\/\*[\s\S]*?\*\//g, ""), "no rule names the lens's retired amber").not.toMatch(/--ml-run|var\(--run\)/);
+    const STATUS_CLASS = /\.(?:mnode|phasegroup|steprow|tlphase|tltask)\.s-(?:running|complete|error|degraded|abandoned|waiting)\b/;
+    const PALETTE = /var\(--(?:good|bad|warn|dim|accent|run|ml-run|good-soft|severe)\)/;
+    const offenders = rules.filter(([sel, body]) => STATUS_CLASS.test(sel) && PALETTE.test(body));
+    expect(offenders, JSON.stringify(offenders)).toEqual([]);
+  });
+
+  // A `WorkStatus` call site adds a layout class and never a second color
+  // (`WorkStatus.tsx`'s own doc). The mission timeline's phase chip
+  // (`.tlph-tag`) set its text dim, so an ABORTED or DEGRADED chip read gray
+  // text in a colored border there and nowhere else.
+  it("no chip layout class colors the chip", () => {
+    const LAYOUT = /\.(?:tlph-tag|pg-tag|mstatus|labbadge|pill)\b/;
+    const offenders = rules.filter(
+      ([sel, body]) => LAYOUT.test(sel) && !/::?(?:before|after)/.test(sel) && (sets(body, "color") || sets(body, "border-color") || sets(body, "background")),
+    );
+    expect(offenders, JSON.stringify(offenders)).toEqual([]);
   });
 });

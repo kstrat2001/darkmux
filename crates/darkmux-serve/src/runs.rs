@@ -3444,6 +3444,7 @@ mod tests {
             started_ts: Some(now_unix()),
             completed_ts: Some(now_unix()),
             output: None,
+            stop_reason: None,
         }
     }
 

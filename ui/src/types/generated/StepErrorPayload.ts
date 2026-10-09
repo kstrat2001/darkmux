@@ -9,4 +9,14 @@ export type StepErrorPayload = {
  * Why the step errored: the error's message on one line, control and
  * invisible characters dropped, bounded to a few hundred columns.
  */
-cause: string, };
+cause: string, 
+/**
+ * The operator's stop that ended the step (`SIGINT`, `SIGTERM`, `SIGHUP`
+ * or `interrupted`), named by the one decider
+ * (`darkmux_types::interrupt::stop_reason`) as on a `dispatch.error` and a
+ * `run.error`: present means a person stopped it, so the step is abandoned
+ * (aborted), not errored. Absent for a step that failed on its own, under
+ * the run's own wall-clock bound, and on every record written before this
+ * (flow schema 2.1.0, additive).
+ */
+stop_reason?: string, };

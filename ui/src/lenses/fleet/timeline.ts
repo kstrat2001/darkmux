@@ -56,6 +56,7 @@
  * token sums (a caller-side gate, not a change to this file).
  */
 
+import type { AbandonReason } from "../../types/generated/AbandonReason";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
 import { displayNameOf } from "../../lib/machineIdentity";
@@ -103,6 +104,9 @@ interface TimelineBar {
    *  for a running run on a machine that is not reporting): the bar's CSS
    *  class, and its color through `workStatusKind`, as the chip's. */
   status: RunBadgeStatus;
+  /** The reason beside an `abandoned` status (`aborted`: a person stopped
+   *  it), read with `status` by `workStatusKind` for the bar's color. */
+  abandonReason?: AbandonReason;
   title: string;
 }
 
@@ -178,7 +182,16 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const status: RunBadgeStatus = silent ? NOT_REPORTING_STATUS : state.status;
   const word = runStatusWord(status, state.abandonReason);
   const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
-  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status, title: `${role} · ${g.sessionId} · ${word}` };
+  return {
+    sid: g.sessionId,
+    key,
+    hash: dispatchHash(g.sessionId, g.missionId),
+    leftPct,
+    widthPct,
+    status,
+    ...(status === "abandoned" && state.abandonReason ? { abandonReason: state.abandonReason } : {}),
+    title: `${role} · ${g.sessionId} · ${word}`,
+  };
 }
 
 export function buildActivityTimeline(

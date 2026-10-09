@@ -16,7 +16,9 @@ describe("workStatusKind — every raw status the app has maps into seven kinds"
     // (#2406) A mixed terminal — real output shipped, some of it did not.
     // Its own kind, distinct from `stopped` even though they share a color.
     ["degraded", "degraded"],
-    ["aborted", "stopped"],
+    // A mission a person aborted (`mission abort`): the "stopped by a person"
+    // kind, its own color, never degraded's caution amber (operator, 2026-10-07).
+    ["aborted", "aborted"],
     ["abandoned", "stopped"],
     // (F2) A deliberate escalation is a caution, never the error color.
     ["escalated", "stopped"],
@@ -34,7 +36,26 @@ describe("workStatusKind — every raw status the app has maps into seven kinds"
   });
 });
 
+describe("workStatusKind — an abandoned status reads its reason", () => {
+  it("abandoned by a person is aborted; abandoned with no ending, or for no named reason, is stopped", () => {
+    expect(workStatusKind("abandoned", "aborted")).toBe("aborted");
+    expect(workStatusKind("abandoned", "noterminal")).toBe("stopped");
+    expect(workStatusKind("abandoned", undefined)).toBe("stopped");
+    // A reason rides only beside `abandoned`; any other word ignores it.
+    expect(workStatusKind("error", "aborted")).toBe("error");
+  });
+});
+
 describe("<WorkStatus>", () => {
+  it("an abandoned chip a person stopped reads aborted in the aborted kind, unless the caller words it", () => {
+    const el = render(<WorkStatus status="abandoned" abandonReason="aborted" />).container.firstElementChild!;
+    expect(el.textContent).toBe("aborted");
+    expect(el).toHaveAttribute("data-status-kind", "aborted");
+    expect(el).toHaveClass("wstatus", "is-aborted", "s-abandoned");
+    const plain = render(<WorkStatus status="abandoned" />).container.firstElementChild!;
+    expect(plain.textContent).toBe("abandoned");
+    expect(plain).toHaveAttribute("data-status-kind", "stopped");
+  });
   it("a running chip says ONE word whatever the scope's raw status — a mission's `active` and a step's `running` both read RUNNING", () => {
     const m = render(<WorkStatus status="active" />).container.firstElementChild!;
     const r = render(<WorkStatus status="running" />).container.firstElementChild!;

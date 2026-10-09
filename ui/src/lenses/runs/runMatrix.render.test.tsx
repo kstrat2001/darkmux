@@ -67,6 +67,23 @@ function expectedBadgeText(cell: MatrixCell): string {
   return cell.abandonReason === "aborted" ? "aborted" : "no ending";
 }
 
+/** The color kind this cell's badge must carry, written out as literals for
+ *  the same reason as `expectedBadgeText`. Aborted (a person stopped it) is
+ *  its own kind, never degraded's caution (operator, 2026-10-07). */
+function expectedBadgeKind(cell: MatrixCell): string {
+  const KIND: Record<string, string> = {
+    planned: "idle",
+    running: "running",
+    complete: "done",
+    degraded: "degraded",
+    error: "error",
+    escalated: "stopped",
+    unparseable: "idle",
+  };
+  if (cell.status !== "abandoned") return KIND[cell.status];
+  return cell.abandonReason === "aborted" ? "aborted" : "stopped";
+}
+
 function mockRuns(runs: unknown[]) {
   vi.stubGlobal(
     "fetch",
@@ -155,6 +172,7 @@ describe.each(CELLS.map((c) => [c.id, c] as const))("cell %s renders", (_id, cel
     // the DOM (`s-aborted` vs `s-abandoned` would collide if the badge
     // keyed on the label).
     expect(badge.className).toContain(`s-${cell.status}`);
+    expect(badge).toHaveAttribute("data-status-kind", expectedBadgeKind(cell));
 
     // The kind icon on the row, and the untracked marker, are the other
     // two axes the row is supposed to carry. The kind is an icon with no

@@ -231,7 +231,10 @@ pub(crate) fn dispatch_as_crew_of_one_with(
             finalize(&mission_id, &phase_id, status, step_result_reason(result.exit_code));
             Ok(result)
         }
-        NodeStatus::Error => {
+        // A step an operator's stop ended is `Abandoned` naming the stop
+        // (`Step::end_unfinished`), not `Error`: the same failed ending, the
+        // same error and reason, and the run's envelope names the stop.
+        NodeStatus::Error | NodeStatus::Abandoned if step.status == NodeStatus::Error || step.stopped_by_operator() => {
             // `dispatch()` itself returned an `Err` (preflight/model
             // resolution/etc — see `DispatchInternalStepKind`'s
             // `.with_context(...)?`), the one case `preserve_dispatch_result`
@@ -388,6 +391,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         started_ts: None,
         completed_ts: None,
         output: None,
+        stop_reason: None,
     };
 
     (mission, phase, task, step)

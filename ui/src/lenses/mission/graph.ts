@@ -676,6 +676,13 @@ export function statusFromRecord(rec: NormRecord): GraphNodeStatus | MissionStat
   return rec.action === undefined ? undefined : STATUS_ACTIONS.get(rec.action);
 }
 
+/** Whether `rec` is a step terminal naming an operator's stop: the step
+ *  ended abandoned, aborted (`Step::end_unfinished`, the daemon's own
+ *  decision, which the graph snapshot carries), never errored. */
+function stoppedByOperator(rec: NormRecord): boolean {
+  return typeof payloadOf(rec, ACTION.StepError)?.stop_reason === "string";
+}
+
 /** `applyFlowRecord` — the pure counterpart to mission-graph.html's App
  * `onMessage`'s status-flip branch: given the current graph + one flow
  * record + its index, returns the graph with that ONE node/step row's
@@ -715,7 +722,11 @@ export function applyFlowRecord(graph: MissionGraph, rec: NormRecord, idx: Graph
       const advanced = advance(s.status);
       if (advanced === s.status) return s;
       changed = true;
-      return { ...s, status: advanced as GraphStep["status"] };
+      const { abandonedReason: _, ...rest } = s;
+      const next: GraphStep = stoppedByOperator(rec)
+        ? { ...rest, status: "abandoned", abandonedReason: "aborted" }
+        : { ...rest, status: advanced as GraphStep["status"] };
+      return next;
     });
     return changed ? { ...n, steps } : n;
   });

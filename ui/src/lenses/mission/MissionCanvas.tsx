@@ -29,7 +29,7 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { StepRow } from "./StepRow";
-import { WorkStatus } from "../../components/WorkStatus";
+import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import {
   recordDimensions,
@@ -52,6 +52,7 @@ interface MissionNodeData {
   label: string;
   kind: string;
   status: GraphNodeStatus;
+  abandonedReason?: GraphNode["abandonedReason"];
   description?: string;
   steps: GraphNode["steps"];
   metrics: MetricsMap;
@@ -76,7 +77,11 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
       </>
     ) : null;
   return (
-    <div className={`mnode k-${data.kind} s-${data.status}`} title={data.description || data.label}>
+    <div
+      className={`mnode k-${data.kind} s-${data.status}`}
+      data-status-kind={workStatusKind(data.status, data.abandonedReason)}
+      title={data.description || data.label}
+    >
       <Handle type="target" id="lr-in" position={Position.Left} style={{ opacity: 0 }} />
       {phaseHandles}
       <div className="mn-kind">{data.kind}</div>
@@ -102,7 +107,7 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
 
 function PhaseGroup({
   data,
-}: NodeProps<{ label: string; status: GraphNodeStatus; description?: string; statusNote?: string }>) {
+}: NodeProps<{ label: string; status: GraphNodeStatus; abandonedReason?: GraphNode["abandonedReason"]; description?: string; statusNote?: string }>) {
   // (#2406, post-review) The phase box used to carry NO status word at
   // all — a degraded phase was conveyed purely by border color, and the
   // counts reached the page only as a `title=`. Tooltips do not exist on
@@ -114,7 +119,11 @@ function PhaseGroup({
   // description, as it was before this packet — the note no longer needs
   // to hitch a ride on it.
   return (
-    <div className={`phasegroup s-${data.status || "planned"}`} title={data.description || ""}>
+    <div
+      className={`phasegroup s-${data.status || "planned"}`}
+      data-status-kind={workStatusKind(data.status || "planned", data.abandonedReason)}
+      title={data.description || ""}
+    >
       <Handle type="target" id="phase-in" position={Position.Top} style={{ opacity: 0 }} />
       <Handle type="source" id="phase-out" position={Position.Bottom} style={{ opacity: 0 }} />
       <div className="pg-label">
@@ -127,7 +136,7 @@ function PhaseGroup({
             half-hidden behind it. */}
         <span className="pg-state">
           <span className="pg-name">{data.label || ""}</span>
-          <WorkStatus status={data.status} className="pg-tag" />
+          <WorkStatus status={data.status} abandonReason={data.abandonedReason} className="pg-tag" />
           {data.statusNote ? <span className="pg-note">{data.statusNote}</span> : null}
         </span>
       </div>
@@ -238,7 +247,7 @@ function toRfNodes(
         type: "phaseGroup",
         position: { x: box.x, y: box.y },
         style: { width: box.w, height: box.h },
-        data: { label: n.label, status: n.status, description: n.description, statusNote: n.statusNote },
+        data: { label: n.label, status: n.status, abandonedReason: n.abandonedReason, description: n.description, statusNote: n.statusNote },
         draggable: false,
         selectable: false,
         zIndex: 0,
@@ -257,6 +266,7 @@ function toRfNodes(
         label: n.label,
         kind: n.kind,
         status: n.status,
+        abandonedReason: n.abandonedReason,
         description: n.description,
         steps: n.steps || [],
         metrics,

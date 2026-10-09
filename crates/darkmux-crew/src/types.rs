@@ -816,6 +816,39 @@ pub struct Step {
     /// that carries results between steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// The operator's stop that ended this step, as the one decider names it
+    /// (`darkmux_types::interrupt::stop_reason`: `SIGINT`, `SIGTERM`, `SIGHUP`
+    /// or `interrupted`), set only beside `status: Abandoned`. A step an
+    /// operator's signal cut off, or one the run abandoned unstarted because
+    /// of that stop, is abandoned rather than errored: it did not fail, a
+    /// person stopped it, and every view reads it "aborted" (the `abandoned`
+    /// status plus the `aborted` reason, as a run's row does). Absent for every
+    /// other ending, and for every step file written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+impl Step {
+    /// End this step as one that did not complete: `Abandoned` naming the
+    /// operator's stop when one ended it, otherwise `Error`. The ONE place a
+    /// failed step's status is decided, so the scheduler's terminal and the
+    /// launcher's reconcile cannot disagree. A run's own wall-clock bound is
+    /// not an operator's stop (`stop_reason` names none for it): a step it
+    /// cuts off stays an error.
+    pub fn end_unfinished(&mut self) {
+        match darkmux_types::interrupt::stop_reason() {
+            Some(stop) => {
+                self.status = NodeStatus::Abandoned;
+                self.stop_reason = Some(stop.to_string());
+            }
+            None => self.status = NodeStatus::Error,
+        }
+    }
+
+    /// Whether an operator's stop ended this step (see [`Step::stop_reason`]).
+    pub fn stopped_by_operator(&self) -> bool {
+        self.status == NodeStatus::Abandoned && self.stop_reason.is_some()
+    }
 }
 
 /// (#2310 P4) The default `Task::run_on` / `mission_config::TaskConfig::run_on`

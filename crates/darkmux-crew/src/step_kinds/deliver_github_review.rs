@@ -2498,6 +2498,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = Task {
             run_on: crate::types::default_run_on(),
@@ -2543,6 +2544,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = Task {
             run_on: crate::types::default_run_on(),
@@ -2826,6 +2828,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let cfg = DeliverConfig::from_step(&step, &BTreeMap::from([("gather".to_string(), raw)])).unwrap();
         assert_eq!(cfg.scope.unreadable, vec!["unit `u-9` output: truncated".to_string()]);
@@ -3142,6 +3145,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = Task {
             run_on: crate::types::default_run_on(),
@@ -3196,6 +3200,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         step.config = json!({
             "findings": [],
@@ -4037,6 +4042,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             output: None,
+            stop_reason: None,
         };
         let task = Task {
             run_on: crate::types::default_run_on(),
@@ -4338,6 +4344,7 @@ mod tests {
                 started_ts: None,
                 completed_ts: None,
                 output: None,
+                stop_reason: None,
             };
             match DeliverConfig::from_step(&step, &BTreeMap::new()) {
                 Ok(_) => embedded += 1,
