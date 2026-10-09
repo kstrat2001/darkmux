@@ -254,6 +254,11 @@ its own: every entry below labeled 5.0 ships together.
   the row, on its run page and timeline bar on this branch. Its row now reads running, the
   quiet clock runs from the dispatch's end, and the run page keeps its clock and pulse while
   the bar reaches the playhead.
+  A `mission launch` ended by its own wall-clock bound
+  (`runtime.mission_wall_clock_timeout_seconds`) exits 0, as the `degraded` it finalizes
+  says for any generic run; it exited 130, a SIGINT's code, because the reap at the end of
+  the launch read the raised interrupt flag as a signal. Only an operator's stop
+  (`interrupt::stop_reason`) exits `128 + signo` now.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record

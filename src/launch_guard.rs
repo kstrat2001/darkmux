@@ -186,9 +186,21 @@ pub(crate) fn reap_and_exit_on_signal() {
         return;
     }
     darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-    // (#3073-P3-1) Exit with 128 + signo (e.g. 130 for SIGINT, 143 for SIGTERM).
-    let signo = darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT);
-    std::process::exit(128 + signo);
+    if let Some(code) = signal_exit_code() {
+        std::process::exit(code);
+    }
+}
+
+/// The exit code a run an operator stopped ends with: `128 + signo` (130 for
+/// SIGINT, 143 for SIGTERM, 129 for SIGHUP; 130 when a host raised the flag on
+/// its own shutdown with no OS signal, #3073-P3-1). `None` when no operator
+/// stopped it, which includes the run's own wall-clock bound: the bound raises
+/// the same flag, but it is not a signal, and the run exits as its decided
+/// status says (a `degraded` generic run exits 0), never 130. Reads the one
+/// decider of an operator's stop, `interrupt::stop_reason`.
+fn signal_exit_code() -> Option<i32> {
+    darkmux_types::interrupt::stop_reason()?;
+    Some(128 + darkmux_types::interrupt::received_signal().unwrap_or(libc::SIGINT))
 }
 
 /// [`reap_and_exit_on_signal`] for a call site whose only remaining output
@@ -220,7 +232,11 @@ pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     if !darkmux_types::interrupt::is_set() {
         return;
     }
-    eprintln!("Error: {err:?}");
+    // No operator stop (the run's own bound raised the flag): nothing exits
+    // here, so the `Err` reaches `main`, which prints it once.
+    if signal_exit_code().is_some() {
+        eprintln!("Error: {err:?}");
+    }
     reap_and_exit_on_signal();
 }
 
@@ -559,6 +575,32 @@ mod tests {
         darkmux_types::interrupt::reset_for_test();
         assert_eq!(bound, None, "the run's own bound fired: nobody stopped it");
         assert_eq!(signal_then_bound, Some("SIGTERM"), "the operator's signal came first: it is the stop");
+    }
+
+    /// A run's own wall-clock bound is not an operator signal, so it is not a
+    /// signal's exit code: the launch exited 130 (SIGINT's) after finalizing
+    /// `degraded`, because the reap at its end read the raised flag as a
+    /// signal. A signal, and a host's own shutdown, still exit `128 + signo`.
+    #[test]
+    #[serial_test::serial]
+    fn a_wall_clock_bound_is_not_a_signals_exit_code() {
+        // It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        let none = signal_exit_code();
+        mark_bound_fired();
+        let bound = signal_exit_code();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        let sigterm = signal_exit_code();
+        reset_wall_clock_exceeded_for_test();
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::raise_for_test();
+        let host_shutdown = signal_exit_code();
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!((none, bound, sigterm, host_shutdown), (None, None, Some(143), Some(130)));
     }
 
     /// (#2678) `wall_clock_exceeded` is the one extra bit that lets a

@@ -4675,7 +4675,11 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
+    // The bound is not an operator signal: the run finalizes `degraded`, and a
+    // degraded generic run exits 0 (`mission_launch::launch`'s exit-code map).
+    // It exited 130, the code for an operator's SIGINT, because the reap at
+    // the end of the launch read the raised interrupt flag as a signal.
+    assert_eq!(exit_status.code(), Some(0), "a run its own wall-clock bound ended exits as its decided status (degraded) says");
 
     let records = flow_actions(&flows);
     let step_starts = records.iter().filter(|r| r["action"] == "step.start").count();
@@ -4777,7 +4781,7 @@ fn mission_launch_wall_clock_bound_fires_mid_dispatch_and_reaps_curl() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
+    assert_eq!(exit_status.code(), Some(0), "a run its own wall-clock bound ended exits as its decided status (degraded) says");
     assert!(
         stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
         "the `curl` connection opened mid-dispatch was never torn down: the wall-clock watchdog \
