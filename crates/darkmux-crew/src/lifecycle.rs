@@ -1161,8 +1161,28 @@ pub fn mission_start_with_reasoning_and_payload(
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
     save_mission(&mission)?;
+    let payload = with_config_id(payload, mission.spec.as_ref().map(|s| s.config_id.as_str()));
     emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
+}
+
+/// (#3124) The `mission.start` payload key naming the config the run was
+/// launched from (`MissionSpec::config_id`): `dispatch` for a bare
+/// `darkmux dispatch`, the config's own id for a `mission launch`. It is
+/// what lets a machine that holds no `mission.json` for a peer's run decide
+/// its kind the same way the owning machine does (FLOW 2.2.0).
+pub const MISSION_START_CONFIG_ID_KEY: &str = "config_id";
+
+/// Put the spec's config id on the start payload. The spec is the authority
+/// for it, so it replaces a caller's key of the same name; a mission with no
+/// spec adds nothing, and a payload that is not an object is left as it is.
+fn with_config_id(payload: Option<serde_json::Value>, config_id: Option<&str>) -> Option<serde_json::Value> {
+    let Some(config_id) = config_id else { return payload };
+    let mut payload = payload.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(MISSION_START_CONFIG_ID_KEY.to_string(), serde_json::Value::String(config_id.to_string()));
+    }
+    Some(payload)
 }
 
 /// (#1504) Reconciles every non-terminal Phase belonging to this mission to
@@ -1924,6 +1944,36 @@ mod tests {
         let records = records_with_action(&g, "mission.start");
         assert_eq!(records.len(), 1, "{records:?}");
         assert!(records[0].as_object().unwrap().get("payload").is_none() || records[0]["payload"].is_null());
+    }
+
+    /// (#3124) `mission.start` names the config the run was launched from,
+    /// with or without a caller payload, so a machine without the run's
+    /// `mission.json` can tell a bare dispatch from a launched mission.
+    #[serial_test::serial]
+    #[test]
+    fn mission_start_names_the_specs_config_id() {
+        let g = CrewGuard::new();
+        for (id, config, payload) in [
+            ("dispatch-coder-1", "dispatch", None),
+            ("review-1", "review", Some(serde_json::json!({ "graph": { "pruned": 0 } }))),
+        ] {
+            let mut m = seed_mission(id, MissionStatus::Active);
+            m.spec = Some(crate::types::MissionSpec {
+                config_id: config.to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            });
+            save_mission(&m).unwrap();
+            mission_start_with_reasoning_and_payload(id, None, payload).unwrap();
+        }
+        let records = records_with_action(&g, "mission.start");
+        let config_of = |id: &str| {
+            records.iter().find(|r| r["mission_id"] == id).map(|r| r["payload"][MISSION_START_CONFIG_ID_KEY].clone())
+        };
+        assert_eq!(config_of("dispatch-coder-1"), Some(serde_json::json!("dispatch")), "{records:?}");
+        assert_eq!(config_of("review-1"), Some(serde_json::json!("review")), "{records:?}");
+        let review = records.iter().find(|r| r["mission_id"] == "review-1").unwrap();
+        assert_eq!(review["payload"]["graph"]["pruned"], 0, "the caller's own keys stay");
     }
 
     #[serial_test::serial]

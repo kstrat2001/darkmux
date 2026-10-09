@@ -18,8 +18,20 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.1.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 // Version history:
+//   2.2.0 (#3124): `mission.start` gains `payload.config_id`, the config the
+//           run was launched from (`MissionSpec::config_id`): `dispatch` for
+//           a bare `darkmux dispatch`, the config's own id for a `mission
+//           launch`. A machine that sees a peer's run only through the fleet
+//           stream decides its kind from it, the same way the owning
+//           machine decides it from `mission.json`.
+//
+//           ADDITIVE: a reader that does not know the key ignores it. A
+//           `mission.start` written before 2.2.0, or for a mission with no
+//           spec, has no key, and its flow-only run reads `mission` as it
+//           did before. Absence means "this darkmux did not record the
+//           config", never "it was not a dispatch".
 //   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
 //           bool written ONLY as `true`: a later step of the same task is
 //           still planned, so this record is not the end of the task's
