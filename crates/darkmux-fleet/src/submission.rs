@@ -1015,16 +1015,7 @@ pub(crate) fn read_reply_lines(
     };
     let mut last: Option<SubmissionReply> = None;
     for line in std::io::BufReader::new(body).lines() {
-        let line = match line {
-            Ok(line) => line,
-            // (#3130) The final answer already arrived whole (only a `queued`
-            // line may be followed by another), so a failing read after it is
-            // the connection's cleanup, not the answer: ureq clears the
-            // socket's timeouts after the last byte, which macOS refuses with
-            // EINVAL once the peer has reset the connection.
-            Err(_) if last.as_ref().is_some_and(|r| r.status != ReplyStatus::Queued) => break,
-            Err(e) => return Err(AnswerLost { detail: format!("the answer from {where_} broke off: {e}") }.into()),
-        };
+        let Some(line) = reply_line(where_, line, last.as_ref())? else { break };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1047,6 +1038,19 @@ pub(crate) fn read_reply_lines(
         last = Some(reply);
     }
     last.map(|r| (code, r)).ok_or_else(|| not_a_listener(""))
+}
+
+/// One read of a reply body: `Some(line)`, or `None` once the answer is in.
+/// (#3130) A read that fails after a complete final line (only a `queued`
+/// line may be followed by another) is the connection's cleanup, not the
+/// answer: ureq clears the socket's timeouts after the last byte, which
+/// macOS refuses with EINVAL once the peer has reset the connection.
+fn reply_line(where_: &str, line: std::io::Result<String>, last: Option<&SubmissionReply>) -> Result<Option<String>> {
+    match line {
+        Ok(line) => Ok(Some(line)),
+        Err(_) if last.is_some_and(|r| r.status != ReplyStatus::Queued) => Ok(None),
+        Err(e) => Err(AnswerLost { detail: format!("the answer from {where_} broke off: {e}") }.into()),
+    }
 }
 
 /// Send one job to a VERIFIED target's fleet listener (the token is
