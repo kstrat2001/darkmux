@@ -219,7 +219,7 @@ const hasReason = (r: NormRecord): boolean => {
 /** Whether a run's or an execution's error terminal names the operator's
  *  stop. */
 const namesAStop = (r: NormRecord): boolean => {
-  const reason = (payloadOf(r, ACTION.DispatchError) ?? payloadOf(r, ACTION.RunError))?.stop_reason;
+  const reason = (payloadOf(r, ACTION.DispatchError) ?? payloadOf(r, ACTION.RunError) ?? payloadOf(r, ACTION.StepError))?.stop_reason;
   return typeof reason === "string" && reason.length > 0;
 };
 
@@ -233,8 +233,9 @@ function completeEdge(r: NormRecord): CloseEdge {
   return payloadOf(r, ACTION.RunComplete)?.status === DEGRADED_STATUS ? { kind: "degraded" } : { kind: "complete" };
 }
 
-/** A `dispatch.error` / `run.error` edge: the operator's stop when it names
- * one, else an error (killed when the exit code says SIGKILL). */
+/** A `dispatch.error` / `run.error` / `step.error` edge: the operator's stop
+ * when it names one, else an error (killed when the exit code says SIGKILL;
+ * a `step.error` carries none, so it is never killed). */
 function terminalErrorEdge(r: NormRecord): CloseEdge {
   if (namesAStop(r)) return { kind: "operator_stop" };
   return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
@@ -251,9 +252,8 @@ function closeEdgeOf(r: NormRecord): CloseEdge | null {
       return payloadOf(r, ACTION.StepComplete)?.later_step_planned === true ? null : { kind: "complete" };
     case ACTION.DispatchError:
     case ACTION.RunError:
-      return terminalErrorEdge(r);
     case ACTION.StepError:
-      return { kind: "error", killed: false, exitCode: null };
+      return terminalErrorEdge(r);
     case ACTION.SessionEnd:
       return { kind: "session_end" };
     case ACTION.BudgetStop:

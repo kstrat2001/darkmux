@@ -72,7 +72,7 @@ pub struct StepErrorPayload {
     /// `run.error`: present means a person stopped it, so the step is abandoned
     /// (aborted), not errored. Absent for a step that failed on its own, under
     /// the run's own wall-clock bound, and on every record written before this
-    /// (flow schema 2.1.0, additive).
+    /// (flow schema 2.2.0, additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stop_reason: Option<String>,
@@ -494,7 +494,7 @@ pub struct RunPayload {
     /// own interrupt), the same fact and spelling a `dispatch.error`'s
     /// `stop_reason` carries. Present means the operator stopped it: the
     /// lifecycle rule reads it as abandoned, aborted, never as an error.
-    /// Absent (every terminal written before flow schema 2.1.0) means darkmux
+    /// Absent (every terminal written before flow schema 2.2.0) means darkmux
     /// did not record a stop, never that there was none. A run's own
     /// wall-clock bound is never named here.
     #[serde(default, skip_serializing_if = "Option::is_none")]

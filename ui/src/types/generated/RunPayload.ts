@@ -29,7 +29,7 @@ gate?: string,
  * own interrupt), the same fact and spelling a `dispatch.error`'s
  * `stop_reason` carries. Present means the operator stopped it: the
  * lifecycle rule reads it as abandoned, aborted, never as an error.
- * Absent (every terminal written before flow schema 2.1.0) means darkmux
+ * Absent (every terminal written before flow schema 2.2.0) means darkmux
  * did not record a stop, never that there was none. A run's own
  * wall-clock bound is never named here.
  */

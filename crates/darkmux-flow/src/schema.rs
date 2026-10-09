@@ -32,6 +32,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           spec, has no key, and its flow-only run reads `mission` as it
 //           did before. Absence means "this darkmux did not record the
 //           config", never "it was not a dispatch".
+//
+//           Also 2.2.0: `dispatch.error`, `run.error` and `step.error` gain
+//           `payload.stop_reason`: the operator's stop that ended the
+//           execution, the run or the step (`SIGINT`, `SIGTERM`, `SIGHUP`, or
+//           `interrupted` for an interrupt a host raised itself; never the
+//           run's own wall-clock bound). Written on every such error terminal
+//           built after the process caught one
+//           (`FlowRecord::naming_operator_stop`, the scheduler's
+//           `step.error`). The lifecycle rule reads a terminal that names one
+//           as abandoned, aborted, the way it reads a `budget.stop` that
+//           names a reason, and reads a `run.complete` whose `status` is
+//           `Degraded` as degraded. ADDITIVE: a reader that does not know the
+//           key reads the terminal as an error, as before, and every terminal
+//           written before 2.2.0 names none and still reads as an error;
+//           archives are not rewritten.
 //   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
 //           bool written ONLY as `true`: a later step of the same task is
 //           still planned, so this record is not the end of the task's
@@ -44,20 +59,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           simply has a `null` payload and closes the session as it always
 //           did. Absence means "this darkmux did not record a later step",
 //           never "there is none" (the 1.41.0 `seat_class` convention).
-//
-//           (5.0, folded in, unreleased) `dispatch.error` and `run.error`
-//           gain `payload.stop_reason`: the operator's stop that ended the
-//           execution or the run (`SIGINT`, `SIGTERM`, `SIGHUP`, or
-//           `interrupted` for an interrupt a host raised itself; never the
-//           run's own wall-clock bound). Written on every such error terminal
-//           built after the process caught one
-//           (`FlowRecord::naming_operator_stop`). The lifecycle rule reads a
-//           terminal that names one as abandoned, aborted, the way it reads a
-//           `budget.stop` that names a reason, and reads a `run.complete`
-//           whose `status` is `Degraded` as degraded. ADDITIVE: a reader that
-//           does not know the key reads the terminal as an error, as before,
-//           and every terminal written before 2.1.0 names none and still
-//           reads as an error; archives are not rewritten.
+
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           (5.0, #3035, folded in, unreleased: "remote" was the wrong axis,
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`

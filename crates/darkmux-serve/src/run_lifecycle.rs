@@ -27,7 +27,7 @@
 //!    `dispatch.complete` / `dispatch.error`) is the outcome when the
 //!    attempt has one, even when a `session.end` closed it first.
 //!    A terminal that names the operator's stop (a `budget.stop`'s
-//!    `reason`, a `dispatch.error`'s or `run.error`'s `stop_reason`) is
+//!    `reason`, a `dispatch.error`'s, `run.error`'s or `step.error`'s `stop_reason`) is
 //!    abandoned as aborted, never an error; a `run.complete` whose status
 //!    is `Degraded` is degraded.
 //! 4. Waiting. An open `budget.wait` holds the attempt live until its
@@ -69,7 +69,7 @@ struct Folded {
     /// Whether the payload names the operator's stop: a `budget.stop`'s
     /// non-empty `reason` (every reason its producers write is an operator's
     /// stop: an interrupt, `mission abort`/`finalize`, an abandoned phase), or
-    /// a `dispatch.error`'s or `run.error`'s non-empty `stop_reason` (a caught
+    /// a `dispatch.error`'s, `run.error`'s or `step.error`'s non-empty `stop_reason` (a caught
     /// signal).
     names_a_reason: bool,
     /// A `run.complete` whose status says the run completed degraded.
@@ -88,6 +88,7 @@ impl Folded {
             Some(darkmux_flow::Payload::BudgetStop(p)) => (named(&p.reason), 0, false),
             Some(darkmux_flow::Payload::DispatchError(p)) => (named(&p.stop_reason), 0, false),
             Some(darkmux_flow::Payload::RunError(p)) => (named(&p.stop_reason), 0, false),
+            Some(darkmux_flow::Payload::StepError(p)) => (named(&p.stop_reason), 0, false),
             Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
             Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
             _ => (false, 0, false),
@@ -161,13 +162,13 @@ fn closing_ending(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
     if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
         return ended(RunStatus::Complete, None);
     }
-    if *action == FlowAction::StepError {
+    if *action == FlowAction::StepError && !names_a_reason {
         return ended(RunStatus::Error, None);
     }
     if *action == FlowAction::SessionEnd {
         return ended(RunStatus::Abandoned, Some(AbandonReason::NoTerminal));
     }
-    if *action == FlowAction::MissionAbort || (*action == FlowAction::BudgetStop && names_a_reason) {
+    if *action == FlowAction::MissionAbort || (matches!(action, FlowAction::BudgetStop | FlowAction::StepError) && names_a_reason) {
         return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted));
     }
     (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
@@ -398,6 +399,23 @@ pub(crate) fn quiet_clock_live(last_activity_ts: Option<&str>, wait_until_ms: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operator's stop reads the same on every terminal that names it:
+    /// `step.error` carries `stop_reason` as `dispatch.error` and `run.error`
+    /// do, so a step a person stopped is abandoned as aborted from the flow
+    /// alone, as its row reads it. One that names no stop is an error.
+    #[test]
+    fn every_terminal_naming_the_operators_stop_reads_aborted() {
+        let rec = |action: &str, payload: serde_json::Value| serde_json::json!({"action": action, "payload": payload});
+        let aborted = Some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::Aborted) });
+        let error = Some(Ending { status: RunStatus::Error, reason: None });
+        for action in ["dispatch.error", "run.error", "step.error"] {
+            // `cause` is `step.error`'s required field; the others ignore it.
+            let stopped = serde_json::json!({"cause": "interrupted", "stop_reason": "SIGTERM"});
+            assert_eq!(ending_of_record(&rec(action, stopped)), aborted, "{action} naming a stop");
+            assert_eq!(ending_of_record(&rec(action, serde_json::json!({"cause": "boom"}))), error, "{action} naming none");
+        }
+    }
 
     fn fold(f: &mut RunFold, action: FlowAction, mission: &str, ts: &str) {
         f.fold(Some(&action), Some(mission), ts, &serde_json::json!({}));

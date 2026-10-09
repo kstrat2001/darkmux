@@ -17,6 +17,6 @@ cause: string,
  * `run.error`: present means a person stopped it, so the step is abandoned
  * (aborted), not errored. Absent for a step that failed on its own, under
  * the run's own wall-clock bound, and on every record written before this
- * (flow schema 2.1.0, additive).
+ * (flow schema 2.2.0, additive).
  */
 stop_reason?: string, };

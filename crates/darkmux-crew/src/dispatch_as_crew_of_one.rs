@@ -582,6 +582,19 @@ mod tests {
 
     // ── Test fixtures ───────────────────────────────────────────────────
 
+    /// The run reports a step an operator's stop ended (abandoned, naming the
+    /// stop) through the failure arm, as it reports an error; an abandoned
+    /// step that names no stop, and every other status, report as they are.
+    #[test]
+    fn a_step_the_operator_stopped_reports_as_a_failure() {
+        let (_, _, _, base) = build_graph(&test_opts("coder", "hi"), "dispatch-coder-1-abc");
+        let step = |status: NodeStatus, stop: Option<&str>| Step { status, stop_reason: stop.map(str::to_string), ..base.clone() };
+        assert_eq!(outcome_status(&step(NodeStatus::Abandoned, Some("SIGTERM"))), NodeStatus::Error);
+        assert_eq!(outcome_status(&step(NodeStatus::Error, None)), NodeStatus::Error);
+        assert_eq!(outcome_status(&step(NodeStatus::Abandoned, None)), NodeStatus::Abandoned);
+        assert_eq!(outcome_status(&step(NodeStatus::Complete, None)), NodeStatus::Complete);
+    }
+
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
             finding_sites: None,

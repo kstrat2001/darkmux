@@ -492,7 +492,7 @@ pub struct DispatchEndPayload {
     /// means the operator stopped it, the way a `budget.stop` that names a reason does: the
     /// lifecycle rule (`ui/src/lib/lifecycle.ts`, `crates/darkmux-serve/src/run_lifecycle.rs`)
     /// reads it as abandoned, aborted, never as an error. Absent (every terminal written before
-    /// flow schema 2.1.0) means darkmux did not record a stop, never that there was none.
+    /// flow schema 2.2.0) means darkmux did not record a stop, never that there was none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stop_reason: Option<String>,

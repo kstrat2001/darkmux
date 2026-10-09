@@ -406,3 +406,23 @@ describe("a run's status is decided once and every view renders it", () => {
     expect(board(row("lab", "pg-1", LAB_S, "abandoned", "aborted")).kind).not.toBe(board(row("lab", "pg-1", LAB_S, "degraded")).kind);
   });
 });
+
+// The one rule reads the operator's stop on every terminal that names it: a
+// `step.error` carries `stop_reason` as `dispatch.error` and `run.error` do,
+// so a step a person stopped reads aborted from the flow alone, as its row
+// and the mission graph read it. One naming no stop is an error.
+describe("a step.error naming the operator's stop reads aborted from the flow alone", () => {
+  const stateOf = (payload: Record<string, unknown>) => {
+    const data = normAll([rec(0, "step.start"), rec(10, "step.error", { level: "error", payload })]);
+    const t = T0 + 20_000;
+    const run = sessionRun(data, "s1", t);
+    expect(run).not.toBeNull();
+    return toRunState(lifecycleAt(run!, t, DEFAULT_POLICY, NO_PRESENCE));
+  };
+  it("is abandoned as aborted when it names a stop", () => {
+    expect(stateOf({ cause: "interrupted", stop_reason: "SIGTERM" })).toEqual({ status: "abandoned", abandonReason: "aborted" });
+  });
+  it("is an error when it names none", () => {
+    expect(stateOf({ cause: "boom" }).status).toBe("error");
+  });
+});
