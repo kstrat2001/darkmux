@@ -214,6 +214,7 @@ describe("a run's status is decided once and every view renders it", () => {
       timeline: shown(bar?.status, bar?.title.split(" · ").at(-1)),
       page: shown(page.header.status, page.header.pillLabel.toLowerCase()),
       activeTimeSub: page.metrics.find((m) => m.label === "ACTIVE TIME")?.sub,
+      pageLive: page.live,
       cardRunning: card.runningSessionIds.includes(sid),
     };
   }
@@ -307,6 +308,50 @@ describe("a run's status is decided once and every view renders it", () => {
     expect(ownRowOf([other], DISPATCH_S, "m-2", "execution")).toBe(other);
     const ghost = row("dispatch", DISPATCH_S, DISPATCH_S, "abandoned", "aborted");
     expect(ownRowOf([ghost], DISPATCH_S, "m-1", "execution")).toBe(ghost);
+  });
+
+  // A `darkmux dispatch` run IS its one execution. Its execution ended with a
+  // non-zero exit and no signal: the terminal is a `dispatch.error` naming no
+  // stop, and the run's envelope (its row's source) records the same outcome
+  // (`ResultClass::of_exit`, `dispatch_as_crew_of_one`). It used to finalize
+  // `Degraded`: the row said degraded, a view with only the flow said error.
+  it("a dispatch that failed with no signal reads error on every view, with its row and without it", () => {
+    const failed = { result_class: "error", exit_code: 2, total_turns: 4 };
+    const data = normAll([dispatch(0, "dispatch.start"), dispatch(37, "dispatch.turn"), dispatch(END_S, "dispatch.error", { level: "error", payload: failed })]);
+    const dispatchRow = row("dispatch", "d-1", DISPATCH_S, "error");
+    const expected = board(dispatchRow);
+    expect(expected).toEqual({ status: "error", word: "error", kind: "error" });
+    for (const [label, rows] of [["with its row", [dispatchRow]], ["without a row", []]] as const) {
+      for (const live of [true, false]) {
+        const v = views(data, rows, DISPATCH_S, "d-1", AFTER, live);
+        const at = `${label}, ${live ? "live" : "playback"}`;
+        expect(v.timeline, `${at}: fleet timeline bar`).toEqual(expected);
+        expect(v.page, `${at}: run page pill`).toEqual(expected);
+      }
+    }
+  });
+
+  // A lab run is RUNNING until its own record ends, verify included. Its
+  // dispatch session ends first (`dispatch.complete`); the run then verifies
+  // the work, and its row (the lab record, `lifecycle.json`) still says
+  // running. The row's decision used to read that ended session as the run
+  // gone quiet ("no ending"), and this branch made every view render it.
+  it("a lab run verifying after its dispatch ended reads running on every view", () => {
+    const VERIFY_S = END_S + 30;
+    const data = normAll([lab(0, "dispatch.start"), lab(37, "dispatch.turn"), lab(END_S, "dispatch.complete", { payload: { result_class: "ok", total_turns: 3 } })]);
+    const labRow = row("lab", "pg-1", LAB_S, "running");
+    const expected = board(labRow);
+    expect(expected).toEqual({ status: "running", word: "running", kind: "running" });
+    const t = T0 + VERIFY_S * 1000;
+    const v = views(data, [labRow], LAB_S, null, t, true);
+    expect(v.timeline, "fleet timeline bar").toEqual(expected);
+    expect(v.page, "run page pill").toEqual(expected);
+    expect(v.pageLive, "run page: in flight").toBe(true);
+    const bar = buildActivityTimeline(data, new Map(), [U], new Set(), t, t, 1440, true, 0, t, undefined, null, [], DEFAULT_POLICY, new Set(), [labRow], true)
+      .lanes[0].bars.find((b) => b.sid === LAB_S);
+    expect((bar?.leftPct ?? 0) + (bar?.widthPct ?? 0), "the running bar reaches the playhead").toBeCloseTo(100, 5);
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, U, t, null, [labRow]);
+    expect(card.runsCount, "fleet card counts it running").toBe(1);
   });
 
   // A run page's tiles state the shown ending, never the raw flow close. A lab

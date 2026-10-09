@@ -12,7 +12,7 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
-import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, ownRowOf, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, judgementAt, lifecycleAt, ownRowOf, shownRunState, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
 import { CATEGORY, ingest, isBookendStart, recordsAsOf, type NormRecord } from "../../lib/ingest";
@@ -755,7 +755,15 @@ export function SessionReplay({
   // so nothing ticks or pulses, and the pill says unknown.
   const { notReporting, stopped } = useRunSilence(hasRecords, runRow, endedByPresence);
   const pageLifecycle = pageRun !== null ? lifecycleAt(pageRun, clockNow, policy, presence) : null;
-  const plausiblyRunning = pageLifecycle !== null && isRunning(pageLifecycle) && !stopped;
+  // Running as the page shows it (`shownRunState`): at the live edge a row the
+  // daemon lists decides, and presence seeing the session go does not outrank
+  // it (a lab run verifies after its dispatch session ends). Without a row,
+  // the lifecycle's own reading, stopped by presence or a silent machine.
+  const rowDecides = ownRow !== null && playhead === null;
+  const plausiblyRunning =
+    pageLifecycle !== null &&
+    shownRunState(pageLifecycle, ownRow, playhead === null).status === "running" &&
+    !(rowDecides ? hasRecords && notReporting : stopped);
   useRowCatchUp(playhead === null && pageLifecycle?.phase === "closed", ownRow);
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s

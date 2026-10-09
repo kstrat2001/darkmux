@@ -20,6 +20,20 @@ pub enum ResultClass {
     Unknown,
 }
 
+impl ResultClass {
+    /// How an execution ended, by its exit code: the one rule. Its terminal
+    /// (`dispatch.complete` or `dispatch.error`) and, for a `darkmux dispatch`
+    /// run (which is its one execution), the run's own envelope both read it,
+    /// so the row and a view with only the flow give the same answer.
+    pub fn of_exit(exit_code: i32) -> Self {
+        if exit_code == 0 {
+            ResultClass::Ok
+        } else {
+            ResultClass::Error
+        }
+    }
+}
+
 /// How a tool call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

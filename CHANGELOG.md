@@ -245,6 +245,15 @@ its own: every entry below labeled 5.0 ships together.
   names no stop and, without a row, still reads as an error. The status colors are one
   table: a running bar is now the running chip's teal rather than amber, and degraded and
   escalated bars take the warn color their chips already had.
+  A `darkmux dispatch` whose execution exits non-zero with no signal now finalizes its run
+  `error`, the outcome its `dispatch.error` already records (`ResultClass::of_exit`, the one
+  rule both read); it finalized `degraded`, so its row said degraded while a view with only
+  the flow said error. An envelope written before this keeps the `degraded` it says.
+  A lab run is running until its own record ends: between its dispatch's terminal and its
+  verify result its row read abandoned ("no ending"), on the board since #2812 and, through
+  the row, on its run page and timeline bar on this branch. Its row now reads running, the
+  quiet clock runs from the dispatch's end, and the run page keeps its clock and pulse while
+  the bar reaches the playhead.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record

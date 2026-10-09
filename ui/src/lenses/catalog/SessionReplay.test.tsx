@@ -842,6 +842,49 @@ describe("SessionReplay", () => {
     expect(runsCalls).toBe(2);
   });
 
+  // A lab run is running until its own record ends, verify included. Its
+  // dispatch session has closed (`dispatch.complete`) and its row, the lab
+  // record, still says running while it verifies. The page shows the row's
+  // running: the pill, and its pulse is a running one, never "finished" or
+  // "may be abandoned" from the session's own close.
+  it("a lab run verifying after its dispatch ended reads running on its page", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "pg-2.lab.adhoc.coder.pepper-grinder";
+    const records = [
+      { ts: at(60_000), action: "dispatch.start", session_id: sid, machine_id: "M", handle: "coder", payload: {} },
+      { ts: at(20_000), action: "dispatch.complete", session_id: sid, machine_id: "M", handle: "coder", payload: { result_class: "ok", total_turns: 3 } },
+    ];
+    const runs = [{ id: "pg-2", kind: "lab", status: "running", tracked: true, receive_key: 0, dispatch_id: sid }];
+    let runsCalls = 0;
+    // Presence saw the dispatch session live, then saw it go: evidence the
+    // SESSION ended, which the row (the run's own record) outranks.
+    let presenceCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const u = String(url);
+        if (u.startsWith("/fleet/dispatches/live")) {
+          presenceCalls += 1;
+          return Promise.resolve(new Response(JSON.stringify({ dispatches: presenceCalls === 1 ? [{ session_id: sid }] : [], meta: {} }), { status: 200 }));
+        }
+        if (u.includes("/runs")) runsCalls += 1;
+        return Promise.resolve(new Response(JSON.stringify(u.includes("/runs") ? { runs } : { records }), { status: 200 }));
+      }),
+    );
+    renderReplay(sid);
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(presenceCalls).toBeGreaterThan(1), { timeout: 9000 });
+    await waitFor(() => expect(pill()?.textContent).toBe("running"));
+    expect(pill()).toHaveAttribute("data-status-kind", "running");
+    // A running pulse (quiet: the dispatch's last record is 20s old), never
+    // the session's own "finished" or "may be abandoned".
+    expect(pill()).toHaveAttribute("data-live", "quiet");
+    expect(pill()?.getAttribute("title")).toMatch(/^running/);
+    // The row's catch-up asks once as the session closes, never in a loop
+    // while the run verifies.
+    expect(runsCalls).toBeLessThanOrEqual(3);
+  }, 12_000);
+
   // (5.0 R3) A run recorded as running on a peer that is down has no live
   // evidence and no terminal record can arrive: the pill says UNKNOWN, in the
   // place the page already states its status, instead of RUNNING.

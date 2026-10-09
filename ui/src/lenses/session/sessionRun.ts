@@ -54,7 +54,7 @@
 
 import { computeTMax, type RunState } from "../../lib/flow";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
-import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, shownRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, lifecycleAt, recordedActiveMs, recordedWallMs, shownRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import type { Run } from "../../types/generated/Run";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
@@ -648,7 +648,12 @@ function noRunContext(nowMs: number): RunContext {
 function contextOf(run: RunRecords, l: Lifecycle, nowMs: number, row: Run | null, live: boolean): RunContext {
   const members = new Set<NormRecord>(run.attempt ? run.attempt.records : run.group.records);
   const firstSessRec = run.group.records[0] ?? null;
-  const done = !isRunning(l);
+  // The page is in flight while the run it shows is running: the shown state
+  // (the row's, when the daemon lists the run), not the flow's own close, so a
+  // lab run verifying after its dispatch ended keeps its clock and its pulse.
+  // Without a row this is the lifecycle's own `isRunning`.
+  const state = shownRunState(l, row, live);
+  const done = state.status !== "running";
   return {
     run,
     l,
@@ -658,7 +663,7 @@ function contextOf(run: RunRecords, l: Lifecycle, nowMs: number, row: Run | null
     inAttempt: (r) => members.has(r),
     endTs: done ? endMs(l, nowMs) : null,
     done,
-    state: shownRunState(l, row, live),
+    state,
     ...closeFacts(l.close),
   };
 }
@@ -1874,7 +1879,7 @@ export function runRegions(
     // and never shown.
     hasModelWork: effHasModelWork,
     live: !done,
-    ended: l?.close != null,
+    ended: l?.close != null && done,
     lastBeatMs,
     signalsLabel,
     signalGroups,

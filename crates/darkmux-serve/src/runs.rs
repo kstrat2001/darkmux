@@ -642,12 +642,12 @@ fn build_runs_in(
             // the bounded flow-scan window — leaves `lab_run_status` on
             // its artifact-mtime fallback, which is the honest degradation
             // rather than a fabricated verdict.
-            let session_live = summary
+            let session = summary
                 .session_id
                 .as_deref()
                 .and_then(|sid| flow_index.get(sid))
-                .map(|agg| session_is_live(agg, now_ms));
-            let run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
+                .map(|agg| LabSession::of(agg, now_ms));
+            let run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session);
             // (#2902 step 2b) The session the run's provider recorded, read
             // whole. A finished tool-bench row publishes no `session_id`
             // (its trials each ran under their own session — see
@@ -1908,10 +1908,10 @@ fn lab_summary_to_run(
     summary: &LabRunSummary,
     machine: Option<String>,
     now_ms: u64,
-    session_live: Option<bool>,
+    session: Option<LabSession>,
 ) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
-    let status = lab_run_status(summary, now_ms, session_live);
+    let status = lab_run_status(summary, now_ms, session);
     // (#1907, corrected #2462/#1946) `lab_run_status` used to have no abort
     // concept at all — every `Abandoned` arm was the staleness gate (the
     // run's artifact trail went quiet past the budget with no
@@ -2033,6 +2033,34 @@ fn lab_summary_to_run(
     }
 }
 
+/// What a lab run's own dispatch session (#2812) says about the RUN, as
+/// [`lab_run_status`] reads it. Three states, because a session that ended is
+/// not a run that ended: a lab run verifies its work after its dispatch, and
+/// is running until its own record (`lifecycle.json`) ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabSession {
+    /// No terminal, and emitting within the quiet budget: the run is live.
+    Live,
+    /// No terminal, and quiet past the budget: observed-dead.
+    Silent,
+    /// The dispatch ended, at `at_ms` (0 when its time is unreadable): the
+    /// run's own record decides from here.
+    Ended { at_ms: u64 },
+}
+
+impl LabSession {
+    fn of(agg: &SessionAgg, now_ms: u64) -> Self {
+        if agg.terminal_status.is_some() {
+            let at_s = agg.terminal_ts.as_deref().or(agg.last_activity_ts.as_deref()).and_then(parse_flow_ts);
+            LabSession::Ended { at_ms: at_s.map_or(0, |s| s.saturating_mul(1000)) }
+        } else if session_is_live(agg, now_ms) {
+            LabSession::Live
+        } else {
+            LabSession::Silent
+        }
+    }
+}
+
 /// Map a lab run's own `finished`/`degenerate` fields to the flat
 /// [`RunStatus`]. A `degenerate` run (every probe drew nothing usable — see
 /// `darkmux_lab::lab::review`'s own doc) reached its terminal artifact
@@ -2041,10 +2069,12 @@ fn lab_summary_to_run(
 /// step-4 lens can special-case `degenerate` directly off the richer
 /// `/lab/runs` payload if finer granularity turns out to matter).
 ///
-/// (#2812) `session_live` is the run's OWN flow session judged by
-/// [`session_is_live`] — `Some(true)`/`Some(false)` when the run named a
-/// session id and that session is in the flow index, `None` when it named
-/// none or the session has aged out of the scan window. It is POSITIVE
+/// (#2812) `session` is the run's OWN flow session ([`LabSession`]): live,
+/// silent (no terminal, quiet past [`session_is_live`]'s budget) or ended,
+/// when the run named a session id and that session is in the flow index;
+/// `None` when it named none or the session has aged out of the scan window.
+/// An ended session is the dispatch's end, not the run's: the run verifies
+/// after it, and is running until its own record ends. It is POSITIVE
 /// evidence and outranks the artifact-mtime heuristic below, because the
 /// heuristic's premise ("a live run keeps writing artifacts") is simply
 /// false for the providers that write everything at the end: a
@@ -2057,7 +2087,7 @@ fn lab_summary_to_run(
 /// `flow_mission_to_run` and `ghost_runs` already make. Lab was the one
 /// `/runs` source not participating in the liveness axis that function's
 /// own doc claims every source shares.
-fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<bool>) -> RunStatus {
+fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session: Option<LabSession>) -> RunStatus {
     // (#1930) The run's OWN terminal record wins over every inference below.
     // `finished` only ever meant "scores.json exists", so a run that ERRORED
     // never set it and fell through to the idle heuristic — reporting
@@ -2092,8 +2122,17 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // IS indexed and has gone quiet past the same `stale_after_ms()` budget
     // is observed-dead, and falling through to the mtime heuristic for it
     // would only re-derive the same verdict from worse evidence.
-    if let Some(live) = session_live {
-        return if live { RunStatus::Running } else { RunStatus::Abandoned };
+    //
+    // A session that ENDED is not the run ending: the run still verifies the
+    // work after its dispatch, and is running until its own record ends. Its
+    // dispatch's end is then the newest evidence it was alive, so the quiet
+    // clock below runs from there (or from a newer artifact).
+    let mut last_alive_ms = summary.mtime_ms;
+    match session {
+        Some(LabSession::Live) => return RunStatus::Running,
+        Some(LabSession::Silent) => return RunStatus::Abandoned,
+        Some(LabSession::Ended { at_ms }) => last_alive_ms = last_alive_ms.max(at_ms),
+        None => {}
     }
     // (#1621) Unfinished is NOT the same as running, and treating it as such
     // is what made the `running` filter useless: 49 of 52 rows it returned
@@ -2111,7 +2150,7 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // Measured when this landed: all 49 unfinished lab runs on the operator's
     // machine were untouched for over an hour, the freshest 2.6h. Not one was
     // plausibly live.
-    let idle_ms = now_ms.saturating_sub(summary.mtime_ms);
+    let idle_ms = now_ms.saturating_sub(last_alive_ms);
     if idle_ms > stale_after_ms() {
         // It left a trail and the trail STOPS — that is evidence of
         // abandonment, not absence of evidence, so `Abandoned` is honest here
@@ -4501,14 +4540,14 @@ mod tests {
     fn a_manifest_is_a_terminal_record_when_there_is_no_lifecycle() {
         let now = 1_700_000_000_000u64 + 30 * 24 * 3600 * 1000; // long stale
         let old = |ok: Option<bool>| LabRunSummary { run_ok: ok, ..minimal_lab_summary("d", false, false) };
-        assert_eq!(lab_run_status(&old(Some(true)), now, Some(false)), RunStatus::Complete);
-        assert_eq!(lab_run_status(&old(Some(false)), now, Some(false)), RunStatus::Error);
+        assert_eq!(lab_run_status(&old(Some(true)), now, Some(LabSession::Silent)), RunStatus::Complete);
+        assert_eq!(lab_run_status(&old(Some(false)), now, Some(LabSession::Silent)), RunStatus::Error);
         // A degenerate run is an error even when its manifest says ok:
         // tool-bench always writes `ok: true`.
         let degenerate = LabRunSummary { degenerate: true, ..old(Some(true)) };
-        assert_eq!(lab_run_status(&degenerate, now, Some(false)), RunStatus::Error);
+        assert_eq!(lab_run_status(&degenerate, now, Some(LabSession::Silent)), RunStatus::Error);
         // CONTROL: no manifest outcome keeps the old inference.
-        assert_eq!(lab_run_status(&old(None), now, Some(false)), RunStatus::Abandoned);
+        assert_eq!(lab_run_status(&old(None), now, Some(LabSession::Silent)), RunStatus::Abandoned);
     }
 
     /// (#1930) The run's own terminal record outranks every inference.
@@ -9023,8 +9062,10 @@ mod tests {
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Planned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Running) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Complete) => true,
-            // (F10/F11) The mission envelope's `degraded` status; a dispatch
-            // is a crew-of-one mission, whose non-zero exit finalizes degraded.
+            // (F10/F11) The mission envelope's `degraded` status. A dispatch
+            // is a crew-of-one mission; its non-zero exit now finalizes `Error`
+            // (its execution's terminal), so a degraded dispatch row comes
+            // only from an envelope written before 5.0, read as written.
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Degraded) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Abandoned) => true,
@@ -9303,8 +9344,73 @@ mod tests {
         assert_ne!(activity_key(row), 0, "and it must still be orderable: {row:?}");
     }
 
-    /// The inverted case, and the reason `session_live` is a three-valued
-    /// signal rather than a boolean. Without this, the test above would
+    /// The operator's rule (2026-10-07): a lab run is RUNNING until its own
+    /// record ends, verify included. Its dispatch session ends first (its
+    /// `dispatch.complete`), then the run verifies the work, then the run's
+    /// own record (`lifecycle.json`) ends. In between, the row read the ended
+    /// session as the run gone quiet: abandoned, "no ending", on the runs board
+    /// and, through the row, on the run page and the timeline bar too.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lab_run_verifying_after_its_dispatch_ended_reads_running() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-pepper-grinder-verify-1";
+        write_lifecycle_only_lab_run(lab.path(), "pepper-grinder-verify-1", "running", Some(sid));
+        // Hours in, as a real coding-task run is: its run directory has not
+        // moved since it started.
+        backdate_lab_run_artifacts(lab.path(), "pepper-grinder-verify-1");
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.complete", "session_id": sid, "handle": "coder", "payload": {"result_class": "ok"}}),
+            ],
+        );
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!(
+            (row.status, row.abandoned_reason),
+            (RunStatus::Running, None),
+            "the dispatch ended, the run has not: it is verifying: {row:?}"
+        );
+    }
+
+    /// The backstop the rule above keeps: a run whose record still says
+    /// running (a hard kill leaves it so, `Drop` never ran) and whose dispatch
+    /// ended long ago is abandoned, with no ending recorded. The quiet clock
+    /// runs from the dispatch's end, its newest evidence of life.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lab_run_whose_dispatch_ended_long_ago_with_no_ending_of_its_own_is_abandoned() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-pepper-grinder-killed-1";
+        write_lifecycle_only_lab_run(lab.path(), "pepper-grinder-killed-1", "running", Some(sid));
+        backdate_lab_run_artifacts(lab.path(), "pepper-grinder-killed-1");
+        // The dispatch ended a minute past the quiet budget ago, measured from
+        // the real clock `build_runs` judges by.
+        let ended_ago = stale_after_ms() / 1000 + 60;
+        let at = |ago: u64| darkmux_flow::ts_utc_at(now_unix().saturating_sub(ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": at(ended_ago + 600), "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": at(ended_ago), "action": "dispatch.complete", "session_id": sid, "handle": "coder"}),
+            ],
+        );
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!((row.status, row.abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)), "{row:?}");
+    }
+
+    /// The inverted case, and the reason the session fact is more than a
+    /// boolean. Without this, the test above would
     /// pass just as well if `lab_run_status` had been changed to return
     /// `Running` for every lifecycle-only run — which would resurrect
     /// #1621 (49 of 52 rows the `running` filter returned were long-dead
