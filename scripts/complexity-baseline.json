@@ -303,7 +303,7 @@
   "src/machine_list.rs::unreachable_phrase": 15,
   "src/main.rs::cmd_correction": 13,
   "src/main.rs::cmd_dispatch": 14,
-  "src/main.rs::cmd_init": 29,
+  "src/main.rs::cmd_init": 28,
   "src/main.rs::cmd_machine_status": 12,
   "src/main.rs::cmd_model_eject": 12,
   "src/main.rs::cmd_profile": 13,
