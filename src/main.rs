@@ -1872,8 +1872,15 @@ fn cmd_init(
             n += 1;
             println!("  {n}. {text}");
         };
-        if report.profile_registry_created && report.worker_model_filled.is_none() {
-            step("Edit ~/.darkmux/profiles.json to point at a downloaded model (`lms ls` lists them)");
+        // (#3143) Whenever the placeholder is still there, fresh registry or
+        // re-run, and naming the registry this run used (DARKMUX_HOME moves it).
+        if report.worker_model_unfilled_reason.is_some() {
+            let path = report
+                .profile_registry_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the profile registry".to_string());
+            step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
         step("First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`");
         step("Check the setup: `darkmux doctor`");

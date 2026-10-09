@@ -254,14 +254,27 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
         .unwrap_or_default();
     let ram_gb = darkmux_hardware::detect().total_ram_gb;
     let Some(id) = choose_worker_model(&loaded, &available, ram_gb) else {
-        return Err(format!(
-            "LM Studio has no downloaded LLM that fits in {ram_gb} GB. Download one in LM Studio, then \
-             re-run `darkmux init`."
-        ));
+        return Err(no_worker_model_reason(ram_gb));
     };
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
     fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
     Ok(Some(id))
+}
+
+/// Why no worker model was chosen from an answered catalog.
+/// `ram_gb` is 0 when the RAM size could not be read, and then nothing
+/// "fits"; the reason says that rather than naming a 0 GB budget.
+fn no_worker_model_reason(ram_gb: u32) -> String {
+    if ram_gb == 0 {
+        return "could not detect this machine's RAM, so no downloaded LLM could be sized against it. \
+                Load the model you want in LM Studio (a loaded model is chosen whatever its size), then \
+                re-run `darkmux init`."
+            .to_string();
+    }
+    format!(
+        "LM Studio has no downloaded LLM that fits in {ram_gb} GB. Download one in LM Studio, then \
+         re-run `darkmux init`."
+    )
 }
 
 /// A utility model has to be a real model, not a toy: the smallest LLM at or
