@@ -258,7 +258,6 @@
   "runtime/src/lmstudio.rs::read_line_capped": 11,
   "runtime/src/loop_runner.rs::TurnAccum::absorb": 12,
   "runtime/src/loop_runner.rs::run_streaming_turn": 17,
-  "runtime/src/loop_runner.rs::run_with_sleeper": 151,
   "runtime/src/main.rs::run_dispatch": 136,
   "runtime/src/plain_text_tool_calls.rs::consume_json_object": 15,
   "runtime/src/plain_text_tool_calls.rs::fenced_regions": 23,

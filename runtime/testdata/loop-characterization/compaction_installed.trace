@@ -1,0 +1,33 @@
+scenario: compaction_installed
+outcome: Stop
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=4 calls=0 "seed"
+  user chars=279 calls=0 "[compacted:1] Summary: the assistant repeatedly …"
+  user chars=292 calls=0 "padding user 2: context detail that occupies tra…"
+  assistant chars=297 calls=0 "padding assistant 2: context detail that occupie…"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  system chars=256 calls=0 "[darkmux-runtime] Working memory was just compre…"
+  assistant chars=4 calls=0 "done"
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user,user,assistant,user,assistant,user,assistant]
+  #2 model="test-compactor" max_tokens=4096 stream=null roles=[system,user]
+  #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,user,user,assistant,assistant,tool,system]
+checkpoint: turns=1 tokens=50 compactions=1 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,user,user,assistant,assistant,tool,system]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":5000}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":50,"prompt_tokens":5000,"reasoning_tokens":null,"total_tokens":5050}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":1,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"generation":1,"requested_model":"test-compactor","type":"compaction.start"}
+  {"generation":1,"reported_model":"ignored-by-test","requested_model":"test-compactor","type":"compaction.call","usage":{"cached_tokens":null,"completion_tokens":30,"prompt_tokens":500,"reasoning_tokens":null,"total_tokens":530}}
+  {"after_messages":7,"before_messages":10,"generation":1,"summary_chars":279,"tokens_after":258,"tokens_before":5055,"type":"compaction"}
+  {"message_count":1,"seq":1,"signal_kinds":["post_compaction"],"type":"dispatch.feedback.injected"}
+  {"max":null,"seq":2,"type":"dispatch.context","used":300}
+  {"calls_planned":true,"finish_reason":"stop","reported_model":"ignored-by-test","seq":2,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":5,"prompt_tokens":300,"reasoning_tokens":null,"total_tokens":305}}

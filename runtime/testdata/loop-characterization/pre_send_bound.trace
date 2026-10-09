@@ -1,0 +1,22 @@
+scenario: pre_send_bound
+outcome: Stop
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  assistant chars=0 calls=1 ""
+  tool chars=5613 calls=0 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  user chars=8 calls=0 "continue"
+  assistant chars=4 calls=0 "done"
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,user]
+checkpoint: none
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"declared_window":3000,"fits":true,"results_trimmed":1,"tokens_after":2993,"tokens_before":15497,"turn":1,"type":"dispatch.pre_send_bound"}
+  {"max":3000,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"stop","reported_model":"ignored-by-test","seq":1,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":5,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":105}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}

@@ -1,0 +1,28 @@
+scenario: intra_turn_stall
+outcome: EscalationTriggered(IntraTurnStallExhausted)
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  system chars=174 calls=0 "[darkmux-runtime] Your previous response ended w…"
+  system chars=174 calls=0 "[darkmux-runtime] Your previous response ended w…"
+  assistant chars=0 calls=0 ""
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=500 stream=null roles=[system,user]
+  #2 model="test-model" max_tokens=500 stream=null roles=[system,user,system]
+  #3 model="test-model" max_tokens=500 stream=null roles=[system,user,system,system]
+checkpoint: turns=2 tokens=1000 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,system,system]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"length","reported_model":"ignored-by-test","seq":1,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":500,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":600}}
+  {"bound":{"kind":"max_tokens_per_call","source":"built-in","value":500},"completion_tokens":500,"recoveries_budget":2,"recoveries_used":1,"seq":1,"type":"dispatch.intra_turn_stall.recovered"}
+  {"max":null,"seq":2,"type":"dispatch.context","used":101}
+  {"calls_planned":true,"finish_reason":"length","reported_model":"ignored-by-test","seq":2,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":500,"prompt_tokens":101,"reasoning_tokens":null,"total_tokens":601}}
+  {"bound":{"kind":"max_tokens_per_call","source":"built-in","value":500},"completion_tokens":500,"recoveries_budget":2,"recoveries_used":2,"seq":2,"type":"dispatch.intra_turn_stall.recovered"}
+  {"max":null,"seq":3,"type":"dispatch.context","used":102}
+  {"calls_planned":true,"finish_reason":"length","reported_model":"ignored-by-test","seq":3,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":500,"prompt_tokens":102,"reasoning_tokens":null,"total_tokens":602}}
+  {"model":"test-model","prompt_tokens":102,"reason":"escalation_intra_turn_stall_exhausted","seq":3,"type":"dispatch.escalation.triggered"}

@@ -1,0 +1,47 @@
+scenario: cycle_and_cascade
+outcome: Stop
+final_answer: None
+turn_delay_effective_ms: 0
+failed_to_run: 0
+messages:
+  system chars=11 calls=0 "test system"
+  user chars=11 calls=0 "do the task"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  system chars=218 calls=0 "[darkmux-runtime] You've called `read` 3 times i…"
+  system chars=443 calls=0 "[darkmux-runtime] `read` could not run 3 times i…"
+  assistant chars=0 calls=1 ""
+  tool chars=100 calls=0 "tool 'read' returned error: resolving path: /wor…"
+  assistant chars=4 calls=0 "done"
+sleeps: []
+requests:
+  #1 model="test-model" max_tokens=32000 stream=null roles=[system,user]
+  #2 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool]
+  #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool]
+  #4 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system]
+  #5 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system,assistant,tool]
+checkpoint: turns=4 tokens=80 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,assistant,tool,assistant,tool,assistant,tool,system,system,assistant,tool]
+events:
+  {"schema_version":"1.0","type":"trajectory.header"}
+  {"max":null,"seq":1,"type":"dispatch.context","used":100}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":120}}
+  {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":1,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"max":null,"seq":2,"type":"dispatch.context","used":101}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":2,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":101,"reasoning_tokens":null,"total_tokens":121}}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":2,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"max":null,"seq":3,"type":"dispatch.context","used":102}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":3,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":102,"reasoning_tokens":null,"total_tokens":122}}
+  {"canonical_args":"{\"limit\":1,\"offset\":1,\"path\":\"/workspace/x.txt\"}","count":3,"seq":3,"tool_name":"read","type":"dispatch.cycle.suspected","window_size":10}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":3,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"canonical_args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","failure_count":3,"seq":3,"tool_name":"read","type":"dispatch.tool.repeated_failure"}
+  {"message_count":2,"seq":3,"signal_kinds":["cycle_suspected","tool_failure_cascade"],"type":"dispatch.feedback.injected"}
+  {"max":null,"seq":4,"type":"dispatch.context","used":103}
+  {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":4,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":103,"reasoning_tokens":null,"total_tokens":123}}
+  {"args":"{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}","args_chars":48,"emit_seq":null,"emitted":null,"exit_code":null,"failure_reason":"the tool returned an error","ok":false,"outcome":"failed","result":"tool 'read' returned error: resolving path: /workspace/x.txt: No such file or directory (os error 2)","result_chars":100,"seq":4,"tool_name":"read","tool_seq":0,"type":"tool.completed"}
+  {"max":null,"seq":5,"type":"dispatch.context","used":200}
+  {"calls_planned":true,"finish_reason":"stop","reported_model":"ignored-by-test","seq":5,"tool_calls":null,"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":5,"prompt_tokens":200,"reasoning_tokens":null,"total_tokens":205}}

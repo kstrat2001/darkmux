@@ -57,13 +57,13 @@ const ROSTER: &[CallSite] = &[
         duty: Duty::Transport,
     },
     // The turn loop, non-streaming and streaming. Both replies reach
-    // `run_with_sleeper`, which writes one `model.completed` per call.
+    // `AgentLoop::plan_calls`, which writes one `model.completed` per call.
     CallSite {
-        file: "src/loop_runner.rs",
-        caller: "run_with_sleeper",
+        file: "src/loop_phases.rs",
+        caller: "send",
         token: "chat",
         duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
+            records_in: ("src/loop_phases.rs", "plan_calls"),
             marker: "append_model_completed(",
             test: "loop_runner::tests::every_compactor_call_lands_as_one_compaction_call_event_and_turns_name_their_model",
         },
@@ -73,7 +73,7 @@ const ROSTER: &[CallSite] = &[
         caller: "run_streaming_turn",
         token: "chat_streaming_ticking",
         duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
+            records_in: ("src/loop_phases.rs", "plan_calls"),
             marker: "append_model_completed(",
             test: "lmstudio::tests::accumulated_stream_carries_the_served_model_from_its_chunks",
         },
@@ -101,45 +101,26 @@ const ROSTER: &[CallSite] = &[
             test: "compaction::tests::structured_compaction_reports_its_one_compactor_call",
         },
     },
-    // The loop's two compaction sites (resume catch-up and the main loop),
-    // each for both strategies. The loop drains the captured calls into one
-    // `compaction.call` trajectory event each.
+    // The loop's one compaction site, `AgentLoop::attempt_compaction`, shared
+    // by the resume catch-up and the main loop (#3136), for both strategies.
+    // It drains the captured calls into one `compaction.call` trajectory
+    // event each.
     CallSite {
-        file: "src/loop_runner.rs",
-        caller: "run_with_sleeper",
+        file: "src/loop_phases.rs",
+        caller: "attempt_compaction",
         token: "compact",
         duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
+            records_in: ("src/loop_phases.rs", "attempt_compaction"),
             marker: "append_compaction_call(",
             test: "loop_runner::tests::every_compactor_call_lands_as_one_compaction_call_event_and_turns_name_their_model",
         },
     },
     CallSite {
-        file: "src/loop_runner.rs",
-        caller: "run_with_sleeper",
-        token: "compact",
-        duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
-            marker: "append_compaction_call(",
-            test: "loop_runner::tests::every_compactor_call_lands_as_one_compaction_call_event_and_turns_name_their_model",
-        },
-    },
-    CallSite {
-        file: "src/loop_runner.rs",
-        caller: "run_with_sleeper",
+        file: "src/loop_phases.rs",
+        caller: "structured_compaction",
         token: "structured_compact",
         duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
-            marker: "append_compaction_call(",
-            test: "compaction::tests::structured_compaction_reports_its_one_compactor_call",
-        },
-    },
-    CallSite {
-        file: "src/loop_runner.rs",
-        caller: "run_with_sleeper",
-        token: "structured_compact",
-        duty: Duty::Emits {
-            records_in: ("src/loop_runner.rs", "run_with_sleeper"),
+            records_in: ("src/loop_phases.rs", "attempt_compaction"),
             marker: "append_compaction_call(",
             test: "compaction::tests::structured_compaction_reports_its_one_compactor_call",
         },
@@ -486,19 +467,35 @@ fn production_source_cuts_test_items_but_keeps_what_follows() {
     assert_eq!(call_sites(&prod, "chat"), vec!["a".to_string(), "b".to_string()]);
 }
 
-/// The loop compacts at TWO sites (resume catch-up and the main loop), both
-/// inside `run_with_sleeper`, so "the fn reaches `append_compaction_call`"
-/// alone would pass with one site's drain deleted. Each site drains its own.
+/// The loop compacts at ONE site, `attempt_compaction`, which both the resume
+/// catch-up and the main loop call (#3136; there used to be two inline copies,
+/// each with its own drain). Its drain must stay there: "the roster's
+/// recorder reaches `append_compaction_call`" alone would pass with the drain
+/// moved to a caller that only one of the two paths runs. The drain must also
+/// FOLLOW both strategies' calls, which is why it sits after the `match`.
 #[test]
 fn each_loop_compaction_site_drains_its_own_calls() {
-    let body = fn_body("src/loop_runner.rs", "run_with_sleeper");
-    let sites = body.matches("compaction::compact(").count();
-    assert_eq!(sites, 2, "the roster above names two narrative sites");
+    let body = fn_body("src/loop_phases.rs", "attempt_compaction");
+    let sites = body.matches("compaction::compact(").count()
+        + body.matches("self.structured_compaction(").count();
+    assert_eq!(sites, 2, "one call per strategy at the one site");
     assert_eq!(
-        body.matches("trajectory.append_compaction_call(").count(),
-        sites,
-        "one `compaction.call` drain per compaction site (#2902)"
+        body.matches("self.trajectory.append_compaction_call(").count(),
+        1,
+        "one `compaction.call` drain, after both strategies' calls (#2902)"
     );
+    let drain = body.find("self.trajectory.append_compaction_call(").unwrap();
+    assert!(
+        body.match_indices("compaction::compact(").chain(body.match_indices("self.structured_compaction(")).all(|(at, _)| at < drain),
+        "the drain follows every compactor call it accounts for"
+    );
+    for caller in ["compact_thread", "compact_after_resume"] {
+        assert_eq!(
+            fn_body("src/loop_phases.rs", caller).matches("self.attempt_compaction(").count(),
+            1,
+            "`{caller}` compacts through the one site"
+        );
+    }
 }
 
 /// (#2915) Each compaction site marks its START before it calls the
@@ -508,9 +505,10 @@ fn each_loop_compaction_site_drains_its_own_calls() {
 /// that drops or moves its marker below the call fails here.
 #[test]
 fn each_loop_compaction_site_marks_its_start_before_the_call() {
-    let body = fn_body("src/loop_runner.rs", "run_with_sleeper");
+    let body = fn_body("src/loop_phases.rs", "attempt_compaction");
     let starts: Vec<usize> = body.match_indices("trajectory.append_compaction_start(").map(|(i, _)| i).collect();
     let calls: Vec<usize> = body.match_indices("compaction::compact(").map(|(i, _)| i).collect();
+    assert_eq!(calls.len(), 1, "the one compaction site (#3136)");
     assert_eq!(starts.len(), calls.len(), "one `compaction.start` per compaction site (#2915)");
     for (s, c) in starts.iter().zip(&calls) {
         assert!(s < c, "a site's start marker must precede its compactor call (#2915)");
