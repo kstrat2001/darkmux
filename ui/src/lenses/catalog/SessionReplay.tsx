@@ -12,7 +12,7 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
-import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, ownRowOf, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
 import { CATEGORY, ingest, isBookendStart, recordsAsOf, type NormRecord } from "../../lib/ingest";
@@ -32,7 +32,7 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import type { Run } from "../../types/generated/Run";
 import type { RunRelay } from "../../types/generated/RunRelay";
-import { useRunRow } from "../../hooks/useRunRow";
+import { useRunRow, useRunRows } from "../../hooks/useRunRow";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
@@ -629,6 +629,10 @@ export function SessionReplay({
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   // The run's row on the board: a later step of a mission is found by its mission id.
   const runRow = useRunRow(sessionId, ownMissionId, playhead === null);
+  // The row whose run IS this session (a lab run, a dispatch): the pill shows
+  // its status, decided once by the daemon, as the runs board does.
+  const runRows = useRunRows(playhead === null);
+  const ownRow = useMemo(() => ownRowOf(runRows, sessionId, ownMissionId), [runRows, sessionId, ownMissionId]);
   const relay = relayOf(runRow);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
@@ -830,7 +834,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid, notReporting);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid, notReporting, ownRow, playhead === null);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails

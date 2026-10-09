@@ -1934,6 +1934,87 @@
       },
       "phase": "open",
       "status": "running"
+    },
+    {
+      "name": "an execution the operator stopped (its terminal names the stop) is aborted, not an error",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0,
+            "stop_reason": "SIGTERM"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted"
+    },
+    {
+      "name": "an execution terminal that names no stop is an error (every archive written before terminals named one)",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "an execution terminal whose stop is empty names no stop, and is an error",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "lab-run-1.lab.adhoc.coder.pepper-grinder",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "result_class": "error",
+            "error": "dispatch terminated before completion (early return or panic)",
+            "total_turns": 0,
+            "stop_reason": ""
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
     }
   ]
 }

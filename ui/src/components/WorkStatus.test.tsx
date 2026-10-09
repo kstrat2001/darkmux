@@ -46,6 +46,12 @@ describe("<WorkStatus>", () => {
     expect(r).toHaveClass("wstatus", "is-running", "s-running");
     expect(m.getAttribute("data-live")).toBe(r.getAttribute("data-live"));
   });
+  it("its color is keyed by kind, from the one status table (`styles.status.test.ts`)", () => {
+    for (const status of ["running", "complete", "error", "degraded", "abandoned", "planned", "something-new"] as const) {
+      const chip = render(<WorkStatus status={status as never} />).container.firstElementChild!;
+      expect(chip.getAttribute("data-status-kind"), status).toBe(workStatusKind(status));
+    }
+  });
   it("only the running kind carries the pulse hook; a done chip is still", () => {
     const done = render(<WorkStatus status="finalized" />).container.firstElementChild!;
     expect(done).toHaveClass("wstatus", "is-done");

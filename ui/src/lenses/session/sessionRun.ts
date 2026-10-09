@@ -54,7 +54,8 @@
 
 import { computeTMax, type RunState } from "../../lib/flow";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
-import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, shownRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import type { Run } from "../../types/generated/Run";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
@@ -620,9 +621,9 @@ interface RunContext {
   state: RunState;
 }
 
-function runContext(data: NormRecord[], sid: string, nowMs: number, policy: LifecyclePolicy, presence: Presence): RunContext {
+function runContext(data: NormRecord[], sid: string, nowMs: number, policy: LifecyclePolicy, presence: Presence, row: Run | null, live: boolean): RunContext {
   const run = sessionRun(data, sid, nowMs);
-  return run ? contextOf(run, lifecycleAt(run, nowMs, policy, presence), nowMs) : noRunContext(nowMs);
+  return run ? contextOf(run, lifecycleAt(run, nowMs, policy, presence), nowMs, row, live) : noRunContext(nowMs);
 }
 
 /** A session with no records in the window: nothing opened, nothing to
@@ -644,7 +645,7 @@ function noRunContext(nowMs: number): RunContext {
   };
 }
 
-function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
+function contextOf(run: RunRecords, l: Lifecycle, nowMs: number, row: Run | null, live: boolean): RunContext {
   const members = new Set<NormRecord>(run.attempt ? run.attempt.records : run.group.records);
   const firstSessRec = run.group.records[0] ?? null;
   const done = !isRunning(l);
@@ -657,7 +658,7 @@ function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
     inAttempt: (r) => members.has(r),
     endTs: done ? endMs(l, nowMs) : null,
     done,
-    state: toRunState(l),
+    state: shownRunState(l, row, live),
     ...closeFacts(l.close),
   };
 }
@@ -1606,6 +1607,11 @@ export function runRegions(
   /** (5.0 R3) Whether the machine a run executed on is not reporting. A run
    *  that reads running there has no live evidence, so its status is unknown. */
   notReporting?: boolean,
+  /** The daemon's `/runs` row whose run IS this session (`ownRowOf`): the
+   *  pill shows its status, decided once (`shownRunState`). */
+  row: Run | null = null,
+  /** Whether `nowOverride` is the live edge (no parked playhead). */
+  liveEdge = false,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
@@ -1614,7 +1620,7 @@ export function runRegions(
   // (`lib/lifecycle.ts`) every surface reads: its attempt as of `nowMs`
   // (the latest start, #1988's skewed close honored and flagged), its close
   // edge, and whether it is still in flight.
-  const ctx = runContext(data, sid, nowMs, policy, presence);
+  const ctx = runContext(data, sid, nowMs, policy, presence, row, liveEdge);
   const { run, l, d, firstSessRec, startTs, inAttempt, endTs, c, done, skewedClose, state } = ctx;
   const visible = recordsAsOf(data, nowMs);
   const { tel, lms, procs, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);

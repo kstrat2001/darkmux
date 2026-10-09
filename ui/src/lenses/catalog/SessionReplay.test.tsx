@@ -785,6 +785,29 @@ describe("SessionReplay", () => {
     expect(pillEl?.getAttribute("title")).toBe("finished");
   });
 
+  // The operator's rule (2026-10-07): a run's status is decided once, on its
+  // `/runs` row, and the run page renders that decision. The lab run stopped
+  // with SIGTERM: its board row reads aborted; its flow terminal, written
+  // before terminals named a stop, reads error if re-derived.
+  it("a lab run's page shows its board row's status, not one re-derived from its records", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const sid = "pg-1.lab.adhoc.coder.pepper-grinder";
+    const records = [
+      { ts: at(60_000), action: "dispatch.start", session_id: sid, machine_id: "M", handle: "coder", payload: {} },
+      { ts: at(30_000), action: "dispatch.error", session_id: sid, machine_id: "M", payload: { result_class: "error", error: "dispatch terminated before completion (early return or panic)", total_turns: 0 } },
+    ];
+    const runs = [{ id: "pg-1", kind: "lab", status: "abandoned", abandoned_reason: "aborted", tracked: true, receive_key: 0, dispatch_id: sid }];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => Promise.resolve(new Response(JSON.stringify(String(url).includes("/runs") ? { runs } : { records }), { status: 200 }))),
+    );
+    renderReplay(sid);
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const pill = () => document.querySelector(".session-run__header .pill");
+    await waitFor(() => expect(pill()?.textContent).toBe("ABORTED"));
+    expect(pill()).toHaveAttribute("data-status-kind", "stopped");
+  });
+
   // (5.0 R3) A run recorded as running on a peer that is down has no live
   // evidence and no terminal record can arrive: the pill says UNKNOWN, in the
   // place the page already states its status, instead of RUNNING.

@@ -489,6 +489,32 @@ describe("FleetLens", () => {
     expect(card.textContent).not.toContain("idle");
   });
 
+  // The operator's rule (2026-10-07): a run's status is decided once, on its
+  // `/runs` row, and the timeline bar renders that decision, word and color.
+  // The lab run stopped with SIGTERM: its board row reads aborted; its flow
+  // terminal, written before terminals named a stop, reads error if re-derived.
+  it("a lab run's timeline bar shows its board row's status and color", async () => {
+    const sid = "pg-1.lab.adhoc.coder.pepper-grinder";
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const recs = [
+      { ts: at(120_000), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: sid, action: "dispatch.start", handle: "coder" },
+      { ts: at(60_000), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: sid, action: "dispatch.error", payload: { result_class: "error", total_turns: 0 } },
+    ];
+    const today = todayUTC();
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      flowToday: recs.filter((r) => r.ts.startsWith(today)),
+      flowYesterday: recs.filter((r) => !r.ts.startsWith(today)),
+      runs: [{ id: "pg-1", kind: "lab", status: "abandoned", abandoned_reason: "aborted", machine: "MacBook-Pro", tracked: true, receive_key: 0, dispatch_id: sid }],
+    });
+    renderFleetLens();
+    const bar = () => document.querySelector(`.sbar[data-arg="${sid}"]`);
+    await waitFor(() => expect(bar()).not.toBeNull());
+    await waitFor(() => expect(bar()).toHaveAttribute("data-status-kind", "stopped"));
+    expect(bar()).toHaveClass("abandoned");
+    expect(bar()?.getAttribute("title")).toMatch(/· aborted$/);
+  });
+
   // (#1923 review) The rendered-DOM twin of `cards.test.ts`'s double-count
   // case. A lab run's DISPATCH phase DOES ride the flow stream — the
   // provider calls `darkmux_crew::dispatch::dispatch`, which emits the

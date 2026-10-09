@@ -134,8 +134,27 @@
      plus the mission lens's own `--ml-run`), `#ffb86b` (stale panels,
      abandoned bars, lab warnings) and `--warn` itself. The last two are the
      same concept and are now one; the first is not — a run in progress is
-     not a warning, and collapsing it would say so on every fleet screen. */
+     not a warning, and collapsing it would say so on every fleet screen.
+     Since the one status palette below, the mission lens's `--ml-run` is its
+     only reader: a running session bar is the running kind's color. */
   --run: #ffd166;
+
+  /* THE status palette (operator, 2026-10-07: "the color of the status
+     should be a one time status setting so it should not even have a chance
+     of being different across views"). A status word maps to its kind once
+     (`WorkStatus.tsx`'s `workStatusKind`) and a kind to its color once, here;
+     `[data-status-kind]` below hands it to an element as `--status-color`. The
+     work-status chip, the fleet timeline's bar and the fleet card's lamp read
+     it and name no color of their own. A run in progress is the accent: the
+     chip's color since it existed, and no longer an amber bar beside a teal
+     chip (`--run` above stays the mission lens's own). */
+  --status-running: var(--accent);
+  --status-done: var(--good);
+  --status-error: var(--bad);
+  --status-degraded: var(--warn);
+  --status-stopped: var(--warn);
+  --status-idle: var(--dim);
+  --status-unknown: var(--dim);
 
   /* (U2-3) The one raw rgba outside this block (`.phasegroup.s-complete`'s
      border). Promoted as-is rather than mixed from `--good`: its hue is a
@@ -2801,6 +2820,17 @@ body {
 .labrunmeta.dim {
   color: var(--dim);
 }
+/* The kind-to-color lookup: the ONE place a status kind becomes a color. */
+[data-status-kind="running"] { --status-color: var(--status-running); }
+[data-status-kind="done"] { --status-color: var(--status-done); }
+[data-status-kind="error"] { --status-color: var(--status-error); }
+[data-status-kind="degraded"] { --status-color: var(--status-degraded); }
+[data-status-kind="stopped"] { --status-color: var(--status-stopped); }
+/* A chip with no kind yet (a loading placeholder) is idle. */
+[data-status-kind="idle"],
+.wstatus:not([data-status-kind]) { --status-color: var(--status-idle); }
+[data-status-kind="unknown"] { --status-color: var(--status-unknown); }
+
 /* ─── The ONE work-status chip (components/WorkStatus.tsx) ──────────────────
    Every scope — mission, phase, task, step, run — renders its status through
    this. Five kinds, one palette, one pulse. A call site may add a LAYOUT
@@ -2815,30 +2845,16 @@ body {
   text-transform: uppercase;
   padding: 3px 7px;
   border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--dim);
+  border: 1px solid var(--status-color);
+  color: var(--status-color);
   white-space: nowrap;
 }
-/* (U2-3) `var(--accent)` directly. This named `--run`, which THIS SHEET
-   NEVER DEFINED, so the chip has always rendered the accent fallback.
-   Naming what it renders is the whole fix — and it is deliberately NOT
-   pointed at the new `--run` token, because that would silently repaint
-   every running chip amber. Flagged rather than changed: a running session
-   is a teal CHIP here and an amber BAR on the activity lane, which is a
-   real inconsistency and an operator call, not a refactor's to make. */
-.wstatus.is-running { color: var(--accent); border-color: var(--accent); }
-.wstatus.is-done { color: var(--good); border-color: var(--good); }
-.wstatus.is-error { color: var(--bad); border-color: var(--bad); }
-/* (#2406) Same `--warn` token `.is-stopped` and `.fleetcov`
-   already use for "a caution, not a failure" — a mixed terminal is a
-   caution, not a failure, same as an operator/budget stop. Reusing the
-   existing warn palette on purpose (no new color for an existing concept);
-   `degraded` stays its own KIND so the raw status word, not the color,
-   tells it apart from `stopped`. */
-.wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-idle,
-.wstatus.is-unknown { color: var(--dim); border-color: var(--border); }
+/* An idle or unknown chip keeps the quiet panel border; its word stays the
+   kind's color. (#2406: `degraded` and `stopped` share the warn color and stay
+   apart by their raw word.) */
+.wstatus[data-status-kind="idle"],
+.wstatus[data-status-kind="unknown"],
+.wstatus:not([data-status-kind]) { border-color: var(--border); }
 
 .labbadge {
   flex: 0 0 auto;
@@ -3937,7 +3953,8 @@ body {
    the line's box: a padding the same size as a negative margin gives the glow
    room and moves nothing. */
 .mach .stat {
-  --lit: var(--accent);
+  /* Lit work is the running color, from the one status palette. */
+  --lit: var(--status-running);
   --lamp-unlit: var(--dim);
   --lamp-size: 8px;
   padding: 4px 8px;
@@ -4440,7 +4457,7 @@ body {
   position: absolute;
   top: 5px;
   height: 18px;
-  background: var(--dim);
+  background: var(--status-color);
   border-radius: 3px;
   min-width: 2px;
   /* (drill-in packet) Clickable — see `FleetLens.tsx`'s own doc on the bar's
@@ -4477,18 +4494,9 @@ body {
     min-width: 24px;
   }
 }
-.sbar.running {
-  background-color: var(--run);
-  box-shadow: 0 0 6px var(--run);
-}
-.sbar.complete {
-  background-color: var(--good);
-}
-.sbar.abandoned {
-  background-color: var(--warn);
-}
-.sbar.error {
-  background-color: var(--error);
+/* A bar's color is its status kind's (`[data-status-kind]`), as the chip's is. */
+.sbar[data-status-kind="running"] {
+  box-shadow: 0 0 6px var(--status-color);
 }
 .tltrack .ph {
   position: absolute;

@@ -2160,7 +2160,8 @@ impl<'a> StepBookend<'a> {
     fn emit_abort(&mut self) {
         if let (Some(mut rec), Some(c)) = (self.on_abort.take(), self.ctx) {
             rec.ts = darkmux_flow::ts_utc_now();
-            c.emit(rec);
+            // Armed when the execution started: name a stop that came since.
+            c.emit(rec.naming_operator_stop());
         }
     }
 }
@@ -3177,6 +3178,53 @@ impl StepKind for ProceduralNoopStepKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step execution's bookend arms its abort terminal when the execution
+    /// starts, before any stop. An operator's signal that then ends the
+    /// execution must still be named on that terminal when it is written, or
+    /// the run reads "error" on every flow-derived view while the run's own
+    /// record reads "aborted".
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    fn an_armed_abort_written_after_an_operator_stop_names_the_stop() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        darkmux_types::interrupt::reset_for_test();
+        let session = darkmux_types::session_id::SessionId::task(crate::test_run(), "t1");
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+        let rec = |payload| {
+            darkmux_flow::FlowRecord::for_execution_with(
+                &session,
+                &execution,
+                darkmux_flow::Level::Info,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                payload,
+                "s1",
+            )
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let bookend = StepBookend::new(
+            Some(&ctx),
+            rec(darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default())),
+            rec(darkmux_flow::Payload::DispatchError(DispatchEndPayload::aborted(None))),
+        );
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        drop(bookend);
+        darkmux_types::interrupt::reset_for_test();
+        drop(ctx);
+        let stops: Vec<Option<String>> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(darkmux_flow::FlowRecord {
+                    payload: Some(darkmux_flow::Payload::DispatchError(p)), ..
+                }) => Some(p.stop_reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, [Some("SIGTERM".to_string())]);
+    }
     use std::sync::Arc;
     use serde_json::json;
     use tempfile::TempDir;

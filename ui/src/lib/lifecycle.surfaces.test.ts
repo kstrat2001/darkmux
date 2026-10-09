@@ -9,11 +9,14 @@ import { buildFleetCard } from "../testing/fleetCard";
 import { buildActivityTimeline } from "../lenses/fleet/timeline";
 import { runRegions } from "../lenses/session/sessionRun";
 import { flowToRenderModel } from "./flow";
-import { DEFAULT_POLICY, lifecycleAt, toRunState } from "./lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, lifecycleAt, ownRowOf, toRunState } from "./lifecycle";
 import { sessionRun } from "./runRef";
 import { liveExecutions } from "./tokenRate";
 import { normAll, type RawRecord } from "../testing/records";
 import { recordsAsOf, type NormRecord } from "./ingest";
+import { runBadgeStatus, runStatusLabel } from "../lenses/runs/format";
+import { workStatusKind } from "../components/WorkStatus";
+import type { Run } from "../types/generated/Run";
 
 const T0 = Date.parse("2026-09-27T10:00:00Z");
 const at = (s: number) => new Date(T0 + s * 1000).toISOString();
@@ -115,5 +118,105 @@ describe("a long run", () => {
     const lc = lifecycleAt(run!, t, DEFAULT_POLICY);
     expect(lc.startMs).toBe(T0);
     expect(lc.lastActivityMs).toBe(T0 + 3_000_000);
+  });
+});
+
+// The operator's rule (2026-10-07): "the color of the status should be a one
+// time status setting so it should not even have a chance of being different
+// across views." A run the daemon lists has its status decided once, on its
+// `/runs` row (the runs board, `darkmux run list`); the run page and the fleet
+// timeline render that decision, word and color, and never re-derive it.
+//
+// The fixture is the run that broke it: a `darkmux lab run pepper-grinder`
+// stopped with SIGTERM. Its lab record says it was interrupted, so the board
+// read "aborted" (yellow); its flow terminal, written before terminals named
+// a stop, says only `result_class: error`, so the run page and the timeline
+// bar re-derived "error" (red).
+describe("every view renders the daemon's one decision for a run it lists", () => {
+  const S = "pepper-grinder-coder-qwen38-1791342379-1.lab.adhoc.coder.pepper-grinder";
+  const lab = (s: number, action: string, extra: RawRecord = {}): RawRecord => rec(s, action, { session_id: S, ...extra });
+  const abortPayload = { result_class: "error", error: "dispatch terminated before completion (early return or panic)", total_turns: 0 };
+  const END_S = 5679;
+  const archived = normAll([
+    lab(0, "dispatch.start"),
+    lab(37, "dispatch.turn"),
+    lab(END_S, "dispatch.error", { level: "error", payload: abortPayload }),
+  ]);
+  const row: Run = {
+    id: "pepper-grinder-coder-qwen38-1791342379-1",
+    kind: "lab",
+    status: "abandoned",
+    abandoned_reason: "aborted",
+    dispatch_id: S,
+    tracked: true,
+    receive_key: 0,
+  };
+
+  /** The status, word and color kind one view shows. */
+  const shown = (status: string | undefined, word: string | undefined) => ({ status, word, kind: workStatusKind(status) });
+  const board = (r: Run) => shown(runBadgeStatus(r), runStatusLabel(r));
+
+  /** What the run page and the timeline bar show for the run at `t`, judged
+   *  `live` (the live edge) or in playback, with the board's rows. */
+  function views(data: NormRecord[], rows: readonly Run[], t: number, live: boolean) {
+    const bar = buildActivityTimeline(data, new Map(), [U], new Set(), t, t, 1440, true, 0, t, undefined, null, [], DEFAULT_POLICY, new Set(), rows, live)
+      .lanes[0].bars.find((b) => b.sid === S);
+    const page = runRegions(flowToRenderModel(recordsAsOf(data, t)), S, t, true, null, null, NO_PRESENCE, DEFAULT_POLICY, null, false, ownRowOf(rows, S, null), live).header;
+    return { timeline: shown(bar?.status, bar?.title.split(" · ").at(-1)), page: shown(page.status, page.pillLabel.toLowerCase()) };
+  }
+
+  it("at the live edge, the run page and the timeline bar show the row's status, word and color", () => {
+    const expected = board(row);
+    expect(expected).toEqual({ status: "abandoned", word: "aborted", kind: "stopped" });
+    const v = views(archived, [row], T0 + (END_S + 60) * 1000, true);
+    expect(v.timeline, "fleet timeline bar").toEqual(expected);
+    expect(v.page, "run page").toEqual(expected);
+  });
+
+  it("in playback, it is running while it ran, and once it ended its ending is the row's", () => {
+    const during = views(archived, [row], T0 + 600_000, false);
+    expect(during.timeline.status).toBe("running");
+    expect(during.page.status).toBe("running");
+    const after = views(archived, [row], T0 + (END_S + 60) * 1000, false);
+    expect(after.timeline).toEqual(board(row));
+    expect(after.page).toEqual(board(row));
+  });
+
+  it("at the live edge the row is the status even before the flow has the run's end", () => {
+    // The daemon has the lab record's verdict; the flow terminal is not in yet.
+    const open = normAll([lab(0, "dispatch.start"), lab(37, "dispatch.turn")]);
+    const t = T0 + 60_000;
+    const live = views(open, [row], t, true);
+    expect(live.timeline).toEqual(board(row));
+    expect(live.page).toEqual(board(row));
+    // In playback the same instant is judged from the records: it was running then.
+    expect(views(open, [row], t, false).page.status).toBe("running");
+  });
+
+  it("a dispatch row is a session's own only for the mission its records name", () => {
+    const other: Run = { ...row, kind: "dispatch", id: "m-2" };
+    expect(ownRowOf([other], S, "m-1")).toBeNull();
+    expect(ownRowOf([other], S, "m-2")).toBe(other);
+    const ghost: Run = { ...row, kind: "dispatch", id: S };
+    expect(ownRowOf([ghost], S, "m-1")).toBe(ghost);
+  });
+
+  it("a mission's row is not its execution's: an execution page keeps its own status", () => {
+    const mission: Run = { ...row, id: "m-1", kind: "mission", status: "running", abandoned_reason: undefined };
+    expect(ownRowOf([mission], S, null)).toBeNull();
+    const v = views(archived, [mission], T0 + (END_S + 60) * 1000, true);
+    expect(v.page.status).toBe("error");
+    expect(v.timeline.status).toBe("error");
+  });
+
+  it("with no row, a terminal that names the operator's stop reads aborted on every view", () => {
+    const stopped = normAll([
+      lab(0, "dispatch.start"),
+      lab(37, "dispatch.turn"),
+      lab(END_S, "dispatch.error", { level: "error", payload: { ...abortPayload, stop_reason: "SIGTERM" } }),
+    ]);
+    const v = views(stopped, [], T0 + (END_S + 60) * 1000, true);
+    expect(v.timeline).toEqual(board(row));
+    expect(v.page).toEqual(board(row));
   });
 });

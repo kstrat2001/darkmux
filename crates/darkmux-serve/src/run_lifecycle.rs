@@ -26,6 +26,9 @@
 //! 3. Outcome. A bookend terminal (`run.complete` / `run.error`,
 //!    `dispatch.complete` / `dispatch.error`) is the outcome when the
 //!    attempt has one, even when a `session.end` closed it first.
+//!    A terminal that names the operator's stop (a `budget.stop`'s
+//!    `reason`, a `dispatch.error`'s `stop_reason`) is abandoned as
+//!    aborted, never an error.
 //! 4. Waiting. An open `budget.wait` holds the attempt live until its
 //!    announced resume time plus the grace; the staleness clock then runs
 //!    from there.
@@ -62,9 +65,10 @@ struct Folded {
     ts: String,
     /// Its `ts` as epoch seconds; `None` when unparsable.
     at: Option<u64>,
-    /// Whether the payload names a non-empty `reason`: every reason a
-    /// `budget.stop` producer writes is an operator's stop (an interrupt,
-    /// `mission abort`/`finalize`, an abandoned phase).
+    /// Whether the payload names the operator's stop: a `budget.stop`'s
+    /// non-empty `reason` (every reason its producers write is an operator's
+    /// stop: an interrupt, `mission abort`/`finalize`, an abandoned phase), or
+    /// a `dispatch.error`'s non-empty `stop_reason` (a caught signal).
     names_a_reason: bool,
     /// A `budget.wait`'s announced wait, milliseconds.
     wait_ms: u64,
@@ -77,6 +81,7 @@ impl Folded {
     fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
         let (names_a_reason, wait_ms, later_step_planned) = match darkmux_flow::reader::payload_of(v) {
             Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0, false),
+            Some(darkmux_flow::Payload::DispatchError(p)) => (p.stop_reason.as_deref().is_some_and(|r| !r.is_empty()), 0, false),
             Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
             Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
             _ => (false, 0, false),
@@ -109,11 +114,14 @@ impl Folded {
 }
 
 /// The ending `action` implies when it is a closing record (rule 2).
-/// `names_a_reason` is a `budget.stop`'s payload fact.
+/// `names_a_reason` is the payload's naming of an operator's stop (a
+/// `budget.stop`'s `reason`, a `dispatch.error`'s `stop_reason`): a terminal
+/// that names one is the operator's stop, abandoned as aborted, not a failure.
 pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
     let ended = |status, reason| Some(Ending { status, reason });
     match action.bookend().map(|b| b.edge) {
         Some(Edge::Complete) => return ended(RunStatus::Complete, None),
+        Some(Edge::Error) if names_a_reason => return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted)),
         Some(Edge::Error) => return ended(RunStatus::Error, None),
         Some(Edge::Start) | None => {}
     }

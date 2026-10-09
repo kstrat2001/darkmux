@@ -45,6 +45,15 @@ stderr_excerpt?: string, exit_code?: number, result_class?: ResultClass,
  */
 error?: string, 
 /**
+ * On a `dispatch.error` only: the operator's stop that ended the execution, named (`SIGINT`,
+ * `SIGTERM`, `SIGHUP`, or `interrupted` when a host raised its own interrupt). Present
+ * means the operator stopped it, the way a `budget.stop` that names a reason does: the
+ * lifecycle rule (`ui/src/lib/lifecycle.ts`, `crates/darkmux-serve/src/run_lifecycle.rs`)
+ * reads it as abandoned, aborted, never as an error. Absent (every terminal written before
+ * flow schema 2.1.0) means darkmux did not record a stop, never that there was none.
+ */
+stop_reason?: string, 
+/**
  * The model turns the execution took: a direct single-shot call or a map item is 1, a
  * container loop its fold's count, an execution that ended before any call 0. Every
  * producer states it: `new` takes it and there is no `Default`, so a struct built without

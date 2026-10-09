@@ -31,8 +31,10 @@
  *              or none at all): the raw word shows in the chip, dim, and in the
  *              DOM as `s-<raw>`. Never worded as idle.
  *
- * Styling lives in ONE place: `.wstatus` in `styles.css`. A call site may add
- * a layout class (`className`) but never a second color/animation source.
+ * Styling lives in ONE place: `.wstatus` in `styles.css`, its color from the
+ * one status palette (`[data-status-kind]`, which the fleet timeline's bar
+ * reads too). A call site may add a layout class (`className`) but never a
+ * second color/animation source.
  */
 import type { LivenessState } from "./LivenessPulse";
 import type { RunBadgeStatus } from "../lib/runStatusWord";
@@ -114,7 +116,7 @@ export function WorkStatus({
   const raw = status ?? "unknown";
   const cls = ["wstatus", `is-${kind}`, `s-${raw}`, className].filter(Boolean).join(" ");
   return (
-    <span className={cls} data-live={kind === "running" ? (live ?? "beating") : undefined} title={title}>
+    <span className={cls} data-status-kind={kind} data-live={kind === "running" ? (live ?? "beating") : undefined} title={title}>
       {kind === "running" ? RUNNING_WORD : (label ?? raw)}
     </span>
   );

@@ -46,7 +46,9 @@
  * 3. Outcome. How it ended comes from the attempt's bookend terminal when
  *    it has one (a `session.end` that lands first does not erase a clean
  *    `run.complete` or `dispatch.complete`), else from the closing record
- *    itself.
+ *    itself. A terminal that names the operator's stop (a `budget.stop`'s
+ *    `reason`, a `dispatch.error`'s `stop_reason`) is abandoned as aborted,
+ *    never an error.
  * 4. Waiting. A `budget.wait` with no `budget.resume` or closing record
  *    after it holds the run `waiting` until its announced resume time plus
  *    `budgetWaitGraceMs`; past that the staleness clock runs from there.
@@ -65,6 +67,7 @@ import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal,
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
+import type { Run } from "../types/generated/Run";
 
 export type LifecyclePhase = "not_started" | "open" | "waiting" | "closed" | "stale";
 
@@ -78,7 +81,10 @@ export type CloseEdge =
    *  is an operator's stop: an interrupt, `mission abort`/`finalize`, an
    *  abandoned phase). */
   | { readonly kind: "budget_stop"; readonly byOperator: boolean }
-  | { readonly kind: "mission_abort" };
+  | { readonly kind: "mission_abort" }
+  /** An execution the operator stopped: its `dispatch.error` names the stop
+   *  (`stop_reason`: a caught signal). Not a failure. */
+  | { readonly kind: "operator_stop" };
 
 export interface LifecyclePolicy {
   /** How long an open run may go silent before it reads as stopped. The
@@ -204,6 +210,12 @@ const hasReason = (r: NormRecord): boolean => {
   return typeof reason === "string" && reason.length > 0;
 };
 
+/** Whether an execution's error terminal names the operator's stop. */
+const namesAStop = (r: NormRecord): boolean => {
+  const reason = payloadOf(r, ACTION.DispatchError)?.stop_reason;
+  return typeof reason === "string" && reason.length > 0;
+};
+
 /** The edge a closing record implies; `null` for any other record. */
 function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
@@ -213,8 +225,10 @@ function closeEdgeOf(r: NormRecord): CloseEdge | null {
       return { kind: "complete" };
     case ACTION.StepComplete:
       return payloadOf(r, ACTION.StepComplete)?.later_step_planned === true ? null : { kind: "complete" };
-    case ACTION.RunError:
     case ACTION.DispatchError:
+      if (namesAStop(r)) return { kind: "operator_stop" };
+      return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
+    case ACTION.RunError:
       return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
     case ACTION.StepError:
       return { kind: "error", killed: false, exitCode: null };
@@ -452,6 +466,7 @@ function closedState(edge: CloseEdge): RunState {
     case "budget_stop":
       return { status: "abandoned", abandonReason: edge.byOperator ? "aborted" : "noterminal" };
     case "mission_abort":
+    case "operator_stop":
       return { status: "abandoned", abandonReason: "aborted" };
   }
 }
@@ -469,6 +484,35 @@ export function toRunState(l: Lifecycle): RunState {
     case "closed":
       return closedState(l.close?.edge ?? { kind: "session_end" });
   }
+}
+
+/** The `/runs` row whose run IS this session's: a lab run or a dispatch, each
+ *  one role execution, its session named by `dispatch_id`. A mission's row is
+ *  never one: the session it names is one of its executions, whose status is
+ *  that execution's, not the mission's. `missionId`: the mission the session's
+ *  records name, which a dispatch row's id must be (or the session itself, for
+ *  a dispatch the daemon read from the flow alone). */
+export function ownRowOf(rows: readonly Run[], sessionId: string, missionId: string | null): Run | null {
+  return rows.find((r) => r.kind !== "mission" && r.dispatch_id === sessionId && (missionId === null || r.id === missionId || r.id === sessionId)) ?? null;
+}
+
+/** The run's state as every view shows it. The operator (2026-10-07): "the
+ *  color of the status should be a one time status setting so it should not
+ *  even have a chance of being different across views." For a run the daemon
+ *  lists (`row`, from `ownRowOf`), the status is decided ONCE, on the row (the
+ *  runs board, `darkmux run list`), and a view renders that decision: judged
+ *  `live` (at the live edge), the row's status is the state; judged at a past
+ *  instant (playback), the lifecycle says whether the run was in flight or not
+ *  yet ended then, and once it had ended, how it ended is the row's (when the
+ *  row has ended too). Without a row, the one lifecycle rule's (`toRunState`),
+ *  which the daemon's own executor shares. */
+export function shownRunState(l: Lifecycle, row: Run | null, live: boolean): RunState {
+  const own = toRunState(l);
+  if (!row) return own;
+  const decided: RunState = row.abandoned_reason ? { status: row.status, abandonReason: row.abandoned_reason } : { status: row.status };
+  if (live) return decided;
+  const ended = (s: RunState) => s.status !== "running" && s.status !== "planned";
+  return ended(own) && ended(decided) ? decided : own;
 }
 
 /** (#2011, #2346) The run's own measured duration: the `wall_ms` its

@@ -196,6 +196,22 @@ pub fn received_signal() -> Option<i32> {
     }
 }
 
+/// The operator's stop, as a terminal record names it: the signal that set the
+/// flag (`SIGINT`, `SIGTERM`, `SIGHUP`), or `interrupted` when it was raised
+/// without one ([`mark_interrupted`]: a long-lived host's own shutdown, or a
+/// run's wall-clock bound). `None` while nothing has stopped this process.
+pub fn stop_reason() -> Option<&'static str> {
+    if !is_set() {
+        return None;
+    }
+    Some(match received_signal() {
+        Some(libc::SIGINT) => "SIGINT",
+        Some(libc::SIGTERM) => "SIGTERM",
+        Some(libc::SIGHUP) => "SIGHUP",
+        _ => "interrupted",
+    })
+}
+
 /// (#2476) Set [`INTERRUPTED`] directly, WITHOUT installing (or touching)
 /// any `libc::signal(2)` disposition — the production twin of
 /// [`simulate_sigint_for_test`] etc., callable from a normal (non-test)

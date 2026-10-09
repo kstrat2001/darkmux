@@ -223,6 +223,18 @@ its own: every entry below labeled 5.0 ships together.
   no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
   the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
   an endpoint's host split the URL with one parser.
+- **A run's status reads the same on every view** (operator, 2026-10-07). A lab run stopped
+  with SIGTERM read "aborted" on the runs board and "error" on its run page and its fleet
+  timeline bar: the board reads the lab run's own record, and the other two re-derived the
+  status from the execution's flow terminal, which said only `result_class: error`. Now an
+  execution's `dispatch.error` written after darkmux caught a signal names it
+  (`stop_reason`, flow schema 2.1.0, additive), and the daemon and the viewer read such a
+  terminal as aborted. A run page and a timeline bar for a run the runs board lists (a lab
+  run, a dispatch) show that row's status, at the live edge and once the run has ended in
+  playback, rather than deriving one. A terminal written before this names no stop and,
+  without a row, still reads as an error. The status colors are one table: a running bar is
+  now the running chip's teal rather than amber, and degraded and escalated bars take the
+  warn color their chips already had.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record

@@ -44,6 +44,18 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           simply has a `null` payload and closes the session as it always
 //           did. Absence means "this darkmux did not record a later step",
 //           never "there is none" (the 1.41.0 `seat_class` convention).
+//
+//           (5.0, folded in, unreleased) `dispatch.error` gains
+//           `payload.stop_reason`: the operator's stop that ended the
+//           execution (`SIGINT`, `SIGTERM`, `SIGHUP`, or `interrupted` for an
+//           interrupt a host raised itself). Written on every execution error
+//           terminal built after the process caught one
+//           (`FlowRecord::naming_operator_stop`). The lifecycle rule reads a
+//           terminal that names one as abandoned, aborted, the way it reads a
+//           `budget.stop` that names a reason. ADDITIVE: a reader that does
+//           not know the key reads the terminal as an error, as before, and
+//           every terminal written before 2.1.0 names none and still reads
+//           as an error; archives are not rewritten.
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           (5.0, #3035, folded in, unreleased: "remote" was the wrong axis,
 //           so `budget.*` payload `scope` `step` is `dispatch` and its `step`
@@ -2560,6 +2572,25 @@ impl FlowRecord {
     ) -> Self {
         let action = payload.action();
         FlowRecord { payload: Some(payload), ..FlowRecord::for_execution(session, execution, level, category, stage, action, handle) }
+            .naming_operator_stop()
+    }
+
+    /// This record, with an execution's `dispatch.error` naming the operator's
+    /// stop when the process has one ([`darkmux_types::interrupt::stop_reason`])
+    /// and its producer named none. The lab run's own record already reads an
+    /// error after a caught signal as an interrupt (`darkmux_lab`'s
+    /// `finish_interrupted`); this is the same fact on the execution's flow
+    /// terminal, so the one lifecycle rule reads both alike. Every execution
+    /// record is built through [`FlowRecord::for_execution_with`], which calls
+    /// it; a terminal built BEFORE the stop and written after it (a bookend
+    /// guard's armed abort) calls it again when it is written.
+    pub fn naming_operator_stop(mut self) -> Self {
+        if let Some(crate::payload::Payload::DispatchError(p)) = self.payload.as_mut() {
+            if p.stop_reason.is_none() {
+                p.stop_reason = darkmux_types::interrupt::stop_reason().map(str::to_string);
+            }
+        }
+        self
     }
 }
 
@@ -2891,5 +2922,55 @@ mod forward_compat_tests {
             .expect("a record with the removed `orchestrator` key must still deserialize");
         assert_eq!(rec.handle, "h1");
         assert_eq!(rec.machine_id.as_deref(), Some("studio"));
+    }
+}
+
+#[cfg(test)]
+mod operator_stop_tests {
+    use super::*;
+    use crate::payload::{DispatchEndPayload, Payload};
+    use darkmux_types::execution_id::ExecutionId;
+    use darkmux_types::interrupt;
+    use darkmux_types::session_id::{RunId, SessionId};
+
+    fn record(payload: Payload) -> FlowRecord {
+        let session = SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n");
+        FlowRecord::for_execution_with(&session, &ExecutionId::mint(), Level::Error, Category::Work, Stage::Dispatch, payload, "coder")
+    }
+
+    fn stop_of(r: &FlowRecord) -> Option<String> {
+        match &r.payload {
+            Some(Payload::DispatchError(p) | Payload::DispatchComplete(p)) => p.stop_reason.clone(),
+            _ => None,
+        }
+    }
+
+    /// An execution's error terminal built once the operator has stopped the
+    /// process names the stop, so every view's one lifecycle rule reads the
+    /// execution as aborted, not failed: the pepper-grinder lab run stopped
+    /// with SIGTERM read "aborted" on the runs board (its lab record) and
+    /// "error" on the fleet timeline and its run page (its flow terminal,
+    /// which said nothing of the stop). Before the stop, the same terminal
+    /// names none; a clean `dispatch.complete` never names one; and a
+    /// producer's own reason is kept.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    fn an_execution_error_built_after_an_operator_stop_names_the_stop() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        interrupt::reset_for_test();
+        let before = record(Payload::DispatchError(DispatchEndPayload::aborted(None)));
+        interrupt::simulate_sigterm_for_test();
+        let after = record(Payload::DispatchError(DispatchEndPayload::aborted(None)));
+        let complete = record(Payload::DispatchComplete(DispatchEndPayload::new(1)));
+        let own = record(Payload::DispatchError(DispatchEndPayload {
+            stop_reason: Some("phase abandoned".to_string()),
+            ..DispatchEndPayload::aborted(None)
+        }));
+        interrupt::reset_for_test();
+        assert_eq!(stop_of(&before), None, "nothing stopped the process yet");
+        assert_eq!(stop_of(&after).as_deref(), Some("SIGTERM"));
+        assert_eq!(stop_of(&complete), None, "a clean end is never a stop");
+        assert_eq!(stop_of(&own).as_deref(), Some("phase abandoned"), "a producer's own reason wins");
     }
 }
