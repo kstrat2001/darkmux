@@ -1,5 +1,5 @@
-# darkmux self-review — darkmux reviews its own PRs, in public, on a local
-# crew of models.
+# darkmux self-review — darkmux reviews its own PRs, in public, with whatever
+# reviewer seat the runner's machine staffs (a local model or a hosted one).
 #
 # darkmux dogfooding itself: a PR diff is dispatched to the **review pipeline**
 # (`templates/builtin/mission-configs/review.json`, #2310 P4d — built on the
@@ -11,9 +11,11 @@
 # renders the GitHub review payload. Staffing is resolved on the runner from
 # the `role_profiles` map in the runner's own `~/.darkmux/config.json` (#1475)
 # — this workflow names no models and no profile; it only supplies the
-# diff/source params below. Running on a self-hosted runner. No cloud API is
-# involved by default (see the `mod_seat_profile` review.json input for the
-# one opt-in exception). The findings post back as native inline PR comments.
+# diff/source params below. Running on a self-hosted runner. Whether a cloud
+# API is involved is the runner's staffing choice, not this workflow's: a
+# local `role_profiles.reviewer` keeps everything on the machine, a hosted one
+# (e.g. a Claude seat) sends the review prompts to that provider. The
+# findings post back as native inline PR comments.
 #
 # SECURITY (public repo + self-hosted runner): the trigger is **workflow_dispatch
 # only** — it never fires on a `pull_request` event, so a stranger's PR (or a
@@ -29,11 +31,12 @@
 # and where it goes: the diff (`diff_file`), the PR title/body as intent text
 # (`intent_file`), and that read-only materialized tree — all read as data,
 # NEVER EXECUTED (the runner configures no `test_command`, so `create-mods`'s
-# gate never runs a command against it either), and dispatched to the LOCAL
-# reviewer model named by the runner's own `role_profiles.reviewer`. The one
-# opt-in exception is `mod_seat_profile`, which — only when explicitly set —
-# sends a finding and its named source to a hosted endpoint for a coder seat;
-# unset by default. The repo checkout below (this workflow's OWN checkout
+# gate never runs a command against it either), and dispatched to the
+# reviewer seat named by the runner's own `role_profiles.reviewer`. When that
+# seat is a hosted endpoint, the diff, intent text and the source excerpts
+# the reviewer reads go to that provider. `mod_seat_profile`, only when
+# explicitly set, likewise sends a finding and its named source to a hosted
+# coder seat; unset by default. The repo checkout below (this workflow's OWN checkout
 # step, distinct from the materialized PR tree above) is of trusted `main`
 # (the review tooling), never the PR ref. Runner registration + prerequisites:
 # see .github/DARKMUX_REVIEW_RUNNER.md.
@@ -198,7 +201,7 @@ jobs:
           # review binary now assembles each seat's prompt itself (rubric +
           # intent + diff); this step's only job is handing it the author's
           # stated intent as plain data — NO AI in the loop here, just a `gh`
-          # fetch, so it stays within the runner's no-LLM-API constraint.
+          # fetch.
           PRTITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
           PRBODY=$(gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""')
           # Cap for the model's context budget via a bash substring, NOT `| head`:
@@ -215,7 +218,7 @@ jobs:
             fi
           } > "$RUNNER_TEMP/qa/intent.txt"
 
-      - name: darkmux PR-review dispatch (local crew — no LLM API)
+      - name: darkmux PR-review dispatch (the runner's reviewer seat)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
