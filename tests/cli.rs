@@ -14065,6 +14065,8 @@ fn init_lists_a_skill_that_is_not_darkmux_s_as_skipped_and_leaves_it_alone() {
 
     assert!(out.contains("  skipped (1): my-skill\n"), "{out}");
     assert_eq!(fs::read_to_string(&installed).unwrap(), "the operator's\n");
+}
+
 // ── (5.0) what a console panel shows a viewer that is not this machine ──
 
 /// Every fact in the console fixture that a viewer who is not this machine
