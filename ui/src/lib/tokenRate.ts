@@ -504,6 +504,45 @@ function prefillOverdue(opener: { atMs: number; promptChars: number }, records: 
   return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
 }
 
+/** The reading once the evidence is stale. (#3145) A turn that has produced
+ *  nothing since its opener is still reading the prompt until the opener's
+ *  bound runs out; otherwise silence after a heartbeat is STALL, and no
+ *  heartbeat at all is PROMPT. */
+function staleReading(
+  opener: { atMs: number; promptChars: number } | null,
+  lastBeatAt: number | null,
+  records: NormRecord[],
+  nowMs: number,
+): LiveStateReading {
+  if (opener !== null && !prefillOverdue(opener, records, nowMs)) return { state: "prompt", promptChars: opener.promptChars };
+  return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
+}
+
+/** (#3145) The PROMPT reading after a marker: bounded by the turn's opener
+ *  when the opener is at or after the marker (STALL once its prefill bound
+ *  runs out); otherwise the last beat's size while that size is current. */
+function promptAfterMarker(
+  opener: { atMs: number; promptChars: number } | null,
+  lastBeat: HeartbeatSample | null,
+  markerAtMs: number,
+  records: NormRecord[],
+  nowMs: number,
+): LiveStateReading {
+  if (opener !== null && opener.atMs >= markerAtMs) {
+    return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : { state: "prompt", promptChars: opener.promptChars };
+  }
+  return promptSizeIsCurrent(lastBeat, markerAtMs) ? { state: "prompt", promptChars: lastBeat.promptChars } : { state: "prompt" };
+}
+
+/** Whether the last beat carries a prompt size that still describes the
+ *  request being read: an opener no older than the marker. */
+function promptSizeIsCurrent(
+  lastBeat: HeartbeatSample | null,
+  markerAtMs: number,
+): lastBeat is HeartbeatSample & { promptChars: number } {
+  return lastBeat !== null && lastBeat.promptChars !== undefined && lastBeat.atMs >= markerAtMs;
+}
+
 /** (#2877 pass 2, "is this resting? can't tell") The legible word a stopped
  * tube reads between heartbeats — the operator's phone note: a flat ring and
  * "—" is indistinguishable between a thermal rest, a model still doing
@@ -826,14 +865,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     // outlasts `prefillStallAfterMs` reads STALL here too, rather than
     // PROMPT for as long as the marker stays the latest evidence.
     const lastBeat = beats.length ? beats[beats.length - 1] : null;
-    const prompt = (): LiveStateReading => {
-      if (opener !== null && opener.atMs >= found.atMs) {
-        return prefillOverdue(opener, cut, nowMs) ? { state: "stalled" } : { state: "prompt", promptChars: opener.promptChars };
-      }
-      return lastBeat !== null && lastBeat.promptChars !== undefined && lastBeat.atMs >= found.atMs
-        ? { state: "prompt", promptChars: lastBeat.promptChars }
-        : { state: "prompt" };
-    };
+    const prompt = (): LiveStateReading => promptAfterMarker(opener, lastBeat, found.atMs, cut, nowMs);
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) {
@@ -900,10 +932,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     if (last.chars === 0) return opener !== null ? { state: "prompt", promptChars: opener.promptChars } : { state: "prompt" };
     return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
-  // (#3145) Stale, but the turn has produced nothing since its opener: the
-  // model is still reading the prompt until the opener's bound runs out.
-  if (opener !== null && !prefillOverdue(opener, cut, nowMs)) return { state: "prompt", promptChars: opener.promptChars };
-  return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
+  return staleReading(opener, lastBeatAt, cut, nowMs);
 }
 
 /** (#2890) Whether the latest generating sample is reasoning rather than
