@@ -897,20 +897,27 @@ impl FlowMissionAgg {
             }
         }
         self.fold_terminal(v, ts);
-        // Gated on the action so only a `mission.start` payload is cloned.
-        if self.config_id.is_none() && darkmux_flow::reader::action_of(v) == Some(FlowAction::MissionStart) {
-            if let Some(darkmux_flow::Payload::MissionStart(open)) = darkmux_flow::reader::payload_of(v) {
-                self.config_id = open
-                    .0
-                    .get(darkmux_crew::lifecycle::MISSION_START_CONFIG_ID_KEY)
-                    .and_then(|c| c.as_str())
-                    .map(str::to_string);
-            }
-        }
+        self.fold_config_id(v);
         if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
             if !sid.is_empty() && !self.session_ids.iter().any(|s| s == sid) {
                 self.session_ids.push(sid.to_string());
             }
+        }
+    }
+
+    /// (#3124) The config the run was launched from, read off its
+    /// `mission.start` payload. Gated on the action so only that payload is
+    /// cloned.
+    fn fold_config_id(&mut self, v: &serde_json::Value) {
+        if self.config_id.is_some() || darkmux_flow::reader::action_of(v) != Some(FlowAction::MissionStart) {
+            return;
+        }
+        if let Some(darkmux_flow::Payload::MissionStart(open)) = darkmux_flow::reader::payload_of(v) {
+            self.config_id = open
+                .0
+                .get(darkmux_crew::lifecycle::MISSION_START_CONFIG_ID_KEY)
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
         }
     }
 
