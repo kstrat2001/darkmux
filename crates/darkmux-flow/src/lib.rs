@@ -3976,6 +3976,8 @@ mod tests {
         //   2.1.0 — (5.0, #3074) additive: `step.complete.payload.later_step_planned`
         //            (written only as `true`): a later step of the task is still
         //            planned, so the record does not close its session.
+        //   2.2.0 — (#3124) additive: `mission.start.payload.config_id`, so
+        //            a flow-only run reads the same kind on every machine.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -3987,7 +3989,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.1.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.2.0");
     }
 
     #[test]

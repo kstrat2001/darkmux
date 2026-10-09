@@ -869,6 +869,11 @@ struct FlowMissionAgg {
     session_ids: Vec<String>,
     /// The newest receive key among this mission's records ([`record_receive_key`]).
     last_key: Option<u64>,
+    /// (#3124) The config the run was launched from, as its `mission.start`
+    /// names it ([`darkmux_crew::lifecycle::MISSION_START_CONFIG_ID_KEY`]);
+    /// `None` for a record written before FLOW 2.2.0. Read by
+    /// [`mission_run_kind`], the same decision the tracked path makes.
+    config_id: Option<String>,
 }
 
 impl FlowMissionAgg {
@@ -892,6 +897,16 @@ impl FlowMissionAgg {
             }
         }
         self.fold_terminal(v, ts);
+        // Gated on the action so only a `mission.start` payload is cloned.
+        if self.config_id.is_none() && darkmux_flow::reader::action_of(v) == Some(FlowAction::MissionStart) {
+            if let Some(darkmux_flow::Payload::MissionStart(open)) = darkmux_flow::reader::payload_of(v) {
+                self.config_id = open
+                    .0
+                    .get(darkmux_crew::lifecycle::MISSION_START_CONFIG_ID_KEY)
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+            }
+        }
         if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
             if !sid.is_empty() && !self.session_ids.iter().any(|s| s == sid) {
                 self.session_ids.push(sid.to_string());
@@ -1076,7 +1091,7 @@ fn flow_mission_to_run(
         .map(|(sid, _)| sid.to_string());
     Run {
         id: mission_id.to_string(),
-        kind: RunKind::Mission,
+        kind: mission_run_kind(agg.config_id.as_deref(), false),
         status,
         machine: agg.machine.clone(),
         machine_uid: agg.machine_uid.clone(),
@@ -1116,22 +1131,32 @@ fn flow_mission_to_run(
 /// rule this implements.
 fn classify_mission(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -> (RunKind, Option<(Task, Step)>) {
     let shape = crew_of_one_shape(mission, phases_by_id);
-    let kind = match &mission.spec {
-        Some(spec) if spec.config_id == "dispatch" => RunKind::Dispatch,
-        Some(_) => RunKind::Mission,
-        None => {
-            if shape.is_some() {
-                RunKind::Dispatch
-            } else {
-                RunKind::Mission
-            }
-        }
-    };
+    let kind = mission_run_kind(mission.spec.as_ref().map(|s| s.config_id.as_str()), shape.is_some());
     // Only surface the shape when the FINAL kind is Dispatch — a marker-
     // driven Mission with an (unlikely) accidental crew-of-one structural
     // shape must not borrow that shape's role/session for its Run.
     let shape = if kind == RunKind::Dispatch { shape } else { None };
     (kind, shape)
+}
+
+/// (#3124) The one decision of a mission-backed run's [`RunKind`], whoever
+/// reads the run: [`classify_mission`] passes the loaded `Mission`'s spec and
+/// structure, and [`flow_mission_to_run`] passes the config id its
+/// `mission.start` record names, so the owning machine and a machine that
+/// sees the run only through the fleet stream give it the same kind.
+///
+/// The config id decides when there is one (`dispatch` is the crew-of-one
+/// marker; any other id is a launched mission). Only without one does the
+/// crew-of-one structure decide; a flow-only row has no structure to offer,
+/// so a run whose records name no config (written before FLOW 2.2.0) reads
+/// `Mission`, as it always did.
+fn mission_run_kind(config_id: Option<&str>, crew_of_one_shape: bool) -> RunKind {
+    match config_id {
+        Some("dispatch") => RunKind::Dispatch,
+        Some(_) => RunKind::Mission,
+        None if crew_of_one_shape => RunKind::Dispatch,
+        None => RunKind::Mission,
+    }
 }
 
 /// `Some((task, step))` only when `mission` has EXACTLY the crew-of-one
@@ -8041,6 +8066,95 @@ mod tests {
             !runs.iter().any(|r| r.id == "peer-session-1"),
             "the peer's session is represented by its mission row, not duplicated as a ghost"
         );
+    }
+
+    /// (#3124) The records a peer's run writes, produced by the real
+    /// lifecycle writer under a throwaway "peer" state: the mission minted
+    /// with `config_id`, started and closed, plus one role execution's
+    /// bookends under an adhoc session of that run (what `darkmux dispatch`
+    /// runs under). The peer's state is dropped before returning, so the
+    /// caller reads these as a machine that holds no `mission.json` for them.
+    fn peer_run_records(mission_id: &str, config_id: &str) -> Vec<serde_json::Value> {
+        let peer = CrewGuard::new();
+        let mut mission = minimal_mission(
+            mission_id,
+            vec![],
+            Some(MissionSpec { config_id: config_id.to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        darkmux_crew::lifecycle::mission_start_with_reasoning(mission_id, Some("darkmux dispatch coder")).unwrap();
+        darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, None).unwrap();
+        let mut records: Vec<serde_json::Value> = std::fs::read_dir(peer.join("flows"))
+            .unwrap()
+            .flat_map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap().lines().map(String::from).collect::<Vec<_>>())
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect();
+        assert!(
+            records.iter().any(|r| r["action"] == "mission.start"),
+            "the peer must have written its mission.start: {records:?}"
+        );
+        // Written on this host, so they name it; a peer's records name the peer.
+        for r in &mut records {
+            r["machine_id"] = serde_json::json!("studio");
+            r["machine_uid"] = serde_json::json!("PEER-UID-1");
+        }
+        let session = darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission(mission_id).unwrap(),
+            "coder",
+            "n1",
+        )
+        .wire();
+        for action in ["dispatch.start", "dispatch.complete"] {
+            records.push(serde_json::json!({
+                "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work", "stage": "dispatch",
+                "action": action, "handle": "coder", "session_id": session, "mission_id": mission_id,
+                "machine_id": "studio", "machine_uid": "PEER-UID-1",
+            }));
+        }
+        records
+    }
+
+    /// (#3124) A peer's bare `darkmux dispatch` reads `dispatch` on a
+    /// machine that sees it only through the fleet stream, the same kind
+    /// its own machine gives it from `mission.json`. It used to read
+    /// `mission` here: the flow-only row was built as `RunKind::Mission`
+    /// without consulting the one kind decision.
+    #[test]
+    #[serial_test::serial]
+    fn a_peers_bare_dispatch_reads_dispatch_from_the_fleet_stream() {
+        let fleet = peer_run_records("dispatch-coder-1791436244-b9a0-0", "dispatch");
+        let _here = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "dispatch-coder-1791436244-b9a0-0").unwrap_or_else(|| panic!("{runs:?}"));
+        assert!(!row.tracked, "premise: this machine holds no record of the peer's run");
+        assert_eq!(row.kind, RunKind::Dispatch, "{row:?}");
+    }
+
+    /// (#3124) The inverted case: a peer's launched mission still reads
+    /// `mission` from the fleet stream, and so does a run whose records name
+    /// no config (written by a darkmux before FLOW 2.2.0): absence is not
+    /// evidence of a dispatch.
+    #[test]
+    #[serial_test::serial]
+    fn a_peers_mission_and_a_run_naming_no_config_read_mission_from_the_fleet_stream() {
+        let mut fleet = peer_run_records("review-1791436244-a1b2c3", "review");
+        let mut legacy = peer_run_records("dispatch-coder-1791436599-c81c-0", "dispatch");
+        for r in &mut legacy {
+            if let Some(p) = r.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                p.remove("config_id");
+            }
+        }
+        fleet.extend(legacy);
+        let _here = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let runs = build_runs(flows.path(), None, &fleet);
+        for id in ["review-1791436244-a1b2c3", "dispatch-coder-1791436599-c81c-0"] {
+            let row = runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id}: {runs:?}"));
+            assert!(!row.tracked, "{id}: premise");
+            assert_eq!(row.kind, RunKind::Mission, "{id}: {row:?}");
+        }
     }
 
     /// Two machines that share a display name are still two machines: the

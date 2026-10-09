@@ -123,10 +123,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    - **dispatch** — TOP-LEVEL ONLY: the verb `darkmux dispatch <role>`, and the `RunKind` it
      produces, which means *a run consisting of exactly one role execution*. It is named for
      its CONTENT, not for the verb. Note `RunKind::Dispatch` (the runs-board type, `darkmux_serve::runs::RunKind`) is
-     decided FROM a mission by `classify_mission`: a spec with `config_id == "dispatch"` is
-     Dispatch, any other spec is Mission, and only a mission with no spec falls back to shape
-     (a crew-of-one graph). So it is a label on a mission, not a third ontological peer of
-     `Mission`.
+     decided FROM a mission by one decision, `mission_run_kind`: a `config_id` of `dispatch` is
+     Dispatch, any other config id is Mission, and only a mission with no config id falls back
+     to shape (a crew-of-one graph). `classify_mission` feeds it the loaded spec and shape; a
+     run seen only through the fleet stream feeds it the `config_id` its `mission.start`
+     payload names (#3124), so every machine gives a run the same kind. So it is a label on a
+     mission, not a third ontological peer of `Mission`.
    - **role execution** — the INNER unit: *one role, running until it stops*. Many turns, not
      one model call (`max_turns`, `turn_seq`). This is deliberately named for the ROLE, not
      the model, because the model is DERIVED, not declared: `select_model(role, profile)`
