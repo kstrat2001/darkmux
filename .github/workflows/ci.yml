@@ -251,7 +251,7 @@ jobs:
     # UBUNTU, not the macos job that runs the rest of the workspace. Three
     # reasons: apt installs redis in seconds where brew takes tens of them;
     # the harness has no macOS dependency (no Keychain, no `lms`, no
-    # `target_os` gate); and isolating the release build keeps it off the
+    # `target_os` gate); and isolating the e2e build keeps it off the
     # 15-minute cap of the main job.
     #
     # A SERVICE CONTAINER WOULD NOT WORK HERE, which is worth recording so
@@ -304,14 +304,20 @@ jobs:
       # told otherwise, which would serialize a full release build behind
       # the test timer. `DARKMUX_E2E_BIN` (harness.rs) exists for exactly
       # this: build once here, point the harness at the artifact.
-      - name: Build the release binary the harness will drive
+      #
+      # A DEV binary, not release: these tests drive daemons over loopback
+      # and redis and need no optimized code, while the release profile
+      # (thin LTO, one codegen unit) took ~3.5 of this job's ~6 minutes. The
+      # dev build also leaves the dependency artifacts the test steps below
+      # reuse. Release-mode behavior is release-verify.yml's job.
+      - name: Build the binary the harness will drive
         if: steps.filter.outputs.rust == 'true'
-        run: cargo build --release --bin darkmux
+        run: cargo build --bin darkmux
 
       - name: Fleet e2e (real daemons, real redis)
         if: steps.filter.outputs.rust == 'true'
         env:
-          DARKMUX_E2E_BIN: ${{ github.workspace }}/target/release/darkmux
+          DARKMUX_E2E_BIN: ${{ github.workspace }}/target/debug/darkmux
           # (#1662) Turns the silent skip into a hard failure — but ONLY
           # here. Keyed on this var rather than `CI` because GitHub sets
           # `CI` on every runner, and the macOS workspace job runs these
