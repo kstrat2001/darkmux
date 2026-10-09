@@ -90,7 +90,9 @@
 //!   and allow-list rows' detail is withheld; `flow status` withholds its
 //!   directories, the Redis URL and each hook's target; `lab fixture list`
 //!   withholds each fixture's path. The remote form is cached apart from this
-//!   machine's (see [`audience_key`]).
+//!   machine's (see [`audience_key`]), and only after the daemon's filter
+//!   below has run on it: a cached remote body never holds a raw value, even
+//!   one rotated out of the configuration inside the TTL.
 //! - **The daemon redacts the text, whatever the panel** ([`redact_for_remote`]),
 //!   stdout and `stderr_tail` alike (stderr is redacted, not dropped, so a
 //!   failed panel still says why): every roster address (and its host part)
@@ -1103,19 +1105,21 @@ pub(crate) async fn panel_handler(
     State(state): State<AppState>,
 ) -> Result<axum::Json<PanelResponse>, (StatusCode, String)> {
     let remote = !crate::caller_is_local_or_holds_token(peer.map(|c| c.0), &headers);
-    let mut body = run_panel(&id, raw_query.0, params.0, remote, &headers, &state).await?;
-    if remote {
-        // Both sets read the disk (the roster, config.json, the profile and
-        // fixture registries), so they are derived off the async runtime, and
-        // reused while what they read is unchanged (see `redaction`'s caches).
-        let (r, w, machine) = tokio::task::spawn_blocking(|| {
-            (Redaction::derive_cached(), crate::redaction::panel_withheld_cached(), darkmux_flow::resolve_machine_id())
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("redacting panel \"{id}\": {e}\n")))?;
-        redact_for_remote(&mut body, &r, &w, machine.as_deref());
-    }
-    Ok(axum::Json(body))
+    run_panel(&id, raw_query.0, params.0, remote, &headers, &state).await.map(axum::Json)
+}
+
+/// A fresh remote body redacted against the sets as they stand now. Both
+/// sets read the disk (the roster, config.json, the profile and fixture
+/// registries), so they are derived off the async runtime, and reused while
+/// what they read is unchanged (see `redaction`'s caches).
+async fn redact_fresh_for_remote(body: &mut PanelResponse) -> Result<(), (StatusCode, String)> {
+    let (r, w, machine) = tokio::task::spawn_blocking(|| {
+        (Redaction::derive_cached(), crate::redaction::panel_withheld_cached(), darkmux_flow::resolve_machine_id())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("redacting panel \"{}\": {e}\n", body.panel)))?;
+    redact_for_remote(body, &r, &w, machine.as_deref());
+    Ok(())
 }
 
 async fn run_panel(
@@ -1253,7 +1257,7 @@ async fn run_panel(
     let ansi_text = capped_stdout(&String::from_utf8_lossy(&output.stdout));
     let stderr_tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
 
-    let body = PanelResponse {
+    let mut body = PanelResponse {
         panel: id.to_string(),
         argv: final_argv.clone(),
         opts: opts_echo,
@@ -1270,6 +1274,14 @@ async fn run_panel(
         age_ms: 0,
         auto_refresh: spec.auto_refresh,
     };
+    // A remote body is redacted BEFORE it is cached, against the sets as they
+    // stand when it was rendered, so no cached remote body ever holds a raw
+    // value: redacting on serve instead would use the CURRENT sets, and a
+    // value rotated out of the configuration inside the TTL would be in none
+    // of them (5.0 security re-review N2).
+    if remote {
+        redact_fresh_for_remote(&mut body).await?;
+    }
 
     if spec.cache_ttl.is_zero() && !remote {
         // Manual panel: nothing cached (an explicit run is a real run), but
@@ -2940,8 +2952,11 @@ mod tests {
         }
     }
 
-    /// Serve `role-list` from a pre-seeded cache (no spawn) to `peer`, with
-    /// the roster and HOME the filter derives from set for the call.
+    /// Serve `role-list` to `peer`, with the roster and HOME the filter
+    /// derives from set for the call. This machine's form comes from a
+    /// pre-seeded cache; a remote caller's is spawned (a cached remote body
+    /// is already redacted, see `run_panel`) from a child that prints what an
+    /// unshaping verb would, so the daemon's own filter is what is under test.
     async fn served_to(peer: &str, host: &str) -> PanelResponse {
         let dir = tempfile::tempdir().unwrap();
         let roster = dir.path().join("fleet.json");
@@ -2950,17 +2965,21 @@ mod tests {
             r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"peerone.tailnet.example:8765","added_unix_ms":1}}}"#,
         )
         .unwrap();
+        let probe = probe_body();
+        let (out, err, child) = (dir.path().join("out"), dir.path().join("err"), dir.path().join("child.sh"));
+        std::fs::write(&out, &probe.ansi_text).unwrap();
+        std::fs::write(&err, &probe.stderr_tail).unwrap();
+        std::fs::write(&child, format!("#!/bin/sh\ncat '{}'\ncat '{}' >&2\n", out.display(), err.display())).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
         let (prev_fleet, prev_home) = (std::env::var("DARKMUX_FLEET_FILE").ok(), std::env::var("HOME").ok());
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         std::env::set_var("HOME", "/Users/tester");
-        let state = app_state();
-        // Both forms seeded: this machine's and the remote one (the verb's
-        // remote form is cached apart, see `audience_key`). The remote entry
-        // holds what an unshaping verb would print, so the daemon's own
-        // filter is what is under test.
-        for key in [audience_key("role-list", false), audience_key("role-list", true)] {
-            state.panels.cache.lock().await.insert(key, CacheEntry { body: probe_body(), captured: SystemTime::now() });
-        }
+        let mut state = app_state();
+        state.panels.child_exe = Some(child);
+        state.panels.cache.lock().await.insert(audience_key("role-list", false), CacheEntry { body: probe, captured: SystemTime::now() });
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(PANEL_HEADER, "1".parse().unwrap());
         headers.insert("host", host.parse().unwrap());
@@ -3223,6 +3242,72 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// (5.0 security re-review N2) A remote caller served from the cache
+    /// reads a body that was redacted when it was stored. An endpoint URL
+    /// rotated inside the cache's TTL is in no withheld set any more, so a
+    /// body redacted on serve, against the CURRENT set, would hand the old
+    /// value to the next remote caller.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_remote_caller_never_reads_a_location_rotated_inside_the_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dm");
+        std::fs::create_dir_all(&root).unwrap();
+        let profiles = |url: &str| {
+            std::fs::write(
+                root.join("profiles.json"),
+                format!(r#"{{"profiles":{{}},"endpoints":{{"hosted":{{"url":"{url}","auth":{{"type":"bearer","key_env":"FAKE_KEY_VAR"}}}}}}}}"#),
+            )
+            .unwrap()
+        };
+        profiles("https://old-fake-endpoint.example.com/v1");
+        // The child prints what `profile list` printed before the rotation.
+        let out = dir.path().join("out.txt");
+        std::fs::write(&out, "hosted: unmanaged @ old-fake-endpoint.example.com\n").unwrap();
+        let child = dir.path().join("child.sh");
+        std::fs::write(&child, format!("#!/bin/sh\ncat '{}'\n", out.display())).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
+        let keys = ["DARKMUX_HOME", "HOME", "DARKMUX_FLEET_FILE", "DARKMUX_PROFILES", "DARKMUX_REDIS_URL"];
+        let saved: Vec<(&str, Option<String>)> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        std::env::set_var("DARKMUX_HOME", &root);
+        std::env::set_var("HOME", dir.path().join("home"));
+        std::env::set_var("DARKMUX_FLEET_FILE", root.join("fleet.json"));
+        std::env::remove_var("DARKMUX_PROFILES");
+        std::env::remove_var("DARKMUX_REDIS_URL");
+        let mut state = app_state();
+        state.panels.child_exe = Some(child);
+        let serve = || {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(PANEL_HEADER, "1".parse().unwrap());
+            headers.insert("host", "localhost:8765".parse().unwrap());
+            panel_handler(
+                Path("profile-list".to_string()),
+                axum::extract::RawQuery(None),
+                Query(HashMap::new()),
+                Some(axum::extract::ConnectInfo("100.64.1.2:50000".parse().unwrap())),
+                headers,
+                State(state.clone()),
+            )
+        };
+        let first = serve().await.map(|b| b.0.ansi_text);
+        profiles("https://rotated-fake-endpoint.example.com/v1");
+        let second = serve().await.map(|b| (b.0.ansi_text, b.0.age_ms));
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let first = first.unwrap();
+        assert!(!first.contains("old-fake-endpoint"), "{first}");
+        let (second, age_ms) = second.unwrap();
+        assert!(age_ms > 0 || second == first, "the second request is the cached body: {second}");
+        assert!(!second.contains("old-fake-endpoint"), "a rotated location leaked from the cache: {second}");
     }
 
     // ── real panel output: colored, punctuated, linked ─────────────────

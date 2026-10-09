@@ -496,8 +496,9 @@ fn apply_spans<'a>(text: &'a str, mut spans: Vec<Span>) -> std::borrow::Cow<'a, 
 /// Unchanged text is returned borrowed.
 pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<'a, str> {
     // Every host fact has a `.`, a `:`, a `/` or an `@` in or beside it (a name
-    // that is only a word is a fact solely as `host:port` or `://host`).
-    if text.len() < 4 || !text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) {
+    // that is only a word is a fact solely as `host:port` or `://host`),
+    // unless a renderer cut one short with `…` and that punctuation went.
+    if text.len() < 4 || !(text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) || text.contains(CUT)) {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut spans = Vec::new();
@@ -512,7 +513,47 @@ pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<
     for n in &r.needles {
         needle_spans(text, n, &mut spans);
     }
+    if text.contains(CUT) {
+        cut_needle_spans(text, r, &mut spans);
+        cut_tailnet_spans(text, &mut spans);
+    }
     apply_spans(text, spans)
+}
+
+/// What a truncating renderer puts where it cut a cell short.
+const CUT: char = '…';
+
+/// A roster address, its host, the hub's host or a directory, cut short by a
+/// truncating renderer (`head…tail` or `head…`, see
+/// `panel_audience::cut_spans`): what is left still names it. A bare host
+/// (`studio`) is a fact only where it addresses, so a cut of one is not.
+fn cut_needle_spans(text: &str, r: &Redaction, out: &mut Vec<Span>) {
+    for n in r.needles.iter().filter(|n| !n.bare) {
+        for (start, end) in darkmux_types::panel_audience::cut_spans(text, &n.lower) {
+            out.push(Span { start, end, with: n.with });
+        }
+    }
+}
+
+/// A `.ts.net` name cut short: `box.tail-x…s.net` (a middle cut that kept at
+/// least `s.net` of its end) or `box.tail-x.ts…` (an end cut that kept a
+/// dotted name and at least `.t` of the suffix). The span covers the name's
+/// letters on both sides of the `…`, never a `:port` after it. A cut that
+/// keeps neither (`box.tail-x…`) is not recognizable as a tailnet name.
+fn cut_tailnet_spans(text: &str, out: &mut Vec<Span>) {
+    let name_byte = |c: &u8| c.is_ascii_alphanumeric() || matches!(*c, b'.' | b'-');
+    let b = text.as_bytes();
+    for (e, _) in text.match_indices(CUT) {
+        let head = b[..e].iter().rev().take_while(|c| name_byte(c)).count();
+        let after = e + CUT.len_utf8();
+        let tail = b[after..].iter().take_while(|c| name_byte(c)).count();
+        let (h, t) = (text[e - head..e].to_ascii_lowercase(), text[after..after + tail].to_ascii_lowercase());
+        let middle = t.ends_with("s.net") && (head > 0 || t.contains(".ts.net"));
+        let end_cut = tail == 0 && h.contains('.') && [".t", ".ts", ".ts.", ".ts.n", ".ts.ne"].iter().any(|s| h.ends_with(s));
+        if middle || end_cut {
+            out.push(Span { start: e - head, end: after + tail, with: ADDRESS_HIDDEN });
+        }
+    }
 }
 
 /// How many bytes of `rest` (which starts with an ESC or a C1 CSI, U+009B)
@@ -608,7 +649,9 @@ pub(crate) fn redact_panel_stdout(text: &str, r: &Redaction, w: &Withheld) -> St
 ///   value of a scrubbed kind, every unknown key's value and every value of
 ///   the wrong type);
 /// - the profile registry's endpoints (where each lives, where its key is),
-///   the lab fixture registry's paths, the Redis URL and the temp directory.
+///   the lab fixture registry's paths, the Redis URL and the temp directory;
+/// - every enum setting's value that is not one of its tokens, from
+///   `config.json` or the environment (bad config, which doctor quotes).
 ///
 /// A path under the home or `DARKMUX_HOME` directory is left to
 /// [`Redaction`], which already reads it as `~` or `$DARKMUX_HOME`. A value
@@ -669,9 +712,14 @@ pub fn panel_withheld() -> Withheld {
         .collect();
     let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
     let outside = |vs: Vec<String>| vs.into_iter().filter(|v| !under_a_home(v)).collect::<Vec<_>>();
+    // An enum setting's value that is not one of its tokens is bad config,
+    // which doctor's refusal quotes, whether it was set in `config.json` or
+    // the environment: what it holds is not what the key means.
+    let bad_enum = darkmux_types::config_enum::bad_values().into_iter().map(|b| b.raw);
     Withheld::from_values(outside(from_config))
         .merged(Withheld::from_locations(outside(locations)))
         .merged(Withheld::from_values(credentials))
+        .merged(Withheld::from_values(outside(bad_enum.collect())))
         .sparing(&public)
 }
 
@@ -1098,6 +1146,44 @@ mod tests {
         Redaction::from_parts(&[], &[], None, None)
     }
 
+    /// The middle cut `run list` and `mission status` make: head, `…`, tail,
+    /// `max` characters in all.
+    fn middle_cut(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let keep = max - 1;
+        let (head, tail) = (keep.div_ceil(2), keep - keep.div_ceil(2));
+        format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+    }
+
+    /// (5.0 security re-review C5) A cell cut short with `…`, in the middle
+    /// or at its end, still hides a roster address (and its host) and a
+    /// `.ts.net` name the roster does not list: what the cut leaves of either
+    /// still names it.
+    #[test]
+    fn a_cut_roster_address_or_tailnet_name_is_still_hidden() {
+        let r = Redaction::from_parts(&[("peerone", "peerone.lan-fake.example:8765")], &[], None, None);
+        for addr in ["peerone.lan-fake.example:8765", "peerone.lan-fake.example"] {
+            for max in 6..addr.chars().count() {
+                let cut = middle_cut(addr, max);
+                assert_eq!(r.line(&format!("at {cut}  x")), format!("at {ADDRESS_HIDDEN}  x"), "{cut}");
+            }
+            let head: String = addr.chars().take(10).collect();
+            assert_eq!(r.line(&format!("at {head}…")), format!("at {ADDRESS_HIDDEN}"), "{head}…");
+        }
+        // A tailnet name: cut in the middle with its `s.net` kept, or at its
+        // end with its `.ts` kept.
+        let name = "box.tail-fake.ts.net";
+        for max in 11..name.chars().count() {
+            let cut = middle_cut(name, max);
+            assert_eq!(r.line(&format!("peer {cut}:8765")), format!("peer {ADDRESS_HIDDEN}:8765"), "{cut}");
+        }
+        for head in ["box.tail-fake.ts…", "box.tail-fake.ts.n…"] {
+            assert_eq!(r.line(&format!("peer {head} up")), format!("peer {ADDRESS_HIDDEN} up"), "{head}");
+        }
+        // Text that names neither keeps its `…`.
+        assert_eq!(r.line("loading… done; v1.2…3.4"), "loading… done; v1.2…3.4");
+    }
+
     #[test]
     fn ipv4_is_hidden_when_private_or_addressing_and_prose_versions_survive() {
         let r = rules();
@@ -1177,6 +1263,10 @@ mod tests {
             ("HOME", dir.path().join("home").display().to_string()),
             ("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-hostsrc/scenario.json".to_string()),
             ("DARKMUX_MODS_DIR", "/opt/fake-mods".to_string()),
+            // (5.0 security re-review N3) An enum setting holding a value that is
+            // not one of its tokens is bad config, which doctor's refusal
+            // quotes, wherever it was set.
+            ("DARKMUX_FLEET_MODE", "/opt/fake-env-enum-garbage".to_string()),
         ];
         let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).chain([("DARKMUX_FLEET_FILE", std::env::var_os("DARKMUX_FLEET_FILE")), ("DARKMUX_PROFILES", std::env::var_os("DARKMUX_PROFILES"))]).collect();
         for (k, v) in &vars {
@@ -1192,7 +1282,7 @@ mod tests {
             }
         }
         let vals = w.values();
-        for want in ["/opt/fake-hostsrc/scenario.json", "/opt/fake-mods", "/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta", "https://hosted-secret.example.com/v1", "other-key-item"] {
+        for want in ["/opt/fake-env-enum-garbage", "/opt/fake-hostsrc/scenario.json", "/opt/fake-mods", "/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta", "https://hosted-secret.example.com/v1", "other-key-item"] {
             assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
         }
         for public in ["hosted", "LAPTOP", "laptop", "relay"] {

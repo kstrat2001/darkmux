@@ -261,6 +261,23 @@ fn wrong_typed(root: &Value) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Whether `v`, at `pattern`, is a string an enum-valued setting does not
+/// register as one of its tokens (`config_enum::ENUM_SETTINGS`). That is bad
+/// config, and doctor's refusal quotes it: what it holds is not what the key
+/// means, so it is withheld like a value of the wrong type. A retired
+/// spelling is not a token either.
+fn bad_enum_token(pattern: &[String], v: &Value) -> bool {
+    let Value::String(raw) = v else { return false };
+    let key = pattern.join(".");
+    crate::config_enum::ENUM_SETTINGS.iter().any(|s| s.key == key && s.canonical(raw).is_none())
+}
+
+/// An unknown key's NAME that looks like a location (it holds a `/`, `.` or
+/// `:`): `config list` prints keys, and doctor names an unknown key by path.
+fn location_like_key(k: &str) -> bool {
+    k.contains(['/', '.', ':'])
+}
+
 /// One step down from a value: its pattern path (`hooks.rules[].http`, for the
 /// tables) and its display path (`hooks.rules[0].http`, as the user-file gate
 /// names it).
@@ -323,7 +340,7 @@ pub fn shape_config_json(root: &mut Value) -> bool {
                 };
                 (!shown && withhold(item)) | any
             }),
-            _ => config_verdict(&at.pattern) != Verdict::Shown && withhold(v),
+            _ => (config_verdict(&at.pattern) != Verdict::Shown || bad_enum_token(&at.pattern, v)) && withhold(v),
         }
     }
     let wrong = wrong_typed(root);
@@ -332,8 +349,10 @@ pub fn shape_config_json(root: &mut Value) -> bool {
 
 /// Every string in `config.json` a remote viewer must not read anywhere a
 /// panel prints it: a value whose kind [`Kind::scrubbed`], a value under a
-/// key neither table names (an unknown or retired key, a note), and a value
-/// of the wrong type (doctor's user-file row prints it).
+/// key neither table names (an unknown or retired key, a note), a value of
+/// the wrong type, location-like keys inside it included (doctor's user-file
+/// row prints it), an unknown key whose name looks like a location, and a string an
+/// enum-valued setting does not register (doctor's refusal quotes it).
 pub fn config_scrub_values(root: &Value) -> Vec<String> {
     fn scrubbed(verdict: Verdict) -> bool {
         matches!(verdict, Verdict::Withheld(None)) || matches!(verdict, Verdict::Withheld(Some(k)) if k.scrubbed())
@@ -342,7 +361,15 @@ pub fn config_scrub_values(root: &Value) -> Vec<String> {
         match v {
             Value::String(s) => out.push(s.clone()),
             Value::Array(items) => items.iter().for_each(|i| every_string(i, out)),
-            Value::Object(map) => map.values().for_each(|c| every_string(c, out)),
+            Value::Object(map) => map.iter().for_each(|(k, c)| {
+                // A key here is free text too, but hiding a plain word
+                // (`enabled`) everywhere would hide ordinary output: only a
+                // key that looks like a location is taken.
+                if location_like_key(k) {
+                    out.push(k.clone());
+                }
+                every_string(c, out)
+            }),
             _ => {}
         }
     }
@@ -351,7 +378,13 @@ pub fn config_scrub_values(root: &Value) -> Vec<String> {
             return every_string(v, out);
         }
         match v {
-            Value::Object(map) => map.iter().for_each(|(k, child)| walk(child, &at.key(k), wrong, out)),
+            Value::Object(map) => map.iter().for_each(|(k, child)| {
+                let at = at.key(k);
+                if location_like_key(k) && config_verdict(&at.pattern) == Verdict::Withheld(None) {
+                    out.push(k.clone());
+                }
+                walk(child, &at, wrong, out)
+            }),
             Value::Array(items) => {
                 for (i, item) in items.iter().enumerate() {
                     let at = at.item(i);
@@ -362,7 +395,7 @@ pub fn config_scrub_values(root: &Value) -> Vec<String> {
                     }
                 }
             }
-            Value::String(s) if scrubbed(config_verdict(&at.pattern)) => out.push(s.clone()),
+            Value::String(s) if scrubbed(config_verdict(&at.pattern)) || bad_enum_token(&at.pattern, v) => out.push(s.clone()),
             _ => {}
         }
     }
@@ -455,9 +488,10 @@ impl Withheld {
     /// `text` with every whole occurrence of a value replaced by [`WITHHELD`].
     /// An occurrence inside a longer word is not one (`/srv/x` in
     /// `/srv/xy`); a path's own children are (`/srv/x` in `/srv/x/y`). A
-    /// value a renderer cut short with `…` is one too, when at least
-    /// [`MIN_CUT_CHARS`] of it show (`/srv/xy…` for `/srv/xyz`): truncating a
-    /// cell must not turn a withheld value into a readable prefix of it.
+    /// value a renderer cut short with `…` is one too, head and tail
+    /// together, when at least [`MIN_CUT_CHARS`] of it show (`/srv/xy…` or
+    /// `/sr…xyz` for `/srv/xyz`, see [`cut_spans`]): truncating a cell must
+    /// not turn a withheld value into a readable part of it.
     pub fn scrub(&self, text: &str) -> String {
         let mut out = text.to_string();
         for n in &self.needles {
@@ -531,31 +565,65 @@ fn replace_whole(text: &str, needle: &str) -> String {
     out
 }
 
-/// `text` with each `…` that ends a proper prefix of `needle` (at least
-/// [`MIN_CUT_CHARS`] long, whole on its left) replaced, prefix and `…`
-/// together, by [`WITHHELD`].
-fn replace_cut(text: &str, needle: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// The byte spans of `text` that are `needle` cut short by a truncating
+/// renderer: a head of it, a `…`, then a tail of it (`head…tail`, as a cell
+/// cut in the middle reads; `head…` when the cut is at the end), with at least
+/// [`MIN_CUT_CHARS`] of it showing and neither end glued to a longer word.
+/// Each span runs from the head's first byte to the tail's last. Shared by
+/// [`Withheld::scrub`] and the daemon's address redaction.
+pub fn cut_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    // Byte offsets of every char boundary in the needle, and its char count.
+    let bounds: Vec<usize> = needle.char_indices().map(|(i, _)| i).chain([needle.len()]).collect();
+    let chars = bounds.len() - 1;
+    let ci = |a: &str, b: &str| a.as_bytes().eq_ignore_ascii_case(b.as_bytes());
+    let mut out = Vec::new();
     let mut last = 0;
     for (e, _) in text.match_indices(CUT) {
         if e < last {
             continue;
         }
-        let before = &text[last..e];
-        let prefixes: Vec<usize> = needle.char_indices().skip(MIN_CUT_CHARS).map(|(k, _)| k).collect();
-        let longest = prefixes.into_iter().rev().find(|&k| {
-            k <= before.len()
-                && before.is_char_boundary(before.len() - k)
-                && before.as_bytes()[before.len() - k..].eq_ignore_ascii_case(&needle.as_bytes()[..k])
-                && !(before[..before.len() - k].chars().next_back().is_some_and(word_char) && needle.starts_with(word_char))
-        });
-        if let Some(k) = longest {
-            out.push_str(&text[last..e - k]);
-            out.push_str(WITHHELD);
-            last = e + CUT.len_utf8();
+        let (before, after) = (&text[last..e], &text[e + CUT.len_utf8()..]);
+        // `k` chars of the needle's head end `before`; `j` of its tail start `after`.
+        let head_ok = |k: usize| {
+            let hb = bounds[k];
+            hb <= before.len()
+                && before.is_char_boundary(before.len() - hb)
+                && ci(&before[before.len() - hb..], &needle[..hb])
+                && (k == 0 || !(before[..before.len() - hb].chars().next_back().is_some_and(word_char) && needle.starts_with(word_char)))
+        };
+        let tail_ok = |j: usize| {
+            let tb = needle.len() - bounds[chars - j];
+            tb <= after.len()
+                && after.is_char_boundary(tb)
+                && ci(&after[..tb], &needle[needle.len() - tb..])
+                && (j == 0 || !(after[tb..].chars().next().is_some_and(word_char) && needle.ends_with(word_char)))
+        };
+        // The cut that shows the most of the needle, and never all of it.
+        let best = (0..chars)
+            .filter(|&k| head_ok(k))
+            .filter_map(|k| (0..chars - k).rev().find(|&j| tail_ok(j)).map(|j| (k, j)))
+            .max_by_key(|(k, j)| (k + j, *k));
+        if let Some((k, j)) = best.filter(|(k, j)| k + j >= MIN_CUT_CHARS) {
+            let start = e - bounds[k];
+            let end = e + CUT.len_utf8() + (needle.len() - bounds[chars - j]);
+            out.push((start, end));
+            last = end;
         }
     }
-    out.push_str(&text[last..]);
+    out
+}
+
+/// `text` with each [`cut_spans`] occurrence of `needle` replaced by
+/// [`WITHHELD`].
+fn replace_cut(text: &str, needle: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in cut_spans(text, needle) {
+        out.push_str(&text[at..start]);
+        out.push_str(WITHHELD);
+        at = end;
+    }
+    out.push_str(&text[at..]);
     out
 }
 
@@ -795,6 +863,37 @@ mod tests {
         assert!(!vals.iter().any(|v| v == "standalone"), "a shown value is not scrubbed: {vals:?}");
     }
 
+    /// (5.0 security re-review N3) Three more places a value doctor or
+    /// `config list` prints could name a location: a KEY inside a value of the
+    /// wrong type, an unknown key whose NAME is a path or a host, and a shown
+    /// enum-valued key holding a value that is not one of its tokens (bad
+    /// config, which doctor's refusal quotes). Each is scrubbed everywhere,
+    /// and the enum value is withheld in `config list`; a valid token stays.
+    #[test]
+    fn wrong_typed_keys_path_named_keys_and_bad_enum_tokens_are_withheld() {
+        let doc = serde_json::json!({
+            "radio": { "humor": { "/opt/fake-key-in-wrong-type": 1, "enabled": 2 } },
+            "/opt/fake-unknown-key-path": true,
+            "runtime": { "gpubox.corp-fake.example": 1, "max_turns": 5 },
+            "fleet": { "mode": "/opt/fake-enum-garbage", "busy_policy": "queue" },
+            "hooks": { "rules": [ { "match": { "level": "/opt/fake-level-garbage", "action": "run.complete" } } ] }
+        });
+        let vals = config_scrub_values(&doc);
+        for want in ["/opt/fake-key-in-wrong-type", "/opt/fake-unknown-key-path", "gpubox.corp-fake.example", "/opt/fake-enum-garbage", "/opt/fake-level-garbage"] {
+            assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
+        }
+        assert!(!vals.iter().any(|v| v == "run.complete" || v == "max_turns" || v == "enabled"), "plain words stay: {vals:?}");
+        let mut v = doc.clone();
+        assert!(shape_config_json(&mut v));
+        let w = Value::String(WITHHELD.into());
+        assert_eq!(v.pointer("/fleet/mode"), Some(&w), "{v:#}");
+        assert_eq!(v.pointer("/hooks/rules/0/match/level"), Some(&w), "{v:#}");
+        let mut good = serde_json::json!({ "fleet": { "mode": "hub" }, "hooks": { "rules": [ { "match": { "level": "error" } } ] } });
+        shape_config_json(&mut good);
+        assert_eq!(good.pointer("/fleet/mode").and_then(Value::as_str), Some("hub"), "a registered token stays");
+        assert_eq!(good.pointer("/hooks/rules/0/match/level").and_then(Value::as_str), Some("error"), "a registered token stays");
+    }
+
     /// (5.0 review item 6) Hosts are case-insensitive, so the scrub is: a
     /// host written in another case is the same host.
     #[test]
@@ -815,6 +914,38 @@ mod tests {
         assert_eq!(w.scrub("at hosted-sec…  next"), format!("at {WITHHELD}  next"));
         assert_eq!(w.scrub("nothing to cut… here"), "nothing to cut… here");
         assert_eq!(w.scrub("whole /opt/fake-wrongtype-path/deep/inside"), format!("whole {WITHHELD}"));
+    }
+
+    /// The middle cut `run list` and `mission status` make: head, `…`, tail,
+    /// `max` characters in all.
+    fn middle_cut(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let keep = max - 1;
+        let (head, tail) = (keep.div_ceil(2), keep - keep.div_ceil(2));
+        format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+    }
+
+    /// (5.0 security re-review C5) A value cut in the MIDDLE (`head…tail`, as
+    /// `run list` and `mission status` truncate a cell) is withheld whole: the
+    /// tail is as much the value as the head. At every width that shows at
+    /// least [`MIN_CUT_CHARS`] of it, inside a line or alone in a cell.
+    #[test]
+    fn a_value_cut_in_the_middle_is_withheld_with_its_tail() {
+        let needles = ["http://gpubox.corp-fake.example:1234", "/opt/fake-wrongtype-path/deep/inside"];
+        let w = Withheld::from_values(needles.iter().map(|n| n.to_string()));
+        for n in needles {
+            for max in MIN_CUT_CHARS + 1..n.chars().count() {
+                let cut = middle_cut(n, max);
+                assert_eq!(w.scrub(&format!("at {cut}  next")), format!("at {WITHHELD}  next"), "{cut}");
+                assert_eq!(w.scrub(&cut), WITHHELD, "{cut}");
+            }
+        }
+        // A `…` with nothing of a value on either side, and a value's head
+        // followed by text that is not its tail, keep what is not the value.
+        assert_eq!(w.scrub("nothing to cut… here"), "nothing to cut… here");
+        assert_eq!(w.scrub("http://gpub… unrelated"), format!("{WITHHELD} unrelated"));
+        // A tail glued to a longer word is not the value's end.
+        assert_eq!(w.scrub("x …h/inside2"), "x …h/inside2");
     }
 
     #[test]

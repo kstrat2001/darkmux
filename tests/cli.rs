@@ -14365,7 +14365,6 @@ fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full(
                 failures.push(format!("panel {id} shows `{s}` to a remote viewer:\n{shown}"));
             }
         }
-        eprintln!("REMOTEDUMP {id}:\n{shown}\nENDDUMP");
         remote_bodies.insert(id.clone(), body);
     }
     // A failed panel still says why: its stderr reaches the remote viewer
@@ -14408,4 +14407,74 @@ fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full(
         assert!(text.contains(s), "this machine reads `{s}`: {text}");
     }
     assert_eq!(local["withheld"].as_str().unwrap_or_default(), "", "nothing is withheld from this machine");
+}
+
+/// (5.0 security re-review N1) `run list --usage` for a remote viewer: an
+/// endpoint darkmux called is an address whatever its value, so a usage row
+/// with no `endpoint_id` withholds its ENDPOINT cell, and a run's route
+/// (`kind:host/model`) is withheld; a named endpoint still reads as its
+/// registry id. The records come from a PEER, so no value here is in this
+/// machine's configuration: only the field's meaning can withhold it.
+#[test]
+fn run_list_usage_withholds_every_endpoint_address_from_a_remote_viewer() {
+    let run = |remote: bool| {
+        let mut cmd = darkmux_std_cmd();
+        console_env(&mut cmd);
+        let flows = spawn_env(&cmd, "DARKMUX_FLOWS_DIR");
+        let now = darkmux_flow::ts_utc_now();
+        let usage = |sid: &str, endpoint: &str, endpoint_id: Option<&str>| {
+            let mut payload = serde_json::json!({ "call_kind": "turn", "purpose": "work", "requested_model": "fake-model", "endpoint": endpoint, "token_source": "provider", "prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10 });
+            if let Some(id) = endpoint_id {
+                payload["endpoint_id"] = serde_json::json!(id);
+            }
+            serde_json::json!({ "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": sid, "execution_id": format!("exec-{sid}"), "handle": "coder", "machine_id": "peer2", "machine_uid": "UID-FAKE-PEER", "payload": payload })
+        };
+        let records = [
+            serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-peer", "execution_id": "exec-sess-peer", "handle": "coder", "machine_id": "peer2", "payload": { "endpoint": "openai:gpubox.corp-fake.example/fake-model" } }),
+            usage("sess-peer", "http://gpubox.corp-fake.example:1234", None),
+            usage("sess-peer", "azure:named-fake.example.com/fake-model", Some("azure")),
+        ];
+        let body: String = records.iter().map(|r| format!("{r}\n")).collect();
+        fs::write(flows.join(format!("{}.jsonl", darkmux_flow::day_utc_now())), body).unwrap();
+        cmd.env("DARKMUX_PANEL", "run-list").env("COLUMNS", "200").args(["run", "list", "--usage", "--all"]);
+        if remote {
+            cmd.env("DARKMUX_PANEL_AUDIENCE", "remote");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        strip_escapes(&String::from_utf8_lossy(&out.stdout))
+    };
+    let remote = run(true);
+    assert!(!remote.contains("gpubox") && !remote.contains("corp-fake") && !remote.contains("named-fake"), "{remote}");
+    assert!(remote.contains("(shown on this machine only)"), "the cell says it was withheld: {remote}");
+    assert!(remote.contains("azure"), "a named endpoint reads as its registry id: {remote}");
+    let local = run(false);
+    assert!(local.contains("http://gpubox.corp-fake.example:1234"), "this machine reads the endpoint: {local}");
+    assert!(local.contains("via openai:gpubox.corp-fake.example/fake-model"), "this machine reads the route: {local}");
+}
+
+/// (5.0 security re-review N1, the same shape elsewhere) `profile list`
+/// prints where each unmanaged endpoint's requests go, by host. For a remote
+/// viewer that host is withheld as an address whatever it is spelled like,
+/// even a public machine name the value scrub spares.
+#[test]
+fn profile_list_withholds_an_endpoint_host_from_a_remote_viewer() {
+    let run = |remote: bool| {
+        let mut cmd = darkmux_std_cmd();
+        console_env(&mut cmd);
+        fs::write(
+            spawn_env(&cmd, "DARKMUX_HOME").join("profiles.json"),
+            r#"{"profiles":{"lan":{"description":"lan","models":[{"id":"gpt-fake","endpoint":"onpeer"}]}},"endpoints":{"onpeer":{"url":"http://peer2:1234/v1","auth":{"type":"bearer","key_env":"FAKE_KEY_VAR"}}}}"#,
+        )
+        .unwrap();
+        cmd.env("DARKMUX_PANEL", "profile-list").env("COLUMNS", "120").args(["profile", "list"]);
+        if remote {
+            cmd.env("DARKMUX_PANEL_AUDIENCE", "remote");
+        }
+        let out = cmd.output().unwrap();
+        strip_escapes(&String::from_utf8_lossy(&out.stdout))
+    };
+    let remote = run(true);
+    assert!(remote.contains("onpeer: unmanaged @ (shown on this machine only)"), "{remote}");
+    assert!(run(false).contains("onpeer: unmanaged @ peer2:1234"), "this machine reads the host");
 }

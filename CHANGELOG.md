@@ -438,18 +438,34 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
     daemon user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
     `$DARKMUX_HOME`), and every address, path, endpoint URL and credential
     pointer this machine is configured with reads "(shown on this machine
-    only)", in any case, and also where a renderer cut it short with `…`.
-    That set is read through the same `config_access` accessors the code uses
-    (`LOCATION_ACCESSORS`; a test scans the module and fails on an accessor
-    that could name a location and is in neither list, so a setting that
-    exists only in the environment is covered), plus `config.json` as written
-    (a value of the wrong type and an unknown key's value included), the
-    profile registry's endpoints, the lab fixture registry, the Redis URL and
-    the temp directory. A credential pointer spelled like a machine, profile
-    or endpoint name does not hide the name. `config-list` also withholds a
-    shown key whose value has the wrong type, and every `config.json` leaf is
-    classified by its own path, so a new field under a withheld prefix fails
-    the guard. `doctor` is floored per audience: a remote run never closes this
+    only)", in any case. A value a renderer cut short with `…` is matched by
+    the part that shows, head and tail (`run-list` and `mission-status` cut a
+    cell in the middle), when at least four characters of it show; the same
+    applies to roster addresses, and a `.ts.net` name is recognized when the
+    cut keeps its `s.net` end or its `.ts`. A cut that keeps fewer characters,
+    or a `.ts.net` name cut so that neither shows, is not recognized. That set
+    is read through the same `config_access` functions the code uses
+    (`LOCATION_ACCESSORS`; a test scans the module's public functions,
+    `pub(crate)` ones and ones taking arguments included, and fails on one
+    that could return text and is in neither list, so a setting that exists
+    only in the environment is covered), plus `config.json` as written (a
+    value of the wrong type with any location-like key inside it, an unknown
+    key's value, an unknown key whose name looks like a location, and an
+    enum-valued setting holding something that is not one of its tokens), the
+    environment's bad enum values, the profile registry's endpoints, the lab
+    fixture registry, the Redis URL and the temp directory. A free-form string
+    setting holding something else of the right type is not recognized. A
+    credential pointer spelled like a machine, profile or endpoint name does
+    not hide the name. A field darkmux knows is an address is withheld
+    whatever its value, including what a peer's records name: `run-list`
+    withholds each run's route and each usage group's endpoint (a named
+    endpoint still reads as its registry id), and `profile-list` each
+    unmanaged endpoint's host. A remote body is redacted before it is cached,
+    so a value rotated out of the configuration inside the cache's lifetime
+    never reaches a remote caller. `config-list` also withholds a shown key
+    whose value has the wrong type or is not one of its enum's tokens, and
+    every `config.json` leaf is classified by its own path, so a new field
+    under a withheld prefix fails the guard. `doctor` is floored per audience: a remote run never closes this
     machine's 30s window, and a remote caller inside the remote window reads
     the last remote run (with its age) instead of starting a probe. Matches are whole tokens only (`mac` is not
     hidden inside `macos`; punctuation and color codes are boundaries; an OSC 8

@@ -2388,9 +2388,9 @@ pub fn skills_override_dirs() -> Vec<std::path::PathBuf> {
 // through the same accessors the code uses, so an environment override and a
 // setting that has no `config.json` key at all are covered. The table is
 // checked, not trusted: `location_guard` below scans this file for every
-// zero-argument accessor that could return text and fails until each one is
-// either in [`LOCATION_ACCESSORS`] or named, with its reason, as not a
-// location.
+// public function (`pub`, `pub(crate)`, `pub(super)`, with or without
+// arguments) that could return text and fails until each one is either in
+// [`LOCATION_ACCESSORS`] or named, with its reason, as not a location.
 
 /// The locations a resolved setting's value names.
 pub trait AsLocations {
@@ -2514,21 +2514,61 @@ mod location_guard {
         ("thermal_pause_at", "an enum value"),
         ("thermal_resume_at", "an enum value"),
         ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
+        ("config", "the whole config.json document: its locations are read by the accessors named here and `panel_audience::config_scrub_values`"),
+        ("env_str", "the raw environment reader the accessors are built on; each location it reads is read through its accessor"),
+        ("format_listen_addr", "formats its arguments; the resolved address is `serve_listen_addr`"),
+        ("format_client_addr", "formats its arguments; the resolved address is `serve_client_addr`"),
+        ("resolve_enum", "an enum value; one that is not a token is withheld as bad config (`config_enum::bad_values`)"),
+        ("resolve_enum_token", "an enum value; one that is not a token is withheld as bad config (`config_enum::bad_values`)"),
+        ("enum_bad_values", "bad enum values, withheld as bad config through `config_enum::bad_values`"),
+        ("role_profile", "a profile name"),
+        ("as_str", "a tier's name (env, config, default)"),
+        ("describe", "where a client address came from (a tier, or the daemon's pid), never the address"),
+        ("set_config_for_test", "a test hook that installs a config"),
     ];
 
-    /// Every `pub fn NAME() -> TYPE` in this file's production code, as
-    /// `(NAME, TYPE)`, signatures spanning lines included.
-    fn zero_arg_accessors() -> Vec<(String, String)> {
-        let src = include_str!("config_access.rs");
+    /// Every public function in `src`'s production code (`pub`, `pub(crate)`
+    /// or `pub(super)`; with or without arguments, `&self` and generics
+    /// included) that returns something, as `(NAME, TYPE, TAKES_ARGUMENTS)`,
+    /// signatures spanning lines included.
+    fn accessors_in(src: &str) -> Vec<(String, String, bool)> {
         let production: String =
             src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(src).split_whitespace().collect::<Vec<_>>().join(" ");
+        // The index just past the bracket that closes the one at `open`.
+        let close = |s: &str, open: usize, (o, c): (char, char)| -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, ch) in s[open..].char_indices() {
+                if ch == o {
+                    depth += 1;
+                } else if ch == c && !(c == '>' && s[..open + i].ends_with('-')) {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + i + 1);
+                    }
+                }
+            }
+            None
+        };
         let mut out = Vec::new();
-        for piece in production.split("pub fn ").skip(1) {
-            let Some((name, rest)) = piece.split_once('(') else { continue };
-            let Some(rest) = rest.trim_start().strip_prefix(')') else { continue };
-            let Some(ty) = rest.trim_start().strip_prefix("->") else { continue };
-            let ty = ty.split('{').next().unwrap_or("").trim().to_string();
-            out.push((name.trim().to_string(), ty));
+        for (at, _) in production.match_indices(" fn ") {
+            let before = &production[..at];
+            if !["pub", "pub(crate)", "pub(super)"].iter().any(|v| before.ends_with(&format!(" {v}")) || before == *v) {
+                continue;
+            }
+            let rest = &production[at + 4..];
+            let name_end = rest.find(['<', '(']).unwrap_or(rest.len());
+            let name = rest[..name_end].trim().to_string();
+            let mut i = name_end;
+            if rest[i..].starts_with('<') {
+                let Some(end) = close(rest, i, ('<', '>')) else { continue };
+                i = end;
+            }
+            let Some(open) = rest[i..].find('(').map(|o| i + o) else { continue };
+            let Some(end) = close(rest, open, ('(', ')')) else { continue };
+            let takes_args = !rest[open + 1..end - 1].trim().trim_end_matches(',').trim().is_empty();
+            let Some(ty) = rest[end..].trim_start().strip_prefix("->") else { continue };
+            let ty = ty.split(['{', ';']).next().unwrap_or("").split(" where ").next().unwrap_or("").trim().to_string();
+            out.push((name, ty, takes_args));
         }
         out.sort();
         out.dedup();
@@ -2542,28 +2582,44 @@ mod location_guard {
         ty.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).any(|t| !SCALARS.contains(&t))
     }
 
-    /// The structural guard: the location table is complete. Every
-    /// zero-argument accessor here whose value could be text (a `String`, a
-    /// path, a list, a struct) is read by [`resolved_locations`] or named in
-    /// `NOT_LOCATIONS` with the reason it names no location. A
-    /// `_with_source` sibling returns its accessor's value and is covered by
-    /// it.
-    #[test]
-    fn every_accessor_that_can_name_a_location_is_read() {
-        let found = zero_arg_accessors();
-        assert!(found.len() > 80, "the scan found the accessors: {found:?}");
-        let read: Vec<&str> = LOCATION_ACCESSORS.iter().map(|(n, _)| *n).collect();
-        let mut unclassified = Vec::new();
-        for (name, ty) in &found {
-            if name.ends_with("_with_source") || !can_hold_text(ty) {
+    /// The accessors in `found` that could name a location and are neither
+    /// in `read` nor in `excused`. A `_with_source` returns its plain
+    /// sibling's value and is covered by it, but only when that sibling
+    /// exists. One that takes arguments cannot be read without them, so it
+    /// must be excused (its reason names what covers the value, if anything).
+    fn unclassified(found: &[(String, String, bool)], read: &[&str], excused: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, ty, takes_args) in found {
+            if !can_hold_text(ty) {
                 continue;
             }
-            let listed = read.contains(&name.as_str());
-            let excused = NOT_LOCATIONS.iter().any(|(n, _)| n == name);
-            if listed == excused {
-                unclassified.push(format!("{name} -> {ty}"));
+            if let Some(base) = name.strip_suffix("_with_source") {
+                if !found.iter().any(|(f, _, _)| f == base) {
+                    out.push(format!("{name} -> {ty} (a `_with_source` with no `{base}` beside it)"));
+                }
+                continue;
+            }
+            let (listed, is_excused) = (read.contains(&name.as_str()), excused.contains(&name.as_str()));
+            if listed == is_excused || (*takes_args && !is_excused) {
+                out.push(format!("{name} -> {ty}{}", if *takes_args { " (takes arguments)" } else { "" }));
             }
         }
+        out
+    }
+
+    /// The structural guard: the location table is complete. Every public
+    /// function here whose value could be text (a `String`, a path, a list,
+    /// a struct) is read by [`resolved_locations`] or named in
+    /// `NOT_LOCATIONS` with the reason it names no location; one that takes
+    /// arguments must be named there. A `_with_source` returns its plain
+    /// sibling's value and is covered by it, when the sibling exists.
+    #[test]
+    fn every_accessor_that_can_name_a_location_is_read() {
+        let found = accessors_in(include_str!("config_access.rs"));
+        assert!(found.len() > 80, "the scan found the accessors: {found:?}");
+        let read: Vec<&str> = LOCATION_ACCESSORS.iter().map(|(n, _)| *n).collect();
+        let excused: Vec<&str> = NOT_LOCATIONS.iter().map(|(n, _)| *n).collect();
+        let unclassified = unclassified(&found, &read, &excused);
         assert!(
             unclassified.is_empty(),
             "classify each accessor: add it to LOCATION_ACCESSORS (it names an address, a path or a URL a \
@@ -2571,14 +2627,36 @@ mod location_guard {
              {unclassified:?}"
         );
         for (n, _) in NOT_LOCATIONS {
-            assert!(found.iter().any(|(f, _)| f == n), "NOT_LOCATIONS names `{n}`, which is not an accessor here");
+            assert!(found.iter().any(|(f, _, _)| f == n), "NOT_LOCATIONS names `{n}`, which is not an accessor here");
         }
         // The scan sees what the guard must: a path-returning accessor, an
         // env-only one, and a signature spanning lines.
         for must in ["host_source_script", "findings_dir", "identity_path_override", "fleet_identity_provider"] {
-            assert!(found.iter().any(|(f, _)| f == must), "the scan missed `{must}`");
+            assert!(found.iter().any(|(f, _, _)| f == must), "the scan missed `{must}`");
         }
         assert!(!can_hold_text("(Option<u32>, Source)") && can_hold_text("Option<std::path::PathBuf>"));
+    }
+
+    /// (5.0 security re-review C4) The shapes of accessor the scan must not
+    /// miss, each in a source of its own: a `pub(crate)` one, one that takes
+    /// an argument (generic or not), and a `_with_source` with no plain
+    /// sibling to cover it. Each is unclassified until someone decides.
+    #[test]
+    fn the_scan_catches_every_shape_of_accessor() {
+        for (src, name) in [
+            ("pub(crate) fn hidden_dir() -> std::path::PathBuf {\n    x()\n}\n", "hidden_dir"),
+            ("pub fn endpoint_for(name: &str) -> Option<String> {\n    x()\n}\n", "endpoint_for"),
+            ("pub fn templated<T: Into<String>>(\n    t: T,\n) -> String {\n    x()\n}\n", "templated"),
+            ("pub(super) fn method_url(&self) -> String {\n    x()\n}\n", "method_url"),
+            ("pub fn orphan_with_source() -> (String, Source) {\n    x()\n}\n", "orphan_with_source"),
+        ] {
+            let found = accessors_in(src);
+            let got = unclassified(&found, &[], &[]);
+            assert!(got.iter().any(|u| u.starts_with(&format!("{name} "))), "{name} is unclassified in {src:?}: {got:?}");
+        }
+        // A `_with_source` beside its plain accessor is covered by it.
+        let paired = "pub fn a_dir() -> String {\n}\npub fn a_dir_with_source() -> (String, Source) {\n}\n";
+        assert_eq!(unclassified(&accessors_in(paired), &["a_dir"], &[]), Vec::<String>::new());
     }
 
     /// Each entry reads its own accessor: a setting that exists only in the

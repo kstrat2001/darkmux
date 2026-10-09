@@ -47,12 +47,15 @@ pub(crate) fn run(
         let view = darkmux_serve::fleet_view::fetch_local_daemon_view_within(&darkmux_types::config_access::serve_client_addr(), darkmux_serve::fleet_view::LOCAL_VIEW_COLD_WAIT)?;
         Some((view, darkmux_serve::live_session_ids()))
     });
-    let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
-    let report = usage.then(|| UsageReport {
+    let mut filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
+    let mut report = usage.then(|| UsageReport {
         since: built.since.clone(),
         default_window: built.default_window,
         breakdown: built.usage,
     });
+    if darkmux_types::panel_audience::remote() {
+        withhold_addresses(&mut filtered, report.as_mut());
+    }
 
     // The bound to name, whenever the operator gave one.
     let since_label = since.map(|_| built.since.as_str());
@@ -71,6 +74,23 @@ pub(crate) fn run(
         }
     }
     Ok(0)
+}
+
+/// (5.0) The remote form, for a console viewer that is not this machine
+/// (`darkmux_types::panel_audience`): every field darkmux knows is an address
+/// is withheld whatever its value, because a peer's records name endpoints
+/// this machine's configuration does not, so no list of known values could
+/// catch them. A run's route (`kind:host/model`) and a usage group's endpoint
+/// string go; a named endpoint still reads as its registry id, which is a
+/// name, not an address.
+fn withhold_addresses(rows: &mut [Run], report: Option<&mut UsageReport>) {
+    use darkmux_types::panel_audience::WITHHELD;
+    for route in rows.iter_mut().filter_map(|r| r.route.as_mut()) {
+        *route = WITHHELD.to_string();
+    }
+    for endpoint in report.into_iter().flat_map(|r| r.breakdown.groups.iter_mut()).filter_map(|g| g.endpoint.as_mut()) {
+        *endpoint = WITHHELD.to_string();
+    }
 }
 
 /// (#2902) `--since`: keep the rows active at or after the bound — the
