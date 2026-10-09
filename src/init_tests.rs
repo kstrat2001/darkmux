@@ -808,6 +808,9 @@ fn a_failing_lms_ls_reads_as_could_not_ask_not_as_nothing_fits() {
     let reason = r.worker_model_unfilled_reason.expect("a reason");
     assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
     assert!(!reason.contains("fits in"), "{reason}");
+    // The utility half stays quiet: the worker line already reported lms.
+    assert_eq!(r.utility_model_unfilled_reason, None);
+    assert_eq!(r.utility_model_filled, None);
     assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON);
 
     // `ls` succeeds but prints something that is not JSON.
@@ -816,6 +819,7 @@ fn a_failing_lms_ls_reads_as_could_not_ask_not_as_nothing_fits() {
     let reason = r.worker_model_unfilled_reason.expect("a reason");
     assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
     assert!(reason.contains("not a JSON list"), "{reason}");
+    assert_eq!(r.utility_model_unfilled_reason, None);
 
     // An empty catalog is still an answer: "nothing fits", not "could not ask".
     env.lms(&[], &[]);
