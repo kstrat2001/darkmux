@@ -1127,7 +1127,7 @@ fn render_ephemeral_result(
         .ok_or_else(|| anyhow::anyhow!("panel command graph's terminal step `{last_step_id}` vanished"))?;
 
     let output = terminal.output.clone().unwrap_or_default();
-    if terminal.status == NodeStatus::Error || terminal.stopped_by_operator() {
+    if terminal.ended_as_failure() {
         return Ok(EphemeralOutcome {
             text: format!("darkmux: command failed:\n\n{output}"),
             success: false,

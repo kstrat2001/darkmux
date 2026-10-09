@@ -1807,46 +1807,60 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             // `Complete`, unchanged — a genuinely dataless mint/dispatch-
             // shape mission, the same "no data, don't invent a verdict"
             // reasoning this arm has always applied.
-            Ok(None) => {
-                let phases: Vec<Phase> = darkmux_crew::loader::load_phases()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|p| p.mission_id == mission.id)
-                    .collect();
-                if phases.is_empty() || phases.iter().any(|p| p.status == PhaseStatus::Complete) {
-                    RunStatus::Complete
-                } else {
-                    RunStatus::Abandoned
-                }
-            }
+            Ok(None) => envelope_less_status(mission),
             // The run ended on the operator's stop, recorded where it ended
             // (`finalize_mission_with_payload`, from the one decider its
             // `run.error` and `dispatch.error` name it from): the operator
             // tore it down, so it reads as the flow's lifecycle rule reads
             // those terminals, never as the error the envelope's status says.
-            Ok(Some(envelope)) if envelope.stop_reason.is_some() => RunStatus::Abandoned,
-            Ok(Some(envelope)) => {
-                // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
-                // `RunOutcome::Partial` is NOT read here: `status` already
-                // collapses `Partial` into `Degraded`
-                // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
-                // its own `RunStatus` (F10/F11), so a cut-off or partial run
-                // never reads `Complete`.
-                //
-                // (#1881) `envelope.status` itself can be
-                // `MissionOutcomeStatus::Unknown` (a status value this
-                // binary doesn't recognize, degraded via `#[serde(other)]`
-                // rather than failing the whole parse). That is exactly the
-                // "this binary cannot tell you what happened" case
-                // `Unparseable` exists for, so it gets its own arm.
-                match envelope.status {
-                    MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
-                    MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
-                    MissionOutcomeStatus::Degraded => RunStatus::Degraded,
-                    MissionOutcomeStatus::Clean => RunStatus::Complete,
-                }
-            }
+            Ok(Some(envelope)) => envelope_status(&envelope),
         }
+}
+
+/// A Finalized mission with no envelope (see the `Ok(None)` arm above):
+/// complete when it has no phases or any phase completed, else abandoned.
+fn envelope_less_status(mission: &Mission) -> RunStatus {
+    let phases: Vec<Phase> = darkmux_crew::loader::load_phases()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.mission_id == mission.id)
+        .collect();
+    if phases.is_empty() || phases.iter().any(|p| p.status == PhaseStatus::Complete) {
+        RunStatus::Complete
+    } else {
+        RunStatus::Abandoned
+    }
+}
+
+/// A Finalized mission's status from its envelope.
+fn envelope_status(envelope: &darkmux_crew::envelope::MissionEnvelope) -> RunStatus {
+    // The run ended on the operator's stop, recorded where it ended
+    // (`finalize_mission_with_payload`, from the one decider its
+    // `run.error` and `dispatch.error` name it from): the operator
+    // tore it down, so it reads as the flow's lifecycle rule reads
+    // those terminals, never as the error the envelope's status says.
+    if envelope.stop_reason.is_some() {
+        return RunStatus::Abandoned;
+    }
+    // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
+    // `RunOutcome::Partial` is NOT read here: `status` already
+    // collapses `Partial` into `Degraded`
+    // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
+    // its own `RunStatus` (F10/F11), so a cut-off or partial run
+    // never reads `Complete`.
+    //
+    // (#1881) `envelope.status` itself can be
+    // `MissionOutcomeStatus::Unknown` (a status value this
+    // binary doesn't recognize, degraded via `#[serde(other)]`
+    // rather than failing the whole parse). That is exactly the
+    // "this binary cannot tell you what happened" case
+    // `Unparseable` exists for, so it gets its own arm.
+    match envelope.status {
+        MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
+        MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
+        MissionOutcomeStatus::Degraded => RunStatus::Degraded,
+        MissionOutcomeStatus::Clean => RunStatus::Complete,
+    }
 }
 
 /// (#2682 fix-pass MUST FIX 1/2/3/5) The dispatch-liveness verdict for
@@ -2097,24 +2111,10 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session: Option<LabSessi
     // `Running` and `Unknown` deliberately fall THROUGH to the staleness check
     // below: the first may be a hard-killed run whose `Drop` never ran (the one
     // gap RAII cannot close), and the second must never be read as a verdict.
-    use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
-    match summary.lifecycle_status {
-        // (#2860) `Complete` says the HARNESS ran to the end, not how the
-        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
-        // dispatch errored was listed complete while its own detail view
-        // said errored. Every other run kind already reports its outcome.
-        Some(Lc::Complete) => return settled_lab_status(summary),
-        Some(Lc::Error) => return RunStatus::Error,
-        Some(Lc::Interrupted) => return RunStatus::Abandoned,
-        // (#2860) No lifecycle verdict (a run from before the record existed):
-        // a manifest is written only when the run ends, so its `ok` is a
-        // terminal record too, and outranks the staleness guess below.
-        None if summary.run_ok.is_some() => return settled_lab_status(summary),
-        _ => {}
+    if let Some(status) = lab_own_verdict(summary) {
+        return status;
     }
-    if summary.finished {
-        return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
-    }
+
     // (#2812) The run's own flow session, when there is one, answers the
     // liveness question directly — see this function's doc for why it
     // outranks the artifact heuristic below rather than merely feeding it.
@@ -2127,13 +2127,12 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session: Option<LabSessi
     // work after its dispatch, and is running until its own record ends. Its
     // dispatch's end is then the newest evidence it was alive, so the quiet
     // clock below runs from there (or from a newer artifact).
-    let mut last_alive_ms = summary.mtime_ms;
-    match session {
+    let last_alive_ms = match session {
         Some(LabSession::Live) => return RunStatus::Running,
         Some(LabSession::Silent) => return RunStatus::Abandoned,
-        Some(LabSession::Ended { at_ms }) => last_alive_ms = last_alive_ms.max(at_ms),
-        None => {}
-    }
+        Some(LabSession::Ended { at_ms }) => summary.mtime_ms.max(at_ms),
+        None => summary.mtime_ms,
+    };
     // (#1621) Unfinished is NOT the same as running, and treating it as such
     // is what made the `running` filter useless: 49 of 52 rows it returned
     // were long-dead bench runs, and the three live ones were lost in them.
@@ -2158,6 +2157,28 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session: Option<LabSessi
         return RunStatus::Abandoned;
     }
     RunStatus::Running
+}
+
+/// The verdict a lab run's own records give, before any liveness inference
+/// ([`lab_run_status`]'s first rule): its lifecycle record, its manifest's
+/// `ok`, or its scores. `None` when they say nothing settled.
+fn lab_own_verdict(summary: &LabRunSummary) -> Option<RunStatus> {
+    use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+    match summary.lifecycle_status {
+        // (#2860) `Complete` says the HARNESS ran to the end, not how the
+        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
+        // dispatch errored was listed complete while its own detail view
+        // said errored. Every other run kind already reports its outcome.
+        Some(Lc::Complete) => return Some(settled_lab_status(summary)),
+        Some(Lc::Error) => return Some(RunStatus::Error),
+        Some(Lc::Interrupted) => return Some(RunStatus::Abandoned),
+        // (#2860) No lifecycle verdict (a run from before the record existed):
+        // a manifest is written only when the run ends, so its `ok` is a
+        // terminal record too, and outranks the staleness guess below.
+        None if summary.run_ok.is_some() => return Some(settled_lab_status(summary)),
+        _ => {}
+    }
+    summary.finished.then_some(if summary.degenerate { RunStatus::Error } else { RunStatus::Complete })
 }
 
 /// (#2860, F2) The status of a lab run that ENDED and wrote a manifest: an

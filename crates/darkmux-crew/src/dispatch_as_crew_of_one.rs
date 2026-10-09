@@ -76,6 +76,14 @@ pub fn dispatch_as_crew_of_one(opts: DispatchOpts) -> Result<DispatchResult> {
     )
 }
 
+/// The step's status as this run reports it: a step an operator's stop ended
+/// is `Abandoned` naming the stop (`Step::end_unfinished`), which reports
+/// the same failed ending as `Error`, with the same error and reason; the
+/// run's envelope names the stop.
+fn outcome_status(step: &crate::types::Step) -> NodeStatus {
+    if step.ended_as_failure() { NodeStatus::Error } else { step.status }
+}
+
 /// The injectable core of [`dispatch_as_crew_of_one`] — `registry` and
 /// `host_factory` are caller-supplied so tests can substitute a fake
 /// `dispatch.internal` kind (no Docker/LMStudio) and a
@@ -199,7 +207,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         .get(&step_id)
         .ok_or_else(|| anyhow!("dispatch: step `{step_id}` vanished from the run graph"))?;
 
-    match step.status {
+    match outcome_status(step) {
         NodeStatus::Complete => {
             let raw: RawDispatchOutcome = serde_json::from_str(step.output.as_deref().unwrap_or_default())
                 .context("dispatch: could not parse the crew-of-one step's packed DispatchResult")?;
@@ -234,7 +242,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         // A step an operator's stop ended is `Abandoned` naming the stop
         // (`Step::end_unfinished`), not `Error`: the same failed ending, the
         // same error and reason, and the run's envelope names the stop.
-        NodeStatus::Error | NodeStatus::Abandoned if step.status == NodeStatus::Error || step.stopped_by_operator() => {
+        NodeStatus::Error => {
             // `dispatch()` itself returned an `Err` (preflight/model
             // resolution/etc — see `DispatchInternalStepKind`'s
             // `.with_context(...)?`), the one case `preserve_dispatch_result`

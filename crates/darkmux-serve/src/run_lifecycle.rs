@@ -137,14 +137,27 @@ pub(crate) fn ending_of_record(v: &serde_json::Value) -> Option<Ending> {
 /// the run completed degraded (its own wall-clock bound, a degraded step),
 /// which the run's row reads as degraded too.
 pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool, degraded: bool) -> Option<Ending> {
+    action
+        .bookend()
+        .and_then(|b| bookend_ending(&b.edge, names_a_reason, degraded))
+        .or_else(|| closing_ending(action, names_a_reason))
+}
+
+/// A bookend terminal's ending; `None` for a start, which ends nothing.
+fn bookend_ending(edge: &Edge, names_a_reason: bool, degraded: bool) -> Option<Ending> {
+    let (status, reason) = match edge {
+        Edge::Complete if degraded => (RunStatus::Degraded, None),
+        Edge::Complete => (RunStatus::Complete, None),
+        Edge::Error if names_a_reason => (RunStatus::Abandoned, Some(AbandonReason::Aborted)),
+        Edge::Error => (RunStatus::Error, None),
+        Edge::Start => return None,
+    };
+    Some(Ending { status, reason })
+}
+
+/// The ending a closing record that is not a bookend implies.
+fn closing_ending(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
     let ended = |status, reason| Some(Ending { status, reason });
-    match action.bookend().map(|b| b.edge) {
-        Some(Edge::Complete) if degraded => return ended(RunStatus::Degraded, None),
-        Some(Edge::Complete) => return ended(RunStatus::Complete, None),
-        Some(Edge::Error) if names_a_reason => return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted)),
-        Some(Edge::Error) => return ended(RunStatus::Error, None),
-        Some(Edge::Start) | None => {}
-    }
     if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
         return ended(RunStatus::Complete, None);
     }

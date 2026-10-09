@@ -753,6 +753,15 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
     finalize_mission_with_payload(envelope, None)
 }
 
+/// The run ends here: an ending that is not clean, while the operator has
+/// stopped this process, is that stop (the one decider, the same one the
+/// run's `run.error` and its executions' `dispatch.error` name it from).
+fn stamp_operator_stop(envelope: &mut MissionEnvelope) {
+    if envelope.stop_reason.is_none() && envelope.status != MissionOutcomeStatus::Clean {
+        envelope.stop_reason = darkmux_types::interrupt::stop_reason().map(str::to_string);
+    }
+}
+
 /// (#2301) [`finalize_mission`] with a `mission close` PAYLOAD.
 ///
 /// A generic graph's last phase can produce a run summary (the crawl's
@@ -769,12 +778,7 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
     // function only ever needed a shared borrow, so this clone changes
     // nothing about the finalize decision itself, only what gets saved.
     let mut envelope = envelope.clone();
-    // The run ends here: an ending that is not clean, while the operator has
-    // stopped this process, is that stop (the one decider, the same one the
-    // run's `run.error` and its executions' `dispatch.error` name it from).
-    if envelope.stop_reason.is_none() && envelope.status != MissionOutcomeStatus::Clean {
-        envelope.stop_reason = darkmux_types::interrupt::stop_reason().map(str::to_string);
-    }
+    stamp_operator_stop(&mut envelope);
     for phase in &envelope.phases {
         let result = match phase.outcome {
             // (#2406) `Degraded` drives the phase to the SAME lifecycle

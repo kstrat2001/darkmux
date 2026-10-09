@@ -849,6 +849,13 @@ impl Step {
     pub fn stopped_by_operator(&self) -> bool {
         self.status == NodeStatus::Abandoned && self.stop_reason.is_some()
     }
+
+    /// Whether the step ended as a failure: an error, or an operator's stop
+    /// (abandoned, naming the stop), which every caller reports the way it
+    /// reports an error.
+    pub fn ended_as_failure(&self) -> bool {
+        self.status == NodeStatus::Error || self.stopped_by_operator()
+    }
 }
 
 /// (#2310 P4) The default `Task::run_on` / `mission_config::TaskConfig::run_on`

@@ -12,9 +12,9 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
-import { NO_PRESENCE, judgementAt, lifecycleAt, ownRowOf, shownRunState, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, judgementAt, lifecycleAt, ownRowOf, shownRunState, type Lifecycle, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
-import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
+import { sessionRouteRecords, sessionRun, type Grain } from "../../lib/runRef";
 import { CATEGORY, ingest, isBookendStart, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
@@ -501,6 +501,22 @@ function useRunSilence(hasRecords: boolean, row: Run | null, endedByPresence: bo
   return { notReporting, stopped: endedByPresence || (hasRecords && notReporting) };
 }
 
+/** The grain of the page's run, `null` when there is none. */
+function grainOf(run: { group: { grain: Grain } } | null): Grain | null {
+  return run?.group.grain ?? null;
+}
+
+/** Running as the page shows it (`shownRunState`): at the live edge a row the
+ * daemon lists decides, and presence seeing the session go does not outrank
+ * it (a lab run verifies after its dispatch session ends); only a silent
+ * machine stops it. Without a row, the lifecycle's own reading, stopped by
+ * presence or a silent machine. */
+function plausiblyRunningOf(l: Lifecycle | null, row: Run | null, live: boolean, silentMachine: boolean, stopped: boolean): boolean {
+  if (l === null) return false;
+  const rowDecides = row !== null && live;
+  return shownRunState(l, row, live).status === "running" && !(rowDecides ? silentMachine : stopped);
+}
+
 /** At the live edge, a run's row (`/runs`, polled every `PRESENCE_POLL_MS`)
  *  can lag its flow terminal: the run closed, its row still reads in flight.
  *  The row decides how the run ended, so the page never shows an ending of
@@ -508,8 +524,9 @@ function useRunSilence(hasRecords: boolean, row: Run | null, endedByPresence: bo
  *  rather than reading "running" for the rest of the poll. `closed`: a
  *  closing record of this run has arrived (not a run gone quiet, which the
  *  row's own staleness rule decides), at the live edge. */
-function useRowCatchUp(closed: boolean, row: Run | null): void {
+function useRowCatchUp(live: boolean, l: Lifecycle | null, row: Run | null): void {
   const queryClient = useQueryClient();
+  const closed = live && l?.phase === "closed";
   const lagging = closed && row !== null && (row.status === "running" || row.status === "planned");
   useEffect(() => {
     if (lagging) void queryClient.invalidateQueries({ queryKey: queryKeys.runs() });
@@ -749,22 +766,15 @@ export function SessionReplay({
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
   // The row whose run IS this session: the pill and the tiles show its
   // status, decided once where the run ended, as the runs board does.
-  const ownRow = ownRowOf(runRows, sessionId, ownMissionId, pageRun?.group.grain ?? null);
+  const ownRow = ownRowOf(runRows, sessionId, ownMissionId, grainOf(pageRun));
   // (5.0 R3) A run on a machine the fleet view holds as down has no live
   // evidence and no terminal record can arrive: it is not plausibly running,
   // so nothing ticks or pulses, and the pill says unknown.
   const { notReporting, stopped } = useRunSilence(hasRecords, runRow, endedByPresence);
-  const pageLifecycle = pageRun !== null ? lifecycleAt(pageRun, clockNow, policy, presence) : null;
-  // Running as the page shows it (`shownRunState`): at the live edge a row the
-  // daemon lists decides, and presence seeing the session go does not outrank
-  // it (a lab run verifies after its dispatch session ends). Without a row,
-  // the lifecycle's own reading, stopped by presence or a silent machine.
-  const rowDecides = ownRow !== null && playhead === null;
-  const plausiblyRunning =
-    pageLifecycle !== null &&
-    shownRunState(pageLifecycle, ownRow, playhead === null).status === "running" &&
-    !(rowDecides ? hasRecords && notReporting : stopped);
-  useRowCatchUp(playhead === null && pageLifecycle?.phase === "closed", ownRow);
+  const pageLifecycle = pageRun && lifecycleAt(pageRun, clockNow, policy, presence);
+  const atLiveEdge = playhead === null;
+  const plausiblyRunning = plausiblyRunningOf(pageLifecycle, ownRow, atLiveEdge, hasRecords && notReporting, stopped);
+  useRowCatchUp(atLiveEdge, pageLifecycle, ownRow);
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;

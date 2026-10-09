@@ -4207,16 +4207,23 @@ fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::Ph
             PhaseOutcomeKind::Degraded,
             Some(format!("{completed} of {total} task(s) completed, {errored} errored, {abandoned} abandoned")),
         )
-    } else if let Some(stop) = phase_steps.iter().find(|s| s.stopped_by_operator()).and_then(|s| s.stop_reason.as_deref()) {
+    } else {
+        (PhaseOutcomeKind::Abandoned, Some(abandoned_phase_reason(phase_steps, errored, any_started)))
+    }
+}
+
+/// Why a phase that did not complete is abandoned, most specific first.
+fn abandoned_phase_reason(phase_steps: &[&crew::types::Step], errored: usize, any_started: bool) -> String {
+    if let Some(stop) = phase_steps.iter().find(|s| s.stopped_by_operator()).and_then(|s| s.stop_reason.as_deref()) {
         // An operator's stop ended this phase's work: say so, not "errored"
         // or "steps left non-terminal".
-        (PhaseOutcomeKind::Abandoned, Some(format!("stopped by the operator ({stop})")))
+        format!("stopped by the operator ({stop})")
     } else if errored > 0 {
-        (PhaseOutcomeKind::Abandoned, Some(format!("{errored} task(s) errored")))
+        format!("{errored} task(s) errored")
     } else if !any_started {
-        (PhaseOutcomeKind::Abandoned, Some("phase never started (scheduler did not reach it)".to_string()))
+        "phase never started (scheduler did not reach it)".to_string()
     } else {
-        (PhaseOutcomeKind::Abandoned, Some("phase did not complete (steps left non-terminal)".to_string()))
+        "phase did not complete (steps left non-terminal)".to_string()
     }
 }
 

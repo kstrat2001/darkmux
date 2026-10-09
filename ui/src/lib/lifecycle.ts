@@ -227,20 +227,31 @@ const namesAStop = (r: NormRecord): boolean => {
  *  (`RunPayload::DEGRADED_STATUS`). */
 const DEGRADED_STATUS = "Degraded";
 
+/** A completing record's edge: a `run.complete` whose status says degraded
+ * is degraded; every other completion is complete. */
+function completeEdge(r: NormRecord): CloseEdge {
+  return payloadOf(r, ACTION.RunComplete)?.status === DEGRADED_STATUS ? { kind: "degraded" } : { kind: "complete" };
+}
+
+/** A `dispatch.error` / `run.error` edge: the operator's stop when it names
+ * one, else an error (killed when the exit code says SIGKILL). */
+function terminalErrorEdge(r: NormRecord): CloseEdge {
+  if (namesAStop(r)) return { kind: "operator_stop" };
+  return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
+}
+
 /** The edge a closing record implies; `null` for any other record. */
 function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
     case ACTION.RunComplete:
-      return payloadOf(r, ACTION.RunComplete)?.status === DEGRADED_STATUS ? { kind: "degraded" } : { kind: "complete" };
     case ACTION.DispatchComplete:
     case ACTION.MissionClose:
-      return { kind: "complete" };
+      return completeEdge(r);
     case ACTION.StepComplete:
       return payloadOf(r, ACTION.StepComplete)?.later_step_planned === true ? null : { kind: "complete" };
     case ACTION.DispatchError:
     case ACTION.RunError:
-      if (namesAStop(r)) return { kind: "operator_stop" };
-      return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
+      return terminalErrorEdge(r);
     case ACTION.StepError:
       return { kind: "error", killed: false, exitCode: null };
     case ACTION.SessionEnd:

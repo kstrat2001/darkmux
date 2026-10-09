@@ -1563,6 +1563,23 @@ function errorOutcome(state: RunState, edge: CloseEdge | undefined): string | un
   return `errored${edge.exitCode != null ? ` (exit ${edge.exitCode})` : ""}`;
 }
 
+/** A figure for a metric tile: formatted, or a dash when there is none. */
+function dashOr(v: number | null | undefined, fmt: (n: number) => string): string {
+  return v != null ? fmt(v) : "—";
+}
+
+/** The header's `abandonReason`, present only when the pill has one. */
+function abandonReasonField(reason: AbandonReason | undefined): { abandonReason?: AbandonReason } {
+  return reason ? { abandonReason: reason } : {};
+}
+
+/** Whether the run reads as ended: its lifecycle closed AND the status shown
+ * is not running (a row can still say running after its session closed, as a
+ * lab run verifying its work does). */
+function endedAndShown(l: Lifecycle | null | undefined, done: boolean): boolean {
+  return l?.close != null && done;
+}
+
 /** `runRegions()`, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
  * session (the `/flow-dispatch/<id>` response, through `flowToRenderModel`
@@ -1755,7 +1772,7 @@ export function runRegions(
   const armed = restArmed(sp.bounds);
   // (#2890) The MODEL section's cells, in the order the operator reads them:
   // turns, tool calls, active time, tokens in, tokens out, context.
-  push(modelIdx, { value: effTurnsValue != null ? String(effTurnsValue) : "—", label: "TURNS" });
+  push(modelIdx, { value: dashOr(effTurnsValue, String), label: "TURNS" });
   if (activeInModel) {
     // The tool calls of the same executions the turn and token counts
     // describe (this run's attempt, or its mission's executions when those
@@ -1768,8 +1785,8 @@ export function runRegions(
   // board shows; the part that is darkmux's own utility calls is named in the
   // tiles' hover text (no layout of its own).
   const utilityHint = tokenHintOf({ tokIn: effTokIn, tokOut: effTokOut, tokTotal: effTokTotal, tokUtility: effTokUtility });
-  push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN", hintTitle: utilityHint });
-  push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT", hintTitle: utilityHint });
+  push(modelIdx, { value: dashOr(effTokIn, fmtC), label: "TOKENS IN", hintTitle: utilityHint });
+  push(modelIdx, { value: dashOr(effTokOut, fmtC), label: "TOKENS OUT", hintTitle: utilityHint });
   // A single-shot call records no `telemetry.context` sample and neither
   // bookend names the model's window, so its prompt has nothing to be a share
   // of: the tile reads a dash rather than a guessed window.
@@ -1862,7 +1879,7 @@ export function runRegions(
     header: {
       pillLabel: pill.label.toUpperCase(),
       status: pill.status,
-      ...(pill.abandonReason ? { abandonReason: pill.abandonReason } : {}),
+      ...abandonReasonField(pill.abandonReason),
       role,
       sid,
       machineName: on.name,
@@ -1884,7 +1901,7 @@ export function runRegions(
     // and never shown.
     hasModelWork: effHasModelWork,
     live: !done,
-    ended: l?.close != null && done,
+    ended: endedAndShown(l, done),
     lastBeatMs,
     signalsLabel,
     signalGroups,

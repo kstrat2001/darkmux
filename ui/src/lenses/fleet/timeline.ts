@@ -157,6 +157,18 @@ interface BarWindow {
   live: boolean;
 }
 
+/** Where a bar ends: a running run reaches the playhead, anything else its
+ * own end (or the playhead when it has none yet). */
+function barEnd(state: { status: string }, l: Parameters<typeof endMs>[0], playheadT: number): number {
+  if (state.status === "running") return playheadT;
+  return endMs(l, playheadT) ?? playheadT;
+}
+
+/** A bar's `abandonReason`, present only on an abandoned bar that has one. */
+function abandonReasonField(status: RunBadgeStatus, reason: AbandonReason | undefined): { abandonReason?: AbandonReason } {
+  return status === "abandoned" && reason ? { abandonReason: reason } : {};
+}
+
 /** One run's bar, or `null` when it draws none: bookkeeping-only sessions
  *  (a mission's lifecycle, a scheduler task), a run not started as of the
  *  playhead, and one that ended before the window. The bar spans the run's
@@ -170,7 +182,7 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const state = shownRunState(l, ownRowOf(w.rows, g.sessionId, g.missionId, g.grain), w.live);
   // A run its row says is still running (a lab run verifying after its
   // dispatch ended) reaches the playhead, as any running bar does.
-  const end = state.status === "running" ? w.playheadT : (endMs(l, w.playheadT) ?? w.playheadT);
+  const end = barEnd(state, l, w.playheadT);
   if (end < w.tlMin) return null;
   // Clip a straddling start to the window edge; an untimed start draws from
   // the edge, visible rather than dropped.
@@ -189,9 +201,15 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
     leftPct,
     widthPct,
     status,
-    ...(status === "abandoned" && state.abandonReason ? { abandonReason: state.abandonReason } : {}),
+    ...abandonReasonField(status, state.abandonReason),
     title: `${role} · ${g.sessionId} · ${word}`,
   };
+}
+
+/** The timeline's window: the fixed range when one is given, else the
+ * `windowMinutes` ending at the playhead. */
+function windowBounds(fixedRange: [number, number] | undefined, playheadT: number, windowMinutes: number): [number, number] {
+  return fixedRange ?? [playheadT - windowMinutes * 60000, playheadT];
 }
 
 export function buildActivityTimeline(
@@ -258,9 +276,7 @@ export function buildActivityTimeline(
   /** Whether `playheadT` is the live edge (no parked playhead). */
   live = false,
 ): ActivityTimeline {
-  const winMs = windowMinutes * 60000;
-  const tlMax = fixedRange ? fixedRange[1] : playheadT;
-  const tlMin = fixedRange ? fixedRange[0] : tlMax - winMs;
+  const [tlMin, tlMax] = windowBounds(fixedRange, playheadT, windowMinutes);
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
