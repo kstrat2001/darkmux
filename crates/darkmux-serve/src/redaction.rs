@@ -163,7 +163,7 @@ impl Redaction {
             if !is_public(addr) {
                 all.push(addr.to_string());
             }
-            if let Some(host) = address_host(addr).filter(|h| !is_public(h)) {
+            if let Some(host) = darkmux_types::panel_audience::address_host(addr).filter(|h| !is_public(h)) {
                 all.push(host.to_string());
             }
         }
@@ -205,17 +205,6 @@ impl Redaction {
     }
 }
 
-/// The host of a roster address (`name:8765`, `[::1]:8765`, a bare IP or name).
-fn address_host(addr: &str) -> Option<&str> {
-    if let Some(rest) = addr.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-    match addr.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => Some(host),
-        _ => None,
-    }
-}
-
 /// A character that continues a host name or a path component: a match
 /// touching one is part of a longer word (`mac` in `macos`, `studio` in
 /// `lmstudio-community`, `/Users/kain` in `/Users/kainx`), never the needle.
@@ -250,7 +239,7 @@ fn continues_backward(before: &str) -> bool {
 /// redactor uses (#3074).
 fn url_host(url: &str) -> Option<String> {
     let hostport = UrlAuthority::parse(url)?.hostport();
-    let host = address_host(hostport).unwrap_or(hostport);
+    let host = darkmux_types::panel_audience::address_host(hostport).unwrap_or(hostport);
     (!host.is_empty()).then(|| host.to_string())
 }
 

@@ -657,16 +657,23 @@ fn replace_cut(text: &str, needle: &str) -> String {
     out
 }
 
-/// The host of `host:port`, `[v6]:port` or a bare host.
-fn host_of(hostport: &str) -> &str {
-    if let Some(rest) = hostport.strip_prefix('[') {
-        return rest.split_once(']').map(|(h, _)| h).unwrap_or(rest);
+/// The host of `host:port` or `[v6]:port`; `None` for anything else (a bare
+/// host, a bare IPv6 address, an unclosed bracket). The one parser for both
+/// this module and the daemon's address redaction.
+pub fn address_host(addr: &str) -> Option<&str> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
     }
-    hostport
-        .rsplit_once(':')
-        .filter(|(h, p)| !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()))
-        .map(|(h, _)| h)
-        .unwrap_or(hostport)
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => Some(host),
+        _ => None,
+    }
+}
+
+/// The host of `host:port`, `[v6]:port` or a bare host. Malformed input
+/// (an unclosed `[`) is returned whole, so it never reads as loopback.
+fn host_of(hostport: &str) -> &str {
+    address_host(hostport).unwrap_or(hostport)
 }
 
 /// A loopback address, `localhost`, or a URL whose host is one of them.
@@ -680,6 +687,21 @@ fn is_loopback(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one host parser: a port is split off a name or a bracketed IPv6;
+    /// anything else has no host:port shape. A malformed address (an
+    /// unclosed `[`) is never read as loopback, so it is withheld like any
+    /// other value.
+    #[test]
+    fn address_host_splits_host_port_and_a_malformed_address_is_not_loopback() {
+        assert_eq!(address_host("studio:8765"), Some("studio"));
+        assert_eq!(address_host("[::1]:8765"), Some("::1"));
+        assert_eq!(address_host("studio"), None);
+        assert_eq!(address_host("::1"), None);
+        assert_eq!(address_host("[::1"), None);
+        assert!(is_loopback("[::1]:8765") && is_loopback("localhost:1234") && is_loopback("http://127.0.0.1:1234/v1"));
+        assert!(!is_loopback("[::1"), "an unclosed bracket is not loopback");
+    }
 
     fn path(p: &str) -> Vec<String> {
         p.split('.').map(str::to_string).collect()
