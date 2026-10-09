@@ -2751,8 +2751,8 @@ impl<'a> AgentLoop<'a> {
         let (turns, stall_recoveries_used, stall_recovery_budget) =
             (self.state.turns, self.state.stall_recoveries_used, self.limits.stall_recovery_budget);
         eprintln!(
-            "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{stall_recovery_budget} used, hit {}. (#1123/#1221)",
-            bound.describe()
+            "{}",
+            empty_stall_recovered_line(turns, stall_recoveries_used, stall_recovery_budget, &bound.describe())
         );
     }
 
@@ -3217,4 +3217,29 @@ fn context_overflow(call: &Call) -> anyhow::Error {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "<unknown>".to_string())
     )
+}
+
+/// The stderr line for an intra-turn stall whose completion was empty.
+fn empty_stall_recovered_line(turns: u32, stall_recoveries_used: u32, stall_recovery_budget: u32, hit: &str) -> String {
+    format!(
+        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit \
+         the boundary with an EMPTY completion, so there is nothing to \
+         resume. Dropped the useless turn, injected a nudge; budget \
+         {stall_recoveries_used}/{stall_recovery_budget} used, hit {hit}. (#1123/#1221)"
+    )
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    /// (#3142 item 3) The line reads as one sentence: no run of spaces where
+    /// a source line break used to be.
+    #[test]
+    fn the_empty_stall_line_has_no_broken_join() {
+        let line = empty_stall_recovered_line(7, 1, 3, "the generation check-in");
+        assert!(!line.contains("  "), "{line}");
+        assert!(line.contains("turn 7 hit the boundary with an EMPTY completion, so there is nothing to resume."), "{line}");
+        assert!(line.contains("budget 1/3 used, hit the generation check-in."), "{line}");
+    }
 }

@@ -418,9 +418,20 @@ jobs:
       # parent-workspace job above). Image build itself needs a Docker
       # daemon — deferred to a follow-up Linux job; macOS runners don't ship
       # a working Docker.
+      # (#3142) nextest under the root `.config/nextest.toml`'s `ci` profile,
+      # named with `--config-file` because that file is scoped to the root
+      # workspace and `runtime/` is not a member. A hung test is killed at
+      # terminate-after instead of running the job into its timeout (two
+      # runtime tests spun for 9+ minutes when a remedy was ignored).
+      - name: Install cargo-nextest
+        if: steps.filter.outputs.runtime == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Test (runtime crate)
         if: steps.filter.outputs.runtime == 'true'
-        run: cargo test --manifest-path runtime/Cargo.toml
+        run: cargo nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml --profile ci
 
       - name: Clippy (runtime crate, all targets, no warnings allowed)
         if: steps.filter.outputs.runtime == 'true'
