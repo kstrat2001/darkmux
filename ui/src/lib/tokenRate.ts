@@ -451,6 +451,53 @@ export function isStalled(records: NormRecord[], nowMs: number): boolean {
   return nowMs - freshOf(samples[samples.length - 1]) > STALL_AFTER_MS;
 }
 
+/** (#3145) A prefill's allowance that does not grow with the prompt: the
+ *  slowest first output recorded on a small prompt was 78.6 s (a 13,474-char
+ *  first turn, cold, on a 27B dense endpoint model), which a size-scaled
+ *  bound alone would call a hang. */
+export const PREFILL_FLOOR_MS = 90_000;
+
+/** (#3145) The prefill speed the bound assumes, in prompt chars per second:
+ *  about half the slowest recorded on a large prompt (903 ch/s, a
+ *  300,078-char turn that took 332 s; the issue's 244,552-char turn took
+ *  195 s, 1,254 ch/s). Prefill slows as the context grows, so the margin is
+ *  for prompts larger than any yet recorded. Over every recorded turn with
+ *  an opener and a first output (759), the slowest came to 0.67 of this
+ *  bound. */
+export const PREFILL_CHARS_PER_SEC = 500;
+
+/** (#3145) How long after a turn's opener the model may stay silent, still
+ *  reading the prompt, before the silence reads STALL: the floor plus the
+ *  prompt at `PREFILL_CHARS_PER_SEC`, and never less than `STALL_AFTER_MS`.
+ *  244,552 chars: 90 s + 489 s = 579 s. */
+export function prefillStallAfterMs(promptChars: number): number {
+  return Math.max(STALL_AFTER_MS, PREFILL_FLOOR_MS + (Math.max(0, promptChars) / PREFILL_CHARS_PER_SEC) * 1000);
+}
+
+/** (#3145) The current turn's opener, when the model has produced nothing
+ *  since it: every sample after it in the same turn is a 0-char chunk (an
+ *  engine may send an empty first chunk the moment the request lands) and
+ *  none is writing a tool call. The silence after it is the prompt being
+ *  read. `null` with no opener carrying `prompt_chars` (an older host), or
+ *  once anything was generated. */
+function prefillOpener(beats: HeartbeatSample[]): { atMs: number; promptChars: number } | null {
+  const last = beats[beats.length - 1];
+  if (last === undefined) return null;
+  for (let i = beats.length - 1; i >= 0; i--) {
+    const b = beats[i];
+    if (b.turn !== last.turn || b.chars !== 0 || b.writingTool !== undefined) return null;
+    if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars };
+  }
+  return null;
+}
+
+/** (#3145) Whether a prefill has outlasted its bound: silent past
+ *  `STALL_AFTER_MS` (the ordinary rule, so a live refresh still counts)
+ *  AND past `prefillStallAfterMs` of its opener. */
+function prefillOverdue(opener: { atMs: number; promptChars: number }, records: NormRecord[], nowMs: number): boolean {
+  return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+}
+
 /** (#2877 pass 2, "is this resting? can't tell") The legible word a stopped
  * tube reads between heartbeats — the operator's phone note: a flat ring and
  * "—" is indistinguishable between a thermal rest, a model still doing
@@ -604,7 +651,14 @@ function compactionEndMarker(r: NormRecord, atMs: number, startedAtMs: number): 
  * reads `"tools"` with `writing`, never `"stalled"`: the runtime ticks for as
  * long as it waits on that call. So an endpoint that hangs after naming a
  * tool reads "tool gen · <tool> · Ns" until the host's inactivity watchdog ends the
- * dispatch (600 s by default), never STALL. */
+ * dispatch (600 s by default), never STALL.
+ *
+ * (#3145) Silence after a turn's opener (`prompt_chars`), before anything is
+ * generated, is the model reading the prompt, which an engine does without
+ * sending anything: it reads `"prompt"` with the opener's size until
+ * `prefillStallAfterMs` of that size has passed, and only then `"stalled"`.
+ * Rule 3's `STALL_AFTER_MS` still governs silence once the turn has
+ * produced output, and a turn whose opener carries no size. */
 export function deriveLiveState(records: NormRecord[], nowMs: number): LiveStateReading {
   // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
   // `isStalled`, the marker scan) then agrees on "as of `nowMs`" instead of
@@ -615,6 +669,10 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
   const cut = recordsAsOf(records, nowMs);
   const beats = heartbeatSamples(cut);
   const lastBeatAt = beats.length ? beats[beats.length - 1].atMs : null;
+  // (#3145) The current turn's opener while nothing has been generated
+  // since it: the prompt's size, and the start its prefill bound counts
+  // from, for every PROMPT reading below.
+  const opener = prefillOpener(beats);
 
   let marker: StateMarker | null = null;
   // `dispatch.tool` is emitted when a tool COMPLETES. A turn that ends with
@@ -757,11 +815,19 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     // opener then still describes the request the model is reading, so a
     // PROMPT reading carries its size (only an opener carries `prompt_chars`). An opener from before the marker's
     // second belongs to a request the marker already closed, and never does.
+    //
+    // (#3145) The same opener bounds the silence after it: a prefill that
+    // outlasts `prefillStallAfterMs` reads STALL here too, rather than
+    // PROMPT for as long as the marker stays the latest evidence.
     const lastBeat = beats.length ? beats[beats.length - 1] : null;
-    const prompt = (): LiveStateReading =>
-      lastBeat !== null && lastBeat.promptChars !== undefined && lastBeat.atMs >= found.atMs
+    const prompt = (): LiveStateReading => {
+      if (opener !== null && opener.atMs >= found.atMs) {
+        return prefillOverdue(opener, cut, nowMs) ? { state: "stalled" } : { state: "prompt", promptChars: opener.promptChars };
+      }
+      return lastBeat !== null && lastBeat.promptChars !== undefined && lastBeat.atMs >= found.atMs
         ? { state: "prompt", promptChars: lastBeat.promptChars }
         : { state: "prompt" };
+    };
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) {
@@ -823,9 +889,14 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       if (last.writingTool) reading.toolName = last.writingTool;
       return reading;
     }
-    if (last.chars === 0) return last.promptChars !== undefined ? { state: "prompt", promptChars: last.promptChars } : { state: "prompt" };
+    // (#3145) The size is the turn's opener's, so an empty first chunk
+    // after it (which carries none) does not drop it.
+    if (last.chars === 0) return opener !== null ? { state: "prompt", promptChars: opener.promptChars } : { state: "prompt" };
     return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
+  // (#3145) Stale, but the turn has produced nothing since its opener: the
+  // model is still reading the prompt until the opener's bound runs out.
+  if (opener !== null && !prefillOverdue(opener, cut, nowMs)) return { state: "prompt", promptChars: opener.promptChars };
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
 }
 
