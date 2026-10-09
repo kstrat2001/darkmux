@@ -13981,8 +13981,16 @@ fn init_without_a_usable_model_says_why_and_tells_the_operator_to_edit_the_regis
     let out = stdout_of(&init_in(&home, &dm, &home.join("no-such-lms"), &[]));
     assert!(out.contains("worker model: not set. could not ask LM Studio what is downloaded"), "{out}");
     assert!(!out.contains("utility model:"), "the worker line already reported lms: {out}");
-    assert!(out.contains("Next steps:\n  1. Edit ~/.darkmux/profiles.json to point at a downloaded model"), "{out}");
+    // (#3143 item 1) The step names the registry this run wrote, which
+    // DARKMUX_HOME moved, not a fixed `~/.darkmux`.
+    let edit_step = format!("Next steps:\n  1. Edit {} to point at a downloaded model", dm.join("profiles.json").display());
+    assert!(out.contains(&edit_step), "{out}");
     assert!(out.contains("  2. First answer, no Docker needed"), "{out}");
+    // (#3143 item 3) A re-run over the registry still holding the
+    // placeholder gives the same step, not just the reason.
+    let out = stdout_of(&init_in(&home, &dm, &home.join("no-such-lms"), &[]));
+    assert!(out.contains("worker model: not set."), "{out}");
+    assert!(out.contains(&edit_step), "{out}");
 
     // The worker is set, but only a toy is downloaded for the utility seat.
     let (home, dm) = isolated_roots();
@@ -13993,7 +14001,7 @@ fn init_without_a_usable_model_says_why_and_tells_the_operator_to_edit_the_regis
     assert!(out.contains("utility model: not verified. the registry's utility model `"), "{out}");
     assert!(out.contains("is not downloaded and no LLM of at least 1 GB is"), "{out}");
     assert!(!out.contains("worker model:"), "{out}");
-    assert!(!out.contains("Edit ~/.darkmux/profiles.json"), "the registry was not created by this run: {out}");
+    assert!(!out.contains("Next steps:\n  1. Edit "), "the worker is set, so there is nothing to edit: {out}");
 }
 
 #[cfg(unix)]

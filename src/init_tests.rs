@@ -791,3 +791,50 @@ fn cmd_init_exits_zero_for_every_successful_outcome() {
     env.lms(&[model("toy", GB / 2, "llm")], &[]);
     assert_eq!(crate::cmd_init(false, None, None, false, false).unwrap(), 0);
 }
+
+// ── #3143: a failing `lms`, and an undetected RAM size ───────────────────
+
+/// (#3143 item 2) An `lms` that runs but fails (`ls` exits non-zero) or
+/// answers with something that is not a JSON list is a failure to ask, not
+/// an empty catalog: the reason must say LM Studio could not be asked, never
+/// that nothing fits.
+#[test]
+#[serial_test::serial]
+fn a_failing_lms_ls_reads_as_could_not_ask_not_as_nothing_fits() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    // No `ls.json`: the stub's `ls` exits 1.
+    let r = init(&opts()).unwrap();
+    let reason = r.worker_model_unfilled_reason.expect("a reason");
+    assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
+    assert!(!reason.contains("fits in"), "{reason}");
+    // The utility half stays quiet: the worker line already reported lms.
+    assert_eq!(r.utility_model_unfilled_reason, None);
+    assert_eq!(r.utility_model_filled, None);
+    assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON);
+
+    // `ls` succeeds but prints something that is not JSON.
+    fs::write(env.stub.path().join("ls.json"), "LM Studio is updating, try again\n").unwrap();
+    let r = init(&opts()).unwrap();
+    let reason = r.worker_model_unfilled_reason.expect("a reason");
+    assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
+    assert!(reason.contains("not a JSON list"), "{reason}");
+    assert_eq!(r.utility_model_unfilled_reason, None);
+
+    // An empty catalog is still an answer: "nothing fits", not "could not ask".
+    env.lms(&[], &[]);
+    let r = init(&opts()).unwrap();
+    let reason = r.worker_model_unfilled_reason.expect("a reason");
+    assert!(reason.starts_with("LM Studio has no downloaded LLM that fits in"), "{reason}");
+}
+
+/// (#3143 item 4) When the RAM size could not be detected (0), the reason
+/// says so instead of claiming nothing fits in 0 GB.
+#[test]
+fn the_no_worker_reason_names_an_undetected_ram_size() {
+    let known = no_worker_model_reason(64);
+    assert!(known.contains("fits in 64 GB"), "{known}");
+    let unknown = no_worker_model_reason(0);
+    assert!(!unknown.contains("0 GB"), "{unknown}");
+    assert!(unknown.contains("could not detect this machine's RAM"), "{unknown}");
+}

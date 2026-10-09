@@ -305,22 +305,31 @@ pub struct ModelMeta {
 }
 
 /// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
-/// Returns an empty vec on failure rather than erroring — the caller likely
-/// wants to render "(no models found)" rather than crash.
+/// Errors when `lms` cannot be run, exits non-zero, or prints something that
+/// is not a JSON list: a failed listing is not an empty catalog (#3143).
+/// A caller that wants "nothing listed" on failure says so with
+/// `unwrap_or_default()`.
 pub fn list_available() -> Result<Vec<ModelMeta>> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["ls", "--json"]);
     let out = run_bounded(cmd, "ls", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
         .map_err(|e| anyhow::anyhow!("running `lms ls --json`: {e}"))?;
+    // (#3143) A failed listing is an error, never an empty catalog: an empty
+    // list reads downstream as "nothing is downloaded", which a broken or old
+    // `lms` cannot back. Same distinction `list_loaded` draws.
     if !out.status.success() {
-        return Ok(Vec::new());
+        let how = match out.status.code() {
+            Some(code) => format!("exited with status {code}"),
+            None => "was killed by a signal".to_string(),
+        };
+        let stderr = out.stderr.trim();
+        let detail = if stderr.is_empty() { String::new() } else { format!(" ({stderr})") };
+        bail!("`lms ls --json` {how}{detail}");
     }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out.stdout) else {
-        return Ok(Vec::new());
-    };
-    let Some(arr) = parsed.as_array() else {
-        return Ok(Vec::new());
-    };
+    let arr = serde_json::from_str::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .ok_or_else(|| anyhow::anyhow!("`lms ls --json` printed something that is not a JSON list"))?;
     Ok(arr.iter().filter_map(meta_from_json).collect())
 }
 
