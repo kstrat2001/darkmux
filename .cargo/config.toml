@@ -84,7 +84,8 @@ t-all = "nextest run --workspace"
 # paths-filtered), but locally it needs naming or "run the area you touched"
 # has no area for the most behavior-dense code in the repo.
 #
-# Caveat: `.config/nextest.toml` is scoped to the root workspace, so this run
-# gets NO terminate-after — the hang protection that justifies nextest
-# elsewhere does not extend here.
-t-runtime = "nextest run --manifest-path runtime/Cargo.toml"
+# `.config/nextest.toml` is scoped to the root workspace, so it is named
+# explicitly: without `--config-file` this run got no terminate-after, the
+# hang protection that justifies nextest elsewhere (#3142). Run from the
+# repo root, as every alias here is.
+t-runtime = "nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml"
