@@ -437,7 +437,7 @@
   "ui/src/lib/scopeMorph.ts::advanceMorph": 12,
   "ui/src/lib/scopeMorph.ts::scopeTargets": 16,
   "ui/src/lib/tokenRate.ts::averageGenerationRate": 16,
-  "ui/src/lib/tokenRate.ts::deriveLiveState": 97,
+  "ui/src/lib/tokenRate.ts::deriveLiveState": 96,
   "ui/src/lib/tokenRate.ts::executionRole": 11,
   "ui/src/lib/tokenRate.ts::executionTokenReading": 34,
   "ui/src/lib/tokenRate.ts::heartbeatSamples": 21,

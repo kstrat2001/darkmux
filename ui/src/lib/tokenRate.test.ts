@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
   DEFAULT_CHARS_PER_TOKEN,
+  PREFILL_CHARS_PER_SEC,
+  PREFILL_FLOOR_MS,
+  prefillStallAfterMs,
   STALL_AFTER_MS,
   aggregateLiveState,
   aggregateTokenRate,
@@ -1471,6 +1474,89 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 60_000 });
   });
 
+});
+
+// (#3145) A long prefill: the engine streams nothing between the turn's
+// opener and its first generated character. The sequence is the real one
+// from the issue's run (turn 54, a 27B dense model on an endpoint): the
+// previous turn's tool and a 15 s rest at 02:24:45, the opener (244,552
+// chars) at 02:25:00.375, a 0-char first chunk 94 ms later, then nothing
+// until generation began 195 s on. Every reading passes `nowMs`
+// explicitly: the clock is a parameter of each assertion, never the
+// suite's wall clock.
+describe("(#3145) a long prefill reads PROMPT, not STALL", () => {
+  const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+  const opener = Date.parse("2026-10-09T02:25:00Z") + 375;
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: wholeSec(atMs), action, session_id: SID, payload });
+  const PROMPT_CHARS = 244_552;
+  const issueRun = (promptChars: number | null = PROMPT_CHARS): NormRecord[] => [
+    wire(opener - 30_000, "dispatch.start"),
+    wire(opener - 15_375, "dispatch.turn", { turn_seq: 53, tool_calls_count: 1 }),
+    wire(opener - 15_375, "dispatch.tool", { tool_name: "bash" }),
+    wire(opener - 15_375, "dispatch.rest", { ms: 15_000 }),
+    wire(opener, "dispatch.turn.heartbeat", {
+      turn_seq: 54,
+      cumulative_chars: 0,
+      sampled_at_ms: opener,
+      generated_chars: 0,
+      ...(promptChars !== null ? { prompt_chars: promptChars } : {}),
+    }),
+    wire(opener + 94, "dispatch.turn.heartbeat", { turn_seq: 54, partial_index: 1, cumulative_chars: 0, sampled_at_ms: opener + 94, generated_chars: 0 }),
+  ];
+
+  it("197 s of silence after a 244,552-char opener reads PROMPT with the opener's size", () => {
+    expect(deriveLiveState(issueRun(), opener + 197_000)).toEqual({ state: "prompt", promptChars: PROMPT_CHARS });
+  });
+
+  it("the size rides through the empty first chunk from the start, not only once the silence is long", () => {
+    expect(deriveLiveState(issueRun(), opener + 5_000)).toEqual({ state: "prompt", promptChars: PROMPT_CHARS });
+  });
+
+  it("the bound is the floor plus the prompt at the assumed prefill speed: 579 s for the issue's prompt", () => {
+    expect(PREFILL_FLOOR_MS).toBe(90_000);
+    expect(PREFILL_CHARS_PER_SEC).toBe(500);
+    expect(prefillStallAfterMs(PROMPT_CHARS)).toBeCloseTo(579_104, 0);
+    // Never shorter than the ordinary stall threshold, whatever the size.
+    expect(prefillStallAfterMs(0)).toBeGreaterThanOrEqual(STALL_AFTER_MS);
+  });
+
+  it("a genuine hang past the bound still reads STALL", () => {
+    const bound = prefillStallAfterMs(PROMPT_CHARS);
+    expect(deriveLiveState(issueRun(), opener + bound)).toEqual({ state: "prompt", promptChars: PROMPT_CHARS });
+    expect(deriveLiveState(issueRun(), opener + bound + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("an opener with no prompt_chars keeps the ordinary 30 s stall", () => {
+    const run = issueRun(null);
+    expect(deriveLiveState(run, opener + 94 + STALL_AFTER_MS)).toEqual({ state: "prompt" });
+    expect(deriveLiveState(run, opener + 94 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+    expect(deriveLiveState(run, opener + 197_000)).toEqual({ state: "stalled" });
+  });
+
+  it("once the turn has generated anything, silence is a stall at 30 s again", () => {
+    const run = [
+      ...issueRun(),
+      wire(opener + 195_000, "dispatch.turn.heartbeat", { turn_seq: 54, partial_index: 2, cumulative_chars: 40, sampled_at_ms: opener + 195_000, generated_chars: 40 }),
+    ];
+    expect(deriveLiveState(run, opener + 195_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("an opener in the same second as the turn's marker is bounded too (it read PROMPT forever)", () => {
+    const tied = [
+      wire(opener - 30_000, "dispatch.start"),
+      wire(opener - 5_000, "dispatch.turn", { turn_seq: 53, tool_calls_count: 1 }),
+      wire(opener - 200, "dispatch.tool", { tool_name: "bash" }),
+      wire(opener, "dispatch.turn.heartbeat", { turn_seq: 54, cumulative_chars: 0, sampled_at_ms: opener, generated_chars: 0, prompt_chars: PROMPT_CHARS }),
+    ];
+    const bound = prefillStallAfterMs(PROMPT_CHARS);
+    expect(deriveLiveState(tied, opener + 197_000)).toEqual({ state: "prompt", promptChars: PROMPT_CHARS });
+    expect(deriveLiveState(tied, opener + bound + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("the run page and fleet card read it through the one aggregate", () => {
+    expect(aggregateLiveState([issueRun()], opener + 197_000, DEFAULT_POLICY)).toMatchObject({ state: "prompt", promptChars: PROMPT_CHARS });
+  });
 });
 
 describe("(#2890) thinking vs visible text while generating", () => {
