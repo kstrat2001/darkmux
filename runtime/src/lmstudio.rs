@@ -445,9 +445,7 @@ impl LmStudioClient {
         let mut body = serde_json::to_value(req)?;
         if self.renames_cap() {
             if let Some(obj) = body.as_object_mut() {
-                if let Some(mt) = obj.remove("max_tokens") {
-                    obj.insert("max_completion_tokens".to_string(), mt);
-                }
+                chat_completions_shape(obj);
             }
         }
         Ok(body)
@@ -578,11 +576,21 @@ pub(crate) fn build_streaming_request_body(req: &ChatRequest, remote: bool) -> R
         serde_json::json!({"include_usage": true}),
     );
     if remote {
-        if let Some(mt) = body_obj.remove("max_tokens") {
-            body_obj.insert("max_completion_tokens".to_string(), mt);
-        }
+        chat_completions_shape(body_obj);
     }
     Ok(body)
+}
+
+/// The `chat-completions` dialect's request shape (`Dialect::ChatCompletions`):
+/// `max_completion_tokens` instead of `max_tokens`, and no `temperature`.
+/// Hosted reasoning models refuse a sampling value (Claude 5.x answers 400
+/// "`temperature` is deprecated for this model"), so this dialect leaves the
+/// provider's default in place; the managed LM Studio dialect keeps both.
+fn chat_completions_shape(body: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(mt) = body.remove("max_tokens") {
+        body.insert("max_completion_tokens".to_string(), mt);
+    }
+    body.remove("temperature");
 }
 
 // ─── Streaming chat-completions (#205) ──────────────────────────────
@@ -1415,6 +1423,16 @@ mod tests {
         let body = renames.request_body(&sample_request()).expect("body builds");
         assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(10_000)));
         assert!(body.get("max_tokens").is_none());
+        // `chat-completions` sends no `temperature` (the dialect's documented
+        // shape): hosted reasoning models refuse it, and Claude 5.x answers
+        // 400 "`temperature` is deprecated for this model". The managed
+        // dialect keeps it, for LM Studio.
+        assert!(body.get("temperature").is_none(), "{body}");
+        let streamed = build_streaming_request_body(&sample_request(), renames.renames_cap()).expect("body builds");
+        assert!(streamed.get("temperature").is_none(), "{streamed}");
+        assert!(keeps.request_body(&sample_request()).expect("body builds").get("temperature").is_some());
+        let kept = build_streaming_request_body(&sample_request(), keeps.renames_cap()).expect("body builds");
+        assert!(kept.get("temperature").is_some(), "{kept}");
 
         assert_eq!(Dialect::parse("chat-completions"), Some(Dialect::ChatCompletions));
         assert_eq!(Dialect::parse("chat-completions-max-tokens"), Some(Dialect::ChatCompletionsMaxTokens));
