@@ -76,6 +76,66 @@ darkmux release.
   machine and token holders see the output unchanged. Fleet work submission
   is untouched: it still needs the token and a network-verified sender.
 
+### Fixed
+
+- **A run's status is decided once and reads the same on every view** (operator,
+  2026-10-07). A lab run stopped with SIGTERM read "aborted" on the runs board and "error"
+  on its run page and its fleet timeline bar: the board reads the lab run's own record, and
+  the other two re-derived the status from the execution's flow terminal, which said only
+  `result_class: error`. A `darkmux dispatch` or a `mission launch` stopped the same way read
+  "error" everywhere. Now an operator's stop is decided once, where the run ends
+  (`interrupt::stop_reason`), and named on every record of that ending: the execution's
+  `dispatch.error` and the run's `run.error` carry `stop_reason` (flow schema 2.2.0,
+  additive), the mission envelope carries it (envelope schema 1.6, additive), and the lab
+  run's record reads the same decider. The runs board, `darkmux run list`, the run page and
+  the timeline bar all read such a run as aborted, for every run kind, with the row and from
+  the flow alone (a peer's run). A run's own wall-clock bound is never named as a stop: it
+  reads degraded, and the execution it cut reads as the error it was. A `run.complete` whose
+  status is `Degraded` reads degraded in the daemon and the viewer, as the run's row does.
+  A run page and a timeline bar show the status of the board's row for that run (a lab run,
+  a dispatch, and a mission's own run session), at the live edge and once the run has ended
+  in playback; the page's tiles state that shown ending (an ABORTED run no longer says
+  "errored" under its time), and a page whose run has just closed asks the daemon for its row
+  at once rather than reading "running" until the next poll. A terminal written before this
+  names no stop and, without a row, still reads as an error. The status colors are one
+  table: a running bar is now the running chip's teal rather than amber, and degraded and
+  escalated bars take the warn color their chips already had.
+  A `darkmux dispatch` whose execution exits non-zero with no signal now finalizes its run
+  `error`, the outcome its `dispatch.error` already records (`ResultClass::of_exit`, the one
+  rule both read); it finalized `degraded`, so its row said degraded while a view with only
+  the flow said error. An envelope written before this keeps the `degraded` it says.
+  A lab run is running until its own record ends: between its dispatch's terminal and its
+  verify result its row read abandoned ("no ending"), on the board since #2812 and, through
+  the row, on its run page and timeline bar on this branch. Its row now reads running, the
+  quiet clock runs from the dispatch's end, and the run page keeps its clock and pulse while
+  the bar reaches the playhead.
+  A `mission launch` ended by its own wall-clock bound
+  (`runtime.mission_wall_clock_timeout_seconds`) exits 0, as the `degraded` it finalizes
+  says for any generic run; it exited 130, a SIGINT's code, because the reap at the end of
+  the launch read the raised interrupt flag as a signal. Only an operator's stop
+  (`interrupt::stop_reason`) exits `128 + signo` now.
+  A step an operator's signal ends now ends `abandoned` naming the stop (`Step.stop_reason`,
+  additive; `Step::end_unfinished` is the one decider the scheduler's terminal and the
+  launcher's reconcile share), and the steps the stopped run never reached name it too. It
+  read "error" in `mission show`, its `--json`, the mission graph and the debrief under a run
+  whose row read aborted. Its task and phase roll up from it by the existing rules. The words
+  stay the existing ones: `mission show --json` and `/mission/:id/graph.json` nodes and step
+  rows gain an additive `abandonedReason: "aborted"` beside `status: "abandoned"`, `mission
+  debrief --json` phases gain `abandoned_reason`, and `step.error` gains `stop_reason` (flow
+  schema 2.2.0, additive); text reads "aborted" (`tests/cli-json.golden` regenerated). The
+  envelope's phase reason says "stopped by the operator (SIGTERM)" and its warning counts the
+  stopped steps rather than calling them "never ran". A step the run's own wall-clock bound
+  cuts off stays an error.
+  "Aborted" (a person stopped it) has its own color, a muted gray-violet (`--status-aborted`,
+  #a594d6: 6.8:1 on the panel, 7.2:1 on the page background), distinct from degraded's amber,
+  from idle's gray and from running's teal. The kind is decided once (`workStatusKind`, which
+  now reads an `abandoned` status's reason) and the board's chip, the timeline bar, the run
+  page's pill and the mission lens's nodes, step rows, timeline cards and legend all render it.
+  The mission lens's own status colors are folded into the one table: a running node is the
+  running teal rather than its own amber (`--ml-run` and `--run` retired), an abandoned node
+  takes the table's color rather than a faded gray, and the timeline's phase chip no longer
+  overrides its text with the dim gray.
+
 ## [5.0.0] - 2026-10-08
 
 The version jumps from 3.13.0 because the work that began as 4.0 was never tagged on
@@ -223,63 +283,6 @@ its own: every entry below labeled 5.0 ships together.
   no userinfo, has its `password`, `pass`, or `requirepass` query value masked, even when
   the value holds an `@`. The flow redactor, the serve redactor, a `step.error` cause and
   an endpoint's host split the URL with one parser.
-- **A run's status is decided once and reads the same on every view** (operator,
-  2026-10-07). A lab run stopped with SIGTERM read "aborted" on the runs board and "error"
-  on its run page and its fleet timeline bar: the board reads the lab run's own record, and
-  the other two re-derived the status from the execution's flow terminal, which said only
-  `result_class: error`. A `darkmux dispatch` or a `mission launch` stopped the same way read
-  "error" everywhere. Now an operator's stop is decided once, where the run ends
-  (`interrupt::stop_reason`), and named on every record of that ending: the execution's
-  `dispatch.error` and the run's `run.error` carry `stop_reason` (flow schema 2.1.0,
-  additive), the mission envelope carries it (envelope schema 1.6, additive), and the lab
-  run's record reads the same decider. The runs board, `darkmux run list`, the run page and
-  the timeline bar all read such a run as aborted, for every run kind, with the row and from
-  the flow alone (a peer's run). A run's own wall-clock bound is never named as a stop: it
-  reads degraded, and the execution it cut reads as the error it was. A `run.complete` whose
-  status is `Degraded` reads degraded in the daemon and the viewer, as the run's row does.
-  A run page and a timeline bar show the status of the board's row for that run (a lab run,
-  a dispatch, and a mission's own run session), at the live edge and once the run has ended
-  in playback; the page's tiles state that shown ending (an ABORTED run no longer says
-  "errored" under its time), and a page whose run has just closed asks the daemon for its row
-  at once rather than reading "running" until the next poll. A terminal written before this
-  names no stop and, without a row, still reads as an error. The status colors are one
-  table: a running bar is now the running chip's teal rather than amber, and degraded and
-  escalated bars take the warn color their chips already had.
-  A `darkmux dispatch` whose execution exits non-zero with no signal now finalizes its run
-  `error`, the outcome its `dispatch.error` already records (`ResultClass::of_exit`, the one
-  rule both read); it finalized `degraded`, so its row said degraded while a view with only
-  the flow said error. An envelope written before this keeps the `degraded` it says.
-  A lab run is running until its own record ends: between its dispatch's terminal and its
-  verify result its row read abandoned ("no ending"), on the board since #2812 and, through
-  the row, on its run page and timeline bar on this branch. Its row now reads running, the
-  quiet clock runs from the dispatch's end, and the run page keeps its clock and pulse while
-  the bar reaches the playhead.
-  A `mission launch` ended by its own wall-clock bound
-  (`runtime.mission_wall_clock_timeout_seconds`) exits 0, as the `degraded` it finalizes
-  says for any generic run; it exited 130, a SIGINT's code, because the reap at the end of
-  the launch read the raised interrupt flag as a signal. Only an operator's stop
-  (`interrupt::stop_reason`) exits `128 + signo` now.
-  A step an operator's signal ends now ends `abandoned` naming the stop (`Step.stop_reason`,
-  additive; `Step::end_unfinished` is the one decider the scheduler's terminal and the
-  launcher's reconcile share), and the steps the stopped run never reached name it too. It
-  read "error" in `mission show`, its `--json`, the mission graph and the debrief under a run
-  whose row read aborted. Its task and phase roll up from it by the existing rules. The words
-  stay the existing ones: `mission show --json` and `/mission/:id/graph.json` nodes and step
-  rows gain an additive `abandonedReason: "aborted"` beside `status: "abandoned"`, `mission
-  debrief --json` phases gain `abandoned_reason`, and `step.error` gains `stop_reason` (flow
-  schema 2.1.0, additive); text reads "aborted" (`tests/cli-json.golden` regenerated). The
-  envelope's phase reason says "stopped by the operator (SIGTERM)" and its warning counts the
-  stopped steps rather than calling them "never ran". A step the run's own wall-clock bound
-  cuts off stays an error.
-  "Aborted" (a person stopped it) has its own color, a muted gray-violet (`--status-aborted`,
-  #a594d6: 6.8:1 on the panel, 7.2:1 on the page background), distinct from degraded's amber,
-  from idle's gray and from running's teal. The kind is decided once (`workStatusKind`, which
-  now reads an `abandoned` status's reason) and the board's chip, the timeline bar, the run
-  page's pill and the mission lens's nodes, step rows, timeline cards and legend all render it.
-  The mission lens's own status colors are folded into the one table: a running node is the
-  running teal rather than its own amber (`--ml-run` and `--run` retired), an abandoned node
-  takes the table's color rather than a faded gray, and the timeline's phase chip no longer
-  overrides its text with the dim gray.
 - **A task with a later step still planned does not read as finished** (#3074). A step's
   `step.complete` closed its task's session, so the session showed Complete between that
   step and the next one's `step.start` (long when the next step waits on a gate). The record
