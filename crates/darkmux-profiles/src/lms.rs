@@ -305,8 +305,10 @@ pub struct ModelMeta {
 }
 
 /// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
-/// Returns an empty vec on failure rather than erroring — the caller likely
-/// wants to render "(no models found)" rather than crash.
+/// Errors when `lms` cannot be run, exits non-zero, or prints something that
+/// is not a JSON list: a failed listing is not an empty catalog (#3143).
+/// A caller that wants "nothing listed" on failure says so with
+/// `unwrap_or_default()`.
 pub fn list_available() -> Result<Vec<ModelMeta>> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["ls", "--json"]);
