@@ -12,7 +12,7 @@
 //!   caller it streams the body through [`crate::redaction_stream`], redacting each
 //!   key and value as it passes, so a field no one thought to list (an operator-authored profile description, a path in
 //!   an error line) is covered without naming it.
-//! - [`redact_stdout`] is for a console panel's terminal output, which needs
+//! - [`redact_panel_stdout`] is for a console panel's terminal output, which needs
 //!   its escape sequences split out first (see [`classify_escape`]).
 //!
 //! The streams redact each event line with [`Redaction::line`]. Local callers
@@ -25,6 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use darkmux_types::url_authority::UrlAuthority;
 use crate::redaction_stream::StreamRedactor;
+use darkmux_types::panel_audience::Withheld;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
@@ -88,7 +89,7 @@ static REDACTION_CACHE: std::sync::Mutex<Option<RedactionCache>> = std::sync::Mu
 
 impl Redaction {
     /// [`Self::derive`], reused while `fleet.json`, HOME and DARKMUX_HOME are unchanged.
-    fn derive_cached() -> std::sync::Arc<Self> {
+    pub(crate) fn derive_cached() -> std::sync::Arc<Self> {
         let key = CacheKey::current();
         let mut guard = REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         guard.get_or_insert_with(RedactionCache::default).get(key, std::time::Instant::now(), Self::derive)
@@ -162,7 +163,7 @@ impl Redaction {
             if !is_public(addr) {
                 all.push(addr.to_string());
             }
-            if let Some(host) = address_host(addr).filter(|h| !is_public(h)) {
+            if let Some(host) = darkmux_types::panel_audience::address_host(addr).filter(|h| !is_public(h)) {
                 all.push(host.to_string());
             }
         }
@@ -204,17 +205,6 @@ impl Redaction {
     }
 }
 
-/// The host of a roster address (`name:8765`, `[::1]:8765`, a bare IP or name).
-fn address_host(addr: &str) -> Option<&str> {
-    if let Some(rest) = addr.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-    match addr.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => Some(host),
-        _ => None,
-    }
-}
-
 /// A character that continues a host name or a path component: a match
 /// touching one is part of a longer word (`mac` in `macos`, `studio` in
 /// `lmstudio-community`, `/Users/kain` in `/Users/kainx`), never the needle.
@@ -249,7 +239,7 @@ fn continues_backward(before: &str) -> bool {
 /// redactor uses (#3074).
 fn url_host(url: &str) -> Option<String> {
     let hostport = UrlAuthority::parse(url)?.hostport();
-    let host = address_host(hostport).unwrap_or(hostport);
+    let host = darkmux_types::panel_audience::address_host(hostport).unwrap_or(hostport);
     (!host.is_empty()).then(|| host.to_string())
 }
 
@@ -371,17 +361,30 @@ fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
             continue;
         }
         let start = i;
-        while i < b.len() && (b[i].is_ascii_hexdigit() || b[i] == b':') {
-            i += 1;
-        }
+        i += b[i..].iter().take_while(|c| c.is_ascii_hexdigit() || **c == b':').count();
         if b.get(i).is_some_and(|c| word_byte(*c)) {
             continue;
         }
         let glued = start > 0 && word_byte(b[start - 1]);
-        if let Some(span) = v6_in_run(text, start, i, glued) {
+        if let Some(mut span) = v6_in_run(text, start, i, glued) {
+            if span.end == i {
+                span.end += zone_len(&b[i..]);
+                i = span.end;
+            }
             out.push(span);
         }
     }
+}
+
+/// The bytes of an IPv6 zone at the start of `rest` (`%en0`, or `%25en0` in
+/// a URL), which names this machine's interface and so goes with the
+/// address; 0 when there is none.
+fn zone_len(rest: &[u8]) -> usize {
+    if rest.first() != Some(&b'%') {
+        return 0;
+    }
+    let zone = rest[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-')).count();
+    if zone > 0 { 1 + zone } else { 0 }
 }
 
 /// The host-fact IPv6 literal in the run `start..end`, if any: the whole run,
@@ -486,8 +489,9 @@ fn apply_spans<'a>(text: &'a str, mut spans: Vec<Span>) -> std::borrow::Cow<'a, 
 /// Unchanged text is returned borrowed.
 pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<'a, str> {
     // Every host fact has a `.`, a `:`, a `/` or an `@` in or beside it (a name
-    // that is only a word is a fact solely as `host:port` or `://host`).
-    if text.len() < 4 || !text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) {
+    // that is only a word is a fact solely as `host:port` or `://host`),
+    // unless a renderer cut one short with `…` and that punctuation went.
+    if text.len() < 4 || !(text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) || text.contains(CUT)) {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut spans = Vec::new();
@@ -502,7 +506,47 @@ pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<
     for n in &r.needles {
         needle_spans(text, n, &mut spans);
     }
+    if text.contains(CUT) {
+        cut_needle_spans(text, r, &mut spans);
+        cut_tailnet_spans(text, &mut spans);
+    }
     apply_spans(text, spans)
+}
+
+/// What a truncating renderer puts where it cut a cell short.
+const CUT: char = '…';
+
+/// A roster address, its host, the hub's host or a directory, cut short by a
+/// truncating renderer (`head…tail` or `head…`, see
+/// `panel_audience::cut_spans`): what is left still names it. A bare host
+/// (`studio`) is a fact only where it addresses, so a cut of one is not.
+fn cut_needle_spans(text: &str, r: &Redaction, out: &mut Vec<Span>) {
+    for n in r.needles.iter().filter(|n| !n.bare) {
+        for (start, end) in darkmux_types::panel_audience::cut_spans(text, &n.lower) {
+            out.push(Span { start, end, with: n.with });
+        }
+    }
+}
+
+/// A `.ts.net` name cut short: `box.tail-x…s.net` (a middle cut that kept at
+/// least `s.net` of its end) or `box.tail-x.ts…` (an end cut that kept a
+/// dotted name and at least `.t` of the suffix). The span covers the name's
+/// letters on both sides of the `…`, never a `:port` after it. A cut that
+/// keeps neither (`box.tail-x…`) is not recognizable as a tailnet name.
+fn cut_tailnet_spans(text: &str, out: &mut Vec<Span>) {
+    let name_byte = |c: &u8| c.is_ascii_alphanumeric() || matches!(*c, b'.' | b'-');
+    let b = text.as_bytes();
+    for (e, _) in text.match_indices(CUT) {
+        let head = b[..e].iter().rev().take_while(|c| name_byte(c)).count();
+        let after = e + CUT.len_utf8();
+        let tail = b[after..].iter().take_while(|c| name_byte(c)).count();
+        let (h, t) = (text[e - head..e].to_ascii_lowercase(), text[after..after + tail].to_ascii_lowercase());
+        let middle = t.ends_with("s.net") && (head > 0 || t.contains(".ts.net"));
+        let end_cut = tail == 0 && h.contains('.') && [".t", ".ts", ".ts.", ".ts.n", ".ts.ne"].iter().any(|s| h.ends_with(s));
+        if middle || end_cut {
+            out.push(Span { start: e - head, end: after + tail, with: ADDRESS_HIDDEN });
+        }
+    }
 }
 
 /// How many bytes of `rest` (which starts with an ESC or a C1 CSI, U+009B)
@@ -513,14 +557,14 @@ pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<
 /// escape is dropped whole; one that is malformed or unterminated loses only
 /// its introducer, so what follows is ordinary text and gets redacted as such
 /// (`\x1b[/Users/kain` must not be eaten as the sequence `\x1b[/U`).
-fn classify_escape(rest: &str, r: &Redaction) -> (usize, String) {
+fn classify_escape(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
     let bytes = rest.as_bytes();
     if rest.starts_with('\u{9b}') {
         return csi(rest, 2);
     }
     match bytes.get(1) {
         Some(b'[') => csi(rest, 2),
-        Some(b']') => osc(rest, r),
+        Some(b']') => osc(rest, r, w),
         // A charset designation (`ESC ( B`) is three bytes.
         Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => (3, String::new()),
         _ => (1, String::new()),
@@ -539,7 +583,9 @@ fn csi(rest: &str, intro: usize) -> (usize, String) {
 }
 
 /// An OSC: kept only as an OSC 8 hyperlink, rebuilt without its parameters.
-fn osc(rest: &str, r: &Redaction) -> (usize, String) {
+/// Its target is dropped when it names a host fact or a value the console
+/// withholds (`w`).
+fn osc(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
     let body = &rest[2..];
     let bel = body.find('\x07').map(|p| (p, 1));
     let st = body.find("\x1b\\").map(|p| (p, 2));
@@ -550,7 +596,7 @@ fn osc(rest: &str, r: &Redaction) -> (usize, String) {
     let Some((_params, target)) = body[..end].strip_prefix("8;").and_then(|l| l.split_once(';')) else {
         return (consumed, String::new());
     };
-    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target;
+    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target || w.hits(target);
     (consumed, format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }))
 }
 
@@ -559,8 +605,10 @@ fn osc(rest: &str, r: &Redaction) -> (usize, String) {
 /// escape boundary is always a token boundary: panel children are forced to
 /// color, and `\x1b[2m/Users/kain` must read as a path, not as a path glued to
 /// the `m` that ends the escape. See [`classify_escape`] for which escapes
-/// survive.
-pub(crate) fn redact_stdout(text: &str, r: &Redaction) -> String {
+/// survive. Each run also loses every value in `w` (the console panels'
+/// extra set, [`panel_withheld`]).
+pub(crate) fn redact_panel_stdout(text: &str, r: &Redaction, w: &Withheld) -> String {
+    let redact_run = |run: &str| w.scrub(&redact_text(run, r));
     let mut out = String::with_capacity(text.len());
     let mut run_start = 0;
     let mut i = 0;
@@ -570,14 +618,163 @@ pub(crate) fn redact_stdout(text: &str, r: &Redaction) -> String {
             i += ch.len_utf8();
             continue;
         }
-        out.push_str(&redact_text(&text[run_start..i], r));
-        let (consumed, kept) = classify_escape(&text[i..], r);
+        out.push_str(&redact_run(&text[run_start..i]));
+        let (consumed, kept) = classify_escape(&text[i..], r, w);
         out.push_str(&kept);
         i += consumed;
         run_start = i;
     }
-    out.push_str(&redact_text(&text[run_start..], r));
+    out.push_str(&redact_run(&text[run_start..]));
     out
+}
+
+/// What a console panel withholds from a remote viewer beyond [`Redaction`]:
+/// the addresses, paths, endpoint URLs and credential pointers this machine is
+/// configured with, wherever a verb prints them. Read when the request is
+/// served, from the same places the verbs read:
+///
+/// - every location a setting resolves to (`env > config.json > default`),
+///   through the accessors the code itself reads it with
+///   (`darkmux_types::config_access::LOCATION_ACCESSORS`; a test there fails
+///   on an accessor that could name a location and is in no list), so a
+///   setting that exists only in the environment is covered;
+/// - `config.json` as written (`panel_audience::config_scrub_values`: every
+///   value of a scrubbed kind, every unknown key's value and every value of
+///   the wrong type);
+/// - the profile registry's endpoints (where each lives, where its key is),
+///   the lab fixture registry's paths, the Redis URL and the temp directory;
+/// - every enum setting's value that is not one of its tokens, from
+///   `config.json` or the environment (bad config, which doctor quotes).
+///
+/// A path under the home or `DARKMUX_HOME` directory is left to
+/// [`Redaction`], which already reads it as `~` or `$DARKMUX_HOME`. A value
+/// spelled like a public name (a roster machine, this machine, a profile or
+/// an endpoint) is never withheld, as [`Redaction`] never hides one: a
+/// credential pointer named after its endpoint must not hide the endpoint.
+///
+/// The verbs that shape their own remote form (`doctor`, `flow status`) use
+/// the same set before they wrap their output.
+pub fn panel_withheld() -> Withheld {
+    use darkmux_types::panel_audience::config_scrub_values;
+    let read_json = |p: &std::path::Path| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+    };
+    let config_path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+    let from_config = read_json(&config_path).map(|c| config_scrub_values(&c)).unwrap_or_default();
+
+    let path_str = |p: std::path::PathBuf| p.to_string_lossy().to_string();
+    let mut locations = darkmux_types::config_access::resolved_locations();
+    locations.extend(darkmux_lab::lab::registry::fixture_locations());
+    locations.extend(darkmux_flow::redis_url().map(|u| u.expose_for_probe().to_string()));
+    for d in [std::env::temp_dir(), std::env::temp_dir().canonicalize().unwrap_or_default()] {
+        locations.push(path_str(d));
+    }
+
+    // The public names: never withheld (see the doc above).
+    let mut public: Vec<String> = Vec::new();
+    if let Ok(roster) = darkmux_fleet::load_roster() {
+        for m in roster.machines.values() {
+            public.push(m.id.clone());
+            public.extend(m.current_name.clone());
+        }
+    }
+    public.extend(darkmux_flow::resolve_machine_id());
+
+    let credentials = registry_sets(&mut locations, &mut public);
+    let outside = outside_the_homes;
+    // An enum setting's value that is not one of its tokens is bad config,
+    // which doctor's refusal quotes, whether it was set in `config.json` or
+    // the environment: what it holds is not what the key means.
+    let bad_enum = darkmux_types::config_enum::bad_values().into_iter().map(|b| b.raw);
+    Withheld::from_values(outside(from_config))
+        .merged(Withheld::from_locations(outside(locations)))
+        .merged(Withheld::from_values(credentials))
+        .merged(Withheld::from_values(outside(bad_enum.collect())))
+        .sparing(&public)
+}
+
+/// The profile registry's part of [`panel_withheld`]: the registry's own
+/// path and each endpoint's URL go into `locations`, its profile and
+/// endpoint names into `public`; returns each endpoint's credential pointer.
+fn registry_sets(locations: &mut Vec<String>, public: &mut Vec<String>) -> Vec<String> {
+    let mut credentials: Vec<String> = Vec::new();
+    let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) else { return credentials };
+    locations.push(reg_path.to_string_lossy().to_string());
+    let registry: Option<serde_json::Value> =
+        std::fs::read_to_string(&reg_path).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let Some(registry) = registry else { return credentials };
+    for section in ["profiles", "endpoints"] {
+        public.extend(registry.get(section).and_then(|m| m.as_object()).into_iter().flat_map(|m| m.keys().cloned()));
+    }
+    for ep in registry.get("endpoints").and_then(|e| e.as_object()).into_iter().flat_map(|m| m.values()) {
+        locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
+        for key in ["keychain", "key_env"] {
+            credentials.extend(ep.pointer(&format!("/auth/{key}")).and_then(|v| v.as_str()).map(str::to_string));
+        }
+    }
+    credentials
+}
+
+/// `values` without those under `HOME` or `DARKMUX_HOME` (or spelled with
+/// `~`), which the home-prefix redaction already rewrites.
+fn outside_the_homes(values: Vec<String>) -> Vec<String> {
+    let homes: Vec<String> = ["HOME", "DARKMUX_HOME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|h| h.trim_end_matches('/').to_string())
+        .filter(|h| h.len() > 1)
+        .collect();
+    let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
+    values.into_iter().filter(|v| !under_a_home(v)).collect()
+}
+
+/// What [`panel_withheld`] read, so a cached set is reused only while it is
+/// still the answer: each file's mtime and length, and every `DARKMUX_*`
+/// variable plus `HOME` and `TMPDIR`.
+#[derive(Clone, PartialEq, Eq)]
+struct WithheldKey {
+    files: Vec<Option<(std::time::SystemTime, u64)>>,
+    env: Vec<(String, String)>,
+}
+
+impl WithheldKey {
+    fn current() -> Self {
+        let meta = |p: Option<std::path::PathBuf>| {
+            p.and_then(|p| std::fs::metadata(p).ok()).and_then(|m| Some((m.modified().ok()?, m.len())))
+        };
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
+        let files = vec![
+            meta(Some(root.config.clone())),
+            meta(darkmux_profiles::profiles::registry_path(None)),
+            meta(Some(root.root.join("lab-registry.json"))),
+            meta(Some(darkmux_fleet::roster_path())),
+        ];
+        let mut env: Vec<(String, String)> =
+            std::env::vars().filter(|(k, _)| k.starts_with("DARKMUX_") || k == "HOME" || k == "TMPDIR").collect();
+        env.sort();
+        Self { files, env }
+    }
+}
+
+static PANEL_WITHHELD_CACHE: std::sync::Mutex<Option<(WithheldKey, std::time::Instant, std::sync::Arc<Withheld>)>> =
+    std::sync::Mutex::new(None);
+
+/// [`panel_withheld`], reused for at most [`REDACTION_CACHE_TTL`] while the
+/// files it read and the environment are unchanged: a console on a 3s
+/// auto-refresh would otherwise re-read four files and resolve every setting
+/// per remote request.
+pub(crate) fn panel_withheld_cached() -> std::sync::Arc<Withheld> {
+    let key = WithheldKey::current();
+    let now = std::time::Instant::now();
+    let mut guard = PANEL_WITHHELD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, at, w)) = guard.as_ref() {
+        if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
+            return w.clone();
+        }
+    }
+    let w = std::sync::Arc::new(panel_withheld());
+    *guard = Some((key, now, w.clone()));
+    w
 }
 
 #[cfg(test)]
@@ -954,6 +1151,44 @@ mod tests {
         Redaction::from_parts(&[], &[], None, None)
     }
 
+    /// The middle cut `run list` and `mission status` make: head, `…`, tail,
+    /// `max` characters in all.
+    fn middle_cut(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let keep = max - 1;
+        let (head, tail) = (keep.div_ceil(2), keep - keep.div_ceil(2));
+        format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+    }
+
+    /// (5.0 security re-review C5) A cell cut short with `…`, in the middle
+    /// or at its end, still hides a roster address (and its host) and a
+    /// `.ts.net` name the roster does not list: what the cut leaves of either
+    /// still names it.
+    #[test]
+    fn a_cut_roster_address_or_tailnet_name_is_still_hidden() {
+        let r = Redaction::from_parts(&[("peerone", "peerone.lan-fake.example:8765")], &[], None, None);
+        for addr in ["peerone.lan-fake.example:8765", "peerone.lan-fake.example"] {
+            for max in 6..addr.chars().count() {
+                let cut = middle_cut(addr, max);
+                assert_eq!(r.line(&format!("at {cut}  x")), format!("at {ADDRESS_HIDDEN}  x"), "{cut}");
+            }
+            let head: String = addr.chars().take(10).collect();
+            assert_eq!(r.line(&format!("at {head}…")), format!("at {ADDRESS_HIDDEN}"), "{head}…");
+        }
+        // A tailnet name: cut in the middle with its `s.net` kept, or at its
+        // end with its `.ts` kept.
+        let name = "box.tailnet-example.ts.net";
+        for max in 11..name.chars().count() {
+            let cut = middle_cut(name, max);
+            assert_eq!(r.line(&format!("peer {cut}:8765")), format!("peer {ADDRESS_HIDDEN}:8765"), "{cut}");
+        }
+        for head in ["box.tailnet-example.ts…", "box.tailnet-example.ts.n…"] {
+            assert_eq!(r.line(&format!("peer {head} up")), format!("peer {ADDRESS_HIDDEN} up"), "{head}");
+        }
+        // Text that names neither keeps its `…`.
+        assert_eq!(r.line("loading… done; v1.2…3.4"), "loading… done; v1.2…3.4");
+    }
+
     #[test]
     fn ipv4_is_hidden_when_private_or_addressing_and_prose_versions_survive() {
         let r = rules();
@@ -983,6 +1218,80 @@ mod tests {
         }
         for kept in ["::1", "[::1]:8765", "at 12:34:56 today", "darkmux::fleet", "a::b", "::"] {
             assert_eq!(r.line(kept), kept, "{kept}");
+        }
+    }
+
+    /// (5.0 review item 8) An IPv6 address's zone (`%en0`, or `%25en0` in a
+    /// URL) names this machine's interface: it goes with the address.
+    #[test]
+    fn an_ipv6_zone_goes_with_its_address() {
+        let r = rules();
+        assert_eq!(r.line("peer fe80::1%en0 up"), format!("peer {ADDRESS_HIDDEN} up"));
+        assert_eq!(r.line("http://[fe80::1%25en0]:8765/x"), format!("http://[{ADDRESS_HIDDEN}]:8765/x"));
+        assert_eq!(r.line("::1%lo0 stays"), "::1%lo0 stays", "loopback stays, zone and all");
+    }
+
+    /// (5.0 review item 8) An OSC 8 link whose target names a value the
+    /// console withholds loses its target, as one naming a host fact does.
+    #[test]
+    fn a_link_to_a_withheld_location_loses_its_target() {
+        let w = Withheld::from_values(["/opt/fake-fixtures/alpha".to_string()]);
+        let text = "\x1b]8;;file:///opt/fake-fixtures/alpha\x1b\\alpha\x1b]8;;\x1b\\\n";
+        assert_eq!(redact_panel_stdout(text, &rules(), &w), "\x1b]8;;\x1b\\alpha\x1b]8;;\x1b\\\n");
+    }
+
+    /// (5.0 review items 1, 2 and 5) What a console panel withholds is read
+    /// from every place this machine names a location: a setting that exists
+    /// only in the environment, the lab fixture registry, the profile
+    /// registry's endpoints. A credential pointer spelled like a public name
+    /// (an endpoint's Keychain item named after the endpoint, a key variable
+    /// named after a roster machine) is not withheld: the name stays readable.
+    #[test]
+    #[serial_test::serial]
+    fn panel_withheld_reads_every_location_and_spares_public_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dm");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lab-registry.json"),
+            r#"{"fixtures":{"alpha":{"path":"/opt/fake-fixtures/alpha","content_hash":"h","hashed_at":"t","manifest_version":"1"},"beta":{"path":"/Volumes/FakeWork/beta","content_hash":"h","hashed_at":"t","manifest_version":"1"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("profiles.json"),
+            r#"{"profiles":{},"endpoints":{"hosted":{"url":"https://hosted-secret.example.com/v1","auth":{"type":"bearer","keychain":"hosted"}},"relay":{"url":"https://relay-secret.example.com/v1","auth":{"type":"bearer","key_env":"LAPTOP"}},"other":{"url":"https://other-secret.example.com/v1","auth":{"type":"bearer","keychain":"other-key-item"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("fleet.json"), r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"100.64.9.1","added_unix_ms":1}}}"#).unwrap();
+        let vars = [
+            ("DARKMUX_HOME", root.display().to_string()),
+            ("HOME", dir.path().join("home").display().to_string()),
+            ("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-hostsrc/scenario.json".to_string()),
+            ("DARKMUX_MODS_DIR", "/opt/fake-mods".to_string()),
+            // (5.0 security re-review N3) An enum setting holding a value that is
+            // not one of its tokens is bad config, which doctor's refusal
+            // quotes, wherever it was set.
+            ("DARKMUX_FLEET_MODE", "/opt/fake-env-enum-garbage".to_string()),
+        ];
+        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).chain([("DARKMUX_FLEET_FILE", std::env::var_os("DARKMUX_FLEET_FILE")), ("DARKMUX_PROFILES", std::env::var_os("DARKMUX_PROFILES"))]).collect();
+        for (k, v) in &vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let w = panel_withheld();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let vals = w.values();
+        for want in ["/opt/fake-env-enum-garbage", "/opt/fake-hostsrc/scenario.json", "/opt/fake-mods", "/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta", "https://hosted-secret.example.com/v1", "other-key-item"] {
+            assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
+        }
+        for public in ["hosted", "LAPTOP", "laptop", "relay"] {
+            assert!(!vals.iter().any(|v| v.eq_ignore_ascii_case(public)), "the public name {public} is not withheld: {vals:?}");
         }
     }
 

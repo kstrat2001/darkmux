@@ -100,6 +100,7 @@ PanelResponse.gather_ms: number
 PanelResponse.exit_code: number | null
 PanelResponse.ansi_text: string
 PanelResponse.stderr_tail: string
+PanelResponse.withheld: string
 PanelResponse.cols: number
 PanelResponse.cache_ttl_ms: number
 PanelResponse.age_ms: number

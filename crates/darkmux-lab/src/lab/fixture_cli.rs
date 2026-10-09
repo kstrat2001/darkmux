@@ -124,19 +124,34 @@ pub fn cmd_unregister(name: &str) -> Result<String> {
 
 /// `dm lab fixture list` — show registered fixtures table.
 pub fn cmd_list() -> Result<String> {
+    cmd_list_for(darkmux_types::panel_audience::remote())
+}
+
+/// [`cmd_list`], or (`remote`) as the console's lab-fixture-list panel shows
+/// it to a viewer that is not this machine (5.0): each fixture's path, and an
+/// orphaned registry's, read "(shown on this machine only)"; the names,
+/// versions, hashes and dates stay. The registry itself lives under the
+/// darkmux root, which the daemon's own redaction already shows as
+/// `$DARKMUX_HOME` or `~`.
+fn cmd_list_for(remote: bool) -> Result<String> {
+    use darkmux_types::panel_audience::WITHHELD;
+    let shown = |p: &Path| if remote { WITHHELD.to_string() } else { p.display().to_string() };
     // (#2613) Same forced home tier as `cmd_register` — see its comment.
     let paths = paths::resolve(ResolveScope::ForceUser);
     let reg_path = default_registry_path(&paths);
+    let orphan_note = |msg: &mut String| {
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            msg.push_str("\n\n  ");
+            msg.push_str(&crate::lab::registry::orphan_signpost_line(Path::new(&shown(&orphan))));
+        }
+    };
 
     if !reg_path.exists() {
         let mut msg = format!(
             "No registry at {}.\n  To get started:\n    `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
         );
-        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
-            msg.push_str("\n\n  ");
-            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
-        }
+        orphan_note(&mut msg);
         return Ok(msg);
     }
 
@@ -146,10 +161,7 @@ pub fn cmd_list() -> Result<String> {
             "Registry at {} has no fixtures registered.\n  Add one: `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
         );
-        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
-            msg.push_str("\n\n  ");
-            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
-        }
+        orphan_note(&mut msg);
         return Ok(msg);
     }
 
@@ -162,7 +174,7 @@ pub fn cmd_list() -> Result<String> {
     for (name, entry) in &registry.fixtures {
         out.push_str(&format!(
             "\n  {name}\n    path:       {}\n    version:    {}\n    satisfies:  {}\n    hash:       {}\n    hashed_at:  {}\n",
-            entry.path.display(),
+            shown(&entry.path),
             entry.manifest_version,
             entry.satisfies.as_deref().unwrap_or("(none)"),
             entry.content_hash,
@@ -178,4 +190,29 @@ mod tests {
     // the binary). Unit-test coverage for the underlying LabRegistry
     // operations lives in src/lab/registry.rs. This module is thin
     // wiring; the wiring is exercised via the CLI tests.
+
+    /// (5.0) The console's lab-fixture-list panel, for a viewer that is not
+    /// this machine: every fixture's absolute path is withheld; its name and
+    /// version stay. This machine reads the paths.
+    #[test]
+    #[serial_test::serial]
+    fn the_remote_list_withholds_each_fixture_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lab-registry.json"),
+            r#"{"fixtures":{"alpha":{"path":"/opt/fake-fixtures/alpha","content_hash":"h1","hashed_at":"t","manifest_version":"1"},"beta":{"path":"/Volumes/FakeWork/beta","content_hash":"h2","hashed_at":"t","manifest_version":"2"}}}"#,
+        )
+        .unwrap();
+        let saved = std::env::var_os("DARKMUX_HOME");
+        std::env::set_var("DARKMUX_HOME", dir.path());
+        let (remote, local) = (super::cmd_list_for(true).unwrap(), super::cmd_list_for(false).unwrap());
+        match saved {
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
+        }
+        assert!(!remote.contains("/opt/fake") && !remote.contains("/Volumes/"), "{remote}");
+        assert!(remote.contains("alpha") && remote.contains("beta") && remote.contains("version:    2"), "{remote}");
+        assert_eq!(remote.matches("path:       (shown on this machine only)").count(), 2, "{remote}");
+        assert!(local.contains("/opt/fake-fixtures/alpha") && local.contains("/Volumes/FakeWork/beta"), "{local}");
+    }
 }

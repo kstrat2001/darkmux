@@ -73,6 +73,8 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-types/src/endpoint.rs", ".key_env", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".key_env", 2, "resolve_endpoint_secret's Keychain-read hint naming the variable to export (message text), downstream of credential_source"),
     ("crates/darkmux-doctor/src/lib.rs", ".key_env", 1, "a message naming the field `endpoint.auth.key_env`"),
+    ("crates/darkmux-types/src/panel_audience.rs", ".keychain", 1, "the redaction table names the config key path `hooks.rules[].headers.*.keychain_item` to classify it as a credential pointer; it resolves no endpoint credential"),
+    ("crates/darkmux-types/src/panel_audience.rs", ".keychain", 1, "the redaction table names the config key path `hooks.rules[].headers.*.keychain_item` to classify it as a credential pointer; it resolves no endpoint credential"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_completion_tokens\"", 1, "THE body builder, chat-completions dialect"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
     ("crates/darkmux-types/src/endpoint.rs", "Lmstudio", 5, "the backend's own facts: the enum variant and its config_enum entry, its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),

@@ -12,6 +12,70 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [Unreleased]
+
+### Changed
+
+- **The console redacts for remote viewers instead of refusing them.** In
+  5.0.0, `doctor`, `config-list` and `flow-status` were served only to this
+  machine or a token holder. Now no console panel is refused for being remote. A caller that is neither
+  this machine nor a token holder is served every panel redacted: the verb
+  renders its remote form (`doctor` runs every check and keeps every row,
+  status and remedy, but withholds the fleet listener's address, port and
+  busy policy, this machine's network node and the allow-list's entries;
+  `config-list` withholds every value that names an address, a path, a URL
+  or a credential pointer, the listener's port, the busy policy and each
+  allow-list entry beyond its machine name; `flow-status` withholds its
+  directories, the Redis URL and each hook's target; `lab-fixture-list`
+  withholds each fixture's path), and the daemon then filters the text of
+  every panel, stdout and stderr alike (stderr is redacted, not dropped, so a
+  failed panel still says why): every roster address (and its host part)
+  reads "(address hidden)", an IPv6 address loses its zone with it, the
+  daemon user's home prefix reads `~` (a `DARKMUX_HOME` outside it reads
+  `$DARKMUX_HOME`), and every address, path, endpoint URL and credential
+  pointer this machine is configured with reads "(shown on this machine
+  only)", in any case. A value a renderer cut short with `…` is matched by
+  the part that shows, head and tail (`run-list` and `mission-status` cut a
+  cell in the middle), when at least four characters of it show; the same
+  applies to roster addresses, and a `.ts.net` name is recognized when the
+  cut keeps its `s.net` end or its `.ts`. A cut that keeps fewer characters,
+  or a `.ts.net` name cut so that neither shows, is not recognized. That set
+  is read through the same `config_access` functions the code uses
+  (`LOCATION_ACCESSORS`; a test scans the module's public functions,
+  `pub(crate)` ones and ones taking arguments included, and fails on one
+  that could return text and is in neither list, so a setting that exists
+  only in the environment is covered), plus `config.json` as written (a
+  value of the wrong type with any location-like key inside it, an unknown
+  key's value, an unknown key whose name looks like a location, and an
+  enum-valued setting holding something that is not one of its tokens), the
+  environment's bad enum values, the profile registry's endpoints, the lab
+  fixture registry, the Redis URL and the temp directory. A free-form string
+  setting holding something else of the right type is not recognized. A
+  credential pointer spelled like a machine, profile or endpoint name does
+  not hide the name. A field darkmux knows is an address is withheld
+  whatever its value, including what a peer's records name: `run-list`
+  withholds each run's route and each usage group's endpoint (a named
+  endpoint still reads as its registry id), and `profile-list` each
+  unmanaged endpoint's host. A remote body is redacted before it is cached,
+  so a value rotated out of the configuration inside the cache's lifetime
+  never reaches a remote caller. `config-list` also withholds a shown key
+  whose value has the wrong type or is not one of its enum's tokens, and
+  every `config.json` leaf is classified by its own path, so a new field
+  under a withheld prefix fails the guard. `doctor` is floored per audience: a remote run never closes this
+  machine's 30s window, and a remote caller inside the remote window reads
+  the last remote run (with its age) instead of starting a probe. Matches are whole tokens only (`mac` is not
+  hidden inside `macos`; punctuation and color codes are boundaries; an OSC 8
+  link to a hidden target loses the target, not its label; only SGR and OSC 8
+  escapes are sent, and `HOME` and `DARKMUX_HOME` are matched in their
+  symlink-resolved form too), and a machine id or name is never hidden: only
+  the address behind it. The sets come from the roster, the config and the
+  environment at request time. Where anything was withheld, the response's
+  new `withheld` field carries one plain notice ("shown on this machine only:
+  run `darkmux doctor` on studio itself, or over ssh, for the full output"),
+  which the console shows calmly below the output, never as an error. This
+  machine and token holders see the output unchanged. Fleet work submission
+  is untouched: it still needs the token and a network-verified sender.
+
 ## [5.0.0] - 2026-10-08
 
 The version jumps from 3.13.0 because the work that began as 4.0 was never tagged on

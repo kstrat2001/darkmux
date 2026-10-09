@@ -2329,12 +2329,11 @@
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
     }
 
-    // ─── (#2988 review) panels that describe the execution surface ─────
-    // `/health` withholds the fleet listener's address, port, busy policy
-    // and allow-list from a non-local caller. The panels whose output holds
-    // the same facts (`doctor`, `config-list`) follow, even with read auth
-    // off. `?opt.bogus=1` makes a request that PASSES the gate answer 400
-    // before anything spawns; a refused one answers 401.
+    // ─── panels follow the read posture, whatever they print (5.0) ─────
+    // No panel is refused for who is asking: a caller the read posture admits
+    // is served every panel, redacted when it is not this machine (see
+    // `panel.rs`'s module doc). `?opt.bogus=1` makes a request that PASSES
+    // the gate answer 400 before anything spawns; a refused one answers 401.
 
     async fn panel_status(
         auth: AuthEnv,
@@ -2355,46 +2354,41 @@
         resp.status()
     }
 
+    /// Every panel, including the three that print the execution surface
+    /// (`doctor`, `config-list`, `flow-status`; they used to need this machine
+    /// or the token whatever the posture): with read auth off a tailnet peer,
+    /// a proxied request and a rebinding Host all pass the gate (and are
+    /// served the redacted form); with read auth on, a caller with no token is
+    /// refused, as on every read route.
     #[tokio::test]
     #[serial_test::serial]
-    async fn an_execution_surface_panel_refuses_a_remote_caller_with_read_auth_off() {
-        // `flow-status` prints the sinks' paths, hook target URLs and the Redis
-        // URL: a non-local caller without the token gets a 401 there too.
-        for id in ["doctor", "config-list", "flow-status"] {
-            for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
-                let s = panel_status(auth, remote_peer(), id, &[]).await;
-                assert_eq!(s, StatusCode::UNAUTHORIZED, "{id} under {auth:?}");
-            }
-            let proxied = panel_status(AuthEnv::Off, loopback_peer(), id, &[("X-Forwarded-For", "100.64.0.7")]).await;
-            assert_eq!(proxied, StatusCode::UNAUTHORIZED, "{id} through a proxy");
-            let rebound = panel_status(AuthEnv::Off, loopback_peer(), id, &[("Host", "attacker.example:8765")]).await;
-            assert_eq!(rebound, StatusCode::UNAUTHORIZED, "{id} with a rebinding Host");
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn an_execution_surface_panel_serves_this_machine_and_the_token() {
-        for id in ["doctor", "config-list", "flow-status"] {
-            let local = panel_status(AuthEnv::Off, loopback_peer(), id, &[]).await;
-            assert_eq!(local, StatusCode::BAD_REQUEST, "{id}: this machine passes the gate");
-            let token = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[("Authorization", BEARER)]).await;
-            assert_eq!(token, StatusCode::BAD_REQUEST, "{id}: the token passes the gate");
-            let wrong = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[("Authorization", "Bearer wrong")]).await;
-            assert_eq!(wrong, StatusCode::UNAUTHORIZED, "{id}: a wrong token does not");
-        }
-    }
-
-    /// The inverse: a read panel still follows the read posture, so with
-    /// read auth off a tailnet peer's phone dashboard keeps its panels.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_read_panel_follows_the_read_posture() {
-        for id in ["mission-status", "role-list", "machine-status", "lab-fixture-list", "run-list", "profile-list", "machine-list"] {
+    async fn every_panel_follows_the_read_posture() {
+        for id in crate::panel::PANEL_IDS {
             let s = panel_status(AuthEnv::Off, remote_peer(), id, &[]).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{id} with read auth off");
+            let s = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[]).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{id}: a token alone does not close reads");
+            let proxied = panel_status(AuthEnv::Off, loopback_peer(), id, &[("X-Forwarded-For", "100.64.0.7")]).await;
+            assert_eq!(proxied, StatusCode::BAD_REQUEST, "{id} through a proxy");
+            let rebound = panel_status(AuthEnv::Off, loopback_peer(), id, &[("Host", "attacker.example:8765")]).await;
+            assert_eq!(rebound, StatusCode::BAD_REQUEST, "{id} with a rebinding Host");
             let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED, "{id} with read auth on, no token");
+        }
+    }
+
+    /// This machine and a token holder pass the gate for every panel; a wrong
+    /// token is still refused where reads need one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_panel_serves_this_machine_and_the_token() {
+        for id in crate::panel::PANEL_IDS {
+            let local = panel_status(AuthEnv::ReadAuth, loopback_peer(), id, &[]).await;
+            assert_eq!(local, StatusCode::BAD_REQUEST, "{id}: this machine passes the gate");
+            let token = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[("Authorization", BEARER)]).await;
+            assert_eq!(token, StatusCode::BAD_REQUEST, "{id}: the token passes the gate");
+            let wrong = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[("Authorization", "Bearer wrong")]).await;
+            assert_eq!(wrong, StatusCode::UNAUTHORIZED, "{id}: a wrong token does not");
         }
     }
 

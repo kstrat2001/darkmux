@@ -99,6 +99,20 @@ pub struct FleetSubmissionFacts {
     pub clock_skews: Vec<(String, i64)>,
 }
 
+/// The row naming this machine's node on the network and the address its
+/// listener binds.
+pub const IDENTITY_ROW: &str = "fleet identity";
+/// The row naming the listener's address, port and busy policy.
+pub const LISTENER_ROW: &str = "fleet listener";
+/// The row listing each allow-list entry's scope and node.
+pub const TRUST_ROW: &str = "fleet trust";
+/// (5.0) The rows whose detail IS the execution surface (the listener's
+/// address, port and busy policy, this machine's node, and what each trusted
+/// machine may run here): a remote viewer's doctor keeps each row and its
+/// remedy and withholds the detail ([`crate::shape_for_remote`]), as
+/// `/health` gives a non-local caller only the listener's coarse state.
+pub const EXECUTION_SURFACE_ROWS: &[&str] = &[IDENTITY_ROW, LISTENER_ROW, TRUST_ROW];
+
 fn check(name: &str, status: Status, message: String, hint: Option<String>) -> Check {
     Check { name: name.into(), status, message, hint }
 }
@@ -249,13 +263,13 @@ fn token_row(f: &FleetSubmissionFacts) -> Check {
 fn identity_row(f: &FleetSubmissionFacts) -> Check {
     match &f.provider {
         ProviderReport::Unknown { value } => check(
-            "fleet identity",
+            IDENTITY_ROW,
             Status::Fail,
             format!("unknown identity provider `{value}`: every submission is refused"),
             Some("`darkmux config set fleet.identity.provider tailscale`".into()),
         ),
         ProviderReport::Down { value, detail } => check(
-            "fleet identity",
+            IDENTITY_ROW,
             if f.listener_enabled { Status::Fail } else { Status::Warn },
             format!("{value} cannot answer ({detail}): every submission is refused until it can"),
             Some(format!(
@@ -264,7 +278,7 @@ fn identity_row(f: &FleetSubmissionFacts) -> Check {
             )),
         ),
         ProviderReport::Up { value, local_name, local_addr } => check(
-            "fleet identity",
+            IDENTITY_ROW,
             Status::Pass,
             format!(
                 "{value}: this machine is `{local_name}`{}{}",
@@ -288,7 +302,7 @@ fn identity_row(f: &FleetSubmissionFacts) -> Check {
 fn listener_row(f: &FleetSubmissionFacts) -> Check {
     if !f.listener_enabled {
         return check(
-            "fleet listener",
+            LISTENER_ROW,
             Status::Warn,
             "off: this machine takes no work from other machines, though its allow-list names some".into(),
             Some("`darkmux config set fleet.listener.enabled true`, then restart `darkmux serve`.".into()),
@@ -299,9 +313,9 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
         _ => format!("<overlay address>:{}", f.port),
     };
     match f.listener_bound {
-        Some(true) => check("fleet listener", Status::Pass, format!("listening on {addr}{}", busy_note(f)), None),
+        Some(true) => check(LISTENER_ROW, Status::Pass, format!("listening on {addr}{}", busy_note(f)), None),
         Some(false) => check(
-            "fleet listener",
+            LISTENER_ROW,
             Status::Warn,
             match &f.daemon_listener_state {
                 Some(state) => format!("enabled, but nothing is listening on {addr}; the daemon says: {state}"),
@@ -315,7 +329,7 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
             ),
         ),
         None => check(
-            "fleet listener",
+            LISTENER_ROW,
             Status::Warn,
             format!("enabled, but not checked: no overlay address to bind (port {})", f.port),
             None,
@@ -364,7 +378,7 @@ fn trust_row(f: &FleetSubmissionFacts) -> Check {
     let entries = match &f.trusted {
         Err(e) => {
             return check(
-                "fleet trust",
+                TRUST_ROW,
                 Status::Fail,
                 format!("the allow-list cannot be read ({e}): the listener refuses everything"),
                 Some("Fix the JSON in config.json; `darkmux machine trust` rewrites one entry.".into()),
@@ -374,7 +388,7 @@ fn trust_row(f: &FleetSubmissionFacts) -> Check {
     };
     if entries.is_empty() {
         return check(
-            "fleet trust",
+            TRUST_ROW,
             Status::Pass,
             "no machine is trusted: every submission is refused (deny by default)".into(),
             Some("`darkmux machine trust <machine> --profiles <profile>` lets one in.".into()),
@@ -424,7 +438,7 @@ fn trust_row(f: &FleetSubmissionFacts) -> Check {
         ProviderReport::Up { value, .. } | ProviderReport::Down { value, .. } | ProviderReport::Unknown { value } => value,
     };
     check(
-        "fleet trust",
+        TRUST_ROW,
         worst,
         format!("verified by {provider}: {}", lines.join(" · ")),
         (!hints.is_empty()).then(|| hints.join("; ")),

@@ -283,7 +283,11 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
             println!("{}", get_at(&path, &key)?);
         }
         ConfigCmd::List => {
-            println!("{}", list_at(&path)?);
+            // (5.0) The console's config-list panel, for a viewer that is not
+            // this machine: values that name an address, a path, a URL, a
+            // credential pointer or the execution surface are withheld.
+            let listed = list_for(&path, darkmux_types::panel_audience::remote())?;
+            println!("{listed}");
             // (#2947) stderr, so `darkmux config list | jq` still parses,
             // and only for a person at a terminal: the serve daemon's
             // config-list console panel keeps the last stderr lines and
@@ -546,6 +550,14 @@ fn get_at(path: &Path, key: &str) -> Result<String> {
 /// surface" grounding source rather than re-deriving its own read of
 /// `config.json` (single derivation of "what does `config list` show").
 pub(crate) fn list_at(path: &Path) -> Result<String> {
+    list_for(path, false)
+}
+
+/// [`list_at`], or (`remote`) as a viewer that is not this machine reads it in
+/// the console: every value `panel_audience::config_verdict` does not show
+/// reads "(shown on this machine only)"; the keys, and the plain settings,
+/// stay.
+fn list_for(path: &Path, remote: bool) -> Result<String> {
     if !path.exists() {
         return Ok(format!(
             "(no config.json at {} — run `darkmux init` to write the full default config)",
@@ -554,6 +566,9 @@ pub(crate) fn list_at(path: &Path) -> Result<String> {
     }
     let mut root = load_object(path)?;
     redact_secret_keys(&mut root);
+    if remote {
+        darkmux_types::panel_audience::shape_config_json(&mut root);
+    }
     serde_json::to_string_pretty(&root).context("serializing config.json")
 }
 

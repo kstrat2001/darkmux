@@ -2380,6 +2380,398 @@ pub fn skills_override_dirs() -> Vec<std::path::PathBuf> {
     )
 }
 
+// ── (5.0) Every location the settings resolve to ──
+//
+// A console panel served to a viewer that is not this machine withholds every
+// address, path and URL this machine is configured with, wherever a verb
+// prints one (`darkmux_types::panel_audience`). Those values are read here,
+// through the same accessors the code uses, so an environment override and a
+// setting that has no `config.json` key at all are covered. The table is
+// checked, not trusted: `location_guard` below scans this file for every
+// public function (`pub`, `pub(crate)`, `pub(super)`, with or without
+// arguments) that could return text and fails until each one is either in
+// [`LOCATION_ACCESSORS`] or named, with its reason, as not a location.
+
+/// The locations a resolved setting's value names.
+pub trait AsLocations {
+    fn as_locations(&self) -> Vec<String>;
+}
+
+impl AsLocations for String {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.clone()]
+    }
+}
+
+impl AsLocations for std::path::PathBuf {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.to_string_lossy().into_owned()]
+    }
+}
+
+impl<T: AsLocations> AsLocations for Option<T> {
+    fn as_locations(&self) -> Vec<String> {
+        self.iter().flat_map(AsLocations::as_locations).collect()
+    }
+}
+
+impl<T: AsLocations> AsLocations for Vec<T> {
+    fn as_locations(&self) -> Vec<String> {
+        self.iter().flat_map(AsLocations::as_locations).collect()
+    }
+}
+
+impl AsLocations for crate::config::HookRule {
+    fn as_locations(&self) -> Vec<String> {
+        self.http.iter().chain(&self.file).cloned().collect()
+    }
+}
+
+impl AsLocations for ClientEndpoint {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.addr.clone()]
+    }
+}
+
+impl AsLocations for crate::config::RetiredLeftover {
+    fn as_locations(&self) -> Vec<String> {
+        vec![self.value.clone()]
+    }
+}
+
+macro_rules! location_accessors {
+    ($($accessor:ident),* $(,)?) => {
+        /// Every accessor in this module whose value names an address, a path
+        /// or a URL, by name, each read through the accessor itself. See
+        /// [`resolved_locations`].
+        pub const LOCATION_ACCESSORS: &[(&str, fn() -> Vec<String>)] =
+            &[$((stringify!($accessor), || $accessor().as_locations())),*];
+    };
+}
+
+location_accessors!(
+    lms_bin,
+    lmstudio_url,
+    fleet_identity_bin,
+    redis_host,
+    audit_dir_override,
+    hooks_outbox_dir,
+    hooks_rules,
+    hooks_adapters_dir,
+    serve_bind,
+    serve_client_addr,
+    serve_client_endpoint,
+    serve_listen_addr,
+    retired_env_leftovers,
+    daemon_cors_origins,
+    liveness_dir,
+    host_sampler_lock_path,
+    host_source_script,
+    flows_dir,
+    findings_dir,
+    mods_dir,
+    lab_dir,
+    runtime_cache_dir,
+    cache_dir,
+    fleet_file,
+    identity_path_override,
+    templates_override_dirs,
+    skills_override_dirs,
+);
+
+/// Every address, path and URL the settings resolve to right now (`env >
+/// config.json > built-in default`), one entry per value as its accessor
+/// returns it. A caller filters what it does not need (a loopback address, a
+/// path under the home directory).
+pub fn resolved_locations() -> Vec<String> {
+    LOCATION_ACCESSORS.iter().flat_map(|(_, read)| read()).collect()
+}
+
+#[cfg(test)]
+mod location_guard {
+    use super::*;
+
+    /// Accessors that return text but name no address, path or URL, each
+    /// with why. A new accessor that returns text is in neither list and
+    /// fails [`every_accessor_that_can_name_a_location_is_read`].
+    const NOT_LOCATIONS: &[(&str, &str)] = &[
+        ("SERVE_BIND_DEFAULT", "the default bind, public in the source; the bind in effect is read through `serve_bind`"),
+        ("FLEET_BUSY_POLICY_DEFAULT", "the default busy policy token, public in the source (the policy in effect is withheld where printed)"),
+        ("FLEET_IDENTITY_PROVIDER_DEFAULT", "the default provider's name"),
+        ("REDIS_TELEMETRY_STREAM_SUFFIX", "a stream name's suffix"),
+        ("LOCATION_ACCESSORS", "this table itself: accessor names and functions, no value"),
+        ("machine_id", "this machine's public name, which every viewer reads"),
+        ("fleet_mode", "an enum value"),
+        ("declared_fleet_mode", "an enum value"),
+        ("fleet_busy_policy", "an enum value (withheld where printed, as the execution surface)"),
+        ("fleet_identity_provider", "an enum value"),
+        ("fleet_defaults_radio_answerer_profile", "a profile name"),
+        ("radio_answerer_profile", "a profile name"),
+        ("redis_stream", "a stream name"),
+        ("redis_telemetry_stream", "a stream name"),
+        ("cmd_allowed_verbs", "CLI verb names"),
+        ("hooks_enabled_provenance", "which tier set a switch"),
+        ("check_retired_env", "the same leftovers as `retired_env_leftovers`, split by policy"),
+        ("role_profiles", "role and profile names"),
+        ("default_role", "a role name"),
+        ("live_cadence", "milliseconds and a tier"),
+        ("detection_degeneracy_policy", "an enum value"),
+        ("thermal_pause_at", "an enum value"),
+        ("thermal_resume_at", "an enum value"),
+        ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
+        ("config", "the whole config.json document: its locations are read by the accessors named here and `panel_audience::config_scrub_values`"),
+        ("env_str", "the raw environment reader the accessors are built on; each location it reads is read through its accessor"),
+        ("format_listen_addr", "formats its arguments; the resolved address is `serve_listen_addr`"),
+        ("format_client_addr", "formats its arguments; the resolved address is `serve_client_addr`"),
+        ("resolve_enum", "an enum value; one that is not a token is withheld as bad config (`config_enum::bad_values`)"),
+        ("resolve_enum_token", "an enum value; one that is not a token is withheld as bad config (`config_enum::bad_values`)"),
+        ("enum_bad_values", "bad enum values, withheld as bad config through `config_enum::bad_values`"),
+        ("role_profile", "a profile name"),
+        ("as_str", "a tier's name (env, config, default)"),
+        ("describe", "where a client address came from (a tier, or the daemon's pid), never the address"),
+        ("set_config_for_test", "a test hook that installs a config"),
+    ];
+
+    /// `src` without its `#[cfg(test)] mod` blocks, wherever they sit, so
+    /// production code after a test module is still scanned.
+    fn production_of(src: &str) -> String {
+        const MARK: &str = "\n#[cfg(test)]\nmod ";
+        let mut out = String::new();
+        let mut rest = src;
+        while let Some(at) = rest.find(MARK) {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + MARK.len()..];
+            // `mod name;` (a file module) ends at its semicolon; an inline one
+            // at the brace that closes its body.
+            let end = match (after.find('{'), after.find(';')) {
+                (Some(open), semi) if semi.is_none_or(|s| open < s) => {
+                    let mut depth = 0usize;
+                    after[open..].char_indices().find_map(|(i, c)| {
+                        depth = if c == '{' { depth + 1 } else if c == '}' { depth - 1 } else { depth };
+                        (c == '}' && depth == 0).then_some(open + i + 1)
+                    })
+                }
+                (_, semi) => semi.map(|s| s + 1),
+            };
+            rest = &after[end.unwrap_or(after.len())..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Whether the text before an item's keyword makes it public: `pub` or
+    /// any `pub(...)`, ahead of `const`, `async`, `unsafe` or `extern "…"`.
+    fn is_public(before: &str) -> bool {
+        const QUALIFIERS: &[&str] = &["const", "async", "unsafe", "extern"];
+        let mut b = before.trim_end();
+        loop {
+            let word_start = b.rfind(' ').map_or(0, |i| i + 1);
+            let word = &b[word_start..];
+            // An ABI string (`extern "C"`) is dropped with its `extern`.
+            let abi = word.starts_with('"') && b[..word_start].trim_end().ends_with("extern");
+            if !(QUALIFIERS.contains(&word) || abi) {
+                break;
+            }
+            b = b[..word_start].trim_end();
+        }
+        if b == "pub" || b.ends_with(" pub") {
+            return true;
+        }
+        // `pub(crate)`, `pub(super)`, `pub(in a::b)`: the last `pub(` whose
+        // parentheses close exactly at the end.
+        b.rfind("pub(").is_some_and(|i| {
+            let tail = &b[i..];
+            (i == 0 || b[..i].ends_with(' ')) && tail.ends_with(')') && tail.matches('(').count() == tail.matches(')').count()
+        })
+    }
+
+    /// Every public `static` or `const` item in `production` (whitespace
+    /// collapsed), as `(NAME, TYPE, false)`.
+    fn items_in(production: &str) -> Vec<(String, String, bool)> {
+        let mut out = Vec::new();
+        for kw in [" static ", " const "] {
+            for (at, _) in production.match_indices(kw) {
+                if !is_public(&production[..at]) {
+                    continue;
+                }
+                let rest = production[at + kw.len()..].trim_start_matches("mut ");
+                let Some((name, ty)) = rest.split_once(':') else { continue };
+                if name.contains(['(', ' ']) {
+                    continue; // `const fn`, handled as a function
+                }
+                let ty = ty.split(['=', ';']).next().unwrap_or("").trim().to_string();
+                out.push((name.trim().to_string(), ty, false));
+            }
+        }
+        out
+    }
+
+    /// Every public item in `src`'s production code that hands out a value:
+    /// each function (any `pub` visibility, any qualifier; with or without
+    /// arguments, `&self` and generics included) that returns something,
+    /// and each `static` or `const`, as `(NAME, TYPE, TAKES_ARGUMENTS)`,
+    /// signatures spanning lines included.
+    fn accessors_in(src: &str) -> Vec<(String, String, bool)> {
+        let production: String = production_of(src).split_whitespace().collect::<Vec<_>>().join(" ");
+        // The index just past the bracket that closes the one at `open`.
+        let close = |s: &str, open: usize, (o, c): (char, char)| -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, ch) in s[open..].char_indices() {
+                if ch == o {
+                    depth += 1;
+                } else if ch == c && !(c == '>' && s[..open + i].ends_with('-')) {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + i + 1);
+                    }
+                }
+            }
+            None
+        };
+        let mut out = Vec::new();
+        for (at, _) in production.match_indices(" fn ") {
+            let before = &production[..at];
+            if !is_public(before) {
+                continue;
+            }
+            let rest = &production[at + 4..];
+            let name_end = rest.find(['<', '(']).unwrap_or(rest.len());
+            let name = rest[..name_end].trim().to_string();
+            let mut i = name_end;
+            if rest[i..].starts_with('<') {
+                let Some(end) = close(rest, i, ('<', '>')) else { continue };
+                i = end;
+            }
+            let Some(open) = rest[i..].find('(').map(|o| i + o) else { continue };
+            let Some(end) = close(rest, open, ('(', ')')) else { continue };
+            let takes_args = !rest[open + 1..end - 1].trim().trim_end_matches(',').trim().is_empty();
+            let Some(ty) = rest[end..].trim_start().strip_prefix("->") else { continue };
+            let ty = ty.split(['{', ';']).next().unwrap_or("").split(" where ").next().unwrap_or("").trim().to_string();
+            out.push((name, ty, takes_args));
+        }
+        out.extend(items_in(&production));
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Whether a return type can carry text: anything but numbers, booleans,
+    /// a tier and the wrappers around them.
+    fn can_hold_text(ty: &str) -> bool {
+        const SCALARS: &[&str] = &["bool", "u8", "u16", "u32", "u64", "usize", "f64", "Source", "Option"];
+        ty.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).any(|t| !SCALARS.contains(&t))
+    }
+
+    /// The accessors in `found` that could name a location and are neither
+    /// in `read` nor in `excused`. A `_with_source` returns its plain
+    /// sibling's value and is covered by it, but only when that sibling
+    /// exists. One that takes arguments cannot be read without them, so it
+    /// must be excused (its reason names what covers the value, if anything).
+    fn unclassified(found: &[(String, String, bool)], read: &[&str], excused: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, ty, takes_args) in found {
+            if !can_hold_text(ty) {
+                continue;
+            }
+            if let Some(base) = name.strip_suffix("_with_source") {
+                if !found.iter().any(|(f, _, _)| f == base) {
+                    out.push(format!("{name} -> {ty} (a `_with_source` with no `{base}` beside it)"));
+                }
+                continue;
+            }
+            let (listed, is_excused) = (read.contains(&name.as_str()), excused.contains(&name.as_str()));
+            if listed == is_excused || (*takes_args && !is_excused) {
+                out.push(format!("{name} -> {ty}{}", if *takes_args { " (takes arguments)" } else { "" }));
+            }
+        }
+        out
+    }
+
+    /// The structural guard: the location table is complete. Every public
+    /// function here whose value could be text (a `String`, a path, a list,
+    /// a struct) is read by [`resolved_locations`] or named in
+    /// `NOT_LOCATIONS` with the reason it names no location; one that takes
+    /// arguments must be named there. A `_with_source` returns its plain
+    /// sibling's value and is covered by it, when the sibling exists.
+    #[test]
+    fn every_accessor_that_can_name_a_location_is_read() {
+        let found = accessors_in(include_str!("config_access.rs"));
+        assert!(found.len() > 80, "the scan found the accessors: {found:?}");
+        let read: Vec<&str> = LOCATION_ACCESSORS.iter().map(|(n, _)| *n).collect();
+        let excused: Vec<&str> = NOT_LOCATIONS.iter().map(|(n, _)| *n).collect();
+        let unclassified = unclassified(&found, &read, &excused);
+        assert!(
+            unclassified.is_empty(),
+            "classify each accessor: add it to LOCATION_ACCESSORS (it names an address, a path or a URL a \
+             remote console viewer must not read), or to NOT_LOCATIONS with the reason it does not: \
+             {unclassified:?}"
+        );
+        for (n, _) in NOT_LOCATIONS {
+            assert!(found.iter().any(|(f, _, _)| f == n), "NOT_LOCATIONS names `{n}`, which is not an accessor here");
+        }
+        // The scan sees what the guard must: a path-returning accessor, an
+        // env-only one, and a signature spanning lines.
+        for must in ["host_source_script", "findings_dir", "identity_path_override", "fleet_identity_provider"] {
+            assert!(found.iter().any(|(f, _, _)| f == must), "the scan missed `{must}`");
+        }
+        assert!(!can_hold_text("(Option<u32>, Source)") && can_hold_text("Option<std::path::PathBuf>"));
+    }
+
+    /// (5.0 security re-review C4) The shapes of accessor the scan must not
+    /// miss, each in a source of its own: a `pub(crate)` one, one that takes
+    /// an argument (generic or not), and a `_with_source` with no plain
+    /// sibling to cover it. Each is unclassified until someone decides.
+    #[test]
+    fn the_scan_catches_every_shape_of_accessor() {
+        for (src, name) in [
+            ("pub(crate) fn hidden_dir() -> std::path::PathBuf {\n    x()\n}\n", "hidden_dir"),
+            ("pub fn endpoint_for(name: &str) -> Option<String> {\n    x()\n}\n", "endpoint_for"),
+            ("pub fn templated<T: Into<String>>(\n    t: T,\n) -> String {\n    x()\n}\n", "templated"),
+            ("pub(super) fn method_url(&self) -> String {\n    x()\n}\n", "method_url"),
+            ("pub fn orphan_with_source() -> (String, Source) {\n    x()\n}\n", "orphan_with_source"),
+            // (re-check of fix pass 2) qualifiers, a scoped visibility, and
+            // items that are not functions at all.
+            ("pub const fn const_dir() -> &'static str {\n    \"/x\"\n}\n", "const_dir"),
+            ("pub async fn async_url() -> String {\n    x()\n}\n", "async_url"),
+            ("pub unsafe fn raw_path() -> String {\n    x()\n}\n", "raw_path"),
+            ("pub(in crate::config_access) fn scoped_dir() -> String {\n    x()\n}\n", "scoped_dir"),
+            ("pub static STATIC_DIR: &str = \"/x\";\n", "STATIC_DIR"),
+            ("pub const CONST_URL: &str = \"http://x\";\n", "CONST_URL"),
+            // Production code after a test module is still production code.
+            ("pub fn early_dir() -> String {\n}\n\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n\npub fn late_dir() -> String {\n}\n", "late_dir"),
+        ] {
+            let found = accessors_in(src);
+            let got = unclassified(&found, &[], &[]);
+            assert!(got.iter().any(|u| u.starts_with(&format!("{name} "))), "{name} is unclassified in {src:?}: {got:?}");
+        }
+        // A `_with_source` beside its plain accessor is covered by it.
+        let paired = "pub fn a_dir() -> String {\n}\npub fn a_dir_with_source() -> (String, Source) {\n}\n";
+        assert_eq!(unclassified(&accessors_in(paired), &["a_dir"], &[]), Vec::<String>::new());
+    }
+
+    /// Each entry reads its own accessor: a setting that exists only in the
+    /// environment comes back, so a remote console viewer is never shown it.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_only_location_is_resolved() {
+        let keys = ["DARKMUX_HOST_SOURCE_SCRIPT", "DARKMUX_FINDINGS_DIR", "DARKMUX_IDENTITY_PATH"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-host-script.json");
+        std::env::set_var("DARKMUX_FINDINGS_DIR", "/opt/fake-findings");
+        std::env::set_var("DARKMUX_IDENTITY_PATH", "/opt/fake-identity.md");
+        let all = resolved_locations();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        for want in ["/opt/fake-host-script.json", "/opt/fake-findings", "/opt/fake-identity.md"] {
+            assert!(all.iter().any(|l| l == want), "{want} in {all:?}");
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod detection_policy_regression {

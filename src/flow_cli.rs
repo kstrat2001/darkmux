@@ -495,7 +495,10 @@ fn run_drain(rule_filter: Option<usize>, max_seconds: u64, json: bool) -> Result
 /// Render `darkmux flow status` to stdout. Calls `flow::collect_status()`
 /// for the snapshot; format gated by `--json`.
 fn print_status(json: bool) -> Result<()> {
-    let status = flow::collect_status();
+    let mut status = flow::collect_status();
+    if darkmux_types::panel_audience::remote() {
+        shape_status_for_remote(&mut status, &darkmux_serve::panel_withheld());
+    }
     if json {
         // (#776) machine-readable: force color off (defense-in-depth).
         darkmux_types::style::set_colorize_override(Some(false));
@@ -504,6 +507,34 @@ fn print_status(json: bool) -> Result<()> {
         print!("{}", flow::format_status_human(&status));
     }
     Ok(())
+}
+
+/// (5.0) `flow status` as a viewer that is not this machine reads it in the
+/// console: the Redis URL, the flows and outbox directories and each hook's
+/// target are withheld where they are printed, and every other string loses
+/// the values in `darkmux_serve::panel_withheld` (an audit directory in the
+/// sink composition, a path in a hook's last error). Shaped on the data,
+/// before the renderer wraps it.
+fn shape_status_for_remote(status: &mut flow::FlowStatus, w: &darkmux_types::panel_audience::Withheld) {
+    use darkmux_types::panel_audience::WITHHELD;
+    if let Some(r) = status.redis.as_mut() {
+        r.url = WITHHELD.to_string();
+    }
+    status.disk.flows_dir = WITHHELD.to_string();
+    status.hooks.outbox_dir = WITHHELD.to_string();
+    for rule in &mut status.hooks.rules {
+        rule.url = WITHHELD.to_string();
+    }
+    // Through its JSON form, so every string field is covered without naming
+    // each one. The status is ours and round-trips (pinned by
+    // `the_remote_status_withholds_every_location_and_round_trips`); were that
+    // ever to break, the structural withholding above still stands.
+    if let Ok(mut v) = serde_json::to_value(&*status) {
+        w.scrub_json(&mut v);
+        if let Ok(shaped) = serde_json::from_value(v) {
+            *status = shaped;
+        }
+    }
 }
 
 /// One line per sidecar a torn audit tail was set aside into.
@@ -835,6 +866,42 @@ mod tests {
     // forces color off regardless of what FlowStatus now carries.
 
     // ─── (#2093 merge-gate finding 10) drain verb ────────────────────────
+
+    /// (5.0) The remote `flow status`: the Redis URL, both directories and
+    /// each hook's target read "(shown on this machine only)", and a
+    /// configured location anywhere else in the status (a hook's last error,
+    /// the sink composition's config) is scrubbed through the JSON round trip.
+    #[test]
+    fn the_remote_status_withholds_every_location_and_round_trips() {
+        let mut status: flow::FlowStatus = serde_json::from_value(serde_json::json!({
+            "schema_version": "2.1.0",
+            "sinks": { "info": { "kind": "Tee", "config": { "audit_dir": "/srv/secret-audit" } }, "active_kinds": ["LocalFile"], "composition": "Tee([LocalFile])" },
+            "redis": { "url": "redis://100.64.77.9:6379", "stream": "darkmux:flow", "telemetry_stream": "t", "reachable": false,
+                       "reachability_error": "connect to db.secret-host.example failed", "near_max_len": false },
+            "disk": { "flows_dir": "/srv/secret-flows", "exists": true, "day_files": 3, "total_bytes": 10 },
+            "schema": { "writer_version": "2.1.0", "observed_versions": [], "skew_detected": false },
+            "overall_state": "ok",
+            "hooks": { "enabled": true, "outbox_dir": "/srv/secret-outbox", "rules": [ {
+                "index": 0, "match_desc": "action=run.complete", "url": "https://hooks.secret.example/p", "is_loopback": false,
+                "is_tailnet": false, "signed": true, "is_empty_match": false, "undelivered": 0,
+                "last_error": "POST https://hooks.secret.example/p: wrote /srv/secret-audit/x", "dropped_appends": 0,
+                "cursor_write_failures": 0, "stalled": false, "quarantined_lines": 0 } ] }
+        }))
+        .expect("a populated status");
+        let w = darkmux_types::panel_audience::Withheld::from_values([
+            "/srv/secret-audit".to_string(),
+            "https://hooks.secret.example/p".into(),
+            "db.secret-host.example".into(),
+        ]);
+        shape_status_for_remote(&mut status, &w);
+        let text = flow::format_status_human(&status);
+        for secret in ["100.64.77.9", "secret-flows", "secret-outbox", "hooks.secret", "secret-audit", "secret-host"] {
+            assert!(!text.contains(secret), "`{secret}` in the remote flow status:\n{text}");
+        }
+        assert!(text.contains("flows_dir:    (shown on this machine only)"), "{text}");
+        assert!(text.contains("day_files:    3"), "the health lines stay: {text}");
+        assert_eq!(status.sinks.info.config.get("audit_dir").map(String::as_str), Some("(shown on this machine only)"));
+    }
 
     #[test]
     fn drain_hooks_delivers_pending_lines_and_reports_counts() {

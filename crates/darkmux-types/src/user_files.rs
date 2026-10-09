@@ -739,7 +739,7 @@ fn merge<'a>(mut a: ObjectShape<'a>, b: ObjectShape<'a>) -> ObjectShape<'a> {
 }
 
 /// `parent.key` for a message: the key rendered by [`segment`].
-fn join_display(parent: &str, key: &str) -> String {
+pub(crate) fn join_display(parent: &str, key: &str) -> String {
     join(parent, &segment(key))
 }
 
