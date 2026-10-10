@@ -340,7 +340,7 @@ jobs:
           DARKMUX_E2E_REQUIRED: "1"
         run: |
           set -o pipefail
-          cargo test -q -p darkmux-serve -p darkmux-flow -- \
+          cargo test -p darkmux-serve -p darkmux-flow -- \
             a_telemetry_flood_does_not_evict_a_usage_record \
             the_live_tail_carries_work_records_and_machine_samples \
             flow_stream_handler_carries_the_telemetry_stream \
