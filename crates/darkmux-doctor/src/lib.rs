@@ -4066,20 +4066,26 @@ fn endpoints_status(
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
+    uncached_claude_check(&name, &listed, registry).unwrap_or(Check { name, status: Status::Pass, message: listed, hint: None })
+}
+
+/// (#3173) The `endpoints` row as a Warn when a Claude endpoint is declared
+/// onto the uncached layer; `None` when none is.
+fn uncached_claude_check(name: &str, listed: &str, registry: &darkmux_types::ProfileRegistry) -> Option<Check> {
     let uncached = uncached_claude_endpoints(registry);
-    if !uncached.is_empty() {
-        let named = uncached.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
-        return Check {
-            name,
-            status: Status::Warn,
-            message: format!(
-                "{listed}. A Claude endpoint declared onto the OpenAI-compatible layer does not cache: every \
-                 turn pays full input price for the whole conversation again ({named})"
-            ),
-            hint: Some(uncached_claude_hint(&uncached, "the profile registry")),
-        };
+    if uncached.is_empty() {
+        return None;
     }
-    Check { name, status: Status::Pass, message: listed, hint: None }
+    let named = uncached.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
+    Some(Check {
+        name: name.to_string(),
+        status: Status::Warn,
+        message: format!(
+            "{listed}. A Claude endpoint declared onto the OpenAI-compatible layer does not cache: every \
+             turn pays full input price for the whole conversation again ({named})"
+        ),
+        hint: Some(uncached_claude_hint(&uncached, "the profile registry")),
+    })
 }
 
 /// (#3173) The edit for [`uncached_claude_endpoints`], made in `registry`
