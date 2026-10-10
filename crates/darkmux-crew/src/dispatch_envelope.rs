@@ -97,7 +97,9 @@ fn is_zero<T: Default + PartialEq>(n: &T) -> bool {
 
 impl EnvelopeMetrics {
     pub fn of(fold: &TrajectoryFold, model: &str) -> Self {
-        let TokenSum { prompt, completion, total, reasoning, cached } = fold.tokens;
+        // Cache writes are priced per call from the usage records (#3168);
+        // the envelope's run summary does not carry them.
+        let TokenSum { prompt, completion, total, reasoning, cached, cache_write: _ } = fold.tokens;
         EnvelopeMetrics {
             model: model.to_string(),
             wall_ms: fold.wall_ms(),

@@ -1948,6 +1948,7 @@ mod tests {
                 // refactor that drops them in `into_response` fail.
                 reasoning: Some(5),
                 cached: Some(16),
+                cache_write: Some(3),
             }),
         };
         acc.ingest(&final_chunk);
@@ -1956,8 +1957,8 @@ mod tests {
         let usage = resp.usage.expect("usage captured from final chunk");
         assert_eq!((usage.prompt, usage.completion, usage.total), (Some(42), Some(7), Some(49)));
         assert_eq!(
-            (usage.reasoning, usage.cached),
-            (Some(5), Some(16)),
+            (usage.reasoning, usage.cached, usage.cache_write),
+            (Some(5), Some(16), Some(3)),
             "the details must survive the chunk stream, not just prompt/completion/total"
         );
     }

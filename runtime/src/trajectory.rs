@@ -1644,6 +1644,7 @@ mod tests {
             total: Some(700),
             reasoning: Some(500),
             cached: Some(20),
+            cache_write: Some(8),
         };
         t.append_model_completed(1, "stop", CallTokens { reported: Some(&usage), estimate: None }, None, None, None);
 
@@ -1663,6 +1664,7 @@ mod tests {
             "the reported reasoning tokens must reach the trajectory — this is the only producer"
         );
         assert_eq!(first["usage"]["cached_tokens"], 20);
+        assert_eq!(first["usage"]["cache_write_tokens"], 8, "#3168: cache writes reach the trajectory as their own count");
 
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert!(
@@ -1670,6 +1672,7 @@ mod tests {
             "a provider that named no details object must serialize null, never 0"
         );
         assert!(second["usage"]["cached_tokens"].is_null());
+        assert!(second["usage"].get("cache_write_tokens").is_none(), "an unreported write is omitted, so non-caching events read as before");
         // The provider's own total must survive verbatim alongside them.
         assert_eq!(first["usage"]["total_tokens"], 700);
     }

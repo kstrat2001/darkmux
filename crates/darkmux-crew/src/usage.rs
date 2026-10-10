@@ -227,6 +227,7 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
         total_tokens: count(counts.total_tokens()),
         reasoning_tokens: count(counts.reasoning),
         cached_tokens: count(counts.cached),
+        cache_write_tokens: count(counts.cache_write),
         turn_seq: None,
         index: None,
         generation: None,
@@ -521,6 +522,18 @@ mod tests {
             sum.add(&counts);
             assert_eq!(sum.total, amount_of(&record).total, "counts {counts:?}");
         }
+    }
+
+    /// (#3168) The usage record carries cache writes as their own count, so a
+    /// cached run's four billed classes can be priced from its records.
+    #[test]
+    fn the_usage_record_carries_cache_writes_as_their_own_count() {
+        let facts = CallFacts { call_kind: CallKind::SingleShot, role_id: None, requested_model: "m", reported_model: None, endpoint: "h/m", endpoint_id: None };
+        let counts = darkmux_trajectory::UsageCounts { prompt: Some(110), completion: Some(5), cached: Some(80), cache_write: Some(20), ..Default::default() };
+        let record = serde_json::to_value(usage_payload(&facts, &counts)).unwrap();
+        assert_eq!((record["cached_tokens"].as_u64(), record["cache_write_tokens"].as_u64()), (Some(80), Some(20)), "{record}");
+        let plain = serde_json::to_value(usage_payload(&facts, &darkmux_trajectory::UsageCounts { prompt: Some(1), ..Default::default() })).unwrap();
+        assert!(plain.get("cache_write_tokens").is_none(), "an unreported write is absent: {plain}");
     }
 
     /// The sums read a usage record as raw JSON, in the one value domain the

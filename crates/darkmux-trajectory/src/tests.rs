@@ -94,7 +94,7 @@ fn a_written_event_reads_back_equal() {
         seq: 3,
         ts: 9,
         finish_reason: "tool_calls".into(),
-        usage: Some(Usage { prompt_tokens: Some(10), completion_tokens: Some(2), total_tokens: Some(12), reasoning_tokens: None, cached_tokens: Some(4) }),
+        usage: Some(Usage { prompt_tokens: Some(10), completion_tokens: Some(2), total_tokens: Some(12), reasoning_tokens: None, cached_tokens: Some(4), cache_write_tokens: None }),
         tool_calls: Some(vec![ToolCallEntry { id: "a".into(), name: "read".into(), arguments_chars: 5, path: Some("f".into()), runs: Some(false) }]),
         reported_model: None,
         calls_planned: true,

@@ -15028,7 +15028,7 @@ fn direct_tokens_carry_exactly_the_direct_token_keys() {
     let keys: Vec<&str> = none.as_object().unwrap().keys().map(String::as_str).collect();
     assert_eq!(keys, ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"]);
     assert!(none.as_object().unwrap().values().all(|v| v.is_null()), "{none}");
-    let counts = darkmux_trajectory::UsageCounts { prompt: Some(3), completion: Some(4), total: None, reasoning: Some(1), cached: None };
+    let counts = darkmux_trajectory::UsageCounts { prompt: Some(3), completion: Some(4), total: None, reasoning: Some(1), cached: None, cache_write: None };
     let some = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&counts)).unwrap();
     assert_eq!(some["prompt_tokens"], 3);
     assert_eq!(some["total_tokens"], 7, "the one total rule: prompt + completion when the provider sent none");

@@ -107,8 +107,14 @@ fn usage_as_chat(c: &darkmux_trajectory::UsageCounts) -> Value {
             u.insert(k.into(), v.into());
         }
     }
-    if let Some(cached) = c.cached {
-        u.insert("prompt_tokens_details".into(), json!({ "cached_tokens": cached }));
+    let mut details = Map::new();
+    for (k, v) in [("cached_tokens", c.cached), ("cache_write_tokens", c.cache_write)] {
+        if let Some(v) = v {
+            details.insert(k.into(), v.into());
+        }
+    }
+    if !details.is_empty() {
+        u.insert("prompt_tokens_details".into(), Value::Object(details));
     }
     Value::Object(u)
 }
@@ -153,6 +159,7 @@ mod tests {
         assert_eq!(chat["model"], "claude-sonnet-5-5");
         let counts = darkmux_trajectory::UsageCounts::of_reply(&chat);
         assert_eq!((counts.prompt, counts.completion, counts.total, counts.cached), (Some(42), Some(5), Some(47), Some(30)));
+        assert_eq!(counts.cache_write, Some(10), "cache writes survive the translation as their own count (#3168)");
         let parsed = crate::dispatch_internal::parse_hosted_response(chat.to_string().as_bytes());
         assert!(parsed.is_ok(), "the translated reply passes the shape check");
     }

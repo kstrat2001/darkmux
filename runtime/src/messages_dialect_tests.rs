@@ -99,9 +99,9 @@ fn usage_counts_cache_writes_and_reads_as_prompt_tokens_and_reads_as_cached() {
     let u = usage_counts(&json!({
         "input_tokens": 4, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 17_610, "output_tokens": 9,
     }));
-    assert_eq!(u, UsageCounts { prompt: Some(17_714), completion: Some(9), total: Some(17_723), reasoning: None, cached: Some(17_610) });
+    assert_eq!(u, UsageCounts { prompt: Some(17_714), completion: Some(9), total: Some(17_723), reasoning: None, cached: Some(17_610), cache_write: Some(100) });
     let bare = usage_counts(&json!({"output_tokens": 9}));
-    assert_eq!((bare.prompt, bare.total, bare.cached), (None, None, None));
+    assert_eq!((bare.prompt, bare.total, bare.cached, bare.cache_write), (None, None, None, None));
 }
 
 #[test]

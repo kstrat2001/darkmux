@@ -3980,7 +3980,8 @@ mod tests {
         //            a flow-only run reads the same kind on every machine.
         //            Also additive: `stop_reason` on `dispatch.error`,
         //            `run.error` and `step.error`, the operator's stop that
-        //            ended the execution, the run or the step.
+        //            ended the execution, the run or the step. Also
+        //            additive (#3168): `cache_write_tokens` on the usage record.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

@@ -47,6 +47,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           key reads the terminal as an error, as before, and every terminal
 //           written before 2.2.0 names none and still reads as an error;
 //           archives are not rewritten.
+//
+//           Also 2.2.0 (#3168): the usage record (`telemetry.tokens`) and a
+//           trajectory event's `usage` block gain `cache_write_tokens`, the
+//           prompt tokens written to the provider's cache (the Messages API's
+//           `cache_creation_input_tokens`). Like `cached_tokens` it is a part
+//           of `prompt_tokens`, priced apart from uncached input and from
+//           reads. Written only when the provider reported it. ADDITIVE.
 //   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
 //           bool written ONLY as `true`: a later step of the same task is
 //           still planned, so this record is not the end of the task's
