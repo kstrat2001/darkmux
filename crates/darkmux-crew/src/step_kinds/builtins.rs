@@ -2360,6 +2360,7 @@ fn map_item_token_payload(
             total: res.total_tokens,
             reasoning: res.reasoning_tokens,
             cached: res.cached_tokens,
+            cache_write: None,
         },
         reported_model: res.served_model.clone(),
     };
@@ -5708,7 +5709,7 @@ mod tests {
         let reply = crate::single_shot::SingleShotReply {
             content: "ok".to_string(),
             model: Some("hosted".to_string()),
-            counts: darkmux_trajectory::UsageCounts { total: Some(1261), prompt: Some(75), completion: Some(1186), reasoning: Some(1024), cached: Some(64) },
+            counts: darkmux_trajectory::UsageCounts { total: Some(1261), prompt: Some(75), completion: Some(1186), reasoning: Some(1024), cached: Some(64), cache_write: None },
         };
         let payload = serde_json::to_value(hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply)).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);

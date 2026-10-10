@@ -32,6 +32,12 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
     /// Same contract as `reasoning_tokens`.
     pub cached_tokens: Option<u64>,
+    /// (#3168) Prompt tokens written to the provider's cache, billed apart
+    /// from uncached input and from reads. Unlike the counts above it is
+    /// omitted, not `null`, when unreported: only a caching provider sends
+    /// it, so every other call's event reads exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for Usage {
@@ -44,6 +50,7 @@ impl<'de> Deserialize<'de> for Usage {
             total_tokens: count("total_tokens"),
             reasoning_tokens: count("reasoning_tokens"),
             cached_tokens: count("cached_tokens"),
+            cache_write_tokens: count("cache_write_tokens"),
         })
     }
 }
@@ -57,6 +64,7 @@ impl Usage {
             total: self.total_tokens,
             reasoning: self.reasoning_tokens,
             cached: self.cached_tokens,
+            cache_write: self.cache_write_tokens,
         }
     }
 }
@@ -71,6 +79,7 @@ impl From<&UsageCounts> for Usage {
             total_tokens: c.total,
             reasoning_tokens: c.reasoning,
             cached_tokens: c.cached,
+            cache_write_tokens: c.cache_write,
         }
     }
 }
@@ -98,6 +107,11 @@ pub struct UsageCounts {
     /// `prompt_tokens_details.cached_tokens`: prompt tokens served from the
     /// provider's cache.
     pub cached: Option<u64>,
+    /// (#3168) Prompt tokens written to the provider's cache: the Messages
+    /// API's `cache_creation_input_tokens`, carried on the chat shape as
+    /// `prompt_tokens_details.cache_write_tokens` (the name OpenRouter's
+    /// OpenAI-compatible layer uses). Like `cached`, a part of `prompt`.
+    pub cache_write: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for UsageCounts {
@@ -119,23 +133,24 @@ impl UsageCounts {
             total: count("/total_tokens"),
             reasoning: count("/completion_tokens_details/reasoning_tokens"),
             cached: count("/prompt_tokens_details/cached_tokens"),
+            cache_write: count("/prompt_tokens_details/cache_write_tokens"),
         }
     }
 
     /// (#3162) THE parse of a Messages-API `usage` object (Anthropic's native
     /// dialect), onto the same counts: prompt is the uncached input plus the
     /// cache writes plus the cache reads (every input token the endpoint
-    /// served, which is what a budget counts), and `cached` is the cache
-    /// reads. A count the API did not send stays unreported; there is no
+    /// served, which is what a budget counts), `cached` is the cache reads
+    /// and `cache_write` the cache writes. A count the API did not send stays unreported; there is no
     /// prompt figure without `input_tokens`.
     pub fn from_messages_usage(usage: &serde_json::Value) -> Self {
         let count = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64);
         let read = count("cache_read_input_tokens");
-        let prompt = count("input_tokens")
-            .map(|i| i.saturating_add(count("cache_creation_input_tokens").unwrap_or(0)).saturating_add(read.unwrap_or(0)));
+        let write = count("cache_creation_input_tokens");
+        let prompt = count("input_tokens").map(|i| i.saturating_add(write.unwrap_or(0)).saturating_add(read.unwrap_or(0)));
         let completion = count("output_tokens");
         let total = prompt.zip(completion).map(|(p, c)| p.saturating_add(c));
-        Self { prompt, completion, total, reasoning: None, cached: read }
+        Self { prompt, completion, total, reasoning: None, cached: read, cache_write: write }
     }
 
     /// The counts of a whole chat-completion reply: its `usage` object, or
@@ -201,6 +216,7 @@ pub struct TokenSum {
     /// `None` until a call reports the field.
     pub reasoning: Option<u64>,
     pub cached: Option<u64>,
+    pub cache_write: Option<u64>,
 }
 
 impl TokenSum {
@@ -213,6 +229,9 @@ impl TokenSum {
         }
         if let Some(k) = c.cached {
             self.cached = Some(self.cached.unwrap_or(0).saturating_add(k));
+        }
+        if let Some(w) = c.cache_write {
+            self.cache_write = Some(self.cache_write.unwrap_or(0).saturating_add(w));
         }
     }
 }
@@ -286,7 +305,7 @@ mod tests {
         let c = UsageCounts::from_provider(&v);
         assert_eq!(
             c,
-            UsageCounts { prompt: Some(75), completion: Some(1186), total: Some(1261), reasoning: Some(1024), cached: Some(64) }
+            UsageCounts { prompt: Some(75), completion: Some(1186), total: Some(1261), reasoning: Some(1024), cached: Some(64), cache_write: None }
         );
         let via_serde: UsageCounts = serde_json::from_value(v).unwrap();
         assert_eq!(via_serde, c, "serde and the direct read are the same parse");
@@ -333,9 +352,32 @@ mod tests {
         assert_eq!(UsageCounts::of_reply(&serde_json::json!({"choices": []})), UsageCounts::default());
     }
 
+    /// (#3168) Cache writes are billed apart from uncached input and from
+    /// reads, so they are their own count on both dialects.
+    #[test]
+    fn cache_writes_are_their_own_count_on_both_dialects() {
+        let m = UsageCounts::from_messages_usage(&serde_json::json!({
+            "input_tokens": 4, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 17_610, "output_tokens": 9,
+        }));
+        assert_eq!((m.prompt, m.cached, m.cache_write), (Some(17_714), Some(17_610), Some(100)), "prompt still counts every input token");
+        let no_write = UsageCounts::from_messages_usage(&serde_json::json!({"input_tokens": 4, "output_tokens": 1}));
+        assert_eq!(no_write.cache_write, None, "an unsent count is unreported, not zero");
+        let chat = UsageCounts::from_provider(&serde_json::json!({
+            "prompt_tokens": 50, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 12},
+        }));
+        assert_eq!((chat.cached, chat.cache_write), (Some(30), Some(12)));
+        assert_eq!(UsageCounts::from_provider(&serde_json::json!({"prompt_tokens": 1})).cache_write, None);
+        let mut s = TokenSum::default();
+        s.add(&UsageCounts { prompt: Some(1), ..Default::default() });
+        assert_eq!(s.cache_write, None, "no call reported a write");
+        s.add(&m);
+        s.add(&UsageCounts { cache_write: Some(5), ..Default::default() });
+        assert_eq!(s.cache_write, Some(105));
+    }
+
     #[test]
     fn a_recorded_usage_block_carries_exactly_the_reported_counts() {
-        let c = UsageCounts { prompt: Some(10), total: Some(12), cached: Some(4), ..Default::default() };
+        let c = UsageCounts { prompt: Some(10), total: Some(12), cached: Some(4), cache_write: Some(3), ..Default::default() };
         let u = Usage::from(&c);
         assert_eq!(u.counts(), c, "recording and reading back are inverse");
         assert_eq!(u.completion_tokens, None, "an unreported count is recorded as unreported");

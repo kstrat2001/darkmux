@@ -16,6 +16,18 @@ darkmux release.
 
 ### Added
 
+- **A usage record counts cache writes on their own** (#3168). The four
+  classes a cached Claude call bills (uncached input, cache writes, cache reads,
+  output) are priced differently: on Sonnet 5.5, a write costs 1.25x an uncached
+  input token and a read 0.05x. Writes were folded into `prompt_tokens`, so a
+  cached run could not be priced from its records. The usage record
+  (`telemetry.tokens`) and a trajectory event's `usage` block now carry
+  `cache_write_tokens`, read from the Messages API's
+  `cache_creation_input_tokens`, or from `prompt_tokens_details.cache_write_tokens`
+  on an OpenAI-compatible reply. Like `cached_tokens`, it is a part of
+  `prompt_tokens`, and it is written only when the provider reports it. This
+  is part of flow schema 2.2.0, still unreleased, so there is no separate bump.
+
 - **Prompt caching on Claude endpoints: the `messages` dialect** (#3162). An
   endpoint declaring `"dialect": "messages"` is sent Anthropic's native
   Messages API at `{url}/messages` instead of the OpenAI-compatible

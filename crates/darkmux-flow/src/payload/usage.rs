@@ -133,6 +133,11 @@ pub struct UsagePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub cached_tokens: Option<u64>,
+    /// (#3168) Prompt tokens written to the provider's cache, a part of
+    /// `prompt_tokens` billed apart from uncached input and from reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub cache_write_tokens: Option<u64>,
     /// The runtime turn, on a `turn` record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]

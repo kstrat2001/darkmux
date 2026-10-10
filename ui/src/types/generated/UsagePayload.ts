@@ -56,6 +56,11 @@ total_tokens?: number,
  */
 reasoning_tokens?: number, cached_tokens?: number, 
 /**
+ * (#3168) Prompt tokens written to the provider's cache, a part of
+ * `prompt_tokens` billed apart from uncached input and from reads.
+ */
+cache_write_tokens?: number, 
+/**
  * The runtime turn, on a `turn` record.
  */
 turn_seq?: number, 
