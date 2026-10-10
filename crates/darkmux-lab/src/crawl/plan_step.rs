@@ -217,7 +217,7 @@ pub fn plan_one_rule(cfg: &PlanStepConfig) -> Result<Plan> {
     // `plan_with_params` below reads every file in the trees it names. The
     // binding must therefore stay alive across that call — dropping it
     // early would let a peer `plan.sites` step (8-wide since #2397) tear
-    // `<root>/tree/<id>` down mid-walk, and `plan.rs` records the resulting
+    // `<root>/tree/<snapshot>/<id>` down mid-walk (a rebuild of a dirty one), and `plan.rs` records the resulting
     // read errors as `skipped` rather than failing: a silent under-report.
     let materialized = materialize(&spec, MaterializeOptions { fetch: cfg.fetch, read_only: true })
         .with_context(|| format!("materializing workspace '{}'", spec.effective_name()))?;

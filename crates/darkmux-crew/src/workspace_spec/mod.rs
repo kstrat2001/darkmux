@@ -37,7 +37,7 @@ pub mod glob;
 mod materialize;
 
 pub use materialize::{
-    materialize, MaterializeOptions, Materialized, MaterializedSource, SkippedFile, WorkspaceLock,
+    materialize, tree_head, MaterializeOptions, Materialized, MaterializedSource, SkippedFile, WorkspaceLock,
 };
 
 use anyhow::{bail, Context, Result};

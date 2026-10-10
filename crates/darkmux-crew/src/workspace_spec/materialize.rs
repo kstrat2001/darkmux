@@ -4,8 +4,20 @@
 //!
 //! Git mechanics: a bare mirror per source at `<root>/mirror/<id>.git`
 //! (cloned once, `git fetch --prune`d on later resolves when `fetch` is
-//! requested), then a DETACHED worktree at `<root>/tree/<id>` checked out
-//! at the ref's resolved sha, optionally made read-only. Moved UNCHANGED
+//! requested), then a DETACHED worktree at `<root>/tree/<snapshot>/<id>`
+//! checked out at the ref's resolved sha, optionally made read-only.
+//!
+//! **One snapshot per set of shas (#3188).** `<snapshot>` is a digest of
+//! every source's `(id, sha)` ([`snapshot_key`]), so two missions that
+//! materialize one source at different shas get two directories and
+//! neither can move the other's checkout; the same shas share one. It
+//! replaced a single `<root>/tree/<id>` per source, which two `review`
+//! missions launched at once both recorded, each with its own sha, so one
+//! reviewed the other's commit. Each snapshot is leased for the life of
+//! the process that materialized it ([`take_snapshot_lease`]), and every
+//! materialize prunes the snapshots nobody leases
+//! ([`prune_unleased_snapshots`] states the rule). A consumer checks a
+//! tree with [`tree_head`] before trusting the sha a plan recorded for it. Moved UNCHANGED
 //! from `darkmux_lab::crawl::sources` (#1959 packet 1's `sources::resolve`)
 //! — same containment guards, same shell-out-to-`git` approach, same
 //! every test. The one behavior change: `read_only` is now a caller
@@ -216,12 +228,36 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
         .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
     let lock = WorkspaceLock::acquire(&canon_root)?;
 
-    let sources: Vec<MaterializedSource> = spec
+    // (#3188) Mirror work first: every source's sha is resolved before any
+    // tree is touched, because the shas name the snapshot the trees go in.
+    let resolved: Vec<ResolvedSource> = spec
         .sources
         .iter()
         .zip(gens_before)
-        .map(|(s, gen_before)| resolve_one(s, &mirror_root, &tree_root, opts, gen_before))
+        .map(|(s, gen_before)| resolve_one(s, &mirror_root, opts, gen_before))
         .collect::<Result<_>>()?;
+
+    // (#3188) One snapshot directory per set of (source, sha) pairs:
+    // `<root>/tree/<key>/<source id>`. Two missions at different shas get
+    // two directories, so neither can move the other's checkout; two at the
+    // same shas share one. The lease is taken BEFORE the checkout and
+    // before the prune, both still under the workspace lock, so no peer's
+    // prune can ever see this snapshot unleased.
+    let key = snapshot_key(&resolved);
+    let snapshot = contained_child(&tree_root, &key).context("resolving the snapshot dir")?;
+    refuse_symlinked_dir(&snapshot)?;
+    fs::create_dir_all(&snapshot)
+        .with_context(|| format!("creating snapshot dir {}", snapshot.display()))?;
+    take_snapshot_lease(&tree_root, &key)?;
+
+    let sources: Vec<MaterializedSource> = spec
+        .sources
+        .iter()
+        .zip(resolved)
+        .map(|(s, r)| checkout_one(s, &mirror_root, &snapshot, r, opts))
+        .collect::<Result<_>>()?;
+
+    prune_unleased_snapshots(&tree_root, &mirror_root);
 
     let include = spec.effective_include();
     let exclude = spec.effective_exclude();
@@ -368,15 +404,22 @@ fn no_hardlinks_flag(source: &SourceSpec) -> &'static [&'static str] {
     if source.path.is_some() { &[] } else { &["--no-hardlinks"] }
 }
 
+/// One source's mirror work, done: the mirror it lives in and the sha its
+/// ref resolved to (#3188 split this out of the checkout, which now needs
+/// every source's sha first to name the snapshot directory).
+struct ResolvedSource {
+    mirror_path: PathBuf,
+    sha: String,
+}
+
 fn resolve_one(
     source: &SourceSpec,
     mirror_root: &Path,
-    tree_root: &Path,
     opts: MaterializeOptions,
     // This call's fetch generation for this source, read BEFORE it blocked
     // on the workspace lock (#2399).
     gen_before: u64,
-) -> Result<MaterializedSource> {
+) -> Result<ResolvedSource> {
     let fetch = opts.fetch;
     let origin = source
         .origin()
@@ -430,14 +473,12 @@ fn resolve_one(
             source.id
         );
     }
-    // Compute both paths through the containment guard ONCE, up front, so
-    // neither the clone nor the worktree checkout below can run against an
-    // escaping path in the first place (#1959 second-round finding,
-    // carried over from `crawl::sources`).
+    // Compute the mirror path through the containment guard ONCE, up
+    // front, so the clone below can never run against an escaping path
+    // (#1959 second-round finding, carried over from `crawl::sources`);
+    // `checkout_one` does the same for the tree path.
     let mirror_path = contained_child(mirror_root, &format!("{}.git", source.id))
         .with_context(|| format!("resolving mirror path for source '{}'", source.id))?;
-    let tree_path = contained_child(tree_root, &source.id)
-        .with_context(|| format!("resolving tree path for source '{}'", source.id))?;
 
     // (#2399) The mirror is darkmux-owned cache state, so an existing one
     // is VERIFIED before it is trusted — bare, and pointing at the origin
@@ -553,12 +594,29 @@ fn resolve_one(
         );
     }
     let sha = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
+    Ok(ResolvedSource { mirror_path, sha })
+}
+
+/// Check one resolved source out, detached, at `<snapshot>/<source id>`
+/// (#3188). Reuses a pristine checkout already there; rebuilds anything
+/// else.
+fn checkout_one(
+    source: &SourceSpec,
+    mirror_root: &Path,
+    snapshot: &Path,
+    resolved: ResolvedSource,
+    opts: MaterializeOptions,
+) -> Result<MaterializedSource> {
+    let ResolvedSource { mirror_path, sha } = resolved;
+    let git_ref = source.resolved_ref();
+    let tree_path = contained_child(snapshot, &source.id)
+        .with_context(|| format!("resolving tree path for source '{}'", source.id))?;
 
     if tree_path.exists() {
         // Belt-and-suspenders backstop right before the destructive ops
         // that follow, independent of `WorkspaceSpec::validate`'s id-shape
         // check and `contained_child` above.
-        assert_direct_child(tree_root, &tree_path, &format!("tree path for source '{}'", source.id))?;
+        assert_direct_child(snapshot, &tree_path, &format!("tree path for source '{}'", source.id))?;
         assert_direct_child(mirror_root, &mirror_path, &format!("mirror path for source '{}'", source.id))?;
         // (#2399 review) A tree that is already this mirror's worktree, at
         // this exact sha, with nothing modified or added, is byte-identical
@@ -777,6 +835,176 @@ impl WorkspaceLock {
     fn acquire(_root: &Path) -> Result<Self> {
         Ok(Self { not_send: PhantomData })
     }
+}
+
+/// (#3188) The snapshot directory name for one set of resolved sources:
+/// the first 16 hex digits of a blake3 digest over each `(id, sha)` pair,
+/// in spec order. Equal pairs give equal keys, so the same shas reuse one
+/// snapshot; any differing sha gives a different directory.
+fn snapshot_key(resolved: &[ResolvedSource]) -> String {
+    let mut h = blake3::Hasher::new();
+    for r in resolved {
+        // The mirror's file name is `<source id>.git`: the id is part of the
+        // key, so two sources swapping shas never collide.
+        h.update(r.mirror_path.file_name().map(|n| n.as_encoded_bytes()).unwrap_or_default());
+        h.update(b"\0");
+        h.update(r.sha.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
+
+/// The lease file beside a snapshot: `<root>/tree/<key>.lease`. Beside it,
+/// never inside it, because the snapshot directory is what a unit mounts.
+fn lease_path(tree_root: &Path, key: &str) -> PathBuf {
+    tree_root.join(format!("{key}.lease"))
+}
+
+/// Process-lifetime leases, one open file per snapshot this process has
+/// materialized (#3188). Each holds a SHARED `flock` on the snapshot's
+/// lease file; the kernel drops it when the process exits, crash included.
+#[cfg(unix)]
+fn held_leases() -> &'static Mutex<HashMap<PathBuf, fs::File>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, fs::File>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// (#3188) Mark a snapshot in use for the rest of this process's life: a
+/// shared `flock` on its lease file, kept open in [`held_leases`]. A
+/// mission is one `darkmux mission launch` process, so the lease lasts
+/// exactly as long as the mission whose plan recorded the snapshot, and
+/// every unit of that mission can still read it. Called only under the
+/// workspace lock, which every pruner also holds, so taking it never races
+/// a prune of the same snapshot.
+#[cfg(unix)]
+fn take_snapshot_lease(tree_root: &Path, key: &str) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let path = lease_path(tree_root, key);
+    let mut held = held_leases().lock().unwrap_or_else(|e| e.into_inner());
+    if held.contains_key(&path) {
+        return Ok(());
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening snapshot lease {}", path.display()))?;
+    loop {
+        // SAFETY: `file` owns the fd for the whole call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow::Error::new(err).context(format!("leasing snapshot {}", path.display())));
+        }
+    }
+    held.insert(path, file);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn take_snapshot_lease(_tree_root: &Path, _key: &str) -> Result<()> {
+    Ok(())
+}
+
+/// True when no live process holds `lease`, proved by taking an exclusive
+/// non-blocking `flock` on it. The returned file keeps that lock until it is
+/// dropped, so a caller deletes the snapshot while still holding it.
+#[cfg(unix)]
+fn try_claim_unleased(lease: &Path) -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(lease).ok()?;
+    // SAFETY: `file` owns the fd for the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    (rc == 0).then_some(file)
+}
+
+/// Off Unix there are no leases, so nothing is ever provably unused and
+/// nothing is pruned.
+#[cfg(not(unix))]
+fn try_claim_unleased(_lease: &Path) -> Option<fs::File> {
+    None
+}
+
+/// (#3188) **The cleanup rule.** Every materialize of a workspace removes
+/// each OTHER directory under `<root>/tree` that no live process holds a
+/// lease on: snapshots whose missions have ended (or crashed), and the
+/// pre-#3188 single `<root>/tree/<source>` checkouts, which never had a
+/// lease. A snapshot a running mission recorded is leased by that
+/// mission's process and is never removed. So at rest a workspace holds
+/// one snapshot (the newest), and while missions run it holds one per
+/// distinct set of shas in flight.
+///
+/// Runs under the workspace lock. Best effort: a directory that cannot be
+/// removed is named on stderr and left for the next materialize, never an
+/// error for this one, whose own snapshot is already complete. Symlinks
+/// are never followed or removed (darkmux never makes one here).
+fn prune_unleased_snapshots(tree_root: &Path, mirror_root: &Path) {
+    let Ok(entries) = fs::read_dir(tree_root) else { return };
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        // `file_type` does not follow symlinks: only real directories (and
+        // never a lease file) are candidates.
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let dir = entry.path();
+        let lease = lease_path(tree_root, &name);
+        // The snapshot this call just materialized is leased by this very
+        // process, so the claim fails on it like on any other live one.
+        let Some(_claim) = try_claim_unleased(&lease) else { continue };
+        // Checkouts are made read-only; restore write access so they can go.
+        let _ = make_tree_writable(&dir);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                removed_any = true;
+                let _ = fs::remove_file(&lease);
+            }
+            Err(e) => eprintln!(
+                "darkmux: could not prune unused workspace snapshot {}: {e} — it is left for the next materialize",
+                dir.display()
+            ),
+        }
+    }
+    if removed_any {
+        // The removed checkouts were worktrees; drop their stale entries
+        // from each mirror's worktree list.
+        if let Ok(mirrors) = fs::read_dir(mirror_root) {
+            for m in mirrors.flatten() {
+                let path = m.path();
+                if path.extension().is_some_and(|e| e == "git") && path.is_dir() {
+                    let _ = Command::new("git").current_dir(&path).args(["worktree", "prune"]).output();
+                }
+            }
+        }
+    }
+}
+
+/// (#3188) The commit a materialized checkout actually holds — `git
+/// rev-parse HEAD` run inside `tree` — or `None` when `tree` is not a
+/// checkout at all. `GIT_CEILING_DIRECTORIES` is set to `tree`'s parent so
+/// a plain directory never reports the HEAD of some repository above it.
+///
+/// This is what a consumer checks right before it reads a tree a plan
+/// recorded: the plan's sha is a claim about the tree, this is the tree.
+pub fn tree_head(tree: &Path) -> Option<String> {
+    let ceiling = tree.parent().unwrap_or(tree);
+    let out = Command::new("git")
+        .current_dir(tree)
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// True when `tree_path` is ALREADY this mirror's worktree, checked out at
@@ -2588,6 +2816,181 @@ mod tests {
             !escape.path().join("pwned").exists(),
             "refused, but the escape path was created anyway: {msg}"
         );
+    }
+
+
+    // ── #3188: one materialized tree per (source, sha) ──────────────────
+
+    /// Commit `a.txt` = `body` on `main` in `repo`, returning the new sha.
+    fn commit_a(repo: &Path, body: &str) -> String {
+        let git = |args: &[&str]| {
+            let out = Command::new("git").current_dir(repo).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        fs::write(repo.join("a.txt"), body).unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", body.trim()]);
+        git(&["rev-parse", "HEAD"])
+    }
+
+    /// (#3188) The live failure: two `review` missions launched at once
+    /// for two PRs of ONE repository. Both plans recorded
+    /// `<root>/tree/<source>`, each with its own sha, and one checkout can
+    /// hold only one of them, so the second mission's units read the first
+    /// mission's code. Two materializations of one source at different
+    /// shas, both still live, must each read their own file contents.
+    #[test]
+    fn two_live_materializations_of_one_source_at_different_shas_each_read_their_own_contents() {
+        let source = init_source_repo();
+        let sha_one = commit_a(source.path(), "one\n");
+        let sha_two = commit_a(source.path(), "two\n");
+        let workdir = TempDir::new().unwrap();
+        let spec_one = spec_for("t-3188", workdir.path(), source.path(), &sha_one);
+        let spec_two = spec_for("t-3188", workdir.path(), source.path(), &sha_two);
+
+        // Each mission keeps only what its plan records — the sha and the
+        // tree path — and drops the `Materialized` (and its lock) right
+        // after planning, exactly as `crawl.plan`/`plan.sites` do.
+        let (tree_one, recorded_one) = {
+            let m = materialize(&spec_one, RO).unwrap();
+            (m.sources[0].tree.clone(), m.sources[0].sha.clone())
+        };
+        let (tree_two, recorded_two) = {
+            let m = materialize(&spec_two, RO).unwrap();
+            (m.sources[0].tree.clone(), m.sources[0].sha.clone())
+        };
+        assert_eq!(recorded_one, sha_one);
+        assert_eq!(recorded_two, sha_two);
+
+        assert_eq!(
+            fs::read_to_string(tree_one.join("a.txt")).unwrap(),
+            "one\n",
+            "mission one's tree must still hold mission one's sha after mission two materialized: {}",
+            tree_one.display()
+        );
+        assert_eq!(fs::read_to_string(tree_two.join("a.txt")).unwrap(), "two\n");
+        assert_eq!(tree_head(&tree_one).as_deref(), Some(sha_one.as_str()));
+        assert_eq!(tree_head(&tree_two).as_deref(), Some(sha_two.as_str()));
+    }
+
+    /// (#3188) The same sha materialized twice reuses one tree rather than
+    /// growing a second copy.
+    #[test]
+    fn the_same_sha_materialized_twice_reuses_one_tree() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-3188-reuse", workdir.path(), source.path(), "main");
+        let first = materialize(&spec, RO).unwrap().sources[0].tree.clone();
+        let second = materialize(&spec, RO).unwrap().sources[0].tree.clone();
+        assert_eq!(first, second, "one sha, one tree");
+        let snapshots: Vec<_> = fs::read_dir(workdir.path().join("tree"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert_eq!(snapshots.len(), 1, "exactly one snapshot dir: {snapshots:?}");
+    }
+
+    /// (#3188) Concurrency on the mirror: two threads materializing ONE
+    /// source at two different shas at the same instant both succeed, leave
+    /// one healthy mirror, and each reads its own contents.
+    #[test]
+    fn concurrent_materializations_at_different_shas_share_one_healthy_mirror() {
+        let source = init_source_repo();
+        let sha_one = commit_a(source.path(), "one\n");
+        let sha_two = commit_a(source.path(), "two\n");
+        let workdir = TempDir::new().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [sha_one.clone(), sha_two.clone()]
+            .into_iter()
+            .map(|sha| {
+                let spec = spec_for("t-3188-race", workdir.path(), source.path(), &sha);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    materialize(&spec, RO).map(|m| m.sources[0].tree.clone())
+                })
+            })
+            .collect();
+        let trees: Vec<PathBuf> =
+            handles.into_iter().map(|h| h.join().unwrap().unwrap_or_else(|e| panic!("{e:#}"))).collect();
+        assert_eq!(fs::read_to_string(trees[0].join("a.txt")).unwrap(), "one\n");
+        assert_eq!(fs::read_to_string(trees[1].join("a.txt")).unwrap(), "two\n");
+        assert!(corrupt_siblings(workdir.path()).is_empty());
+    }
+
+    /// (#3188) The cleanup rule: a materialize removes every OTHER snapshot
+    /// no live process holds a lease on — including a pre-#3188
+    /// `<root>/tree/<source>` checkout — and keeps every leased one.
+    #[test]
+    fn materialize_prunes_unleased_snapshots_and_keeps_leased_ones() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let tree_root = workdir.path().join("tree");
+        // A snapshot some OTHER live process still holds: its lease file
+        // carries a shared flock on a description this test owns.
+        let held = tree_root.join("0123456789abcdef");
+        fs::create_dir_all(held.join("app")).unwrap();
+        fs::write(held.join("app/held.txt"), "x").unwrap();
+        let held_lease = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(tree_root.join("0123456789abcdef.lease"))
+            .unwrap();
+        {
+            use std::os::unix::io::AsRawFd;
+            assert_eq!(unsafe { libc::flock(held_lease.as_raw_fd(), libc::LOCK_SH) }, 0);
+        }
+        // A snapshot whose holder is gone (lease file present, no flock),
+        // and the old single-tree layout's checkout.
+        let orphan = tree_root.join("fedcba9876543210");
+        fs::create_dir_all(orphan.join("app")).unwrap();
+        fs::write(tree_root.join("fedcba9876543210.lease"), "").unwrap();
+        let old_layout = tree_root.join("app");
+        fs::create_dir_all(&old_layout).unwrap();
+        fs::write(old_layout.join("stale.txt"), "x").unwrap();
+
+        let spec = spec_for("t-3188-prune", workdir.path(), source.path(), "main");
+        let m = materialize(&spec, RO).unwrap();
+
+        assert!(held.join("app/held.txt").exists(), "a leased snapshot must survive a prune");
+        assert!(!orphan.exists(), "an unleased snapshot must be pruned");
+        assert!(!tree_root.join("fedcba9876543210.lease").exists(), "its lease file goes with it");
+        assert!(!old_layout.exists(), "the pre-#3188 single tree must be pruned");
+        assert!(m.sources[0].tree.join("a.txt").exists(), "the new snapshot is untouched");
+        // Exactly two snapshots and their two leases remain: nothing else,
+        // and never a lease of a lease file.
+        let new_key = m.sources[0].tree.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+        let mut left: Vec<String> =
+            fs::read_dir(&tree_root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        let mut expected = vec![
+            "0123456789abcdef".to_string(),
+            "0123456789abcdef.lease".to_string(),
+            new_key.clone(),
+            format!("{new_key}.lease"),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        drop(held_lease);
+    }
+
+    /// (#3188) The unit-time check: `tree_head` reports the checkout's real
+    /// HEAD, so a caller can refuse a tree that no longer holds its sha.
+    #[test]
+    fn tree_head_reports_the_checkout_sha_and_none_for_a_plain_directory() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-3188-head", workdir.path(), source.path(), "main");
+        let m = materialize(&spec, RO).unwrap();
+        assert_eq!(tree_head(&m.sources[0].tree).as_deref(), Some(m.sources[0].sha.as_str()));
+        // A plain directory INSIDE a repository: git would climb to the
+        // repository above and report its HEAD without the ceiling.
+        let plain = source.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(tree_head(&plain), None, "a non-checkout has no HEAD, never a parent's");
     }
 
 }
