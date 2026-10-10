@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.0.0)
+#   brew install darkmux                # stable release (v5.1.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,11 +17,10 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.0.0, a breaking release: a retired config key, setting
-  # value or environment variable is refused, naming its replacement, and
-  # `darkmux doctor` names each one to fix. See CHANGELOG.md.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.0.0.tar.gz"
-  sha256 "a1f910044145d66e5467c254c472d6d40e3233a40d89bfbf731443055a979bb4"
+  # Stable release: v5.1.0, Claude endpoints cached by default (prompt caching on
+  # every turn of the agent loop). See CHANGELOG.md.
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.1.0.tar.gz"
+  sha256 "933a2c4b010d8eebe26b7cb12a499243e0d2b34bf82143dd59a0ad08b80e60ca"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
