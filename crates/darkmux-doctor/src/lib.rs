@@ -14718,6 +14718,52 @@ mod tests {
         );
     }
 
+    /// (#2533) Doctor and the spawn must agree on a RELATIVE `lms_bin`.
+    /// Every `lms` spawn pins its cwd to `/` (#1863), and `std::process`
+    /// does `chdir` before `exec`, so a relative program path resolved
+    /// against `/` and every dispatch failed with "not found", while this
+    /// check resolved the same string against the process cwd and said
+    /// PASS. The fix resolves a relative path-bearing value once, in the
+    /// accessor both sides read, so this test runs BOTH from one cwd: the
+    /// doctor row and a real `lms ps --json` spawn through the fake.
+    #[serial_test::serial]
+    #[test]
+    fn check_lms_binary_and_the_spawn_agree_on_a_relative_lms_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        let fake = dir.path().join("bin").join("lms");
+        std::fs::write(&fake, "#!/bin/sh\necho '[]'\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let prev_lms_bin = std::env::var("DARKMUX_LMS_BIN").ok();
+        let prev_cwd = std::env::current_dir().unwrap();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "./bin/lms") };
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let check = check_lms_binary();
+        let spawned = lms::list_loaded();
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        unsafe {
+            match prev_lms_bin {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        let spawned = spawned.map_err(|e| format!("{e:#}"));
+        assert_eq!(
+            spawned.as_ref().map(Vec::len),
+            Ok(0),
+            "doctor said PASS, so the spawn must reach the same binary: {spawned:?}"
+        );
+    }
+
     #[test]
     fn parse_major_minor_accepts_two_part_versions_and_rejects_garbage() {
         assert_eq!(parse_major_minor("1.1"), Some((1, 1)));

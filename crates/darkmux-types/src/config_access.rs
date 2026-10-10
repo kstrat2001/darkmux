@@ -480,9 +480,31 @@ pub fn lms_bin() -> String {
 /// `darkmux doctor`'s "lms binary" row names the tier so an operator whose
 /// `config.lms_bin` is set doesn't have to guess why the row differs from a
 /// bare `lms` lookup.
+///
+/// (#2533) A relative value that names a path (`./bin/lms`, `bin/lms`) is
+/// anchored here to this process's working directory, so the string every
+/// consumer gets is absolute. Every `lms` spawn pins its cwd to `/` (#1863)
+/// and `std::process` does `chdir` before `exec`, so a relative program
+/// path would otherwise resolve against `/` at spawn time while
+/// `darkmux doctor` resolved it against the process cwd and said PASS.
+/// Anchoring once, in the one accessor both read, makes them agree. A bare
+/// name (`lms`) stays a `PATH` lookup.
 pub fn lms_bin_with_source() -> (String, Source) {
     let (v, s) = pick_string_with_source("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms"));
-    (v.unwrap(), s)
+    let cwd = std::env::current_dir().ok();
+    (anchor_program_path(v.unwrap(), cwd.as_deref()), s)
+}
+
+/// Joins a relative, path-bearing program value onto `cwd`; an absolute
+/// path, a bare name, or a missing `cwd` passes through unchanged. Pure, so
+/// the rule is testable without touching the process cwd.
+fn anchor_program_path(value: String, cwd: Option<&std::path::Path>) -> String {
+    // `Path::join` with an absolute argument returns that argument, so an
+    // absolute value needs no separate branch.
+    match cwd {
+        Some(cwd) if value.contains('/') => cwd.join(&value).to_string_lossy().into_owned(),
+        _ => value,
+    }
 }
 /// The LMStudio **base** URL (`scheme://host:port`), resolving
 /// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`.
@@ -2968,6 +2990,22 @@ mod tests {
         assert_eq!(pick_string_with_source(k, Some("c"), Some("d")), (Some("c".to_string()), Source::Config));
         unsafe { std::env::remove_var(k); }
         assert_eq!(pick_string_with_source(k, None, None), (None, Source::BuiltIn));
+    }
+
+    // ── (#2533) a relative, path-bearing `lms_bin` is anchored to the cwd
+    //    of the process that resolves it, ONCE, so every `lms` spawn (whose
+    //    cwd is pinned to `/`, #1863) and doctor's check see the same file.
+    #[test]
+    fn a_relative_lms_bin_is_anchored_to_the_resolving_cwd() {
+        let cwd = std::path::Path::new("/work/tree");
+        assert_eq!(anchor_program_path("./bin/lms".into(), Some(cwd)), "/work/tree/./bin/lms");
+        assert_eq!(anchor_program_path("bin/lms".into(), Some(cwd)), "/work/tree/bin/lms");
+        // An absolute path and a bare PATH-searched name pass through untouched.
+        assert_eq!(anchor_program_path("/opt/lms".into(), Some(cwd)), "/opt/lms");
+        assert_eq!(anchor_program_path("lms".into(), Some(cwd)), "lms");
+        // No readable cwd (deleted worktree): nothing to anchor to, so the
+        // value passes through rather than being invented.
+        assert_eq!(anchor_program_path("./bin/lms".into(), None), "./bin/lms");
     }
 
     // (#2498) `pick_string` and `pick_string_with_source` are two
