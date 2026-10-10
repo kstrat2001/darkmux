@@ -52,6 +52,15 @@ darkmux release.
 
 ### Changed
 
+- **Test output prints what failed, not every pass** (#3134). nextest's
+  default profile now prints a line only for a test that failed, retried or ran
+  slow, then the summary, and each failure's output once, at the end. CI's
+  profile inherits this. Measured on the `t-fast` crates: a green run went from
+  about 1,200 lines to 6, and a red run (eight failures) from 1,203 to 211, with
+  every panic message still shown. The plain `cargo test` steps in CI and
+  release-verify run with `-q`. `scripts/ci-failures.py <run-id>` prints only a
+  failed run's failing-test blocks: one run's 12,183 log lines became 4.
+
 - **The console redacts for remote viewers instead of refusing them.** In
   5.0.0, `doctor`, `config-list` and `flow-status` were served only to this
   machine or a token holder. Now no console panel is refused for being remote. A caller that is neither

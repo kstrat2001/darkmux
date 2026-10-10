@@ -38,6 +38,16 @@ retries = 1
 # Print the slowest tests so creeping slowness is visible before it bites.
 final-status-level = "slow"
 
+# (#3134) Quiet by default: the binaries run 900-2,400 tests each, and a PASS
+# line per test was thousands of lines that every reader (an agent above all)
+# paid for and needed none of. A run now prints a line only for a test that
+# failed, retried or ran slow, then the summary; a failing test's captured
+# output comes once, at the end. `ci` inherits all three. `--status-level
+# pass` on the command line brings the per-test lines back.
+status-level = "retry"
+success-output = "never"
+failure-output = "final"
+
 [profile.ci]
 # CI is the ship gate: no retries, so a flake fails the build instead of being
 # papered over. Same hang protection, same no-fail-fast reporting.
