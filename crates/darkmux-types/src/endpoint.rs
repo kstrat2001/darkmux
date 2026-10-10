@@ -60,6 +60,9 @@ pub enum ManagedBackend {
     /// LM Studio, loaded and unloaded through `lms`.
     Lmstudio,
 }
+/// (#3173) The host whose endpoints default to [`Dialect::Messages`].
+pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
+
 
 /// The request shape an endpoint accepts. Both are OpenAI-compatible chat
 /// completions; they differ in the fields around the messages, which are
@@ -659,10 +662,12 @@ impl ModelEndpoint {
         Ok(kind)
     }
 
-    /// The request shape: declared, else the kind's default.
+    /// The request shape: declared, else `messages` for an Anthropic host
+    /// (#3173), else the kind's default.
     pub fn resolved_dialect(&self) -> Result<Dialect, EndpointError> {
         let kind = self.kind()?;
         match &self.dialect {
+            None if self.speaks_messages_by_host() => Ok(Dialect::Messages),
             None => Ok(kind.default_dialect()),
             Some(Lenient::Known(d)) => Ok(*d),
             Some(Lenient::Unrecognized(raw)) => Err(EndpointError(format!(
@@ -671,6 +676,15 @@ impl ModelEndpoint {
                 quoted_tokens::<Dialect>()
             ))),
         }
+    }
+
+    /// (#3173) An unmanaged endpoint on `api.anthropic.com` that declares no
+    /// dialect is sent Anthropic's native Messages API: the OpenAI-compatible
+    /// layer there neither caches nor reports caching, so every agent-loop
+    /// turn would pay full input price for the whole conversation again. The
+    /// host is matched exactly, never as a prefix. A declared dialect wins.
+    fn speaks_messages_by_host(&self) -> bool {
+        self.dialect.is_none() && self.host().as_deref() == Some(ANTHROPIC_API_HOST)
     }
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
@@ -729,7 +743,7 @@ impl ModelEndpoint {
     /// `messages` (#3162).
     fn fields_the_dialect_sends(&self, dialect: Dialect) -> Result<(), String> {
         let effort_unsent = matches!(dialect, Dialect::ChatCompletionsMaxTokens | Dialect::Messages);
-        if self.reasoning_effort.is_some() && self.dialect.is_some() && effort_unsent {
+        if self.reasoning_effort.is_some() && (self.dialect.is_some() || self.speaks_messages_by_host()) && effort_unsent {
             return Err(format!(
                 "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
                 dialect.as_str()
@@ -1125,6 +1139,25 @@ mod tests {
 
     /// (#3162) The `messages` dialect's URL is `{url}/messages`, and the two
     /// fields it never sends are refused beside it rather than dropped.
+    /// (#3173) An `api.anthropic.com` endpoint that declares no dialect is
+    /// sent the Messages API, the only way its prompt caching applies. A
+    /// declared dialect still wins, and other hosts keep the kind's default.
+    #[test]
+    fn an_anthropic_endpoint_with_no_dialect_speaks_messages() {
+        let ep = |url: &str, dialect: Option<Dialect>| ModelEndpoint { url: Some(url.into()), dialect: dialect.map(Into::into), ..Default::default() };
+        let claude = ep("https://api.anthropic.com/v1", None);
+        assert_eq!(claude.resolved_dialect().unwrap(), Dialect::Messages);
+        assert_eq!(claude.chat_url().unwrap(), "https://api.anthropic.com/v1/messages");
+        let declared = ep("https://api.anthropic.com/v1", Some(Dialect::ChatCompletions));
+        assert_eq!(declared.resolved_dialect().unwrap(), Dialect::ChatCompletions, "a declared dialect wins");
+        let other = ep("https://api.x.ai/v1", None);
+        assert_eq!(other.resolved_dialect().unwrap(), Dialect::ChatCompletions);
+        let lookalike = ep("https://api.anthropic.com.evil.example/v1", None);
+        assert_eq!(lookalike.resolved_dialect().unwrap(), Dialect::ChatCompletions, "the host, not a prefix");
+        let effort = ModelEndpoint { reasoning_effort: Some("high".into()), ..ep("https://api.anthropic.com/v1", None) };
+        assert!(effort.validate().is_err(), "an inferred `messages` refuses a field it never sends, as a declared one does");
+    }
+
     #[test]
     fn a_messages_endpoint_posts_to_messages_and_refuses_fields_it_cannot_send() {
         let claude = ModelEndpoint {

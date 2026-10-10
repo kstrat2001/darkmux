@@ -16,14 +16,19 @@ darkmux release.
 
 ### Added
 
-- **`darkmux doctor` warns about a Claude endpoint that runs uncached** (#3173).
-  An `api.anthropic.com` endpoint on the OpenAI-compatible layer neither caches
-  nor reports caching, so every turn of the agent loop pays full input price
-  for the whole conversation again. The `endpoints` row now warns, names each
-  such endpoint, and gives the edit (`"dialect": "messages"`) and the registry
-  file to make it in. The guide's endpoint example gains a cached Claude seat,
-  with its budget numbers left as placeholders. It also corrects a stale line:
-  an inline endpoint on a model is refused since 5.0, not still accepted.
+- **A Claude endpoint is cached by default** (#3173). An endpoint on
+  `api.anthropic.com` that declares no `dialect` now resolves to `messages`, so
+  it is sent Anthropic's native Messages API, and its prompt caching applies
+  without anyone knowing to ask for it. Before this, it ran on the
+  OpenAI-compatible layer, which neither caches nor reports caching, so every
+  turn of the agent loop paid full input price for the whole conversation
+  again. A declared dialect still wins. Declaring a non-`messages` one there
+  makes the `darkmux doctor` `endpoints` row warn, naming the endpoint, the
+  edit and the registry file. A `reasoning_effort` on such an endpoint is
+  refused, as it already was for a declared `messages`, because it would never
+  be sent. The guide's endpoint example gains a Claude seat, with its budget
+  numbers left as placeholders, and drops a stale line: an inline endpoint on a
+  model is refused since 5.0, not still accepted.
 
 - **A usage record counts cache writes on their own** (#3168). The four
   classes a cached Claude call bills (uncached input, cache writes, cache reads,
