@@ -77,6 +77,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-types/src/panel_audience.rs", ".keychain", 1, "the redaction table names the config key path `hooks.rules[].headers.*.keychain_item` to classify it as a credential pointer; it resolves no endpoint credential"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_completion_tokens\"", 1, "THE body builder, chat-completions dialect"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
+    ("crates/darkmux-crew/src/messages_wire.rs", "insert(\"max_tokens\"", 1, "THE body builder, messages dialect: chat_body's Messages branch, called only from there (#3162)"),
     ("crates/darkmux-types/src/endpoint.rs", "Lmstudio", 5, "the backend's own facts: the enum variant and its config_enum entry, its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),
     ("crates/darkmux-types/src/endpoint.rs", "\"lmstudio\"", 1, "the backend's serde/config spelling (the config_enum token)"),
     ("crates/darkmux-types/src/lib.rs", "Lmstudio", 1, "a model that names no endpoint is on the one managed backend darkmux has"),

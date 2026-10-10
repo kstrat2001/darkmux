@@ -33,6 +33,7 @@ mod feedback;
 mod interrupt;
 mod json_repair;
 mod lmstudio;
+mod messages_dialect;
 mod checkpoint;
 mod loop_runner;
 mod pace;
@@ -391,7 +392,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 }
                 Some((v, None)) => {
-                    eprintln!("--dialect must be `chat-completions` or `chat-completions-max-tokens` (got {v:?})");
+                    eprintln!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})");
                     return ExitCode::from(2);
                 }
                 None => {

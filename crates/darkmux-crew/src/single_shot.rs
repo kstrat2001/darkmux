@@ -161,6 +161,7 @@ pub fn chat_body(b: &ChatBody) -> serde_json::Value {
                 obj.insert("reasoning_effort".into(), effort.into());
             }
         }
+        Dialect::Messages => return crate::messages_wire::body(b.model, &b.messages, b.max_tokens),
         Dialect::ChatCompletionsMaxTokens => {
             if let Some(t) = b.temperature {
                 obj.insert("temperature".into(), serde_json::json!(t));

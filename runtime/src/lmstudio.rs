@@ -313,6 +313,9 @@ pub enum Dialect {
     ChatCompletions,
     /// `max_tokens`.
     ChatCompletionsMaxTokens,
+    /// (#3162) Anthropic's native Messages API, translated at this client's
+    /// boundary (`crate::messages_dialect`) so prompt caching works.
+    Messages,
 }
 
 impl Dialect {
@@ -321,6 +324,7 @@ impl Dialect {
         match s {
             "chat-completions" => Some(Dialect::ChatCompletions),
             "chat-completions-max-tokens" => Some(Dialect::ChatCompletionsMaxTokens),
+            "messages" => Some(Dialect::Messages),
             _ => None,
         }
     }
@@ -410,7 +414,7 @@ impl LmStudioClient {
     pub(crate) fn renames_cap(&self) -> bool {
         match self.dialect {
             Some(Dialect::ChatCompletions) => true,
-            Some(Dialect::ChatCompletionsMaxTokens) => false,
+            Some(Dialect::ChatCompletionsMaxTokens) | Some(Dialect::Messages) => false,
             None => self.is_remote_brain(),
         }
     }
@@ -442,6 +446,9 @@ impl LmStudioClient {
     /// `max_tokens` field, since this only fires when `chat_url_override`
     /// is set.
     fn request_body(&self, req: &ChatRequest) -> Result<serde_json::Value> {
+        if self.speaks_messages() {
+            return crate::messages_dialect::request_body(req, false);
+        }
         let mut body = serde_json::to_value(req)?;
         if self.renames_cap() {
             if let Some(obj) = body.as_object_mut() {
@@ -451,7 +458,19 @@ impl LmStudioClient {
         Ok(body)
     }
 
+    /// (#3162) True when this client speaks the Messages dialect.
+    fn speaks_messages(&self) -> bool {
+        self.dialect == Some(Dialect::Messages)
+    }
+
+    /// The auth header, plus the API version header the Messages dialect
+    /// requires on every request.
     fn apply_auth_header(&self, req: ureq::Request) -> ureq::Request {
+        let req = if self.speaks_messages() {
+            req.set("anthropic-version", crate::messages_dialect::ANTHROPIC_VERSION)
+        } else {
+            req
+        };
         match &self.auth_header {
             Some((name, value)) => req.set(name, value),
             None => req,
@@ -470,6 +489,10 @@ impl LmStudioClient {
         );
         let resp = send_capturing_error(request.send_json(body), "chat")?;
 
+        if self.speaks_messages() {
+            let reply: serde_json::Value = resp.into_json().context("parsing the messages reply as JSON")?;
+            return crate::messages_dialect::response(&reply);
+        }
         resp.into_json::<ChatResponse>()
             .context("parsing LMStudio chat response as JSON")
     }
@@ -488,13 +511,17 @@ impl LmStudioClient {
         req: &ChatRequest,
     ) -> Result<ChunkStream<BufReader<Box<dyn std::io::Read + Send + Sync>>>> {
         let resp = self.send_streaming(req)?;
-        Ok(ChunkStream::new(BufReader::new(resp.into_reader())))
+        Ok(self.chunk_stream(BufReader::new(resp.into_reader())))
     }
 
     /// The one streaming POST both entry points share.
     fn send_streaming(&self, req: &ChatRequest) -> Result<ureq::Response> {
         let url = self.effective_chat_url();
-        let body = build_streaming_request_body(req, self.renames_cap())?;
+        let body = if self.speaks_messages() {
+            crate::messages_dialect::request_body(req, true)?
+        } else {
+            build_streaming_request_body(req, self.renames_cap())?
+        };
         let request = self.apply_auth_header(
             self.agent
                 .post(&url)
@@ -511,8 +538,19 @@ impl LmStudioClient {
     pub fn chat_streaming_ticking(&self, req: &ChatRequest, tick: Duration) -> Result<TickingStream> {
         let resp = self.send_streaming(req)?;
         let closer = connection_handle(resp.local_addr(), resp.remote_addr());
-        let inner = ChunkStream::new(BufReader::new(resp.into_reader()));
+        let inner = self.chunk_stream(BufReader::new(resp.into_reader()));
         Ok(TickingStream::spawn(inner, tick).with_closer(closer))
+    }
+
+    /// The chunk stream over a reply body, translating Messages events
+    /// when this client speaks that dialect.
+    fn chunk_stream<R: BufRead>(&self, reader: R) -> ChunkStream<R> {
+        let stream = ChunkStream::new(reader);
+        if self.speaks_messages() {
+            stream.translating_messages()
+        } else {
+            stream
+        }
     }
 }
 
@@ -1055,11 +1093,46 @@ impl std::error::Error for StreamWentSilent {}
 pub struct ChunkStream<R: BufRead> {
     reader: R,
     done: bool,
+    /// (#3162) Set for the Messages dialect: each `data:` payload is a
+    /// Messages event, translated into a chunk (or skipped, or the end).
+    messages: Option<crate::messages_dialect::StreamTranslator>,
 }
 
 impl<R: BufRead> ChunkStream<R> {
     pub fn new(reader: R) -> Self {
-        Self { reader, done: false }
+        Self { reader, done: false, messages: None }
+    }
+
+    /// (#3162) Read the stream as Messages events.
+    pub fn translating_messages(mut self) -> Self {
+        self.messages = Some(Default::default());
+        self
+    }
+
+    /// One `data:` payload as the next item, or `None` to keep reading.
+    fn payload(&mut self, data: &str) -> Option<Result<ChatChunk>> {
+        use crate::messages_dialect::Translated;
+        let Some(t) = self.messages.as_mut() else {
+            return Some(serde_json::from_str::<ChatChunk>(data).map_err(|e| {
+                self.done = true;
+                anyhow!("SSE chunk parse failed: {e} — payload: {data}")
+            }));
+        };
+        let translated = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(|e| anyhow!("SSE event parse failed: {e} — payload: {data}"))
+            .and_then(|event| t.translate(&event));
+        match translated {
+            Ok(Translated::Chunk(c)) => Some(Ok(c)),
+            Ok(Translated::Skip) => None,
+            Ok(Translated::Done) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -1093,14 +1166,12 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                             self.done = true;
                             return None;
                         }
-                        match serde_json::from_str::<ChatChunk>(data) {
-                            Ok(chunk) => return Some(Ok(chunk)),
-                            Err(e) => {
-                                self.done = true;
-                                return Some(Err(anyhow!(
-                                    "SSE chunk parse failed: {e} — payload: {data}"
-                                )));
-                            }
+                        let data = data.to_string();
+                        if let Some(item) = self.payload(&data) {
+                            return Some(item);
+                        }
+                        if self.done {
+                            return None;
                         }
                     }
                     // Other SSE fields (event:, id:, retry:) are ignored.

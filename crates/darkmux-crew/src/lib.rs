@@ -182,6 +182,7 @@ pub mod sleep_assertion;
 // — see the module doc for the DependencyNode/is_ready/reachable/
 // run_step_graph shape.
 pub mod scheduler;
+pub(crate) mod messages_wire;
 pub mod single_shot;
 // (#2902 step 3) The one endpoint/model resolver.
 pub mod target;
