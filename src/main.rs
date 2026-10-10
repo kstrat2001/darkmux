@@ -1714,6 +1714,22 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
     }
 }
 
+/// `cmd_init`'s utility-model lines: the id init chose, why it left the
+/// binding as written or removed it, and the window it sized (#2053, #3020).
+fn print_init_utility_model(report: &init::InitReport, p: &std::path::Path) {
+    if let Some(id) = report.utility_model_filled.as_deref() {
+        println!("utility model: `{id}` (the registry named one LM Studio does not have; this is the closest downloaded match, edit {} to change)", p.display());
+    } else if let Some(reason) = report.utility_model_unfilled_reason.as_deref() {
+        println!("utility model: not verified. {reason}");
+    } else if let Some(reason) = report.utility_model_unregistered_reason.as_deref() {
+        println!("utility model: not registered. {reason}");
+    }
+    // (#3020) The shipped window, resized to what this machine can hold.
+    if let Some(n) = report.utility_model_n_ctx {
+        println!("utility model window: {n} tokens (sized from this machine's AI headroom; edit {} to change)", p.display());
+    }
+}
+
 fn cmd_init(
     with_hook: bool,
     with_claude_md: Option<std::path::PathBuf>,
@@ -1740,17 +1756,7 @@ fn cmd_init(
         } else if let Some(reason) = report.worker_model_unfilled_reason.as_deref() {
             println!("worker model: not set. {reason}");
         }
-        if let Some(id) = report.utility_model_filled.as_deref() {
-            println!("utility model: `{id}` (the registry named one LM Studio does not have; this is the closest downloaded match, edit {} to change)", p.display());
-        } else if let Some(reason) = report.utility_model_unfilled_reason.as_deref() {
-            println!("utility model: not verified. {reason}");
-        } else if let Some(reason) = report.utility_model_unregistered_reason.as_deref() {
-            println!("utility model: not registered. {reason}");
-        }
-        // (#3020) The shipped window, resized to what this machine can hold.
-        if let Some(n) = report.utility_model_n_ctx {
-            println!("utility model window: {n} tokens (sized from this machine's AI headroom; edit {} to change)", p.display());
-        }
+        print_init_utility_model(&report, p);
     }
     if let Some(p) = report.config_path.as_ref() {
         if report.config_already_present {

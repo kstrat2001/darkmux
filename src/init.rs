@@ -120,26 +120,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     //     init). A registry without the placeholder is never touched, so an
     //     operator's own edits outrank this every time.
     if !opts.dry_run && registry_path.exists() {
-        match fill_worker_model(&registry_path) {
-            Ok(Some(id)) => report.worker_model_filled = Some(id),
-            Ok(None) => {}
-            Err(reason) => report.worker_model_unfilled_reason = Some(reason),
-        }
-        // (#2053) The utility binding ships as a literal id too; on a machine
-        // whose key differs (publisher prefix, or no such model) the first
-        // dispatch warned about its compactor. Verify it the same way.
-        // (#3020) It also ships a window, sized here from the machine's AI
-        // headroom; a machine that cannot hold one registers no utility.
-        match fill_utility_model(&registry_path) {
-            Ok(Some(UtilityPlan::Bind { id, n_ctx })) => {
-                report.utility_model_filled = id;
-                report.utility_model_n_ctx = n_ctx;
-            }
-            Ok(Some(UtilityPlan::Unbind(reason))) => report.utility_model_unregistered_reason = Some(reason),
-            Ok(Some(UtilityPlan::Missing(reason))) => report.utility_model_unfilled_reason = Some(reason),
-            Ok(Some(UtilityPlan::Keep)) | Ok(None) => {}
-            Err(reason) => report.utility_model_unfilled_reason = Some(reason),
-        }
+        fill_models(&registry_path, &mut report);
     }
 
     // 2) Bootstrap the config file (#661). Same never-overwrite discipline as
@@ -194,6 +175,31 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     }
 
     Ok(report)
+}
+
+/// Steps 1b and 1c: fill the worker placeholder and verify the utility
+/// binding against what LM Studio has, recording each outcome on `report`.
+fn fill_models(registry_path: &Path, report: &mut InitReport) {
+    match fill_worker_model(registry_path) {
+        Ok(Some(id)) => report.worker_model_filled = Some(id),
+        Ok(None) => {}
+        Err(reason) => report.worker_model_unfilled_reason = Some(reason),
+    }
+    // (#2053) The utility binding ships as a literal id too; on a machine
+    // whose key differs (publisher prefix, or no such model) the first
+    // dispatch warned about its compactor. Verify it the same way.
+    // (#3020) It also ships a window, sized here from the machine's AI
+    // headroom; a machine that cannot hold one registers no utility.
+    match fill_utility_model(registry_path) {
+        Ok(Some(UtilityPlan::Bind { id, n_ctx })) => {
+            report.utility_model_filled = id;
+            report.utility_model_n_ctx = n_ctx;
+        }
+        Ok(Some(UtilityPlan::Unbind(reason))) => report.utility_model_unregistered_reason = Some(reason),
+        Ok(Some(UtilityPlan::Missing(reason))) => report.utility_model_unfilled_reason = Some(reason),
+        Ok(Some(UtilityPlan::Keep)) | Ok(None) => {}
+        Err(reason) => report.utility_model_unfilled_reason = Some(reason),
+    }
 }
 
 /// The fill-in-the-blank `profiles.example.json` ships in every worker slot.
@@ -545,37 +551,49 @@ fn worker_facts(registry_json: &str, available: &[darkmux_profiles::lms::ModelMe
     (bytes, floor)
 }
 
-fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityPlan>, String> {
-    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
-    let Some((vs, ve)) = utility_value_span(&text) else {
-        return Ok(None);
-    };
-    let current = text[vs..ve].to_string();
+/// The shipped binding's id, and its window when that is the shipped one
+/// too: `None` when there is no binding or the operator set its id by hand.
+fn shipped_utility_binding(text: &str) -> Option<(String, Option<u32>)> {
+    let (vs, ve) = utility_value_span(text)?;
+    let current = &text[vs..ve];
     // Only the value the example registry ships is init's to change. An
     // operator who set a utility id by hand, downloaded or not, keeps it.
     let shipped = utility_value_span(EXAMPLE_PROFILES_JSON).map(|(a, b)| &EXAMPLE_PROFILES_JSON[a..b]);
-    if shipped != Some(current.as_str()) {
-        return Ok(None);
+    if shipped != Some(current) {
+        return None;
     }
     // (#3020) Likewise the window: only the shipped one is init's to size.
     let window_of = |t: &str| utility_n_ctx_span(t).and_then(|(a, b)| t[a..b].parse::<u32>().ok());
     let shipped_window = window_of(EXAMPLE_PROFILES_JSON);
-    let window = window_of(&text).filter(|w| Some(*w) == shipped_window);
-    let available = match darkmux_profiles::lms::list_available() {
-        Ok(v) => v,
-        Err(_) => return Ok(None), // the worker fill already reported an unreachable lms
+    Some((current.to_string(), window_of(text).filter(|w| Some(*w) == shipped_window)))
+}
+
+/// The registry text after applying `plan`; `None` when nothing is written.
+fn apply_utility_plan(text: &str, current: &str, plan: &UtilityPlan) -> Option<String> {
+    match plan {
+        UtilityPlan::Keep | UtilityPlan::Missing(_) => None,
+        UtilityPlan::Bind { id, n_ctx } => set_utility_binding(text, id.as_deref().unwrap_or(current), *n_ctx),
+        UtilityPlan::Unbind(_) => remove_utility_binding(text),
+    }
+}
+
+fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityPlan>, String> {
+    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
+    let Some((current, window)) = shipped_utility_binding(&text) else {
+        return Ok(None);
+    };
+    // An unreachable lms was already reported by the worker fill.
+    let Ok(available) = darkmux_profiles::lms::list_available() else {
+        return Ok(None);
     };
     let (worker_bytes, floor) = worker_facts(&text, &available);
     let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
     let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
-    let filled = match &plan {
-        UtilityPlan::Keep => return Ok(None),
-        UtilityPlan::Missing(_) => return Ok(Some(plan)),
-        UtilityPlan::Bind { id, n_ctx } => set_utility_binding(&text, id.as_deref().unwrap_or(&current), *n_ctx),
-        UtilityPlan::Unbind(_) => remove_utility_binding(&text),
-    };
-    let Some(filled) = filled else { return Ok(None) };
-    fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    if let Some(filled) = apply_utility_plan(&text, &current, &plan) {
+        fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    } else if !matches!(plan, UtilityPlan::Missing(_)) {
+        return Ok(None);
+    }
     Ok(Some(plan))
 }
 
