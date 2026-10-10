@@ -14150,7 +14150,9 @@ fn init_without_a_usable_model_says_why_and_tells_the_operator_to_edit_the_regis
     fs::write(dm.join("profiles.json"), example.replace("<your-worker-model-id>", "mine")).unwrap();
     let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"toy","sizeBytes":500000000,"type":"llm"}]"#);
     let out = stdout_of(&init_in(&home, &dm, &lms, &[]));
-    assert!(out.contains("utility model: not verified. the registry's utility model `"), "{out}");
+    // (#3020) The shipped binding is removed, not left pointing at a model
+    // that is not there.
+    assert!(out.contains("utility model: not registered. the registry's utility model `"), "{out}");
     assert!(out.contains("is not downloaded and no LLM of at least 1 GB is"), "{out}");
     assert!(!out.contains("worker model:"), "{out}");
     assert!(!out.contains("Next steps:\n  1. Edit "), "the worker is set, so there is nothing to edit: {out}");
