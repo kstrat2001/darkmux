@@ -60,6 +60,9 @@ pub enum ManagedBackend {
     /// LM Studio, loaded and unloaded through `lms`.
     Lmstudio,
 }
+/// (#3173) The host whose endpoints default to [`Dialect::Messages`].
+pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
+
 
 /// The request shape an endpoint accepts. Both are OpenAI-compatible chat
 /// completions; they differ in the fields around the messages, which are
@@ -659,10 +662,12 @@ impl ModelEndpoint {
         Ok(kind)
     }
 
-    /// The request shape: declared, else the kind's default.
+    /// The request shape: declared, else `messages` for an Anthropic host
+    /// (#3173), else the kind's default.
     pub fn resolved_dialect(&self) -> Result<Dialect, EndpointError> {
         let kind = self.kind()?;
         match &self.dialect {
+            None if self.speaks_messages_by_host() => Ok(Dialect::Messages),
             None => Ok(kind.default_dialect()),
             Some(Lenient::Known(d)) => Ok(*d),
             Some(Lenient::Unrecognized(raw)) => Err(EndpointError(format!(
@@ -671,6 +676,24 @@ impl ModelEndpoint {
                 quoted_tokens::<Dialect>()
             ))),
         }
+    }
+
+    /// (#3173) An unmanaged endpoint on `api.anthropic.com` that declares no
+    /// dialect is sent Anthropic's native Messages API: the OpenAI-compatible
+    /// layer there neither caches nor reports caching, so every agent-loop
+    /// turn would pay full input price for the whole conversation again. The
+    /// host is matched exactly, never as a prefix. A declared dialect wins.
+    fn speaks_messages_by_host(&self) -> bool {
+        self.dialect.is_none() && self.is_anthropic_host()
+    }
+
+    /// (#3173) True when this unmanaged endpoint's host is
+    /// [`ANTHROPIC_API_HOST`], however the URL spells it: any case, an
+    /// explicit port, a trailing dot. Exact otherwise, never a prefix.
+    pub fn is_anthropic_host(&self) -> bool {
+        self.host().is_some_and(|h| {
+            crate::panel_audience::host_of(&h).trim_end_matches('.').eq_ignore_ascii_case(ANTHROPIC_API_HOST)
+        })
     }
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
@@ -729,14 +752,22 @@ impl ModelEndpoint {
     /// `messages` (#3162).
     fn fields_the_dialect_sends(&self, dialect: Dialect) -> Result<(), String> {
         let effort_unsent = matches!(dialect, Dialect::ChatCompletionsMaxTokens | Dialect::Messages);
-        if self.reasoning_effort.is_some() && self.dialect.is_some() && effort_unsent {
-            return Err(format!(
-                "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
-                dialect.as_str()
-            ));
+        // (#3173) An inferred `messages` has no declared dialect to drop: the
+        // remedy names where it came from and how to keep the old shape.
+        let remedy = if self.speaks_messages_by_host() {
+            format!(
+                "the endpoint declares no dialect, so on {ANTHROPIC_API_HOST} it speaks `messages` (the only \
+                 way its prompt caching applies); drop the field, or declare \"dialect\": \"chat-completions\" \
+                 to keep the uncached OpenAI-compatible layer"
+            )
+        } else {
+            "drop one of the two".to_string()
+        };
+        if self.reasoning_effort.is_some() && (self.dialect.is_some() || self.speaks_messages_by_host()) && effort_unsent {
+            return Err(format!("`reasoning_effort` is never sent in the `{}` dialect; {remedy}", dialect.as_str()));
         }
         if dialect == Dialect::Messages && self.api_version.is_some() {
-            return Err("`api_version` is never sent in the `messages` dialect; drop one of the two".to_string());
+            return Err(format!("`api_version` is never sent in the `messages` dialect; {remedy}"));
         }
         Ok(())
     }
@@ -1121,6 +1152,33 @@ mod tests {
             "https://r.example/openai/deployments/d/chat/completions?api-version=2025-01-01-preview"
         );
         assert!(ModelEndpoint::reference("nope").chat_url().is_err());
+    }
+
+    /// (#3173) An `api.anthropic.com` endpoint that declares no dialect is
+    /// sent the Messages API, the only way its prompt caching applies. A
+    /// declared dialect still wins, and other hosts keep the kind's default.
+    #[test]
+    fn an_anthropic_endpoint_with_no_dialect_speaks_messages() {
+        let ep = |url: &str, dialect: Option<Dialect>| ModelEndpoint { url: Some(url.into()), dialect: dialect.map(Into::into), ..Default::default() };
+        let claude = ep("https://api.anthropic.com/v1", None);
+        assert_eq!(claude.resolved_dialect().unwrap(), Dialect::Messages);
+        assert_eq!(claude.chat_url().unwrap(), "https://api.anthropic.com/v1/messages");
+        let declared = ep("https://api.anthropic.com/v1", Some(Dialect::ChatCompletions));
+        assert_eq!(declared.resolved_dialect().unwrap(), Dialect::ChatCompletions, "a declared dialect wins");
+        let other = ep("https://api.x.ai/v1", None);
+        assert_eq!(other.resolved_dialect().unwrap(), Dialect::ChatCompletions);
+        for spelling in ["https://api.anthropic.com:443/v1", "https://API.Anthropic.com/v1", "https://api.anthropic.com./v1"] {
+            assert_eq!(ep(spelling, None).resolved_dialect().unwrap(), Dialect::Messages, "{spelling}: the same host");
+            assert!(ep(spelling, None).is_anthropic_host(), "{spelling}");
+        }
+        let lookalike = ep("https://api.anthropic.com.evil.example/v1", None);
+        assert_eq!(lookalike.resolved_dialect().unwrap(), Dialect::ChatCompletions, "the host, not a prefix");
+        let effort = ModelEndpoint { reasoning_effort: Some("high".into()), ..ep("https://api.anthropic.com/v1", None) };
+        let refusal = effort.validate().expect_err("an inferred `messages` refuses a field it never sends, as a declared one does");
+        assert!(
+            refusal.contains("api.anthropic.com") && refusal.contains(r#""dialect": "chat-completions""#),
+            "says the dialect was inferred and how to keep the old one: {refusal}"
+        );
     }
 
     /// (#3162) The `messages` dialect's URL is `{url}/messages`, and the two

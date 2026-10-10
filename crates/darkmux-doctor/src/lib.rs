@@ -3936,7 +3936,12 @@ fn check_endpoints() -> Check {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let mut ledger = darkmux_crew::budget::Ledger::new(darkmux_types::config_access::flows_dir());
-            endpoints_status(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs))
+            let mut c = endpoints_status(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs));
+            let uncached = uncached_claude_endpoints(&l.registry);
+            if c.status == Status::Warn && !uncached.is_empty() {
+                c.hint = Some(uncached_claude_hint(&uncached, &format!("`{}`", l.path.display())));
+            }
+            c
         }
         Err(e) => Check {
             name: "endpoints".into(),
@@ -4061,7 +4066,49 @@ fn endpoints_status(
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
-    Check { name, status: Status::Pass, message: listed, hint: None }
+    uncached_claude_check(&name, &listed, registry).unwrap_or(Check { name, status: Status::Pass, message: listed, hint: None })
+}
+
+/// (#3173) The `endpoints` row as a Warn when a Claude endpoint is declared
+/// onto the uncached layer; `None` when none is.
+fn uncached_claude_check(name: &str, listed: &str, registry: &darkmux_types::ProfileRegistry) -> Option<Check> {
+    let uncached = uncached_claude_endpoints(registry);
+    if uncached.is_empty() {
+        return None;
+    }
+    let named = uncached.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
+    Some(Check {
+        name: name.to_string(),
+        status: Status::Warn,
+        message: format!(
+            "{listed}. A Claude endpoint declared onto the OpenAI-compatible layer does not cache: every \
+             turn pays full input price for the whole conversation again ({named})"
+        ),
+        hint: Some(uncached_claude_hint(&uncached, "the profile registry")),
+    })
+}
+
+/// (#3173) The edit for [`uncached_claude_endpoints`], made in `registry`
+/// (the loaded file's path when the caller knows it).
+fn uncached_claude_hint(ids: &[String], registry: &str) -> String {
+    let named = ids.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
+    format!(
+        r#"set "dialect": "messages" on {named} in {registry}, or remove the dialect (a Claude endpoint speaks `messages` by default), so each is sent Anthropic's native Messages API and its prompt caching applies. (#3173)"#
+    )
+}
+
+/// (#3173) The ids of `endpoints` entries on `api.anthropic.com` whose
+/// resolved dialect is not `messages`: the OpenAI-compatible layer there
+/// neither caches nor reports caching. One that declares no dialect resolves
+/// to `messages` on its own, so only a declared other dialect is listed.
+fn uncached_claude_endpoints(registry: &darkmux_types::ProfileRegistry) -> Vec<String> {
+    registry
+        .endpoints
+        .iter()
+        .filter(|(_, ep)| ep.is_anthropic_host())
+        .filter(|(_, ep)| !matches!(ep.resolved_dialect(), Ok(darkmux_types::Dialect::Messages)))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
@@ -11545,6 +11592,56 @@ mod tests {
         let mut r: darkmux_types::ProfileRegistry = serde_json::from_str(json).unwrap();
         r.materialize_endpoints();
         r
+    }
+
+    /// (#3173) A Claude endpoint declared onto the OpenAI-compatible layer
+    /// pays full input price for the whole conversation every turn: that
+    /// layer neither caches nor reports caching. Doctor warns and gives the
+    /// edit. One with no dialect speaks `messages` on its own, so it is
+    /// silent, as are one on `messages` and any other host.
+    #[test]
+    fn an_uncached_claude_endpoint_warns_with_the_edit() {
+        let mut no_spend = |_: &darkmux_crew::budget::EndpointBudget| Vec::new();
+        let uncached = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"claude-sonnet-5-5","endpoint":"claude"}]}},
+                "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","auth":{"type":"bearer","keychain":"k"}},
+                             "haiku":{"url":"https://api.anthropic.com/v1/","dialect":"chat-completions"},
+                             "opus":{"url":"https://api.anthropic.com/v1","dialect":"chat-completions-max-tokens"},
+                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
+        );
+        let c = endpoints_status(&uncached, &mut no_spend);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains(r#""dialect": "messages""#), "the exact edit: {hint}");
+        assert!(hint.contains("endpoints.haiku") && hint.contains("endpoints.opus"), "names each declared one: {hint}");
+        assert!(!hint.contains("endpoints.claude"), "no dialect speaks messages on its own: {hint}");
+        assert!(!hint.contains("grok"), "another host is not a Claude endpoint: {hint}");
+        assert!(c.message.contains("does not cache"), "{}", c.message);
+        let cached = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"claude-sonnet-5-5","endpoint":"claude"}]}},
+                "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","dialect":"messages"},
+                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
+        );
+        let c = endpoints_status(&cached, &mut no_spend);
+        assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);
+    }
+
+    /// (#3173 review) The hint names the registry file `check_endpoints`
+    /// actually loaded, so the edit can be made where it is read.
+    #[test]
+    #[serial_test::serial]
+    fn the_uncached_claude_hint_names_the_loaded_registry_file() {
+        let (_g, path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"p":{"models":[{"id":"claude-sonnet-5-5","endpoint":"claude"}]}},
+                "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","dialect":"chat-completions"}}}"#,
+        )
+        .unwrap();
+        let c = check_endpoints();
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains(&format!("`{}`", path.display())), "{hint}");
     }
 
     /// (#3035) A leftover `remote.*` env var names the `endpoints.<id>.limits`

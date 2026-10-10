@@ -672,7 +672,7 @@ pub fn address_host(addr: &str) -> Option<&str> {
 
 /// The host of `host:port`, `[v6]:port` or a bare host. Malformed input
 /// (an unclosed `[`) is returned whole, so it never reads as loopback.
-fn host_of(hostport: &str) -> &str {
+pub(crate) fn host_of(hostport: &str) -> &str {
     address_host(hostport).unwrap_or(hostport)
 }
 

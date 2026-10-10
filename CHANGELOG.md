@@ -16,6 +16,25 @@ darkmux release.
 
 ### Added
 
+- **A Claude endpoint is cached by default** (#3173). An endpoint on
+  `api.anthropic.com` that declares no `dialect` now resolves to `messages`, so
+  it is sent Anthropic's native Messages API, and its prompt caching applies
+  without anyone knowing to ask for it. Before this, it ran on the
+  OpenAI-compatible layer, which neither caches nor reports caching, so every
+  turn of the agent loop paid full input price for the whole conversation
+  again. A declared dialect still wins. Declaring a non-`messages` one there
+  makes the `darkmux doctor` `endpoints` row warn, naming the endpoint, the
+  edit and the registry file. A `reasoning_effort` on such an endpoint is
+  refused, as it already was for a declared `messages`, because it would never
+  be sent. **That can refuse a registry that loaded before:** an Anthropic
+  endpoint with `reasoning_effort` or `api_version` and no dialect. The refusal
+  says the dialect was inferred from the host, and that declaring
+  `"dialect": "chat-completions"` keeps the old, uncached shape. The host
+  matches however the URL spells it: any case, an explicit port, or a trailing
+  dot. The guide's endpoint example gains a Claude seat, with its budget
+  numbers left as placeholders, and drops a stale line: an inline endpoint on a
+  model is refused since 5.0, not still accepted.
+
 - **A usage record counts cache writes on their own** (#3168). The four
   classes a cached Claude call bills (uncached input, cache writes, cache reads,
   output) are priced differently: on Sonnet 5.5, a write costs 1.25x an uncached
