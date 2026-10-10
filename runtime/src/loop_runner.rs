@@ -15297,3 +15297,7 @@ mod tool_writing_tests;
 #[cfg(test)]
 #[path = "loop_characterization_tests.rs"]
 mod loop_characterization_tests;
+
+#[cfg(test)]
+#[path = "messages_cache_prefix_tests.rs"]
+mod messages_cache_prefix_tests;

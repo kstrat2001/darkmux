@@ -599,7 +599,7 @@ impl<'a> AgentLoop<'a> {
         // this always uses the local chars/4 estimate rather than the
         // main loop's reported-vs-estimate staleness gate — there's
         // nothing to compare the estimate against yet.
-        let trim_stats = crate::tool_result_prune::soft_trim_old_tool_results(&mut self.messages);
+        let trim_stats = self.soft_trim_old_results();
         if trim_stats.results_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \
@@ -2124,6 +2124,21 @@ impl<'a> AgentLoop<'a> {
     // ─── compaction ──────────────────────────────────────────────────────
 
     /// The context check after a tool turn. `Some` ends the dispatch.
+    /// (#1391) The per-turn soft trim of old oversized tool results, except
+    /// on an endpoint that caches the prompt prefix (#3193). Trimming a
+    /// result once it ages out of the recent window rewrites a message the
+    /// previous request already sent, so the next request no longer extends
+    /// the cache entry that request wrote: every turn re-wrote its whole
+    /// conversation at the cache-write price and read back only the first
+    /// message. There the cache read costs far less than the bytes the trim
+    /// reclaims, and compaction still bounds the conversation.
+    fn soft_trim_old_results(&mut self) -> crate::tool_result_prune::ToolTrimStats {
+        if self.client.caches_prompt_prefix() {
+            return crate::tool_result_prune::ToolTrimStats::default();
+        }
+        crate::tool_result_prune::soft_trim_old_tool_results(&mut self.messages)
+    }
+
     fn trim_and_compact(&mut self, wire_max_tokens: u32) -> Option<LoopOutcome> {
         // (#1391) Soft-trim OLD oversized tool-result bodies before the
         // compaction trigger is evaluated. This is a zero-model-call,
@@ -2134,8 +2149,7 @@ impl<'a> AgentLoop<'a> {
         // (see TOOL_RESULT_TRIM_PRESERVE_RECENT), so the model never
         // loses context it is actively reasoning over. Runs every turn;
         // idempotent on bodies already reclaimed.
-        let trim_stats =
-            crate::tool_result_prune::soft_trim_old_tool_results(&mut self.messages);
+        let trim_stats = self.soft_trim_old_results();
         if trim_stats.results_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \

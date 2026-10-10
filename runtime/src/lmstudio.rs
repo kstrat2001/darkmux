@@ -463,6 +463,15 @@ impl LmStudioClient {
         self.dialect == Some(Dialect::Messages)
     }
 
+    /// (#3193) True when the endpoint caches the prompt prefix across
+    /// requests: the Messages dialect's automatic breakpoint, on each
+    /// request's last block. A later request reads that entry back only when
+    /// it starts with exactly the same blocks, so the loop must not rewrite
+    /// an earlier message of the conversation between turns.
+    pub fn caches_prompt_prefix(&self) -> bool {
+        self.speaks_messages()
+    }
+
     /// The auth header, plus the API version header the Messages dialect
     /// requires on every request.
     fn apply_auth_header(&self, req: ureq::Request) -> ureq::Request {
