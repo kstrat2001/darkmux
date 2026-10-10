@@ -23,7 +23,7 @@ darkmux init      # config + profiles + agent skills (never overwrites)
 darkmux doctor    # pre-flight: LMStudio, models, Docker, runtime, RAM
 ```
 
-Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint: a machine with zero local models still runs full reviews. [Docker](https://www.docker.com/products/docker-desktop) hosts the dispatch runtime; the image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
+Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint, or by Claude with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)): a machine with zero local models still runs full reviews. [Docker](https://www.docker.com/products/docker-desktop) hosts the dispatch runtime; the image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
 
 ## Your first mission
 

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude endpoints: a cached seat | darkmux user guide</title>
+<meta name="description" content="Staff a darkmux role with Claude through Anthropic's API. darkmux speaks the native Messages API there, so prompt caching covers every turn of the agent loop. Setup, budgets, and reading the cache numbers.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand"><img src="../media/icon/mark-trapezoid-out.svg" width="22" height="22" alt="">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> claude</span>
+    <div class="links">
+      <a href="../guide/">Guide</a>
+      <a href="../demo/">Demo</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">10 <span class="dot">·</span> hosted seat</div>
+    <h1>Claude endpoints: a cached seat</h1>
+    <p class="lede">Any role can be staffed by Claude through Anthropic's API. On <code>api.anthropic.com</code> darkmux speaks Anthropic's native Messages API, so prompt caching covers every turn of the agent loop: each turn reads the conversation before it from the cache instead of sending it again at full price. darkmux reports tokens; the rate is between you and Anthropic.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Set it up</h2>
+    <p>Put the API key in the Keychain. Only the item's name goes in any file.</p>
+    <pre><code>security add-generic-password -a "$USER" -s darkmux-anthropic -w</code></pre>
+    <p>Declare the endpoint once under <code>endpoints</code> in <code>~/.darkmux/profiles.json</code>, and a profile whose model names it:</p>
+    <pre><code>{ "endpoints": {
+    "claude": { "url": "https://api.anthropic.com/v1",
+                "auth": { "type": "bearer", "keychain": "darkmux-anthropic" } } },
+  "profiles": {
+    "claude-seat": { "models": [ { "id": "claude-sonnet-5-5", "n_ctx": 200000, "endpoint": "claude" } ] } } }</code></pre>
+    <p>Then point a role at the seat. Any role works; this one makes Claude the reviewer:</p>
+    <pre><code>darkmux config set role_profiles.reviewer claude-seat</code></pre>
+    <p><code>darkmux doctor -v</code> lists the endpoint with the dialect it resolved. Captured on the operator's machine, trimmed to one endpoint:</p>
+    <pre><code>✓ endpoints   `claude-sonnet`: unmanaged, api.anthropic.com, messages, credential from
+              Keychain `darkmux-anthropic`; limits 100000000 tokens per 30d · waits at most
+              30m; calls run one at a time (no limits.concurrent_calls); budget wait, early
+              warning at 80%: spent 38492046 tokens in 1613 calls over the last 30d</code></pre>
+    <p><code>messages</code> is the part that matters. You do not declare it: an endpoint on <code>api.anthropic.com</code> with no <code>dialect</code> gets it. Declaring another dialect there sends the OpenAI-compatible layer, which neither caches nor reports caching, and <code>doctor</code> warns with the edit to undo it.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What is cached</h2>
+    <p>Two things, both automatic. The system prompt and the tool definitions carry their own cache breakpoint, so every dispatch of a role shares them. The conversation is cached as it grows, so each turn of a dispatch reads everything before it from the cache and pays full input price only for what is new. An agent loop resends its whole conversation every turn, which is why the second part is most of the effect.</p>
+    <p>Anthropic keeps an entry for five minutes after its last use, so turns and dispatches that follow each other closely keep reading it. A long pause starts a fresh entry.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Budgets</h2>
+    <p>A budget sits on the endpoint, beside <code>url</code> and <code>auth</code>. The numbers are yours; darkmux ships none.</p>
+    <pre><code>"limits": { "window": { "period": "30d", "tokens": &lt;tokens&gt; },
+            "policy": "wait", "max_wait": "30m", "warn_at": 0.8 }</code></pre>
+    <ul>
+      <li><code>window</code> counts tokens over the last <code>period</code>, rolling, with no calendar reset.</li>
+      <li><code>wait</code> pauses calls to that endpoint until the window has room, then resumes. <code>max_wait</code> fails a call at once, naming when there would be room, instead of holding it longer than its caller can outlive (a CI job's timeout, say). <code>warn</code> only warns.</li>
+      <li>The window counts every input token, cached or not. Size it in tokens you are willing to process, not as a bill: a cached token is cheaper than an uncached one, and the budget does not know your rates.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Reading the numbers</h2>
+    <p>Every model call writes a <code>telemetry.tokens</code> flow record. <code>prompt_tokens</code> is every input token the call sent, <code>cached_tokens</code> the part read from the cache, and <code>cache_write_tokens</code> the part written to it. One dispatch, turn by turn:</p>
+    <pre><code>jq -r --arg s review-1791622322-7977d4.adhoc.reviewer.test-gap-u-0001 \
+  'select(.action=="telemetry.tokens" and .session_id==$s)
+   | [.payload.turn_seq, .payload.prompt_tokens, .payload.cached_tokens] | @tsv' \
+  ~/.darkmux/flows/2026-10-10.jsonl</code></pre>
+    <pre><code>1	11475	7112
+2	27260	11471
+3	30783	27258
+4	29455	11471</code></pre>
+    <p class="session-caption">Verbatim, captured 2026-10-10: a Claude Sonnet 5.5 reviewer unit in a PR review.</p>
+    <p>Turn 1 read the shared system prompt and tools. Turns 2 and 3 read everything before them. Turn 4 read only the head, because something earlier in its conversation changed and the cache matches an exact prefix. A dispatch's <code>--json</code> envelope carries <code>cached_tokens</code> summed over its calls, and the fleet view's token readout shows cached tokens beside the rest. Multiply by your own rates to see what that is worth to you.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="crawl-and-hooks.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Crawl a codebase</span>
+  </a>
+  <a href="index.html" class="next">
+    <span class="dir">Guide home ›</span>
+    <span class="title">Back to TOC</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>

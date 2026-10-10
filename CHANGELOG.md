@@ -16,6 +16,15 @@ darkmux release.
 
 ### Added
 
+- **Guide: Claude endpoints, a cached seat** (#3174). A new page,
+  `docs/guide/claude.html`, takes a user from an API key to a Claude-staffed
+  role. It covers the Keychain item, the endpoint and seat profile, and
+  `role_profiles`, then what is cached and why it matters for an agent loop,
+  then budgets (`wait`, `max_wait`, and why the window counts cached tokens in
+  full), then reading `prompt_tokens`, `cached_tokens` and `cache_write_tokens`.
+  It shows real output from a real run, and token counts only. It is linked
+  from the guide index, the crawl page and the README.
+
 - **A Claude endpoint is cached by default** (#3173). An endpoint on
   `api.anthropic.com` that declares no `dialect` now resolves to `messages`, so
   it is sent Anthropic's native Messages API, and its prompt caching applies
