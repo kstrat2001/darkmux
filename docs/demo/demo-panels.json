@@ -8,23 +8,24 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537622,
+    "captured_ts_ms": 1791601044877,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 19,
+    "gather_ms": 3,
     "opts": {},
     "panel": "config-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "doctor": {
     "age_ms": 0,
-    "ansi_text": "darkmux doctor \u2014 79 checks\n\n\u25cf needs attention \u2014 temp residue: 100 darkmux director(ies) under\u2026\n\n  \u2713 build                  darkmux 5.0.0 (83905f180) \u00b7 flow schema 2.1.0\n  \u2713 71 more checks passed \u2014 `-v` for detail\n  \u26a0 temp residue           100 darkmux director(ies) under\n                           /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/\n                           (darkmux-dispatch-analyst x36, darkmux-out-analyst x36,\n                           darkmux-out-code-reviewer x11, darkmux-dispatch-code-reviewer x10,\n                           darkmux-out-coder x6)\n        \u2192 each one is a directory darkmux created and left. `darkmux-out-*` and `darkmux-dispatch-*`\n          are a dispatch's out-dir and workspace: they hold that run's prompt, trajectory and\n          checkpoint, so they are kept deliberately and removing one discards that run's record. The\n          rest are test scratch, which a test process now collects on its own (#2707); any still\n          here predate that. Each `darkmux-out-*` dir has siblings `<dir>.resume_origin.json` and\n          `<dir>.execution.lock`: delete them together, and delete any sibling whose dir is already\n          gone (an orphan). Nothing here is removed for you: review\n          /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ and delete what you are done with.\n  \u26a0 daemon reachable       daemon not reachable at 127.0.0.1:8765 (connection refused) \u00b7 address\n                           built-in default\n        \u2192 run `darkmux serve` to start the daemon for live viewing features\n  \u26a0 power posture          thermal fair (cap 100%) \u2014 AC power (80%); Low Power Mode off; last\n                           thermal emergency at 2026-10-05 01:14:23 +0800 (>24h ago)\n        \u2192 let the machine cool.\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 state file permissions 27 of 27 darkmux state file(s) are group- or world-readable \u2014\n                           mission/phase state (26, mode 644), flow records (1, mode 644)\n        \u2192 darkmux sets the mode only when IT creates a file \u2014 one written by an older binary, or\n          loosened by hand afterward, keeps whatever mode it already had. File NAMES are omitted\n          from this report on purpose: `darkmux doctor` output is republished verbatim by the\n          viewer's console lens, and the names in these stores are yours, not darkmux's. List them\n          on this machine, then restrict them:\n        \u2192 find \"/home/demo/.darkmux/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\(\n          -perm -g+r -o -perm -o+r \\) -print\n        \u2192 find \"/home/demo/.darkmux/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\(\n          -perm -g+r -o -perm -o+r \\) -exec chmod go-rwx {} +\n  \u26a0 unreachable residents  2 darkmux-owned resident(s) unreachable \u2014 no profile in this registry\n                           declares them right now: darkmux:microsoft/phi-4,\n                           darkmux:qwen/qwen3.8-27b\n        \u2192 darkmux never auto-unloads a resident outside a reconcile it's already planning (operator\n          sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this \u2014 but only\n          on the next dispatch that reaches it, and only through THIS same registry (this registry\n          was loaded from /home/demo/.darkmux/profiles.json).\n          To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed\n          (e.g. `lms unload darkmux:microsoft/phi-4`), or `darkmux machine eject` to sweep every\n          darkmux-owned resident if nothing is running. This is usually a leftover from a superseded\n          profile version or review-staffing seat \u2014 no data loss either way.\n  \u26a0 darkmux skills freshness darkmux-* skills: 12 up to date; 5 stale (darkmux-add-machine,\n                             darkmux-analyze-run, darkmux-escalation-handler, darkmux-lab-notebook,\n                             darkmux-list-runs)\n        \u2192 content differs from this binary's bundled copy \u2014 an older darkmux installed it, or it was\n          edited locally. `darkmux init` refreshes a copy it can prove darkmux itself wrote (a\n          provenance stamp recorded at install time) and leaves every other one alone, so a skill\n          installed before darkmux started recording provenance stays listed here even after `init`\n          runs. `darkmux init --force` takes this binary's version of ALL of them, discarding any\n          local edit, and records provenance so later runs refresh silently; to take just one,\n          delete that skill's directory and re-run `init`\n\n72 pass, 7 warn \u2014 workable but worth a look\n",
+    "ansi_text": "darkmux doctor \u2014 79 checks\n\n\u25cf needs attention \u2014 temp residue: 281 darkmux director(ies) under\u2026\n\n  \u2713 build                  darkmux 5.0.0 (e45e55b28) \u00b7 flow schema 2.2.0\n  \u2713 72 more checks passed \u2014 `-v` for detail\n  \u26a0 temp residue           281 darkmux director(ies) under\n                           /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/\n                           (darkmux-dispatch-analyst x102, darkmux-out-analyst x102,\n                           darkmux-out-code-reviewer x31, darkmux-dispatch-code-reviewer x23,\n                           darkmux-out-coder x15)\n        \u2192 each one is a directory darkmux created and left. `darkmux-out-*` and `darkmux-dispatch-*`\n          are a dispatch's out-dir and workspace: they hold that run's prompt, trajectory and\n          checkpoint, so they are kept deliberately and removing one discards that run's record. The\n          rest are test scratch, which a test process now collects on its own (#2707); any still\n          here predate that. Each `darkmux-out-*` dir has siblings `<dir>.resume_origin.json` and\n          `<dir>.execution.lock`: delete them together, and delete any sibling whose dir is already\n          gone (an orphan). Nothing here is removed for you: review\n          /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ and delete what you are done with.\n  \u26a0 daemon reachable       daemon not reachable at 127.0.0.1:8765 (connection refused) \u00b7 address\n                           built-in default\n        \u2192 run `darkmux serve` to start the daemon for live viewing features\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 flow action vocabulary 372 record(s) in the last 7 day file(s) carry an action this darkmux does\n                           not know: telemetry.process (372)\n        \u2192 They read as-is and nothing acts on them. A newer darkmux on this machine or a peer writes\n          actions this build does not know; upgrading this binary names them. A record from a 3.x\n          archive, or of an action a release retired, is unknown here for good: nothing maps an old\n          spelling.\n  \u26a0 state file permissions 27 of 27 darkmux state file(s) are group- or world-readable \u2014\n                           mission/phase state (26, mode 644), flow records (1, mode 644)\n        \u2192 darkmux sets the mode only when IT creates a file \u2014 one written by an older binary, or\n          loosened by hand afterward, keeps whatever mode it already had. File NAMES are omitted\n          from this report on purpose: `darkmux doctor` output is republished verbatim by the\n          viewer's console lens, and the names in these stores are yours, not darkmux's. List them\n          on this machine, then restrict them:\n        \u2192 find \"/home/demo/.darkmux/missions\"\n          \"/home/demo/.darkmux/flows\" -type f\n          \\( -perm -g+r -o -perm -o+r \\) -print\n        \u2192 find \"/home/demo/.darkmux/missions\"\n          \"/home/demo/.darkmux/flows\" -type f\n          \\( -perm -g+r -o -perm -o+r \\) -exec chmod go-rwx {} +\n  \u26a0 darkmux skills freshness darkmux-* skills: 12 up to date; 5 stale (darkmux-add-machine,\n                             darkmux-analyze-run, darkmux-escalation-handler, darkmux-lab-notebook,\n                             darkmux-list-runs)\n        \u2192 content differs from this binary's bundled copy \u2014 an older darkmux installed it, or it was\n          edited locally. `darkmux init` refreshes a copy it can prove darkmux itself wrote (a\n          provenance stamp recorded at install time) and leaves every other one alone, so a skill\n          installed before darkmux started recording provenance stays listed here even after `init`\n          runs. `darkmux init --force` takes this binary's version of ALL of them, discarding any\n          local edit, and records provenance so later runs refresh silently; to take just one,\n          delete that skill's directory and re-run `init`\n\n73 pass, 6 warn \u2014 workable but worth a look\n",
     "argv": [
       "doctor"
     ],
     "auto_refresh": false,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537899,
+    "captured_ts_ms": 1791601044922,
     "cols": 100,
     "exit_code": 0,
     "gather_ms": 3,
@@ -34,24 +35,25 @@
   },
   "flow-status": {
     "age_ms": 0,
-    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       2.1.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    1\n  total_bytes:  1527023\n\nSchema\n  writer:       2.1.0\n  observed:     (none)\n  skew:         false\n\nHooks\n  enabled:      false\n  outbox_dir:   /home/demo/.darkmux/hooks\n  (no rules configured)\n",
+    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       2.2.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    1\n  total_bytes:  1682395\n\nSchema\n  writer:       2.2.0\n  observed:     (none)\n  skew:         false\n\nHooks\n  enabled:      false\n  outbox_dir:   /home/demo/.darkmux/hooks\n  (no rules configured)\n",
     "argv": [
       "flow",
       "status"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537638,
+    "captured_ts_ms": 1791601044881,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 11,
+    "gather_ms": 3,
     "opts": {},
     "panel": "flow-status",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "lab-fixture-list": {
     "age_ms": 0,
-    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:be0f245416975e98722b21a3fa8fd0359283fea41847372dc07a77d284f63858\n    hashed_at:  2026-10-08T08:30:53Z\n\n",
+    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:be0f245416975e98722b21a3fa8fd0359283fea41847372dc07a77d284f63858\n    hashed_at:  2026-10-10T02:55:55Z\n\n",
     "argv": [
       "lab",
       "fixture",
@@ -59,30 +61,32 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537752,
+    "captured_ts_ms": 1791601044885,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 111,
+    "gather_ms": 3,
     "opts": {},
     "panel": "lab-fixture-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "machine-list": {
     "age_ms": 0,
-    "ansi_text": "\u001b[1;36mdarkmux machine list\u001b[0m\n  roster:           \u001b[2m/home/demo/.darkmux/fleet.json\u001b[0m\n  local machine_id: \u001b[2mm5-ultra-256gb\u001b[0m\n\n\u001b[2mMACHINE        LIVE  AI-HEADROOM OS            VERSION      LOADED\u001b[0m\nm5-ultra-256gb live  82 GB       macos aarch64 5.0.0        darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-tur\u2026\n\u001b[2m  status: dispatch in flight\u001b[0m\n\u001b[2m  utility model: qwen3-4b-instruct-2507, resident; job: not shown here\u001b[0m\n\u001b[2m  profiles: analyst (managed), coder (managed), reviewer (managed); thermal: fair\u001b[0m\n\n(no peers in roster: single-machine fleet)\nAdd a peer: darkmux machine add <id> --address <dns-name>\n",
+    "ansi_text": "\u001b[1;36mdarkmux machine list\u001b[0m\n  roster:           \u001b[2m/home/demo/.darkmux/fleet.json\u001b[0m\n  local machine_id: \u001b[2mm5-ultra-256gb\u001b[0m\n\n\u001b[2mMACHINE        LIVE  AI-HEADROOM OS            VERSION      LOADED\u001b[0m\nm5-ultra-256gb live  86 GB       macos aarch64 5.0.0        darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-tur\u2026\n\u001b[2m  status: idle\u001b[0m\n\u001b[2m  utility model: qwen3-4b-instruct-2507, resident; job: not shown here\u001b[0m\n\u001b[2m  profiles: analyst (managed), coder (managed), reviewer (managed); thermal: nominal\u001b[0m\n\n(no peers in roster: single-machine fleet)\nAdd a peer: darkmux machine add <id> --address <dns-name>\n",
     "argv": [
       "machine",
       "list"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537597,
+    "captured_ts_ms": 1791601044872,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 9324,
+    "gather_ms": 4,
     "opts": {},
     "panel": "machine-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "machine-status": {
     "age_ms": 0,
@@ -93,7 +97,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448528266,
+    "captured_ts_ms": 1791601044867,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -103,22 +107,23 @@
   },
   "mission-status": {
     "age_ms": 0,
-    "ansi_text": "\u001b[1;36mmission status: 1 mission\u001b[0m\n\n\u001b[2mFINALIZED (1)\u001b[0m\n  \u25c6 \u001b]8;;/#mission=demo-review-nameof-recency\u001b\\Review\u001b]8;;\u001b\\  \u001b[2m42m\u001b[0m    3/3  \u2593\u2593\u2593\u2593  \u001b[2m3 complete\u001b[0m\n      \u001b[2m\u00b7\u001b[0m \u001b[2mPR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)\u001b[0m\n\n\u001b[32m\u2713 board is clean: every mission's phases are reconciled\u001b[0m\n",
+    "ansi_text": "\u001b[1;36mmission status: 1 mission\u001b[0m\n\n\u001b[2mFINALIZED (1)\u001b[0m\n  \u25c6 \u001b]8;;/#mission=demo-review-nameof-recency\u001b\\Review\u001b]8;;\u001b\\   \u001b[2m4m\u001b[0m    3/3  \u2593\u2593\u2593\u2593  \u001b[2m3 complete\u001b[0m\n      \u001b[2m\u00b7\u001b[0m \u001b[2mPR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)\u001b[0m\n\n\u001b[32m\u2713 board is clean: every mission's phases are reconciled\u001b[0m\n",
     "argv": [
       "mission",
       "status"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 8000,
-    "captured_ts_ms": 1791448528220,
+    "captured_ts_ms": 1791601044847,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 105,
+    "gather_ms": 36,
     "opts": {
       "all": "recent"
     },
     "panel": "mission-status",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "profile-list": {
     "age_ms": 0,
@@ -129,15 +134,16 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448537897,
+    "captured_ts_ms": 1791601044921,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 12,
+    "gather_ms": 4,
     "opts": {
       "remote": "off"
     },
     "panel": "profile-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "role-list": {
     "age_ms": 0,
@@ -148,33 +154,35 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1791448528261,
+    "captured_ts_ms": 1791601044867,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 38,
+    "gather_ms": 18,
     "opts": {},
     "panel": "role-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   },
   "run-list": {
     "age_ms": 0,
-    "ansi_text": "\u001b[1;36mruns: 10 shown\u001b[0m\n  KIND     STATUS        STARTED    DURATION    TOKENS  ID                                          MACHINE             \n  dispatch running       10m ago    10m+       208.22k  darkmux-crawler-crawl\u2026rded-locks-2250176547 Workstation         \n  dispatch complete      21m ago    2m         208.22k  darkmux-crawler-crawl\u2026or-discard-1307487261 Workstation         \n  mission  complete      1h ago     32m         83.62k  demo-review-nameof-recency                  Workstation         \n  dispatch complete      59m ago    2m         333.15k  darkmux-reviewer-revi\u2026-flow-sinks-987519170 Workstation         \n  dispatch complete      1h ago     2m         149.91k  darkmux-crawler-crawl\u2026wrap-paths-4040708454 Workstation         \n  dispatch complete      2h ago     2m          58.30k  darkmux-reviewer-doc-drift-sweep-3918945565 Studio              \n  dispatch complete      3h ago     2m         249.86k  darkmux-reviewer-revi\u2026rve-routes-1318381388 Workstation         \n  dispatch complete      4h ago     2m         385.20k  darkmux-analyst-crawl\u2026ck-ordering-921964300 Workstation         \n  dispatch complete      5h ago     2m          37.47k  darkmux-estimator-est\u2026te-backlog-4092573714 Mini                \n  dispatch complete      6h ago     2m         195.72k  darkmux-crawler-crawl\u2026-discard-2-2301155233 Workstation         \n\u001b[2mshowing 10 of 11 runs (1 more not shown: `--all` for every run)\u001b[0m\n",
+    "ansi_text": "\u001b[1;36mruns: 9 shown\u001b[0m\n  KIND     STATUS        STARTED    DURATION    TOKENS  ID                                          MACHINE             \n  dispatch running       7m ago     7m+        208.22k  darkmux-crawler-crawl\u2026rded-locks-2250176547 Workstation         \n  dispatch complete      6m ago     2m         249.86k  darkmux-reviewer-revi\u2026rve-routes-1318381388 Studio              \n  mission  complete      36m ago    32m         83.62k  demo-review-nameof-recency                  Workstation         \n  dispatch complete      14m ago    9m         301.85k  darkmux-analyst-crawl\u2026ck-ordering-921964300 Mini                \n  dispatch complete      17m ago    2m          45.80k  darkmux-compactor-com\u2026ajectories-2619114180 Studio              \n  dispatch complete      21m ago    2m          62.46k  darkmux-reviewer-revi\u2026-flow-sinks-987519170 Mini                \n  dispatch complete      29m ago    9m         543.34k  darkmux-crawler-crawl\u2026wrap-paths-4040708454 Workstation         \n  dispatch complete      34m ago    9m         211.29k  darkmux-reviewer-doc-drift-sweep-3918945565 Studio              \n  dispatch complete      33m ago    2m          37.47k  darkmux-estimator-est\u2026te-backlog-4092573714 Mini                \n",
     "argv": [
       "run",
       "list"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 8000,
-    "captured_ts_ms": 1791448537879,
+    "captured_ts_ms": 1791601044916,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 123,
+    "gather_ms": 29,
     "opts": {
       "all": "recent",
       "kind": "all",
       "usage": "off"
     },
     "panel": "run-list",
-    "stderr_tail": ""
+    "stderr_tail": "",
+    "withheld": ""
   }
 }
