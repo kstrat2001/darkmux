@@ -14015,8 +14015,22 @@ fn init_lms_stub(dir: &std::path::Path, catalog: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 /// `darkmux init <args>` against a fixed `(home, darkmux_home)` and `lms`.
 fn init_in(home: &std::path::Path, darkmux_home: &std::path::Path, lms: &std::path::Path, args: &[&str]) -> std::process::Output {
+    // (#3020) `init` sizes the utility window from this machine's AI headroom,
+    // which `doctor` reads from `vm_stat`. A stub first on PATH pins it at
+    // 64 GiB reclaimable, so these tests read the same on an 8 GB CI runner
+    // as on a 128 GB laptop.
+    use std::os::unix::fs::PermissionsExt;
+    let ram = home.join("ram-stub");
+    fs::create_dir_all(&ram).unwrap();
+    fs::write(
+        ram.join("vm_stat"),
+        "#!/bin/sh\necho 'Mach Virtual Memory Statistics: (page size of 16384 bytes)'\necho 'Pages free:                               4194304.'\necho 'Pages inactive:                                 0.'\n",
+    )
+    .unwrap();
+    fs::set_permissions(ram.join("vm_stat"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", ram.display(), std::env::var("PATH").unwrap_or_default());
     let mut cmd = darkmux_cmd();
-    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home).env("DARKMUX_LMS_BIN", lms);
+    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home).env("DARKMUX_LMS_BIN", lms).env("PATH", path);
     cmd.arg("init").args(args).output().unwrap()
 }
 
