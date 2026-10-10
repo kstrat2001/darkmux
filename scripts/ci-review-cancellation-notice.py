@@ -151,6 +151,100 @@ def elapsed_minutes(started_epoch, now_epoch) -> "int | None":
     return max(0, int((now - started) // 60))
 
 
+def open_budget_wait(flow_dir, started_epoch, now_epoch):
+    """(#3159) The `budget.wait` payload a review was still holding when the
+    job ended, or `None`: the last `budget.wait` that no later
+    `budget.resume` or `budget.stop` closed."""
+    open_wait = None
+    for rec in review_budget_records(flow_dir, started_epoch, now_epoch):
+        action = rec.get("action")
+        if action == "budget.wait":
+            open_wait = rec.get("payload") or {}
+        elif action in ("budget.resume", "budget.stop"):
+            open_wait = None
+    return open_wait
+
+
+def review_budget_records(flow_dir, started_epoch, now_epoch):
+    """Every budget record of a review mission written between the job's
+    start and now, oldest first, from this machine's flow day files (UTC).
+    Anything unreadable is skipped: these records only sharpen what is
+    posted, they never block it."""
+    if not flow_dir:
+        return []
+    try:
+        start, now = float(started_epoch), float(now_epoch)
+    except (TypeError, ValueError):
+        return []
+    import datetime
+
+    stamp = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc)
+    since, until = stamp(start).strftime("%Y-%m-%dT%H:%M:%SZ"), stamp(now).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day, last_day, out = stamp(start).date(), stamp(now).date(), []
+    while day <= last_day:
+        path = Path(flow_dir) / f"{day.isoformat()}.jsonl"
+        day += datetime.timedelta(days=1)
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if '"budget.' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not str(rec.get("action", "")).startswith("budget.") or not since <= str(rec.get("ts", "")) <= until:
+                continue
+            if str(rec.get("mission_id", "")).startswith("review-"):
+                out.append(rec)
+    return out
+
+
+def budget_warnings(flow_dir, started_epoch, now_epoch) -> str:
+    """(#3161) A PR comment naming each endpoint whose budget a review warned
+    about, once per endpoint (its latest warning), or `""` when none did.
+    Before this the warnings reached only the runner's log and flow file, so
+    the PR saw nothing until a budget stopped a review outright."""
+    latest = {}
+    for rec in review_budget_records(flow_dir, started_epoch, now_epoch):
+        if rec.get("action") == "budget.warn":
+            payload = rec.get("payload") or {}
+            latest[payload.get("endpoint_id") or "?"] = payload.get("message") or ""
+    if not latest:
+        return ""
+    lines = [":warning: darkmux self-review: an endpoint budget warned during this review."]
+    lines += [f"- `{ep}`: {msg.removeprefix('darkmux: ')}" for ep, msg in sorted(latest.items())]
+    lines.append("Under policy `wait`, calls pause once a budget is reached; raise `limits.window` or set "
+                 "`limits.max_wait` in profiles.json on the runner before the next review.")
+    return "\n".join(lines)
+
+
+def budget_wait_cause(wait: dict) -> str:
+    """The notice's cause line for a review cancelled while it waited on a
+    budget: which endpoint, how full, when it would have resumed, and the
+    fix."""
+    import datetime
+
+    endpoint = wait.get("endpoint_id") or "an endpoint"
+    spent, limit, period = wait.get("spent"), wait.get("limit"), wait.get("period")
+    fill = f" ({spent:,} of {limit:,} {wait.get('metric') or 'tokens'} in the last {period})" if isinstance(spent, int) and isinstance(limit, int) else ""
+    resume = wait.get("resume_at_ms")
+    when = (
+        "its calls would have resumed at "
+        + datetime.datetime.fromtimestamp(resume / 1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if isinstance(resume, (int, float))
+        else "no resume time was known"
+    )
+    return (
+        f"was cancelled while waiting on endpoint `{endpoint}`'s budget{fill}: {when}, so the job ran out "
+        "of time with no model call in flight. This is a budget stop, not a slow review: raise the endpoint's "
+        "`limits.window` (or set `limits.max_wait` so a wait that cannot end in time fails at once) in "
+        "profiles.json on the runner, then re-run."
+    )
+
+
 def compute_notice(
     job_status: str,
     rendered_path: str,
@@ -158,6 +252,7 @@ def compute_notice(
     started_epoch=None,
     now_epoch=None,
     run_url: str = "",
+    budget_wait=None,
 ) -> str:
     """The disclosure body to post, or `""` when no notice is needed.
 
@@ -173,6 +268,14 @@ def compute_notice(
         return ""
 
     minutes = elapsed_minutes(started_epoch, now_epoch)
+    if budget_wait is not None:
+        lines = [
+            f":no_entry: darkmux self-review {budget_wait_cause(budget_wait)} The review never finished, "
+            "so no automated review was produced; treat it as needing manual review.",
+        ]
+        if run_url:
+            lines.append(f"See the run for details: {run_url}")
+        return "\n".join(lines)
     try:
         budget = int(timeout_minutes)
     except (TypeError, ValueError):
@@ -404,6 +507,62 @@ def rendered_has_content_self_test() -> list:
     return failures
 
 
+def budget_wait_self_test(tmp_path: Path) -> list:
+    """(#3159) The open-wait reader and the notice it feeds, on the shape of
+    PR #3158's review: a wait announced at 09:22 and never closed."""
+    failures = []
+    start = 1791535413  # 2026-10-09T08:43:33Z
+    wait = {"endpoint_id": "claude-sonnet", "metric": "tokens", "spent": 19400716, "limit": 19400000,
+            "period": "30d", "resume_at_ms": 1794109764000}
+    def rec(ts, action, mission="review-1791535413-dd000e", payload=None):
+        return json.dumps({"ts": ts, "action": action, "mission_id": mission, "payload": payload or {}})
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (flows / "2026-10-09.jsonl").write_text("\n".join([
+        rec("2026-10-09T07:00:00Z", "budget.wait", payload={"endpoint_id": "before-the-job"}),
+        rec("2026-10-09T09:00:00Z", "budget.wait", payload={"endpoint_id": "x"}),
+        rec("2026-10-09T09:01:00Z", "budget.resume"),
+        rec("2026-10-09T09:22:45Z", "budget.wait", payload=wait),
+        rec("2026-10-09T09:30:00Z", "budget.resume", mission="dispatch-other"),
+        "not json",
+    ]) + "\n")
+    got = open_budget_wait(str(flows), start, start + 91 * 60)
+    if got != wait:
+        failures.append(f"open_budget_wait: expected the 09:22 wait, got {got!r}")
+    if open_budget_wait(str(flows), start, start + 30 * 60) is not None:
+        failures.append("a wait written after now must not count (the 09:22 wait is past a 30-minute window)")
+    (flows / "2026-10-09.jsonl").open("a").write(rec("2026-10-09T09:40:00Z", "budget.stop") + "\n")
+    if open_budget_wait(str(flows), start, start + 91 * 60) is not None:
+        failures.append("a wait closed by a budget.stop is not open")
+    if open_budget_wait(str(tmp_path / "missing"), start, start + 60) is not None:
+        failures.append("a missing flow dir reads as no wait")
+    notice = compute_notice("cancelled", str(tmp_path / "none.json"), 90, start, start + 91 * 60, "u", budget_wait=wait)
+    for needle in ["claude-sonnet", "19,400,716 of 19,400,000 tokens in the last 30d", "2026-11-08 03:49 UTC", "limits.max_wait",
+                   "not a slow review", "no automated review was produced"]:
+        if needle not in notice:
+            failures.append(f"budget notice: expected {needle!r} in {notice!r}")
+    if "most likely its own" in notice:
+        failures.append("a budget wait must not be reported as the job's own timeout")
+    warn = {"endpoint_id": "claude-sonnet", "message": "darkmux: ⚠ endpoint `claude-sonnet` is at 80% of its budget"}
+    (flows / "2026-10-09.jsonl").open("a").write("\n".join([
+        rec("2026-10-09T09:09:24Z", "budget.warn", payload={"endpoint_id": "claude-sonnet", "message": "older"}),
+        rec("2026-10-09T09:10:00Z", "budget.warn", payload=warn),
+        rec("2026-10-09T09:11:00Z", "budget.warn", mission="dispatch-other", payload={"endpoint_id": "not-a-review"}),
+    ]) + "\n")
+    posted = budget_warnings(str(flows), start, start + 91 * 60)
+    for needle in ["`claude-sonnet`: ⚠ endpoint `claude-sonnet` is at 80% of its budget", "limits.max_wait"]:
+        if needle not in posted:
+            failures.append(f"budget warnings: expected {needle!r} in {posted!r}")
+    for needle in ["older", "not-a-review", "darkmux: ⚠"]:
+        if needle in posted:
+            failures.append(f"budget warnings: {needle!r} must not be posted: {posted!r}")
+    if budget_warnings(str(flows), start + 92 * 60, start + 100 * 60) != "":
+        failures.append("no warning in the window posts nothing")
+    if compute_notice("success", "", 90, budget_wait=wait) != "":
+        failures.append("a successful job gets no notice even with a wait on record")
+    return failures
+
+
 def self_test() -> int:
     failures = []
     import tempfile
@@ -439,9 +598,10 @@ def self_test() -> int:
                 if needle in result:
                     failures.append(f"{label}: expected {needle!r} ABSENT from notice, got: {result!r}")
 
+        failures.extend(budget_wait_self_test(tmp_path))
     failures.extend(rendered_has_content_self_test())
 
-    total = len(SELF_TEST_CASES) + 2
+    total = len(SELF_TEST_CASES) + 3
     if failures:
         print("ci-review-cancellation-notice self-test FAILED:\n" + "\n".join(failures))
         return 1
@@ -452,7 +612,7 @@ def self_test() -> int:
 USAGE = (
     "usage: ci-review-cancellation-notice.py --job-status <success|failure|cancelled> "
     "--rendered <path> --timeout-minutes <N> [--started-epoch <epoch>] "
-    "[--now-epoch <epoch>] [--run-url <url>]\n"
+    "[--now-epoch <epoch>] [--run-url <url>] [--flow-dir <darkmux flows dir>]\n"
     "       ci-review-cancellation-notice.py --self-test"
 )
 
@@ -478,6 +638,13 @@ def _take_flag(args: list, flag: str):
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
+    if "--budget-warnings" in sys.argv:
+        argv = [a for a in sys.argv[1:] if a != "--budget-warnings"]
+        import time
+
+        print(budget_warnings(_take_flag(argv, "--flow-dir"), _take_flag(argv, "--started-epoch"),
+                              _take_flag(argv, "--now-epoch") or time.time()))
+        sys.exit(0)
 
     argv = sys.argv[1:]
     job_status = _take_flag(argv, "--job-status")
@@ -486,6 +653,7 @@ if __name__ == "__main__":
     started_epoch = _take_flag(argv, "--started-epoch")
     now_epoch = _take_flag(argv, "--now-epoch")
     run_url = _take_flag(argv, "--run-url") or ""
+    flow_dir = _take_flag(argv, "--flow-dir")
 
     if job_status is None or rendered is None or timeout_minutes is None:
         print(USAGE, file=sys.stderr)
@@ -504,6 +672,7 @@ if __name__ == "__main__":
             started_epoch=started_epoch,
             now_epoch=now_epoch,
             run_url=run_url,
+            budget_wait=open_budget_wait(flow_dir, started_epoch, now_epoch),
         )
     )
     sys.exit(0)
