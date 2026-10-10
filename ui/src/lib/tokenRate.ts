@@ -57,6 +57,12 @@ export interface HeartbeatSample {
    *  a refresh is never a sample of its own, so it never pairs into a rate
    *  or reorders the stream. */
   freshMs?: number;
+  /** (#3152) The shortest span this sample may be paired across for a rate:
+   *  a live sample's cadence. The live channel also sends a sample on every
+   *  transition, and a bursty stream (Claude's) lands hundreds of chars a
+   *  few ms after the previous one, which read as 20,062 tok/s. Absent for a
+   *  durable heartbeat, which the host already spaces at least 2 s apart. */
+  minSpanMs?: number;
 }
 
 /** (#2889) The `phase` value a heartbeat carries while the model writes a
@@ -91,6 +97,8 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     const atMs = num(f.sampled_at_ms) ?? r.tMs;
     if (atMs === null) continue;
     const sample: HeartbeatSample = { atMs, chars, turn: f.turn_seq };
+    const cadence = (r as unknown as { live_cadence_ms?: unknown }).live_cadence_ms;
+    if (typeof cadence === "number" && Number.isFinite(cadence) && cadence > 0) sample.minSpanMs = cadence;
     const visible = num(f.cumulative_chars);
     if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
@@ -331,8 +339,12 @@ export interface TokenRateReading {
 export function currentTokenRate(records: NormRecord[]): TokenRateReading | null {
   const samples = heartbeatSamples(records);
   if (samples.length < 2) return carriedTokenRate(records, samples);
-  const prev = samples[samples.length - 2];
   const next = samples[samples.length - 1];
+  // (#3152) The pair's base is the newest earlier sample at least the
+  // sampling cadence back, never one a burst landed a few ms after.
+  const base = rateBase(samples, samples.length - 1);
+  if (base === null) return carriedTokenRate(records, samples);
+  const prev = samples[base];
   // `generated_chars` restarts every turn: a new turn's first sample paired
   // with the previous turn's last spans the tool gap and read near 0.
   if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return carriedTokenRate(records, samples);
@@ -410,10 +422,25 @@ function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolea
  *  found there can't disagree about which one gets to count. The scan keeps
  *  going past an untrusted one for the most recent pair with real
  *  progress. */
+/** (#3152) The index of the sample `samples[i]` is measured from: the newest
+ *  earlier sample at least `minSpanMs` before it. `null` when the turn has
+ *  no such sample (or the earlier one belongs to another turn). */
+function rateBase(samples: HeartbeatSample[], i: number): number | null {
+  const next = samples[i];
+  for (let j = i - 1; j >= 0; j--) {
+    const prev = samples[j];
+    if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return null;
+    if (next.atMs - prev.atMs >= (next.minSpanMs ?? 0)) return j;
+  }
+  return null;
+}
+
 function carriedTokenRate(records: NormRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
   for (let i = samples.length - 1; i > 0; i--) {
     const next = samples[i];
-    const prev = samples[i - 1];
+    const base = rateBase(samples, i);
+    if (base === null) continue;
+    const prev = samples[base];
     if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
     if (!openerPairTrusted(prev, next)) continue;
     // (#2889) Same rule as the direct path: writing samples never pair.
