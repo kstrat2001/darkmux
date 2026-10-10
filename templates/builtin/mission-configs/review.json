@@ -46,6 +46,16 @@
       "required": false
     },
     {
+      "name": "gate_image",
+      "description": "(#2973) The container image the gate runs `test_command` in: the patched scratch copy mounted at /workspace and nothing else, no network, no capabilities. It needs the project's toolchain (e.g. `rust:1-slim` for a Rust repo). A `test_command` runs model-written code (a kit can edit build.rs, package.json scripts or a Makefile), so with neither this nor `gate_on_host` set the gate refuses and every mod records why.",
+      "default": ""
+    },
+    {
+      "name": "gate_on_host",
+      "description": "(#2973) `true` runs `test_command` on this machine instead of in a container, as the darkmux user with its files and network: model-written code then runs as you. Set this or `gate_image`, not both.",
+      "default": "false"
+    },
+    {
       "name": "rules",
       "description": "Comma-separated rule ids to review with, the same rule-selection mechanism every rule-planning document uses — a `plan-<rule>` task whose rule is not named is pruned at mint with reason `not_selected`. Absent means every enabled plan task this document declares.",
       "required": false
@@ -175,7 +185,9 @@
             {"id": "gate-step", "kind": "mods.gate", "config": {
               "workdir": "{{item.tree_root}}",
               "for_key": "{{item.key}}",
-              "test_command": "{{test_command}}"
+              "test_command": "{{test_command}}",
+              "gate_image": "{{gate_image}}",
+              "gate_on_host": "{{gate_on_host}}"
             }}
           ]
         },
@@ -203,7 +215,9 @@
             {"id": "dispatch-gate-step", "kind": "mods.gate", "config": {
               "workdir": "{{item.tree_root}}",
               "for_key": "{{item.key}}",
-              "test_command": "{{test_command}}"
+              "test_command": "{{test_command}}",
+              "gate_image": "{{gate_image}}",
+              "gate_on_host": "{{gate_on_host}}"
             }}
           ]
         }
