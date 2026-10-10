@@ -347,6 +347,11 @@ struct SourceFiles {
     tree: PathBuf,
     all: Vec<String>,
     content: HashMap<String, Option<Rc<String>>>,
+    /// The largest file read whole; `None` reads any size. A tree walk keeps
+    /// [`MAX_FILE_BYTES`]; a diff plan reads only the files the diff
+    /// changed and keeps windows around their hunks, so it takes `None`
+    /// (#3171).
+    max_bytes: Option<u64>,
 }
 
 impl SourceFiles {
@@ -361,7 +366,17 @@ impl SourceFiles {
             tree: tree.to_path_buf(),
             all,
             content: HashMap::new(),
+            max_bytes: Some(MAX_FILE_BYTES),
         }
+    }
+
+    /// (#3171) The cache a diff plan reads through: no size cap. The cap
+    /// guards a tree walk, which reads whole files by the thousand; a diff
+    /// names a handful of changed files and a unit carries only the windows
+    /// around their hunks. Capping here dropped the change itself from the
+    /// review (PR #3170: a 684 KB file, skipped by every rule).
+    fn for_diff(tree: &Path, all: Vec<String>) -> Self {
+        Self { max_bytes: None, ..Self::new(tree, all) }
     }
 
     fn matching(&self, applies_to: &[String], exclude: &[String]) -> Vec<String> {
@@ -378,7 +393,7 @@ impl SourceFiles {
         }
         let full = self.tree.join(rel);
         let result = match fs::metadata(&full) {
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+            Ok(meta) if self.max_bytes.is_some_and(|max| meta.len() > max) => {
                 skipped.push(SkippedEntry {
                     reason: format!("exceeds {MAX_FILE_BYTES} bytes ({} bytes)", meta.len()),
                     file: rel.to_string(),
@@ -1222,7 +1237,7 @@ pub fn plan_diff_rule(materialized: &Materialized, rule: &Rule, diff_text: &str,
         .collect();
     let all = materialized.files.get(&source.id).cloned().unwrap_or_default();
     let files_walked = all.len();
-    let mut files = SourceFiles::new(&source.tree, all);
+    let mut files = SourceFiles::for_diff(&source.tree, all);
 
     let regexes: Vec<Regex> = rule
         .prefilter
@@ -2354,6 +2369,37 @@ line two
     /// one hunk, `swallowed-error` (a real embedded rule with a real
     /// prefilter), over a `Materialized` built the same way
     /// `workspace_spec::materialize` would for a one-source spec.
+    /// (#3171) A diff plan reviews a changed hunk in a file over
+    /// `MAX_FILE_BYTES`. The cap guards tree walks (whole files, thousands of
+    /// them); a diff unit carries only windows around the hunks, so dropping
+    /// a changed file for its size meant the code change went unreviewed
+    /// (PR #3170: `dispatch_internal.rs`, 684 KB, skipped by every rule).
+    #[test]
+    fn plan_diff_rule_reviews_a_changed_hunk_in_a_file_over_the_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let padding = "// padding line to grow the file past the cap\n".repeat((MAX_FILE_BYTES as usize / 40) + 10);
+        fs::write(dir.path().join("big.rs"), format!("fn changed() {{\n    let x = 1;\n}}\n{padding}")).unwrap();
+        assert!(fs::metadata(dir.path().join("big.rs")).unwrap().len() > MAX_FILE_BYTES);
+        let diff_text = [
+            "diff --git a/big.rs b/big.rs",
+            "--- a/big.rs",
+            "+++ b/big.rs",
+            "@@ -1,2 +1,3 @@",
+            " fn changed() {",
+            "+    let x = 1;",
+            " }",
+        ]
+        .join("\n")
+            + "\n";
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"c".repeat(40))], Vec::new());
+        let (rules, _) = darkmux_crew::rules::load_all(None);
+        let plan = plan_diff_rule(&materialized, &rules["intent-vs-diff"].clone(), &diff_text, PlanParams::default()).unwrap();
+        assert!(plan.totals.skipped.is_empty(), "the changed file is not skipped: {:?}", plan.totals.skipped);
+        assert_eq!(plan.units.len(), 1, "{:?}", plan.units);
+        let Unit::Site { sites, .. } = &plan.units[0] else { panic!("expected a Site unit") };
+        assert_eq!(sites[0].file, "big.rs");
+    }
+
     #[test]
     fn plan_diff_rule_plans_one_site_kind_rule_over_a_diff() {
         let dir = TempDir::new().unwrap();

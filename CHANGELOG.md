@@ -102,6 +102,17 @@ darkmux release.
 
 ### Fixed
 
+- **A diff review reviews changed files of any size, and says what it did not read** (#3171).
+  The review planner skipped every changed file over 512 KB (a guard meant for
+  whole-tree scans), so a PR touching one of the large source files had that
+  change silently unreviewed: PR #3170's review read only its changelog entry
+  and still posted "0 finding(s)". A diff plan now reads changed files of any
+  size (a unit carries only the windows around their hunks); "hunks covered"
+  counts hunks a completed unit's window overlaps, not windows (it read "3/4"
+  where the truth was 1 of 4); and any file a plan could not read is named in
+  the scope line as "Not reviewed: <file> (<reason>)", which keeps the run from
+  reading as clean.
+
 - **A text-mode dispatch no longer warns that its output is "not an envelope"** (#3164).
   Every `darkmux dispatch` run without `--json` printed "the runtime's stdout is
   not an envelope this darkmux reads ... without metrics, detections or bounds"
