@@ -58,19 +58,32 @@ fn save_phase(id: &str, mission: &str) {
 /// A one-unit plan naming a real rule, whose source tree lives under
 /// `root/tree/app` so the unit's workspace root is `root/tree`.
 fn write_plan(root: &Path, rule: &str, unit_id: &str, sha: &str) -> PathBuf {
-    let tree = root.join("tree").join("app");
-    fs::create_dir_all(&tree).unwrap();
+    write_plan_with_sources(root, rule, unit_id, &[("app", sha)])
+}
+
+/// `write_plan` over several sources, each a sibling checkout under
+/// `root/tree` at its own sha; the unit works on the FIRST.
+fn write_plan_with_sources(root: &Path, rule: &str, unit_id: &str, sources: &[(&str, &str)]) -> PathBuf {
+    let mut plan_sources = Vec::new();
+    for (id, sha) in sources {
+        let tree = root.join("tree").join(id);
+        fs::create_dir_all(&tree).unwrap();
+        if !sha.is_empty() {
+            point_head_at(&tree, sha);
+        }
+        plan_sources.push(serde_json::json!({
+            "id": id, "sha": sha, "ref": "main",
+            "tree": tree.to_string_lossy(), "files_walked": 1, "out_of_scope": 0
+        }));
+    }
     let plan = serde_json::json!({
         "schema_version": crate::crawl::plan::PLAN_SCHEMA_VERSION,
         "workspace": "fixture-ws",
         "planned_at": "2026-09-04T00:00:00Z",
         "rules": [rule],
-        "sources": [{
-            "id": "app", "sha": sha, "ref": "main",
-            "tree": tree.to_string_lossy(), "files_walked": 1, "out_of_scope": 0
-        }],
+        "sources": plan_sources,
         "units": [{
-            "kind": "site", "id": unit_id, "rule": rule, "source": "app",
+            "kind": "site", "id": unit_id, "rule": rule, "source": sources[0].0,
             "sites": [{"file": "src/a.ts", "line": 2, "start": 1, "end": 5, "hits": [2]}],
             "est_tokens": 400
         }],
@@ -91,6 +104,19 @@ fn write_plan(root: &Path, rule: &str, unit_id: &str, sha: &str) -> PathBuf {
     });
     fs::write(&p, serde_json::to_string(&wrapped).unwrap()).unwrap();
     p
+}
+
+/// (#3188) Make `tree` a checkout whose HEAD is `sha` — a detached HEAD
+/// naming an object the repo does not hold, which `git rev-parse HEAD`
+/// reports as-is. Every unit now checks its tree's HEAD against the plan's
+/// sha before dispatching, so a fixture tree must hold the sha its plan
+/// records, exactly as a materialized one does.
+fn point_head_at(tree: &Path, sha: &str) {
+    if !tree.join(".git").exists() {
+        let out = std::process::Command::new("git").current_dir(tree).args(["init", "-q"]).output().unwrap();
+        assert!(out.status.success(), "git init: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    fs::write(tree.join(".git/HEAD"), format!("{sha}\n")).unwrap();
 }
 
 fn unit_step(config: serde_json::Value) -> Step {
@@ -1240,6 +1266,68 @@ fn an_empty_sha_is_refused_rather_than_stamped_onto_findings() {
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
     let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains("empty sha") && err.contains("unversioned"), "{err}");
+}
+
+/// (#3188) The live failure: two `review` missions shared one tree, which
+/// held the FIRST mission's sha, and the second mission's units reviewed it
+/// against their own plan. A unit whose tree does not hold its plan's sha
+/// must refuse loudly, naming both shas, before anything dispatches.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_unit_whose_tree_holds_a_different_sha_than_its_plan_is_refused() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let planned = "a".repeat(40);
+    let actual = "b".repeat(40);
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &planned);
+    // Another mission moved the shared checkout after this plan was written.
+    point_head_at(&ws.path().join("tree").join("app"), &actual);
+    let kind = DispatchUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("dispatched against the wrong tree"))));
+    let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
+    assert!(!err.contains("dispatched against the wrong tree"), "the unit must refuse before dispatching: {err}");
+    assert!(err.contains(&planned) && err.contains(&actual), "the refusal must name both shas: {err}");
+}
+
+/// (#3188) A unit's mount holds every sibling source (an edge unit reads two),
+/// so a sibling whose tree moved off its plan's sha refuses the unit too,
+/// even when the unit's own source is intact.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_unit_whose_sibling_tree_holds_a_different_sha_is_refused() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let lib_planned = "c".repeat(40);
+    let plan =
+        write_plan_with_sources(ws.path(), "unnamed-predicate", "u-0001", &[("app", &"a".repeat(40)), ("lib", &lib_planned)]);
+    point_head_at(&ws.path().join("tree").join("lib"), &"d".repeat(40));
+    let kind = DispatchUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("dispatched against the wrong tree"))));
+    let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
+    assert!(!err.contains("dispatched against the wrong tree"), "the unit must refuse before dispatching: {err}");
+    assert!(err.contains("`lib`") && err.contains(&lib_planned), "the refusal must name the sibling: {err}");
+}
+
+/// (#3188) A tree that is gone (pruned, or never materialized) refuses the
+/// same way: no HEAD is not the plan's sha.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_unit_whose_tree_is_not_a_checkout_is_refused() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    fs::remove_dir_all(ws.path().join("tree").join("app").join(".git")).unwrap();
+    let kind = DispatchUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("dispatched against the wrong tree"))));
+    let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
+    assert!(!err.contains("dispatched against the wrong tree"), "the unit must refuse before dispatching: {err}");
+    assert!(err.contains("no checkout"), "{err}");
 }
 
 #[test]

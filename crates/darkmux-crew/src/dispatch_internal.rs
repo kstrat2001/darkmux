@@ -6015,8 +6015,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //   - `src/coder_phase.rs` creates a git WORKTREE per phase and
     //     dispatches the coder into it via the workdir.
     //   - `crates/darkmux-lab/src/crawl/unit_step.rs` mounts the
-    //     materialized workspace's `tree/` PARENT (so the container's
-    //     `/workspace/<source>/…` paths resolve), and each `tree/<source>`
+    //     materialized snapshot dir `tree/<snapshot>` (#3188; so the container's
+    //     `/workspace/<source>/…` paths resolve), and each `<snapshot>/<source>`
     //     under it is a detached worktree of a bare mirror outside the
     //     mount. Hence `find_split_gitdirs`'s one-level child scan — the
     //     mount root itself has no `.git` at all, so a workdir-only check

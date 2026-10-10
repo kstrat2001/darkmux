@@ -914,6 +914,27 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
             ps.tree.display()
         )
     })?;
+    // (#3188) The plan's sha is a claim about the tree; check the tree.
+    // Every source mounted under this unit's root is checked (the unit's
+    // own among them, since its tree's parent IS the root): an edge unit
+    // reads two of them, and any unit can open a sibling. Two `review` missions once shared one checkout and one of
+    // them reviewed the other's commit — a tree that does not hold the sha
+    // its plan recorded refuses here, before anything dispatches.
+    for mounted in the_plan.sources.iter().filter(|s| s.tree.parent() == Some(tree_root.as_path())) {
+        let actual = darkmux_crew::workspace_spec::tree_head(&mounted.tree);
+        if actual.as_deref() != Some(mounted.sha.as_str()) {
+            bail!(
+                "`{DISPATCH_UNIT_KIND}`: unit `{}`: the plan recorded source `{}` at {}, but its tree `{}` \
+                 holds {} — reviewing it would anchor every finding to the wrong code. The tree was \
+                 replaced or removed after this plan was written: re-plan this rule",
+                unit.id(),
+                mounted.id,
+                mounted.sha,
+                mounted.tree.display(),
+                actual.as_deref().unwrap_or("no checkout")
+            );
+        }
+    }
     Ok(UnitContext {
         workspace: the_plan.workspace.clone(),
         unit_id: unit.id().to_string(),

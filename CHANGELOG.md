@@ -133,6 +133,26 @@ darkmux release.
   ends with its records. The browser reconnects, the new connection falls back
   to the file tail, and the viewer's reconnect re-fetch fills the gap.
 
+- **Two missions reviewing one repository at once no longer share a
+  checkout** (#3188). A workspace materialized each source into one tree,
+  `<root>/tree/<source>`, so two `review` missions launched together both
+  recorded that path, each with its own sha, and one reviewed the other's
+  commit. Each materialization now checks out into its own snapshot,
+  `<root>/tree/<snapshot>/<source>`, named by a digest of every source's
+  sha: different shas get different directories, and the same shas reuse
+  one. The process that materializes a snapshot holds a lease on it until
+  it exits, and every materialize removes the snapshots nobody holds, so at
+  rest a workspace keeps one snapshot and while missions run it keeps one
+  per set of shas in flight. A snapshot another live process holds is never
+  cleaned or rebuilt: if it is not pristine, the materialize refuses, naming
+  the snapshot and the holder's pid. The old single-tree checkout
+  (`<root>/tree/<source>`) is never removed automatically, because a mission
+  on an older binary may still be reading it, so one stale tree per
+  workspace stays until you delete it.
+  A `dispatch.unit` step now checks that every tree its plan mounts holds
+  the sha the plan recorded, and refuses the unit, naming both shas,
+  before it dispatches.
+
 - **A relative `lms_bin` works again, and `darkmux doctor` checks the file a dispatch will run** (#2533).
   Every `lms` spawn runs with its working directory pinned to `/` (#1863), so a
   relative `lms_bin` such as `./bin/lms` resolved against `/` and every dispatch

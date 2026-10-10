@@ -322,9 +322,10 @@ fn submodule_superproject(checkout: &Path, target: &Path) -> Option<PathBuf> {
 /// workdirs in this repo, and only one of them puts the checkout AT the
 /// workdir. `coder_phase` creates a git worktree and dispatches with
 /// `--workdir <that worktree>`; the crawl's unit dispatch
-/// (`darkmux_lab::crawl::unit_step`) mounts the workspace's `tree/`
-/// PARENT so the container's `/workspace/<source>/…` paths resolve, and
-/// each `tree/<source>` under it is a detached worktree of a bare mirror
+/// (`darkmux_lab::crawl::unit_step`) mounts the materialization's
+/// snapshot dir, `tree/<snapshot>` (#3188), so the container's
+/// `/workspace/<source>/…` paths resolve, and each `tree/<snapshot>/<source>`
+/// under it is a detached worktree of a bare mirror
 /// that lives outside the mount. Inspecting only the mount root is blind
 /// to the second one — and the crawler role is explicitly instructed to
 /// run `git log` and `git show`, so it is the case that hurts most.
@@ -931,9 +932,9 @@ mod tests {
     }
 
     /// A multi-source crawl is the ordinary case, not an edge one: every
-    /// source materializes at `<workspace>/tree/<source id>` (siblings
-    /// under one root), an `EdgeSpec` names TWO sources in a single spec,
-    /// and `crawl::unit_step` passes the SHARED `tree/` root as the
+    /// source materializes at `<workspace>/tree/<snapshot>/<source id>`
+    /// (siblings under one root, #3188), an `EdgeSpec` names TWO sources in
+    /// a single spec, and `crawl::unit_step` passes the SHARED snapshot root as the
     /// workdir for every unit regardless of which source that unit works
     /// on. Returning only the first sorted child would then describe
     /// `alpha` to a dispatch that is working on `zeta` — deterministic,
