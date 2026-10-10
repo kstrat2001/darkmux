@@ -132,9 +132,14 @@ darkmux release.
   `<root>/tree/<snapshot>/<source>`, named by a digest of every source's
   sha: different shas get different directories, and the same shas reuse
   one. The process that materializes a snapshot holds a lease on it until
-  it exits, and every materialize removes the snapshots nobody holds,
-  including the old single-tree checkouts, so at rest a workspace keeps one
-  snapshot and while missions run it keeps one per set of shas in flight.
+  it exits, and every materialize removes the snapshots nobody holds, so at
+  rest a workspace keeps one snapshot and while missions run it keeps one
+  per set of shas in flight. A snapshot another live process holds is never
+  cleaned or rebuilt: if it is not pristine, the materialize refuses, naming
+  the snapshot and the holder's pid. The old single-tree checkout
+  (`<root>/tree/<source>`) is never removed automatically, because a mission
+  on an older binary may still be reading it, so one stale tree per
+  workspace stays until you delete it.
   A `dispatch.unit` step now checks that every tree its plan mounts holds
   the sha the plan recorded, and refuses the unit, naming both shas,
   before it dispatches.

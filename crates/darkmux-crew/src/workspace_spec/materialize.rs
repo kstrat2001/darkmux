@@ -248,13 +248,17 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     refuse_symlinked_dir(&snapshot)?;
     fs::create_dir_all(&snapshot)
         .with_context(|| format!("creating snapshot dir {}", snapshot.display()))?;
+    // (#3189 review) Whether some OTHER live process holds this snapshot,
+    // asked before this process takes its own lease: such a snapshot is
+    // never cleaned or rebuilt here (see `checkout_one`).
+    let held_elsewhere = snapshot_held_elsewhere(&tree_root, &key);
     take_snapshot_lease(&tree_root, &key)?;
 
     let sources: Vec<MaterializedSource> = spec
         .sources
         .iter()
         .zip(resolved)
-        .map(|(s, r)| checkout_one(s, &mirror_root, &snapshot, r, opts))
+        .map(|(s, r)| checkout_one(s, &mirror_root, &snapshot, r, opts, held_elsewhere.as_ref()))
         .collect::<Result<_>>()?;
 
     prune_unleased_snapshots(&tree_root, &mirror_root);
@@ -606,6 +610,8 @@ fn checkout_one(
     snapshot: &Path,
     resolved: ResolvedSource,
     opts: MaterializeOptions,
+    // `Some(holders)` when another live process leases this snapshot.
+    held_elsewhere: Option<&String>,
 ) -> Result<MaterializedSource> {
     let ResolvedSource { mirror_path, sha } = resolved;
     let git_ref = source.resolved_ref();
@@ -636,6 +642,19 @@ fn checkout_one(
                 git_ref: git_ref.to_string(),
                 tree: tree_path,
             });
+        }
+        // (#3189 review) Not reusable means dirty or broken, and the fix is a
+        // teardown. A snapshot another live process holds is never torn
+        // down: its units may be reading it right now (a probe saw ENOENT
+        // on 29,414 of 43,857 reads during such a rebuild).
+        if let Some(holders) = held_elsewhere {
+            bail!(
+                "snapshot {} for source '{}' at {sha} is not pristine and is held by another live darkmux \
+                 process ({holders}); darkmux never rebuilds a tree another mission may be reading. \
+                 Let that mission finish, or stop it, and materialize again",
+                snapshot.display(),
+                source.id
+            );
         }
         // The prior checkout may have been made read-only — restore write
         // access before `git worktree remove`/`remove_dir_all` need it.
@@ -864,8 +883,8 @@ fn lease_path(tree_root: &Path, key: &str) -> PathBuf {
 /// materialized (#3188). Each holds a SHARED `flock` on the snapshot's
 /// lease file; the kernel drops it when the process exits, crash included.
 #[cfg(unix)]
-fn held_leases() -> &'static Mutex<HashMap<PathBuf, fs::File>> {
-    static HELD: OnceLock<Mutex<HashMap<PathBuf, fs::File>>> = OnceLock::new();
+fn held_leases() -> &'static Mutex<HashMap<PathBuf, darkmux_types::flock::FlockGuard>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, darkmux_types::flock::FlockGuard>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -878,31 +897,65 @@ fn held_leases() -> &'static Mutex<HashMap<PathBuf, fs::File>> {
 /// a prune of the same snapshot.
 #[cfg(unix)]
 fn take_snapshot_lease(tree_root: &Path, key: &str) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
     let path = lease_path(tree_root, key);
     let mut held = held_leases().lock().unwrap_or_else(|e| e.into_inner());
     if held.contains_key(&path) {
         return Ok(());
     }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening snapshot lease {}", path.display()))?;
-    loop {
-        // SAFETY: `file` owns the fd for the whole call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(anyhow::Error::new(err).context(format!("leasing snapshot {}", path.display())));
-        }
+    // One `pid` line per process that ever leased this snapshot, so a
+    // refusal can name its holder. Bounded: one line per materializing
+    // process, removed with the snapshot. Opening for append also creates
+    // the file, which `lock_shared_existing` then locks.
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening snapshot lease {}", path.display()))?;
+        let _ = writeln!(f, "pid {}", std::process::id());
     }
-    held.insert(path, file);
+    let guard = darkmux_types::flock::lock_shared_existing(&path)
+        .with_context(|| format!("leasing snapshot {}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("snapshot lease {} vanished before it was locked", path.display()))?;
+    held.insert(path, guard);
     Ok(())
+}
+
+/// (#3189 review) `Some(holders)` when a live process OTHER than this one
+/// leases the snapshot; `holders` names the pids its lease file recorded.
+/// This process's own lease (if it has one) is released first and the
+/// probe is an exclusive non-blocking claim, so only another holder makes
+/// it fail. Runs under the workspace lock, which every pruner also holds,
+/// so dropping our lease for the probe cannot let a prune in.
+#[cfg(unix)]
+fn snapshot_held_elsewhere(tree_root: &Path, key: &str) -> Option<String> {
+    let path = lease_path(tree_root, key);
+    if !path.exists() {
+        return None;
+    }
+    held_leases().lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+    if try_claim_unleased(&path).is_some() {
+        return None;
+    }
+    let me = format!("pid {}", std::process::id());
+    let pids: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("pid ") && *l != me)
+        .map(str::to_string)
+        .collect();
+    Some(if pids.is_empty() {
+        format!("lease {}", path.display())
+    } else {
+        format!("lease {}, leased by {}", path.display(), pids.join(", "))
+    })
+}
+
+/// Off Unix there are no leases, so no holder is ever known.
+#[cfg(not(unix))]
+fn snapshot_held_elsewhere(_tree_root: &Path, _key: &str) -> Option<String> {
+    None
 }
 
 #[cfg(not(unix))]
@@ -914,26 +967,26 @@ fn take_snapshot_lease(_tree_root: &Path, _key: &str) -> Result<()> {
 /// non-blocking `flock` on it. The returned file keeps that lock until it is
 /// dropped, so a caller deletes the snapshot while still holding it.
 #[cfg(unix)]
-fn try_claim_unleased(lease: &Path) -> Option<fs::File> {
-    use std::os::unix::io::AsRawFd;
-    let file = fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(lease).ok()?;
-    // SAFETY: `file` owns the fd for the whole call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(file)
+fn try_claim_unleased(lease: &Path) -> Option<darkmux_types::flock::FlockGuard> {
+    // An I/O error proves nothing about the holders, so it answers "held":
+    // the safe direction is to keep the snapshot.
+    darkmux_types::flock::try_lock_exclusive(lease).ok().flatten()
 }
 
 /// Off Unix there are no leases, so nothing is ever provably unused and
 /// nothing is pruned.
 #[cfg(not(unix))]
-fn try_claim_unleased(_lease: &Path) -> Option<fs::File> {
+fn try_claim_unleased(_lease: &Path) -> Option<()> {
     None
 }
 
 /// (#3188) **The cleanup rule.** Every materialize of a workspace removes
 /// each OTHER directory under `<root>/tree` that no live process holds a
-/// lease on: snapshots whose missions have ended (or crashed), and the
-/// pre-#3188 single `<root>/tree/<source>` checkouts, which never had a
-/// lease. A snapshot a running mission recorded is leased by that
+/// lease on: snapshots whose missions have ended (or crashed). A
+/// pre-#3188 single `<root>/tree/<source>` checkout has no lease file and
+/// is never removed here (an older binary may still be reading it); one
+/// such stale tree per workspace stays until the operator removes it. A
+/// snapshot a running mission recorded is leased by that
 /// mission's process and is never removed. So at rest a workspace holds
 /// one snapshot (the newest), and while missions run it holds one per
 /// distinct set of shas in flight.
@@ -955,6 +1008,13 @@ fn prune_unleased_snapshots(tree_root: &Path, mirror_root: &Path) {
         let name = entry.file_name().to_string_lossy().to_string();
         let dir = entry.path();
         let lease = lease_path(tree_root, &name);
+        // (#3189 review) Only snapshots carry a lease file — one is created
+        // before any checkout. A pre-#3188 `<root>/tree/<source>` never had
+        // one, and a mission on the previous binary (which has no unit HEAD
+        // check) may still be reading it, so it is left for the operator.
+        if !lease.exists() {
+            continue;
+        }
         // The snapshot this call just materialized is leased by this very
         // process, so the claim fails on it like on any other live one.
         let Some(_claim) = try_claim_unleased(&lease) else { continue };
@@ -2921,8 +2981,8 @@ mod tests {
     }
 
     /// (#3188) The cleanup rule: a materialize removes every OTHER snapshot
-    /// no live process holds a lease on — including a pre-#3188
-    /// `<root>/tree/<source>` checkout — and keeps every leased one.
+    /// no live process holds a lease on, keeps every leased one, and never
+    /// touches a pre-#3188 `<root>/tree/<source>` checkout.
     #[test]
     fn materialize_prunes_unleased_snapshots_and_keeps_leased_ones() {
         let source = init_source_repo();
@@ -2958,7 +3018,10 @@ mod tests {
         assert!(held.join("app/held.txt").exists(), "a leased snapshot must survive a prune");
         assert!(!orphan.exists(), "an unleased snapshot must be pruned");
         assert!(!tree_root.join("fedcba9876543210.lease").exists(), "its lease file goes with it");
-        assert!(!old_layout.exists(), "the pre-#3188 single tree must be pruned");
+        // (#3189 review) A mission on the previous binary may still be reading
+        // the old single tree, and that binary has no unit HEAD check: it is
+        // left for the operator, never pruned.
+        assert!(old_layout.join("stale.txt").exists(), "the pre-#3188 single tree must be left alone");
         assert!(m.sources[0].tree.join("a.txt").exists(), "the new snapshot is untouched");
         // Exactly two snapshots and their two leases remain: nothing else,
         // and never a lease of a lease file.
@@ -2969,6 +3032,7 @@ mod tests {
         let mut expected = vec![
             "0123456789abcdef".to_string(),
             "0123456789abcdef.lease".to_string(),
+            "app".to_string(),
             new_key.clone(),
             format!("{new_key}.lease"),
         ];
@@ -2991,6 +3055,53 @@ mod tests {
         let plain = source.path().join("plain");
         fs::create_dir_all(&plain).unwrap();
         assert_eq!(tree_head(&plain), None, "a non-checkout has no HEAD, never a parent's");
+    }
+
+
+    /// (#3189 review) The probe that proved the rebuild hazard: mission A
+    /// materializes, its tree is dirtied, and a reader keeps reading it
+    /// while mission B — another live process, which holds the same
+    /// snapshot's lease — materializes the same sha. B used to tear the tree
+    /// down and re-add it under A's reader (ENOENT on 29,414 of 43,857
+    /// reads). A snapshot another process holds is never cleaned or rebuilt:
+    /// B refuses, naming the snapshot, and A's tree is untouched.
+    #[test]
+    fn a_dirty_snapshot_another_process_holds_is_refused_never_rebuilt_under_its_reader() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let spec = spec_for("t-3189-dirty", workdir.path(), source.path(), "main");
+        let tree = materialize(&spec, RW).unwrap().sources[0].tree.clone();
+        fs::write(tree.join("scribble.txt"), "dirty\n").unwrap();
+        let key = tree.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+        // Mission A's process: a shared flock on the lease through a
+        // description this process's own lease registry does not own.
+        let other = fs::OpenOptions::new().read(true).write(true).open(workdir.path().join(format!("tree/{key}.lease"))).unwrap();
+        assert_eq!(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_SH) }, 0);
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let misses = std::sync::Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let (stop, misses, file) = (stop.clone(), misses.clone(), tree.join("a.txt"));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if fs::read(&file).is_err() {
+                        misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        let result = materialize(&spec, RW);
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        let err = format!("{:#}", result.err().expect("a dirty snapshot another process holds must be refused"));
+        assert!(err.contains(&key), "the refusal must name the snapshot: {err}");
+        assert!(err.contains("held by another"), "the refusal must say who holds it: {err}");
+        assert_eq!(misses.load(Ordering::Relaxed), 0, "the holder's reader must never miss a file");
+        assert!(tree.join("scribble.txt").exists(), "the held tree must not be cleaned");
+        drop(other);
     }
 
 }
