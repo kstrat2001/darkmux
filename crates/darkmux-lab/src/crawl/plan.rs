@@ -438,17 +438,26 @@ impl SourceFiles {
             .collect()
     }
 
+    /// (#3180) True, after listing `rel` as skipped, when it is a generated
+    /// file: no unit reads it.
+    fn skip_generated(&mut self, rel: &str, skipped: &mut Vec<SkippedEntry>, source_id: &str) -> bool {
+        if !self.generated.contains(rel) {
+            return false;
+        }
+        skipped.push(SkippedEntry {
+            reason: "generated (`linguist-generated` in .gitattributes)".to_string(),
+            file: rel.to_string(),
+            source: Some(source_id.to_string()),
+        });
+        self.content.insert(rel.to_string(), None);
+        true
+    }
+
     fn get(&mut self, rel: &str, skipped: &mut Vec<SkippedEntry>, source_id: &str) -> Option<Rc<String>> {
         if let Some(v) = self.content.get(rel) {
             return v.clone();
         }
-        if self.generated.contains(rel) {
-            skipped.push(SkippedEntry {
-                reason: "generated (`linguist-generated` in .gitattributes)".to_string(),
-                file: rel.to_string(),
-                source: Some(source_id.to_string()),
-            });
-            self.content.insert(rel.to_string(), None);
+        if self.skip_generated(rel, skipped, source_id) {
             return None;
         }
         let full = self.tree.join(rel);
