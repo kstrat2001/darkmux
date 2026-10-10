@@ -7156,6 +7156,23 @@ pub fn reclaimable_gb_for_specs() -> Option<u64> {
 /// real-headroom expression. (#275)
 pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 
+/// The AI-available RAM in bytes: the same `reclaimable + resident −
+/// safety_margin` figure the `RAM headroom` row reports, floored at 0.
+/// `None` when `vm_stat` cannot be read (non-macOS). One computation for
+/// every caller: `serve`'s /machine/specs and `init`'s utility window (#3020).
+pub fn ai_headroom_bytes() -> Option<u64> {
+    let gb = read_reclaimable_gb()?;
+    let resident_gb = lms::list_loaded()
+        .ok()
+        .map(|models| models.iter().filter_map(|m| darkmux_types::size::parse_size_gb(&m.size)).sum::<f64>())
+        .unwrap_or(0.0);
+    let real_gb = (gb as f64) + resident_gb - (RAM_SAFETY_MARGIN_GB as f64);
+    if real_gb < 0.0 {
+        return Some(0);
+    }
+    Some((real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
+}
+
 fn read_reclaimable_gb() -> Option<u64> {
     let out = Command::new("vm_stat").output().ok()?;
     if !out.status.success() {

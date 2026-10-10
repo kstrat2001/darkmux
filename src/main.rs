@@ -1744,6 +1744,12 @@ fn cmd_init(
             println!("utility model: `{id}` (the registry named one LM Studio does not have; this is the closest downloaded match, edit {} to change)", p.display());
         } else if let Some(reason) = report.utility_model_unfilled_reason.as_deref() {
             println!("utility model: not verified. {reason}");
+        } else if let Some(reason) = report.utility_model_unregistered_reason.as_deref() {
+            println!("utility model: not registered. {reason}");
+        }
+        // (#3020) The shipped window, resized to what this machine can hold.
+        if let Some(n) = report.utility_model_n_ctx {
+            println!("utility model window: {n} tokens (sized from this machine's AI headroom; edit {} to change)", p.display());
         }
     }
     if let Some(p) = report.config_path.as_ref() {

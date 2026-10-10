@@ -3080,23 +3080,7 @@ fn read_ram_total_bytes() -> Option<u64> {
 /// computation. Returns `None` on non-macOS (today's doctor is
 /// macOS-shaped).
 fn read_ram_free_for_ai_bytes() -> Option<u64> {
-    let gb = darkmux_doctor::reclaimable_gb_for_specs()?;
-    let resident_gb = darkmux_profiles::lms::list_loaded()
-        .ok()
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|m| darkmux_types::size::parse_size_gb(&m.size))
-                .sum::<f64>()
-        })
-        .unwrap_or(0.0);
-    let safety_gb = darkmux_doctor::RAM_SAFETY_MARGIN_GB_FOR_SPECS as f64;
-    let real_gb = (gb as f64) + resident_gb - safety_gb;
-    if real_gb < 0.0 {
-        return Some(0);
-    }
-    let bytes = (real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64;
-    Some(bytes)
+    darkmux_doctor::ai_headroom_bytes()
 }
 
 /// Read the CPU brand string. macOS: `sysctl machdep.cpu.brand_string`

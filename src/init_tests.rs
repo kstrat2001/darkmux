@@ -81,6 +81,10 @@ impl InitEnv {
         let home_path = env.home.path().to_path_buf();
         env.set("HOME", home_path.as_os_str().to_owned());
         env.set("DARKMUX_LMS_BIN", lms.into_os_string());
+        // (#3020) The utility window is sized from the AI headroom doctor
+        // reads off the live host; pin it, so no test depends on how much
+        // memory this machine has free. Plenty, unless a test says otherwise.
+        env.headroom(Some(1 << 50));
         // A skills override would change which source `init` installs from;
         // the target is what matters here, and it is under HOME.
         env.unset("DARKMUX_SKILLS_DIR");
@@ -111,6 +115,12 @@ impl InitEnv {
         fs::write(self.stub.path().join("ls.json"), Value::Array(catalog.to_vec()).to_string()).unwrap();
         let ps: Vec<Value> = loaded.iter().map(|id| serde_json::json!({ "identifier": id, "modelKey": id })).collect();
         fs::write(self.stub.path().join("ps.json"), Value::Array(ps).to_string()).unwrap();
+    }
+
+    /// The AI headroom (bytes) `init` sizes the utility window from;
+    /// `None` reads as "could not be measured".
+    fn headroom(&self, bytes: Option<u64>) {
+        set_ai_headroom_override(Some(bytes));
     }
 
     /// Point `lms` at a path that does not exist, so spawning it fails.
@@ -155,6 +165,7 @@ impl InitEnv {
 
 impl Drop for InitEnv {
     fn drop(&mut self) {
+        set_ai_headroom_override(None);
         for (var, value) in self.prev.drain(..).rev() {
             // SAFETY: as in `set`.
             unsafe {
@@ -539,12 +550,6 @@ fn the_utility_fill_rewrites_only_the_shipped_binding_and_only_when_it_is_missin
             want: Ok(Some("small-2b".to_string())),
         },
         Case {
-            name: "absent, and only toys downloaded",
-            registry: filled.clone(),
-            catalog: vec![model("toy-0.5b", GB / 2, "llm")],
-            want: Err("is not downloaded and no LLM of at least 1 GB is"),
-        },
-        Case {
             name: "an id the operator set by hand is theirs, downloaded or not",
             registry: custom,
             catalog: vec![model("small-2b", 2 * GB, "llm")],
@@ -586,6 +591,108 @@ fn the_utility_fill_rewrites_only_the_shipped_binding_and_only_when_it_is_missin
             }
         }
     }
+}
+
+/// The registry `text` as darkmux loads it, with every validation applied.
+fn load(env: &InitEnv) -> darkmux_types::ProfileRegistry {
+    darkmux_profiles::profiles::load_registry(Some(env.registry().to_str().unwrap()))
+        .expect("the registry init wrote must load")
+        .registry
+}
+
+/// (#3020) Seen on an 8 GB machine: LM Studio held no usable LLM (a Gemma
+/// still downloading, an embedding model) and doctor reported 0 GB available
+/// for AI. `init` left the shipped `qwen/qwen3-4b-instruct-2507` at 120,000
+/// tokens registered. It must leave the utility unregistered and say why,
+/// naming the fleet route.
+#[test]
+#[serial_test::serial]
+fn an_8gb_machine_with_no_ai_headroom_registers_no_utility_model() {
+    darkmux_types::run_in_own_process!();
+    for (name, catalog) in [
+        ("only an embedding", vec![model("text-embedding-nomic", GB / 10, "embedding")]),
+        ("only toys", vec![model("toy-0.5b", GB / 2, "llm"), model("text-embedding-nomic", GB / 10, "embedding")]),
+        ("a real LLM, but no headroom", vec![model("google/gemma-4-e4b", 6 * GB, "llm")]),
+    ] {
+        let env = InitEnv::new();
+        env.write_registry(&example_without_placeholder());
+        env.lms(&catalog, &[]);
+        env.headroom(Some(0));
+
+        let r = init(&opts()).unwrap();
+
+        let reg = load(&env);
+        assert_eq!(reg.utility_model_id(), None, "{name}: no utility registered: {}", env.read_registry());
+        assert!(reg.validate().is_empty(), "{name}: {:?}", reg.validate());
+        assert_eq!(r.utility_model_filled, None, "{name}");
+        let reason = r.utility_model_unregistered_reason.clone().unwrap_or_default();
+        assert!(reason.contains(&format!("`{}`", shipped_utility())), "{name}: names the id: {reason}");
+        if name == "a real LLM, but no headroom" {
+            assert!(reason.contains("0 GB available for AI"), "{reason}");
+            assert!(reason.contains("profile@machine"), "{reason}");
+        }
+    }
+}
+
+/// (#3020) With some headroom, the shipped window shrinks to what the machine
+/// can hold beside its worker, and only the window changes.
+#[test]
+#[serial_test::serial]
+fn a_tight_machine_gets_the_utility_window_its_headroom_can_hold() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let registry = EXAMPLE_PROFILES_JSON.replace(PLACEHOLDER_MODEL_ID, "worker-8b");
+    env.write_registry(&registry);
+    let (worker, utility) = (5 * GB, 2 * GB);
+    env.lms(&[model("worker-8b", worker, "llm"), model(shipped_utility(), utility, "llm")], &[]);
+    let rate = darkmux_profiles::model_ledger::fallback_kv_rate_for_size(utility);
+    env.headroom(Some(worker + utility + 2 * 64_000 * rate));
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.utility_model_n_ctx, Some(64_000));
+    assert_eq!(r.utility_model_unregistered_reason, None);
+    assert_eq!(load(&env).utility_model_n_ctx(), Some(64_000));
+    assert_eq!(env.read_registry(), registry.replacen("\"n_ctx\": 120000 }", "\"n_ctx\": 64000 }", 1));
+}
+
+/// (#3020) The floor is the smallest window a worker profile declares (the
+/// shipped `fast` profile's 32000): a smaller utility window is not registered.
+#[test]
+#[serial_test::serial]
+fn a_utility_window_below_the_smallest_worker_window_is_not_registered() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.write_registry(&example_without_placeholder());
+    let utility = 2 * GB;
+    env.lms(&[model(shipped_utility(), utility, "llm")], &[]);
+    let rate = darkmux_profiles::model_ledger::fallback_kv_rate_for_size(utility);
+    env.headroom(Some(utility + 2 * 20_000 * rate));
+
+    let r = init(&opts()).unwrap();
+
+    let reason = r.utility_model_unregistered_reason.unwrap_or_default();
+    assert!(reason.contains("20000-token") && reason.contains("32000 tokens"), "{reason}");
+    assert_eq!(load(&env).utility_model_id(), None);
+}
+
+/// (#3020) A window the operator set by hand is theirs: never resized, and
+/// the binding never removed for RAM, however little headroom there is.
+#[test]
+#[serial_test::serial]
+fn a_hand_set_utility_window_is_never_resized_or_removed() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let registry = example_without_placeholder().replacen("\"n_ctx\": 120000 }", "\"n_ctx\": 64000 }", 1);
+    env.write_registry(&registry);
+    env.lms(&[model(shipped_utility(), 2 * GB, "llm")], &[]);
+    env.headroom(Some(0));
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.utility_model_unregistered_reason, None);
+    assert_eq!(r.utility_model_n_ctx, None);
+    assert_eq!(env.read_registry(), registry);
 }
 
 #[test]
