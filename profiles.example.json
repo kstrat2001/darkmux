@@ -40,7 +40,8 @@
       "limits": {
         "window": { "period": null, "tokens": null, "calls": null },
         "policy": null,
-        "warn_at": null
+        "warn_at": null,
+        "max_wait": null
       }
     }
   },

@@ -232,7 +232,7 @@
   "crates/darkmux-trajectory/src/fold.rs::TrajectoryFold::apply": 30,
   "crates/darkmux-types/src/endpoint.rs::ModelEndpoint::kind": 15,
   "crates/darkmux-types/src/endpoint.rs::ModelEndpoint::validate": 13,
-  "crates/darkmux-types/src/endpoint.rs::UsageLimits::validate": 20,
+  "crates/darkmux-types/src/endpoint.rs::UsageLimits::validate": 18,
   "crates/darkmux-types/src/param_scalar.rs::text_form_ok": 12,
   "crates/darkmux-types/src/residency_lease.rs::LeaseGuard::identifiers_i_should_lead": 16,
   "crates/darkmux-types/src/session_id.rs::SessionId::parse": 13,

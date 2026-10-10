@@ -32,7 +32,13 @@ pub(crate) fn budget(policy: BudgetPolicy, tokens: Option<u64>, calls: Option<u6
         warn_at,
         window: darkmux_types::WindowBudget { period_secs: DAY as u64, tokens, calls },
         period: "1d".into(),
+        max_wait: None,
     }
+}
+
+/// [`budget`] under `wait` with a `max_wait` of `secs`.
+fn waiting_at_most(secs: u64) -> EndpointBudget {
+    EndpointBudget { max_wait: Some((secs, format!("{}m", secs / 60))), ..budget(BudgetPolicy::Wait, Some(1_000), None, None) }
 }
 
 /// A named endpoint carrying `limits`.
@@ -1200,4 +1206,44 @@ fn a_step_budget_settles_a_zero_total_like_a_missing_one() {
     assert_eq!(super::conservative_spend(one.total_tokens(), 4096, "p"), super::conservative_spend(missing.total_tokens(), 4096, "p"));
     assert!(super::conservative_spend(one.total_tokens(), 4096, "p") >= 4096);
     assert_eq!(one.floor_tokens(), 900);
+}
+
+
+/// (#3160) A wait that cannot end within the endpoint's `max_wait` fails at
+/// once, sends nothing, and says when the window would have room. The
+/// failure this pins: a CI review waited on a 30-day window that would free
+/// in 714 hours, inside a 90-minute job, until the job was cancelled.
+#[test]
+fn a_wait_longer_than_max_wait_fails_at_once_without_sleeping() {
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
+    let err = admit_with(waiting_at_most(1_800), &solo_caller(), &env).unwrap_err().to_string();
+    assert!(err.contains("max_wait 30m") && err.contains("nothing was sent"), "{err}");
+    assert!(err.contains("23h"), "names how long the wait would have been: {err}");
+    assert_eq!(env.slept_ms.get(), 0, "it never sleeps");
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetStop], "the refusal is on the record");
+    let stop = env.payload(darkmux_flow::FlowAction::BudgetStop);
+    assert_eq!(stop["endpoint_id"].as_str(), Some("azure"));
+    assert!(stop["reason"].as_str().unwrap().contains("max_wait"), "{stop}");
+    assert_eq!(stop["resume_at_ms"].as_i64(), Some((T0 - 10 + DAY) * 1_000), "{stop}");
+}
+
+/// A wait that fits inside `max_wait` waits exactly as before.
+#[test]
+fn a_wait_within_max_wait_still_waits_and_resumes() {
+    let env = FakeEnv::new(vec![(T0 - DAY + 90, 1_000)]);
+    admit_with(waiting_at_most(1_800), &solo_caller(), &env).unwrap();
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
+}
+
+/// A wait with no known resume time (a zero budget) is held at most
+/// `max_wait`, then fails.
+#[test]
+fn a_wait_with_no_resume_time_gives_up_at_max_wait() {
+    let env = FakeEnv::new(vec![]);
+    let b = EndpointBudget { max_wait: Some((60, "1m".into())), ..budget(BudgetPolicy::Wait, Some(0), None, None) };
+    let err = admit_with(b, &solo_caller(), &env).unwrap_err().to_string();
+    assert!(err.contains("max_wait 1m"), "{err}");
+    let slept = env.slept_ms.get();
+    assert!((60_000..=90_000).contains(&slept), "held about max_wait, then stopped: {slept}");
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop]);
 }
