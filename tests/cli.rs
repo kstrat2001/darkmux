@@ -3327,6 +3327,44 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
         );
 }
 
+/// (#3164) Runs a full local dispatch through the stable fakes, the model
+/// resident and the runtime image built for this darkmux. The fake `docker
+/// run` exits 0 with empty stdout, which is not an envelope: exactly what the
+/// host's enrichment warns about when it reads one.
+fn dispatch_through_fakes(extra: &[&str]) -> assert_cmd::assert::Assert {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("lms-ps.json"),
+        r#"[{"identifier":"darkmux:model-a","modelKey":"model-a","status":"loaded","sizeBytes":1000000000,"contextLength":32000}]"#,
+    )
+    .unwrap();
+    let (fake_bin, _log) = fake_docker_for_runtime_image(
+        tmp.path(),
+        &[("darkmux-runtime:latest", env!("CARGO_PKG_VERSION"))],
+    );
+    let mut args = vec!["--skip-preflight"];
+    args.extend_from_slice(extra);
+    let out = dispatch_with_fake_docker(tmp.path(), &fake_bin, &args);
+    drop(tmp);
+    out
+}
+
+/// (#3164) A text-mode dispatch never reads the runtime's stdout as an
+/// envelope, so it never warns that it is not one. The pair below proves the
+/// dispatch reached the enrichment point at all: with `--json` the same fake
+/// output does draw the warning. Pins the call site in `dispatch()`, which
+/// the helper's own unit tests cannot see (a falsification review proved
+/// `runtime_stdout_for_caller(true, ...)` there left them green).
+#[test]
+fn a_text_mode_dispatch_does_not_warn_that_its_output_is_not_an_envelope() {
+    dispatch_through_fakes(&[]).stderr(predicate::str::contains("not an envelope").not());
+}
+
+#[test]
+fn a_json_dispatch_still_warns_when_its_output_is_not_an_envelope() {
+    dispatch_through_fakes(&["--json"]).stderr(predicate::str::contains("not an envelope"));
+}
+
 // ─── #2923: a runtime image built for another darkmux is refused before it runs ──
 
 /// Stable fake `docker` and `lms`, shared by every test in this binary and
