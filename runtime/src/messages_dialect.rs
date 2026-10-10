@@ -15,7 +15,8 @@
 //! the envelope changes, plus two documented exceptions below (a malformed
 //! tool call's arguments, and the note after a cut turn):
 //!
-//! - Leading `system` messages become the top-level `system`. A `system`
+//! - Leading `system` messages become the top-level `system`, one text
+//!   block carrying its own cache breakpoint (the prefix units share). A `system`
 //!   message later in the conversation (the runtime's `[darkmux-runtime]`
 //!   feedback notes) becomes a user text block with the same text, in place,
 //!   so the cached prefix ahead of it stays stable.
@@ -65,7 +66,12 @@ pub fn request_body(req: &ChatRequest, stream: bool) -> Result<Value> {
     body.insert("model".into(), req.model.clone().into());
     body.insert("max_tokens".into(), max_tokens.into());
     if !system.is_empty() {
-        body.insert("system".into(), system.into());
+        // (#3162) A breakpoint of its own at the end of the system prompt:
+        // the tools and system prompt are the prefix every unit of a review
+        // shares, and the automatic breakpoint (at the conversation's last
+        // block) only ever writes the cache at the END of one unit's
+        // conversation, where the next unit's first call cannot reach it.
+        body.insert("system".into(), json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]));
     }
     body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {

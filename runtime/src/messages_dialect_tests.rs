@@ -50,7 +50,7 @@ fn a_conversation_becomes_the_messages_shape_with_caching_and_no_sampling_fields
         json!({
             "model": "claude-sonnet-5-5",
             "max_tokens": 4096,
-            "system": "You review diffs.",
+            "system": [{"type": "text", "text": "You review diffs.", "cache_control": {"type": "ephemeral"}}],
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "Review this."}]},
                 {"role": "assistant", "content": [
