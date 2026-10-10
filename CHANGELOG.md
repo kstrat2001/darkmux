@@ -16,6 +16,15 @@ darkmux release.
 
 ### Added
 
+- **`darkmux doctor` warns about a Claude endpoint that runs uncached** (#3173).
+  An `api.anthropic.com` endpoint on the OpenAI-compatible layer neither caches
+  nor reports caching, so every turn of the agent loop pays full input price
+  for the whole conversation again. The `endpoints` row now warns, names each
+  such endpoint, and gives the edit (`"dialect": "messages"`) and the registry
+  file to make it in. The guide's endpoint example gains a cached Claude seat,
+  with its budget numbers left as placeholders. It also corrects a stale line:
+  an inline endpoint on a model is refused since 5.0, not still accepted.
+
 - **A usage record counts cache writes on their own** (#3168). The four
   classes a cached Claude call bills (uncached input, cache writes, cache reads,
   output) are priced differently: on Sonnet 5.5, a write costs 1.25x an uncached
