@@ -13,7 +13,7 @@ use crate::crawl::semver::{prerelease_tag, range_admits};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -338,6 +338,45 @@ impl From<PlanParams> for PlanParamsRecord {
     }
 }
 
+/// (#3180) The paths in `all` that `.gitattributes` marks
+/// `linguist-generated` (set, or `true`), asked of git itself so every
+/// pattern rule and every nested `.gitattributes` reads the way GitHub reads
+/// it. A tree that is not a git checkout has no attributes to read, so
+/// nothing in it is generated.
+fn linguist_generated(tree: &Path, all: &[String]) -> HashSet<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if all.is_empty() {
+        return HashSet::new();
+    }
+    let child = Command::new("git")
+        .current_dir(tree)
+        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return HashSet::new() };
+    // Written from a thread: git answers as it reads, so a tree's worth of
+    // paths would fill the output pipe while this side is still writing.
+    let input = all.join("\0") + "\0";
+    let writer = child.stdin.take().map(|mut stdin| std::thread::spawn(move || stdin.write_all(input.as_bytes())));
+    let Ok(out) = child.wait_with_output() else { return HashSet::new() };
+    if !writer.is_some_and(|w| matches!(w.join(), Ok(Ok(())))) {
+        return HashSet::new();
+    }
+    if !out.status.success() {
+        return HashSet::new();
+    }
+    // `-z` output: `<path> NUL <attribute> NUL <value> NUL`, per path.
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    fields
+        .chunks_exact(3)
+        .filter(|f| matches!(f[2], b"set" | b"true"))
+        .map(|f| String::from_utf8_lossy(f[0]).into_owned())
+        .collect()
+}
+
 /// Per-source file cache: the sorted relative-path listing (computed once)
 /// plus a lazily-populated, read-once content cache shared across every
 /// rule pass over this source, so a file matched by two rules (e.g.
@@ -352,6 +391,10 @@ struct SourceFiles {
     /// changed and keeps windows around their hunks, so it takes `None`
     /// (#3171).
     max_bytes: Option<u64>,
+    /// (#3180) Files `.gitattributes` marks `linguist-generated`, never
+    /// read: a diff plan lists them as skipped instead of reviewing them.
+    /// Empty for a tree walk.
+    generated: HashSet<String>,
 }
 
 impl SourceFiles {
@@ -367,6 +410,7 @@ impl SourceFiles {
             all,
             content: HashMap::new(),
             max_bytes: Some(MAX_FILE_BYTES),
+            generated: HashSet::new(),
         }
     }
 
@@ -375,8 +419,15 @@ impl SourceFiles {
     /// names a handful of changed files and a unit carries only the windows
     /// around their hunks. Capping here dropped the change itself from the
     /// review (PR #3170: a 684 KB file, skipped by every rule).
+    ///
+    /// (#3180) It does skip what `.gitattributes` marks `linguist-generated`
+    /// (GitHub's own convention, which it collapses in a PR's diff): a
+    /// minified bundle is a few hundred lines of up to megabytes each, so a
+    /// window around one hunk reads hundreds of thousands of tokens of
+    /// output nobody wrote. PR #3178's review spent 80% of its cost there.
     fn for_diff(tree: &Path, all: Vec<String>) -> Self {
-        Self { max_bytes: None, ..Self::new(tree, all) }
+        let generated = linguist_generated(tree, &all);
+        Self { max_bytes: None, generated, ..Self::new(tree, all) }
     }
 
     fn matching(&self, applies_to: &[String], exclude: &[String]) -> Vec<String> {
@@ -390,6 +441,15 @@ impl SourceFiles {
     fn get(&mut self, rel: &str, skipped: &mut Vec<SkippedEntry>, source_id: &str) -> Option<Rc<String>> {
         if let Some(v) = self.content.get(rel) {
             return v.clone();
+        }
+        if self.generated.contains(rel) {
+            skipped.push(SkippedEntry {
+                reason: "generated (`linguist-generated` in .gitattributes)".to_string(),
+                file: rel.to_string(),
+                source: Some(source_id.to_string()),
+            });
+            self.content.insert(rel.to_string(), None);
+            return None;
         }
         let full = self.tree.join(rel);
         let result = match fs::metadata(&full) {
@@ -2398,6 +2458,52 @@ line two
         assert_eq!(plan.units.len(), 1, "{:?}", plan.units);
         let Unit::Site { sites, .. } = &plan.units[0] else { panic!("expected a Site unit") };
         assert_eq!(sites[0].file, "big.rs");
+    }
+
+    /// (#3180) A diff plan does not review a file `.gitattributes` marks
+    /// `linguist-generated`: it is listed as skipped, so the review's scope
+    /// line names it, and no unit reads it. PR #3178's review spent 80% of
+    /// its cost reading two 810 KB minified viewer bundles.
+    #[test]
+    fn plan_diff_rule_skips_a_linguist_generated_file() {
+        let dir = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        fs::create_dir_all(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join(".gitattributes"), "assets/*.html linguist-generated\n").unwrap();
+        fs::write(dir.path().join("assets/bundle.html"), "fn changed() {\n    let x = 1;\n}\n").unwrap();
+        fs::write(dir.path().join("src.rs"), "fn changed() {\n    let x = 1;\n}\n").unwrap();
+        let hunk = |path: &str| {
+            [
+                format!("diff --git a/{path} b/{path}"),
+                format!("--- a/{path}"),
+                format!("+++ b/{path}"),
+                "@@ -1,2 +1,3 @@".to_string(),
+                " fn changed() {".to_string(),
+                "+    let x = 1;".to_string(),
+                " }".to_string(),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let diff_text = hunk("assets/bundle.html") + &hunk("src.rs");
+        let materialized = materialized_for(vec![diff_source_at(dir.path(), "app", &"c".repeat(40))], Vec::new());
+        let (rules, _) = darkmux_crew::rules::load_all(None);
+        let plan = plan_diff_rule(&materialized, &rules["intent-vs-diff"].clone(), &diff_text, PlanParams::default()).unwrap();
+        let files: Vec<&str> = plan
+            .units
+            .iter()
+            .flat_map(|u| match u {
+                Unit::Site { sites, .. } => sites.iter().map(|s| s.file.as_str()).collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(files, ["src.rs"], "only the hand-written file is reviewed: {:?}", plan.units);
+        let skip = plan.totals.skipped.iter().find(|s| s.file == "assets/bundle.html").expect("the generated file is listed as skipped");
+        assert!(skip.reason.contains("generated"), "{}", skip.reason);
     }
 
     #[test]
