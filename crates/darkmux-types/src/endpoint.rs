@@ -692,8 +692,7 @@ impl ModelEndpoint {
     /// explicit port, a trailing dot. Exact otherwise, never a prefix.
     pub fn is_anthropic_host(&self) -> bool {
         self.host().is_some_and(|h| {
-            let bare = h.rsplit_once(':').filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit())).map_or(h.as_str(), |(host, _)| host);
-            bare.trim_end_matches('.').eq_ignore_ascii_case(ANTHROPIC_API_HOST)
+            crate::panel_audience::host_of(&h).trim_end_matches('.').eq_ignore_ascii_case(ANTHROPIC_API_HOST)
         })
     }
 
