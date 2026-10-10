@@ -344,6 +344,12 @@ pub(crate) fn run_bookend_record(
 /// lifecycle rule reads a `run.complete` whose status is
 /// [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row reads its
 /// `Degraded` envelope, so the spelling here is that constant's.
+/// (#3125) A launch's `run.start` payload: it promises the run session's
+/// beat (`RunPayload::beats`) exactly when that beat's first write landed.
+fn run_start_payload(mission_presence: Option<&flow::session_presence::SessionEmitter>) -> RunPayload {
+    RunPayload { beats: flow::session_presence::beats(mission_presence), ..RunPayload::default() }
+}
+
 fn run_close_payload(status: crew::envelope::MissionOutcomeStatus, ok: bool) -> RunPayload {
     RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(ok) }
 }
@@ -894,8 +900,7 @@ pub fn launch(
             RunPayload::failed("run terminated before completion (early return or panic)"),
         )
     });
-    let run_start = RunPayload { beats: flow::session_presence::beats(mission_presence.as_ref()), ..RunPayload::default() };
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, run_start));
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, run_start_payload(mission_presence.as_ref())));
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
@@ -9229,6 +9234,34 @@ mod tests {
     }
 
     // ── #1877, contract 8 — the run bookend, prescribed ──────────────────
+
+    /// (#3125) A launch's `run.start` promises the run session's beat exactly
+    /// when its emitter's first beat landed (`beats: true`), and says nothing
+    /// when the hub refused it. A reader reads a promised beat gone as the run
+    /// having ended, so the promise is the whole of the SIGKILL fix for a launch.
+    #[test]
+    #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
+    fn the_run_start_promises_its_beat_exactly_when_the_first_beat_landed() {
+        let (port, _log) = darkmux_flow::spawn_acking_redis_peer();
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        for (url, landed) in [
+            (format!("redis://127.0.0.1:{port}"), true),
+            (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
+        ] {
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &url) };
+            let run = RunId::mission(&format!("beats-3125-{landed}")).unwrap();
+            let presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run), None, None);
+            assert_eq!(run_start_payload(presence.as_ref()).beats, landed, "hub {url}");
+            if let Some(p) = presence {
+                p.stop();
+            }
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+        assert!(!run_start_payload(None).beats, "no emitter (presence off): no promise");
+    }
 
     #[test]
     fn run_bookend_record_is_the_run_grain_on_the_run_session() {

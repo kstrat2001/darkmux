@@ -6536,7 +6536,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id.
-    let mut dispatch_start_payload = dispatch_start_payload(
+    let dispatch_start_payload = dispatch_start_payload(
         &image,
         &opts.message,
         &system_prompt,
@@ -6547,29 +6547,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         allowed_tools.as_deref(),
         &opts.brief_refs,
     )?;
-    // (#1187 follow-up) Mirror `dispatch_unmanaged`'s `"endpoint": label` field —
-    // its absence, not just its presence, is meaningful to the viewer (no
-    // field ⇒ rendered as local LMStudio), so this must be set whenever the
-    // container's brain is actually remote.
-    if let Some(label) = &unmanaged_endpoint_raw_label {
-        dispatch_start_payload.endpoint = Some(label.clone());
-    }
-    // (#2114 follow-up) Resume provenance the viewer/flow log render —
-    // names the SOURCE dir (the prior dispatch's host_out), distinct from
-    // this dispatch's own `out_dir` (recorded elsewhere on the result).
-    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
-    // above.
-    if let Some(resume_from) = &opts.resume_from {
-        dispatch_start_payload.resumed_from = Some(resume_from.display().to_string());
-    }
-    // (#3125) The beat this dispatch publishes, promised on its start.
-    dispatch_start_payload.beats = darkmux_flow::session_presence::beats(session_emitter.as_ref());
-    // (#1959) Provenance the runtime can't derive on its own (the crawl
-    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
-    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
-    // unset.
-    let mut dispatch_start_payload = darkmux_flow::Payload::DispatchStart(dispatch_start_payload);
-    merge_record_context(&mut dispatch_start_payload, &opts.record_context);
+    let dispatch_start_payload = container_start_payload(
+        dispatch_start_payload,
+        unmanaged_endpoint_raw_label.as_deref(),
+        opts.resume_from.as_deref(),
+        session_emitter.as_ref(),
+        &opts.record_context,
+    );
     // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
     // `open()` — arms it, so any `?`-return or panic before the clean
     // `dispatch.complete` below emits a `dispatch.error` terminal so the
@@ -9857,6 +9841,43 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
 /// One nested key so it can never collide with a record's own top-level
 /// fields. A `None` context, or a payload type with no `context` field, is a
 /// no-op — never a partial/corrupted merge.
+/// The container path's `dispatch.start` payload, from the runtime metadata
+/// [`dispatch_start_payload`] built. Split out (#3125) so the `beats` promise,
+/// the one fact a reader needs to read this dispatch's lost beat as its end,
+/// is tested without Docker.
+fn container_start_payload(
+    mut payload: DispatchStartPayload,
+    endpoint_label: Option<&str>,
+    resume_from: Option<&std::path::Path>,
+    session_emitter: Option<&darkmux_flow::session_presence::SessionEmitter>,
+    record_context: &Option<darkmux_flow::payload::RecordContext>,
+) -> darkmux_flow::Payload {
+    // (#1187 follow-up) Mirror `dispatch_unmanaged`'s `"endpoint": label` field —
+    // its absence, not just its presence, is meaningful to the viewer (no
+    // field ⇒ rendered as local LMStudio), so this must be set whenever the
+    // container's brain is actually remote.
+    if let Some(label) = endpoint_label {
+        payload.endpoint = Some(label.to_string());
+    }
+    // (#2114 follow-up) Resume provenance the viewer/flow log render —
+    // names the SOURCE dir (the prior dispatch's host_out), distinct from
+    // this dispatch's own `out_dir` (recorded elsewhere on the result).
+    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
+    // above.
+    if let Some(resume_from) = resume_from {
+        payload.resumed_from = Some(resume_from.display().to_string());
+    }
+    // (#3125) The beat this dispatch publishes, promised on its start.
+    payload.beats = darkmux_flow::session_presence::beats(session_emitter);
+    // (#1959) Provenance the runtime can't derive on its own (the crawl
+    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
+    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
+    // unset.
+    let mut payload = darkmux_flow::Payload::DispatchStart(payload);
+    merge_record_context(&mut payload, record_context);
+    payload
+}
+
 fn merge_record_context(payload: &mut darkmux_flow::Payload, record_context: &Option<darkmux_flow::payload::RecordContext>) {
     if let Some(ctx) = record_context {
         payload.attribute_context(ctx);
