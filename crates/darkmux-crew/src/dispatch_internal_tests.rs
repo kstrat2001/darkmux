@@ -20237,3 +20237,26 @@ fn every_sampler_join_in_dispatch_is_the_bounded_one() {
         let (got, _) = probe_with_fake_docker("echo 27.3.1", Duration::from_secs(5));
         assert_eq!(got, None);
     }
+
+/// (#3164) A text-mode dispatch asks the runtime for its human summary, not a
+/// JSON envelope, so its stdout is never read as one: no enrichment and no
+/// "not an envelope" warning, which before this fired on every dispatch run
+/// without `--json` while the summary itself printed fine.
+#[test]
+fn a_text_mode_dispatch_never_reads_its_stdout_as_an_envelope() {
+    let text = "dispatching to model: m\n\n--- final assistant message ---\nOK\n".to_string();
+    let enriched = std::cell::Cell::new(false);
+    let out = super::runtime_stdout_for_caller(false, text.clone(), |s| {
+        enriched.set(true);
+        s
+    });
+    assert_eq!(out, text, "text mode prints the runtime's own summary unchanged");
+    assert!(!enriched.get(), "text mode never parses stdout as an envelope");
+}
+
+/// The inverse: a `--json` dispatch still enriches its envelope.
+#[test]
+fn a_json_dispatch_still_enriches_its_envelope() {
+    let out = super::runtime_stdout_for_caller(true, r#"{"result":"stop"}"#.to_string(), |s| format!("{s}+enriched"));
+    assert_eq!(out, r#"{"result":"stop"}+enriched"#);
+}
