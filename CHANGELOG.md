@@ -114,6 +114,15 @@ darkmux release.
 
 ### Fixed
 
+- **A relative `lms_bin` works again, and `darkmux doctor` checks the file a dispatch will run** (#2533).
+  Every `lms` spawn runs with its working directory pinned to `/` (#1863), so a
+  relative `lms_bin` such as `./bin/lms` resolved against `/` and every dispatch
+  failed with "not found", blaming a missing LM Studio install, while doctor
+  resolved the same string against its own working directory and reported PASS.
+  A relative value that names a path is now anchored once, to the working
+  directory of the darkmux process that reads it, in the one accessor that both
+  the spawns and doctor use. A bare name such as `lms` is still found on `PATH`.
+
 - **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
   A hosted Claude stream arrives in bursts, and the live channel sends a sample
   on every transition as well as on its cadence: captured live, 642 chars landed
