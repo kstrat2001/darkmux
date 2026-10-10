@@ -191,6 +191,12 @@ pub struct ModsGateConfig {
     pub test_command: Option<String>,
     /// The checkout the kit is applied against.
     pub workdir: Option<String>,
+    /// (#2973) The container image `test_command` runs in: the patched
+    /// scratch copy mounted, nothing else, no network. Blank: unset.
+    pub gate_image: Option<String>,
+    /// (#2973) Run `test_command` on this machine instead of in a container.
+    /// Model-written code then runs as the darkmux user.
+    pub gate_on_host: Option<Flag>,
 }
 
 impl ConfigRules for ModsGateConfig {

@@ -61,16 +61,16 @@ pub use crate::runtime_image::RUNTIME_IMAGE;
 // capabilities, forbid privilege escalation, limit PIDs and memory.
 /// Drop ALL Linux capabilities — the runtime needs none for its job
 /// (HTTP calls to LMStudio, file reads/writes via bind mounts).
-const DOCKER_CAP_DROP: &str = "ALL";
+pub(crate) const DOCKER_CAP_DROP: &str = "ALL";
 /// Prevent newpriv inside the container — even if a capability is
 /// granted, the kernel blocks setuid/setgid/binary-sUID tricks.
-const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
+pub(crate) const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
 /// Per-container PID limit — prevents fork-bomb style resource exhaustion
 /// inside the container. 512 is a sane default for an LLM agent loop.
-const DOCKER_PIDS_LIMIT: u64 = 512;
+pub(crate) const DOCKER_PIDS_LIMIT: u64 = 512;
 /// Per-container memory limit — prevents OOM-killing the host. 4g is a
 /// sane default for an LLM agent loop that may compile/test code.
-const DOCKER_MEMORY: &str = "4g";
+pub(crate) const DOCKER_MEMORY: &str = "4g";
 /// TODO (#839): Run the container as non-root (`--user 1000:1000`).
 /// This requires verifying that the workspace bind-mount and injected
 /// runtime binary are readable/executable by uid 1000:gid 1000 inside
@@ -1643,7 +1643,7 @@ fn apply_cache_mount(args: &mut Vec<String>, cache: &Path) {
 /// a newline has no place in a legitimate registry ref. The `--` fence on the
 /// docker invocations already prevents flag interpretation — this keeps the
 /// contract explicit rather than fence-dependent.
-fn validate_image_ref(image: &str) -> Result<()> {
+pub(crate) fn validate_image_ref(image: &str) -> Result<()> {
     if image.is_empty() {
         bail!("image ref is empty");
     }

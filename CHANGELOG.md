@@ -113,6 +113,16 @@ darkmux release.
   the scope line as "Not reviewed: <file> (<reason>)", which keeps the run from
   reading as clean.
 
+- **The mods gate runs model-written code in a container, not on your machine** (#2973).
+  With a `test_command` set, `mods.gate` applied a model-written kit and ran the
+  command over it on the host, as you, with your files and network: a kit that
+  edits `build.rs`, `package.json` scripts or a Makefile is code that runs the
+  moment the gate does. It now runs in a container from the review's
+  `gate_image` param (the patched copy mounted, nothing else, no network, no
+  capabilities). Running on the host takes an explicit `gate_on_host: true`.
+  **Breaking for anyone with `test_command` set:** with neither param the gate
+  refuses and every mod records the fix, instead of running on the host.
+
 - **A text-mode dispatch no longer warns that its output is "not an envelope"** (#3164).
   Every `darkmux dispatch` run without `--json` printed "the runtime's stdout is
   not an envelope this darkmux reads ... without metrics, detections or bounds"

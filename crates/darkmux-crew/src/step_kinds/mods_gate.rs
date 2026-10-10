@@ -103,16 +103,20 @@
 //! that executes the moment the gate runs. `git apply --check` proves a
 //! patch APPLIES; it says nothing about what the patched tree then does.
 //!
-//! What bounds the blast radius here, honestly: the patch lands in a
-//! throwaway copy (the source checkout is never patched), kit paths that
-//! escape the checkout are refused before the apply, and the command is
-//! killed at the configured deadline. What does NOT bound it: the
-//! command's own privileges, its network access, or anything it writes
-//! outside the scratch dir. **So point `test_command` only at a tree you
-//! would be willing to run untrusted code in** — and treat enabling the
-//! gate on a machine holding credentials as the decision it is. An
-//! operator who configures no `test_command` never executes anything: the
-//! gate skips with `"no test_command configured"`.
+//! What bounds the blast radius (#2973): the patch lands in a throwaway
+//! copy (the source checkout is never patched), kit paths that escape the
+//! checkout are refused before the apply, the command is killed at the
+//! configured deadline, and by default it runs in a CONTAINER
+//! (`gate_image`): the patched copy mounted at `/workspace` and nothing
+//! else, `--network none`, `--cap-drop=ALL`, no new privileges, `sh` as the
+//! entrypoint, removed when it exits (and removed by name if the deadline
+//! kills its client). Running on the host takes an explicit
+//! `gate_on_host: true`, and then nothing bounds the command's own
+//! privileges, its network, or what it writes outside the scratch dir: treat
+//! that on a machine holding credentials as the decision it is. A
+//! `test_command` with neither set is refused, every mod recording why; an
+//! operator who configures no `test_command` never executes anything (the
+//! gate skips with `"no test_command configured"`).
 
 use crate::mods::{self, GateOutcome, ModRecord};
 use crate::step_config::{load_checked, non_blank, ConfigKind, ModsGateConfig};
@@ -190,6 +194,7 @@ impl StepKind for ModsGateStepKind {
         let test_command = non_blank(cfg.test_command);
         let test_command = test_command.as_deref();
         let workdir = cfg.workdir.as_deref();
+        let placement = gate_placement(non_blank(cfg.gate_image).as_deref(), cfg.gate_on_host.is_some_and(|f| f.0));
 
         let root = mods::mods_dir();
         let all = mods::load_all_at(&root).context("loading the mod store")?;
@@ -200,8 +205,7 @@ impl StepKind for ModsGateStepKind {
         // reason (no applicable kit, workdir/infra trouble) is computed
         // per mod inside `gate_one_mod` instead — the two are different
         // questions and must not collapse into one summary field.
-        let no_command_reason =
-            if test_command.is_none() { Some("no test_command configured".to_string()) } else { None };
+        let no_command_reason = document_skip_reason(test_command, &placement);
         // The source id is the name of the one checkout beneath the workdir —
         // the same resolution `gate_one_mod` applies the kit in. Recorded on
         // every mod this step gates that arrived without one, so the deliverer
@@ -222,7 +226,7 @@ impl StepKind for ModsGateStepKind {
             }
             let (outcome, skip_reason) = match test_command {
                 None => (None, no_command_reason.clone()),
-                Some(cmd) => gate_one_mod(m, cmd, workdir),
+                Some(cmd) => gate_one_mod(m, cmd, workdir, &placement),
             };
             let res = mods::record_gate_with_source(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref())
                 .with_context(|| format!("step `{}`: recording the gate for mod `{}`", step.id, m.key))?;
@@ -247,7 +251,16 @@ impl StepKind for ModsGateStepKind {
 /// gate run (pass or fail), or `(None, Some(reason))` for an infra-level
 /// skip. NEVER `(Some(outcome), Some(reason))` or `(None, None)` — exactly
 /// one of the two is populated, always.
-fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<GateOutcome>, Option<String>) {
+fn gate_one_mod(
+    m: &ModRecord,
+    command: &str,
+    workdir: Option<&str>,
+    placement: &Result<GatePlacement, String>,
+) -> (Option<GateOutcome>, Option<String>) {
+    let placement = match placement {
+        Ok(p) => p,
+        Err(refused) => return (None, Some(refused.clone())),
+    };
     if m.kit_kind.as_deref() != Some("unified-diff") {
         // (#2310 P4c-2b PR #2357 review MUST FIX A) Only a kit DECLARED as
         // a unified diff can be mechanically applied — same discipline
@@ -419,30 +432,193 @@ fn gate_one_mod(m: &ModRecord, command: &str, workdir: Option<&str>) -> (Option<
     // unbounded `.output()` here produced live. A command that outruns
     // `runtime.step_command_timeout_seconds` is a named SKIP, not a
     // `passed: false`: a suite that hung says nothing about the kit.
-    let mut test_cmd = std::process::Command::new("sh");
-    test_cmd.arg("-c").arg(command).current_dir(&scratch_checkout);
-    let timeout = crate::bounded_command::configured_timeout();
-    match crate::bounded_command::run_bounded(test_cmd, timeout) {
-        crate::bounded_command::Bounded::Finished { success, code, .. } => (
-            Some(GateOutcome {
-                passed: success,
-                command: command.to_string(),
-                exit_code: code,
-                applied: Some(true),
-                reason: None,
-            }),
-            None,
-        ),
-        crate::bounded_command::Bounded::TimedOut { seconds } => {
-            (None, Some(format!("test_command exceeded {seconds}s")))
-        }
-        crate::bounded_command::Bounded::Interrupted => {
-            (None, Some("interrupted before test_command finished".to_string()))
-        }
-        crate::bounded_command::Bounded::SpawnFailed(e) => {
-            (None, Some(format!("could not run the gate command in {}: {e}", scratch_checkout.display())))
+    run_gate_command(placement, command, &scratch_checkout)
+}
+
+/// Why no mod in this step is run at all, or `None` when each is gated:
+/// no `test_command`, or (#2973) a `test_command` with no place to run.
+fn document_skip_reason(test_command: Option<&str>, placement: &Result<GatePlacement, String>) -> Option<String> {
+    match (test_command, placement) {
+        (None, _) => Some("no test_command configured".to_string()),
+        (Some(_), Err(refused)) => Some(refused.clone()),
+        (Some(_), Ok(_)) => None,
+    }
+}
+
+/// Run a gate's `test_command` where `placement` says and read the result:
+/// a finished run is a real outcome (pass or fail); a deadline, an
+/// interrupt or a command that could not start is a named skip.
+fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: &Path) -> (Option<GateOutcome>, Option<String>) {
+    if let GatePlacement::Container(_) = placement {
+        reap_orphaned_gate_containers();
+        if let Err(e) = std::fs::write(scratch_checkout.join(GATE_SENTINEL), b"") {
+            return (None, Some(format!("could not mark the scratch copy for the container: {e}")));
         }
     }
+    let (test_cmd, container) = gate_test_command(placement, command, scratch_checkout);
+    let ran = crate::bounded_command::run_bounded(test_cmd, crate::bounded_command::configured_timeout());
+    if let (Some(name), crate::bounded_command::Bounded::TimedOut { .. } | crate::bounded_command::Bounded::Interrupted) =
+        (&container, &ran)
+    {
+        // Killing the `docker run` client does not stop its container.
+        remove_container(name);
+    }
+    gate_result(placement, command, scratch_checkout, ran)
+}
+
+/// What one gate run means. (#2973 review) In a container, `docker run`'s
+/// own exit 125 is Docker failing to run it (a missing image, a stopped
+/// daemon, or the sentinel check finding the scratch copy unmounted): a
+/// named skip, never a kit that "applied and failed its tests".
+fn gate_result(
+    placement: &GatePlacement,
+    command: &str,
+    scratch_checkout: &Path,
+    ran: crate::bounded_command::Bounded,
+) -> (Option<GateOutcome>, Option<String>) {
+    use crate::bounded_command::Bounded;
+    match ran {
+        Bounded::Finished { code: Some(DOCKER_RUN_FAILED), .. } if matches!(placement, GatePlacement::Container(_)) => (
+            None,
+            Some(format!(
+                "the gate container did not run test_command (docker exit {DOCKER_RUN_FAILED}): the `gate_image` may be \
+                 missing, Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
+            )),
+        ),
+        Bounded::Finished { success, code, .. } => (
+            Some(GateOutcome { passed: success, command: command.to_string(), exit_code: code, applied: Some(true), reason: None }),
+            None,
+        ),
+        Bounded::TimedOut { seconds } => (None, Some(format!("test_command exceeded {seconds}s"))),
+        Bounded::Interrupted => (None, Some("interrupted before test_command finished".to_string())),
+        Bounded::SpawnFailed(e) => (None, Some(format!("could not run the gate command in {}: {e}", scratch_checkout.display()))),
+    }
+}
+
+/// `docker run`'s exit code for "the container could not be run".
+const DOCKER_RUN_FAILED: i32 = 125;
+
+/// (#2973 review) A file the gate writes into the scratch copy and the
+/// container checks for before running anything: a Docker daemon that
+/// cannot see the scratch dir (remote, or a VM without that share) mounts
+/// an empty directory, where a permissive `test_command` would pass.
+const GATE_SENTINEL: &str = ".darkmux-gate";
+
+/// The label a gate container carries: the darkmux process that started it.
+const GATE_PID_LABEL: &str = "darkmux.gate.pid";
+
+/// (#2973 review) The gate containers to remove: those whose owning
+/// darkmux process is gone (a crash or SIGKILL kills the `docker run`
+/// client, never its container). A live owner's container is left alone.
+fn orphaned_gate_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32) -> bool) -> Vec<String> {
+    listed.iter().filter(|(_, pid)| pid.is_some_and(|p| !alive(p))).map(|(name, _)| name.clone()).collect()
+}
+
+/// Remove gate containers whose owner is gone. Best effort and bounded: a
+/// Docker that cannot list them is the next `docker run`'s failure to name.
+fn reap_orphaned_gate_containers() {
+    let mut ps = std::process::Command::new("docker");
+    ps.args(["ps", "-a", "--filter", &format!("label={GATE_PID_LABEL}"), "--format", &format!("{{{{.Names}}}}\t{{{{.Label \"{GATE_PID_LABEL}\"}}}}")]);
+    let crate::bounded_command::Bounded::Finished { success: true, stdout, .. } =
+        crate::bounded_command::run_bounded(ps, std::time::Duration::from_secs(30))
+    else {
+        return;
+    };
+    let listed: Vec<(String, Option<u32>)> = String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter_map(|l| l.split_once('\t').map(|(n, p)| (n.to_string(), p.trim().parse().ok())))
+        .collect();
+    for name in orphaned_gate_containers(&listed, crate::host_sampler_lock::pid_alive) {
+        remove_container(&name);
+    }
+}
+
+/// (#2973) Where a gate's `test_command` runs. It executes model-written
+/// code (a kit can edit `build.rs`, `package.json` scripts, a Makefile), so
+/// it runs in a container unless the operator chose the host explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatePlacement {
+    /// `docker run` on this image, the scratch copy its only mount, no network.
+    Container(String),
+    /// `sh -c` on this machine, as the darkmux user (`gate_on_host: true`).
+    Host,
+}
+
+/// (#2973) The placement a gate config chose, or why it is refused.
+fn gate_placement(image: Option<&str>, on_host: bool) -> Result<GatePlacement, String> {
+    match (image, on_host) {
+        (Some(_), true) => Err("set `gate_image` or `gate_on_host`, not both: one decides where the gate runs".to_string()),
+        // (#3177 review) The dispatch path's own image-ref check: empty, a
+        // leading `-`, whitespace or control characters are refused.
+        (Some(image), false) => crate::dispatch_internal::validate_image_ref(image)
+            .map(|()| GatePlacement::Container(image.to_string()))
+            .map_err(|e| format!("`gate_image`: {e}")),
+        (None, true) => Ok(GatePlacement::Host),
+        (None, false) => Err("test_command runs model-written code, so the gate needs a place to run it: set \
+            `gate_image` to an image with the project's toolchain (it runs there with no network and only the \
+            patched copy mounted), or `gate_on_host: true` to run it on this machine as the darkmux user"
+            .to_string()),
+    }
+}
+
+/// (#2973) `docker run` arguments for a gate in a container: the patched
+/// scratch copy at `/workspace` and nothing else mounted, no network, no
+/// capabilities, no new privileges, removed when it exits, and `sh` as the
+/// entrypoint whatever the image declares.
+fn gate_container_args(image: &str, name: &str, checkout: &Path, command: &str) -> Vec<String> {
+    use crate::dispatch_internal::{DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT};
+    ["run", "--rm", "--init", "--name", name, "--network", "none"]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([
+        // (#2973 review) The coder container's own limits: model-written
+        // code here is no more trusted than the coder's.
+        format!("--cap-drop={DOCKER_CAP_DROP}"),
+        format!("--security-opt={DOCKER_SECURITY_OPT}"),
+        format!("--pids-limit={DOCKER_PIDS_LIMIT}"),
+        format!("--memory={DOCKER_MEMORY}"),
+        "--label".to_string(),
+        format!("{GATE_PID_LABEL}={}", std::process::id()),
+        "-v".to_string(),
+        format!("{}:/workspace", checkout.display()),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        // The image's own entrypoint never wraps the command (the darkmux
+        // runtime image's would take `sh -c` as its arguments).
+        "--entrypoint".to_string(),
+        "sh".to_string(),
+        image.to_string(),
+        "-c".to_string(),
+        format!("test -f /workspace/{GATE_SENTINEL} || exit {DOCKER_RUN_FAILED}\n{command}"),
+    ])
+    .collect()
+}
+
+/// The command a gate runs, and the container's name when it runs in one.
+fn gate_test_command(placement: &GatePlacement, command: &str, checkout: &Path) -> (std::process::Command, Option<String>) {
+    match placement {
+        GatePlacement::Host => {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(command).current_dir(checkout);
+            (cmd, None)
+        }
+        GatePlacement::Container(image) => {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("darkmux-gate-{}-{n}", std::process::id());
+            let mut cmd = std::process::Command::new("docker");
+            cmd.args(gate_container_args(image, &name, checkout, command));
+            (cmd, Some(name))
+        }
+    }
+}
+
+/// Stop and remove a gate container whose `docker run` client was killed.
+/// Best effort: a container already gone is the goal, not an error.
+fn remove_container(name: &str) {
+    let mut rm = std::process::Command::new("docker");
+    rm.args(["rm", "-f", name]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let _ = crate::bounded_command::run_bounded(rm, std::time::Duration::from_secs(30));
 }
 
 /// Remove a copied `.git` — a FILE for a linked worktree, a directory for
@@ -629,6 +805,136 @@ pub fn register_mods_gate_kind(registry: &StepKindRegistry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // ── #2973: the gate's test command runs in a container by default ──
+
+    /// A configured `test_command` runs model-written code, so it never
+    /// runs on the host by default: an image puts it in a container, an
+    /// explicit `gate_on_host` is the only way onto the host, and neither
+    /// (or both) is refused with the fix named.
+    #[test]
+    fn the_gate_runs_in_a_container_unless_the_host_is_chosen_explicitly() {
+        assert_eq!(gate_placement(Some("rust:1-slim"), false), Ok(GatePlacement::Container("rust:1-slim".into())));
+        assert_eq!(gate_placement(None, true), Ok(GatePlacement::Host));
+        let neither = gate_placement(None, false).unwrap_err();
+        assert!(neither.contains("gate_image") && neither.contains("gate_on_host"), "{neither}");
+        let both = gate_placement(Some("rust:1-slim"), true).unwrap_err();
+        assert!(both.contains("not both"), "{both}");
+        assert!(gate_placement(Some("--privileged"), false).unwrap_err().contains("`--privileged`"));
+        for bad in ["rust:1 slim", "rust:1\nslim", "rust\u{7}"] {
+            assert!(gate_placement(Some(bad), false).unwrap_err().starts_with("`gate_image`:"), "{bad:?}");
+        }
+    }
+
+    /// The container sees the patched scratch copy and nothing else: no
+    /// network, no capabilities, no new privileges, the command last.
+    #[test]
+    fn the_gate_container_mounts_only_the_scratch_copy_with_no_network() {
+        let args = gate_container_args("rust:1-slim", "darkmux-gate-1", Path::new("/tmp/s/checkout"), "cargo test");
+        let joined = args.join(" ");
+        for want in ["run", "--rm", "--name darkmux-gate-1", "--network none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "-v /tmp/s/checkout:/workspace", "-w /workspace"] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 1, "exactly one mount: {joined}");
+        assert!(joined.contains("--entrypoint sh rust:1-slim -c"), "{joined}");
+        // (#2973 review) The coder container's own limits, tini as PID 1, and
+        // the owner pid as a label so an orphan can be reaped.
+        for want in ["--pids-limit=512", "--memory=4g", "--init", &format!("--label darkmux.gate.pid={}", std::process::id())] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        // The script refuses to run the command unless the patched copy is
+        // actually mounted (a remote daemon mounts an empty directory).
+        let script = args.last().unwrap();
+        assert!(script.starts_with(&format!("test -f /workspace/{GATE_SENTINEL} || exit 125")), "{script}");
+        assert!(script.ends_with("\ncargo test"), "{script}");
+    }
+
+    /// (#3177 review) The step itself, with a `test_command` and no place
+    /// to run it: the summary carries the refusal and every mod records it.
+    #[test]
+    fn a_step_with_a_test_command_and_no_placement_records_the_refusal_on_every_mod() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right");
+        for key in ["mod-r1", "mod-r2"] {
+            mods::materialize(mods_dir.path(), &a_mod_kit(key, "sess-r/1", &kit, Some("unified-diff"))).unwrap();
+        }
+        let out = ModsGateStepKind
+            .run(
+                &step(json!({"for_key": "sess-r/1", "test_command": "touch /tmp/darkmux-gate-should-not-run",
+                    "workdir": tree_root.to_string_lossy()})),
+                &task(),
+                &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
+            )
+            .unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&out.output).unwrap();
+        assert!(summary["skipped_reason"].as_str().unwrap().contains("gate_image"), "{summary}");
+        for key in ["mod-r1", "mod-r2"] {
+            let rec = mods::load_at(mods_dir.path(), key).unwrap().unwrap();
+            assert!(rec.gate.is_none(), "nothing ran: {rec:?}");
+            assert!(rec.gate_skipped_reason.as_deref().is_some_and(|r| r.contains("gate_on_host")), "{rec:?}");
+        }
+    }
+
+    /// (#3177 review) A gate container past the deadline is removed, not
+    /// left running behind its killed client. Needs Docker and a local
+    /// `darkmux-runtime:latest`, so it is ignored in the default run.
+    #[test]
+    #[ignore = "needs Docker and a local darkmux-runtime:latest image"]
+    #[serial_test::serial] // sets DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    fn a_gate_container_past_the_deadline_is_removed() {
+        let prev = std::env::var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", "3") };
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let m = a_mod_kit("mod-slow", "sess-s/1", &one_line_kit("wrong", "right"), Some("unified-diff"));
+        let (outcome, reason) = gate_one_mod(&m, "sleep 300", Some(&tree_root.to_string_lossy()),
+            &Ok(GatePlacement::Container("darkmux-runtime:latest".into())));
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", v), None => std::env::remove_var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS") }
+        }
+        assert!(outcome.is_none() && reason.as_deref().is_some_and(|r| r.contains("exceeded 3s")), "{outcome:?} {reason:?}");
+        let ps = std::process::Command::new("docker")
+            .args(["ps", "-a", "--filter", &format!("label={GATE_PID_LABEL}={}", std::process::id()), "-q"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&ps.stdout).trim().is_empty(), "a gate container outlived its deadline");
+    }
+
+    /// (#2973 review, PROVEN) `docker run` exiting 125 is Docker failing to
+    /// run the container (a missing image, a stopped daemon, the copy not
+    /// mounted): a named skip, never "applied, tests failed".
+    #[test]
+    fn a_container_that_never_ran_the_command_is_a_skip_not_a_failed_kit() {
+        let (outcome, reason) = gate_result(&GatePlacement::Container("x".into()), "true", Path::new("/w"),
+            crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() });
+        assert!(outcome.is_none(), "{outcome:?}");
+        assert!(reason.unwrap().contains("exit 125"));
+        let (on_host, _) = gate_result(&GatePlacement::Host, "true", Path::new("/w"),
+            crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() });
+        assert!(on_host.is_some_and(|o| !o.passed), "on the host, 125 is the command's own exit");
+    }
+
+    /// (#2973 review) An orphan is a gate container whose owner process is
+    /// gone; a live owner's container is left alone.
+    #[test]
+    fn only_gate_containers_whose_owner_is_gone_are_reaped() {
+        let listed = vec![("darkmux-gate-1-0".to_string(), Some(111)), ("darkmux-gate-2-0".to_string(), Some(222)), ("x".to_string(), None)];
+        let orphans = orphaned_gate_containers(&listed, |pid| pid == 222);
+        assert_eq!(orphans, vec!["darkmux-gate-1-0".to_string()]);
+    }
+
+    /// With a `test_command` but no placement chosen, every mod records the
+    /// refusal as its skip reason and nothing is spawned.
+    #[test]
+    fn a_test_command_with_no_placement_runs_nothing_and_says_why() {
+        let m = a_mod_kit("mod-refused", "refused/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
+        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", Some("/nonexistent"), &gate_placement(None, false));
+        assert!(outcome.is_none());
+        assert!(reason.unwrap().contains("gate_image"), "the skip names the fix");
+    }
+
     use super::*;
     use crate::mods::{ForFinding, ModContext, ModRecord};
     use crate::types::{NodeStatus, Task};
@@ -780,6 +1086,37 @@ mod tests {
     /// error) regardless of the kit's content. After the fix: `passed:
     /// true`, `applied: Some(true)`, and the checkout used is a SCRATCH
     /// copy — the fixture's own `answer.txt` (the mirror) is unchanged.
+    /// (#2973) The real container path: the patched copy is visible at
+    /// `/workspace`, the network is down, and the host's home is not there.
+    /// Needs Docker and a local `darkmux-runtime:latest`, so it is ignored in
+    /// the default run: `cargo nextest run -p darkmux-crew --run-ignored all
+    /// -E 'test(a_container_gate_sees_the_patched_copy_and_nothing_else)'`.
+    #[test]
+    #[ignore = "needs Docker and a local darkmux-runtime:latest image"]
+    fn a_container_gate_sees_the_patched_copy_and_nothing_else() {
+        let mods_dir = TempDir::new().unwrap();
+        let _guard = ModsDirGuard::set(mods_dir.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let kit = one_line_kit("wrong", "right");
+        mods::materialize(mods_dir.path(), &a_mod_kit("mod-ctr", "sess-c/1", &kit, Some("unified-diff"))).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let command = format!(
+            "grep -q right answer.txt && ! wget -q -T 3 -O /dev/null http://example.com && [ ! -e '{home}' ] && [ \"$(pwd)\" = /workspace ]"
+        );
+        ModsGateStepKind
+            .run(
+                &step(json!({"for_key": "sess-c/1", "gate_image": "darkmux-runtime:latest", "test_command": command,
+                    "workdir": tree_root.to_string_lossy()})),
+                &task(),
+                &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
+            )
+            .unwrap();
+        let rec = mods::load_at(mods_dir.path(), "mod-ctr").unwrap().unwrap();
+        let gate = rec.gate.as_ref().unwrap_or_else(|| panic!("expected a real gate outcome: {rec:?}"));
+        assert!(gate.passed, "patched file visible, no network, no host home, cwd /workspace: {gate:?}");
+    }
+
     #[test]
     #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
     fn a_kit_that_fixes_a_planted_failing_test_gates_passed() {
@@ -796,7 +1133,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/1",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -839,7 +1176,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/1",
-                    "test_command": "sleep 300",
+                    "gate_on_host": true, "test_command": "sleep 300",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -887,7 +1224,7 @@ mod tests {
                 &step(json!({
                     "for_key": "sess-a/1",
                     // Passes only if the kit applied AND `.git` is gone.
-                    "test_command": "grep -q right answer.txt && ! test -e .git",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt && ! test -e .git",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -935,7 +1272,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/1",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -963,7 +1300,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/1",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -1038,7 +1375,7 @@ mod tests {
         mods::materialize(mods_dir.path(), &a_mod_kit("mod-src", "sess-a/1", &kit, Some("unified-diff"))).unwrap();
         ModsGateStepKind
             .run(
-                &step(json!({ "for_key": "sess-a/1", "test_command": "true", "workdir": tree_root.to_string_lossy() })),
+                &step(json!({ "for_key": "sess-a/1", "gate_on_host": true, "test_command": "true", "workdir": tree_root.to_string_lossy() })),
                 &task(),
                 &BTreeMap::new(),
                 &crate::step_kinds::StepRunCtx::for_test(),
@@ -1087,7 +1424,7 @@ mod tests {
                 &step(json!({
                     "for_key": "sess-a/1",
                     // The hostile shape: a kit's test target that commits.
-                    "test_command": "git -c user.email=t@e -c user.name=t commit -q -am pwned; true",
+                    "gate_on_host": true, "test_command": "git -c user.email=t@e -c user.name=t commit -q -am pwned; true",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -1122,7 +1459,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/2",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -1156,7 +1493,7 @@ mod tests {
         let result = ModsGateStepKind.run(
             &step(json!({
                 "for_key": "sess-a/3",
-                "test_command": "grep -q right answer.txt",
+                "gate_on_host": true, "test_command": "grep -q right answer.txt",
                 "workdir": tree_root.to_string_lossy(),
             })),
             &task(),
@@ -1189,7 +1526,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/4",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -1218,7 +1555,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/5",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": "/definitely/does/not/exist/anywhere",
                 })),
                 &task(),
@@ -1288,7 +1625,7 @@ mod tests {
             .run(
                 &step(json!({
                     "for_key": "sess-a/9",
-                    "test_command": "grep -q right answer.txt",
+                    "gate_on_host": true, "test_command": "grep -q right answer.txt",
                     "workdir": tree_root.to_string_lossy(),
                 })),
                 &task(),
@@ -1319,7 +1656,7 @@ mod tests {
         .unwrap();
 
         let outcome = ModsGateStepKind
-            .run(&step(json!({ "for_key": "sess-a/4", "test_command": "false" })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+            .run(&step(json!({ "for_key": "sess-a/4", "gate_on_host": true, "test_command": "false" })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let summary: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(summary["mods_gated"], 0, "already gated — the second pass changes nothing");
@@ -1554,7 +1891,7 @@ mod tests {
         std::fs::write(deep.join("f.txt"), "x").unwrap();
         let m = a_mod_kit("mod-deep", "sess-a/1", &one_line_kit("wrong", "right"), Some("unified-diff"));
 
-        let (outcome, reason) = gate_one_mod(&m, "true", Some(&tree_root.to_string_lossy()));
+        let (outcome, reason) = gate_one_mod(&m, "true", Some(&tree_root.to_string_lossy()), &Ok(GatePlacement::Host));
 
         assert!(outcome.is_none(), "{outcome:?}");
         let reason = reason.expect("an infra skip reason");
