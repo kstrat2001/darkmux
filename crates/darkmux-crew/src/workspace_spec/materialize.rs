@@ -3136,7 +3136,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
 
-        let err = format!("{:#}", result.err().expect("a dirty snapshot another process holds must be refused"));
+        let err = format!("{:#}", result.expect_err("a dirty snapshot another process holds must be refused"));
         assert!(err.contains(&key), "the refusal must name the snapshot: {err}");
         assert!(err.contains("held by another"), "the refusal must say who holds it: {err}");
         assert_eq!(misses.load(Ordering::Relaxed), 0, "the holder's reader must never miss a file");
