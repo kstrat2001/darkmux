@@ -6,8 +6,9 @@
  * - **Desktop (over 560px):** the tube is a centered block between the
  *   card's header and its status lines, so it is bounded by the card's
  *   WIDTH only and the card grows downward to fit it (operator: with three
- *   across "there's plenty of room down to make these taller"). 55% of the
- *   inner width, clamped [`STACKED_MIN`, `STACKED_MAX`].
+ *   across "there's plenty of room down to make these taller"). 62% of the
+ *   inner width, clamped [`STACKED_MIN`, `STACKED_MAX`]: the room the
+ *   tighter margins around it gave back (2026-10-10).
  * - **Phone:** the tube sits to the right of the text as a reserved square:
  *   at most `TUBE_WIDTH_SHARE` of the inner width and never into the
  *   `TEXT_RESERVE` floor the text column keeps, clamped [`TUBE_MIN`,
@@ -23,9 +24,9 @@ const TUBE_WIDTH_SHARE = 0.45;
 /** The text column's floor beside a phone tube: the widest lines ("dispatch
  *  in flight", the hardware line) measure up to about 180px. */
 const TEXT_RESERVE = 184;
-const STACKED_SHARE = 0.55;
+const STACKED_SHARE = 0.62;
 export const STACKED_MIN = 120;
-export const STACKED_MAX = 180;
+export const STACKED_MAX = 200;
 
 function px(v: string): number {
   const n = parseFloat(v);

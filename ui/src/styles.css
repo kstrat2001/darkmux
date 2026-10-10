@@ -4149,7 +4149,16 @@ body {
     align-self: center;
     width: var(--tube);
     height: var(--tube);
-    margin: 12px 0 14px;
+    /* (operator, 2026-10-10: "reduce the blank vertical space between the
+       scope and the status items below it") The status line's own 8px
+       margin is the gap below; the room saved goes to the tube
+       (`tubeFit.ts`'s STACKED_SHARE). */
+    margin: 8px 0 0;
+  }
+  /* The same note for the card's bottom edge: the last line's own leading
+     already clears it, so the card's padding below it is shorter. */
+  .mach:has(> .mach-body--scope) {
+    padding-bottom: 10px;
   }
 }
 
