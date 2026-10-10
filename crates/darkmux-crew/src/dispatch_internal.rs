@@ -7441,16 +7441,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(
-        stdout,
-        &model,
-        &trajectory_summary,
-        &host_stats,
-        &host_extras,
-        &host_out,
-        resolved_runtime_bounds(agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?,
-        thermal_ladder_summary,
-    );
+    let bounds = resolved_runtime_bounds(agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?;
+    let stdout = runtime_stdout_for_caller(opts.json, stdout, |stdout| {
+        enrich_envelope_with_summary(
+            stdout,
+            &model,
+            &trajectory_summary,
+            &host_stats,
+            &host_extras,
+            &host_out,
+            bounds,
+            thermal_ladder_summary,
+        )
+    });
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     // (#2111 review finding) Built by a standalone, pure function —
@@ -7852,6 +7855,20 @@ fn parse_runtime_envelope(stdout: &str, warn: &dyn Fn(&str)) -> Option<darkmux_t
             ));
             None
         }
+    }
+}
+
+/// (#3164) What the caller gets from the runtime's stdout. Only a `--json`
+/// dispatch asked the runtime for an envelope, so only its stdout is enriched
+/// (and warned about when it does not parse); a text-mode dispatch asked for
+/// the runtime's human summary and gets it unchanged. Before this, every
+/// text-mode dispatch printed "the runtime's stdout is not an envelope" over
+/// a summary that was exactly what it asked for.
+fn runtime_stdout_for_caller(json: bool, stdout: String, enrich: impl FnOnce(String) -> String) -> String {
+    if json {
+        enrich(stdout)
+    } else {
+        stdout
     }
 }
 

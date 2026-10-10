@@ -102,6 +102,12 @@ darkmux release.
 
 ### Fixed
 
+- **A text-mode dispatch no longer warns that its output is "not an envelope"** (#3164).
+  Every `darkmux dispatch` run without `--json` printed "the runtime's stdout is
+  not an envelope this darkmux reads ... without metrics, detections or bounds"
+  above a summary that printed fine. Only a `--json` dispatch asks the runtime
+  for an envelope, so only its output is read as one.
+
 - **A review stopped by an endpoint budget says so on the PR** (#3159, #3161).
   The cancellation notice read a review cancelled while waiting on a `wait`
   budget as "most likely its own timeout". It now reads the runner's flow log
