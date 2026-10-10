@@ -42,9 +42,10 @@ fn sse_reply(text: Option<&str>, calls: &[(&str, &str, &str)]) -> String {
         .collect()
 }
 
-/// A Messages endpoint on loopback that answers the n-th request with
-/// `replies[n]` (the last one repeats) and records every request body.
-fn recording_messages_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+/// An endpoint on loopback that answers the n-th request with `replies[n]`
+/// (the last one repeats; SSE when it opens with `event:`, else JSON) and
+/// records every request body.
+fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -72,9 +73,10 @@ fn recording_messages_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Val
                 all.len() - 1
             };
             let reply = &replies[n.min(replies.len() - 1)];
+            let kind = if reply.starts_with("event:") { "text/event-stream" } else { "application/json" };
             let _ = sock.write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
                     reply.len()
                 )
                 .as_bytes(),
@@ -122,7 +124,7 @@ fn each_messages_request_extends_the_previous_one_through_its_last_block() {
         sse_reply(None, &[("toolu_7", "echo", &two)]),
         sse_reply(Some("All done."), &[]),
     ];
-    let (url, bodies) = recording_messages_server(replies);
+    let (url, bodies) = recording_server(replies);
     let client = LmStudioClient::with_base_url("http://unused.invalid")
         .with_chat_url(url)
         .with_dialect(Dialect::Messages)
@@ -159,4 +161,102 @@ fn around_first_difference(a: &str, b: &str) -> String {
     let at = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     let (start, end) = (at.saturating_sub(40), (at + 100).min(a.len()));
     a.get(start..end).unwrap_or(a).to_string()
+}
+
+/// A checkpoint killed mid-turn: one large echo result already recorded,
+/// then an assistant turn whose five large echo calls are all pending. The
+/// resume's catch-up appends their five results, which pushes the first
+/// result out of the soft trim's protected window.
+fn killed_mid_turn() -> checkpoint::RunCheckpoint {
+    let call = |id: &str, tag: &str| crate::lmstudio::ToolCall {
+        id: id.into(),
+        kind: "function".into(),
+        function: crate::lmstudio::FunctionCall {
+            name: "echo".into(),
+            arguments: format!(r#"{{"text":"{tag} {}"}}"#, "x".repeat(5_000)),
+        },
+        extra_content: None,
+    };
+    let assistant = |calls: Vec<crate::lmstudio::ToolCall>| Message {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(calls),
+        tool_call_id: None,
+        name: None,
+        reasoning_content: None,
+    };
+    let pending: Vec<_> = ["two", "three", "four", "five", "six"]
+        .iter()
+        .enumerate()
+        .map(|(i, tag)| call(&format!("toolu_{}", i + 2), tag))
+        .collect();
+    checkpoint::RunCheckpoint {
+        schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+        role_id: "test-role".into(),
+        messages: vec![
+            Message::system("system prompt"),
+            Message::user("do the task"),
+            assistant(vec![call("toolu_1", "one")]),
+            Message::tool_result("toolu_1", "echo", &format!("one {}", "x".repeat(5_000))),
+            assistant(pending.clone()),
+        ],
+        turns: 2,
+        total_completion_tokens: 10,
+        compactions: 0,
+        pending_hand_back: None,
+        pending_tool_calls: Some(pending),
+        pending_tool_calls_seq_base: 0,
+        pending_head_started: false,
+        written_at_unix_ms: checkpoint::unix_ms(),
+    }
+}
+
+/// Resume [`killed_mid_turn`] against `client` (one more turn, which ends
+/// the run) and return the request bodies the endpoint saw.
+fn resume_once(client: &LmStudioClient, streaming: bool, bodies: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+    let tmp = tempfile::Builder::new().prefix("cache-prefix-resume").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        client, client, "claude-test", vec![], &[Tool::Echo], &mut traj, streaming,
+        &compaction::CompactionConfig::never_compact(), Some(10), None, Some(4_096), None, Some(u32::MAX), None,
+        std::collections::BTreeMap::new(), None, tmp.path(), "test-role", Some(killed_mid_turn()), &RealSleeper,
+    )
+    .expect("the resumed run completes");
+    let seen = bodies.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the resume makes one request");
+    seen
+}
+
+/// (#3193) The post-resume check (`compact_after_resume`) does not elide a
+/// result the request before the kill already sent: the first request after
+/// a resume still extends the cache entry that request wrote.
+#[test]
+#[serial_test::serial]
+fn a_resume_on_the_messages_dialect_does_not_elide_an_earlier_result() {
+    let (url, bodies) = recording_server(vec![sse_reply(Some("All done."), &[])]);
+    let client = LmStudioClient::with_base_url("http://unused.invalid")
+        .with_chat_url(url)
+        .with_dialect(Dialect::Messages)
+        .with_auth_header("x-api-key", "test-key");
+    let first = &resume_once(&client, true, &bodies)[0];
+    let result = &first["messages"][2]["content"][0];
+    assert_eq!(result["tool_use_id"], "toolu_1", "{first}");
+    assert_eq!(result["content"], format!("one {}", "x".repeat(5_000)), "the first result is sent whole");
+}
+
+/// (#1391) The other side of the guard: an endpoint that does not cache the
+/// prompt prefix still has old results soft-trimmed after a resume.
+#[test]
+#[serial_test::serial]
+fn a_resume_on_a_chat_completions_dialect_still_soft_trims_an_old_result() {
+    let reply = super::tests::chat_response_json(Some("All done."), None, "stop", 10, 2).to_string();
+    let (url, bodies) = recording_server(vec![reply]);
+    let client = LmStudioClient::with_base_url("http://unused.invalid")
+        .with_chat_url(url.replace("/messages", "/chat/completions"))
+        .with_dialect(Dialect::ChatCompletions);
+    let first = &resume_once(&client, false, &bodies)[0];
+    let result = &first["messages"][3];
+    assert_eq!(result["tool_call_id"], "toolu_1", "{first}");
+    let body = result["content"].as_str().unwrap();
+    assert!(body.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL), "the old result is trimmed");
 }
