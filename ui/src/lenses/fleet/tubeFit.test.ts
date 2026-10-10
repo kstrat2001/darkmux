@@ -18,12 +18,12 @@ describe("tubeSize (phone: beside the text)", () => {
 });
 
 describe("stackedTubeSize (desktop: between header and status)", () => {
-  it("is 55% of the card's inner width", () => {
-    // A 332px desktop card has 300px inside: 165px.
-    expect(stackedTubeSize(300)).toBe(165);
+  it("is 62% of the card's inner width", () => {
+    // A 332px desktop card has 300px inside: 186px.
+    expect(stackedTubeSize(300)).toBe(186);
   });
   it("is clamped both ways", () => {
     expect(stackedTubeSize(150)).toBe(STACKED_MIN);
-    expect(stackedTubeSize(428)).toBe(STACKED_MAX);
+    expect(stackedTubeSize(400)).toBe(STACKED_MAX);
   });
 });
