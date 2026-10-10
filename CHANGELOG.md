@@ -151,6 +151,18 @@ darkmux release.
 
 ### Fixed
 
+- **A Claude turn reads the previous turn's cache back** (#3193). On the
+  `messages` dialect, each turn read only the first message from the cache and
+  wrote the rest of the conversation again, at the cache-write price. The
+  cause was the per-turn soft trim of old tool results (#1391): once a large
+  result aged out of the recent window, its middle was elided, which rewrote a
+  message the previous request had already sent, so the next request no longer
+  extended that request's cache entry. The soft trim no longer runs on an
+  endpoint that caches the prompt prefix; compaction still bounds the
+  conversation there. Other dialects are unchanged. A new test drives the real
+  loop for six turns against a recording Messages server and checks that each
+  request extends the previous one through its last block.
+
 - **A live view no longer goes silent when the fleet's Redis drops** (#3122).
   When Redis stopped answering, the daemon's Redis tail gave up after its
   retries and sent `stream.error`. The live channel kept the connection open,
