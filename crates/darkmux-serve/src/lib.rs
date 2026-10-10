@@ -3224,8 +3224,7 @@ async fn flow_stream_handler(
     // events) ignores them, and a viewer needs no second stream or slot.
     // Local-daemon only: these are samples from THIS machine's dispatches,
     // whichever path (Redis or file) the flow records above come from.
-    let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
-        Box::pin(futures::stream::select(event_stream, live_hub::live_events(redaction)));
+    let event_stream = records_then_live(event_stream, live_hub::live_events(redaction));
 
     // (#925) Carry the SSE slot inside the stream so the open-count decrement
     // happens exactly when the connection ends or the client disconnects.
@@ -3233,6 +3232,24 @@ async fn flow_stream_handler(
         s.next().await.map(|item| (item, (s, slot)))
     });
     Ok(Sse::new(guarded.boxed()).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+type SseEvents = futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>;
+
+/// The live view's one SSE stream: the flow records, with the live channel's
+/// samples interleaved, ENDING when the records end (#3122). The live channel
+/// never ends on its own, so a plain `select` kept a connection open after
+/// its record source had stopped (the Redis tail gives up after
+/// `MAX_CONSECUTIVE_XREAD_FAILURES`): the tab never reconnected and showed a
+/// finished run as RUNNING, then STALLED. Ending the response makes the
+/// browser reconnect; the new connection probes Redis again (falling back to
+/// the file tail) and the viewer's reconnect reconcile backfills the gap.
+fn records_then_live(records: SseEvents, live: SseEvents) -> SseEvents {
+    use futures::stream::StreamExt;
+    // Records arrive as `Some`, then one `None` marks their end; the live
+    // samples are always `Some`. The merged stream stops at that `None`.
+    let records = records.map(Some).chain(futures::stream::once(async { None }));
+    Box::pin(futures::stream::select(records, live.map(Some)).take_while(|e| std::future::ready(e.is_some())).filter_map(std::future::ready))
 }
 
 /// GET /flow/:date — returns flow records for a UTC day.

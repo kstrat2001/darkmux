@@ -114,6 +114,16 @@ darkmux release.
 
 ### Fixed
 
+- **A live view no longer goes silent when the fleet's Redis drops** (#3122).
+  When Redis stopped answering, the daemon's Redis tail gave up after its
+  retries and sent `stream.error`. The live channel kept the connection open,
+  so the tab never reconnected. It received no more records and showed a
+  finished run as RUNNING, then STALLED, until reloaded. Reproduced against a
+  daemon with its own Redis, killed mid-stream: the connection stayed open and
+  a record written to the flow file afterward never arrived. The response now
+  ends with its records. The browser reconnects, the new connection falls back
+  to the file tail, and the viewer's reconnect re-fetch fills the gap.
+
 - **A relative `lms_bin` works again, and `darkmux doctor` checks the file a dispatch will run** (#2533).
   Every `lms` spawn runs with its working directory pinned to `/` (#1863), so a
   relative `lms_bin` such as `./bin/lms` resolved against `/` and every dispatch
