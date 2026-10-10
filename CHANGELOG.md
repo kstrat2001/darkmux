@@ -14,6 +14,19 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-10-10
+
+Claude endpoints, efficient by default. A Claude seat now speaks Anthropic's native
+Messages API with prompt caching on every turn of the agent loop, with no setting to
+find. Usage records count cache reads and writes as their own classes, and a review no
+longer reads generated files. Measured on one real PR review (the same diff, model and
+intent as a 5.0 run that never finished): it finished, 86% of its input tokens were
+read from cache, and later turns wrote only their new content. Also in this release:
+missions get a workspace tree per commit, so parallel reviews are safe; a killed run
+reads abandoned instead of running; `init` fits the utility model to the machine;
+quiet test output; and the mods gate runs in a container. Flow schema 2.2.0
+(additive).
+
 ### Added
 
 - **Guide: Claude endpoints, a cached seat** (#3174). A new page,
@@ -3350,6 +3363,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.0
 [5.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.0.0
 [3.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.13.0
 [3.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.12.0

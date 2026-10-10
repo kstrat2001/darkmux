@@ -40,7 +40,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 
 [package]
 name = "darkmux"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2021"
 description = "Lab and multiplexer for local LLM configurations"
 license = "MIT"
