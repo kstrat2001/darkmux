@@ -123,10 +123,11 @@ impl UsageCounts {
     }
 
     /// (#3162) THE parse of a Messages-API `usage` object (Anthropic's native
-    /// dialect), onto the same counts: prompt = uncached input + cache writes
-    /// + cache reads (every input token the endpoint served, which is what a
-    /// budget counts), `cached` = cache reads. A count the API did not send
-    /// stays unreported; there is no prompt figure without `input_tokens`.
+    /// dialect), onto the same counts: prompt is the uncached input plus the
+    /// cache writes plus the cache reads (every input token the endpoint
+    /// served, which is what a budget counts), and `cached` is the cache
+    /// reads. A count the API did not send stays unreported; there is no
+    /// prompt figure without `input_tokens`.
     pub fn from_messages_usage(usage: &serde_json::Value) -> Self {
         let count = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64);
         let read = count("cache_read_input_tokens");
