@@ -497,7 +497,7 @@ pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnum
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
 pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
      \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \
-     \"tokens_per_dispatch\": <integer>, \"concurrent_calls\": <integer>}";
+     \"max_wait\": \"<n>m|<n>h|<n>d\", \"tokens_per_dispatch\": <integer>, \"concurrent_calls\": <integer>}";
 
 /// (#2902 step 5 review M2) Every endpoint `limits` that cannot be used as
 /// written: unreadable (one mistyped field, `"tokens": "2M"`, makes the whole

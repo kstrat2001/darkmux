@@ -209,6 +209,14 @@ pub struct UsageLimits {
     /// never picks a threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_at: Option<f64>,
+    /// (#3160) The longest a `wait` may hold one call, as a period
+    /// (`"30m"`, `"2h"`, `"1d"`). A wait whose window frees later than that
+    /// fails at once, naming when it would have room, instead of holding the
+    /// call past what the caller can outlive (a CI job's timeout). Only
+    /// under `wait`; `0` is no bound; absent, a wait holds until the window
+    /// has room, however long that is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait: Option<String>,
     /// Forward-compat overflow.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -285,6 +293,9 @@ impl UsageLimits {
                 parts.push(format!("{} per {period}", budget.join(", ")));
             }
         }
+        if let (Some(_), Some(m)) = (self.max_wait_secs(), self.max_wait.as_deref()) {
+            parts.push(format!("waits at most {m}"));
+        }
         parts.join(" · ")
     }
 
@@ -297,6 +308,38 @@ impl UsageLimits {
     /// The per-dispatch token cap, when one is set (`0` is none).
     pub fn dispatch_cap(&self) -> Option<u64> {
         self.tokens_per_dispatch.filter(|n| *n > 0)
+    }
+
+    /// (#3160) The `max_wait` bound in seconds, when one is set, parses, and
+    /// is not `0`.
+    pub fn max_wait_secs(&self) -> Option<u64> {
+        self.max_wait.as_deref().and_then(period_secs).filter(|s| *s > 0)
+    }
+
+    /// `warn_at` is a fraction strictly between 0 and 1.
+    fn validate_warn_at(&self) -> Result<(), String> {
+        match self.warn_at {
+            Some(f) if !(f.is_finite() && f > 0.0 && f < 1.0) => {
+                Err(format!("limits.warn_at must be a fraction between 0 and 1 (e.g. 0.8), got {f}"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `max_wait` is a period, and it bounds only a `wait`.
+    fn validate_max_wait(&self) -> Result<(), String> {
+        let Some(m) = self.max_wait.as_deref() else { return Ok(()) };
+        // (zero doctrine) `0` in any unit is no bound, never "instantly".
+        let zero = m.strip_suffix(['m', 'h', 'd']).is_some_and(|n| n.parse() == Ok(0u64));
+        if !zero && !is_period(m) {
+            return Err(format!("limits.max_wait must be `<n>m`, `<n>h` or `<n>d` (got {m:?})"));
+        }
+        if self.max_wait_secs().is_some() && self.resolved_policy() != Ok(BudgetPolicy::Wait) {
+            return Err("limits.max_wait bounds a wait, and only policy `wait` waits: set policy `wait`, or \
+                 drop max_wait"
+                .to_string());
+        }
+        Ok(())
     }
 
     /// The window budget, when one is set and its period parses.
@@ -374,13 +417,8 @@ impl UsageLimits {
                 }
             }
         }
-        if let Some(f) = self.warn_at {
-            if !(f.is_finite() && f > 0.0 && f < 1.0) {
-                return Err(format!(
-                    "limits.warn_at must be a fraction between 0 and 1 (e.g. 0.8), got {f}"
-                ));
-            }
-        }
+        self.validate_max_wait()?;
+        self.validate_warn_at()?;
         if let Err(raw) = self.resolved_policy() {
             return Err(format!(
                 "limits.policy `{raw}` is not a budget policy; valid: {}",
@@ -1430,5 +1468,24 @@ mod tests {
         };
         assert_eq!(l.summary(), "500000 tokens/dispatch · 2 concurrent calls · 2000000 tokens, 400 calls per 1d");
         assert_eq!(UsageLimits::default().summary(), "");
+    }
+
+    /// (#3160) `max_wait` bounds how long a `wait` may hold a call: a period
+    /// like the window's, meaningful only under `wait`, `0` is no bound.
+    #[test]
+    fn max_wait_is_a_period_that_applies_only_under_wait() {
+        let window = || Some(UsageWindow { period: Some("30d".into()), tokens: Some(100), ..Default::default() });
+        let wait = Some(Lenient::Known(BudgetPolicy::Wait));
+        let ok = UsageLimits { window: window(), policy: wait.clone(), max_wait: Some("30m".into()), ..Default::default() };
+        assert_eq!(ok.validate(), Ok(()));
+        assert_eq!(ok.max_wait_secs(), Some(1_800));
+        assert_eq!(ok.summary(), "100 tokens per 30d · waits at most 30m");
+        let zero = UsageLimits { max_wait: Some("0m".into()), ..ok.clone() };
+        assert_eq!((zero.validate(), zero.max_wait_secs()), (Ok(()), None));
+        let bad = UsageLimits { max_wait: Some("an hour".into()), ..ok.clone() };
+        assert!(bad.validate().unwrap_err().contains("limits.max_wait"));
+        let warn = UsageLimits { policy: None, ..ok };
+        let why = warn.validate().unwrap_err();
+        assert!(why.contains("max_wait") && why.contains("`wait`"), "{why}");
     }
 }

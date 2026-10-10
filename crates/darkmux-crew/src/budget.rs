@@ -116,6 +116,9 @@ pub struct EndpointBudget {
     pub window: WindowBudget,
     /// The period as written (`"1d"`), for messages.
     pub period: String,
+    /// (#3160) `limits.max_wait`: the longest one call may wait, in seconds
+    /// and as written. `None`: a wait holds until the window has room.
+    pub max_wait: Option<(u64, String)>,
 }
 
 /// How a message names the endpoint a value belongs to.
@@ -198,6 +201,7 @@ impl EndpointBudget {
             warn_at: limits.warn_at,
             window,
             period: limits.window.as_ref().and_then(|w| w.period.clone()).unwrap_or_default(),
+            max_wait: limits.max_wait_secs().zip(limits.max_wait.clone()),
         }))
     }
 
@@ -783,8 +787,8 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 return Ok(());
             }
             Verdict::Wait { breach, resume_at } => {
-                if let Some(why) = env.stop_reason(caller) {
-                    return Err(stopped_wait(&b, why, waited_ms, announced.is_some(), caller, env));
+                if let Some(err) = wait_must_end(&b, resume_at, now, waited_ms, announced.is_some(), caller, env) {
+                    return Err(err);
                 }
                 if announced != Some(resume_at) {
                     announce_wait(&b, &breach, resume_at, now, caller, env);
@@ -840,6 +844,73 @@ fn stopped_wait(
         stop_record(&b.endpoint_id, &why, waited_ms, &message, caller, env);
     }
     anyhow::anyhow!(message)
+}
+
+/// Why a wait ends here without sending: its run was stopped, or (#3160)
+/// the window cannot have room within the endpoint's `max_wait`.
+fn wait_must_end(
+    b: &EndpointBudget,
+    resume_at: Option<i64>,
+    now: i64,
+    waited_ms: u64,
+    announced: bool,
+    caller: &BudgetCaller<'_>,
+    env: &dyn BudgetEnv,
+) -> Option<anyhow::Error> {
+    if let Some(why) = env.stop_reason(caller) {
+        return Some(stopped_wait(b, why, waited_ms, announced, caller, env));
+    }
+    past_max_wait(b, resume_at, now, waited_ms, caller, env)
+}
+
+/// (#3160) A wait that cannot end within the endpoint's `max_wait`: the
+/// window frees later than `max_wait` from when the wait began, or no resume
+/// time is known and the wait has already held that long. Records a
+/// `budget.stop` and returns the error; nothing is sent.
+fn past_max_wait(
+    b: &EndpointBudget,
+    resume_at: Option<i64>,
+    now: i64,
+    waited_ms: u64,
+    caller: &BudgetCaller<'_>,
+    env: &dyn BudgetEnv,
+) -> Option<anyhow::Error> {
+    let (limit_secs, written) = b.max_wait.as_ref()?;
+    let ahead_secs = resume_at.map(|r| (r + 1 - now).max(0) as u64);
+    let held_secs = waited_ms / 1_000;
+    let over = match ahead_secs {
+        Some(ahead) => held_secs + ahead > *limit_secs,
+        None => held_secs >= *limit_secs,
+    };
+    if !over {
+        return None;
+    }
+    let when = match ahead_secs {
+        Some(ahead) => format!("its window has room again in about {}", human_duration(ahead)),
+        None => format!("no time is known when its window has room, after waiting {}", human_duration(held_secs)),
+    };
+    let reason = format!("{when}, past this endpoint's max_wait {written}");
+    let message = format!(
+        "darkmux: endpoint `{}` has reached its budget ({}): {reason}; the call fails now and nothing was sent. \
+         Raise the budget or max_wait in profiles.json, or run again once the window has room",
+        b.endpoint_id,
+        b.describe()
+    );
+    env.say(&message);
+    env.emit(record(
+        darkmux_flow::Level::Warn,
+        caller,
+        darkmux_flow::Payload::BudgetStop(BudgetPayload {
+            endpoint_id: Some(b.endpoint_id.clone()),
+            reason: Some(reason),
+            waited_ms: Some(waited_ms),
+            resume_at_ms: resume_at.map(|r| (r as u64) * 1_000),
+            period: Some(b.period.clone()),
+            pid: Some(std::process::id()),
+            ..budget_payload(BudgetScope::Endpoint, &message)
+        }),
+    ));
+    Some(anyhow::anyhow!(message))
 }
 
 /// The `budget.stop` record: a wait ended because its run was stopped.

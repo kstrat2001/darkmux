@@ -1208,6 +1208,7 @@ UsageLimits
   window?: UsageWindow | null
   policy?: Lenient4 | null
   warn_at?: double | null
+  max_wait?: string | null
 UsageReport
   since: string
   default_window: boolean

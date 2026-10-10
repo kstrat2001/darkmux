@@ -28,6 +28,16 @@ darkmux release.
   served. `reasoning_effort` and `api_version` are refused beside it.
   `tests/cli-json.golden` regenerated (`Dialect` gains `"messages"`, additive).
 
+- **`limits.max_wait`: a budget wait that cannot end in time fails at once** (#3160).
+  Under policy `wait`, a call whose endpoint window frees later than
+  `max_wait` (or that has held that long with no known resume time) fails
+  immediately with a `budget.stop` record naming the endpoint, its spend, when
+  the window would have room and the fix; nothing is sent. Before it, PR
+  #3158's review waited on a 30-day window due to free in 714 hours inside a
+  90-minute CI job until the job was cancelled. Absent or `0`, a wait holds
+  as before. `tests/cli-json.golden` regenerated (`UsageLimits` gains
+  `max_wait`, additive).
+
 ### Changed
 
 - **The console redacts for remote viewers instead of refusing them.** In
