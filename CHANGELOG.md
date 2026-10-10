@@ -145,6 +145,15 @@ darkmux release.
   it says the machine is best used as a fleet client (`profile@machine`). A
   utility id or window the operator set by hand is never changed.
 
+- **A diff review no longer reads generated files** (#3180). A file that
+  `.gitattributes` marks `linguist-generated`, GitHub's own convention, is
+  listed as skipped and gets no review unit. darkmux now marks its viewer
+  bundle, demo fixtures and generated TypeScript types. PR #3178's Claude
+  review cost $6.97 for an 87-line diff. 80% of that was reading two minified
+  810 KB bundles: 61 lines from one of them came to about 300K prompt tokens,
+  14 times over. Measured on darkmux's tree, the attribute lookup takes
+  32 ms per rule.
+
 - **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
   A hosted Claude stream arrives in bursts, and the live channel sends a sample
   on every transition as well as on its cadence: captured live, 642 chars landed

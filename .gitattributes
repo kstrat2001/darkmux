@@ -1,0 +1,7 @@
+# Generated files: GitHub collapses them in a PR's diff, and a darkmux diff
+# review lists them as skipped instead of reviewing them (#3180).
+crates/darkmux-serve/assets/next.html linguist-generated
+docs/demo/index.html linguist-generated
+docs/demo/demo-*.json linguist-generated
+docs/demo/demo-*.jsonl linguist-generated
+ui/src/types/generated/** linguist-generated
