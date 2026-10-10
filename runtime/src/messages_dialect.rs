@@ -273,38 +273,41 @@ impl StreamTranslator {
     pub fn translate(&mut self, event: &Value) -> Result<Translated> {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
         Ok(match kind {
-            "message_start" => {
-                let m = event.get("message").cloned().unwrap_or_default();
-                self.id = str_of(&m, "id");
-                self.model = m.get("model").and_then(Value::as_str).map(str::to_string);
-                self.start_usage = m.get("usage").cloned().unwrap_or_default();
-                // The input side is known now: a stream cut before
-                // `message_delta` still reports the prompt it was served
-                // (output stays unreported, so the total is unknown).
-                let mut input = self.start_usage.clone();
-                if let Some(obj) = input.as_object_mut() {
-                    obj.remove("output_tokens");
-                }
-                Translated::Chunk(self.chunk(Delta::default(), None, Some(usage_counts(&input))))
-            }
+            "message_start" => self.message_start(event),
             "content_block_start" => self.block_start(event),
             "content_block_delta" => self.block_delta(event),
-            "message_delta" => {
-                let stop = event.pointer("/delta/stop_reason").and_then(Value::as_str).map(finish_reason);
-                let mut usage = self.start_usage.clone();
-                if let (Some(obj), Some(Value::Object(late))) = (usage.as_object_mut(), event.get("usage")) {
-                    for (k, v) in late {
-                        if !v.is_null() {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                Translated::Chunk(self.chunk(Delta::default(), stop, Some(usage_counts(&usage))))
-            }
+            "message_delta" => self.message_delta(event),
             "message_stop" => Translated::Done,
             "error" => return Err(anyhow!("endpoint sent an error event mid-stream: {event}")),
             _ => Translated::Skip,
         })
+    }
+
+    /// `message_start`: the id, model and input usage, which a stream cut
+    /// before `message_delta` still reports (output stays unreported, so the
+    /// total is unknown).
+    fn message_start(&mut self, event: &Value) -> Translated {
+        let m = event.get("message").cloned().unwrap_or_default();
+        self.id = str_of(&m, "id");
+        self.model = m.get("model").and_then(Value::as_str).map(str::to_string);
+        self.start_usage = m.get("usage").cloned().unwrap_or_default();
+        let mut input = self.start_usage.clone();
+        if let Some(obj) = input.as_object_mut() {
+            obj.remove("output_tokens");
+        }
+        Translated::Chunk(self.chunk(Delta::default(), None, Some(usage_counts(&input))))
+    }
+
+    /// `message_delta`: the stop reason, and the late usage over the start's.
+    fn message_delta(&mut self, event: &Value) -> Translated {
+        let stop = event.pointer("/delta/stop_reason").and_then(Value::as_str).map(finish_reason);
+        let mut usage = self.start_usage.clone();
+        if let (Some(obj), Some(Value::Object(late))) = (usage.as_object_mut(), event.get("usage")) {
+            for (k, v) in late.iter().filter(|(_, v)| !v.is_null()) {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        Translated::Chunk(self.chunk(Delta::default(), stop, Some(usage_counts(&usage))))
     }
 
     fn block_start(&mut self, event: &Value) -> Translated {
