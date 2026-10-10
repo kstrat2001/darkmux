@@ -9249,7 +9249,7 @@ mod tests {
             (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
         ] {
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", &url) };
-            let run = RunId::mission(&format!("beats-3125-{landed}")).unwrap();
+            let run = RunId::mission(format!("beats-3125-{landed}")).unwrap();
             let presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run), None, None);
             assert_eq!(run_start_payload(presence.as_ref()).beats, landed, "hub {url}");
             if let Some(p) = presence {
