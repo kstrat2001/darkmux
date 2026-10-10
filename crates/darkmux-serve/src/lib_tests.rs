@@ -8396,3 +8396,33 @@ mod fleet_cache_wall_clock {
         assert_eq!(uid_of("studio", std::time::Duration::ZERO), (Some("UID-S".into()), true), "an expired scan reads history again");
     }
 }
+
+/// (#3122) A live view whose record source ends (the Redis tail gives up
+/// after its consecutive XREAD failures) must end the response, so the
+/// browser reconnects onto the file tail and its reconnect reconcile fills the
+/// gap. The live channel never ends on its own, and while it held the
+/// connection open the tab kept a stream that delivered no more records:
+/// a finished run read RUNNING, then STALLED.
+mod flow_stream_ends_with_its_records {
+    use super::super::records_then_live;
+    use axum::response::sse::Event;
+    use futures::stream::{self, StreamExt};
+
+    #[tokio::test]
+    async fn the_response_ends_when_the_record_source_ends_though_the_live_channel_is_open() {
+        let records = stream::iter(vec![Ok(Event::default().data("a")), Ok(Event::default().data("stream.error"))]).boxed();
+        let live = stream::pending().boxed();
+        let all = tokio::time::timeout(std::time::Duration::from_secs(2), records_then_live(records, live).collect::<Vec<_>>())
+            .await
+            .expect("the response ends once its records do");
+        assert_eq!(all.len(), 2, "every record is delivered before the end");
+    }
+
+    #[tokio::test]
+    async fn live_samples_still_flow_while_records_do() {
+        let records = stream::pending().boxed();
+        let live = stream::iter(vec![Ok(Event::default().event("live").data("s"))]).boxed();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), records_then_live(records, live).next()).await;
+        assert!(matches!(first, Ok(Some(Ok(_)))), "a live sample arrives while the record source is open");
+    }
+}
