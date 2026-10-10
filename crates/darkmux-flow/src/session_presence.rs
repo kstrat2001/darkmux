@@ -95,6 +95,20 @@ pub fn session_key(session_id: &str) -> String {
 /// Redis blip must never crash the dispatch, so errors propagate for the
 /// emitter to swallow.
 pub fn write_session_beat(client: &redis::Client, beat: &SessionBeat, ttl_secs: u64) -> Result<()> {
+    write_session_beat_within(client, beat, ttl_secs, crate::REDIS_RESPONSE_TIMEOUT)
+}
+
+/// [`write_session_beat`] with its `SET` bounded by `response_bound` rather
+/// than the usual [`crate::REDIS_RESPONSE_TIMEOUT`]. (#3125) The emitter's
+/// first beat runs before the caller writes its start record, so it waits no
+/// longer for a hub's answer than darkmux waits to connect at all
+/// ([`REDIS_CONNECT_TIMEOUT`]).
+fn write_session_beat_within(
+    client: &redis::Client,
+    beat: &SessionBeat,
+    ttl_secs: u64,
+    response_bound: std::time::Duration,
+) -> Result<()> {
     let payload = serde_json::to_string(beat).context("serializing session beat")?;
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for session-beat write")?;
@@ -103,7 +117,8 @@ pub fn write_session_beat(client: &redis::Client, beat: &SessionBeat, ttl_secs: 
     // `SessionEmitter::stop`'s `h.join()` never returns and the dispatch
     // strands without its terminal record. With the deadline the write fails,
     // the beat lapses (the TTL covers that), and teardown proceeds.
-    bound_redis_response(&conn);
+    let _ = conn.set_read_timeout(Some(response_bound));
+    let _ = conn.set_write_timeout(Some(response_bound));
     let _: redis::Value = redis::cmd("SET")
         .arg(session_key(&beat.session_id))
         .arg(payload)
@@ -353,7 +368,10 @@ fn spawn_with_client(
     let beat_session_id = session_id.clone();
     // (#3125) The first beat, written here before the caller writes its start
     // record, so the record can say whether the beat is really published
-    // ([`SessionEmitter::beats`]). Bounded like every beat write.
+    // ([`SessionEmitter::beats`]). Its `SET` is bounded by
+    // `REDIS_CONNECT_TIMEOUT`, not the usual response bound: a start record
+    // never waits longer for a liveness promise than darkmux waits to connect.
+    // A first beat that misses it promises nothing; the thread keeps beating.
     let first_beat = SessionBeat {
         session_id: session_id.clone(),
         machine_uid: machine_uid.clone(),
@@ -363,7 +381,7 @@ fn spawn_with_client(
         mission_id: mission_id.clone(),
         beat_ts_ms: crate::presence::now_ms(),
     };
-    let first_beat_written = write_session_beat(&client, &first_beat, DEFAULT_TTL_SECS).is_ok();
+    let first_beat_written = write_session_beat_within(&client, &first_beat, DEFAULT_TTL_SECS, REDIS_CONNECT_TIMEOUT).is_ok();
 
     let handle = std::thread::Builder::new()
         .name("darkmux-session-presence".to_string())
@@ -653,6 +671,30 @@ mod tests {
             .expect("an emitter still spawns: the beat is best-effort");
         assert!(!beats(Some(&dead)), "a beat that never landed is not promised");
         assert!(!beats(None), "no emitter, no promise");
+    }
+
+    /// (#3125) Against a hub that accepts and never answers, the first beat
+    /// gives up within `REDIS_CONNECT_TIMEOUT` (plus the local connect), not
+    /// the 1 s response bound, so a dispatch's start waits no longer for its
+    /// liveness promise than darkmux waits to connect; and the start then
+    /// promises nothing.
+    #[test]
+    fn the_first_beat_against_a_silent_hub_gives_up_within_the_connect_bound() {
+        // Budget: the phase guard, the first beat, and the teardown's SET NX and DEL.
+        let port = crate::spawn_silent_redis_peer(6);
+        crate::assert_silent_peer_reaches_command_phase(port);
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str()).unwrap();
+        let start = std::time::Instant::now();
+        let emitter = spawn_with_client(client, &test_session("sid-3125-silent-first-beat"), None, None).expect("spawn emitter");
+        let elapsed = start.elapsed();
+        assert!(!emitter.beats(), "an unanswered first beat promises nothing");
+        let ceiling = REDIS_CONNECT_TIMEOUT + std::time::Duration::from_millis(250);
+        assert!(
+            elapsed < ceiling,
+            "the first beat took {elapsed:?} against a silent hub; it must give up within {ceiling:?} \
+             (REDIS_CONNECT_TIMEOUT plus a local connect), not the 1 s response bound"
+        );
+        drop(emitter); // bounded teardown, outside the measured window
     }
 
     #[test]
