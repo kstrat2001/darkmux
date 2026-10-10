@@ -1625,6 +1625,7 @@ mod tests {
         assert!(!plain.stopped_by_operator());
     }
 
+    #[serial_test::serial]
     #[test]
     fn reconcile_phase_steps_terminal_warns_only_for_running_not_planned() {
         let _g = CrewGuard::new();
