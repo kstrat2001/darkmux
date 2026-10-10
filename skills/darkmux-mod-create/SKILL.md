@@ -152,7 +152,9 @@ darkmux mod show "$MOD"
 
 darkmux does not open the kit. Its only judgment is the gate, which copies the
 checkout, `git apply`s the kit and runs the run's `test_command` in the patched
-copy. A gate-passed unified-diff kit renders as a one-click GitHub suggestion;
+copy: in a container from the run's `gate_image` (the copy its only mount, no
+network), or on the host only with `gate_on_host: true`. A `test_command` with
+neither set is refused, and every mod records why (#2973). A gate-passed unified-diff kit renders as a one-click GitHub suggestion;
 anything else renders as a patch comment or a question.
 
 ## The Claude monitor — watching for fired `create_finding` matches
