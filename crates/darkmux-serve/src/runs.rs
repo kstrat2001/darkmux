@@ -556,9 +556,21 @@ fn build_runs_in(
     fleet: &[serde_json::Value],
     window: &ScanWindow,
 ) -> RunsWithUsage {
+    build_runs_judged_by(flows_dir, lab_dir, fleet, window, &PeerClocks::cached())
+}
+
+/// [`build_runs_in`] judged by an explicit presence reading, so a test can
+/// build the union as any process would, with the beats it would read.
+fn build_runs_judged_by(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: &[serde_json::Value],
+    window: &ScanWindow,
+    peers: &PeerClocks,
+) -> RunsWithUsage {
     // (#2902 step 2b) The usage fold shares the session index's one pass.
     let mut usage_fold = crate::usage_sum::UsageFold::new(window.since_iso.clone());
-    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold), &PeerClocks::cached());
+    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold), peers);
     let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
@@ -2350,15 +2362,17 @@ fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
 /// force-quit), so nothing runs it. The staleness budget alone would hold it
 /// running for twice the inactivity timeout, or for good when that is unbounded.
 ///
-/// Only a session a bookend opened (`has_start`: `dispatch.start` or
-/// `run.start`, the only two bookend starts) is judged so, and only once this
-/// process has SEEN it beat (`beat_lost`, [`SeenBeats`]). Not every bookend
-/// beats: an ACP panel run writes `run.start` and beats nothing while it waits
-/// on the operator's sign-off, so a beat that was never there is no evidence.
+/// Only a session whose start record promised its beat (`beats_promised`) is
+/// judged so. Not every bookend beats: an ACP panel run writes `run.start` and
+/// beats nothing while it waits on the operator's sign-off, and a dispatch
+/// whose first beat failed to publish (Redis refusing writes, a process with
+/// no Keychain access) promises nothing, so a beat that was never there is
+/// never read as one that stopped.
 /// A budget wait that has not started (`has_wait` alone) is judged by its
 /// lapse, as before.
 fn bookend_beat_gone(agg: &SessionAgg, now_ms: u64) -> bool {
     agg.beat_lost
+        && agg.beats_promised
         && agg.has_start
         && !crate::run_lifecycle::quiet_clock_live(
             agg.last_activity_ts.as_deref(),
@@ -2565,10 +2579,16 @@ struct SessionAgg {
     /// already) and for a session with no machine uid, or from a peer with no live beat.
     clock_now_ms: Option<u64>,
     /// (#3125) The presence read was good, this session's machine has a live
-    /// presence beat (this machine's checked like any other), this process
-    /// saw the session beat, and no live beat names it now.
+    /// presence beat (this machine's checked like any other), and no live
+    /// beat names the session now.
     /// Set by [`PeerClocks::apply`]; [`session_is_live`] reads it.
     beat_lost: bool,
+    /// (#3125) A start record of this session promised its beat
+    /// (`beats` on `dispatch.start` / `run.start`): its writer publishes the
+    /// session's presence key for as long as it runs. Read from the records
+    /// alone, so every process (a fresh `run list`, a restarted daemon)
+    /// reaches the same verdict.
+    beats_promised: bool,
     /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
     /// budget before its first bookend is a run.
     has_wait: bool,
@@ -2709,30 +2729,6 @@ fn build_flow_session_index_in(
 /// clock by that much, far inside the staleness budget it corrects.
 const PEER_CLOCKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
 
-/// (#3125 review) The sessions this process has seen beat, each with when it
-/// was last seen (this process's clock, epoch ms). In memory only: a daemon
-/// restart, or a fresh `darkmux run list` process, has seen nothing yet, so no
-/// session reads as having lost its beat, and a killed run falls back to the
-/// staleness budget, as before #3125. A session is forgotten once it has been
-/// gone longer than that budget, by which point the budget judges it anyway
-/// (with an unbounded budget nothing is forgotten: one short id per run).
-#[derive(Default)]
-struct SeenBeats {
-    last_seen_ms: HashMap<String, u64>,
-}
-
-impl SeenBeats {
-    /// Record `live` as seen at `now_ms`, forget what has been gone longer
-    /// than `keep_ms`, and return every session still remembered.
-    fn observe(&mut self, live: &HashSet<String>, now_ms: u64, keep_ms: u64) -> HashSet<String> {
-        for sid in live {
-            self.last_seen_ms.insert(sid.clone(), now_ms);
-        }
-        self.last_seen_ms.retain(|_, seen| now_ms.saturating_sub(*seen) <= keep_ms);
-        self.last_seen_ms.keys().cloned().collect()
-    }
-}
-
 #[derive(Default, Clone)]
 struct PeerClocks {
     now_ms: HashMap<String, u64>,
@@ -2741,11 +2737,6 @@ struct PeerClocks {
     /// `None` when presence is off or the read failed: nothing is known, so
     /// no session is judged by its beat.
     live_sessions: Option<HashSet<String>>,
-    /// (#3125) The session ids this process has SEEN beat ([`SeenBeats`]).
-    /// Only a session seen beating and now gone has lost its beat: one that
-    /// never beat (an ACP panel run, whose `run.start` beats nothing; a
-    /// dispatch whose beat writes all failed) says nothing by its absence.
-    seen_beating: HashSet<String>,
 }
 
 impl PeerClocks {
@@ -2757,21 +2748,9 @@ impl PeerClocks {
         // (#3125) The live session beats, read the same way; a failed read
         // knows nothing (`None`), never "every beat is gone".
         let (sessions, state) = crate::read_presence_beats(&url, "runs", darkmux_flow::session_presence::read_live_sessions);
-        let live_sessions: Option<HashSet<String>> = matches!(state, crate::source_state::SourceState::Ok)
+        let live_sessions = matches!(state, crate::source_state::SourceState::Ok)
             .then(|| sessions.into_iter().map(|b| b.session_id).collect());
-        static SEEN: std::sync::Mutex<Option<SeenBeats>> = std::sync::Mutex::new(None);
-        let seen_beating = live_sessions
-            .as_ref()
-            .map(|live| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let mut slot = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                slot.get_or_insert_with(SeenBeats::default).observe(live, now_ms, stale_after_ms())
-            })
-            .unwrap_or_default();
-        Self { live_sessions, seen_beating, ..Self::from_beats(&beats) }
+        Self { live_sessions, ..Self::from_beats(&beats) }
     }
 
     /// [`PeerClocks::read`], at most once per [`PEER_CLOCKS_CACHE_TTL`]: the
@@ -2808,8 +2787,8 @@ impl PeerClocks {
     /// Give each session of ANOTHER machine that machine's clock. This
     /// machine's own sessions keep `None`: they already share this daemon's clock.
     ///
-    /// (#3125) Mark `beat_lost` on each session this process saw beat whose
-    /// beat is now gone, while its machine's own presence beat is live (this
+    /// (#3125) Mark `beat_lost` on each session with no live beat, while its
+    /// machine's own presence beat is live (this
     /// machine included: its beat is checked, never assumed). A session on a
     /// machine whose beat is absent is left alone: its beats may be gone
     /// because that machine cannot write them (it is down, or its Redis
@@ -2824,9 +2803,7 @@ impl PeerClocks {
                 agg.clock_now_ms = self.now_ms.get(&uid).copied();
             }
             let reporting = self.now_ms.contains_key(&uid);
-            agg.beat_lost = reporting
-                && self.seen_beating.contains(session_id)
-                && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
+            agg.beat_lost = reporting && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
         }
     }
 }
@@ -2898,8 +2875,20 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
         }
     }
 
+    agg.beats_promised |= start_promises_beat(v);
     let mission = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
     agg.lifecycle.fold(action.as_ref(), mission, ts, v);
+}
+
+/// (#3125) Whether a start record promises its session's beat: the typed
+/// `beats` of a `dispatch.start` or `run.start` payload.
+fn start_promises_beat(v: &serde_json::Value) -> bool {
+    use darkmux_flow::Payload;
+    match darkmux_flow::reader::payload_of(v) {
+        Some(Payload::DispatchStart(p)) => p.beats,
+        Some(Payload::RunStart(p)) => p.beats,
+        _ => false,
+    }
 }
 
 /// The endpoint an execution bookend's payload names, when it names one.
@@ -5760,11 +5749,12 @@ mod tests {
     }
 
     /// (#3125) A dispatch that was SIGKILLed writes no terminal record, and its
-    /// session beat expires about one TTL later. Once its machine is reporting
-    /// again, nothing is running it, and the row must say so well inside the
-    /// staleness budget (which is how long a quiet live run may go between
-    /// records, not how long a dead one may read running). Every clock here is
-    /// fixed: the peer's clock and this daemon's are both explicit instants.
+    /// session beat expires about one TTL later. Its start promised the beat
+    /// (`beats`), so once its machine is reporting, the missing beat says
+    /// nothing runs it, and the row must say so well inside the staleness
+    /// budget (which is how long a quiet live run may go between records, not
+    /// how long a dead one may read running). Every clock here is fixed: the
+    /// peer's clock and this daemon's are both explicit instants.
     #[test]
     fn a_dispatch_whose_beat_is_gone_on_a_reporting_machine_is_not_running() {
         let start_ts = "2000-01-01T00:00:00Z";
@@ -5776,7 +5766,7 @@ mod tests {
             let mut idx = HashMap::new();
             fold_session_record(
                 &mut idx,
-                &serde_json::json!({ "ts": start_ts, "action": action, "session_id": "killed", "machine_id": "studio", "machine_uid": uid }),
+                &serde_json::json!({ "ts": start_ts, "action": action, "session_id": "killed", "machine_id": "studio", "machine_uid": uid, "payload": { "beats": true } }),
             );
             settle_session_index(&mut idx);
             clocks.apply(&mut idx);
@@ -5785,7 +5775,6 @@ mod tests {
         let reporting = |now: u64, live: Option<HashSet<String>>| PeerClocks {
             now_ms: HashMap::from([(peer.to_ascii_lowercase(), now)]),
             live_sessions: live,
-            seen_beating: HashSet::from(["killed".to_string()]),
         };
 
         let killed = build("dispatch.start", peer, reporting(after, Some(HashSet::new())), after);
@@ -5797,14 +5786,14 @@ mod tests {
         assert_eq!(beating[0].status, RunStatus::Running, "a live beat is a live run");
         let unknown = build("dispatch.start", peer, reporting(after, None), after);
         assert_eq!(unknown[0].status, RunStatus::Running, "presence off or unread: no beat is known to be missing");
-        let down = PeerClocks { live_sessions: Some(HashSet::new()), seen_beating: HashSet::from(["killed".to_string()]), ..Default::default() };
+        let down = PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() };
         let partitioned = build("dispatch.start", peer, down, after);
         assert_eq!(partitioned[0].status, RunStatus::Running, "its machine is not reporting: that is `not reporting`, not an ending");
         let just_started = start_ms + BEAT_GONE_GRACE_MS - 1_000;
         let starting = build("dispatch.start", peer, reporting(just_started, Some(HashSet::new())), just_started);
         assert_eq!(starting[0].status, RunStatus::Running, "inside the grace its first beat may not be read yet");
-        // A call its budget holds before any bookend: its gate's beat ends with
-        // the gate, so its wait's lapse judges it, never its beat.
+        // A call its budget holds before any bookend: its wait's lapse judges
+        // it, never its beat, whatever a record says.
         let mut held = HashMap::new();
         fold_session_record(
             &mut held,
@@ -5812,17 +5801,14 @@ mod tests {
                 "payload": { "scope": "endpoint", "message": "waiting", "wait_ms": 3_600_000 } }),
         );
         settle_session_index(&mut held);
-        PeerClocks { seen_beating: HashSet::from(["held".to_string()]), ..reporting(after, Some(HashSet::new())) }.apply(&mut held);
+        held.get_mut("held").unwrap().beats_promised = true;
+        reporting(after, Some(HashSet::new())).apply(&mut held);
         assert!(held["held"].beat_lost, "the case under test: no beat on a reporting machine");
-        assert!(session_is_live(&held["held"], after), "only a session a bookend opened owes a beat");
+        assert!(session_is_live(&held["held"], after), "only a session a bookend opened is judged by its beat");
 
-        // This machine's own run: it is reporting by definition, and has no peer clock.
+        // This machine's own run, while this machine's own beat is live.
         if let Some(mine) = darkmux_hardware::machine_uid() {
-            let own_clocks = PeerClocks {
-                now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]),
-                live_sessions: Some(HashSet::new()),
-                seen_beating: HashSet::from(["killed".to_string()]),
-            };
+            let own_clocks = PeerClocks { now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]), live_sessions: Some(HashSet::new()) };
             let own = build("dispatch.start", mine, own_clocks, after);
             assert_eq!(own[0].status, RunStatus::Abandoned, "on its own machine too");
         }
@@ -5842,7 +5828,7 @@ mod tests {
         let task_session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m-killed").unwrap(), "coder").wire();
         let rec = |action: &str, session: &str| serde_json::json!({
             "ts": start_ts, "action": action, "handle": "coder", "mission_id": "m-killed",
-            "session_id": session, "machine_id": "studio", "machine_uid": peer,
+            "session_id": session, "machine_id": "studio", "machine_uid": peer, "payload": { "beats": true },
         });
         let records = [rec("run.start", &run_session), rec("dispatch.start", &task_session)];
         let row = |live: HashSet<String>| {
@@ -5853,12 +5839,7 @@ mod tests {
                 missions.entry("m-killed".to_string()).or_default().fold_record(r);
             }
             settle_session_index(&mut idx);
-            PeerClocks {
-                now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]),
-                live_sessions: Some(live),
-                seen_beating: HashSet::from([run_session.clone(), task_session.clone()]),
-            }
-            .apply(&mut idx);
+            PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]), live_sessions: Some(live) }.apply(&mut idx);
             peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
         };
         let killed = row(HashSet::new());
@@ -5868,22 +5849,22 @@ mod tests {
         assert_eq!(row(HashSet::from([run_session.clone()])).status, RunStatus::Running);
     }
 
-    /// (#3125 review) A missing beat counts only for a session this process
-    /// SAW beat, on a machine whose own beat is live. Three runs that never
+    /// (#3125 review) A missing beat counts only for a session whose start
+    /// promised one, on a machine whose own beat is live. Two runs that never
     /// stopped must keep reading running: an ACP panel run (its `run.start`
-    /// beats nothing while it waits on the operator's sign-off), and a session
-    /// on this machine while this machine's own beat is absent (Redis refusing
-    /// writes, or a dispatch with no Keychain access, beats nothing anywhere).
+    /// promises no beat while it waits on the operator's sign-off), and a
+    /// session on this machine while this machine's own beat is absent (Redis
+    /// refusing writes, or no Keychain access, beats nothing anywhere).
     #[test]
-    fn a_session_never_seen_beating_or_on_a_silent_machine_is_not_abandoned() {
+    fn a_session_with_no_beat_promised_or_on_a_silent_machine_is_not_abandoned() {
         let Some(mine) = darkmux_hardware::machine_uid() else { return };
         let start_ts = "2000-01-01T00:00:00Z";
         let after = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
         let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("panel-1").unwrap()).wire();
-        let row = |clocks: PeerClocks| {
+        let row = |payload: serde_json::Value, clocks: PeerClocks| {
             let r = serde_json::json!({
                 "ts": start_ts, "action": "run.start", "handle": "pr-merge", "mission_id": "panel-1",
-                "session_id": run_session, "machine_id": "darkbook", "machine_uid": mine,
+                "session_id": run_session, "machine_id": "darkbook", "machine_uid": mine, "payload": payload,
             });
             let mut idx = HashMap::new();
             let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
@@ -5893,29 +5874,48 @@ mod tests {
             clocks.apply(&mut idx);
             peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
         };
-        let my_beat = HashMap::from([(mine.to_ascii_lowercase(), after)]);
-        let panel = row(PeerClocks { now_ms: my_beat.clone(), live_sessions: Some(HashSet::new()), seen_beating: HashSet::new() });
-        assert_eq!(panel.status, RunStatus::Running, "a run that never beat lost nothing");
-        let silent = row(PeerClocks {
-            now_ms: HashMap::new(),
-            live_sessions: Some(HashSet::new()),
-            seen_beating: HashSet::from([run_session.clone()]),
-        });
+        let my_beat = || PeerClocks { now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]), live_sessions: Some(HashSet::new()) };
+        let panel = row(serde_json::json!({}), my_beat());
+        assert_eq!(panel.status, RunStatus::Running, "a run that promised no beat lost nothing");
+        let silent = row(serde_json::json!({ "beats": true }), PeerClocks { now_ms: HashMap::new(), live_sessions: Some(HashSet::new()) });
         assert_eq!(silent.status, RunStatus::Running, "this machine's own beat is absent: its beats prove nothing");
-        let gone = row(PeerClocks { now_ms: my_beat, live_sessions: Some(HashSet::new()), seen_beating: HashSet::from([run_session.clone()]) });
-        assert_eq!(gone.status, RunStatus::Abandoned, "seen beating, now gone, on a machine that beats: it ended");
+        let gone = row(serde_json::json!({ "beats": true }), my_beat());
+        assert_eq!(gone.status, RunStatus::Abandoned, "promised a beat, beat gone, on a machine that beats: it ended");
     }
 
-    /// (#3125 review) The memory behind `seen_beating`: a session seen in one
-    /// read is still known as seen in a later read that no longer has it, and
-    /// is forgotten only once the staleness budget would judge it anyway.
+    /// (#3125 review) `darkmux run list` and the daemon's `/runs` build the
+    /// same union in different processes: a fresh CLI process and a daemon
+    /// that has been watching for hours. A killed session must read the same in
+    /// both, so its verdict rests only on what every process reads alike: its
+    /// records and the beats live now. Two independent builds, each with its
+    /// own reading, stand in for the two processes. The session is a peer's,
+    /// judged by that peer's fixed clock.
     #[test]
-    fn seen_beats_remember_a_session_after_its_beat_is_gone() {
-        let mut seen = SeenBeats::default();
-        let live = HashSet::from(["s1".to_string()]);
-        assert!(seen.observe(&live, 1_000, 10_000).contains("s1"));
-        assert!(seen.observe(&HashSet::new(), 5_000, 10_000).contains("s1"), "gone from the live set, still seen");
-        assert!(!seen.observe(&HashSet::new(), 11_001, 10_000).contains("s1"), "past the budget it is forgotten");
+    #[serial_test::serial]
+    fn run_list_and_the_daemon_read_a_killed_session_alike() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let start_ts = "2000-01-01T00:00:00Z";
+        let peer_now = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
+        let peer = "STUDIO-UID-3125";
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[serde_json::json!({
+                "ts": start_ts, "action": "dispatch.start", "session_id": "killed-sess", "handle": "coder",
+                "machine_id": "studio", "machine_uid": peer, "payload": { "beats": true },
+            })],
+        );
+        let process = || {
+            let clocks = PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), peer_now)]), live_sessions: Some(HashSet::new()) };
+            let out = build_runs_judged_by(flows.path(), None, &[], &ScanWindow::default_window(), &clocks);
+            let row = out.runs.iter().find(|r| r.id == "killed-sess").expect("the killed session's row").clone();
+            (row.status, row.abandoned_reason)
+        };
+        let daemon = process();
+        let run_list = process();
+        assert_eq!(run_list, daemon, "a fresh process and a long-running one must agree");
+        assert_eq!(run_list, (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)));
     }
 
     #[test]

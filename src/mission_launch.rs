@@ -863,6 +863,21 @@ pub fn launch(
             }
         };
 
+    // (#2877, pre-PR review) The mission's own run session beats presence for
+    // as long as the launch runs. Its executions beat only while a model call
+    // is live, so during the steps between them (a summary, a mod wait, a test
+    // gate, delivery) nothing was live, the run page stopped polling, and it
+    // could miss its own COMPLETE. Dropped explicitly before every
+    // `reap_and_exit_on_signal` (it calls `process::exit`, which runs no
+    // destructors: the key would linger ~15s and the reconciler would write a
+    // redundant `session.end`), and otherwise at scope end after the bookend
+    // has closed. The drop removes the key and suppresses the reconciler's
+    // abandoned edge, same as a dispatch's.
+    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
+    // (#3125) Spawned before the run's `run.start`, which promises the beat
+    // (`RunPayload::beats`) only once its first beat published; declared
+    // before the bookend guard, so an early return writes `run.error` first.
+
     // (#3074) The run's liveness bookend opens as soon as the mission is minted,
     // so any post-mint error return (interpret, staffing check, unexecutable kinds)
     // records run.error rather than leaving the run unclosed in the flow trail.
@@ -879,7 +894,8 @@ pub fn launch(
             RunPayload::failed("run terminated before completion (early return or panic)"),
         )
     });
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+    let run_start = RunPayload { beats: flow::session_presence::beats(mission_presence.as_ref()), ..RunPayload::default() };
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, run_start));
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
@@ -1252,17 +1268,8 @@ pub fn launch(
     };
 
 
-    // (#2877, pre-PR review) The mission's own run session beats presence for
-    // as long as the launch runs. Its executions beat only while a model call
-    // is live, so during the steps between them (a summary, a mod wait, a test
-    // gate, delivery) nothing was live, the run page stopped polling, and it
-    // could miss its own COMPLETE. Dropped explicitly before every
-    // `reap_and_exit_on_signal` (it calls `process::exit`, which runs no
-    // destructors: the key would linger ~15s and the reconciler would write a
-    // redundant `session.end`), and otherwise at scope end after the bookend
-    // has closed. The drop removes the key and suppresses the reconciler's
-    // abandoned edge, same as a dispatch's.
-    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
+    // The mission's run session beat (#2877) spawns before `run.start`
+    // (#3125): see `mission_presence` above the run bookend.
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only

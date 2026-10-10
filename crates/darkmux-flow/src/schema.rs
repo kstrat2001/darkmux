@@ -54,6 +54,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
 //           `cache_creation_input_tokens`). Like `cached_tokens` it is a part
 //           of `prompt_tokens`, priced apart from uncached input and from
 //           reads. Written only when the provider reported it. ADDITIVE.
+//
+//           Also 2.2.0 (#3125): `dispatch.start` and `run.start` gain
+//           `payload.beats`, a bool written ONLY as `true`: the writer
+//           publishes the session's presence beat for as long as it runs, and
+//           its first beat landed. A reader on a machine still reporting reads
+//           that beat gone as the run having ended. Absent (an ACP panel run,
+//           an unpublished beat, every record before 2.2.0) promises nothing.
+//           ADDITIVE.
 //   2.1.0 (5.0, #3074): `step.complete` gains `payload.later_step_planned`, a
 //           bool written ONLY as `true`: a later step of the same task is
 //           still planned, so this record is not the end of the task's

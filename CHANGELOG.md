@@ -207,16 +207,16 @@ darkmux release.
   or force-quit) writes no terminal record. Its session beat expires about 15 s
   later, but the run read `running` on every surface until the staleness budget
   ran out (twice `runtime.inactivity_timeout_seconds`, 20 minutes by default,
-  and never when that is `0`). Now, when presence is on and the run's machine
-  has a live presence beat (this machine included), an open `dispatch.start` or
-  `run.start` whose session beat the daemon saw and is now gone, with nothing
-  written for 30 s, reads `abandoned` (`no ending`) in `/runs` and the runs
-  board. A session that never beat (an ACP panel run waiting on sign-off) is not
-  judged by its beat. The memory of which sessions beat lives in the process:
-  after a daemon restart, and in a `darkmux run list` that does not go through
-  the daemon, a killed run falls back to the staleness budget, as before. A run
-  on a machine that is not reporting still reads `not reporting`. With presence
-  off, or when the beats cannot be read, nothing changes.
+  and never when that is `0`). A `dispatch.start` or `run.start` now says
+  whether its writer beats the session (`payload.beats`, flow schema 2.2.0,
+  written only once the first beat landed). When presence is on, a session
+  that promised a beat, whose beat is gone while its machine's own presence
+  beat is live (this machine included), and that has written nothing for 30 s
+  reads `abandoned` (`no ending`) in `run list`, `/runs` and the runs board
+  alike, in any process. A run that promised no beat (an ACP panel run waiting
+  on sign-off, a dispatch whose beat never published) is judged as before. A
+  run on a machine that is not reporting still reads `not reporting`. With
+  presence off, or when the beats cannot be read, nothing changes.
 
 - **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
   A hosted Claude stream arrives in bursts, and the live channel sends a sample

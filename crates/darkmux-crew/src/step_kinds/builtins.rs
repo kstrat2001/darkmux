@@ -882,6 +882,9 @@ struct ExecutionBookends<'a> {
     step: &'a Step,
     model: &'a str,
     endpoint_label: Option<&'a str>,
+    /// (#3125) The step's session emitter publishes its beat
+    /// (`session_presence::beats`): the `dispatch.start` promises it.
+    beats: bool,
 }
 
 impl ExecutionBookends<'_> {
@@ -911,6 +914,7 @@ impl ExecutionBookends<'_> {
             kind: Some(self.kind.to_string()),
             item_index,
             endpoint: self.endpoint_label.map(str::to_string),
+            beats: self.beats,
             ..Default::default()
         }
     }
@@ -1124,6 +1128,10 @@ impl DispatchSingleShotStepKind {
         // `StepBookend`'s Drop.
         let endpoint_label: Option<String> =
             endpoint.as_ref().map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
+        // (#3125) The emitter (its reasoning below) spawns BEFORE the start
+        // record, so the record can promise a beat that really published.
+        let mut session_emitter =
+            darkmux_flow::session_presence::spawn_session_emitter(session, None, Some(wire_model.to_string()));
         let records = ExecutionBookends {
             kind: "dispatch.single_shot",
             session,
@@ -1131,6 +1139,7 @@ impl DispatchSingleShotStepKind {
             step,
             model: wire_model.as_ref(),
             endpoint_label: endpoint_label.as_deref(),
+            beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
         };
         let mut bookend = records.open(ctx, None, "dispatch.single_shot terminated before completion (early return or panic)");
 
@@ -1148,9 +1157,8 @@ impl DispatchSingleShotStepKind {
         // age the key out.
         //
         // See `DispatchMapStepKind::run_map`'s own spawn site for why the
-        // key is TASK-scoped here rather than step-scoped.
-        let mut session_emitter =
-            darkmux_flow::session_presence::spawn_session_emitter(session, None, Some(wire_model.to_string()));
+        // key is TASK-scoped here rather than step-scoped. Spawned above,
+        // before the start record (#3125).
 
         let mut flow_records = Vec::new();
 
@@ -1906,6 +1914,7 @@ impl DispatchMapStepKind {
                 step,
                 model: wire_model.as_ref(),
                 endpoint_label: endpoint_label.as_deref(),
+                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
             };
             let mut bookend = records.open(
                 ctx,
@@ -4004,6 +4013,7 @@ mod tests {
             step: &s,
             model: "m",
             endpoint_label: None,
+            beats: false,
         };
         let mut start = records.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchStart(records.start_payload(None)));
         start.ts = "2000-01-01T00:00:00Z".to_string();
@@ -7242,6 +7252,11 @@ mod tests {
             1,
             "exactly one liveness start; got {actions:?}"
         );
+        // (#3125) The emitter spawned (and its first beat landed) before the
+        // start was written, so the start promises the beat a reader may read
+        // gone as an ending.
+        let start = records.iter().find(|r| r.action == darkmux_flow::FlowAction::DispatchStart).expect("a start").payload_json();
+        assert_eq!(start["beats"].as_bool(), Some(true), "the start promises its published beat: {start}");
         assert_eq!(
             actions
                 .iter()
