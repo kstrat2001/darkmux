@@ -131,12 +131,13 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         // (#3020) It also ships a window, sized here from the machine's AI
         // headroom; a machine that cannot hold one registers no utility.
         match fill_utility_model(&registry_path) {
-            Ok(Some(UtilityOutcome::Bound { id, n_ctx })) => {
+            Ok(Some(UtilityPlan::Bind { id, n_ctx })) => {
                 report.utility_model_filled = id;
                 report.utility_model_n_ctx = n_ctx;
             }
-            Ok(Some(UtilityOutcome::Unbound(reason))) => report.utility_model_unregistered_reason = Some(reason),
-            Ok(None) => {}
+            Ok(Some(UtilityPlan::Unbind(reason))) => report.utility_model_unregistered_reason = Some(reason),
+            Ok(Some(UtilityPlan::Missing(reason))) => report.utility_model_unfilled_reason = Some(reason),
+            Ok(Some(UtilityPlan::Keep)) | Ok(None) => {}
             Err(reason) => report.utility_model_unfilled_reason = Some(reason),
         }
     }
@@ -363,8 +364,13 @@ fn string_value_after_key(text: &str, from: usize, key: &str) -> Option<ValueAt>
 pub enum UtilityPlan {
     /// Nothing to change.
     Keep,
-    /// Bind `id`; `n_ctx` is `Some` only when the window changes.
-    Bind { id: String, n_ctx: Option<u32> },
+    /// Rewrite the binding: `id` and `n_ctx` are each `Some` only when that
+    /// part changes (a publisher-prefixed id renamed to LM Studio's key, the
+    /// shipped window resized to the machine).
+    Bind { id: Option<String>, n_ctx: Option<u32> },
+    /// Keep a binding the operator set, whose model LM Studio does not have;
+    /// the reason says so in operator words.
+    Missing(String),
     /// Remove the binding: this machine should not register a utility model.
     /// The reason is in operator words.
     Unbind(String),
@@ -385,7 +391,7 @@ pub fn utility_window(headroom_bytes: u64, worker_bytes: u64, utility_bytes: u64
 /// (#3020) Decide the shipped utility binding from what LM Studio has and
 /// what the machine can hold. `window` is the binding's `n_ctx` when it is
 /// still the shipped one (init's to size), `None` when the operator set it
-/// (never resized or removed for RAM). `headroom` is doctor's AI headroom in
+/// (never resized or removed, even when its model is missing). `headroom` is doctor's AI headroom in
 /// bytes, `None` when it could not be read (the shipped window is kept).
 /// `worker_bytes` is the largest worker model the registry names that LM
 /// Studio has. `floor` is the smallest window worth registering: the
@@ -400,6 +406,14 @@ pub fn plan_utility_binding(
     floor: u32,
 ) -> UtilityPlan {
     let Some(id) = choose_utility_model(current, available) else {
+        // A hand-set window makes the binding the operator's: keep it.
+        if window.is_none() {
+            return UtilityPlan::Missing(format!(
+                "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is. \
+                 Its binding has a hand-set window, so it is kept as written; download `{current}` in LM \
+                 Studio, or edit `internal.utility` in profiles.json."
+            ));
+        }
         return UtilityPlan::Unbind(format!(
             "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is, so \
              no utility model is registered: compaction and radio routing are off. Download a small instruct model (a 4B \
@@ -425,7 +439,8 @@ pub fn plan_utility_binding(
             n_ctx = Some(fits);
         }
     }
-    if id == current && n_ctx.is_none() {
+    let id = (id != current).then_some(id);
+    if id.is_none() && n_ctx.is_none() {
         return UtilityPlan::Keep;
     }
     UtilityPlan::Bind { id, n_ctx }
@@ -530,13 +545,7 @@ fn worker_facts(registry_json: &str, available: &[darkmux_profiles::lms::ModelMe
     (bytes, floor)
 }
 
-/// What `fill_utility_model` did.
-enum UtilityOutcome {
-    Bound { id: Option<String>, n_ctx: Option<u32> },
-    Unbound(String),
-}
-
-fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityOutcome>, String> {
+fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityPlan>, String> {
     let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
     let Some((vs, ve)) = utility_value_span(&text) else {
         return Ok(None);
@@ -558,19 +567,16 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
     };
     let (worker_bytes, floor) = worker_facts(&text, &available);
     let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
-    let (filled, outcome) = match plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor) {
+    let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
+    let filled = match &plan {
         UtilityPlan::Keep => return Ok(None),
-        UtilityPlan::Bind { id, n_ctx } => {
-            let Some(filled) = set_utility_binding(&text, &id, n_ctx) else { return Ok(None) };
-            (filled, UtilityOutcome::Bound { id: (id != current).then_some(id), n_ctx })
-        }
-        UtilityPlan::Unbind(reason) => {
-            let Some(filled) = remove_utility_binding(&text) else { return Ok(None) };
-            (filled, UtilityOutcome::Unbound(reason))
-        }
+        UtilityPlan::Missing(_) => return Ok(Some(plan)),
+        UtilityPlan::Bind { id, n_ctx } => set_utility_binding(&text, id.as_deref().unwrap_or(&current), *n_ctx),
+        UtilityPlan::Unbind(_) => remove_utility_binding(&text),
     };
+    let Some(filled) = filled else { return Ok(None) };
     fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
-    Ok(Some(outcome))
+    Ok(Some(plan))
 }
 
 /// (#2450) The profile registry `init` bootstraps, routed through the SAME
@@ -1453,6 +1459,10 @@ mod tests {
         // No usable LLM downloaded is an unbind too, not a stale id left behind.
         let plan = plan_utility_binding("qwen/qwen3-4b-instruct-2507", Some(120_000), &[meta("embed", 1, "embedding")], Some(500 * GIB), 0, 32_000);
         assert!(matches!(plan, UtilityPlan::Unbind(ref r) if r.contains("no LLM of at least 1 GB")), "{plan:?}");
+        // ...unless the window is hand-set: then the binding is the operator's
+        // and stays, and init says its model is not downloaded.
+        let plan = plan_utility_binding("qwen/qwen3-4b-instruct-2507", None, &[meta("embed", 1, "embedding")], Some(500 * GIB), 0, 32_000);
+        assert!(matches!(plan, UtilityPlan::Missing(ref r) if r.contains("is not downloaded") && r.contains("kept")), "{plan:?}");
     }
 
     #[test]
@@ -1463,13 +1473,13 @@ mod tests {
         let headroom = size + 2 * 60_000 * rate;
         assert_eq!(
             plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &avail, Some(headroom), 0, 32_000),
-            UtilityPlan::Bind { id: "qwen3-4b-instruct-2507".into(), n_ctx: Some(60_000) }
+            UtilityPlan::Bind { id: None, n_ctx: Some(60_000) }
         );
         // The model's own maximum caps the window too.
         let capped = vec![meta("qwen3-4b-instruct-2507", 2, "llm")];
         assert_eq!(
             plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &capped, Some(1024 * GIB), 0, 32_000),
-            UtilityPlan::Bind { id: "qwen3-4b-instruct-2507".into(), n_ctx: Some(32_768) }
+            UtilityPlan::Bind { id: None, n_ctx: Some(32_768) }
         );
         // Below the floor: unbound, naming the window it could have had.
         let tight = size + 2 * 10_000 * rate;
@@ -1484,7 +1494,7 @@ mod tests {
         // A publisher-prefixed id is still renamed when the window stays.
         assert_eq!(
             plan_utility_binding("qwen/qwen3-4b-instruct-2507", Some(120_000), &avail, Some(1024 * GIB), 0, 32_000),
-            UtilityPlan::Bind { id: "qwen3-4b-instruct-2507".into(), n_ctx: None }
+            UtilityPlan::Bind { id: Some("qwen3-4b-instruct-2507".into()), n_ctx: None }
         );
     }
 

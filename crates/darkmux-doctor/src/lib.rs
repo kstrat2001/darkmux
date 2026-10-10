@@ -7161,15 +7161,20 @@ pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 /// `None` when `vm_stat` cannot be read (non-macOS). One computation for
 /// every caller: `serve`'s /machine/specs and `init`'s utility window (#3020).
 pub fn ai_headroom_bytes() -> Option<u64> {
-    let gb = read_reclaimable_gb()?;
     let resident_gb = lms::list_loaded()
         .ok()
         .map(|models| models.iter().filter_map(|m| darkmux_types::size::parse_size_gb(&m.size)).sum::<f64>())
         .unwrap_or(0.0);
-    let real_gb = (gb as f64) + resident_gb - (RAM_SAFETY_MARGIN_GB as f64);
-    if real_gb < 0.0 {
-        return Some(0);
-    }
+    headroom_bytes_from(read_reclaimable_gb(), resident_gb, RAM_SAFETY_MARGIN_GB)
+}
+
+/// The arithmetic of [`ai_headroom_bytes`], pure: `reclaimable + resident −
+/// safety` GiB in bytes, rounded to the nearest byte and clamped at 0.
+/// `None` when the reclaimable figure could not be read.
+fn headroom_bytes_from(reclaimable_gb: Option<u64>, resident_gb: f64, safety_gb: u64) -> Option<u64> {
+    let real_gb = (reclaimable_gb? as f64) + resident_gb - (safety_gb as f64);
+    // A float-to-int `as` cast saturates, so a negative figure is 0, never a
+    // wrap; the test pins it.
     Some((real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
 }
 
@@ -7600,6 +7605,23 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── #3020: ai_headroom_bytes's arithmetic ─────────────────────────────
+
+    #[test]
+    fn ai_headroom_is_reclaimable_plus_resident_minus_safety_in_bytes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // vm_stat unreadable: no figure at all, never a 0 that reads as "full".
+        assert_eq!(headroom_bytes_from(None, 4.0, 2), None);
+        // Below the safety margin clamps at 0, never wraps.
+        assert_eq!(headroom_bytes_from(Some(1), 0.0, 2), Some(0));
+        assert_eq!(headroom_bytes_from(Some(0), 0.0, 2), Some(0));
+        // Fractional resident GB converts to exact bytes.
+        assert_eq!(headroom_bytes_from(Some(3), 0.5, 2), Some(GIB + GIB / 2));
+        assert_eq!(headroom_bytes_from(Some(60), 17.25, 2), Some(75 * GIB + GIB / 4));
+        // Rounds to the nearest byte rather than truncating.
+        assert_eq!(headroom_bytes_from(Some(2), 1.0 / (GIB as f64) * 0.6, 2), Some(1));
+    }
     /// Visible text only — the marker and hint carry ANSI escapes whose bytes
     /// must not count toward a width assertion.
     pub(crate) fn strip_ansi(s: &str) -> String {

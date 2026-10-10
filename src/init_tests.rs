@@ -695,6 +695,25 @@ fn a_hand_set_utility_window_is_never_resized_or_removed() {
     assert_eq!(env.read_registry(), registry);
 }
 
+/// (#3020 review) A hand-set window on the shipped id is the operator's
+/// binding: with its model not downloaded, init keeps it and says so.
+#[test]
+#[serial_test::serial]
+fn a_hand_set_window_whose_model_is_missing_is_kept_and_reported() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let registry = example_without_placeholder().replacen("\"n_ctx\": 120000 }", "\"n_ctx\": 64000 }", 1);
+    env.write_registry(&registry);
+    env.lms(&[model("text-embedding-nomic", GB / 10, "embedding")], &[]);
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(env.read_registry(), registry, "the hand-set binding is untouched");
+    assert_eq!(r.utility_model_unregistered_reason, None);
+    let reason = r.utility_model_unfilled_reason.unwrap_or_default();
+    assert!(reason.contains(&format!("`{}` is not downloaded", shipped_utility())), "{reason}");
+}
+
 #[test]
 #[serial_test::serial]
 fn a_fresh_install_fills_the_worker_and_the_utility_in_one_run() {
