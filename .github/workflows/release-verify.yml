@@ -69,7 +69,7 @@ jobs:
         run: cargo build --workspace --release --all-targets
 
       - name: Test release (whole workspace)
-        run: cargo test --workspace --release
+        run: cargo test -q --workspace --release
 
       - name: Clippy release (whole workspace, all targets, no warnings allowed)
         run: cargo clippy --workspace --release --all-targets -- -D warnings
@@ -96,7 +96,7 @@ jobs:
         run: cargo build --manifest-path runtime/Cargo.toml --release --all-targets
 
       - name: Test release (runtime crate)
-        run: cargo test --manifest-path runtime/Cargo.toml --release
+        run: cargo test -q --manifest-path runtime/Cargo.toml --release
 
       - name: Clippy release (runtime crate, all targets, no warnings allowed)
         run: cargo clippy --manifest-path runtime/Cargo.toml --release --all-targets -- -D warnings

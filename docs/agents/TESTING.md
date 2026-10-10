@@ -98,6 +98,14 @@ change to the plugin's `Cargo.toml` alone, runs none of them. A change elsewhere
 reaches `main` unseen. Deferring to CI is right everywhere else; there, it is
 deferring to a check that mostly skips.
 
+**Reading test output costs tokens (#3134).** nextest prints a line only for a
+test that failed, retried or ran slow, then the summary; each failure's captured
+output comes once, at the end. A green area run is about six lines, where it
+used to be one per test. Add `--status-level pass` when you want every line.
+For a red CI run, `scripts/ci-failures.py <run-id>` prints only the failing
+tests' blocks, with their panic messages and the summary, instead of the job
+log: one measured run went from 12,183 log lines to 4.
+
 ## Releasing — the gate, and where the steps live
 
 **Cutting a release? Invoke the `darkmux-point-release` skill and follow it.

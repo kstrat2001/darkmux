@@ -178,7 +178,7 @@ jobs:
       # down mid-read. ~6s warm.
       - name: Doc tests (nextest does not run them)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo test --workspace --doc
+        run: cargo test -q --workspace --doc
 
       # (#2717) The execution-side isolation check. It re-runs each test
       # unit as a child `cargo test` under a sentinel state tree and
@@ -325,7 +325,7 @@ jobs:
         # cargo's own behavior and became its own failure mode, which is the
         # sort of guard that costs more than it protects. Removed.
         run: |
-          cargo test --workspace --test 'e2e_*'
+          cargo test -q --workspace --test 'e2e_*'
 
       # (#2101) In-process tests that need a real redis-server (the telemetry
       # stream's pins: live-view subscription, listing scope, replay samples,
@@ -340,7 +340,7 @@ jobs:
           DARKMUX_E2E_REQUIRED: "1"
         run: |
           set -o pipefail
-          cargo test -p darkmux-serve -p darkmux-flow -- \
+          cargo test -q -p darkmux-serve -p darkmux-flow -- \
             a_telemetry_flood_does_not_evict_a_usage_record \
             the_live_tail_carries_work_records_and_machine_samples \
             flow_stream_handler_carries_the_telemetry_stream \
@@ -368,7 +368,7 @@ jobs:
       - name: Fleet two-daemon profile addresses (#2916)
         if: steps.filter.outputs.rust == 'true'
         run: |
-          cargo test -p darkmux --features e2e-fleet-loopback --test fleet_profile_address_two_daemons
+          cargo test -q -p darkmux --features e2e-fleet-loopback --test fleet_profile_address_two_daemons
 
       - name: No Rust-relevant changes — fleet e2e skipped
         if: steps.filter.outputs.rust != 'true'
