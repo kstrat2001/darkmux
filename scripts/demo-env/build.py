@@ -351,18 +351,30 @@ def fleet_view_for(world, hero, ledgers, now_ms, version, schema):
 # truncated at `now` instead and never emits its terminal record, which is what
 # makes the runs board show a RUNNING row and the detail lens show a pulse.
 REPLAYS = [
-    dict(slug="crawl-error-discard",  machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",  ends_ago_min=14,  scale=1.00),
-    dict(slug="review-flow-sinks",    machine="m5-ultra-256gb",     model="qwen3.5-122b-a10b",              role="reviewer", ends_ago_min=52,  scale=1.60),
-    dict(slug="crawl-unwrap-paths",   machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",  ends_ago_min=97,  scale=0.72),
-    dict(slug="doc-drift-sweep",      machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="reviewer", ends_ago_min=133, scale=0.28),
-    dict(slug="review-serve-routes",  machine="m5-ultra-256gb",     model="qwen3-coder-next-mlx",           role="reviewer", ends_ago_min=181, scale=1.20),
-    dict(slug="crawl-lock-ordering",  machine="m5-ultra-256gb",     model="qwen3.5-122b-a10b",              role="analyst",  ends_ago_min=244, scale=1.85),
-    dict(slug="estimate-backlog",     machine="mac-mini-m4-16gb",   model="qwen3-4b-instruct-2507",         role="estimator",ends_ago_min=298, scale=0.18),
-    dict(slug="crawl-error-discard-2",machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",  ends_ago_min=355, scale=0.94),
-    dict(slug="compact-trajectories", machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="compactor",ends_ago_min=412, scale=0.22),
+    # (operator, 2026-10-10: "keep the whole 32 minute mission ... make sure
+    # there are some less than 10 minute runs on the other machines ... with
+    # some diverse features") The world spans about 35 minutes: the imported
+    # mission (32 min, `MISSION_PLACEMENT`) on the Ultra, ending 3 min ago,
+    # and runs of 3 to 9 minutes on every machine inside that span, so a
+    # scrub through the playhead always lands on generation. Two recordings
+    # with different features: `coder-pepper-grinder` (2.7 min: tool calls,
+    # a detector firing, a feedback injection) and `crawl-error-discard`
+    # (9.1 min: reasoning, generation checkpoints). `scale` scales token
+    # counts only, never time.
+    dict(slug="estimate-backlog",     source="coder-pepper-grinder", machine="mac-mini-m4-16gb",   model="qwen3-4b-instruct-2507",         role="estimator", ends_ago_min=29, scale=0.18),
+    dict(slug="doc-drift-sweep",      source="crawl-error-discard",  machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="reviewer",  ends_ago_min=24, scale=0.28),
+    dict(slug="crawl-unwrap-paths",   source="crawl-error-discard",  machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",   ends_ago_min=19, scale=0.72),
+    dict(slug="review-flow-sinks",    source="coder-pepper-grinder", machine="mac-mini-m4-16gb",   model="qwen3-4b-instruct-2507",         role="reviewer",  ends_ago_min=17, scale=0.30),
+    dict(slug="compact-trajectories", source="coder-pepper-grinder", machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="compactor", ends_ago_min=13, scale=0.22),
+    dict(slug="crawl-lock-ordering",  source="crawl-error-discard",  machine="mac-mini-m4-16gb",   model="qwen3-4b-instruct-2507",         role="analyst",   ends_ago_min=4,  scale=0.40),
+    dict(slug="review-serve-routes",  source="coder-pepper-grinder", machine="m1-max-32gb-studio", model="qwen3-coder-next-mlx",           role="reviewer",  ends_ago_min=2,  scale=1.20),
     # The live one. Started `started_ago_min` ago and still going, so the
     # runs board, the fleet lens and the detail lens all have something in
-    # flight to render.
+    # flight to render. It replays the 2.7-minute coder recording past its
+    # last turn, so it reads as processing its next prompt: the demo proxy
+    # carries no live event stream, and a replay cut mid-generation turns
+    # into a stall the page cannot confirm, which the card shows as
+    # "disconnected" (tried with the 9-minute crawl, 2026-10-10).
     dict(slug="crawl-discarded-locks", machine="m5-ultra-256gb", model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler", started_ago_min=6, live=True, scale=1.0),
 ]
 
@@ -449,7 +461,7 @@ def replay(source, plan, machine, now_ms, session_id):
 # gets `DEFAULT_MISSION_PLACEMENT`, so a freshly-imported mission with no
 # entry yet still materializes (no build break waiting on a config edit).
 MISSION_PLACEMENT = {
-    "demo-review-nameof-recency": dict(machine="m5-ultra-256gb", ends_ago_min=38),
+    "demo-review-nameof-recency": dict(machine="m5-ultra-256gb", ends_ago_min=3),
 }
 DEFAULT_MISSION_PLACEMENT = dict(machine="m5-ultra-256gb", ends_ago_min=30)
 
@@ -691,8 +703,14 @@ def main():
     by_id = {m["id"]: m for m in world["machines"]}
     hero = by_id[world["hero_machine"]]
 
-    src = [json.loads(l) for l in (HERE / "sessions" / "coder-pepper-grinder.jsonl")
-           .read_text().splitlines() if l.strip()]
+    sources = {}
+
+    def source_of(plan):
+        name = plan.get("source", "coder-pepper-grinder")
+        if name not in sources:
+            sources[name] = [json.loads(l) for l in (HERE / "sessions" / f"{name}.jsonl")
+                             .read_text().splitlines() if l.strip()]
+        return sources[name]
 
     out = pathlib.Path(a.out)
     home, fx = out / "demo-home", out / "fixtures"
@@ -712,7 +730,7 @@ def main():
         # would rot between builds.
         digest = zlib.crc32(plan["slug"].encode()) % 10**10
         sid = f"darkmux-{plan['role']}-{plan['slug']}-{digest}"
-        recs, _ = replay(src, plan, machine, now_ms, sid)
+        recs, _ = replay(source_of(plan), plan, machine, now_ms, sid)
         minted.append((sid, plan))
         records.extend(recs)
 
