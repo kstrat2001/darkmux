@@ -11241,6 +11241,19 @@
         assert!(payload["cached_tokens"].is_null());
     }
 
+    /// (#3168 review) The runtime writes `cache_write_tokens` into the
+    /// trajectory's `usage` block; the host reads it back through `Usage`'s
+    /// lenient deserializer onto the per-turn usage record.
+    #[test]
+    fn turn_tokens_payload_carries_cache_writes_read_back_from_the_trajectory() {
+        let event = serde_json::json!({
+            "type": "model.completed", "seq": 3, "finish_reason": "stop",
+            "usage": { "prompt_tokens": 1000, "completion_tokens": 9, "total_tokens": 1009, "cached_tokens": 900, "cache_write_tokens": 96 },
+        });
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event), "reviewer", "m", "ep", None)).unwrap();
+        assert_eq!((payload["cached_tokens"].as_u64(), payload["cache_write_tokens"].as_u64()), (Some(900), Some(96)), "{payload}");
+    }
+
     /// (#1444) A turn whose `usage` DOES carry `reasoning_tokens`/
     /// `cached_tokens` (the shape `trajectory::append_model_completed`
     /// writes when the provider reported them) maps them through as real
