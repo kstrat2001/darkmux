@@ -4099,7 +4099,7 @@ fn uncached_claude_endpoints(registry: &darkmux_types::ProfileRegistry) -> Vec<S
     registry
         .endpoints
         .iter()
-        .filter(|(_, ep)| ep.host().as_deref() == Some(darkmux_types::endpoint::ANTHROPIC_API_HOST))
+        .filter(|(_, ep)| ep.is_anthropic_host())
         .filter(|(_, ep)| !matches!(ep.resolved_dialect(), Ok(darkmux_types::Dialect::Messages)))
         .map(|(id, _)| id.clone())
         .collect()

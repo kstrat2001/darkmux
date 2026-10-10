@@ -684,7 +684,17 @@ impl ModelEndpoint {
     /// turn would pay full input price for the whole conversation again. The
     /// host is matched exactly, never as a prefix. A declared dialect wins.
     fn speaks_messages_by_host(&self) -> bool {
-        self.dialect.is_none() && self.host().as_deref() == Some(ANTHROPIC_API_HOST)
+        self.dialect.is_none() && self.is_anthropic_host()
+    }
+
+    /// (#3173) True when this unmanaged endpoint's host is
+    /// [`ANTHROPIC_API_HOST`], however the URL spells it: any case, an
+    /// explicit port, a trailing dot. Exact otherwise, never a prefix.
+    pub fn is_anthropic_host(&self) -> bool {
+        self.host().is_some_and(|h| {
+            let bare = h.rsplit_once(':').filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit())).map_or(h.as_str(), |(host, _)| host);
+            bare.trim_end_matches('.').eq_ignore_ascii_case(ANTHROPIC_API_HOST)
+        })
     }
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
@@ -743,14 +753,22 @@ impl ModelEndpoint {
     /// `messages` (#3162).
     fn fields_the_dialect_sends(&self, dialect: Dialect) -> Result<(), String> {
         let effort_unsent = matches!(dialect, Dialect::ChatCompletionsMaxTokens | Dialect::Messages);
+        // (#3173) An inferred `messages` has no declared dialect to drop: the
+        // remedy names where it came from and how to keep the old shape.
+        let remedy = if self.speaks_messages_by_host() {
+            format!(
+                "the endpoint declares no dialect, so on {ANTHROPIC_API_HOST} it speaks `messages` (the only \
+                 way its prompt caching applies); drop the field, or declare \"dialect\": \"chat-completions\" \
+                 to keep the uncached OpenAI-compatible layer"
+            )
+        } else {
+            "drop one of the two".to_string()
+        };
         if self.reasoning_effort.is_some() && (self.dialect.is_some() || self.speaks_messages_by_host()) && effort_unsent {
-            return Err(format!(
-                "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
-                dialect.as_str()
-            ));
+            return Err(format!("`reasoning_effort` is never sent in the `{}` dialect; {remedy}", dialect.as_str()));
         }
         if dialect == Dialect::Messages && self.api_version.is_some() {
-            return Err("`api_version` is never sent in the `messages` dialect; drop one of the two".to_string());
+            return Err(format!("`api_version` is never sent in the `messages` dialect; {remedy}"));
         }
         Ok(())
     }
@@ -1137,8 +1155,6 @@ mod tests {
         assert!(ModelEndpoint::reference("nope").chat_url().is_err());
     }
 
-    /// (#3162) The `messages` dialect's URL is `{url}/messages`, and the two
-    /// fields it never sends are refused beside it rather than dropped.
     /// (#3173) An `api.anthropic.com` endpoint that declares no dialect is
     /// sent the Messages API, the only way its prompt caching applies. A
     /// declared dialect still wins, and other hosts keep the kind's default.
@@ -1152,12 +1168,22 @@ mod tests {
         assert_eq!(declared.resolved_dialect().unwrap(), Dialect::ChatCompletions, "a declared dialect wins");
         let other = ep("https://api.x.ai/v1", None);
         assert_eq!(other.resolved_dialect().unwrap(), Dialect::ChatCompletions);
+        for spelling in ["https://api.anthropic.com:443/v1", "https://API.Anthropic.com/v1", "https://api.anthropic.com./v1"] {
+            assert_eq!(ep(spelling, None).resolved_dialect().unwrap(), Dialect::Messages, "{spelling}: the same host");
+            assert!(ep(spelling, None).is_anthropic_host(), "{spelling}");
+        }
         let lookalike = ep("https://api.anthropic.com.evil.example/v1", None);
         assert_eq!(lookalike.resolved_dialect().unwrap(), Dialect::ChatCompletions, "the host, not a prefix");
         let effort = ModelEndpoint { reasoning_effort: Some("high".into()), ..ep("https://api.anthropic.com/v1", None) };
-        assert!(effort.validate().is_err(), "an inferred `messages` refuses a field it never sends, as a declared one does");
+        let refusal = effort.validate().expect_err("an inferred `messages` refuses a field it never sends, as a declared one does");
+        assert!(
+            refusal.contains("api.anthropic.com") && refusal.contains(r#""dialect": "chat-completions""#),
+            "says the dialect was inferred and how to keep the old one: {refusal}"
+        );
     }
 
+    /// (#3162) The `messages` dialect's URL is `{url}/messages`, and the two
+    /// fields it never sends are refused beside it rather than dropped.
     #[test]
     fn a_messages_endpoint_posts_to_messages_and_refuses_fields_it_cannot_send() {
         let claude = ModelEndpoint {
