@@ -2,6 +2,8 @@ import { DEFAULT_POLICY } from "./lifecycle";
 import { describe, expect, it } from "vitest";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
+  isCrossTurnPair,
+  isUsableCadenceMs,
   DEFAULT_CHARS_PER_TOKEN,
   PREFILL_CHARS_PER_SEC,
   PREFILL_FLOOR_MS,
@@ -1799,5 +1801,18 @@ describe("toolReadout (#2963)", () => {
     expect(toolReadout({ state: "tools", toolPath: "src/a.ts" })).toBeNull();
     expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 3 })).toBeNull();
     expect(toolReadout({ state: "prompt", toolName: "write", toolPath: "src/a.ts" })).toBeNull();
+  });
+});
+
+describe("the pairing predicates (#3152)", () => {
+  it("a pair crosses turns only when both name a turn and they differ", () => {
+    expect(isCrossTurnPair(1, 2)).toBe(true);
+    expect(isCrossTurnPair(2, 2)).toBe(false);
+    expect(isCrossTurnPair(undefined, 2)).toBe(false);
+    expect(isCrossTurnPair(1, undefined)).toBe(false);
+  });
+  it("a cadence is usable only as a positive finite number", () => {
+    expect(isUsableCadenceMs(250)).toBe(true);
+    for (const bad of [0, -250, Number.NaN, Number.POSITIVE_INFINITY, "250", null, undefined]) expect(isUsableCadenceMs(bad)).toBe(false);
   });
 });

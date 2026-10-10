@@ -98,7 +98,7 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     if (atMs === null) continue;
     const sample: HeartbeatSample = { atMs, chars, turn: f.turn_seq };
     const cadence = (r as unknown as { live_cadence_ms?: unknown }).live_cadence_ms;
-    if (typeof cadence === "number" && Number.isFinite(cadence) && cadence > 0) sample.minSpanMs = cadence;
+    if (isUsableCadenceMs(cadence)) sample.minSpanMs = cadence;
     const visible = num(f.cumulative_chars);
     if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
@@ -111,7 +111,7 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     // The newest real sample of that turn at or before the repeated state.
     for (let i = out.length - 1; i >= 0; i--) {
       const smp = out[i];
-      if (smp.atMs <= x.stateAt && (smp.turn === undefined || x.turn === undefined || smp.turn === x.turn)) {
+      if (smp.atMs <= x.stateAt && !isCrossTurnPair(smp.turn, x.turn)) {
         smp.freshMs = Math.max(smp.freshMs ?? smp.atMs, x.at);
         break;
       }
@@ -344,10 +344,9 @@ export function currentTokenRate(records: NormRecord[]): TokenRateReading | null
   // sampling cadence back, never one a burst landed a few ms after.
   const base = rateBase(samples, samples.length - 1);
   if (base === null) return carriedTokenRate(records, samples);
+  // (`rateBase` never pairs across turns: `generated_chars` restarts every
+  // turn, so such a pair spans the tool gap and reads near 0.)
   const prev = samples[base];
-  // `generated_chars` restarts every turn: a new turn's first sample paired
-  // with the previous turn's last spans the tool gap and read near 0.
-  if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return carriedTokenRate(records, samples);
   // (#2886 pass 5, MUST — fresh-reviewer finding F1) A SLOW opener pair
   // (the turn's first heartbeat, still at 0 chars, paired with a second one
   // far later) is not generation speed — see `openerPairTrusted`'s own doc.
@@ -422,6 +421,19 @@ function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolea
  *  found there can't disagree about which one gets to count. The scan keeps
  *  going past an untrusted one for the most recent pair with real
  *  progress. */
+/** True when both samples name a turn and they differ: `generated_chars`
+ *  restarts every turn, so such a pair measures nothing. A sample with no
+ *  turn pairs with any. */
+export function isCrossTurnPair(prevTurn: unknown, nextTurn: unknown): boolean {
+  return prevTurn !== undefined && nextTurn !== undefined && prevTurn !== nextTurn;
+}
+
+/** (#3152) A live record's `live_cadence_ms` is usable as a pair's minimum
+ *  span only when it is a positive, finite number of milliseconds. */
+export function isUsableCadenceMs(cadence: unknown): cadence is number {
+  return typeof cadence === "number" && Number.isFinite(cadence) && cadence > 0;
+}
+
 /** (#3152) The index of the sample `samples[i]` is measured from: the newest
  *  earlier sample at least `minSpanMs` before it. `null` when the turn has
  *  no such sample (or the earlier one belongs to another turn). */
@@ -429,7 +441,7 @@ function rateBase(samples: HeartbeatSample[], i: number): number | null {
   const next = samples[i];
   for (let j = i - 1; j >= 0; j--) {
     const prev = samples[j];
-    if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return null;
+    if (isCrossTurnPair(prev.turn, next.turn)) return null;
     if (next.atMs - prev.atMs >= (next.minSpanMs ?? 0)) return j;
   }
   return null;
@@ -441,7 +453,6 @@ function carriedTokenRate(records: NormRecord[], samples: HeartbeatSample[]): To
     const base = rateBase(samples, i);
     if (base === null) continue;
     const prev = samples[base];
-    if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
     if (!openerPairTrusted(prev, next)) continue;
     // (#2889) Same rule as the direct path: writing samples never pair.
     if (prev.writingTool !== undefined || next.writingTool !== undefined) continue;
