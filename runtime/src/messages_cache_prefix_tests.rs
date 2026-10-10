@@ -197,7 +197,7 @@ fn killed_mid_turn() -> checkpoint::RunCheckpoint {
             Message::system("system prompt"),
             Message::user("do the task"),
             assistant(vec![call("toolu_1", "one")]),
-            Message::tool_result("toolu_1", "echo", &format!("one {}", "x".repeat(5_000))),
+            Message::tool_result("toolu_1", "echo", format!("one {}", "x".repeat(5_000))),
             assistant(pending.clone()),
         ],
         turns: 2,
