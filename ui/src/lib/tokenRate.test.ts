@@ -2,6 +2,8 @@ import { DEFAULT_POLICY } from "./lifecycle";
 import { describe, expect, it } from "vitest";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
+  isCrossTurnPair,
+  isUsableCadenceMs,
   DEFAULT_CHARS_PER_TOKEN,
   PREFILL_CHARS_PER_SEC,
   PREFILL_FLOOR_MS,
@@ -206,6 +208,33 @@ describe("measuredCharsPerToken", () => {
 });
 
 describe("currentTokenRate", () => {
+  // (#3152) Claude's stream arrives in bursts, and the live channel sends a
+  // sample on every transition as well as on its cadence: captured live, 642
+  // chars arrived 8 ms after the previous sample, which read as 20,062 tok/s.
+  // A rate pair must span at least the sampling cadence; a closer pair
+  // reaches back to an earlier sample of the same turn.
+  const liveBeat = (atMs: number, chars: number, turn = 2): NormRecord =>
+    ({
+      ...norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID,
+        payload: { sampled_at_ms: atMs, generated_chars: chars, cumulative_chars: chars, turn_seq: turn } }),
+      live: true,
+      live_cadence_ms: 250,
+    }) as NormRecord;
+
+  it("never measures a rate across two live samples closer than the cadence", () => {
+    const reading = currentTokenRate([liveBeat(10_000, 9), liveBeat(10_500, 150), liveBeat(11_000, 300), liveBeat(11_008, 950)]);
+    // The 8 ms pair (300 -> 950) is skipped; the base is the 10,500 sample:
+    // 800 chars over 508 ms = 1,575 chars/s = ~394 tok/s at 4 chars/token,
+    // never 650 chars over 8 ms (20,312 tok/s).
+    expect(reading!.tokensPerSec).toBeCloseTo((950 - 150) / 0.508 / 4, 3);
+    expect(reading!.atMs).toBe(11_008);
+  });
+
+  it("reads no fresh rate when every earlier sample of the turn is inside the cadence", () => {
+    const reading = currentTokenRate([liveBeat(20_000, 9, 3), liveBeat(20_008, 651, 3)]);
+    expect(reading === null || reading.carried === true).toBe(true);
+  });
+
   it("is null with fewer than two samples (a fresh execution)", () => {
     expect(currentTokenRate([beat(1_000, 40)])).toBeNull();
     expect(currentTokenRate([])).toBeNull();
@@ -1772,5 +1801,18 @@ describe("toolReadout (#2963)", () => {
     expect(toolReadout({ state: "tools", toolPath: "src/a.ts" })).toBeNull();
     expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 3 })).toBeNull();
     expect(toolReadout({ state: "prompt", toolName: "write", toolPath: "src/a.ts" })).toBeNull();
+  });
+});
+
+describe("the pairing predicates (#3152)", () => {
+  it("a pair crosses turns only when both name a turn and they differ", () => {
+    expect(isCrossTurnPair(1, 2)).toBe(true);
+    expect(isCrossTurnPair(2, 2)).toBe(false);
+    expect(isCrossTurnPair(undefined, 2)).toBe(false);
+    expect(isCrossTurnPair(1, undefined)).toBe(false);
+  });
+  it("a cadence is usable only as a positive finite number", () => {
+    expect(isUsableCadenceMs(250)).toBe(true);
+    for (const bad of [0, -250, Number.NaN, Number.POSITIVE_INFINITY, "250", null, undefined]) expect(isUsableCadenceMs(bad)).toBe(false);
   });
 });

@@ -102,6 +102,15 @@ darkmux release.
 
 ### Fixed
 
+- **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
+  A hosted Claude stream arrives in bursts, and the live channel sends a sample
+  on every transition as well as on its cadence: captured live, 642 chars landed
+  8 ms after the previous sample and the scope read 20,062 tok/s. A rate is now
+  measured only across samples at least one sampling cadence apart (a closer
+  pair reaches back to an earlier sample of the same turn). Replaying that
+  capture, the reading peaks at 73 tok/s. Local models, which stream token by
+  token, read as before.
+
 - **A diff review reviews changed files of any size, and says what it did not read** (#3171).
   The review planner skipped every changed file over 512 KB (a guard meant for
   whole-tree scans), so a PR touching one of the large source files had that
