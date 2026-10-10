@@ -133,6 +133,18 @@ darkmux release.
   directory of the darkmux process that reads it, in the one accessor that both
   the spawns and doctor use. A bare name such as `lms` is still found on `PATH`.
 
+- **`init` sizes the utility model to the machine, or registers none**
+  (#3020). On an 8 GB machine with no usable LLM downloaded and 0 GB available
+  for AI, `init` left the shipped `qwen/qwen3-4b-instruct-2507` registered at a
+  120,000-token window it could never hold. `init` now sizes the shipped
+  `internal.utility` window from doctor's `RAM headroom` figure: what is left
+  after the worker's and the utility's weights, split evenly between their KV
+  caches, never above the shipped window or the model's own maximum. When that
+  is below the smallest window a worker profile declares, or no LLM of at least
+  1 GB is downloaded, `init` removes the binding and says why; with no headroom
+  it says the machine is best used as a fleet client (`profile@machine`). A
+  utility id or window the operator set by hand is never changed.
+
 - **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
   A hosted Claude stream arrives in bursts, and the live channel sends a sample
   on every transition as well as on its cadence: captured live, 642 chars landed

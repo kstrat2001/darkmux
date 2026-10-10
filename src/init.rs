@@ -48,6 +48,12 @@ pub struct InitReport {
     pub utility_model_filled: Option<String>,
     /// (#2053) Why the utility binding was left as written, when it was.
     pub utility_model_unfilled_reason: Option<String>,
+    /// (#3020) The window `init` wrote into `internal.utility.n_ctx`, sized
+    /// from the machine's AI headroom, when it changed the shipped one.
+    pub utility_model_n_ctx: Option<u32>,
+    /// (#3020) Why `init` removed the shipped `internal.utility` binding
+    /// instead of registering a utility model, when it did.
+    pub utility_model_unregistered_reason: Option<String>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -114,19 +120,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     //     init). A registry without the placeholder is never touched, so an
     //     operator's own edits outrank this every time.
     if !opts.dry_run && registry_path.exists() {
-        match fill_worker_model(&registry_path) {
-            Ok(Some(id)) => report.worker_model_filled = Some(id),
-            Ok(None) => {}
-            Err(reason) => report.worker_model_unfilled_reason = Some(reason),
-        }
-        // (#2053) The utility binding ships as a literal id too; on a machine
-        // whose key differs (publisher prefix, or no such model) the first
-        // dispatch warned about its compactor. Verify it the same way.
-        match fill_utility_model(&registry_path) {
-            Ok(Some(id)) => report.utility_model_filled = Some(id),
-            Ok(None) => {}
-            Err(reason) => report.utility_model_unfilled_reason = Some(reason),
-        }
+        fill_models(&registry_path, &mut report);
     }
 
     // 2) Bootstrap the config file (#661). Same never-overwrite discipline as
@@ -181,6 +175,31 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     }
 
     Ok(report)
+}
+
+/// Steps 1b and 1c: fill the worker placeholder and verify the utility
+/// binding against what LM Studio has, recording each outcome on `report`.
+fn fill_models(registry_path: &Path, report: &mut InitReport) {
+    match fill_worker_model(registry_path) {
+        Ok(Some(id)) => report.worker_model_filled = Some(id),
+        Ok(None) => {}
+        Err(reason) => report.worker_model_unfilled_reason = Some(reason),
+    }
+    // (#2053) The utility binding ships as a literal id too; on a machine
+    // whose key differs (publisher prefix, or no such model) the first
+    // dispatch warned about its compactor. Verify it the same way.
+    // (#3020) It also ships a window, sized here from the machine's AI
+    // headroom; a machine that cannot hold one registers no utility.
+    match fill_utility_model(registry_path) {
+        Ok(Some(UtilityPlan::Bind { id, n_ctx })) => {
+            report.utility_model_filled = id;
+            report.utility_model_n_ctx = n_ctx;
+        }
+        Ok(Some(UtilityPlan::Unbind(reason))) => report.utility_model_unregistered_reason = Some(reason),
+        Ok(Some(UtilityPlan::Missing(reason))) => report.utility_model_unfilled_reason = Some(reason),
+        Ok(Some(UtilityPlan::Keep)) | Ok(None) => {}
+        Err(reason) => report.utility_model_unfilled_reason = Some(reason),
+    }
 }
 
 /// The fill-in-the-blank `profiles.example.json` ships in every worker slot.
@@ -346,50 +365,236 @@ fn string_value_after_key(text: &str, from: usize, key: &str) -> Option<ValueAt>
     Some(ValueAt::Str(start, end))
 }
 
-/// (#2053) Rewrite `internal.utility`'s value, and only that: a profile model
-/// with the same id is a worker slot and stays. Text-level, like the worker
-/// fill, so the operator's file keeps its shape. `None` when there is
-/// nothing to replace.
-pub fn fill_utility_binding(registry_json: &str, current: &str, new_id: &str) -> Option<String> {
-    let (start, end) = utility_value_span(registry_json)?;
-    if &registry_json[start..end] != current || current == new_id {
-        return None;
-    }
-    Some(format!("{}{}{}", &registry_json[..start], new_id, &registry_json[end..]))
+/// (#3020) What `init` does to the shipped `internal.utility` binding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UtilityPlan {
+    /// Nothing to change.
+    Keep,
+    /// Rewrite the binding: `id` and `n_ctx` are each `Some` only when that
+    /// part changes (a publisher-prefixed id renamed to LM Studio's key, the
+    /// shipped window resized to the machine).
+    Bind { id: Option<String>, n_ctx: Option<u32> },
+    /// Keep a binding the operator set, whose model LM Studio does not have;
+    /// the reason says so in operator words.
+    Missing(String),
+    /// Remove the binding: this machine should not register a utility model.
+    /// The reason is in operator words.
+    Unbind(String),
 }
 
-fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<String>, String> {
-    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
-    let Some((vs, ve)) = utility_value_span(&text) else {
-        return Ok(None);
+/// (#3020) The utility model's window on this machine, in tokens: what is
+/// left of the AI headroom after the worker's and the utility's weights,
+/// split evenly between the two models' KV caches (both are resident while
+/// a dispatch compacts, and neither has a measured claim on more), priced at
+/// the ledger's size-derived KV rate, and never above `cap`. 0 when the
+/// weights alone do not fit.
+pub fn utility_window(headroom_bytes: u64, worker_bytes: u64, utility_bytes: u64, cap: u32) -> u32 {
+    let kv_each = headroom_bytes.saturating_sub(worker_bytes).saturating_sub(utility_bytes) / 2;
+    let rate = darkmux_profiles::model_ledger::fallback_kv_rate_for_size(utility_bytes).max(1);
+    u32::try_from(kv_each / rate).unwrap_or(u32::MAX).min(cap)
+}
+
+/// (#3020) Decide the shipped utility binding from what LM Studio has and
+/// what the machine can hold. `window` is the binding's `n_ctx` when it is
+/// still the shipped one (init's to size), `None` when the operator set it
+/// (never resized or removed, even when its model is missing). `headroom` is doctor's AI headroom in
+/// bytes, `None` when it could not be read (the shipped window is kept).
+/// `worker_bytes` is the largest worker model the registry names that LM
+/// Studio has. `floor` is the smallest window worth registering: the
+/// smallest window a worker profile on this machine declares, since the
+/// compactor takes in what a worker's context holds.
+pub fn plan_utility_binding(
+    current: &str,
+    window: Option<u32>,
+    available: &[darkmux_profiles::lms::ModelMeta],
+    headroom: Option<u64>,
+    worker_bytes: u64,
+    floor: u32,
+) -> UtilityPlan {
+    let Some(id) = choose_utility_model(current, available) else {
+        // A hand-set window makes the binding the operator's: keep it.
+        if window.is_none() {
+            return UtilityPlan::Missing(format!(
+                "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is. \
+                 Its binding has a hand-set window, so it is kept as written; download `{current}` in LM \
+                 Studio, or edit `internal.utility` in profiles.json."
+            ));
+        }
+        return UtilityPlan::Unbind(format!(
+            "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is, so \
+             no utility model is registered: compaction and radio routing are off. Download a small instruct model (a 4B \
+             is ideal) in LM Studio, then add `\"utility\": {{ \"id\": \"<model>\", \"n_ctx\": <window> }}` \
+             under `internal` in profiles.json."
+        ));
     };
-    let current = text[vs..ve].to_string();
+    let mut n_ctx = None;
+    if let (Some(shipped), Some(headroom)) = (window, headroom) {
+        let meta = available.iter().find(|m| m.model_type == "llm" && m.model_key == id).expect("chosen from available");
+        let cap = meta.max_context_length.map_or(shipped, |max| max.min(shipped));
+        let fits = utility_window(headroom, worker_bytes, meta.size_bytes, cap);
+        if fits < floor.max(1) {
+            let gb = headroom / (1024 * 1024 * 1024);
+            return UtilityPlan::Unbind(format!(
+                "this machine has {gb} GB available for AI (doctor's `RAM headroom`), room for a {fits}-token \
+                 window for `{id}` (shipped as `{current}`) beside the worker, below the {floor} tokens worth \
+                 registering. No utility model is registered, so compaction and radio routing are off here. This machine is best \
+                 used as a fleet client: route work to a peer with `profile@machine`."
+            ));
+        }
+        if fits != shipped {
+            n_ctx = Some(fits);
+        }
+    }
+    let id = (id != current).then_some(id);
+    if id.is_none() && n_ctx.is_none() {
+        return UtilityPlan::Keep;
+    }
+    UtilityPlan::Bind { id, n_ctx }
+}
+
+/// The byte range of the `n_ctx` number inside the `internal.utility` object.
+fn utility_n_ctx_span(registry_json: &str) -> Option<(usize, usize)> {
+    let ValueAt::Object(open) = string_value_after_key(registry_json, 0, "\"utility\"")? else {
+        return None;
+    };
+    let close = open + registry_json[open..].find('}')?;
+    let k = open + registry_json[open..close].find("\"n_ctx\"")?;
+    let rest = &registry_json[k + "\"n_ctx\"".len()..close];
+    let colon = rest.find(':')?;
+    let after = &rest[colon + 1..];
+    let start = k + "\"n_ctx\"".len() + colon + 1 + (after.len() - after.trim_start().len());
+    let len = registry_json[start..close].find(|c: char| !c.is_ascii_digit())?;
+    (len > 0).then_some((start, start + len))
+}
+
+/// (#3020) Rewrite the `internal.utility` binding's `id`, and its `n_ctx`
+/// when `n_ctx` is `Some`. Text-level, like the other fills. `None` when the
+/// registry has no object-form binding (or no `n_ctx` to rewrite).
+pub fn set_utility_binding(registry_json: &str, id: &str, n_ctx: Option<u32>) -> Option<String> {
+    let (vs, ve) = utility_value_span(registry_json)?;
+    let mut out = registry_json.to_string();
+    // The window sits after the id inside the object; rewrite it first so the
+    // id's byte range is still valid.
+    if let Some(n) = n_ctx {
+        let (ns, ne) = utility_n_ctx_span(registry_json)?;
+        if ns < ve {
+            return None;
+        }
+        out.replace_range(ns..ne, &n.to_string());
+    }
+    out.replace_range(vs..ve, id);
+    Some(out)
+}
+
+/// (#3020) Remove the `"utility": { .. }` member from the registry text,
+/// with the comma that joined it to a sibling, so the file stays valid JSON
+/// and keeps its shape. `None` when there is no object-form binding.
+pub fn remove_utility_binding(registry_json: &str) -> Option<String> {
+    let key = "\"utility\"";
+    let ValueAt::Object(open) = string_value_after_key(registry_json, 0, key)? else {
+        return None;
+    };
+    let key_start = registry_json.find(key)?;
+    let end = open + registry_json[open..].find('}')? + 1;
+    let before = registry_json[..key_start].trim_end();
+    let after = &registry_json[end..];
+    let after_trimmed = after.trim_start();
+    Some(if let Some(b) = before.strip_suffix(',') {
+        // A sibling before: drop `, "utility": {..}`.
+        format!("{b}{after}")
+    } else if let Some(a) = after_trimmed.strip_prefix(',') {
+        // A sibling after: drop `"utility": {..}, `.
+        format!("{}{}", &registry_json[..key_start], a.trim_start())
+    } else {
+        // The only member: keep the closing whitespace, drop the member's line.
+        format!("{before}{after}")
+    })
+}
+
+/// The AI headroom `init` sizes the utility window from: doctor's figure,
+/// or a test's pinned value.
+fn ai_headroom_bytes() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(v) = *AI_HEADROOM_OVERRIDE.lock().unwrap() {
+        return v;
+    }
+    darkmux_doctor::ai_headroom_bytes()
+}
+
+#[cfg(test)]
+static AI_HEADROOM_OVERRIDE: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+
+/// Pin (`Some`) or release (`None`) the headroom `init` reads, for tests.
+#[cfg(test)]
+fn set_ai_headroom_override(v: Option<Option<u64>>) {
+    *AI_HEADROOM_OVERRIDE.lock().unwrap() = v;
+}
+
+/// The worker models the registry names and the smallest window a managed
+/// worker declares: (largest worker size LM Studio lists, floor window).
+fn worker_facts(registry_json: &str, available: &[darkmux_profiles::lms::ModelMeta]) -> (u64, u32) {
+    let Ok(reg) = serde_json::from_str::<darkmux_types::ProfileRegistry>(registry_json) else {
+        return (0, 1);
+    };
+    let workers: Vec<&darkmux_types::ProfileModel> =
+        reg.profiles.values().flat_map(|p| p.models.iter()).filter(|m| m.is_managed()).collect();
+    let floor = workers.iter().filter_map(|m| m.n_ctx).min().unwrap_or(1);
+    let bytes = workers
+        .iter()
+        .filter_map(|w| {
+            let key = darkmux_gestalt::bare_model_key(&w.id);
+            available.iter().find(|m| m.model_type == "llm" && darkmux_gestalt::bare_model_key(&m.model_key) == key)
+        })
+        .map(|m| m.size_bytes)
+        .max()
+        .unwrap_or(0);
+    (bytes, floor)
+}
+
+/// The shipped binding's id, and its window when that is the shipped one
+/// too: `None` when there is no binding or the operator set its id by hand.
+fn shipped_utility_binding(text: &str) -> Option<(String, Option<u32>)> {
+    let (vs, ve) = utility_value_span(text)?;
+    let current = &text[vs..ve];
     // Only the value the example registry ships is init's to change. An
     // operator who set a utility id by hand, downloaded or not, keeps it.
     let shipped = utility_value_span(EXAMPLE_PROFILES_JSON).map(|(a, b)| &EXAMPLE_PROFILES_JSON[a..b]);
-    if shipped != Some(current.as_str()) {
+    if shipped != Some(current) {
+        return None;
+    }
+    // (#3020) Likewise the window: only the shipped one is init's to size.
+    let window_of = |t: &str| utility_n_ctx_span(t).and_then(|(a, b)| t[a..b].parse::<u32>().ok());
+    let shipped_window = window_of(EXAMPLE_PROFILES_JSON);
+    Some((current.to_string(), window_of(text).filter(|w| Some(*w) == shipped_window)))
+}
+
+/// The registry text after applying `plan`; `None` when nothing is written.
+fn apply_utility_plan(text: &str, current: &str, plan: &UtilityPlan) -> Option<String> {
+    match plan {
+        UtilityPlan::Keep | UtilityPlan::Missing(_) => None,
+        UtilityPlan::Bind { id, n_ctx } => set_utility_binding(text, id.as_deref().unwrap_or(current), *n_ctx),
+        UtilityPlan::Unbind(_) => remove_utility_binding(text),
+    }
+}
+
+fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityPlan>, String> {
+    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
+    let Some((current, window)) = shipped_utility_binding(&text) else {
+        return Ok(None);
+    };
+    // An unreachable lms was already reported by the worker fill.
+    let Ok(available) = darkmux_profiles::lms::list_available() else {
+        return Ok(None);
+    };
+    let (worker_bytes, floor) = worker_facts(&text, &available);
+    let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
+    let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
+    if let Some(filled) = apply_utility_plan(&text, &current, &plan) {
+        fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    } else if !matches!(plan, UtilityPlan::Missing(_)) {
         return Ok(None);
     }
-    let available = match darkmux_profiles::lms::list_available() {
-        Ok(v) => v,
-        Err(_) => return Ok(None), // the worker fill already reported an unreachable lms
-    };
-    if available.iter().any(|m| m.model_type == "llm" && m.model_key == current) {
-        return Ok(None);
-    }
-    let Some(id) = choose_utility_model(&current, &available) else {
-        return Err(format!(
-            "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is. \
-             Download a small instruct model (a 4B is ideal) in LM Studio, then re-run `darkmux init`."
-        ));
-    };
-    match fill_utility_binding(&text, &current, &id) {
-        Some(filled) => {
-            fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
-            Ok(Some(id))
-        }
-        None => Ok(None),
-    }
+    Ok(Some(plan))
 }
 
 /// (#2450) The profile registry `init` bootstraps, routed through the SAME
@@ -1209,9 +1414,9 @@ mod tests {
 
     /// The removed bare-string binding is not one init recognizes.
     #[test]
-    fn fill_utility_binding_ignores_a_bare_string() {
+    fn set_utility_binding_ignores_a_bare_string() {
         let reg = r#"{"internal":{"utility":"qwen/qwen3-4b-instruct-2507"},"profiles":{}}"#;
-        assert_eq!(fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "x"), None);
+        assert_eq!(set_utility_binding(reg, "x", None), None);
     }
 
     /// (#2914) The object form `"utility": { "id": .., "n_ctx": .. }` — the
@@ -1219,9 +1424,9 @@ mod tests {
     /// window and the operator's file shape. A profile model with the same
     /// id (a leftover from before #2914) is still not the binding.
     #[test]
-    fn fill_utility_binding_rewrites_the_id_inside_the_object_form() {
+    fn set_utility_binding_rewrites_the_id_inside_the_object_form() {
         let reg = r#"{"internal":{"utility":{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":120000}},"profiles":{"fast":{"models":[{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":32000}]}}}"#;
-        let out = fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "qwen3-4b-instruct-2507").expect("binding present");
+        let out = set_utility_binding(reg, "qwen3-4b-instruct-2507", None).expect("binding present");
         assert!(out.contains(r#""utility":{"id":"qwen3-4b-instruct-2507","n_ctx":120000}"#), "{out}");
         assert!(out.contains(r#""models":[{"id":"qwen/qwen3-4b-instruct-2507""#), "the profile model keeps its id: {out}");
         // An object with no `id` string is not a binding the scanner can fill.
@@ -1238,6 +1443,95 @@ mod tests {
         // (#2914) The example ships the object form, window included.
         let reg: darkmux_types::ProfileRegistry = serde_json::from_str(EXAMPLE_PROFILES_JSON).unwrap();
         assert_eq!(reg.utility_model_n_ctx(), Some(120_000), "the shipped binding declares its window");
+    }
+
+    // ── #3020: the utility window is sized from the machine's AI RAM ──────
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A 2 GB utility candidate whose own maximum window is above the shipped one.
+    fn util_meta() -> darkmux_profiles::lms::ModelMeta {
+        darkmux_profiles::lms::ModelMeta { max_context_length: Some(262_144), ..meta("qwen3-4b-instruct-2507", 2, "llm") }
+    }
+
+    #[test]
+    fn utility_window_splits_what_is_left_after_both_models_between_their_kv_caches() {
+        let rate = darkmux_profiles::model_ledger::fallback_kv_rate_for_size(2 * GIB);
+        // 2 GiB worker + 2 GiB utility, then 2 * 50_000 tokens of KV: 50_000 each.
+        let headroom = 4 * GIB + 2 * 50_000 * rate;
+        assert_eq!(utility_window(headroom, 2 * GIB, 2 * GIB, 120_000), 50_000);
+        // Never above the cap (the shipped window, or the model's own maximum).
+        assert_eq!(utility_window(1024 * GIB, 2 * GIB, 2 * GIB, 120_000), 120_000);
+        // Less headroom than the two models' weights: no window at all.
+        assert_eq!(utility_window(3 * GIB, 2 * GIB, 2 * GIB, 120_000), 0);
+        assert_eq!(utility_window(0, 0, 2 * GIB, 120_000), 0);
+    }
+
+    #[test]
+    fn plan_unbinds_on_a_machine_with_no_ai_headroom_and_names_the_fleet_route() {
+        let avail = vec![util_meta()];
+        let plan = plan_utility_binding("qwen/qwen3-4b-instruct-2507", Some(120_000), &avail, Some(0), 0, 32_000);
+        let UtilityPlan::Unbind(reason) = plan else { panic!("expected Unbind, got {plan:?}") };
+        assert!(reason.contains("0 GB available for AI"), "{reason}");
+        assert!(reason.contains("profile@machine"), "{reason}");
+        // No usable LLM downloaded is an unbind too, not a stale id left behind.
+        let plan = plan_utility_binding("qwen/qwen3-4b-instruct-2507", Some(120_000), &[meta("embed", 1, "embedding")], Some(500 * GIB), 0, 32_000);
+        assert!(matches!(plan, UtilityPlan::Unbind(ref r) if r.contains("no LLM of at least 1 GB")), "{plan:?}");
+        // ...unless the window is hand-set: then the binding is the operator's
+        // and stays, and init says its model is not downloaded.
+        let plan = plan_utility_binding("qwen/qwen3-4b-instruct-2507", None, &[meta("embed", 1, "embedding")], Some(500 * GIB), 0, 32_000);
+        assert!(matches!(plan, UtilityPlan::Missing(ref r) if r.contains("is not downloaded") && r.contains("kept")), "{plan:?}");
+    }
+
+    #[test]
+    fn plan_shrinks_the_shipped_window_to_what_fits_and_keeps_a_hand_set_one() {
+        let avail = vec![util_meta()];
+        let size = 2 * 1_000_000_000;
+        let rate = darkmux_profiles::model_ledger::fallback_kv_rate_for_size(size);
+        let headroom = size + 2 * 60_000 * rate;
+        assert_eq!(
+            plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &avail, Some(headroom), 0, 32_000),
+            UtilityPlan::Bind { id: None, n_ctx: Some(60_000) }
+        );
+        // The model's own maximum caps the window too.
+        let capped = vec![meta("qwen3-4b-instruct-2507", 2, "llm")];
+        assert_eq!(
+            plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &capped, Some(1024 * GIB), 0, 32_000),
+            UtilityPlan::Bind { id: None, n_ctx: Some(32_768) }
+        );
+        // Below the floor: unbound, naming the window it could have had.
+        let tight = size + 2 * 10_000 * rate;
+        let plan = plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &avail, Some(tight), 0, 32_000);
+        assert!(matches!(plan, UtilityPlan::Unbind(ref r) if r.contains("10000")), "{plan:?}");
+        // Ample headroom and the id present: nothing to change.
+        assert_eq!(plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &avail, Some(1024 * GIB), 0, 32_000), UtilityPlan::Keep);
+        // A window that is not init's to size (None) is never resized or unbound.
+        assert_eq!(plan_utility_binding("qwen3-4b-instruct-2507", None, &avail, Some(0), 0, 32_000), UtilityPlan::Keep);
+        // Headroom that cannot be read leaves the window as shipped.
+        assert_eq!(plan_utility_binding("qwen3-4b-instruct-2507", Some(120_000), &avail, None, 0, 32_000), UtilityPlan::Keep);
+        // A publisher-prefixed id is still renamed when the window stays.
+        assert_eq!(
+            plan_utility_binding("qwen/qwen3-4b-instruct-2507", Some(120_000), &avail, Some(1024 * GIB), 0, 32_000),
+            UtilityPlan::Bind { id: Some("qwen3-4b-instruct-2507".into()), n_ctx: None }
+        );
+    }
+
+    #[test]
+    fn set_and_remove_rewrite_only_the_utility_binding() {
+        let reg = "{\n  \"profiles\": {\"fast\": {\"models\": [{\"id\": \"q\", \"n_ctx\": 120000}]}},\n  \"internal\": {\n    \"utility\": { \"id\": \"q\", \"n_ctx\": 120000 }\n  }\n}";
+        let out = set_utility_binding(reg, "q2", Some(48_000)).expect("binding present");
+        assert!(out.contains(r#""utility": { "id": "q2", "n_ctx": 48000 }"#), "{out}");
+        assert!(out.contains(r#"[{"id": "q", "n_ctx": 120000}]"#), "the profile model is untouched: {out}");
+        let out = remove_utility_binding(reg).expect("binding present");
+        let v: Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(v["internal"], serde_json::json!({}), "{out}");
+        assert_eq!(v["profiles"]["fast"]["models"][0]["n_ctx"], 120_000);
+        // A sibling member keeps the object valid whichever side it is on.
+        for reg in [r#"{"internal":{"x":1,"utility":{"id":"q","n_ctx":1}}}"#, r#"{"internal":{"utility":{"id":"q","n_ctx":1}, "x":1}}"#] {
+            let v: Value = serde_json::from_str(&remove_utility_binding(reg).unwrap()).unwrap();
+            assert_eq!(v["internal"], serde_json::json!({"x": 1}), "{reg}");
+        }
+        assert_eq!(remove_utility_binding(r#"{"profiles":{}}"#), None);
     }
 }
 
