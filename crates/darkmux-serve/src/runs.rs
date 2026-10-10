@@ -2350,11 +2350,13 @@ fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
 /// force-quit), so nothing runs it. The staleness budget alone would hold it
 /// running for twice the inactivity timeout, or for good when that is unbounded.
 ///
-/// Only a session a bookend opened (`has_start`) owes a beat: `dispatch.start`
-/// by contract 2 (an execution beats while its work is in flight), and
-/// `run.start` by `mission launch`, whose run session beats for the whole
-/// launch (#2877). Those are the only two bookend starts. A budget wait that
-/// has not started (`has_wait` alone) is judged by its lapse, as before.
+/// Only a session a bookend opened (`has_start`: `dispatch.start` or
+/// `run.start`, the only two bookend starts) is judged so, and only once this
+/// process has SEEN it beat (`beat_lost`, [`SeenBeats`]). Not every bookend
+/// beats: an ACP panel run writes `run.start` and beats nothing while it waits
+/// on the operator's sign-off, so a beat that was never there is no evidence.
+/// A budget wait that has not started (`has_wait` alone) is judged by its
+/// lapse, as before.
 fn bookend_beat_gone(agg: &SessionAgg, now_ms: u64) -> bool {
     agg.beat_lost
         && agg.has_start
@@ -2562,8 +2564,9 @@ struct SessionAgg {
     /// after it stopped. `None` for this machine's own sessions (one clock
     /// already) and for a session with no machine uid, or from a peer with no live beat.
     clock_now_ms: Option<u64>,
-    /// (#3125) The presence read was good, this session's machine is
-    /// reporting (or is this machine), and no live beat names the session.
+    /// (#3125) The presence read was good, this session's machine has a live
+    /// presence beat (this machine's checked like any other), this process
+    /// saw the session beat, and no live beat names it now.
     /// Set by [`PeerClocks::apply`]; [`session_is_live`] reads it.
     beat_lost: bool,
     /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
@@ -2706,6 +2709,30 @@ fn build_flow_session_index_in(
 /// clock by that much, far inside the staleness budget it corrects.
 const PEER_CLOCKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
 
+/// (#3125 review) The sessions this process has seen beat, each with when it
+/// was last seen (this process's clock, epoch ms). In memory only: a daemon
+/// restart, or a fresh `darkmux run list` process, has seen nothing yet, so no
+/// session reads as having lost its beat, and a killed run falls back to the
+/// staleness budget, as before #3125. A session is forgotten once it has been
+/// gone longer than that budget, by which point the budget judges it anyway
+/// (with an unbounded budget nothing is forgotten: one short id per run).
+#[derive(Default)]
+struct SeenBeats {
+    last_seen_ms: HashMap<String, u64>,
+}
+
+impl SeenBeats {
+    /// Record `live` as seen at `now_ms`, forget what has been gone longer
+    /// than `keep_ms`, and return every session still remembered.
+    fn observe(&mut self, live: &HashSet<String>, now_ms: u64, keep_ms: u64) -> HashSet<String> {
+        for sid in live {
+            self.last_seen_ms.insert(sid.clone(), now_ms);
+        }
+        self.last_seen_ms.retain(|_, seen| now_ms.saturating_sub(*seen) <= keep_ms);
+        self.last_seen_ms.keys().cloned().collect()
+    }
+}
+
 #[derive(Default, Clone)]
 struct PeerClocks {
     now_ms: HashMap<String, u64>,
@@ -2714,6 +2741,11 @@ struct PeerClocks {
     /// `None` when presence is off or the read failed: nothing is known, so
     /// no session is judged by its beat.
     live_sessions: Option<HashSet<String>>,
+    /// (#3125) The session ids this process has SEEN beat ([`SeenBeats`]).
+    /// Only a session seen beating and now gone has lost its beat: one that
+    /// never beat (an ACP panel run, whose `run.start` beats nothing; a
+    /// dispatch whose beat writes all failed) says nothing by its absence.
+    seen_beating: HashSet<String>,
 }
 
 impl PeerClocks {
@@ -2725,9 +2757,21 @@ impl PeerClocks {
         // (#3125) The live session beats, read the same way; a failed read
         // knows nothing (`None`), never "every beat is gone".
         let (sessions, state) = crate::read_presence_beats(&url, "runs", darkmux_flow::session_presence::read_live_sessions);
-        let live_sessions = matches!(state, crate::source_state::SourceState::Ok)
+        let live_sessions: Option<HashSet<String>> = matches!(state, crate::source_state::SourceState::Ok)
             .then(|| sessions.into_iter().map(|b| b.session_id).collect());
-        Self { live_sessions, ..Self::from_beats(&beats) }
+        static SEEN: std::sync::Mutex<Option<SeenBeats>> = std::sync::Mutex::new(None);
+        let seen_beating = live_sessions
+            .as_ref()
+            .map(|live| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut slot = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                slot.get_or_insert_with(SeenBeats::default).observe(live, now_ms, stale_after_ms())
+            })
+            .unwrap_or_default();
+        Self { live_sessions, seen_beating, ..Self::from_beats(&beats) }
     }
 
     /// [`PeerClocks::read`], at most once per [`PEER_CLOCKS_CACHE_TTL`]: the
@@ -2755,17 +2799,22 @@ impl PeerClocks {
     }
 
     fn from_beats(beats: &[darkmux_flow::presence::PresenceBeat]) -> Self {
-        Self { now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect(), live_sessions: None }
+        Self {
+            now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect(),
+            ..Self::default()
+        }
     }
 
     /// Give each session of ANOTHER machine that machine's clock. This
     /// machine's own sessions keep `None`: they already share this daemon's clock.
     ///
-    /// (#3125) Mark each session with no live beat whose machine is reporting
-    /// (this machine, or a peer with a live machine beat) `beat_lost`. A
-    /// session on a machine that is not reporting is left alone: its beat is
-    /// gone because its machine is, which is `not reporting`
-    /// ([`mark_not_reporting`]), not an ending.
+    /// (#3125) Mark `beat_lost` on each session this process saw beat whose
+    /// beat is now gone, while its machine's own presence beat is live (this
+    /// machine included: its beat is checked, never assumed). A session on a
+    /// machine whose beat is absent is left alone: its beats may be gone
+    /// because that machine cannot write them (it is down, or its Redis
+    /// refuses writes), which is `not reporting` ([`mark_not_reporting`]), not
+    /// an ending.
     fn apply(&self, idx: &mut HashMap<String, SessionAgg>) {
         let mine = darkmux_hardware::machine_uid().map(str::to_ascii_lowercase);
         for (session_id, agg) in idx.iter_mut() {
@@ -2774,8 +2823,10 @@ impl PeerClocks {
             if !own {
                 agg.clock_now_ms = self.now_ms.get(&uid).copied();
             }
-            let reporting = own || agg.clock_now_ms.is_some();
-            agg.beat_lost = reporting && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
+            let reporting = self.now_ms.contains_key(&uid);
+            agg.beat_lost = reporting
+                && self.seen_beating.contains(session_id)
+                && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
         }
     }
 }
@@ -5734,6 +5785,7 @@ mod tests {
         let reporting = |now: u64, live: Option<HashSet<String>>| PeerClocks {
             now_ms: HashMap::from([(peer.to_ascii_lowercase(), now)]),
             live_sessions: live,
+            seen_beating: HashSet::from(["killed".to_string()]),
         };
 
         let killed = build("dispatch.start", peer, reporting(after, Some(HashSet::new())), after);
@@ -5745,7 +5797,7 @@ mod tests {
         assert_eq!(beating[0].status, RunStatus::Running, "a live beat is a live run");
         let unknown = build("dispatch.start", peer, reporting(after, None), after);
         assert_eq!(unknown[0].status, RunStatus::Running, "presence off or unread: no beat is known to be missing");
-        let down = PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() };
+        let down = PeerClocks { live_sessions: Some(HashSet::new()), seen_beating: HashSet::from(["killed".to_string()]), ..Default::default() };
         let partitioned = build("dispatch.start", peer, down, after);
         assert_eq!(partitioned[0].status, RunStatus::Running, "its machine is not reporting: that is `not reporting`, not an ending");
         let just_started = start_ms + BEAT_GONE_GRACE_MS - 1_000;
@@ -5760,13 +5812,18 @@ mod tests {
                 "payload": { "scope": "endpoint", "message": "waiting", "wait_ms": 3_600_000 } }),
         );
         settle_session_index(&mut held);
-        reporting(after, Some(HashSet::new())).apply(&mut held);
+        PeerClocks { seen_beating: HashSet::from(["held".to_string()]), ..reporting(after, Some(HashSet::new())) }.apply(&mut held);
         assert!(held["held"].beat_lost, "the case under test: no beat on a reporting machine");
         assert!(session_is_live(&held["held"], after), "only a session a bookend opened owes a beat");
 
         // This machine's own run: it is reporting by definition, and has no peer clock.
         if let Some(mine) = darkmux_hardware::machine_uid() {
-            let own = build("dispatch.start", mine, PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() }, after);
+            let own_clocks = PeerClocks {
+                now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]),
+                live_sessions: Some(HashSet::new()),
+                seen_beating: HashSet::from(["killed".to_string()]),
+            };
+            let own = build("dispatch.start", mine, own_clocks, after);
             assert_eq!(own[0].status, RunStatus::Abandoned, "on its own machine too");
         }
     }
@@ -5796,7 +5853,12 @@ mod tests {
                 missions.entry("m-killed".to_string()).or_default().fold_record(r);
             }
             settle_session_index(&mut idx);
-            PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]), live_sessions: Some(live) }.apply(&mut idx);
+            PeerClocks {
+                now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]),
+                live_sessions: Some(live),
+                seen_beating: HashSet::from([run_session.clone(), task_session.clone()]),
+            }
+            .apply(&mut idx);
             peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
         };
         let killed = row(HashSet::new());
@@ -5804,6 +5866,56 @@ mod tests {
         assert_eq!(killed.abandoned_reason, Some(AbandonReason::NoTerminal));
         // Between dispatches only the launcher beats, and that is enough.
         assert_eq!(row(HashSet::from([run_session.clone()])).status, RunStatus::Running);
+    }
+
+    /// (#3125 review) A missing beat counts only for a session this process
+    /// SAW beat, on a machine whose own beat is live. Three runs that never
+    /// stopped must keep reading running: an ACP panel run (its `run.start`
+    /// beats nothing while it waits on the operator's sign-off), and a session
+    /// on this machine while this machine's own beat is absent (Redis refusing
+    /// writes, or a dispatch with no Keychain access, beats nothing anywhere).
+    #[test]
+    fn a_session_never_seen_beating_or_on_a_silent_machine_is_not_abandoned() {
+        let Some(mine) = darkmux_hardware::machine_uid() else { return };
+        let start_ts = "2000-01-01T00:00:00Z";
+        let after = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
+        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("panel-1").unwrap()).wire();
+        let row = |clocks: PeerClocks| {
+            let r = serde_json::json!({
+                "ts": start_ts, "action": "run.start", "handle": "pr-merge", "mission_id": "panel-1",
+                "session_id": run_session, "machine_id": "darkbook", "machine_uid": mine,
+            });
+            let mut idx = HashMap::new();
+            let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
+            fold_session_record(&mut idx, &r);
+            missions.entry("panel-1".to_string()).or_default().fold_record(&r);
+            settle_session_index(&mut idx);
+            clocks.apply(&mut idx);
+            peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
+        };
+        let my_beat = HashMap::from([(mine.to_ascii_lowercase(), after)]);
+        let panel = row(PeerClocks { now_ms: my_beat.clone(), live_sessions: Some(HashSet::new()), seen_beating: HashSet::new() });
+        assert_eq!(panel.status, RunStatus::Running, "a run that never beat lost nothing");
+        let silent = row(PeerClocks {
+            now_ms: HashMap::new(),
+            live_sessions: Some(HashSet::new()),
+            seen_beating: HashSet::from([run_session.clone()]),
+        });
+        assert_eq!(silent.status, RunStatus::Running, "this machine's own beat is absent: its beats prove nothing");
+        let gone = row(PeerClocks { now_ms: my_beat, live_sessions: Some(HashSet::new()), seen_beating: HashSet::from([run_session.clone()]) });
+        assert_eq!(gone.status, RunStatus::Abandoned, "seen beating, now gone, on a machine that beats: it ended");
+    }
+
+    /// (#3125 review) The memory behind `seen_beating`: a session seen in one
+    /// read is still known as seen in a later read that no longer has it, and
+    /// is forgotten only once the staleness budget would judge it anyway.
+    #[test]
+    fn seen_beats_remember_a_session_after_its_beat_is_gone() {
+        let mut seen = SeenBeats::default();
+        let live = HashSet::from(["s1".to_string()]);
+        assert!(seen.observe(&live, 1_000, 10_000).contains("s1"));
+        assert!(seen.observe(&HashSet::new(), 5_000, 10_000).contains("s1"), "gone from the live set, still seen");
+        assert!(!seen.observe(&HashSet::new(), 11_001, 10_000).contains("s1"), "past the budget it is forgotten");
     }
 
     #[test]
