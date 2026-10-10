@@ -202,6 +202,18 @@ darkmux release.
   14 times over. Measured on darkmux's tree, the attribute lookup takes
   32 ms per rule.
 
+- **A killed run stops reading `running` once its machine is back** (#3125).
+  A `darkmux dispatch` or `mission launch` that was SIGKILLed (or OOM-killed,
+  or force-quit) writes no terminal record. Its session beat expires about 15 s
+  later, but the run read `running` on every surface until the staleness budget
+  ran out (twice `runtime.inactivity_timeout_seconds`, 20 minutes by default,
+  and never when that is `0`). Now, when presence is on and the run's machine is
+  reporting (or is this machine), an open `dispatch.start` or `run.start` with
+  no live session beat and nothing written for 30 s reads `abandoned`
+  (`no ending`) in `run list`, `/runs` and the runs board. A run on a machine
+  that is not reporting still reads `not reporting`. With presence off, or when
+  the beats cannot be read, nothing changes.
+
 - **The scope's tok/s no longer spikes into the thousands on a Claude seat** (#3152).
   A hosted Claude stream arrives in bursts, and the live channel sends a sample
   on every transition as well as on its cadence: captured live, 642 chars landed

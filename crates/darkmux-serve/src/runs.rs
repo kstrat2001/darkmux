@@ -2222,6 +2222,13 @@ pub(crate) const UNBOUNDED_STALE_AFTER_MS: u64 = (1 << 53) - 1;
 /// this long past its resume time has lost its process.
 pub(crate) const BUDGET_WAIT_GRACE_MS: u64 = 60_000;
 
+/// (#3125) How long an open bookend may go without a live session beat,
+/// counted from its newest record, before it reads as ended. Two session-beat
+/// TTLs: a dispatch writes `dispatch.start` just before its first beat, and the
+/// beats this build reads may be one [`PEER_CLOCKS_CACHE_TTL`] old, so one TTL
+/// of margin keeps a run that just started from reading dead.
+pub(crate) const BEAT_GONE_GRACE_MS: u64 = 2 * darkmux_flow::session_presence::DEFAULT_TTL_SECS * 1_000;
+
 /// The lifecycle policy every `/runs` row is judged by, published on the
 /// response so the viewer judges flow sessions by the same numbers
 /// (`ui/src/lib/lifecycle.ts`, one spec in `tests/lifecycle/cases.json`).
@@ -2322,13 +2329,40 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// A terminal always wins over liveness: a session that recorded its end
 /// (a terminal of its current attempt, or `RunFold::recorded_end`) is not
 /// live however recent that record is.
+///
+/// (#3125) Nor is a session whose beat is gone while its machine reports
+/// ([`bookend_beat_gone`]): a dead process's last record is recent for a
+/// while, and recency is not life.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
     agg.terminal_status.is_none()
+        && !bookend_beat_gone(agg, now_ms)
         && crate::run_lifecycle::quiet_clock_live(
             agg.last_activity_ts.as_deref(),
             agg.wait_until_ms,
             agg.clock_now_ms.unwrap_or(now_ms),
             stale_after_ms(),
+        )
+}
+
+/// (#3125) An open bookend whose session beat is gone while its machine is
+/// reporting, quiet past [`BEAT_GONE_GRACE_MS`] on that machine's clock: its
+/// process died without a terminal record (SIGKILL, an OOM kill, a
+/// force-quit), so nothing runs it. The staleness budget alone would hold it
+/// running for twice the inactivity timeout, or for good when that is unbounded.
+///
+/// Only a session a bookend opened (`has_start`) owes a beat: `dispatch.start`
+/// by contract 2 (an execution beats while its work is in flight), and
+/// `run.start` by `mission launch`, whose run session beats for the whole
+/// launch (#2877). Those are the only two bookend starts. A budget wait that
+/// has not started (`has_wait` alone) is judged by its lapse, as before.
+fn bookend_beat_gone(agg: &SessionAgg, now_ms: u64) -> bool {
+    agg.beat_lost
+        && agg.has_start
+        && !crate::run_lifecycle::quiet_clock_live(
+            agg.last_activity_ts.as_deref(),
+            None,
+            agg.clock_now_ms.unwrap_or(now_ms),
+            BEAT_GONE_GRACE_MS,
         )
 }
 
@@ -2528,6 +2562,10 @@ struct SessionAgg {
     /// after it stopped. `None` for this machine's own sessions (one clock
     /// already) and for a session with no machine uid, or from a peer with no live beat.
     clock_now_ms: Option<u64>,
+    /// (#3125) The presence read was good, this session's machine is
+    /// reporting (or is this machine), and no live beat names the session.
+    /// Set by [`PeerClocks::apply`]; [`session_is_live`] reads it.
+    beat_lost: bool,
     /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
     /// budget before its first bookend is a run.
     has_wait: bool,
@@ -2668,9 +2706,14 @@ fn build_flow_session_index_in(
 /// clock by that much, far inside the staleness budget it corrects.
 const PEER_CLOCKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PeerClocks {
     now_ms: HashMap<String, u64>,
+    /// (#3125) The session ids with a live session beat
+    /// (`darkmux:session-presence:<sid>`), read with the machine beats.
+    /// `None` when presence is off or the read failed: nothing is known, so
+    /// no session is judged by its beat.
+    live_sessions: Option<HashSet<String>>,
 }
 
 impl PeerClocks {
@@ -2679,47 +2722,60 @@ impl PeerClocks {
     fn read() -> Self {
         let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
         let (beats, _) = crate::read_presence_beats(&url, "runs", darkmux_flow::presence::read_live);
-        Self::from_beats(&beats)
+        // (#3125) The live session beats, read the same way; a failed read
+        // knows nothing (`None`), never "every beat is gone".
+        let (sessions, state) = crate::read_presence_beats(&url, "runs", darkmux_flow::session_presence::read_live_sessions);
+        let live_sessions = matches!(state, crate::source_state::SourceState::Ok)
+            .then(|| sessions.into_iter().map(|b| b.session_id).collect());
+        Self { live_sessions, ..Self::from_beats(&beats) }
     }
 
     /// [`PeerClocks::read`], at most once per [`PEER_CLOCKS_CACHE_TTL`]: the
     /// board rebuilds on a few-second poll, and each read is a Redis SCAN plus
     /// a GET per machine (and a Keychain lookup for the URL).
     fn cached() -> Self {
-        static CACHE: std::sync::Mutex<Option<(std::time::Instant, HashMap<String, u64>)>> = std::sync::Mutex::new(None);
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant, PeerClocks)>> = std::sync::Mutex::new(None);
         Self::cached_in(&CACHE, std::time::Instant::now(), Self::read)
     }
 
     fn cached_in(
-        cache: &std::sync::Mutex<Option<(std::time::Instant, HashMap<String, u64>)>>,
+        cache: &std::sync::Mutex<Option<(std::time::Instant, PeerClocks)>>,
         now: std::time::Instant,
         read: impl FnOnce() -> Self,
     ) -> Self {
         let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, now_ms)) = slot.as_ref() {
+        if let Some((at, clocks)) = slot.as_ref() {
             if now.saturating_duration_since(*at) < PEER_CLOCKS_CACHE_TTL {
-                return Self { now_ms: now_ms.clone() };
+                return clocks.clone();
             }
         }
         let fresh = read();
-        *slot = Some((now, fresh.now_ms.clone()));
+        *slot = Some((now, fresh.clone()));
         fresh
     }
 
     fn from_beats(beats: &[darkmux_flow::presence::PresenceBeat]) -> Self {
-        Self { now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect() }
+        Self { now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect(), live_sessions: None }
     }
 
     /// Give each session of ANOTHER machine that machine's clock. This
     /// machine's own sessions keep `None`: they already share this daemon's clock.
+    ///
+    /// (#3125) Mark each session with no live beat whose machine is reporting
+    /// (this machine, or a peer with a live machine beat) `beat_lost`. A
+    /// session on a machine that is not reporting is left alone: its beat is
+    /// gone because its machine is, which is `not reporting`
+    /// ([`mark_not_reporting`]), not an ending.
     fn apply(&self, idx: &mut HashMap<String, SessionAgg>) {
         let mine = darkmux_hardware::machine_uid().map(str::to_ascii_lowercase);
-        for agg in idx.values_mut() {
+        for (session_id, agg) in idx.iter_mut() {
             let Some(uid) = agg.machine_uid.as_deref().map(str::to_ascii_lowercase) else { continue };
-            if mine.as_deref() == Some(uid.as_str()) {
-                continue;
+            let own = mine.as_deref() == Some(uid.as_str());
+            if !own {
+                agg.clock_now_ms = self.now_ms.get(&uid).copied();
             }
-            agg.clock_now_ms = self.now_ms.get(&uid).copied();
+            let reporting = own || agg.clock_now_ms.is_some();
+            agg.beat_lost = reporting && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
         }
     }
 }
@@ -5615,7 +5671,7 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let read = || {
             reads.set(reads.get() + 1);
-            PeerClocks { now_ms: HashMap::from([("u".to_string(), 7)]) }
+            PeerClocks { now_ms: HashMap::from([("u".to_string(), 7)]), ..Default::default() }
         };
         assert_eq!(PeerClocks::cached_in(&cache, t0, read).now_ms["u"], 7);
         assert_eq!(PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL / 2, read).now_ms["u"], 7);
@@ -5650,6 +5706,104 @@ mod tests {
         assert_eq!(idx["silent"].clock_now_ms, None, "no live beat: not reporting, judged by this daemon's clock");
         assert_eq!(idx["mine"].clock_now_ms, None, "this machine's own sessions keep this machine's clock");
         assert_eq!(idx["anon"].clock_now_ms, None);
+    }
+
+    /// (#3125) A dispatch that was SIGKILLed writes no terminal record, and its
+    /// session beat expires about one TTL later. Once its machine is reporting
+    /// again, nothing is running it, and the row must say so well inside the
+    /// staleness budget (which is how long a quiet live run may go between
+    /// records, not how long a dead one may read running). Every clock here is
+    /// fixed: the peer's clock and this daemon's are both explicit instants.
+    #[test]
+    fn a_dispatch_whose_beat_is_gone_on_a_reporting_machine_is_not_running() {
+        let start_ts = "2000-01-01T00:00:00Z";
+        let start_ms = parse_flow_ts(start_ts).unwrap() * 1_000;
+        let after = start_ms + 60_000;
+        assert!(stale_after_ms() > 60_000, "the case is a run quiet for less than the staleness budget");
+        let peer = "STUDIO-UID-3125";
+        let build = |action: &str, uid: &str, clocks: PeerClocks, now: u64| {
+            let mut idx = HashMap::new();
+            fold_session_record(
+                &mut idx,
+                &serde_json::json!({ "ts": start_ts, "action": action, "session_id": "killed", "machine_id": "studio", "machine_uid": uid }),
+            );
+            settle_session_index(&mut idx);
+            clocks.apply(&mut idx);
+            ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now)
+        };
+        let reporting = |now: u64, live: Option<HashSet<String>>| PeerClocks {
+            now_ms: HashMap::from([(peer.to_ascii_lowercase(), now)]),
+            live_sessions: live,
+        };
+
+        let killed = build("dispatch.start", peer, reporting(after, Some(HashSet::new())), after);
+        assert_eq!(killed[0].status, RunStatus::Abandoned, "machine up, beat gone, no terminal: nothing runs it");
+        assert_eq!(killed[0].abandoned_reason, Some(AbandonReason::NoTerminal));
+
+        // The inverted cases, each of which must still read running.
+        let beating = build("dispatch.start", peer, reporting(after, Some(HashSet::from(["killed".to_string()]))), after);
+        assert_eq!(beating[0].status, RunStatus::Running, "a live beat is a live run");
+        let unknown = build("dispatch.start", peer, reporting(after, None), after);
+        assert_eq!(unknown[0].status, RunStatus::Running, "presence off or unread: no beat is known to be missing");
+        let down = PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() };
+        let partitioned = build("dispatch.start", peer, down, after);
+        assert_eq!(partitioned[0].status, RunStatus::Running, "its machine is not reporting: that is `not reporting`, not an ending");
+        let just_started = start_ms + BEAT_GONE_GRACE_MS - 1_000;
+        let starting = build("dispatch.start", peer, reporting(just_started, Some(HashSet::new())), just_started);
+        assert_eq!(starting[0].status, RunStatus::Running, "inside the grace its first beat may not be read yet");
+        // A call its budget holds before any bookend: its gate's beat ends with
+        // the gate, so its wait's lapse judges it, never its beat.
+        let mut held = HashMap::new();
+        fold_session_record(
+            &mut held,
+            &serde_json::json!({ "ts": start_ts, "action": "budget.wait", "session_id": "held", "machine_id": "studio", "machine_uid": peer,
+                "payload": { "scope": "endpoint", "message": "waiting", "wait_ms": 3_600_000 } }),
+        );
+        settle_session_index(&mut held);
+        reporting(after, Some(HashSet::new())).apply(&mut held);
+        assert!(held["held"].beat_lost, "the case under test: no beat on a reporting machine");
+        assert!(session_is_live(&held["held"], after), "only a session a bookend opened owes a beat");
+
+        // This machine's own run: it is reporting by definition, and has no peer clock.
+        if let Some(mine) = darkmux_hardware::machine_uid() {
+            let own = build("dispatch.start", mine, PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() }, after);
+            assert_eq!(own[0].status, RunStatus::Abandoned, "on its own machine too");
+        }
+    }
+
+    /// (#3125) The same kill under `mission launch`: the launcher's run session
+    /// and its execution both lose their beats at once. A peer's row of the
+    /// mission (and this machine's own, which reads the same sessions) must
+    /// read ended, not running on the strength of the run session's last record.
+    #[test]
+    fn a_mission_whose_beats_are_gone_on_a_reporting_machine_is_not_running() {
+        let start_ts = "2000-01-01T00:00:00Z";
+        let after = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
+        assert!(stale_after_ms() > 60_000);
+        let peer = "STUDIO-UID-3125";
+        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m-killed").unwrap()).wire();
+        let task_session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m-killed").unwrap(), "coder").wire();
+        let rec = |action: &str, session: &str| serde_json::json!({
+            "ts": start_ts, "action": action, "handle": "coder", "mission_id": "m-killed",
+            "session_id": session, "machine_id": "studio", "machine_uid": peer,
+        });
+        let records = [rec("run.start", &run_session), rec("dispatch.start", &task_session)];
+        let row = |live: HashSet<String>| {
+            let mut idx = HashMap::new();
+            let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
+            for r in &records {
+                fold_session_record(&mut idx, r);
+                missions.entry("m-killed".to_string()).or_default().fold_record(r);
+            }
+            settle_session_index(&mut idx);
+            PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]), live_sessions: Some(live) }.apply(&mut idx);
+            peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
+        };
+        let killed = row(HashSet::new());
+        assert_eq!(killed.status, RunStatus::Abandoned, "every beat gone on a reporting machine: nothing runs it");
+        assert_eq!(killed.abandoned_reason, Some(AbandonReason::NoTerminal));
+        // Between dispatches only the launcher beats, and that is enough.
+        assert_eq!(row(HashSet::from([run_session.clone()])).status, RunStatus::Running);
     }
 
     #[test]
