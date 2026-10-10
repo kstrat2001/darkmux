@@ -453,6 +453,18 @@ impl SourceFiles {
         true
     }
 
+    /// `rel`'s whole text, or the reason it can't be read: over the size cap,
+    /// not UTF-8, or an I/O error.
+    fn read_whole(&self, rel: &str) -> Result<String, String> {
+        let full = self.tree.join(rel);
+        let meta = fs::metadata(&full).map_err(|e| format!("stat error: {e}"))?;
+        if self.max_bytes.is_some_and(|max| meta.len() > max) {
+            return Err(format!("exceeds {MAX_FILE_BYTES} bytes ({} bytes)", meta.len()));
+        }
+        let bytes = fs::read(&full).map_err(|e| format!("read error: {e}"))?;
+        String::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())
+    }
+
     fn get(&mut self, rel: &str, skipped: &mut Vec<SkippedEntry>, source_id: &str) -> Option<Rc<String>> {
         if let Some(v) = self.content.get(rel) {
             return v.clone();
@@ -460,43 +472,10 @@ impl SourceFiles {
         if self.skip_generated(rel, skipped, source_id) {
             return None;
         }
-        let full = self.tree.join(rel);
-        let result = match fs::metadata(&full) {
-            Ok(meta) if self.max_bytes.is_some_and(|max| meta.len() > max) => {
-                skipped.push(SkippedEntry {
-                    reason: format!("exceeds {MAX_FILE_BYTES} bytes ({} bytes)", meta.len()),
-                    file: rel.to_string(),
-                    source: Some(source_id.to_string()),
-                });
-                None
-            }
-            Ok(_) => match fs::read(&full) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => Some(Rc::new(s)),
-                    Err(_) => {
-                        skipped.push(SkippedEntry {
-                            reason: "not valid UTF-8".to_string(),
-                            file: rel.to_string(),
-                            source: Some(source_id.to_string()),
-                        });
-                        None
-                    }
-                },
-                Err(e) => {
-                    skipped.push(SkippedEntry {
-                        reason: format!("read error: {e}"),
-                        file: rel.to_string(),
-                        source: Some(source_id.to_string()),
-                    });
-                    None
-                }
-            },
-            Err(e) => {
-                skipped.push(SkippedEntry {
-                    reason: format!("stat error: {e}"),
-                    file: rel.to_string(),
-                    source: Some(source_id.to_string()),
-                });
+        let result = match self.read_whole(rel) {
+            Ok(text) => Some(Rc::new(text)),
+            Err(reason) => {
+                skipped.push(SkippedEntry { reason, file: rel.to_string(), source: Some(source_id.to_string()) });
                 None
             }
         };
