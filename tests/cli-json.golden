@@ -240,7 +240,7 @@ DetectorCounts
   promoted_calls: uint32
 DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition"
 DetectorSeverity = "warn" | "info"
-Dialect = "chat-completions" | "chat-completions-max-tokens"
+Dialect = "chat-completions" | "chat-completions-max-tokens" | "messages"
 DirectDispatchEnvelope
   result: string
   final_assistant: string

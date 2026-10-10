@@ -76,6 +76,11 @@ pub enum Dialect {
     /// `"stream": false`); `reasoning_effort` is never sent. What LM Studio
     /// takes; the default for a managed endpoint.
     ChatCompletionsMaxTokens,
+    /// (#3162) Anthropic's native Messages API at `{url}/messages`:
+    /// `max_tokens`, a top-level `system`, no `temperature` or
+    /// `reasoning_effort`. The one dialect with prompt caching on Claude
+    /// endpoints (the OpenAI-compatible layer neither caches nor reports it).
+    Messages,
 }
 
 impl Dialect {
@@ -83,7 +88,7 @@ impl Dialect {
     pub fn cap_field(self) -> &'static str {
         match self {
             Dialect::ChatCompletions => "max_completion_tokens",
-            Dialect::ChatCompletionsMaxTokens => "max_tokens",
+            Dialect::ChatCompletionsMaxTokens | Dialect::Messages => "max_tokens",
         }
     }
 
@@ -117,6 +122,8 @@ crate::config_enum!(Dialect, "endpoint dialect", [
         "`max_completion_tokens` + optional `reasoning_effort`, no `temperature` (unmanaged default)",
     ChatCompletionsMaxTokens = "chat-completions-max-tokens" =>
         "`max_tokens` + `temperature`, no `reasoning_effort` (managed LM Studio default)",
+    Messages = "messages" =>
+        "Anthropic's native Messages API at `{url}/messages`, with prompt caching (Claude endpoints)",
 ]);
 
 /// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
@@ -630,7 +637,8 @@ impl ModelEndpoint {
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
     /// URL normalized to its `/v1` root (`config_access::lmstudio_url`).
-    /// Unmanaged: `{url}/chat/completions`, plus `?api-version=` when set.
+    /// Unmanaged: `{url}/chat/completions`, plus `?api-version=` when set;
+    /// `{url}/messages` in the `messages` dialect (#3162).
     pub fn chat_url(&self) -> Result<String, EndpointError> {
         match self.kind()? {
             EndpointKind::Managed(ManagedBackend::Lmstudio) => {
@@ -639,6 +647,9 @@ impl ModelEndpoint {
             EndpointKind::Unmanaged => {
                 // `kind()` is Unmanaged only when a url is set.
                 let base = self.url.as_deref().unwrap_or_default().trim_end_matches('/');
+                if self.resolved_dialect()? == Dialect::Messages {
+                    return Ok(format!("{base}/messages"));
+                }
                 Ok(match self.api_version.as_deref() {
                     Some(v) => format!("{base}/chat/completions?api-version={v}"),
                     None => format!("{base}/chat/completions"),
@@ -674,6 +685,24 @@ impl ModelEndpoint {
         }
     }
 
+    /// A declared field the resolved dialect never sends is refused beside it
+    /// rather than silently dropped: `reasoning_effort` in a declared
+    /// `chat-completions-max-tokens` or `messages`, `api_version` in
+    /// `messages` (#3162).
+    fn fields_the_dialect_sends(&self, dialect: Dialect) -> Result<(), String> {
+        let effort_unsent = matches!(dialect, Dialect::ChatCompletionsMaxTokens | Dialect::Messages);
+        if self.reasoning_effort.is_some() && self.dialect.is_some() && effort_unsent {
+            return Err(format!(
+                "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
+                dialect.as_str()
+            ));
+        }
+        if dialect == Dialect::Messages && self.api_version.is_some() {
+            return Err("`api_version` is never sent in the `messages` dialect; drop one of the two".to_string());
+        }
+        Ok(())
+    }
+
     /// Coherence of the endpoint AS WRITTEN (no I/O; the credential's
     /// presence is `darkmux doctor`'s live check). Returns the reason.
     pub fn validate(&self) -> Result<(), String> {
@@ -687,12 +716,7 @@ impl ModelEndpoint {
         if self.api_version.is_some() && kind.is_managed() {
             return Err("`api_version` applies to an unmanaged endpoint's URL; a managed endpoint never sends it".to_string());
         }
-        if self.reasoning_effort.is_some() && dialect == Dialect::ChatCompletionsMaxTokens && self.dialect.is_some() {
-            return Err(format!(
-                "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
-                Dialect::ChatCompletionsMaxTokens.as_str()
-            ));
-        }
+        self.fields_the_dialect_sends(dialect)?;
         if let Some(auth) = &self.auth {
             // (#1312) A credential SOURCE must be declared: the Keychain item
             // (`keychain`) or the env-var name (`key_env`). One is enough.
@@ -1059,6 +1083,25 @@ mod tests {
             "https://r.example/openai/deployments/d/chat/completions?api-version=2025-01-01-preview"
         );
         assert!(ModelEndpoint::reference("nope").chat_url().is_err());
+    }
+
+    /// (#3162) The `messages` dialect's URL is `{url}/messages`, and the two
+    /// fields it never sends are refused beside it rather than dropped.
+    #[test]
+    fn a_messages_endpoint_posts_to_messages_and_refuses_fields_it_cannot_send() {
+        let claude = ModelEndpoint {
+            url: Some("https://api.anthropic.com/v1/".into()),
+            dialect: Some(Dialect::Messages.into()),
+            ..Default::default()
+        };
+        assert_eq!(claude.chat_url().unwrap(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(Dialect::Messages.cap_field(), "max_tokens");
+        assert_eq!(serde_json::to_value(Dialect::Messages).unwrap(), "messages");
+        assert!(claude.validate().is_ok());
+        let effort = ModelEndpoint { reasoning_effort: Some("high".into()), ..claude.clone() };
+        assert!(effort.validate().unwrap_err().contains("`messages`"));
+        let versioned = ModelEndpoint { api_version: Some("1".into()), ..claude };
+        assert!(versioned.validate().unwrap_err().contains("api_version"));
     }
 
     #[test]

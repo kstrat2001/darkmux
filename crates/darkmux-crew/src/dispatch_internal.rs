@@ -3689,6 +3689,8 @@ fn remote_chat_attempt(
     if let Some((h, v)) = auth_header {
         cfg.push_str(&format!("header = \"{}: {}\"\n", esc(h), esc(v)));
     }
+    let messages = crate::messages_wire::speaks_messages(url);
+    cfg.push_str(&crate::messages_wire::version_header_line(messages));
     cfg.push_str(&format!("data = \"{}\"\n", esc(&body.to_string())));
     // The response body goes to its own 0600 file and curl's `%{http_code}`
     // to stdout, so the status is read from a stream that never touches the
@@ -3802,6 +3804,7 @@ fn remote_chat_attempt(
         )));
     }
     let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
+    let response = crate::messages_wire::reply_bytes_as_chat(messages, response);
     classify_hosted_response(status, &response)
 }
 
@@ -3851,7 +3854,9 @@ pub(crate) fn classify_hosted_response(
     };
     match status {
         429 => Err(HostedCallError::RateLimited(message())),
-        503 => Err(HostedCallError::ServerShed(message())),
+        // 529 is the overloaded status a Messages endpoint answers with:
+        // shed load like 503, retried and never charged (#3162 review).
+        503 | 529 => Err(HostedCallError::ServerShed(message())),
         500..=599 => Err(HostedCallError::Other(failure(
             HostedFailure::ServerError,
             format!("hosted endpoint returned HTTP {status}: {}", message()),

@@ -14,6 +14,20 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Prompt caching on Claude endpoints: the `messages` dialect** (#3162). An
+  endpoint declaring `"dialect": "messages"` is sent Anthropic's native
+  Messages API at `{url}/messages` instead of the OpenAI-compatible
+  `chat/completions` layer, which neither caches nor reports caching (probed:
+  the same 17.6k-token prefix billed in full twice). The agent loop's requests
+  carry a top-level `cache_control`, so each turn reads the conversation so far
+  from the cache instead of paying for it again; single-shot calls do not ask
+  for caching. Usage records count cache reads as `cached` and every input
+  token, cached or not, as prompt tokens, so budgets see what the endpoint
+  served. `reasoning_effort` and `api_version` are refused beside it.
+  `tests/cli-json.golden` regenerated (`Dialect` gains `"messages"`, additive).
+
 ### Changed
 
 - **The console redacts for remote viewers instead of refusing them.** In
