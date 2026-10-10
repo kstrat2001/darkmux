@@ -2506,6 +2506,27 @@ line two
         assert!(skip.reason.contains("generated"), "{}", skip.reason);
     }
 
+    /// (#3180 review) Only `set` and `true` mark a file generated; `false`,
+    /// `unset` and an unmarked file are reviewed, and a tree that is not a
+    /// git checkout has no attributes, so nothing in it is generated.
+    #[test]
+    fn linguist_generated_reads_only_set_and_true() {
+        let dir = TempDir::new().unwrap();
+        let paths: Vec<String> = ["bare.js", "on.js", "off.js", "unset.js", "plain.js"].map(String::from).to_vec();
+        assert!(linguist_generated(dir.path(), &paths).is_empty(), "not a git checkout: nothing is generated");
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(["init", "-q"]).output().unwrap();
+        assert!(out.status.success());
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "bare.js linguist-generated\non.js linguist-generated=true\noff.js linguist-generated=false\nunset.js -linguist-generated\n",
+        )
+        .unwrap();
+        let mut got: Vec<String> = linguist_generated(dir.path(), &paths).into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["bare.js", "on.js"]);
+        assert!(linguist_generated(dir.path(), &[]).is_empty());
+    }
+
     #[test]
     fn plan_diff_rule_plans_one_site_kind_rule_over_a_diff() {
         let dir = TempDir::new().unwrap();
