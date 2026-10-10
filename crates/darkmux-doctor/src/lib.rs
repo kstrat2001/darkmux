@@ -4076,7 +4076,7 @@ fn endpoints_status(
                  full input price for the whole conversation again ({named})"
             ),
             hint: Some(format!(
-                r#"add "dialect": "messages" to {named} in the profile registry, so it is sent Anthropic's native Messages API and its prompt caching applies. (#3173)"#
+                r#"add "dialect": "messages" to {named} in the profile registry, so each is sent Anthropic's native Messages API and its prompt caching applies. (#3173)"#
             )),
         };
     }
