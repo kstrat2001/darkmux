@@ -3854,7 +3854,9 @@ pub(crate) fn classify_hosted_response(
     };
     match status {
         429 => Err(HostedCallError::RateLimited(message())),
-        503 => Err(HostedCallError::ServerShed(message())),
+        // 529 is the overloaded status a Messages endpoint answers with:
+        // shed load like 503, retried and never charged (#3162 review).
+        503 | 529 => Err(HostedCallError::ServerShed(message())),
         500..=599 => Err(HostedCallError::Other(failure(
             HostedFailure::ServerError,
             format!("hosted endpoint returned HTTP {status}: {}", message()),

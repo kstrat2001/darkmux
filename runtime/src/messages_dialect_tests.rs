@@ -131,7 +131,8 @@ fn finish_reasons_map_onto_the_chat_completions_spellings() {
     assert_eq!(finish_reason("stop_sequence"), "stop");
     assert_eq!(finish_reason("tool_use"), "tool_calls");
     assert_eq!(finish_reason("max_tokens"), "length");
-    assert_eq!(finish_reason("refusal"), "refusal");
+    assert_eq!(finish_reason("refusal"), "content_filter");
+    assert_eq!(finish_reason("pause_turn"), "pause_turn");
 }
 
 /// A recorded-shape Messages stream (text, a tool call split across two
@@ -272,4 +273,72 @@ fn a_chat_completions_client_sends_no_anthropic_version() {
         .with_dialect(crate::lmstudio::Dialect::ChatCompletions);
     client.chat(&request(vec![Message::user("hi")])).unwrap();
     assert!(!seen.recv().unwrap().to_ascii_lowercase().contains("anthropic-version"));
+}
+
+
+/// A cut turn handed back as a trailing assistant message (the checkpoint's
+/// prefill) is followed by the continuation note, since Claude refuses a
+/// conversation that ends on the assistant.
+#[test]
+fn a_trailing_assistant_prefill_is_followed_by_the_continuation_note() {
+    let req = request(vec![Message::user("Write the file."), Message::assistant_prefill("fn main() {\n    let x = ")]);
+    let body = request_body(&req, false).unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3, "{body}");
+    assert_eq!(msgs[1], json!({"role": "assistant", "content": [{"type": "text", "text": "fn main() {\n    let x = "}]}));
+    assert_eq!(msgs[2], json!({"role": "user", "content": [{"type": "text", "text": CONTINUE_CUT_TURN}]}));
+    // A conversation that already ends on the user gets no note.
+    let ends_on_user = request_body(&request(vec![Message::user("hi")]), false).unwrap();
+    assert_eq!(ends_on_user["messages"].as_array().unwrap().len(), 1);
+}
+
+/// Two tool calls in one reply, their argument deltas interleaved, land in
+/// their own slots.
+#[test]
+fn interleaved_tool_call_deltas_land_in_their_own_calls() {
+    let events = [
+        json!({"type": "message_start", "message": {"id": "m", "usage": {"input_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t_a", "name": "read"}}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t_b", "name": "grep"}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"q\":"}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"x\"}"}}),
+    ];
+    let mut t = StreamTranslator::default();
+    let mut acc = ChunkAccumulator::new();
+    for e in &events {
+        if let Translated::Chunk(c) = t.translate(e).unwrap() {
+            acc.ingest(&c);
+        }
+    }
+    let calls = acc.into_response().choices[0].message.tool_calls.clone().unwrap();
+    let got: Vec<(&str, &str, &str)> =
+        calls.iter().map(|c| (c.id.as_str(), c.function.name.as_str(), c.function.arguments.as_str())).collect();
+    assert_eq!(got, vec![("t_a", "read", r#"{"path":"a"}"#), ("t_b", "grep", r#"{"q":"x"}"#)]);
+}
+
+/// A stream cut before `message_delta` (a client-side checkpoint, an idle
+/// cut) still reports the prompt it was served.
+#[test]
+fn a_stream_cut_before_its_final_delta_still_reports_the_prompt() {
+    let mut t = StreamTranslator::default();
+    let mut acc = ChunkAccumulator::new();
+    let start = json!({"type": "message_start", "message": {"id": "m",
+        "usage": {"input_tokens": 5, "cache_read_input_tokens": 50_000, "output_tokens": 1}}});
+    if let Translated::Chunk(c) = t.translate(&start).unwrap() {
+        acc.ingest(&c);
+    }
+    let u = acc.into_response().usage.unwrap();
+    assert_eq!((u.prompt, u.cached, u.completion, u.total), (Some(50_005), Some(50_000), None, None));
+}
+
+/// The chat-completions stream still ends at the first unparseable chunk:
+/// a valid chunk after it is never read.
+#[test]
+fn a_bad_chat_completions_chunk_ends_the_stream() {
+    use crate::lmstudio::ChunkStream;
+    let sse = "data: {not json}\n\ndata: {\"id\":\"c\",\"choices\":[]}\n\n";
+    let mut s = ChunkStream::new(std::io::BufReader::new(sse.as_bytes()));
+    assert!(s.next().unwrap().is_err());
+    assert!(s.next().is_none(), "nothing is read after a parse failure");
 }

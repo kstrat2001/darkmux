@@ -26,7 +26,8 @@ pub(crate) fn speaks_messages(url: &str) -> bool {
 pub(crate) fn body(model: &str, messages: &Value, max_tokens: u32) -> Value {
     let all = messages.as_array().map(Vec::as_slice).unwrap_or_default();
     let leading = all.iter().take_while(|m| m["role"] == "system").count();
-    let system: Vec<&str> = all[..leading].iter().filter_map(|m| m["content"].as_str()).collect();
+    let system: Vec<&str> =
+        all[..leading].iter().filter_map(|m| m["content"].as_str()).filter(|t| !t.trim().is_empty()).collect();
     let mut b = Map::new();
     b.insert("model".into(), model.into());
     b.insert("max_tokens".into(), max_tokens.into());
@@ -66,6 +67,11 @@ pub(crate) fn reply_bytes_as_chat(messages: bool, body: Vec<u8>) -> Vec<u8> {
 pub(crate) fn reply_as_chat(reply: Value) -> Value {
     if reply.get("error").is_some() || reply.get("content").is_none() {
         return reply;
+    }
+    if reply["stop_reason"] == "refusal" {
+        // An answer the model withheld is not an empty success: it reads as
+        // a rejected call, so a judge never records "" as its verdict.
+        return json!({ "error": { "message": "the model declined to answer (stop_reason: refusal)" } });
     }
     let text: String = reply["content"]
         .as_array()
@@ -198,5 +204,27 @@ mod tests {
         assert_eq!(crate::single_shot::extract_reply(&reply).content, "ok");
         with_version.assert_hits(0);
         plain.assert();
+    }
+
+    #[test]
+    fn a_refusal_reads_as_a_rejected_call_not_an_empty_answer() {
+        let chat = reply_as_chat(json!({"id": "m", "stop_reason": "refusal", "content": [], "usage": {"input_tokens": 3, "output_tokens": 0}}));
+        let parsed = crate::dispatch_internal::parse_hosted_response(chat.to_string().as_bytes());
+        assert!(parsed.is_err(), "{chat}");
+    }
+
+    #[test]
+    fn a_blank_system_message_sends_no_system() {
+        let msgs = json!([{"role": "system", "content": "  "}, {"role": "user", "content": "u"}]);
+        assert!(body("m", &msgs, 8).get("system").is_none());
+    }
+
+    #[test]
+    fn an_overloaded_529_is_shed_load_and_retried() {
+        let r = crate::dispatch_internal::classify_hosted_response(
+            Some(529),
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        assert!(matches!(r, Err(crate::dispatch_internal::HostedCallError::ServerShed(ref m)) if m == "Overloaded"));
     }
 }

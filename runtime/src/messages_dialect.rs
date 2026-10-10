@@ -11,13 +11,18 @@
 //! cacheable block and moves it forward as the conversation grows: exactly
 //! the multi-turn case.
 //!
-//! The translation keeps every model-facing text byte-identical (contract 6).
-//! Only the envelope changes:
+//! The translation keeps the model-facing text of every message (contract 6);
+//! the envelope changes, plus two documented exceptions below (a malformed
+//! tool call's arguments, and the note after a cut turn):
 //!
 //! - Leading `system` messages become the top-level `system`. A `system`
 //!   message later in the conversation (the runtime's `[darkmux-runtime]`
 //!   feedback notes) becomes a user text block with the same text, in place,
 //!   so the cached prefix ahead of it stays stable.
+//! - A conversation ending on an assistant turn (the loop's checkpoint
+//!   prefill) gets [`CONTINUE_CUT_TURN`] after it: Claude refuses a prefill.
+//! - Tool-call arguments that are not a JSON object replay wrapped as
+//!   `{"arguments": "<text>"}`, since `tool_use.input` must be an object.
 //! - An assistant turn becomes `text` and `tool_use` blocks; a `tool` message
 //!   becomes a `tool_result` block in a user turn. Consecutive turns of one
 //!   role merge into one turn, as the Messages API requires alternation.
@@ -35,6 +40,15 @@ use crate::lmstudio::{
 use anyhow::{anyhow, Result};
 use darkmux_trajectory::UsageCounts;
 use serde_json::{json, Map, Value};
+
+/// (#3162 review) Claude models refuse a conversation that ends on an
+/// assistant message ("This model does not support assistant message
+/// prefill", HTTP 400, probed on Haiku and Sonnet 5.5). The loop's
+/// checkpoint hands a cut turn back as exactly that trailing message, so in
+/// this dialect the turn stays an assistant turn and this user note follows
+/// it: the model continues the turn instead of restarting it.
+pub const CONTINUE_CUT_TURN: &str = "[darkmux-runtime] Your previous turn was cut off at the output limit. \
+Continue it exactly where it stopped, without repeating anything already written.";
 
 /// The API version header the Messages endpoint requires on every request.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -106,6 +120,9 @@ fn conversation(messages: &[Message]) -> (String, Vec<Value>) {
             _ => turns.push((role, blocks)),
         }
     }
+    if turns.last().is_some_and(|(role, _)| *role == "assistant") {
+        turns.push(("user", vec![text_block(CONTINUE_CUT_TURN)]));
+    }
     let out = turns
         .into_iter()
         .map(|(role, content)| json!({ "role": role, "content": content }))
@@ -168,6 +185,8 @@ fn finish_reason(stop_reason: &str) -> String {
         "end_turn" | "stop_sequence" => "stop",
         "tool_use" => "tool_calls",
         "max_tokens" => "length",
+        // The loop's spelling for an answer the provider withheld.
+        "refusal" => "content_filter",
         other => other,
     }
     .to_string()
@@ -259,7 +278,14 @@ impl StreamTranslator {
                 self.id = str_of(&m, "id");
                 self.model = m.get("model").and_then(Value::as_str).map(str::to_string);
                 self.start_usage = m.get("usage").cloned().unwrap_or_default();
-                Translated::Chunk(self.chunk(Delta::default(), None, None))
+                // The input side is known now: a stream cut before
+                // `message_delta` still reports the prompt it was served
+                // (output stays unreported, so the total is unknown).
+                let mut input = self.start_usage.clone();
+                if let Some(obj) = input.as_object_mut() {
+                    obj.remove("output_tokens");
+                }
+                Translated::Chunk(self.chunk(Delta::default(), None, Some(usage_counts(&input))))
             }
             "content_block_start" => self.block_start(event),
             "content_block_delta" => self.block_delta(event),
