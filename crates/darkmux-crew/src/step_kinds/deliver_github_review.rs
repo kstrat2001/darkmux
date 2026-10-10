@@ -129,6 +129,13 @@ pub struct DeliverScope {
     /// `GatherOutput::unreadable` when this kind reads a gather envelope.
     #[serde(default)]
     pub unreadable: Vec<String>,
+    /// (#3171) Changed files no rule's plan could read (each plan's
+    /// `totals.skipped`, as `<file> (<reason>)`): the review never looked
+    /// at them, so a run with any is never a clean noop and the scope line
+    /// names each. Without this, PR #3170's review reported "0 findings"
+    /// over a code change it had skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_reviewed: Vec<String>,
 }
 
 /// (#2310 fix-loop E2, S1-6) The standing narrowness of EVERY run this kind
@@ -178,7 +185,7 @@ impl DeliverScope {
     /// uncovered run.
     fn is_clean(&self) -> bool {
         let covered = self.hunks_total == 0 || self.hunks_covered >= self.hunks_total;
-        self.errored.is_empty() && self.unreadable.is_empty() && covered
+        self.errored.is_empty() && self.unreadable.is_empty() && self.not_reviewed.is_empty() && covered
     }
 
     /// The denominator for "N of M rules reviewed". `rules_total` when the
@@ -1049,6 +1056,9 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules
     let joined = |entries: &[String]| entries.iter().map(|e| inline_text(e)).collect::<Vec<_>>().join(", ");
     if !scope.not_attempted.is_empty() {
         line.push_str(&format!(" Not attempted: {}.", joined(&scope.not_attempted)));
+    }
+    if !scope.not_reviewed.is_empty() {
+        line.push_str(&format!(" Not reviewed: {}.", joined(&scope.not_reviewed)));
     }
     // (#2310 P4c-2b PR #2357 review MUST FIX D) Named so a `"degraded"`
     // run's scope line (its whole payload, when there is nothing else to
@@ -2744,6 +2754,24 @@ mod tests {
         assert!(line.contains("Not attempted: architectural review."));
     }
 
+    /// (#3171) A changed file the plan could not read was not reviewed: the
+    /// scope line names it with its reason, and a run with one is never a
+    /// clean noop, so "0 findings" is not read as "the code is clean".
+    #[test]
+    fn a_file_the_review_never_read_is_named_and_the_run_is_not_clean() {
+        let scope = DeliverScope {
+            rules_run: vec!["r1".into()],
+            hunks_covered: 1,
+            hunks_total: 1,
+            not_reviewed: vec!["src/big.rs (not valid UTF-8)".into()],
+            ..Default::default()
+        };
+        let line = scope_line(&scope, 0, &BTreeSet::new());
+        assert!(line.contains("Not reviewed: src/big.rs (not valid UTF-8)."), "{line}");
+        let out = render(&[], &[], DIFF, &scope, None);
+        assert_eq!(out.mode, "degraded", "a skipped file is never a clean noop");
+    }
+
     #[test]
     fn nothing_to_say_is_a_noop_not_an_empty_review() {
         let out = render(&[], &[], DIFF, &DeliverScope::default(), None);
@@ -3776,6 +3804,7 @@ mod tests {
             not_attempted: vec!["architectural review".into()],
             errored: Vec::new(),
             unreadable: Vec::new(),
+            not_reviewed: Vec::new(),
         };
         (findings, mods, scope)
     }

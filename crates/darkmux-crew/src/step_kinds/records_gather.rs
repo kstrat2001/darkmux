@@ -191,7 +191,8 @@ impl StepKind for RecordsGatherStepKind {
             })
             .collect();
 
-        let hunks_total: usize = crate::diff::parse_diff(&diff).iter().map(|(_, hunks)| hunks.len()).sum();
+        let hunks = crate::diff::parse_diff(&diff);
+        let hunks_total: usize = hunks.iter().map(|(_, file_hunks)| file_hunks.len()).sum();
 
         // (#2310 P4c-2b PR #2357 review CONSIDER F, MUST FIX C/D) `refused`
         // is the RUNTIME-BOUNDARY rejection count (`dispatch.unit`'s own
@@ -207,7 +208,7 @@ impl StepKind for RecordsGatherStepKind {
         let scan = scan_unit_and_plan_steps(&mission_id, &task.id);
         // (#2361 item 2) Coverage counts what a COMPLETED unit reviewed —
         // never what a plan intended. See `plan_totals`.
-        let (rules_run, hunks_covered) = plan_totals(&mission_id, hunks_total, &scan.completed_units);
+        let (rules_run, hunks_covered, not_reviewed) = plan_totals(&mission_id, &hunks, &scan.completed_units);
         not_attempted.extend(scan.not_attempted);
         // (#2310 fix-loop E2, S1-6) The rules the run never MINTED a task
         // for — see `pruned_rules`.
@@ -243,6 +244,7 @@ impl StepKind for RecordsGatherStepKind {
             // (#2425) Carried by `GatherOutput::unreadable` beside this scope;
             // `deliver.github_review` folds it in when it reads the envelope.
             unreadable: Vec::new(),
+            not_reviewed,
         };
         // (#1748) The mechanical absence-claim backstop — checks every
         // finding's own "X is missing"/"X is never called" claim against
@@ -357,16 +359,22 @@ fn pruned_rules(mission_id: &str, declared: &std::collections::BTreeMap<String, 
 /// the typed `Plan`), capped by never exceeding `hunks_total` (the diff's
 /// own true hunk count, computed separately from `crate::diff::parse_diff`)
 /// — a plan can find fewer windows than the diff has hunks, never more.
+///
+/// (#3171) A hunk is covered when a completed unit's site window overlaps
+/// it, so three windows on one hunk are ONE covered hunk. Counting distinct
+/// windows posted "3/4 hunks covered" for PR #3170, whose only reviewed
+/// hunk was its changelog entry (1 of 4).
 fn plan_totals(
     mission_id: &str,
-    hunks_total: usize,
+    hunks: &[(String, Vec<crate::diff::Hunk>)],
     completed_units: &std::collections::BTreeSet<(String, String)>,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, usize, Vec<String>) {
     let plan_dir = crate::loader::missions_dir().join(mission_id).join("plan");
     let mut rules: Vec<String> = Vec::new();
-    let mut covered: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
+    let mut not_reviewed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut covered: std::collections::BTreeSet<(String, usize)> = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(&plan_dir) else {
-        return (rules, 0);
+        return (rules, 0, Vec::new());
     };
     let mut paths: Vec<std::path::PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     paths.sort();
@@ -374,6 +382,7 @@ fn plan_totals(
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
         let Ok(raw) = std::fs::read_to_string(path) else { continue };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        not_reviewed.extend(skipped_files(&value));
         let Some(units) = value.pointer("/body/units").and_then(|v| v.as_array()) else { continue };
         let mut reviewed_anything = false;
         for unit in units {
@@ -395,18 +404,43 @@ fn plan_totals(
                 else {
                     continue;
                 };
-                covered.insert((file.to_string(), start));
+                let end = site.get("end").and_then(|v| v.as_u64()).unwrap_or(start);
+                covered.extend(hunks_overlapping(hunks, file, start, end).map(|i| (file.to_string(), i)));
             }
         }
         if reviewed_anything {
             rules.push(stem.to_string());
         }
     }
-    // Capped at `hunks_total`: a plan can find fewer distinct windows than
-    // the diff has hunks (a rule's own `applies_to`/`exclude` narrows it),
-    // never more. `hunks_total == 0` (no `diff_file` given) legitimately
-    // caps coverage at 0 too — nothing to cover without a diff.
-    (rules, covered.len().min(hunks_total))
+    // Every covered entry is a real hunk of the diff, so the count can
+    // never exceed it; no diff (`hunks` empty) covers nothing.
+    (rules, covered.len(), not_reviewed.into_iter().collect())
+}
+
+/// (#3171) A plan's `totals.skipped` entries as `<file> (<reason>)`.
+fn skipped_files(plan: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+    plan.pointer("/body/totals/skipped")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some(format!("{} ({})", e.get("file")?.as_str()?, e.get("reason")?.as_str()?)))
+}
+
+/// The indexes of `file`'s hunks whose new-side lines overlap the window
+/// `[start, end]` (a pure deletion's hunk is its `new_start` line).
+fn hunks_overlapping<'a>(
+    hunks: &'a [(String, Vec<crate::diff::Hunk>)],
+    file: &'a str,
+    start: u64,
+    end: u64,
+) -> impl Iterator<Item = usize> + 'a {
+    let within = move |line: u32| (start..=end).contains(&u64::from(line));
+    hunks
+        .iter()
+        .filter(move |(path, _)| path == file)
+        .flat_map(|(_, file_hunks)| file_hunks.iter().enumerate())
+        .filter(move |(_, h)| if h.new_lines.is_empty() { within(h.new_start) } else { h.new_lines.iter().any(|&l| within(l)) })
+        .map(|(i, _)| i)
 }
 
 /// What [`scan_unit_and_plan_steps`] found, scanning this mission's own
@@ -1221,6 +1255,73 @@ mod tests {
 
     /// Write a `plan/<rule>.json` whose `units[].sites` list is exactly
     /// `sites` — `(file, start)` pairs.
+/// (#3171) PR #3170's shape: five rules opened three different windows
+    /// (starts 77, 82, 87) on the ONE changelog hunk at line 102, and the
+    /// three code hunks were never planned. Coverage counts hunks a
+    /// completed window overlaps, so this is 1 of 4, never "3/4".
+    #[test]
+    #[serial_test::serial] // IsolatedState mutates process-global env
+    fn three_windows_on_one_hunk_cover_one_hunk() {
+        let tmp = IsolatedState::new();
+        save_phase();
+        let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        let window = |start: u64, end: u64| json!({"file": "CHANGELOG.md", "start": start, "end": end});
+        for (rule, (start, end)) in [("existing-solution", (77, 137)), ("intent-vs-diff", (82, 133)), ("test-gap", (87, 128))] {
+            std::fs::write(
+                plan_dir.join(format!("{rule}.json")),
+                serde_json::to_string(&json!({"kind": "plan.sites", "body": {"units": [
+                    {"id": "u-0001", "kind": "site", "sites": [window(start, end)]}
+                ]}}))
+                .unwrap(),
+            )
+            .unwrap();
+            save_unit_step(&format!("unit-{rule}"), rule, "u-0001", NodeStatus::Complete);
+        }
+        let diff_path = tmp.path().join("pr.diff");
+        std::fs::write(
+            &diff_path,
+            "diff --git a/CHANGELOG.md b/CHANGELOG.md\n--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -102,1 +102,2 @@\n ctx\n+entry\n\
+             diff --git a/big.rs b/big.rs\n--- a/big.rs\n+++ b/big.rs\n@@ -10,1 +10,2 @@\n ctx\n+a\n@@ -400,1 +401,2 @@\n ctx\n+b\n\
+             diff --git a/big_tests.rs b/big_tests.rs\n--- a/big_tests.rs\n+++ b/big_tests.rs\n@@ -5,1 +5,2 @@\n ctx\n+c\n",
+        )
+        .unwrap();
+
+        let out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+            .unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        let scope = &wrapped.body.scope;
+        assert_eq!((scope.hunks_covered, scope.hunks_total), (1, 4), "{scope:?}");
+    }
+
+/// (#3171) A file a plan skipped (its `totals.skipped`) reaches the
+    /// scope as not reviewed, once however many rules skipped it.
+    #[test]
+    #[serial_test::serial] // IsolatedState mutates process-global env
+    fn a_file_every_plan_skipped_reaches_the_scope_as_not_reviewed() {
+        let tmp = IsolatedState::new();
+        save_phase();
+        let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        for rule in ["intent-vs-diff", "test-gap"] {
+            std::fs::write(
+                plan_dir.join(format!("{rule}.json")),
+                serde_json::to_string(&json!({"kind": "plan.sites", "body": {"units": [],
+                    "totals": {"skipped": [{"file": "src/big.rs", "reason": "not valid UTF-8", "source": "app"}]}}}))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let diff_path = tmp.path().join("pr.diff");
+        diff_with_n_hunks(&diff_path, &["src/big.rs"]);
+        let out = RecordsGatherStepKind
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
+            .unwrap();
+        let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
+        assert_eq!(wrapped.body.scope.not_reviewed, vec!["src/big.rs (not valid UTF-8)".to_string()], "{:?}", wrapped.body.scope);
+    }
+
     fn write_plan_sites(plan_dir: &std::path::Path, rule: &str, sites: &[(&str, u64)]) {
         let units: Vec<serde_json::Value> = sites
             .iter()
@@ -1251,19 +1352,20 @@ mod tests {
     /// `distinct(sites)` both landed at the SAME capped value (3), so
     /// reverting the DISTINCT count back to a per-rule SUM (the exact
     /// CONSIDER E regression) left this test green. Rebuilt so the two
-    /// answers actually diverge: 4 hunks in the diff, 3 DISTINCT windows
-    /// (`src/a.ts:2` shared by both rules), 5 sites total summed across
+    /// answers actually diverge: 4 hunks in the diff, 3 of them covered
+    /// (`src/a.ts` and `src/b.ts` by both rules), 5 sites total summed across
     /// rules (3 + 2) — a sum-based count would read `min(5, 4) = 4`; the
-    /// correct distinct count is `3`. Mutation-killed below.
+    /// correct count is `3`. (#3171) The fixture's sites now sit on the
+    /// diff's own files and lines: coverage is by hunk overlap.
     #[test]
     #[serial_test::serial] // IsolatedState mutates process-global env
-    fn hunks_covered_counts_distinct_windows_not_the_sum_across_rules() {
+    fn hunks_covered_counts_distinct_hunks_not_the_sum_across_rules() {
         let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
-        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 2), ("src/b.ts", 5), ("src/c.ts", 9)]);
-        write_plan_sites(&plan_dir, "union-vs-enum", &[("src/a.ts", 2), ("src/b.ts", 5)]);
+        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 2), ("src/b.ts", 1), ("src/c.ts", 2)]);
+        write_plan_sites(&plan_dir, "union-vs-enum", &[("src/a.ts", 2), ("src/b.ts", 2)]);
         // (#2361 item 2) Every unit COMPLETED, so every planned window is
         // genuinely covered — this test is about the dedup arithmetic, and
         // the completed-only rule must leave it untouched.
@@ -1273,7 +1375,7 @@ mod tests {
             }
         }
         let diff_path = tmp.path().join("d.diff");
-        diff_with_n_hunks(&diff_path, &["a.ts", "b.ts", "c.ts", "d.ts"]);
+        diff_with_n_hunks(&diff_path, &["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"]);
 
         let out = RecordsGatherStepKind
             .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
@@ -1282,39 +1384,40 @@ mod tests {
         assert_eq!(wrapped.body.scope.rules_run, vec!["existing-solution".to_string(), "union-vs-enum".to_string()]);
         assert_eq!(
             wrapped.body.scope.hunks_covered, 3,
-            "3 DISTINCT (file, start) windows across both rules (5 sites summed, 4 hunks total) — a SUM-based \
+            "3 hunks covered across both rules (5 sites summed, 4 hunks total) — a SUM-based \
              count would wrongly read 4: {:?}",
             wrapped.body.scope
         );
     }
 
     /// (#2310 P4c-2b PR #2357 round-2 review item 1) The companion case:
-    /// plans find MORE distinct windows than the diff actually has hunks
-    /// (3 distinct windows, only 2 hunks in the diff) — the cap must win.
-    /// Mutation-killed below (deleting `.min(hunks_total)` reads 3, not 2).
+    /// plans find MORE windows than the diff actually has hunks (two on one
+    /// hunk, one in a file the diff never touched; 2 hunks in the diff).
+    /// (#3171) Only real hunks are counted, so the count can never exceed
+    /// the diff's own.
     #[test]
     #[serial_test::serial] // IsolatedState mutates process-global env
-    fn hunks_covered_is_capped_when_plans_find_more_windows_than_the_diff_has_hunks() {
+    fn hunks_covered_never_exceeds_the_diffs_hunks_when_plans_find_more_windows() {
         let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
-        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 2), ("src/b.ts", 5), ("src/c.ts", 9)]);
+        write_plan_sites(&plan_dir, "existing-solution", &[("src/a.ts", 1), ("src/a.ts", 2), ("src/c.ts", 1)]);
         // (#2361 item 2) All three units completed — the cap, not the
         // completed-only rule, is what this test measures.
         for u in 1..=3 {
             save_unit_step(&format!("unit-es-{u}"), "existing-solution", &format!("u-{u:04}"), NodeStatus::Complete);
         }
         let diff_path = tmp.path().join("d.diff");
-        diff_with_n_hunks(&diff_path, &["a.ts", "b.ts"]);
+        diff_with_n_hunks(&diff_path, &["src/a.ts", "src/b.ts"]);
 
         let out = RecordsGatherStepKind
             .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(
-            wrapped.body.scope.hunks_covered, 2,
-            "3 distinct windows found but the diff only has 2 hunks — the cap must win: {:?}",
+            wrapped.body.scope.hunks_covered, 1,
+            "3 windows, two on src/a.ts's one hunk and one in a file the diff never touched: 1 hunk: {:?}",
             wrapped.body.scope
         );
     }
