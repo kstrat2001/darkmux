@@ -70,6 +70,10 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # `load_registry` at five sites) stay invisible to the #2632 env-read audit.
 # Dev-dep only; off in the release binary.
 darkmux-profiles = { path = "../darkmux-profiles", features = ["test-support"] }
+# (#3125) The fake Redis peers (`spawn_acking_redis_peer`, `refused_redis_port`)
+# the `beats` promise tests drive each dispatch path against. Dev-dep only;
+# off in the release binary.
+darkmux-flow = { path = "../darkmux-flow", features = ["test-support"] }
 
 # (#2108) The host probe's mach kernel-counter reads (`host_processor_info`,
 # `host_statistics64`, `sysctlbyname`) and its `dlopen`/`dlsym` of the PRIVATE

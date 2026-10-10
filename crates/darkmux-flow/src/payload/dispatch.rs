@@ -372,6 +372,15 @@ pub struct DispatchStartPayload {
     #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
+    /// (#3125, flow schema 2.2.0) The writer beats this session's presence
+    /// key (`darkmux:session-presence:<sid>`) for as long as the execution
+    /// runs, and its first beat landed. A reader may then read the beat gone,
+    /// on a machine still reporting, as the execution having ended. Absent
+    /// (every record before 2.2.0, and a writer whose beat is not published)
+    /// promises nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<bool>", optional))]
+    pub beats: bool,
 }
 
 impl Attribution for DispatchStartPayload {

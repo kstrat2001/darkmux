@@ -95,6 +95,20 @@ pub fn session_key(session_id: &str) -> String {
 /// Redis blip must never crash the dispatch, so errors propagate for the
 /// emitter to swallow.
 pub fn write_session_beat(client: &redis::Client, beat: &SessionBeat, ttl_secs: u64) -> Result<()> {
+    write_session_beat_within(client, beat, ttl_secs, crate::REDIS_RESPONSE_TIMEOUT)
+}
+
+/// [`write_session_beat`] with its `SET` bounded by `response_bound` rather
+/// than the usual [`crate::REDIS_RESPONSE_TIMEOUT`]. (#3125) The emitter's
+/// first beat runs before the caller writes its start record, so it waits no
+/// longer for a hub's answer than darkmux waits to connect at all
+/// ([`REDIS_CONNECT_TIMEOUT`]).
+fn write_session_beat_within(
+    client: &redis::Client,
+    beat: &SessionBeat,
+    ttl_secs: u64,
+    response_bound: std::time::Duration,
+) -> Result<()> {
     let payload = serde_json::to_string(beat).context("serializing session beat")?;
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for session-beat write")?;
@@ -103,7 +117,8 @@ pub fn write_session_beat(client: &redis::Client, beat: &SessionBeat, ttl_secs: 
     // `SessionEmitter::stop`'s `h.join()` never returns and the dispatch
     // strands without its terminal record. With the deadline the write fails,
     // the beat lapses (the TTL covers that), and teardown proceeds.
-    bound_redis_response(&conn);
+    let _ = conn.set_read_timeout(Some(response_bound));
+    let _ = conn.set_write_timeout(Some(response_bound));
     let _: redis::Value = redis::cmd("SET")
         .arg(session_key(&beat.session_id))
         .arg(payload)
@@ -178,9 +193,23 @@ pub struct SessionEmitter {
     /// always runs `Drop` immediately afterward — never pays for the
     /// teardown twice.
     beat_removed: bool,
+    /// (#3125) The first beat was written, synchronously, before this
+    /// emitter was handed back: see [`SessionEmitter::beats`].
+    first_beat_written: bool,
 }
 
 impl SessionEmitter {
+    /// (#3125) Whether this session's beat is really published: its first
+    /// beat landed before the emitter was handed back. The session's start
+    /// record carries this as its `beats` promise, and a reader then counts a
+    /// missing beat as an ending. `false` when the write failed (Redis down,
+    /// refusing writes, or a process with no Keychain access whose password-less
+    /// connection is refused), so a beat that never existed is never read as
+    /// one that stopped.
+    pub fn beats(&self) -> bool {
+        self.first_beat_written
+    }
+
     /// Stop the heartbeat, join the refresh thread, and DELete the key so
     /// the live view drops the session immediately (rather than waiting out
     /// the TTL). Best-effort: a Redis blip on the final DEL just means the
@@ -288,6 +317,12 @@ impl Drop for SessionEmitter {
     }
 }
 
+/// (#3125) The `beats` promise a start record carries for `emitter`: true
+/// only when an emitter exists and its first beat was written.
+pub fn beats(emitter: Option<&SessionEmitter>) -> bool {
+    emitter.is_some_and(SessionEmitter::beats)
+}
+
 /// Spawn a session-liveness heartbeat for the duration of a dispatch.
 /// Refreshes `darkmux:session-presence:<session_id>` every
 /// [`DEFAULT_BEAT_INTERVAL_SECS`] with a [`DEFAULT_TTL_SECS`] TTL until the
@@ -331,11 +366,38 @@ fn spawn_with_client(
     let thread_stop = Arc::clone(&stop);
     let thread_client = client.clone();
     let beat_session_id = session_id.clone();
+    // (#3125) The first beat, written here before the caller writes its start
+    // record, so the record can say whether the beat is really published
+    // ([`SessionEmitter::beats`]). Its `SET` is bounded by
+    // `REDIS_CONNECT_TIMEOUT`, not the usual response bound: a start record
+    // never waits longer for a liveness promise than darkmux waits to connect.
+    // A first beat that misses it promises nothing; the thread keeps beating.
+    let first_beat = SessionBeat {
+        session_id: session_id.clone(),
+        machine_uid: machine_uid.clone(),
+        display_name: display_name.clone(),
+        role: role.clone(),
+        model: model.clone(),
+        mission_id: mission_id.clone(),
+        beat_ts_ms: crate::presence::now_ms(),
+    };
+    let first_beat_written = write_session_beat_within(&client, &first_beat, DEFAULT_TTL_SECS, REDIS_CONNECT_TIMEOUT).is_ok();
 
     let handle = std::thread::Builder::new()
         .name("darkmux-session-presence".to_string())
         .spawn(move || {
-            while !thread_stop.load(Ordering::SeqCst) {
+            // (#3125) The first beat was written before this thread started
+            // (see `first_beat` above), so each lap rests first, then beats.
+            loop {
+                for _ in 0..(DEFAULT_BEAT_INTERVAL_SECS * 4) {
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 let beat = SessionBeat {
                     session_id: beat_session_id.clone(),
                     machine_uid: machine_uid.clone(),
@@ -348,14 +410,6 @@ fn spawn_with_client(
                 // Best-effort: a failed write just means the key may lapse;
                 // the next beat re-establishes it. Never crash the dispatch.
                 let _ = write_session_beat(&thread_client, &beat, DEFAULT_TTL_SECS);
-                // Interruptible sleep: check the stop flag every 250ms so
-                // teardown joins promptly instead of waiting a full interval.
-                for _ in 0..(DEFAULT_BEAT_INTERVAL_SECS * 4) {
-                    if thread_stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
             }
         })
         .ok()?;
@@ -366,6 +420,7 @@ fn spawn_with_client(
         client,
         session_id,
         beat_removed: false,
+        first_beat_written,
     })
 }
 
@@ -595,6 +650,53 @@ mod tests {
     /// runs twice. Both the SET NX and the DEL are idempotent, so the final
     /// STATE (key gone, claim present) looks identical either way — only a
     /// call count can tell them apart.
+    /// (#3125) An emitter promises a beat only when its first beat really
+    /// landed: a start record carrying `beats` lets every reader read the beat
+    /// gone as the run ended, so a refused write (a peer that refuses the
+    /// connection here; Redis refusing writes, or no Keychain password, in
+    /// production) must promise nothing.
+    #[test]
+    fn an_emitter_promises_a_beat_only_once_its_first_beat_landed() {
+        let fake = fake_redis::FakeRedis::spawn();
+        let sid = test_session("sid-3125-promise");
+        let emitter = spawn_with_client(redis::Client::open(fake.url().as_str()).unwrap(), &sid, None, None).expect("spawn emitter");
+        assert!(fake.contains(&session_key(&sid.wire())), "the first beat is written before the emitter is handed back");
+        assert!(beats(Some(&emitter)), "a beat that landed is promised");
+        emitter.stop();
+
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        let dead = spawn_with_client(redis::Client::open(format!("redis://127.0.0.1:{port}").as_str()).unwrap(), &test_session("sid-3125-refused"), None, None)
+            .expect("an emitter still spawns: the beat is best-effort");
+        assert!(!beats(Some(&dead)), "a beat that never landed is not promised");
+        assert!(!beats(None), "no emitter, no promise");
+    }
+
+    /// (#3125) Against a hub that accepts and never answers, the first beat
+    /// gives up within `REDIS_CONNECT_TIMEOUT` (plus the local connect), not
+    /// the 1 s response bound, so a dispatch's start waits no longer for its
+    /// liveness promise than darkmux waits to connect; and the start then
+    /// promises nothing.
+    #[test]
+    fn the_first_beat_against_a_silent_hub_gives_up_within_the_connect_bound() {
+        // Budget: the phase guard, the first beat, and the teardown's SET NX and DEL.
+        let port = crate::spawn_silent_redis_peer(6);
+        crate::assert_silent_peer_reaches_command_phase(port);
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str()).unwrap();
+        let start = std::time::Instant::now();
+        let emitter = spawn_with_client(client, &test_session("sid-3125-silent-first-beat"), None, None).expect("spawn emitter");
+        let elapsed = start.elapsed();
+        assert!(!emitter.beats(), "an unanswered first beat promises nothing");
+        let ceiling = REDIS_CONNECT_TIMEOUT + std::time::Duration::from_millis(250);
+        assert!(
+            elapsed < ceiling,
+            "the first beat took {elapsed:?} against a silent hub; it must give up within {ceiling:?} \
+             (REDIS_CONNECT_TIMEOUT plus a local connect), not the 1 s response bound"
+        );
+        drop(emitter); // bounded teardown, outside the measured window
+    }
+
     #[test]
     fn stop_deletes_the_presence_key_immediately() {
         let fake = fake_redis::FakeRedis::spawn();
@@ -904,6 +1006,10 @@ mod tests {
         let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
             .expect("open client against the fake peer");
 
+        // (#3125) The first beat's SET runs inside the spawn now (the start
+        // record promises a beat only once it landed), so the window spans the
+        // spawn too: the dispatch waits on it before writing `dispatch.start`.
+        let start = std::time::Instant::now();
         let emitter = spawn_with_client(
             client,
             &test_session("sid-2227-teardown"),
@@ -911,19 +1017,13 @@ mod tests {
             None,
         )
         .expect("spawn emitter");
-
-        // Let the beat thread get INSIDE the SET before tearing down — that is
-        // the state `dispatch_internal` tears down from, and the state whose
-        // `h.join()` wedged.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-
-        let start = std::time::Instant::now();
+        assert!(!emitter.beats(), "a silent peer never acknowledged the first beat");
         emitter.stop();
         let elapsed = start.elapsed();
 
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "SessionEmitter::stop() took {elapsed:?} against a command-silent \
+            "spawning and stopping a SessionEmitter took {elapsed:?} against a command-silent \
              peer; expected bounded by 3 x REDIS_RESPONSE_TIMEOUT + connects \
              (~3.1s measured). Before #2227 this wedged (measured 89.42s), \
              stranding the dispatch with no terminal record."

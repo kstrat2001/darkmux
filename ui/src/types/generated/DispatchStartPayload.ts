@@ -80,4 +80,13 @@ step_id?: string,
  * The provenance a dispatch caller supplied (the crawl launcher's workspace, source, sha,
  * rule, unit), a [`RecordContext`].
  */
-context?: RecordContext, };
+context?: RecordContext, 
+/**
+ * (#3125, flow schema 2.2.0) The writer beats this session's presence
+ * key (`darkmux:session-presence:<sid>`) for as long as the execution
+ * runs, and its first beat landed. A reader may then read the beat gone,
+ * on a machine still reporting, as the execution having ended. Absent
+ * (every record before 2.2.0, and a writer whose beat is not published)
+ * promises nothing.
+ */
+beats?: boolean, };

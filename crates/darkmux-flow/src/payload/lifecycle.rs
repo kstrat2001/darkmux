@@ -500,6 +500,15 @@ pub struct RunPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stop_reason: Option<String>,
+    /// (#3125, flow schema 2.2.0) On a `run.start` only: the launcher beats
+    /// the run's session presence key for the whole run, and its first beat
+    /// landed (`mission launch`). A reader may then read the beat gone, on a
+    /// machine still reporting, as the run having ended. Absent on a run
+    /// whose launcher beats nothing (an ACP panel run) and on every record
+    /// before 2.2.0: it promises nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<bool>", optional))]
+    pub beats: bool,
 }
 
 impl Attribution for RunPayload {}

@@ -3319,6 +3319,120 @@
         assert!(actions.contains(&"dispatch.complete"), "must have emitted dispatch complete: {actions:?}");
     }
 
+    /// (#3125) Run `f` with `DARKMUX_REDIS_URL` pointed at `url`, restoring it.
+    fn with_redis_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", url) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        out
+    }
+
+    /// (#3125) A hub that acks every command, and one that refuses every
+    /// connection: the two cases the `beats` promise is decided by.
+    fn healthy_and_refused_hubs() -> [(String, bool); 2] {
+        let (port, _log) = darkmux_flow::spawn_acking_redis_peer();
+        [
+            (format!("redis://127.0.0.1:{port}"), true),
+            (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
+        ]
+    }
+
+    /// (#3125) The hosted path's `dispatch.start` promises its session beat
+    /// (`beats: true`) exactly when the emitter's first beat landed, and says
+    /// nothing when the hub refused it: a reader reads a promised beat gone as
+    /// the dispatch having ended, so a path that forgets the promise brings
+    /// the SIGKILL bug back, and one that promises a beat that never landed
+    /// abandons a live run.
+    #[test]
+    #[serial]
+    fn dispatch_unmanaged_promises_its_beat_exactly_when_the_first_beat_landed() {
+        for (url, landed) in healthy_and_refused_hubs() {
+            let (base_url, _rx) = one_shot_http_mock(
+                r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            );
+            let home = TempDir::new().unwrap();
+            let flows_dir = TempDir::new().unwrap();
+            let prev_home = std::env::var("DARKMUX_HOME").ok();
+            let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+            unsafe {
+                std::env::set_var("DARKMUX_HOME", home.path());
+                std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            }
+            let session = crate::test_session(&format!("beats-3125-hosted-{landed}"));
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "pr-reviewer".to_string();
+            opts.session = session.clone();
+            opts.json = false;
+            let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
+            let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+            let result = with_redis_url(&url, || {
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target)
+            });
+            unsafe {
+                match prev_home {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+                match prev_flows {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+            }
+            result.expect("dispatch_unmanaged must succeed against the mock server");
+            let start = start_payload_on_disk(flows_dir.path(), &session.wire());
+            assert_eq!(start.get("beats").and_then(|b| b.as_bool()), landed.then_some(true), "hub {url}: {start}");
+        }
+    }
+
+    /// The `dispatch.start` payload written for `session_id` under `flows_dir`.
+    fn start_payload_on_disk(flows_dir: &std::path::Path, session_id: &str) -> serde_json::Value {
+        for entry in std::fs::read_dir(flows_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if v["session_id"] == session_id && v["action"] == "dispatch.start" {
+                    return v.get("payload").cloned().unwrap_or_else(|| serde_json::json!({}));
+                }
+            }
+        }
+        panic!("no dispatch.start for {session_id} under {}", flows_dir.display());
+    }
+
+    /// (#3125) The container path's start payload, the part of it Docker does
+    /// not decide: it promises the beat exactly when its emitter's first beat
+    /// landed, and keeps the endpoint and resume provenance it always carried.
+    #[test]
+    #[serial]
+    fn the_container_start_promises_its_beat_exactly_when_the_first_beat_landed() {
+        for (url, landed) in healthy_and_refused_hubs() {
+            let session = crate::test_session(&format!("beats-3125-container-{landed}"));
+            let emitter = with_redis_url(&url, || darkmux_flow::session_presence::spawn_session_emitter(&session, None, None));
+            let payload = container_start_payload(
+                DispatchStartPayload::default(),
+                Some("azure:host/gpt"),
+                Some(std::path::Path::new("/prior/out")),
+                emitter.as_ref(),
+                &None,
+            );
+            let darkmux_flow::Payload::DispatchStart(p) = payload else { panic!("a dispatch.start payload") };
+            assert_eq!(p.beats, landed, "hub {url}");
+            assert_eq!(p.endpoint.as_deref(), Some("azure:host/gpt"));
+            assert_eq!(p.resumed_from.as_deref(), Some("/prior/out"));
+            if let Some(e) = emitter {
+                e.stop();
+            }
+        }
+    }
+
     /// Two missions launching the SAME config run the same step `s1-1645`
     /// under two sessions, one per run: `dispatch_unmanaged` runs under its
     /// caller's session, whichever arm the resolved profile routes to.

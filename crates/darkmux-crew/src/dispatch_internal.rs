@@ -4187,6 +4187,8 @@ fn dispatch_unmanaged(
                 // record, so which records a dispatch was briefed on has to be
                 // its own key on EVERY dispatch path, not just one.
                 brief_refs: Some(opts.brief_refs.clone()),
+                // (#3125) Its emitter (above) published its first beat.
+                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
                 ..Default::default()
             }),
         ),
@@ -4512,6 +4514,22 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     };
     let dispatch_bucket = admit_local_single_shot(&opts, managed_pm.as_ref(), &model_id, &budget_caller)?;
 
+    // (#2344) Session-liveness heartbeat — see the hosted path above for the
+    // full reasoning. This is the primitive `darkmux acp`'s radio answering
+    // seat runs on (`src/radio_answer.rs` via
+    // `darkmux_fleet::routing::dispatch_routed_via`; #2914 moved the
+    // routing seat to the lean utility path, which beats no presence), so
+    // before this the
+    // ONLY interactive local-AI surface darkmux ships was also the one the
+    // live fleet view could never show as running.
+    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        session,
+        Some(opts.role_id.clone()),
+        Some(model_id.clone()),
+    );
+    // (#3125) Spawned before the `dispatch.start` below, which promises the
+    // beat only once it published.
+
     let mut flow_sink = |r: darkmux_flow::FlowRecord| {
         let _ = darkmux_flow::record(r);
     };
@@ -4547,24 +4565,12 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 prompt_chars: Some(opts.message.chars().count() as u64),
                 // (#2295) Same field, same reason — see the hosted path above.
                 brief_refs: Some(opts.brief_refs.clone()),
+                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
                 ..Default::default()
             }),
         ),
     );
 
-    // (#2344) Session-liveness heartbeat — see the hosted path above for the
-    // full reasoning. This is the primitive `darkmux acp`'s radio answering
-    // seat runs on (`src/radio_answer.rs` via
-    // `darkmux_fleet::routing::dispatch_routed_via`; #2914 moved the
-    // routing seat to the lean utility path, which beats no presence), so
-    // before this the
-    // ONLY interactive local-AI surface darkmux ships was also the one the
-    // live fleet view could never show as running.
-    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        session,
-        Some(opts.role_id.clone()),
-        Some(model_id.clone()),
-    );
 
     let t0 = SystemTime::now();
     let req = crate::single_shot::SingleShotRequest {
@@ -6509,9 +6515,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     }
     let remote_needs_auth = remote_auth.is_some();
 
+    // (#638) Session liveness heartbeat. (#3125) Spawned before the
+    // `dispatch.start` below, which promises the beat only once it published. While THIS dispatch process lives,
+    // refresh a short-TTL `darkmux:session-presence:<sid>` Redis key so the
+    // live fleet view keys "running" on the key's existence — a crashed /
+    // killed / watchdog-timed-out dispatch (which never emits a clean
+    // dispatch.complete) ages out of the live set instead of showing
+    // "running" forever. Self-disables when DARKMUX_REDIS_URL is unset. The
+    // TTL is the backstop only for the one exit this can't observe (the
+    // whole host process dying before Drop can run); `stop()` after the
+    // container exits DELetes the key for an instant drop on the clean path.
+    // Held to end-of-fn; an early `?`-return drops it, and `SessionEmitter::
+    // drop` (#2344) now removes the key itself the same way `stop()` does,
+    // rather than only halting the thread and leaving the TTL to age it out.
+    let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        &session,
+        Some(opts.role_id.clone()),
+        Some(model.clone()),
+    );
+
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id.
-    let mut dispatch_start_payload = dispatch_start_payload(
+    let dispatch_start_payload = dispatch_start_payload(
         &image,
         &opts.message,
         &system_prompt,
@@ -6522,27 +6547,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         allowed_tools.as_deref(),
         &opts.brief_refs,
     )?;
-    // (#1187 follow-up) Mirror `dispatch_unmanaged`'s `"endpoint": label` field —
-    // its absence, not just its presence, is meaningful to the viewer (no
-    // field ⇒ rendered as local LMStudio), so this must be set whenever the
-    // container's brain is actually remote.
-    if let Some(label) = &unmanaged_endpoint_raw_label {
-        dispatch_start_payload.endpoint = Some(label.clone());
-    }
-    // (#2114 follow-up) Resume provenance the viewer/flow log render —
-    // names the SOURCE dir (the prior dispatch's host_out), distinct from
-    // this dispatch's own `out_dir` (recorded elsewhere on the result).
-    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
-    // above.
-    if let Some(resume_from) = &opts.resume_from {
-        dispatch_start_payload.resumed_from = Some(resume_from.display().to_string());
-    }
-    // (#1959) Provenance the runtime can't derive on its own (the crawl
-    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
-    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
-    // unset.
-    let mut dispatch_start_payload = darkmux_flow::Payload::DispatchStart(dispatch_start_payload);
-    merge_record_context(&mut dispatch_start_payload, &opts.record_context);
+    let dispatch_start_payload = container_start_payload(
+        dispatch_start_payload,
+        unmanaged_endpoint_raw_label.as_deref(),
+        opts.resume_from.as_deref(),
+        session_emitter.as_ref(),
+        &opts.record_context,
+    );
     // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
     // `open()` — arms it, so any `?`-return or panic before the clean
     // `dispatch.complete` below emits a `dispatch.error` terminal so the
@@ -6594,24 +6605,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 payload,
             ));
         };
-
-    // (#638) Session liveness heartbeat. While THIS dispatch process lives,
-    // refresh a short-TTL `darkmux:session-presence:<sid>` Redis key so the
-    // live fleet view keys "running" on the key's existence — a crashed /
-    // killed / watchdog-timed-out dispatch (which never emits a clean
-    // dispatch.complete) ages out of the live set instead of showing
-    // "running" forever. Self-disables when DARKMUX_REDIS_URL is unset. The
-    // TTL is the backstop only for the one exit this can't observe (the
-    // whole host process dying before Drop can run); `stop()` after the
-    // container exits DELetes the key for an instant drop on the clean path.
-    // Held to end-of-fn; an early `?`-return drops it, and `SessionEmitter::
-    // drop` (#2344) now removes the key itself the same way `stop()` does,
-    // rather than only halting the thread and leaving the TTL to age it out.
-    let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        &session,
-        Some(opts.role_id.clone()),
-        Some(model.clone()),
-    );
 
     // 6. Spawn the docker container. Async via `spawn()` (vs the older
     //    `output()`) so the live trajectory tailer (step 7) can run in
@@ -9848,6 +9841,43 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
 /// One nested key so it can never collide with a record's own top-level
 /// fields. A `None` context, or a payload type with no `context` field, is a
 /// no-op — never a partial/corrupted merge.
+/// The container path's `dispatch.start` payload, from the runtime metadata
+/// [`dispatch_start_payload`] built. Split out (#3125) so the `beats` promise,
+/// the one fact a reader needs to read this dispatch's lost beat as its end,
+/// is tested without Docker.
+fn container_start_payload(
+    mut payload: DispatchStartPayload,
+    endpoint_label: Option<&str>,
+    resume_from: Option<&std::path::Path>,
+    session_emitter: Option<&darkmux_flow::session_presence::SessionEmitter>,
+    record_context: &Option<darkmux_flow::payload::RecordContext>,
+) -> darkmux_flow::Payload {
+    // (#1187 follow-up) Mirror `dispatch_unmanaged`'s `"endpoint": label` field —
+    // its absence, not just its presence, is meaningful to the viewer (no
+    // field ⇒ rendered as local LMStudio), so this must be set whenever the
+    // container's brain is actually remote.
+    if let Some(label) = endpoint_label {
+        payload.endpoint = Some(label.to_string());
+    }
+    // (#2114 follow-up) Resume provenance the viewer/flow log render —
+    // names the SOURCE dir (the prior dispatch's host_out), distinct from
+    // this dispatch's own `out_dir` (recorded elsewhere on the result).
+    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
+    // above.
+    if let Some(resume_from) = resume_from {
+        payload.resumed_from = Some(resume_from.display().to_string());
+    }
+    // (#3125) The beat this dispatch publishes, promised on its start.
+    payload.beats = darkmux_flow::session_presence::beats(session_emitter);
+    // (#1959) Provenance the runtime can't derive on its own (the crawl
+    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
+    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
+    // unset.
+    let mut payload = darkmux_flow::Payload::DispatchStart(payload);
+    merge_record_context(&mut payload, record_context);
+    payload
+}
+
 fn merge_record_context(payload: &mut darkmux_flow::Payload, record_context: &Option<darkmux_flow::payload::RecordContext>) {
     if let Some(ctx) = record_context {
         payload.attribute_context(ctx);

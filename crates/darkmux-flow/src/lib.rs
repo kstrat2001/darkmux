@@ -1313,6 +1313,54 @@ pub fn bound_redis_response(conn: &redis::Connection) {
 pub(crate) const SILENT_PEER_HOLD: std::time::Duration =
     std::time::Duration::from_millis(REDIS_RESPONSE_TIMEOUT.as_millis() as u64 * 5);
 
+/// (#3125) Test support: a fake Redis peer that completes redis-rs's
+/// connection-setup handshake and then answers `+OK` to every command,
+/// recording each read in the returned log. A `SET`, `SET NX` or `DEL` then
+/// succeeds, so a session emitter's first beat lands: the healthy-hub case
+/// the `beats` promise is written for. Each connection is served on its own
+/// thread for as long as the client keeps it open.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_acking_redis_peer() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let accept_log = std::sync::Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let log = std::sync::Arc::clone(&accept_log);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let _ = stream.write_all(b"+OK\r\n+OK\r\n");
+                let _ = stream.flush();
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            log.lock().unwrap_or_else(|e| e.into_inner()).push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                            if stream.write_all(b"+OK\r\n").and_then(|_| stream.flush()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (port, log)
+}
+
+/// (#3125) Test support: a loopback port nothing listens on, so every Redis
+/// connection to it is refused: the dead-hub case, where a session emitter's
+/// first beat never lands and its start must promise nothing.
+#[cfg(any(test, feature = "test-support"))]
+pub fn refused_redis_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().unwrap().port()
+}
+
 /// (#2227) Spawn a fake Redis peer that COMPLETES redis-rs's connection-setup
 /// handshake and then answers nothing.
 ///
@@ -3982,6 +4030,8 @@ mod tests {
         //            `run.error` and `step.error`, the operator's stop that
         //            ended the execution, the run or the step. Also
         //            additive (#3168): `cache_write_tokens` on the usage record.
+        //            Also additive (#3125): `beats` on `dispatch.start` and
+        //            `run.start`, the writer's promise to beat its session.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

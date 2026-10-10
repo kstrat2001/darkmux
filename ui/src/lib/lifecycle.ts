@@ -59,7 +59,8 @@
  *    same session does not: missions launched from one config share a task
  *    session and run at once (#2125).
  * 6. A mission's run session (`runRef.ts`'s `run` grain, opened by
- *    `run.start`) never beats itself; its executions do. Its activity and
+ *    `run.start`) beats itself only under `mission launch` (#2877; an ACP
+ *    panel run's does not); its executions do. Its activity and
  *    its waits are its mission's other runs' too, so it is in flight while
  *    any of them is.
  */

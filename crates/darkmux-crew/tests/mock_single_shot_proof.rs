@@ -503,3 +503,90 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
     assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
     assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
 }
+
+/// (#3125) The local single-shot's `dispatch.start` promises the session beat
+/// (`beats: true`) exactly when its emitter's first beat landed, and says
+/// nothing when the hub refused it. A reader reads a promised beat gone as the
+/// dispatch having ended, so this promise is the whole of the SIGKILL fix on
+/// this path.
+#[test]
+#[serial_test::serial]
+fn a_local_single_shot_promises_its_beat_exactly_when_the_first_beat_landed() {
+    let (port, _log) = darkmux_flow::spawn_acking_redis_peer();
+    for (url, landed) in [
+        (format!("redis://127.0.0.1:{port}"), true),
+        (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
+    ] {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+                "id": "mock-1", "object": "chat.completion", "created": 0, "model": "mock-model",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+            }));
+        });
+        let registry_dir = tempfile::tempdir().unwrap();
+        let profiles_path = write_mock_profiles_registry(registry_dir.path());
+        let flows_dir = tempfile::tempdir().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::set_var("DARKMUX_REDIS_URL", &url);
+        }
+        let session = darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::standalone("test").unwrap(),
+            "coder",
+            format!("beats-3125-local-{landed}-{}", std::process::id()),
+        );
+        let opts = DispatchOpts {
+            finding_sites: None,
+            allow_utility_model: false,
+            remote_origin: None,
+            live_channel: true,
+            brief_refs: Vec::new(),
+            workspace_read_only: false,
+            record_context: None,
+            resume_from: None,
+            host_out: None,
+            max_turns_override: None,
+            timeout_override_seconds: None,
+            role_id: "radio-host".to_string(),
+            message: "hello".to_string(),
+            session: session.clone(),
+            timeout_seconds: 30,
+            skip_preflight: true,
+            json: false,
+            workdir: None,
+            phase_id: None,
+            machine: None,
+            wait: true,
+            compaction: CompactionDispatchArgs::default(),
+            profile_name: Some("mock".to_string()),
+            config_path: Some(profiles_path.to_string_lossy().to_string()),
+            force_container: false,
+            max_completion_tokens: None,
+            image: None,
+            model_base_url_override: Some(server.base_url()),
+            step_id: None,
+            system_prompt_override: None,
+        };
+        let result = dispatch_local_single_shot(opts);
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        result.expect("the mock round trip succeeds");
+        let records = flow_records_for_session(flows_dir.path(), &session.wire());
+        let start = records.iter().find(|r| r["action"] == "dispatch.start").expect("a dispatch.start");
+        let beats = start.get("payload").and_then(|p| p.get("beats")).and_then(Value::as_bool);
+        assert_eq!(beats, landed.then_some(true), "hub {url}: {start}");
+    }
+}

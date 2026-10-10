@@ -882,6 +882,9 @@ struct ExecutionBookends<'a> {
     step: &'a Step,
     model: &'a str,
     endpoint_label: Option<&'a str>,
+    /// (#3125) The step's session emitter publishes its beat
+    /// (`session_presence::beats`): the `dispatch.start` promises it.
+    beats: bool,
 }
 
 impl ExecutionBookends<'_> {
@@ -911,6 +914,7 @@ impl ExecutionBookends<'_> {
             kind: Some(self.kind.to_string()),
             item_index,
             endpoint: self.endpoint_label.map(str::to_string),
+            beats: self.beats,
             ..Default::default()
         }
     }
@@ -1124,6 +1128,10 @@ impl DispatchSingleShotStepKind {
         // `StepBookend`'s Drop.
         let endpoint_label: Option<String> =
             endpoint.as_ref().map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
+        // (#3125) The emitter (its reasoning below) spawns BEFORE the start
+        // record, so the record can promise a beat that really published.
+        let mut session_emitter =
+            darkmux_flow::session_presence::spawn_session_emitter(session, None, Some(wire_model.to_string()));
         let records = ExecutionBookends {
             kind: "dispatch.single_shot",
             session,
@@ -1131,6 +1139,7 @@ impl DispatchSingleShotStepKind {
             step,
             model: wire_model.as_ref(),
             endpoint_label: endpoint_label.as_deref(),
+            beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
         };
         let mut bookend = records.open(ctx, None, "dispatch.single_shot terminated before completion (early return or panic)");
 
@@ -1148,9 +1157,8 @@ impl DispatchSingleShotStepKind {
         // age the key out.
         //
         // See `DispatchMapStepKind::run_map`'s own spawn site for why the
-        // key is TASK-scoped here rather than step-scoped.
-        let mut session_emitter =
-            darkmux_flow::session_presence::spawn_session_emitter(session, None, Some(wire_model.to_string()));
+        // key is TASK-scoped here rather than step-scoped. Spawned above,
+        // before the start record (#3125).
 
         let mut flow_records = Vec::new();
 
@@ -1906,6 +1914,7 @@ impl DispatchMapStepKind {
                 step,
                 model: wire_model.as_ref(),
                 endpoint_label: endpoint_label.as_deref(),
+                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
             };
             let mut bookend = records.open(
                 ctx,
@@ -4004,6 +4013,7 @@ mod tests {
             step: &s,
             model: "m",
             endpoint_label: None,
+            beats: false,
         };
         let mut start = records.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchStart(records.start_payload(None)));
         start.ts = "2000-01-01T00:00:00Z".to_string();
@@ -6959,6 +6969,89 @@ mod tests {
         port
     }
 
+    /// (#3125) Run `f` with `DARKMUX_REDIS_URL` at an acking hub (`true`) and
+    /// at one that refuses every connection (`false`), restoring the variable.
+    fn for_healthy_and_refused_hubs(mut f: impl FnMut(bool)) {
+        let (port, _log) = darkmux_flow::spawn_acking_redis_peer();
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        for (url, landed) in [
+            (format!("redis://127.0.0.1:{port}"), true),
+            (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
+        ] {
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", url) };
+            f(landed);
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+    }
+
+    /// (#3125) Every `dispatch.map` item's `dispatch.start` promises the task
+    /// session's beat exactly when the emitter's first beat landed, and says
+    /// nothing when the hub refused it.
+    #[test]
+    #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
+    fn dispatch_map_items_promise_the_beat_exactly_when_the_first_beat_landed() {
+        for_healthy_and_refused_hubs(|landed| {
+            let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| {
+                Ok(crate::single_shot::SingleShotReply {
+                    content: "ok".to_string(),
+                    model: None,
+                    counts: darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() },
+                })
+            });
+            let s = map_step(json!({ "model": "qwen3.6-35b", "user_template": "check {item}", "collection": ["a", "b"] }));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
+            drop(ctx);
+            let starts: Vec<serde_json::Value> = rx
+                .into_iter()
+                .filter_map(|sig| match sig {
+                    crate::step_kinds::WaveSignal::Record(r) if r.action == darkmux_flow::FlowAction::DispatchStart => Some(r.payload_json()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts.len(), 2, "one start per item");
+            for start in &starts {
+                assert_eq!(start.get("beats").and_then(|b| b.as_bool()), landed.then_some(true), "landed={landed}: {start}");
+            }
+        });
+    }
+
+    /// (#3125) `dispatch.single_shot`'s start says nothing when the hub refused
+    /// its first beat (the healthy case is asserted in the presence test below).
+    #[test]
+    #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
+    fn dispatch_single_shot_promises_the_beat_exactly_when_the_first_beat_landed() {
+        use httpmock::prelude::*;
+        for_healthy_and_refused_hubs(|landed| {
+            let server = MockServer::start();
+            let _mock = server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(200).header("content-type", "application/json").json_body(json!({
+                    "id": "mock-1", "object": "chat.completion", "created": 0, "model": "gpt-5.1",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+                }));
+            });
+            let s = step("s1", "dispatch.single_shot", json!({ "model": "gpt-5.1", "user": "hello", "endpoint": { "url": format!("{}/v1", server.base_url()) } }));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = StepRunCtx::new(crate::test_run(), Some(tx), None, Arc::new(crate::step_kinds::ArtifactBus::new()));
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx).expect("the mock endpoint answers");
+            drop(ctx);
+            let start = rx
+                .into_iter()
+                .find_map(|sig| match sig {
+                    crate::step_kinds::WaveSignal::Record(r) if r.action == darkmux_flow::FlowAction::DispatchStart => Some(r.payload_json()),
+                    _ => None,
+                })
+                .expect("a start");
+            assert_eq!(start.get("beats").and_then(|b| b.as_bool()), landed.then_some(true), "landed={landed}: {start}");
+        });
+    }
+
     #[test]
     #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
     fn dispatch_map_writes_and_releases_a_session_presence_beat() {
@@ -7242,6 +7335,11 @@ mod tests {
             1,
             "exactly one liveness start; got {actions:?}"
         );
+        // (#3125) The emitter spawned (and its first beat landed) before the
+        // start was written, so the start promises the beat a reader may read
+        // gone as an ending.
+        let start = records.iter().find(|r| r.action == darkmux_flow::FlowAction::DispatchStart).expect("a start").payload_json();
+        assert_eq!(start["beats"].as_bool(), Some(true), "the start promises its published beat: {start}");
         assert_eq!(
             actions
                 .iter()

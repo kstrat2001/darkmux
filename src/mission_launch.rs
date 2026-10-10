@@ -344,6 +344,12 @@ pub(crate) fn run_bookend_record(
 /// lifecycle rule reads a `run.complete` whose status is
 /// [`RunPayload::DEGRADED_STATUS`] as degraded, as the run's row reads its
 /// `Degraded` envelope, so the spelling here is that constant's.
+/// (#3125) A launch's `run.start` payload: it promises the run session's
+/// beat (`RunPayload::beats`) exactly when that beat's first write landed.
+fn run_start_payload(mission_presence: Option<&flow::session_presence::SessionEmitter>) -> RunPayload {
+    RunPayload { beats: flow::session_presence::beats(mission_presence), ..RunPayload::default() }
+}
+
 fn run_close_payload(status: crew::envelope::MissionOutcomeStatus, ok: bool) -> RunPayload {
     RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(ok) }
 }
@@ -863,6 +869,21 @@ pub fn launch(
             }
         };
 
+    // (#2877, pre-PR review) The mission's own run session beats presence for
+    // as long as the launch runs. Its executions beat only while a model call
+    // is live, so during the steps between them (a summary, a mod wait, a test
+    // gate, delivery) nothing was live, the run page stopped polling, and it
+    // could miss its own COMPLETE. Dropped explicitly before every
+    // `reap_and_exit_on_signal` (it calls `process::exit`, which runs no
+    // destructors: the key would linger ~15s and the reconciler would write a
+    // redundant `session.end`), and otherwise at scope end after the bookend
+    // has closed. The drop removes the key and suppresses the reconciler's
+    // abandoned edge, same as a dispatch's.
+    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
+    // (#3125) Spawned before the run's `run.start`, which promises the beat
+    // (`RunPayload::beats`) only once its first beat published; declared
+    // before the bookend guard, so an early return writes `run.error` first.
+
     // (#3074) The run's liveness bookend opens as soon as the mission is minted,
     // so any post-mint error return (interpret, staffing check, unexecutable kinds)
     // records run.error rather than leaving the run unclosed in the flow trail.
@@ -879,7 +900,7 @@ pub fn launch(
             RunPayload::failed("run terminated before completion (early return or panic)"),
         )
     });
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, run_start_payload(mission_presence.as_ref())));
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
@@ -1252,17 +1273,8 @@ pub fn launch(
     };
 
 
-    // (#2877, pre-PR review) The mission's own run session beats presence for
-    // as long as the launch runs. Its executions beat only while a model call
-    // is live, so during the steps between them (a summary, a mod wait, a test
-    // gate, delivery) nothing was live, the run page stopped polling, and it
-    // could miss its own COMPLETE. Dropped explicitly before every
-    // `reap_and_exit_on_signal` (it calls `process::exit`, which runs no
-    // destructors: the key would linger ~15s and the reconciler would write a
-    // redundant `session.end`), and otherwise at scope end after the bookend
-    // has closed. The drop removes the key and suppresses the reconciler's
-    // abandoned edge, same as a dispatch's.
-    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
+    // The mission's run session beat (#2877) spawns before `run.start`
+    // (#3125): see `mission_presence` above the run bookend.
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
@@ -9222,6 +9234,34 @@ mod tests {
     }
 
     // ── #1877, contract 8 — the run bookend, prescribed ──────────────────
+
+    /// (#3125) A launch's `run.start` promises the run session's beat exactly
+    /// when its emitter's first beat landed (`beats: true`), and says nothing
+    /// when the hub refused it. A reader reads a promised beat gone as the run
+    /// having ended, so the promise is the whole of the SIGKILL fix for a launch.
+    #[test]
+    #[serial_test::serial] // mutates the DARKMUX_REDIS_URL env var
+    fn the_run_start_promises_its_beat_exactly_when_the_first_beat_landed() {
+        let (port, _log) = darkmux_flow::spawn_acking_redis_peer();
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        for (url, landed) in [
+            (format!("redis://127.0.0.1:{port}"), true),
+            (format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()), false),
+        ] {
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &url) };
+            let run = RunId::mission(format!("beats-3125-{landed}")).unwrap();
+            let presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run), None, None);
+            assert_eq!(run_start_payload(presence.as_ref()).beats, landed, "hub {url}");
+            if let Some(p) = presence {
+                p.stop();
+            }
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+        assert!(!run_start_payload(None).beats, "no emitter (presence off): no promise");
+    }
 
     #[test]
     fn run_bookend_record_is_the_run_grain_on_the_run_session() {

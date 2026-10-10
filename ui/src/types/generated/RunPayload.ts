@@ -33,4 +33,13 @@ gate?: string,
  * did not record a stop, never that there was none. A run's own
  * wall-clock bound is never named here.
  */
-stop_reason?: string, };
+stop_reason?: string, 
+/**
+ * (#3125, flow schema 2.2.0) On a `run.start` only: the launcher beats
+ * the run's session presence key for the whole run, and its first beat
+ * landed (`mission launch`). A reader may then read the beat gone, on a
+ * machine still reporting, as the run having ended. Absent on a run
+ * whose launcher beats nothing (an ACP panel run) and on every record
+ * before 2.2.0: it promises nothing.
+ */
+beats?: boolean, };
