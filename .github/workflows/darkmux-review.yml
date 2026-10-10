@@ -319,6 +319,7 @@ jobs:
               --rendered "$RUNNER_TEMP/qa/rendered.json" \
               --timeout-minutes 90 \
               --started-epoch "${JOB_STARTED_EPOCH:-}" \
+              --flow-dir "${DARKMUX_HOME:-$HOME/.darkmux}/flows" \
               --run-url "$RUN_URL") || NOTICE=""
             if [ -n "$NOTICE" ]; then
               gh pr comment "$PR" --repo "$REPO" --body "$NOTICE"
@@ -518,6 +519,20 @@ jobs:
                 ":warning: darkmux PR review produced a rendered payload with an unrecognized mode (\`$MODE_RESULT\`) — see workflow logs."
               exit 1 ;;
           esac
+
+      # (#3161) An endpoint budget that warned during the review reaches the
+      # PR, not only the runner's log: the warning on #3158's review came 13
+      # minutes before its budget stopped every call, and nobody saw it.
+      - name: Post endpoint budget warnings
+        if: always() && steps.diff.outputs.has_diff == 'true'
+        run: |
+          set -uo pipefail
+          WARNINGS=$(python3 scripts/ci-review-cancellation-notice.py --budget-warnings \
+            --started-epoch "${JOB_STARTED_EPOCH:-}" \
+            --flow-dir "${DARKMUX_HOME:-$HOME/.darkmux}/flows") || WARNINGS=""
+          if [ -n "$WARNINGS" ]; then
+            gh pr comment "$PR" --repo "$REPO" --body "$WARNINGS"
+          fi
 
       - name: Upload review envelope (debugging + audit)
         if: always()

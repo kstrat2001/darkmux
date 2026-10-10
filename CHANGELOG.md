@@ -92,6 +92,14 @@ darkmux release.
 
 ### Fixed
 
+- **A review stopped by an endpoint budget says so on the PR** (#3159, #3161).
+  The cancellation notice read a review cancelled while waiting on a `wait`
+  budget as "most likely its own timeout". It now reads the runner's flow log
+  and names the endpoint, its spend against the limit, when calls would have
+  resumed, and the fix (raise `limits.window`, or set `limits.max_wait`). A
+  `budget.warn` during a review is now posted on the PR too; before, it reached
+  only the runner's log, 13 minutes ahead of the stop on #3158's review.
+
 - **A run's status is decided once and reads the same on every view** (operator,
   2026-10-07). A lab run stopped with SIGTERM read "aborted" on the runs board and "error"
   on its run page and its fleet timeline bar: the board reads the lab run's own record, and
