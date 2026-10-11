@@ -593,8 +593,7 @@ impl<'a> AgentLoop<'a> {
         // here too — otherwise a resume whose catch-up pass just appended a
         // batch of tool results sails straight into the FIRST post-resume
         // request oversized, without the compaction check that would have
-        // caught it on a live (never-killed) run. (The catch-up's results
-        // were soft-trimmed as they were appended, #3202.) No real
+        // caught it on a live (never-killed) run. No real
         // `latest_prompt_tokens` exists yet
         // at this point (no request has been sent in this process), so
         // this always uses the local chars/4 estimate rather than the
@@ -914,9 +913,7 @@ impl<'a> AgentLoop<'a> {
         // compaction and before this line. Measured with the trigger fix
         // already in: 14 of 124 turns went out at up to 39,973 against a
         // declared 32,000, because a result in the protected recent window was
-        // untouchable by both compaction and the soft trim (which, since
-        // #3202, trims a large result as it is appended; many results under
-        // its threshold can still overflow).
+        // untouchable by both compaction and the soft trim (removed in #3202).
         //
         // MEASURE WHAT IS SENT, NOT JUST THE MESSAGES (round-2 merge gate).
         // `measure_request_context` sums message content and tool-call args.
@@ -2114,23 +2111,15 @@ impl<'a> AgentLoop<'a> {
 
     // ─── compaction ──────────────────────────────────────────────────────
 
-    /// (#1391, #3202) Append a tool result to the conversation in its final
-    /// form: soft-trimmed now if it is over the threshold, and never changed
-    /// afterwards. Trimming it later, once it aged out of a recent window,
-    /// rewrote a message an earlier request had already sent, so every
-    /// prefix-caching engine (the Messages API, LM Studio, lithos-metal,
-    /// Splash) lost its cache from that message on and prefilled the rest
-    /// again. The trajectory keeps the whole result; only the conversation
-    /// copy is trimmed.
+    /// (#3202) Append a tool result to the conversation whole. darkmux
+    /// never rewrites it afterwards: every engine behind the loop caches the
+    /// prompt prefix (the Messages API, LM Studio, lithos-metal, Splash), and
+    /// changing a message an earlier request sent breaks that cache from the
+    /// message on. The #1391 soft trim did exactly that once a large result
+    /// aged out of a recent window; it is gone. The conversation is bounded by
+    /// compaction and, as a last resort, the pre-send bound (#2792).
     fn push_tool_result(&mut self, call_id: String, tool_name: String, result: String) {
-        let (message, reclaimed) = crate::tool_result_prune::trim_at_insertion(call_id, tool_name, result);
-        if reclaimed > 0 {
-            eprintln!(
-                "darkmux-runtime: soft-trimmed a tool result as it entered the conversation, \
-                 reclaiming {reclaimed} bytes (#1391/#3202)"
-            );
-        }
-        self.messages.push(message);
+        self.messages.push(Message::tool_result(call_id, tool_name, result));
     }
 
     /// The context check after a tool turn. `Some` ends the dispatch.

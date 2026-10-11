@@ -23,14 +23,13 @@ darkmux release.
   and prefilled the rest of the conversation again. Measured on lithos-metal
   serving `pepper-grinder`: 526 s of a 908 s run was prefill on the eight
   requests that missed, and the re-prefills set off the thermal rests. #3193
-  had turned the trim off on the `messages` dialect only. Now a result over
-  4,000 bytes is trimmed once, as it enters the conversation, to the same
-  head, tail and elision note as before, and never changes afterwards. Every
-  request extends the previous one on every dialect, and the context stays
-  bounded. The trade-off: the model reads a large result's head and tail even
-  on the turn that asked for it, and re-runs the tool for the omitted middle.
-  Tests drive the real loop on every dialect, and through a resume, and check
-  that each request extends the previous one.
+  had turned the trim off on the `messages` dialect only; now it is gone on
+  every dialect. Tool results enter the conversation whole and darkmux never
+  rewrites them, so every request extends the previous one and the model
+  sees each result whole. Compaction bounds the conversation, with the
+  pre-send bound (#2792) as the last resort for a request that would not fit
+  the window; each compaction still breaks the cache once, as it must. Tests drive the real loop on every dialect, and
+  through a resume, and check that each request extends the previous one.
 
 ## [5.1.0] - 2026-10-10
 

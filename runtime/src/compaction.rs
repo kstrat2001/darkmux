@@ -2811,14 +2811,14 @@ mod tests {
         );
     }
 
-    /// (#2808 round-3) THE BOUND MUST WORK ON A THREAD THE LOOP HAS ALREADY
-    /// SOFT-TRIMMED — which is every real thread by the time it compacts.
+    /// (#2808 round-3) THE BOUND MUST WORK ON A MIDDLE WHOSE RESULTS WERE
+    /// ALREADY ELIDED ONCE.
     ///
-    /// The soft trim (#1391) stamps the elision sentinel on every result over
-    /// 4,000 bytes (then every turn, outside a recent window; since #3202 as
-    /// each result enters the conversation). `trim_body_to` then
-    /// refused any sentinel-bearing body outright, so by the time compaction
-    /// ran, the entire middle was untouchable to the hard bound.
+    /// The soft trim (#1391, removed in #3202) stamped the elision sentinel on
+    /// every result over 4,000 bytes; the pre-send bound (#2792) still stamps
+    /// it on what it elides. `trim_body_to` once refused any sentinel-bearing
+    /// body outright, so by the time compaction ran, the entire middle was
+    /// untouchable to the hard bound.
     ///
     /// The result was the bound reporting "the weight is not in tool-result
     /// bodies" about a middle that was ~100% tool-result bodies, and refusing
@@ -2827,18 +2827,17 @@ mod tests {
     /// reached through its fix, on the modal long-agentic shape.
     ///
     /// EVERY fixture in this arc built its middle fresh, so none of them ever
-    /// handed the bound a sentinel-bearing body. This one builds its results
-    /// the way the loop appends them, soft-trimmed.
+    /// handed the bound a sentinel-bearing body. This one elides each result
+    /// once first.
     #[test]
-    fn a_middle_the_loop_already_soft_trimmed_is_still_elided_to_fit() {
+    fn a_middle_already_elided_once_is_still_elided_to_fit() {
         let body = "q".repeat(6_000);
+        let once = crate::tool_result_prune::trim_body_to(&body, 3_200)
+            .expect("fixture guard: the first elision must mark the bodies, else this pins nothing");
         let mut messages = vec![Message::system("sys"), Message::user("go")];
         for n in 0..12 {
             messages.push(Message::assistant("calling read"));
-            // What the loop does as it appends each result.
-            let (result, reclaimed) = crate::tool_result_prune::trim_at_insertion(format!("c{n}"), "read", body.clone());
-            assert!(reclaimed > 0, "fixture guard: the soft trim must actually mark bodies, else this pins nothing");
-            messages.push(result);
+            messages.push(Message::tool_result(format!("c{n}"), "read", &once));
         }
         for n in 0..4 {
             messages.push(Message::user(format!("tail {n}")));
@@ -2863,7 +2862,7 @@ mod tests {
 
         assert!(
             fit.fits(),
-            "an already-soft-trimmed middle must still be reducible to the \
+            "an already-elided middle must still be reducible to the \
              compactor's budget: {} chars against {}, {} elided",
             fit.after_chars,
             fit.budget_chars,

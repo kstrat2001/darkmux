@@ -1,77 +1,41 @@
-//! Tool-result head/tail soft-trim (#1391).
+//! Tool-result head/tail elision for the hard bounds (#2792).
 //!
-//! Oversized tool results sit in the transcript verbatim, and on small
-//! context windows they are the single biggest driver of the FIRST
-//! compaction. Middle-eliding a large tool result (keep the head + tail,
-//! drop the middle behind a marker) is a cheap, lossy-but-bounded context
-//! reclaim that DELAYS the first compaction — on a tight window that can
-//! mean one fewer compaction per dispatch, which is measurable wall-clock.
+//! When a request or a compaction excerpt must fit a window, the largest
+//! tool-result bodies lose their middle behind an explicit marker (keep the
+//! head and tail, state how many bytes went and how to get them back). This
+//! module holds that cut and the last-resort [`hard_trim_to_fit`].
 //!
-//! ## When: once, as the result enters the conversation (#3202)
+//! ## No soft trim (#3202)
 //!
-//! The loop trims a result as it appends it ([`trim_at_insertion`]), to its
-//! final form, and never changes it afterwards. This used to run as each
-//! request was built, on results more than six messages back, which sent a
-//! large result whole for a few turns and then shortened it. That rewrote a
-//! message the engine had already cached, so every prefix-caching engine
-//! (the Messages API, LM Studio, lithos-metal, Splash) fell back to the
-//! head of its cache and prefilled the rest again. Measured on lithos-metal:
-//! 526 s of a 908 s run was prefill on the eight requests that missed.
-//!
-//! The price is that the model never reads a result over the threshold
-//! whole, not even on the turn that asked for it: it reads the head and
-//! tail around the marker, which tells it to re-run the tool for the
-//! omitted section (a narrower `read` range, a filtered command).
+//! #1391 also soft-trimmed every result over 4,000 bytes once it was more
+//! than six messages back, as each request was built. That rewrote a message
+//! the engine had already cached, so every prefix-caching engine (the
+//! Messages API, LM Studio, lithos-metal, Splash) fell back to the head of
+//! its cache and prefilled the rest again. Measured on lithos-metal: 526 s of
+//! a 908 s run was prefill on the eight requests that missed. Trimming once
+//! at insertion instead would have kept the cache but meant the model never
+//! saw a large result whole, even on the turn that asked for it. So tool
+//! results enter the conversation whole and darkmux never rewrites them;
+//! compaction bounds the conversation, and [`hard_trim_to_fit`] is the last
+//! resort before a request that would not fit.
 //!
 //! ## Prior art
 //!
 //! Design convergence with xai-org/grok-build (Apache-2.0), `xai-chat-state`
-//! `PruningConfig` (head 1500 / tail 1500 over a 4000-char threshold).
-//! Independently implemented here; no code copied.
-//!
-//! ## What this is NOT
-//!
-//! - NOT compaction. Compaction summarizes the MIDDLE of the whole
-//!   conversation via a companion model call (`crate::compaction`); this
-//!   is a zero-model-call, purely mechanical byte trim of a single
-//!   oversized tool-result body. It runs BEFORE the compaction trigger is
-//!   evaluated so the reclaimed bytes push the trigger out.
-//! - NOT a hard-clear. The grok-build prior art also hard-clears results
-//!   older than K turns to a placeholder; that second stage is
-//!   deliberately out of scope here (this ships the soft-trim only).
+//! `PruningConfig` (head/tail elision around a marker). Independently
+//! implemented here; no code copied.
 //!
 //! ## Safety
 //!
-//! - Only results over [`TOOL_RESULT_TRIM_THRESHOLD_BYTES`] are touched;
-//!   an ordinary result enters the conversation whole.
-//! - The trim is idempotent: an already-trimmed body carries the marker
-//!   sentinel and is skipped.
 //! - Head/tail cuts land on UTF-8 char boundaries (the #329 class of
 //!   slice-mid-codepoint panics is guarded by clamping to the nearest
 //!   boundary), so multibyte tool output (CJK / emoji / accents) is safe.
 
 use crate::lmstudio::Message;
 
-/// Byte length above which a tool-result body is soft-trimmed.
-/// Conservative: only genuinely large results (4000+ bytes) are touched,
-/// so ordinary short results are never disturbed. Chosen to sit well
-/// above head + tail so a fired trim always leaves a real middle to
-/// elide. (#1391)
-pub const TOOL_RESULT_TRIM_THRESHOLD_BYTES: usize = 4000;
-
-/// Bytes of the head kept verbatim. The head of a tool result usually
-/// carries the most load-bearing context (the command echo, the first
-/// rows of output, the error header). (#1391)
-pub const TOOL_RESULT_TRIM_HEAD_BYTES: usize = 1500;
-
-/// Bytes of the tail kept verbatim. The tail usually carries the
-/// terminal signal (exit status, final assertion, summary line). (#1391)
-pub const TOOL_RESULT_TRIM_TAIL_BYTES: usize = 1500;
-
-/// Sentinel that marks an already-trimmed body. Presence of this
-/// substring makes the pass idempotent (a trimmed body is skipped on
-/// subsequent turns). It is the self-identifying prefix of the
-/// model-facing elision marker, so the marker doubles as the guard. (#1391)
+/// Sentinel that marks an already-elided body: the self-identifying prefix
+/// of the model-facing elision marker, so the marker doubles as the guard
+/// against re-eliding a body for no gain. (#1391)
 pub const TOOL_RESULT_TRIM_MARKER_SENTINEL: &str = "[darkmux-runtime: elided";
 
 /// Outcome of one trim pass over the transcript.
@@ -121,43 +85,13 @@ fn elision_marker(elided_bytes: usize, head_bytes: usize, tail_bytes: usize) -> 
     )
 }
 
-/// Soft-trim a single tool-result body if it is over threshold and not
-/// already trimmed. Returns `Some(new_body)` when a trim was applied,
-/// `None` when the body is left untouched (under threshold, or already
-/// carries the marker sentinel). Pure + total: safe on any `&str`. (#1391)
-pub fn soft_trim_body(body: &str) -> Option<String> {
-    if body.len() <= TOOL_RESULT_TRIM_THRESHOLD_BYTES {
-        return None;
-    }
-    // Idempotent: never re-trim a body we already reclaimed.
-    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) {
-        return None;
-    }
-    let head_end = floor_char_boundary(body, TOOL_RESULT_TRIM_HEAD_BYTES);
-    let tail_start =
-        ceil_char_boundary(body, body.len().saturating_sub(TOOL_RESULT_TRIM_TAIL_BYTES));
-    // Defensive: with THRESHOLD (4000) > HEAD (1500) + TAIL (1500) the head
-    // and tail never overlap, so there is always a real middle to elide.
-    // The guard keeps the function total if the constants are ever retuned
-    // so head + tail could meet.
-    if head_end >= tail_start {
-        return None;
-    }
-    let elided = tail_start - head_end;
-    let head = &body[..head_end];
-    let tail = &body[tail_start..];
-    let marker = elision_marker(elided, head_end, body.len() - tail_start);
-    Some(format!("{head}{marker}{tail}"))
-}
-
 /// (#2792) Elide a body's middle down toward `floor_bytes`, keeping a head
-/// and tail around the same marker [`soft_trim_body`] uses.
+/// and tail around the elision marker.
 ///
-/// Split out so the HARD path can choose its own floor. `soft_trim_body`
-/// hard-codes the #1391 constants, which are tuned for "never disturb an
-/// ordinary short result" — a correct goal for the soft pass and the exact
-/// reason the hard pass reclaimed nothing on a thread made entirely of
-/// medium-sized results.
+/// Split out so the HARD path could choose its own floor. The #1391 soft
+/// trim (removed in #3202) hard-coded constants tuned for "never disturb an
+/// ordinary short result" — the exact reason the hard pass reclaimed nothing
+/// on a thread made entirely of medium-sized results.
 ///
 /// Returns `None` only when the body is already elided (idempotent) or is too
 /// small for head + marker + tail to be shorter than what it replaces.
@@ -165,9 +99,9 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
     // AN ALREADY-ELIDED BODY MAY BE ELIDED FURTHER, and refusing to was what
     // made #2808's bound inert on the modal thread.
     //
-    // The soft trim (#1391) stamps the sentinel on every result over 4,000
-    // bytes (since #3202, as each one enters the conversation) — which is
-    // most of the compaction middle by the time a threshold trips. A flat "contains the
+    // The soft trim (#1391, removed in #3202) stamped the sentinel on every
+    // result over 4,000 bytes outside a recent window — which was most of
+    // the compaction middle by the time a threshold tripped. A flat "contains the
     // sentinel, refuse" guard therefore made every one of those bodies
     // untouchable to the hard bound, so a middle that was ~100% tool-result
     // bytes reported "the weight is not in tool-result bodies" and refused
@@ -209,18 +143,14 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
 }
 
 /// (#2792) LAST-RESORT trim to bring an assembled prompt under a hard
-/// context-window bound, cutting deeper than the soft trim's threshold and
-/// head + tail allow.
+/// context-window bound. Since #3202 it is the only thing that ever elides a
+/// tool result in the conversation; nothing else rewrites one.
 ///
-/// The soft trim exists to reclaim transcript without disturbing an ordinary
-/// result, so it leaves every body at or under 4,000 bytes alone, and until
-/// #3202 it also spared the last six messages. That restraint is correct for
-/// its purpose and is what left this case unhandled: measured on a real run,
-/// ONE tool result landing in that recent window carried the next request to
-/// 38,439 tokens against a declared 32,000, four times in 27 turns. Since
-/// #3202 such a result enters already trimmed, but a thread of many results
-/// at or under 4,000 bytes (or a seeded one) can still overflow. Compaction cannot help — it runs BETWEEN turns, and this growth
-/// happens WITHIN one, after the last compaction and before the send.
+/// Measured on a real run, ONE tool result landing after the last compaction
+/// carried the next request to 38,439 tokens against a declared 32,000, four
+/// times in 27 turns. Compaction cannot help — it runs BETWEEN turns, and
+/// this growth happens WITHIN one, after the last compaction and before the
+/// send.
 ///
 /// On a model loaded at the window its profile declares, that request is
 /// refused outright (HTTP 400, "the number of tokens to keep from the initial
@@ -277,8 +207,8 @@ pub fn hard_trim_to_fit(
         let Some(body) = messages[idx].content.as_deref() else {
             continue;
         };
-        // (#2792 round-2) Do NOT delegate the floor to `soft_trim_body`. Its
-        // 4,000-byte threshold was chosen for the SOFT path's purpose —
+        // (#2792 round-2) Do NOT borrow the soft trim's floor (#1391, since
+        // removed). Its 4,000-byte threshold was chosen for the SOFT path's purpose —
         // "ordinary short results are never disturbed" — which is right for
         // delaying a compaction and wrong for a last-resort bound. Measured:
         // 40 results of 3,000 bytes each, 120,000 bytes against a 32,000
@@ -323,115 +253,38 @@ pub fn hard_trim_to_fit(
     stats
 }
 
-/// (#3202) The tool-result message the loop appends to the conversation:
-/// the body in its FINAL form. A body over the threshold is soft-trimmed
-/// here, once, and nothing changes it afterwards, so every later request
-/// extends the one before it and the engine's prompt cache stays valid. A
-/// body at or under the threshold enters whole. The second value is the
-/// bytes the trim removed (0 when it left the body whole).
-pub fn trim_at_insertion(tool_call_id: impl Into<String>, name: impl Into<String>, body: String) -> (Message, usize) {
-    let (body, reclaimed) = match soft_trim_body(&body) {
-        Some(trimmed) => {
-            let reclaimed = body.len() - trimmed.len();
-            (trimmed, reclaimed)
-        }
-        None => (body, 0),
-    };
-    (Message::tool_result(tool_call_id, name, body), reclaimed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn under_threshold_body_is_untouched() {
-        let body = "x".repeat(TOOL_RESULT_TRIM_THRESHOLD_BYTES);
-        assert!(
-            soft_trim_body(&body).is_none(),
-            "a body exactly at threshold must not trim (boundary is `>`)"
-        );
-        let small = "short output";
-        assert!(soft_trim_body(small).is_none());
-    }
-
-    #[test]
-    fn over_threshold_keeps_exact_head_and_tail() {
-        // Distinct head/tail sentinels so we can assert the exact bytes kept.
-        let head = "HEAD_".to_string() + &"a".repeat(TOOL_RESULT_TRIM_HEAD_BYTES);
-        let tail = "b".repeat(TOOL_RESULT_TRIM_TAIL_BYTES) + "_TAIL";
-        let middle = "m".repeat(5000);
-        let body = format!("{head}{middle}{tail}");
-        let trimmed = soft_trim_body(&body).expect("over-threshold body trims");
-
-        // Head bytes kept verbatim (exactly HEAD_BYTES of them).
-        assert!(trimmed.starts_with(&body[..TOOL_RESULT_TRIM_HEAD_BYTES]));
-        // Tail bytes kept verbatim (exactly the last TAIL_BYTES).
-        assert!(trimmed.ends_with(&body[body.len() - TOOL_RESULT_TRIM_TAIL_BYTES..]));
-        // The marker is present and reports the elided count.
-        assert!(trimmed.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL));
-        // The trimmed body is materially smaller than the original.
+    fn an_elided_body_keeps_its_head_and_tail_around_the_marker() {
+        let body = format!("HEAD_{}_TAIL", "m".repeat(9_000));
+        let trimmed = trim_body_to(&body, 3_200).expect("a large body elides");
+        assert!(trimmed.starts_with("HEAD_"));
+        assert!(trimmed.ends_with("_TAIL"));
         assert!(trimmed.len() < body.len());
-        // And the reclaimed body itself is now under threshold (so it won't
-        // re-fire and won't dominate the next compaction decision).
-        assert!(trimmed.len() < TOOL_RESULT_TRIM_THRESHOLD_BYTES);
+        // The model-facing note, unchanged (contract 6): literal counts, a
+        // directive, and the self-identifying provenance prefix.
+        assert!(trimmed.contains(&elision_marker(body.len() - 3_000, 1_500, 1_500)), "{trimmed}");
+        assert!(trimmed.contains("bytes from the middle of this tool result; kept the first 1500 and last 1500 bytes. Re-run the tool to retrieve the omitted section if you need it.]"));
+        assert!(trimmed.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL));
     }
 
     #[test]
-    fn marker_reports_directive_and_literal_counts() {
-        let body = "z".repeat(6000);
-        let trimmed = soft_trim_body(&body).expect("trims");
-        // Literal: names a byte count.
-        assert!(trimmed.contains("elided "));
-        assert!(trimmed.contains("bytes from the middle"));
-        // Directive: tells the model what action recovers the omitted bytes.
-        assert!(trimmed.contains("Re-run the tool"));
-        // Self-identifying provenance prefix.
-        assert!(trimmed.contains("[darkmux-runtime:"));
-    }
-
-    #[test]
-    fn trim_is_idempotent() {
-        let body = "q".repeat(7000);
-        let once = soft_trim_body(&body).expect("first trim applies");
-        // Second pass over the already-trimmed body is a no-op.
-        assert!(
-            soft_trim_body(&once).is_none(),
-            "an already-trimmed body carries the sentinel and must be skipped"
-        );
+    fn eliding_again_at_the_same_floor_is_a_no_op() {
+        let once = trim_body_to(&"q".repeat(7_000), 3_200).expect("first elision applies");
+        assert!(trim_body_to(&once, once.len()).is_none(), "no gain, no churn");
     }
 
     #[test]
     fn utf8_multibyte_head_and_tail_do_not_panic_and_land_on_boundaries() {
-        // Fill head, middle, and tail regions with 4-byte emoji so the raw
-        // HEAD_BYTES / (len - TAIL_BYTES) indices land MID-codepoint and must
-        // be clamped to char boundaries. "🎉" is 4 bytes.
-        let body = "🎉".repeat(3000); // 12000 bytes, way over threshold
-        let trimmed = soft_trim_body(&body).expect("trims");
-        // If any slice split a codepoint this would have panicked already.
-        // The kept head is only whole emoji.
+        // 4-byte emoji everywhere, so the raw cut indices land MID-codepoint
+        // and must be clamped to char boundaries.
+        let body = "🎉".repeat(3000); // 12000 bytes
+        let trimmed = trim_body_to(&body, 3_200).expect("trims");
         let head_region = trimmed.split(TOOL_RESULT_TRIM_MARKER_SENTINEL).next().unwrap();
-        assert!(
-            head_region.chars().all(|c| c == '🎉' || c == '\n'),
-            "head must contain only whole codepoints"
-        );
-        // Round-trips as valid UTF-8 (String guarantees it, but assert the
-        // kept head is <= the byte cap after clamping DOWN).
-        assert!(head_region.len() <= TOOL_RESULT_TRIM_HEAD_BYTES + 1);
-    }
-
-    #[test]
-    fn a_large_result_enters_the_conversation_trimmed_and_a_small_one_whole() {
-        let big = "y".repeat(6000);
-        let (message, reclaimed) = trim_at_insertion("call_1", "bash", big.clone());
-        let body = message.content.as_deref().unwrap();
-        assert_eq!(body, soft_trim_body(&big).unwrap(), "the soft trim's own final form");
-        assert_eq!(reclaimed, big.len() - body.len());
-        assert_eq!((message.role.as_str(), message.tool_call_id.as_deref()), ("tool", Some("call_1")));
-
-        let exactly = "z".repeat(TOOL_RESULT_TRIM_THRESHOLD_BYTES);
-        let (message, reclaimed) = trim_at_insertion("call_2", "bash", exactly.clone());
-        assert_eq!(message.content.as_deref(), Some(exactly.as_str()), "at the threshold it enters whole");
-        assert_eq!(reclaimed, 0);
+        assert!(head_region.chars().all(|c| c == '🎉' || c == '\n'), "head must contain only whole codepoints");
+        assert!(head_region.len() <= 1_500 + 1);
     }
 }

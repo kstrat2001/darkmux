@@ -5284,11 +5284,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resume_catch_up_appends_an_oversized_result_already_trimmed() {
-        // (#2114 finding N1, #3202) A result the resume catch-up appends
-        // enters the conversation in its final, soft-trimmed form, exactly
-        // as a live turn's does — so the first post-resume request never
-        // sails out carrying the whole oversized result.
+    fn resume_catch_up_appends_an_oversized_result_whole() {
+        // (#3202) A result the resume catch-up appends enters the
+        // conversation whole, exactly as a live turn's does: darkmux never
+        // elides a tool result outside the pre-send bound (#2792), so every
+        // engine's prompt cache stays valid.
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
@@ -5298,14 +5298,14 @@ mod tests {
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
         let server = crate::test_support::GuardedMockServer::start();
-        // The ONLY registered mock requires the elision marker to be
-        // present in the outgoing request body — if the catch-up appended
-        // the result whole, this mock's `matches` predicate fails to match,
-        // and the client call errors instead of silently passing.
-        let expects_trimmed_body_mock = server.mock(|when, then| {
+        // The ONLY registered mock requires the whole result and no elision
+        // marker in the outgoing request body — if the catch-up trimmed the
+        // result, this mock's `matches` predicate fails to match, and the
+        // client call errors instead of silently passing.
+        let expects_whole_body_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
+                b.contains(&"X".repeat(6_000)) && !b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
             });
             then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 100, 5));
         });
@@ -5314,11 +5314,10 @@ mod tests {
         let tmp = tempfile::Builder::new().prefix("resume-trim").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let tools = [Tool::Echo];
-        // Compaction disabled so this test isolates the TRIM path.
+        // Compaction disabled, so nothing else could shorten the thread.
         let cfg = compaction::CompactionConfig::never_compact();
 
-        // (#1391) TOOL_RESULT_TRIM_THRESHOLD_BYTES is 4000 — comfortably
-        // exceeded so the trim actually elides a middle section.
+        // Over the 4,000 bytes the removed #1391 soft trim cut at.
         let echo_call = |id: &str, text: &str| ToolCall {
             id: id.to_string(),
             kind: "function".into(),
@@ -5366,7 +5365,7 @@ mod tests {
         .expect("resumed dispatch returns Ok");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        expects_trimmed_body_mock.assert_hits(1);
+        expects_whole_body_mock.assert_hits(1);
     }
 
     #[test]
@@ -7674,8 +7673,7 @@ mod tests {
 
         // n = 7: head 0..2, preserved tail 3..7, so the compactable middle is
         // exactly index 2 — one tiny message. The weight is the huge message
-        // at the TAIL, which neither the soft trim (it trims only results the loop
-        // appends, never seeded messages, #3202) nor
+        // at the TAIL, which neither the soft trim (removed in #3202) nor
         // compaction (PRESERVE_TAIL = 4) may touch.
         let huge = "x".repeat(120_000); // ~30k tokens by chars/4
         let initial = vec![

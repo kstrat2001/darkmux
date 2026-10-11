@@ -48,6 +48,13 @@ fn sse_reply(text: Option<&str>, calls: &[(&str, &str, &str)]) -> String {
 /// (the last one repeats; SSE when it opens with `event:`, else JSON) and
 /// records every request body.
 fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    recording_server_with_compactor(replies, String::new())
+}
+
+/// [`recording_server`], plus: a request for the model `test-compactor` is
+/// answered with `summary` and recorded as `Value::Null`, so the primary
+/// replies stay in step and the compactor's calls can be counted.
+fn recording_server_with_compactor(replies: Vec<String>, summary: String) -> (String, Arc<Mutex<Vec<Value>>>) {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -69,12 +76,17 @@ fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
             }
             let mut body = vec![0u8; len];
             let _ = reader.read_exact(&mut body);
-            let n = {
+            let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let reply = {
                 let mut all = seen.lock().unwrap();
-                all.push(serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null));
-                all.len() - 1
+                if request["model"] == "test-compactor" {
+                    all.push(Value::Null);
+                    &summary
+                } else {
+                    all.push(request);
+                    &replies[(all.iter().filter(|b| !b.is_null()).count() - 1).min(replies.len() - 1)]
+                }
             };
-            let reply = &replies[n.min(replies.len() - 1)];
             let kind = if reply.starts_with("event:") { "text/event-stream" } else { "application/json" };
             let _ = sock.write_all(
                 format!(
@@ -192,18 +204,15 @@ fn assert_each_request_extends_the_previous(dialect: Dialect, bodies: &[Value]) 
     }
 }
 
-/// Every large tool result the run appended (all but `seeded`) is already in
-/// its final, trimmed form in every request that carries it, the first one
-/// included.
-fn assert_large_results_sent_in_final_form(dialect: Dialect, bodies: &[Value], seeded: &[&str]) {
+/// (#3202) Every tool result goes out whole, as the tool returned it: no
+/// request carries the elision marker.
+fn assert_results_sent_whole(dialect: Dialect, bodies: &[Value]) {
     for (n, body) in bodies.iter().enumerate() {
-        for (id, result) in tool_results(body).into_iter().filter(|(id, _)| !seeded.contains(&id.as_str())) {
+        for (id, result) in tool_results(body) {
             assert!(
-                result.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
-                    && crate::tool_result_prune::soft_trim_body(&result).is_none(),
-                "{dialect:?}: request {} sends {id}'s {}-byte result before its final form",
-                n + 1,
-                result.len()
+                !result.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL),
+                "{dialect:?}: request {} sends {id}'s result elided",
+                n + 1
             );
         }
     }
@@ -249,61 +258,71 @@ fn each_request_extends_the_previous_one_on_every_dialect() {
         let bodies = run_script(dialect, replies, 10);
         assert_eq!(bodies.len(), 6, "{dialect:?}: a six-turn run sends six requests: {}", bodies.len());
         assert_each_request_extends_the_previous(dialect, &bodies);
-        assert_large_results_sent_in_final_form(dialect, &bodies, &[]);
+        assert_results_sent_whole(dialect, &bodies);
     }
 }
 
-/// (#1391, #3202) The context stays bounded on a long run with many large
-/// results: no tool result is ever sent over the trim threshold, so the
-/// tool-result bytes in the last request grow by at most the threshold per
-/// result instead of by each result's full size.
+/// (#3202) With no soft trim, compaction is what bounds the conversation: a
+/// long run of large results reaches compaction and never sends a request
+/// over the declared window, so the last-resort pre-send bound (#2792) never
+/// has to elide a result.
 #[test]
 #[serial_test::serial]
-fn a_long_run_with_many_large_results_stays_bounded() {
+fn a_long_run_of_large_results_compacts_instead_of_overflowing_the_window() {
     const TURNS: usize = 30;
-    const RESULT_BYTES: usize = 20_000;
-    let threshold = crate::tool_result_prune::TOOL_RESULT_TRIM_THRESHOLD_BYTES;
+    const WINDOW: u32 = 32_000;
     let dialect = Dialect::ChatCompletions;
     let calls: Vec<(String, String)> = (0..TURNS)
-        .map(|n| (format!("call_{n}"), format!(r#"{{"text":"{n} {}"}}"#, "x".repeat(RESULT_BYTES))))
+        .map(|n| (format!("call_{n}"), format!(r#"{{"text":"{n} {}"}}"#, "x".repeat(8_000))))
         .collect();
     let mut replies: Vec<String> =
         calls.iter().map(|(id, input)| reply(dialect, None, &[(id.as_str(), "echo", input.as_str())])).collect();
     replies.push(reply(dialect, Some("All done."), &[]));
-    let bodies = run_script(dialect, replies, TURNS as u32 + 5);
-    assert_eq!(bodies.len(), TURNS + 1, "one request per turn");
-    // (#3202) The cost of the run's requests on the chars/4 estimate: every
-    // request's whole prompt, and the part past the previous request's
-    // unchanged messages (what a prefix-caching engine prefills again).
-    let chars = |v: &Value| v.to_string().len();
-    let total: usize = bodies.iter().map(chars).sum();
-    let uncached: usize = std::iter::once(chars(&bodies[0]))
-        .chain(bodies.windows(2).map(|pair| {
-            let (prev, next) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
-            let shared = prev.iter().zip(next).take_while(|(p, q)| p == q).count();
-            next[shared..].iter().map(chars).sum::<usize>()
-        }))
-        .sum();
-    eprintln!(
-        "#3202 cost: {} requests, ~{} prompt tokens in all, ~{} past the unchanged prefix",
-        bodies.len(),
-        total / 4,
-        uncached / 4
+    // (#1389) Long enough and delimiter-free, so the narrative floor and
+    // sanitizer accept it.
+    let summary = reply(
+        dialect,
+        Some(
+            "Summary: the assistant repeatedly called the echo tool with long text and read back \
+             each result. No decisions were finalized and no files were modified. The next \
+             concrete action is to continue echoing and then report that the task is done.",
+        ),
+        &[],
     );
+    let (url, recorded) = recording_server_with_compactor(replies, summary);
+    let client = client_for(dialect, &url);
+    let cfg = compaction::CompactionConfig {
+        compactor_context_window: None,
+        threshold_tokens: 12_000,
+        compactor_model: Some("test-compactor".to_string()),
+        threshold_ratio: None,
+        context_window: Some(WINDOW),
+        strategy: compaction::CompactionStrategy::Narrative,
+        bail_after_compactions: None,
+        custom_instructions: None,
+    };
+    let tmp = tempfile::Builder::new().prefix("cache-prefix-compacts").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
+        &[Tool::Echo], &mut traj, streams(dialect), &cfg, Some(TURNS as u32 + 5), None, Some(4_096), None,
+        Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+    )
+    .expect("the run completes");
+    let recorded = recorded.lock().unwrap().clone();
+    let compactions = recorded.iter().filter(|b| b.is_null()).count();
+    let bodies: Vec<Value> = recorded.into_iter().filter(|b| !b.is_null()).collect();
+    assert_eq!(bodies.len(), TURNS + 1, "one request per turn");
+    assert!(compactions > 0, "a {TURNS}-turn run of 8 KB results must reach compaction");
+    assert_results_sent_whole(dialect, &bodies);
     for (n, body) in bodies.iter().enumerate() {
-        for (id, result) in tool_results(body) {
-            assert!(
-                result.len() <= threshold,
-                "request {} sends {id}'s result at {} bytes, over the trim threshold",
-                n + 1,
-                result.len()
-            );
-        }
+        let tokens = body.to_string().len() / 4;
+        assert!(tokens <= WINDOW as usize, "request {} is ~{tokens} tokens, over the {WINDOW}-token window", n + 1);
     }
-    let last_results: usize = tool_results(bodies.last().unwrap()).iter().map(|(_, r)| r.len()).sum();
+    let trajectory = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
     assert!(
-        last_results <= TURNS * threshold,
-        "the last request carries {last_results} bytes of tool results for {TURNS} results"
+        !trajectory.contains("\"dispatch.pre_send_bound\""),
+        "no request needed the last-resort pre-send bound"
     );
 }
 
@@ -397,6 +416,6 @@ fn a_resume_extends_each_request_on_every_dialect() {
         let first = tool_results(&bodies[0]);
         assert_eq!(first[0].0, "toolu_1", "{dialect:?}: {}", bodies[0]);
         assert_eq!(first[0].1, format!("one {}", "x".repeat(5_000)), "{dialect:?}: the sent result is not rewritten");
-        assert_large_results_sent_in_final_form(dialect, &bodies, &["toolu_1"]);
+        assert_results_sent_whole(dialect, &bodies);
     }
 }
