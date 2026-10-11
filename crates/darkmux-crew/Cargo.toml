@@ -22,6 +22,7 @@ darkmux-gestalt = { path = "../darkmux-gestalt" }
 # (#2413) `host_sampler_lock` stamps the machine's stable hardware identity
 # into the lock file.
 darkmux-hardware = { path = "../darkmux-hardware" }
+darkmux-platform = { path = "../darkmux-platform" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
