@@ -30,6 +30,56 @@ pub trait Platform: Send + Sync {
     /// How a dispatch container reaches a server on this machine through the
     /// name `host.docker.internal`.
     fn container_host_access(&self) -> ContainerHostAccess;
+
+    /// Which user a dispatch container runs as, so it can read and write the
+    /// host directories bind-mounted into it.
+    fn container_user(&self) -> ContainerUser;
+}
+
+/// Which user a dispatch container runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerUser {
+    /// The image's own user (the runtime image's `USER`). Right where the
+    /// engine maps ownership across the mounts (Docker Desktop).
+    Image,
+    /// A numeric user, and group when given: the host user, where bind mounts
+    /// keep the host's ownership (Docker Engine on Linux).
+    Host { uid: u32, gid: Option<u32> },
+}
+
+impl ContainerUser {
+    /// An operator's override: `image`, `<uid>` or `<uid>:<gid>`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value == "image" {
+            return Ok(Self::Image);
+        }
+        let id = |s: &str| s.parse::<u32>().map_err(|_| s.to_string());
+        let parsed = match value.split_once(':') {
+            None => id(value).map(|uid| Self::Host { uid, gid: None }),
+            Some((uid, gid)) => id(uid).and_then(|uid| {
+                Ok(Self::Host {
+                    uid,
+                    gid: Some(id(gid)?),
+                })
+            }),
+        };
+        parsed.map_err(|_| {
+            format!("`{value}` is not a container user: write `image`, `<uid>` or `<uid>:<gid>` (numbers)")
+        })
+    }
+
+    /// The value for `docker run --user`, or `None` to leave the image's user.
+    pub fn docker_user(&self) -> Option<String> {
+        match self {
+            Self::Image => None,
+            Self::Host {
+                uid,
+                gid: Some(gid),
+            } => Some(format!("{uid}:{gid}")),
+            Self::Host { uid, gid: None } => Some(uid.to_string()),
+        }
+    }
 }
 
 /// How a container reaches this machine as `host.docker.internal`.

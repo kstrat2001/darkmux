@@ -1595,6 +1595,20 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
     (v.unwrap(), s)
 }
 
+/// (omarchy) The operator's override for which user the dispatch container
+/// runs as, unparsed: `env(DARKMUX_CONTAINER_USER) > config.runtime.
+/// container_user > none`. There is no built-in default here: with no
+/// override, the platform answers (`darkmux_platform::Platform::
+/// container_user`), and the dispatch parses and applies either.
+pub fn container_user_override() -> Option<String> {
+    container_user_override_with_source().0
+}
+/// `container_user_override` plus WHICH tier resolved it.
+pub fn container_user_override_with_source() -> (Option<String>, Source) {
+    let cfg = config().runtime.as_ref().and_then(|r| r.container_user.as_deref());
+    pick_string_with_source("DARKMUX_CONTAINER_USER", cfg, None)
+}
+
 /// (#2107, #1833) Cadence, in milliseconds, of `darkmux serve`'s daemon-side
 /// continuous host sampler (the machine stats drawer's live feed). Resolves
 /// `env(DARKMUX_HOST_SAMPLER_INTERVAL_MS) > config.runtime.
@@ -2566,6 +2580,7 @@ mod location_guard {
         ("LOCATION_ACCESSORS", "this table itself: accessor names and functions, no value"),
         ("machine_id", "this machine's public name, which every viewer reads"),
         ("default_engine", "an engine's name: `lmstudio` or an endpoint id, which viewers read"),
+        ("container_user_override", "a numeric user and group id, or `image`"),
         ("fleet_mode", "an enum value"),
         ("declared_fleet_mode", "an enum value"),
         ("fleet_busy_policy", "an enum value (withheld where printed, as the execution surface)"),
@@ -3609,6 +3624,31 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(turn_delay_ms(), 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── container_user (omarchy): env > config > none. No default here:
+    //    with no override the platform answers (`darkmux_platform`) ──
+    #[serial_test::serial]
+    #[test]
+    fn container_user_override_env_then_config_then_none() {
+        let k = "DARKMUX_CONTAINER_USER";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(container_user_override_with_source(), (None, Source::BuiltIn), "unset: the platform decides");
+        let cfg = DarkmuxConfig {
+            runtime: Some(crate::config::RuntimeBehaviorConfig { container_user: Some("1001:1001".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        let _guard = set_config_for_test(cfg);
+        assert_eq!(container_user_override_with_source(), (Some("1001:1001".to_string()), Source::Config));
+        unsafe { std::env::set_var(k, "image") };
+        assert_eq!(container_user_override(), Some("image".to_string()), "env wins live");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

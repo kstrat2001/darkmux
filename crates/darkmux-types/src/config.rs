@@ -416,7 +416,11 @@ use std::path::Path;
 //           `config_access::default_engine_with_source` and checked against
 //           `profiles.json` by `default_engine::resolve`. Absent = `lmstudio`,
 //           today's behavior. An older binary refuses it as an unknown key.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.4";
+//   2.5 (omarchy): additive `runtime.container_user` (`image`, `<uid>` or
+//           `<uid>:<gid>`; `DARKMUX_CONTAINER_USER`), overriding the
+//           platform's answer for which user the dispatch container runs
+//           as. An older binary refuses a config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.5";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -1108,6 +1112,15 @@ pub struct RuntimeBehaviorConfig {
     /// honoring an operator's configured rest there would only add real
     /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
+    /// (omarchy, 2.4) Which user the dispatch container runs as: `image`
+    /// (the runtime image's own user), `<uid>` or `<uid>:<gid>`. Unset, the
+    /// platform decides (`darkmux_platform::Platform::container_user`): the
+    /// image's user under Docker Desktop, the host user on Linux, where bind
+    /// mounts keep the host's ownership. Resolved HOST-side through
+    /// `config_access::container_user_override()`; a value that doesn't
+    /// parse refuses the dispatch. Not written by `init`: the right value
+    /// depends on the platform, so a literal would be wrong somewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub container_user: Option<String>,
     /// (#2107, #1833, #2108) Cadence, in milliseconds, of `darkmux serve`'s
     /// daemon-side continuous host sampler — the background thread that
     /// reads cpu/mem/gpu/power/thermal (via its OWN privately-owned
@@ -2239,6 +2252,8 @@ impl DarkmuxConfig {
                 // (#2094) Visible `0` — the pre-existing no-rest behavior,
                 // discoverable + one edit from a thermal-friendly value.
                 turn_delay_ms: Some(0),
+                // Not written: the platform decides (a literal would be wrong somewhere).
+                container_user: None,
                 // (#2107, #1833) Visible `5000` — the machine stats
                 // drawer's daemon-side sampler cadence, discoverable and
                 // one edit from `0` (disabled) or a tighter/looser value.
