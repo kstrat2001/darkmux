@@ -77,12 +77,19 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>Docker, for roles with tools</h2>
-    <p><strong>Not yet verified end to end on Omarchy.</strong> Every role with tools (coder, reviewer, lab workloads) runs in the <code>darkmux-runtime</code> container. On macOS, Docker Desktop lets a container reach a server on the Mac's <code>127.0.0.1</code> as <code>host.docker.internal</code>. Docker Engine on Linux does neither: the name is not defined, and a container reaches the host over the <code>docker0</code> bridge, so the server has to listen there and the firewall has to let that one port in. darkmux maps the name for you on Linux (<code>darkmux-platform</code>); the rest is yours to run, because darkmux never runs <code>sudo</code>:</p>
+    <p>Every role with tools (coder, reviewer, lab workloads) runs in the <code>darkmux-runtime</code> container. On macOS, Docker Desktop hides two differences that Docker Engine on Linux does not, and darkmux's Linux platform strategy (<code>darkmux-platform</code>) handles both:</p>
+    <ul>
+      <li><strong>Reaching the host.</strong> Docker Desktop defines <code>host.docker.internal</code> and forwards it to the Mac's own <code>127.0.0.1</code>. Docker Engine defines neither, so darkmux maps the name to the bridge gateway (<code>--add-host=host.docker.internal:host-gateway</code>). The model server then has to listen on the bridge, and the firewall has to let that one port in.</li>
+      <li><strong>Who owns the files.</strong> darkmux creates each dispatch's workspace and output directories private to you. Docker Desktop maps ownership across those mounts; Docker Engine keeps it, so the container runs as you (<code>--user=&lt;your uid&gt;:&lt;your gid&gt;</code>). Override it with <code>darkmux config set runtime.container_user &lt;uid&gt;:&lt;gid&gt;</code>, or <code>image</code> for the image's own user.</li>
+    </ul>
+    <p>The rest is yours to run, because darkmux never runs <code>sudo</code>:</p>
     <pre><code>sudo usermod -aG docker "$USER"
 sudo systemctl enable --now docker.service
 sudo ufw allow in on docker0 to any port 8080 proto tcp
 sudo ufw status verbose</code></pre>
-    <p>Log out and back in for the group to apply. Then serve the model on the bridge address instead of <code>127.0.0.1</code> (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge), so only containers reach it.</p>
+    <p>Log out and back in for the group to apply. Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A model on an endpoint darkmux does not manage needs its context window declared for a role with tools, which compacts against it: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
+    <pre><code>darkmux dispatch code-reviewer --profile mlx-small "Use the exec tool to run: echo hello-from-container. Then reply with the output in one sentence."</code></pre>
+    <p class="session-caption">Verified 2026-10-11 on the same M2 with a build of the <code>omarchy</code> branch (the two platform changes above are not in a release yet): two turns, one real <code>exec</code> tool call in the container, exit 0, 79 s.</p>
     <p>darkmux keeps the container on its own network rather than the host's. Host networking would make a <code>127.0.0.1</code> server reachable with no setup at all, and it would also give every tool call the run of every port on the machine.</p>
   </div>
 </section>
@@ -94,6 +101,7 @@ sudo ufw status verbose</code></pre>
       <li><strong>radio and compaction</strong> run on the utility model, which only LM Studio can serve today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
       <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only: RAM headroom, the host probe, machine uid.</li>
       <li><strong>The viewer's machine facts</strong> (memory, CPU, power) are empty, and the residency planner sees no memory pools, until each probe has a Linux strategy.</li>
+      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL, as above.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>
