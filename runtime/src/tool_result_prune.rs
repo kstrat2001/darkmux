@@ -2,11 +2,26 @@
 //!
 //! Oversized tool results sit in the transcript verbatim, and on small
 //! context windows they are the single biggest driver of the FIRST
-//! compaction. Middle-eliding an OLD, large tool result (keep the head +
-//! tail, drop the middle behind a marker) is a cheap, lossy-but-bounded
-//! context reclaim that DELAYS the first compaction — on a tight window
-//! that can mean one fewer compaction per dispatch, which is measurable
-//! wall-clock.
+//! compaction. Middle-eliding a large tool result (keep the head + tail,
+//! drop the middle behind a marker) is a cheap, lossy-but-bounded context
+//! reclaim that DELAYS the first compaction — on a tight window that can
+//! mean one fewer compaction per dispatch, which is measurable wall-clock.
+//!
+//! ## When: once, as the result enters the conversation (#3202)
+//!
+//! The loop trims a result as it appends it ([`trim_at_insertion`]), to its
+//! final form, and never changes it afterwards. This used to run as each
+//! request was built, on results more than six messages back, which sent a
+//! large result whole for a few turns and then shortened it. That rewrote a
+//! message the engine had already cached, so every prefix-caching engine
+//! (the Messages API, LM Studio, lithos-metal, Splash) fell back to the
+//! head of its cache and prefilled the rest again. Measured on lithos-metal:
+//! 526 s of a 908 s run was prefill on the eight requests that missed.
+//!
+//! The price is that the model never reads a result over the threshold
+//! whole, not even on the turn that asked for it: it reads the head and
+//! tail around the marker, which tells it to re-run the tool for the
+//! omitted section (a narrower `read` range, a filtered command).
 //!
 //! ## Prior art
 //!
@@ -27,19 +42,17 @@
 //!
 //! ## Safety
 //!
-//! - The last [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages are NEVER
-//!   trimmed — the active tool-call/tool-result thread the model is
-//!   reasoning about right now stays intact.
+//! - Only results over [`TOOL_RESULT_TRIM_THRESHOLD_BYTES`] are touched;
+//!   an ordinary result enters the conversation whole.
 //! - The trim is idempotent: an already-trimmed body carries the marker
-//!   sentinel and is skipped, so re-running the pass every turn is a
-//!   no-op on bodies already reclaimed.
+//!   sentinel and is skipped.
 //! - Head/tail cuts land on UTF-8 char boundaries (the #329 class of
 //!   slice-mid-codepoint panics is guarded by clamping to the nearest
 //!   boundary), so multibyte tool output (CJK / emoji / accents) is safe.
 
 use crate::lmstudio::Message;
 
-/// Byte length above which an OLD tool-result body is soft-trimmed.
+/// Byte length above which a tool-result body is soft-trimmed.
 /// Conservative: only genuinely large results (4000+ bytes) are touched,
 /// so ordinary short results are never disturbed. Chosen to sit well
 /// above head + tail so a fired trim always leaves a real middle to
@@ -55,19 +68,13 @@ pub const TOOL_RESULT_TRIM_HEAD_BYTES: usize = 1500;
 /// terminal signal (exit status, final assertion, summary line). (#1391)
 pub const TOOL_RESULT_TRIM_TAIL_BYTES: usize = 1500;
 
-/// Number of most-recent messages that are NEVER trimmed. The model is
-/// actively reasoning over the tail of the transcript; trimming a result
-/// it just received would remove context it still needs. Only OLDER
-/// results (before this window) are reclaimed. (#1391)
-pub const TOOL_RESULT_TRIM_PRESERVE_RECENT: usize = 6;
-
 /// Sentinel that marks an already-trimmed body. Presence of this
 /// substring makes the pass idempotent (a trimmed body is skipped on
 /// subsequent turns). It is the self-identifying prefix of the
 /// model-facing elision marker, so the marker doubles as the guard. (#1391)
 pub const TOOL_RESULT_TRIM_MARKER_SENTINEL: &str = "[darkmux-runtime: elided";
 
-/// Outcome of one soft-trim pass over the transcript.
+/// Outcome of one trim pass over the transcript.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ToolTrimStats {
     /// How many tool-result bodies were trimmed this pass.
@@ -158,10 +165,9 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
     // AN ALREADY-ELIDED BODY MAY BE ELIDED FURTHER, and refusing to was what
     // made #2808's bound inert on the modal thread.
     //
-    // `soft_trim_old_tool_results` (#1391) runs EVERY TURN, before the
-    // compaction check, and stamps the sentinel on every result over 4,000
-    // bytes outside the protected recent window — which is most of the
-    // compaction middle by the time a threshold trips. A flat "contains the
+    // The soft trim (#1391) stamps the sentinel on every result over 4,000
+    // bytes (since #3202, as each one enters the conversation) — which is
+    // most of the compaction middle by the time a threshold trips. A flat "contains the
     // sentinel, refuse" guard therefore made every one of those bodies
     // untouchable to the hard bound, so a middle that was ~100% tool-result
     // bytes reported "the weight is not in tool-result bodies" and refused
@@ -203,16 +209,17 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
 }
 
 /// (#2792) LAST-RESORT trim to bring an assembled prompt under a hard
-/// context-window bound, overriding the recent-window protection that
-/// [`soft_trim_old_tool_results`] deliberately honors.
+/// context-window bound, cutting deeper than the soft trim's threshold and
+/// head + tail allow.
 ///
-/// The soft trim exists to reclaim transcript without touching what the model
-/// just asked for, so it protects the last
-/// [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages. That protection is correct
-/// for its purpose and is precisely what leaves this case unhandled: measured
-/// on a real run, ONE tool result landing in the protected window carried the
-/// next request to 38,439 tokens against a declared 32,000, four times in 27
-/// turns. Compaction cannot help — it runs BETWEEN turns, and this growth
+/// The soft trim exists to reclaim transcript without disturbing an ordinary
+/// result, so it leaves every body at or under 4,000 bytes alone, and until
+/// #3202 it also spared the last six messages. That restraint is correct for
+/// its purpose and is what left this case unhandled: measured on a real run,
+/// ONE tool result landing in that recent window carried the next request to
+/// 38,439 tokens against a declared 32,000, four times in 27 turns. Since
+/// #3202 such a result enters already trimmed, but a thread of many results
+/// at or under 4,000 bytes (or a seeded one) can still overflow. Compaction cannot help — it runs BETWEEN turns, and this growth
 /// happens WITHIN one, after the last compaction and before the send.
 ///
 /// On a model loaded at the window its profile declares, that request is
@@ -316,42 +323,26 @@ pub fn hard_trim_to_fit(
     stats
 }
 
-/// Walk the transcript and soft-trim every OLD oversized tool-result body.
-/// The last [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages are skipped so
-/// the active thread stays intact. Mutates in place; returns what it
-/// reclaimed for the caller's observability. (#1391)
-pub fn soft_trim_old_tool_results(messages: &mut [Message]) -> ToolTrimStats {
-    let n = messages.len();
-    let protect_from = n.saturating_sub(TOOL_RESULT_TRIM_PRESERVE_RECENT);
-    let mut stats = ToolTrimStats::default();
-    for (i, m) in messages.iter_mut().enumerate() {
-        if i >= protect_from {
-            // Everything from here on is inside the protected recent window.
-            break;
+/// (#3202) The tool-result message the loop appends to the conversation:
+/// the body in its FINAL form. A body over the threshold is soft-trimmed
+/// here, once, and nothing changes it afterwards, so every later request
+/// extends the one before it and the engine's prompt cache stays valid. A
+/// body at or under the threshold enters whole. The second value is the
+/// bytes the trim removed (0 when it left the body whole).
+pub fn trim_at_insertion(tool_call_id: impl Into<String>, name: impl Into<String>, body: String) -> (Message, usize) {
+    let (body, reclaimed) = match soft_trim_body(&body) {
+        Some(trimmed) => {
+            let reclaimed = body.len() - trimmed.len();
+            (trimmed, reclaimed)
         }
-        if m.role != "tool" {
-            continue;
-        }
-        let Some(body) = m.content.as_deref() else {
-            continue;
-        };
-        if let Some(trimmed) = soft_trim_body(body) {
-            let reclaimed = body.len().saturating_sub(trimmed.len());
-            stats.results_trimmed += 1;
-            stats.bytes_reclaimed += reclaimed;
-            m.content = Some(trimmed);
-        }
-    }
-    stats
+        None => (body, 0),
+    };
+    (Message::tool_result(tool_call_id, name, body), reclaimed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tool_msg(body: &str) -> Message {
-        Message::tool_result("call_1", "bash", body)
-    }
 
     #[test]
     fn under_threshold_body_is_untouched() {
@@ -430,47 +421,17 @@ mod tests {
     }
 
     #[test]
-    fn preserve_recent_window_is_not_trimmed() {
+    fn a_large_result_enters_the_conversation_trimmed_and_a_small_one_whole() {
         let big = "y".repeat(6000);
-        // 8 messages; PRESERVE_RECENT=6, so only indices [0, 1] are eligible.
-        let mut messages = vec![
-            tool_msg(&big), // 0 eligible -> trimmed
-            tool_msg(&big), // 1 eligible -> trimmed
-            tool_msg(&big), // 2 protected
-            tool_msg(&big), // 3 protected
-            tool_msg(&big), // 4 protected
-            tool_msg(&big), // 5 protected
-            tool_msg(&big), // 6 protected
-            tool_msg(&big), // 7 protected
-        ];
-        let stats = soft_trim_old_tool_results(&mut messages);
-        assert_eq!(stats.results_trimmed, 2, "only the 2 old results are trimmed");
-        assert!(stats.bytes_reclaimed > 0);
-        // The protected tail bodies are byte-identical to the original.
-        for m in &messages[2..] {
-            assert_eq!(m.content.as_deref().unwrap().len(), big.len());
-        }
-        // The old bodies were reclaimed.
-        for m in &messages[..2] {
-            assert!(m.content.as_deref().unwrap().len() < big.len());
-        }
-    }
+        let (message, reclaimed) = trim_at_insertion("call_1", "bash", big.clone());
+        let body = message.content.as_deref().unwrap();
+        assert_eq!(body, soft_trim_body(&big).unwrap(), "the soft trim's own final form");
+        assert_eq!(reclaimed, big.len() - body.len());
+        assert_eq!((message.role.as_str(), message.tool_call_id.as_deref()), ("tool", Some("call_1")));
 
-    #[test]
-    fn non_tool_messages_are_never_trimmed() {
-        let big = "w".repeat(6000);
-        let mut messages = vec![
-            Message::user(big.clone()),   // 0 — user, huge, NOT a tool result
-            Message::assistant(&big),     // 1 — assistant, huge, NOT a tool result
-            tool_msg("small"),            // 2
-            tool_msg("small"),            // 3
-            tool_msg("small"),            // 4
-            tool_msg("small"),            // 5
-            tool_msg("small"),            // 6
-            tool_msg("small"),            // 7
-        ];
-        let stats = soft_trim_old_tool_results(&mut messages);
-        assert_eq!(stats.results_trimmed, 0, "only role=='tool' bodies are eligible");
-        assert_eq!(messages[0].content.as_deref().unwrap().len(), big.len());
+        let exactly = "z".repeat(TOOL_RESULT_TRIM_THRESHOLD_BYTES);
+        let (message, reclaimed) = trim_at_insertion("call_2", "bash", exactly.clone());
+        assert_eq!(message.content.as_deref(), Some(exactly.as_str()), "at the threshold it enters whole");
+        assert_eq!(reclaimed, 0);
     }
 }
