@@ -5209,6 +5209,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5448,6 +5449,7 @@
             base_url_override: base_url,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         }
     }
 
@@ -5463,6 +5465,27 @@
         cfg.cache_dir = crate::dispatch_internal::shared_cache_dir_for(Some("laptop"));
         let remote = build_docker_run_argv(&cfg).join(" ");
         assert!(!remote.contains("darkmux-cache"), "{remote}");
+    }
+
+    /// (omarchy) Docker Engine on Linux does not define `host.docker.internal`
+    /// (Docker Desktop does), so a container dialing the rewritten loopback URL
+    /// cannot resolve its host. When the platform answers `HostGateway` the
+    /// mapping is a docker-run OPTION, before the `--` fence; `Builtin` (what
+    /// macOS answers) leaves the argv exactly as it was.
+    #[test]
+    fn host_gateway_mapping_follows_the_platforms_answer() {
+        use darkmux_platform::{ContainerHostAccess, FakePlatform, Platform};
+        let flag = "--add-host=host.docker.internal:host-gateway".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+
+        cfg.container_host_access = FakePlatform { container_host_access: ContainerHostAccess::Builtin }.container_host_access();
+        assert!(!build_docker_run_argv(&cfg).contains(&flag), "Builtin adds nothing");
+
+        cfg.container_host_access = FakePlatform { container_host_access: ContainerHostAccess::HostGateway }.container_host_access();
+        let argv = build_docker_run_argv(&cfg);
+        let at = argv.iter().position(|a| *a == flag).expect("HostGateway adds the mapping");
+        let fence = argv.iter().position(|a| a == "--").expect("-- fence");
+        assert!(at < fence, "must be a docker-run option, not a runtime arg: {argv:?}");
     }
 
     /// The value following `--base-url` in `argv`, if the flag is present.
@@ -5680,6 +5703,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5806,6 +5830,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5866,6 +5891,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         }
     }
 
@@ -7569,6 +7595,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);
@@ -14320,6 +14347,7 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
         };
         let argv = build_docker_run_argv(&config);
         let flag = argv

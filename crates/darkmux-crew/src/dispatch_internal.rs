@@ -2457,6 +2457,11 @@ pub struct DockerRunConfig {
     /// exists before setting this — the runtime fails loudly (exit 2)
     /// rather than silently starting fresh on a missing/corrupt one.
     pub resume_checkpoint: bool,
+    /// (omarchy) How the container reaches this machine as
+    /// `host.docker.internal`, the name [`loopback_to_docker_host`] rewrites
+    /// to: the platform's answer (`darkmux_platform`). `HostGateway` adds
+    /// `--add-host=host.docker.internal:host-gateway`; `Builtin` adds nothing.
+    pub container_host_access: darkmux_platform::ContainerHostAccess,
 }
 
 impl DockerRunConfig {
@@ -2604,6 +2609,11 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     if let Some(max_pause_ms) = config.max_pause_ms_env {
         args.push("-e".to_string());
         args.push(format!("DARKMUX_MAX_PAUSE_MS={max_pause_ms}"));
+    }
+
+    // (omarchy) Map host.docker.internal when the platform says to; see the field.
+    if config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway {
+        args.push("--add-host=host.docker.internal:host-gateway".to_string());
     }
 
     // Runtime binary injection (non-default images only)
@@ -7588,6 +7598,7 @@ fn container_run_config(
         // checkpoint into `host_out` when `opts.resume_from` is `Some` —
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
+        container_host_access: darkmux_platform::current().container_host_access(),
         remote_chat_url: agentic_brain.0,
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing

@@ -41,6 +41,7 @@ This document is the **why**: how darkmux is built, the decisions behind the sha
 - [Lab reproducibility: fixtures + content hashing](#lab-reproducibility-fixtures--content-hashing)
 - [Residency: a pure planner, leases and an owned namespace](#residency-a-pure-planner-leases-and-an-owned-namespace)
 - [Thermal and power governors: pause, never kill](#thermal-and-power-governors-pause-never-kill)
+- [Platforms: one strategy per OS, asked and never branched on](#platforms-one-strategy-per-os-asked-and-never-branched-on)
 
 **Running a mission**
 
@@ -673,6 +674,22 @@ An episode is a transition, not a sample, so a long stretch at `serious` counts 
 
 Known gap: the governor acts on what the OS probe reports (a thermal state and a CPU speed limit), and with no reading it has no new information to act on, so it does not throttle a machine it cannot read.
 
+## Platforms: one strategy per OS, asked and never branched on
+
+darkmux was built on macOS, and its host facts came from macOS tools: `sysctl`, `vm_stat`, `ioreg`, `pmset`, the Keychain, IOKit. Linux (first on Omarchy, Arch on Apple Silicon under Asahi) needs different answers to the same questions. The tempting shape is an `if linux` beside each macOS call, and that shape is what this section rules out: it spreads the OS across business logic, so every reader of a dispatch, a planner or a doctor row has to hold every platform in mind, and a Linux fix can quietly change what a Mac does.
+
+**Callers ask a question; a strategy answers it.** `darkmux-platform` holds a `Platform` trait with one method per question, and one implementation per OS (`MacPlatform`, `LinuxPlatform`, `OtherPlatform`), each in its own module. `darkmux_platform::current()` is the only place a `cfg(target_os)` chooses between them. A caller gets data back, never an OS name, so it cannot branch on the OS even by accident. The first question is how a dispatch container reaches this machine as `host.docker.internal`: Docker Desktop defines the name and Docker Engine on Linux does not, so `container_host_access()` answers `Builtin` or `HostGateway`, and the dispatch adds `--add-host=host.docker.internal:host-gateway` for the second. The question is about the engine, not the OS, which is why the answer is a capability: Docker Desktop for Linux and Docker Engine are both Linux.
+
+**macOS behavior does not change.** A Mac answer is the code darkmux already runs there, moved behind the trait and not rewritten, so the existing suite and the macOS CI lane hold it. `OtherPlatform` answers what darkmux did before the crate existed, so an OS with no strategy of its own changes nothing.
+
+**Every strategy compiles everywhere.** Each module is ordinary Rust on every OS, so each one's answers are unit-tested on Linux CI and on a Mac alike. An OS-only call inside a strategy (a sysctl, a `/proc` read) is `cfg`-gated at that leaf, with its parsing compiled everywhere, the shape `gestalt_host::mac_probe` already uses. Tests that need a specific answer use `FakePlatform`, whose every answer the test sets.
+
+**The rule is held by a ratchet, not by this paragraph.** Outside the crate, a line naming the OS (`target_os`, `consts::OS`) is allowed only where one already was when platform strategies arrived: `crates/darkmux-platform/os-gates.allow` lists those per file (100 lines in 23 files at the start). `os_differences_stay_in_the_platform_crate` fails when a file gains one, naming the fix, and when a file loses one until its count is lowered, so the list records the migration and only shrinks.
+
+**Migration order follows what blocks Linux use.** Container host access is first, because every role with tools runs in the container. Next is the memory snapshot: `MacProbe` is the only `ResourceProbe`, so off macOS the residency planner, the machine lens and the scheduler read empty pools, and five crates each read total RAM their own way. Then machine uid (presence and fleet), the host probe (viewer telemetry), secrets (the Keychain) and service management (launchd or systemd).
+
+Known gaps: the ratchet reads text, so an OS check assembled another way (a `cfg` alias, a build script) passes it. `runtime/` is outside the workspace and outside the ratchet; it only ever runs in the Linux container. A Linux container still cannot reach a model server bound only to `127.0.0.1` through the host gateway: that is the server's bind address, which darkmux does not own.
+
 ## Seat classes: every step says what it consumes
 
 A mission is a graph of steps, and the scheduler has to decide, for each one, how many of its siblings may run alongside it. That decision needs one fact: what does this step consume?
@@ -1251,6 +1268,7 @@ A rule that only lives in a paragraph gets skipped under time pressure, so most 
 | `scripts/complexity-ratchet.py` | a new function above cyclomatic complexity 10, and any function whose complexity rises | complexity that lives in data or in a test |
 | `scripts/complexity-ratchet.py --crap` (quality.yml's `coverage` job) | a new Rust function above CRAP 10, and any function whose CRAP rises above its entry in `scripts/crap-baseline.json` | a function with no coverage data on Linux; on an unlabeled pull request, everything (coverage runs on `main` pushes and `full-ci` pull requests, so a rise is caught on `main` after the merge) |
 | `scripts/engagement-sentinel-guard.py` | an engagement-private identifier (an employer, a private repo, a hosted endpoint, a tracker key) entering this public repo, and a UUID-shaped string outside the fake fixture form | a fixture that reproduces private content without spelling a sentinel word; field-policy review is still a human job |
+| `os_differences_stay_in_the_platform_crate` (`darkmux-platform`, in the nextest suite) | a new line naming the OS (`target_os`, `consts::OS`) outside `darkmux-platform`, and a stale count in `os-gates.allow` ([Platforms](#platforms-one-strategy-per-os-asked-and-never-branched-on)) | an OS check that never spells either pattern |
 | `cargo machete` | a dependency a crate declares and never uses | what only a build would show: it reads sources, not the build, so a false positive is listed under the crate's `[package.metadata.cargo-machete] ignored` with a reason |
 | `scripts/verify-tap-pin.py --self-test` | its own logic drifting; the live half runs at release time against the tap | (a pull request has no tag to check) |
 | tracked-but-ignored files, demo sync | a file `.gitignore` says to ignore but git still tracks; a demo page that has drifted from the served viewer | |

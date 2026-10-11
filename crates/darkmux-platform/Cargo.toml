@@ -1,0 +1,12 @@
+[package]
+name = "darkmux-platform"
+version = "5.1.1"
+edition = "2021"
+description = "darkmux platform strategies — how each host OS answers the questions the rest of darkmux asks"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.86"
+
+[dependencies]
