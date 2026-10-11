@@ -28,7 +28,10 @@ darkmux release.
   rewrites them, so every request extends the previous one and the model
   sees each result whole. Compaction bounds the conversation, with the
   pre-send bound (#2792) as the last resort for a request that would not fit
-  the window; each compaction still breaks the cache once, as it must. Tests drive the real loop on every dialect, and
+  the window; each compaction still breaks the cache once, as it must. The
+  pre-send bound now cuts the newest result first, the one going out for the
+  first time, and reaches back to one an earlier request sent only when that
+  is not enough. Tests drive the real loop on every dialect, and
   through a resume, and check that each request extends the previous one.
 
 ## [5.1.0] - 2026-10-10

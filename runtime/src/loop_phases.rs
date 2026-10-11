@@ -952,10 +952,14 @@ impl<'a> AgentLoop<'a> {
         // Floor chosen for THIS path, not inherited from the soft
         // trim's 4,000 — see `hard_trim_to_fit`'s own note on why that
         // constant made the bound inert on the modal shape.
+        // (#3202) Newest first: the results about to be sent for the first
+        // time are cut before any an earlier request sent, so this request
+        // still extends that one and the engine keeps its prompt cache.
         let stats = crate::tool_result_prune::hard_trim_to_fit(
             &mut self.messages,
             message_budget,
             HARD_TRIM_MIN_BODY_BYTES,
+            crate::tool_result_prune::TrimOrder::NewestFirst,
         );
         let (sys_a, prompt_a) = measure_request_context(&self.messages);
         let after_tokens = estimate_prompt_tokens(sys_a + prompt_a, tools_bytes, prompt_anchor);

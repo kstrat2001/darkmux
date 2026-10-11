@@ -326,6 +326,59 @@ fn a_long_run_of_large_results_compacts_instead_of_overflowing_the_window() {
     );
 }
 
+/// (#3202 review) With compaction off (an unset `internal.utility`, or one
+/// refused every time), the pre-send bound (#2792) is all that keeps a request
+/// inside the window. It must cut the result about to be sent for the first
+/// time, not an older one an earlier request already sent: the request it
+/// bounds still extends the previous one.
+///
+/// Echo results cost their size twice (the call's arguments carry the same
+/// text), so each turn grows the thread by twice what cutting its own result
+/// can reclaim. Only the FIRST request the bound fires on can fit by cutting
+/// the newest result alone, so the run ends there.
+#[test]
+#[serial_test::serial]
+fn the_pre_send_bound_cuts_the_newest_result_and_keeps_the_prefix() {
+    const TURNS: usize = 8;
+    const WINDOW: u32 = 32_000;
+    let dialect = Dialect::ChatCompletions;
+    let calls: Vec<(String, String)> = (0..TURNS)
+        .map(|n| (format!("call_{n}"), format!(r#"{{"text":"{n} {}"}}"#, "x".repeat(8_000))))
+        .collect();
+    let mut replies: Vec<String> =
+        calls.iter().map(|(id, input)| reply(dialect, None, &[(id.as_str(), "echo", input.as_str())])).collect();
+    replies.push(reply(dialect, Some("All done."), &[]));
+    let (url, bodies) = recording_server(replies);
+    let client = client_for(dialect, &url);
+    let cfg = compaction::CompactionConfig { context_window: Some(WINDOW), ..compaction::CompactionConfig::never_compact() };
+    let tmp = tempfile::Builder::new().prefix("cache-prefix-bound").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
+        &[Tool::Echo], &mut traj, streams(dialect), &cfg, Some(TURNS as u32 + 5), None, Some(4_096), None,
+        Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+    )
+    .expect("the run completes");
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), TURNS + 1, "one request per turn");
+    let trajectory = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+    let bound: Vec<Value> = trajectory
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "dispatch.pre_send_bound")
+        .collect();
+    assert_eq!(bound.len(), 1, "fixture guard: the bound fires on the last request only: {bound:?}");
+    assert_eq!(bound[0]["fits"], true, "fixture guard: cutting one result fits: {}", bound[0]);
+    assert_each_request_extends_the_previous(dialect, &bodies);
+    let last = tool_results(bodies.last().unwrap());
+    let (newest, earlier) = last.split_last().unwrap();
+    assert!(newest.1.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL), "the newest result is cut");
+    assert!(
+        earlier.iter().all(|(_, r)| !r.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)),
+        "no result an earlier request sent is cut"
+    );
+}
+
 /// `a` around the first byte where it differs from `b`, so a failure shows
 /// the divergence rather than two whole messages.
 fn around_first_difference(a: &str, b: &str) -> String {

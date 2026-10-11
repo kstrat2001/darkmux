@@ -586,9 +586,9 @@ impl CompactionConfig {
 /// produced no disclosure anywhere — no message, no trajectory event, no
 /// flow record, no envelope field — so a zero compaction count read
 /// identically to "never needed one." A long dispatch would run its
-/// transcript up against the primary model's context with only a soft trim
-/// between it and overflow, silently, with no context-overflow handling
-/// anywhere in the runtime to catch it.
+/// transcript up against the primary model's context with only the
+/// last-resort pre-send bound (#2792) between it and overflow, silently: no
+/// soft trim since #3202, and nothing else in the runtime to catch it.
 ///
 /// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
 /// stderr — call sites just print whatever this returns. `None` only when
@@ -1994,8 +1994,13 @@ pub(crate) fn fit_excerpt_to_compactor(
     // one measurement is enough.
     let framing = before_chars.saturating_sub(raw_message_bytes(middle));
     let raw_target = budget_chars.saturating_sub(framing);
-    let stats =
-        crate::tool_result_prune::hard_trim_to_fit(middle, raw_target, EXCERPT_MIN_BODY_BYTES);
+    // Largest first: the excerpt is a one-off text no later request extends.
+    let stats = crate::tool_result_prune::hard_trim_to_fit(
+        middle,
+        raw_target,
+        EXCERPT_MIN_BODY_BYTES,
+        crate::tool_result_prune::TrimOrder::LargestFirst,
+    );
 
     // THE WEIGHT IS NOT ONLY IN TOOL RESULTS (measured on the live dogfood
     // run). `hard_trim_to_fit` elides `role == "tool"` bodies and nothing

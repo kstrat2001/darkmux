@@ -142,6 +142,17 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
     Some(out)
 }
 
+/// (#3202) Which tool-result bodies [`hard_trim_to_fit`] cuts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimOrder {
+    /// The largest first, so the fewest bodies are touched. For a compaction
+    /// excerpt, a one-off text no later request extends.
+    LargestFirst,
+    /// The newest first, so a result an earlier request already sent is
+    /// rewritten only as a last resort. For the conversation itself.
+    NewestFirst,
+}
+
 /// (#2792) LAST-RESORT trim to bring an assembled prompt under a hard
 /// context-window bound. Since #3202 it is the only thing that ever elides a
 /// tool result in the conversation; nothing else rewrites one.
@@ -160,15 +171,16 @@ pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
 /// keeps its head and tail around an explicit elision marker, so the model can
 /// see that it is reading an excerpt.
 ///
-/// Largest first, so the fewest bodies are touched to get under the bound, and
-/// it stops the moment it fits. Returns the bodies trimmed and bytes
-/// reclaimed; a caller that gets `results_trimmed == 0` on an over-window
-/// thread has a thread whose weight is NOT in tool results and must say so
-/// rather than pretend it acted.
+/// `order` says which bodies are cut first ([`TrimOrder`]); it stops the
+/// moment it fits. Returns the bodies trimmed and bytes reclaimed; a caller
+/// that gets `results_trimmed == 0` on an over-window thread has a thread
+/// whose weight is NOT in tool results and must say so rather than pretend it
+/// acted.
 pub fn hard_trim_to_fit(
     messages: &mut [Message],
     target_bytes: usize,
     min_body_bytes: usize,
+    order: TrimOrder,
 ) -> ToolTrimStats {
     let mut stats = ToolTrimStats::default();
     let mut current: usize = messages
@@ -189,14 +201,24 @@ pub fn hard_trim_to_fit(
         return stats;
     }
 
-    // Index the trimmable tool results by body size, largest first.
     let mut candidates: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role == "tool")
         .filter_map(|(i, m)| m.content.as_ref().map(|b| (i, b.len())))
         .collect();
-    candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    match order {
+        TrimOrder::LargestFirst => candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len)),
+        // Newest first. The results at the end were appended since the last
+        // request and go out now for the first time, so cutting them keeps
+        // every earlier request a prefix of this one. Reaching past them, to
+        // a result an earlier request already sent, happens only when the
+        // newest ones are at their floor and the request still does not fit.
+        // That rewrites a sent message and BREAKS the engine's prompt cache
+        // from it on (#3202); a request that fits is worth that, and one that
+        // does not fit is refused outright.
+        TrimOrder::NewestFirst => candidates.reverse(),
+    }
 
     for (idx, _) in candidates {
         if current <= target_bytes {
