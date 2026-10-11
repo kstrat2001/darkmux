@@ -14,6 +14,15 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.1.1] - 2026-10-11
+
+Every local engine keeps its prompt cache. darkmux no longer trims old tool results
+between turns, a trim that rewrote messages the engine had already cached and forced it
+to re-process the conversation. Measured on one pepper-grinder run on lithos-metal
+(Qwen3.6-35B-A3B): 74% of input tokens served from the engine's cache instead of 53%,
+and fresh prompt processing fell from 142,562 tokens to 57,309. LM Studio and Splash
+use the same prefix cache and get the same fix; Claude endpoints had it since 5.1.0.
+
 ### Fixed
 
 - **Every local engine keeps its prompt cache across turns** (#3202). The soft
@@ -3383,6 +3392,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.1.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.1
 [5.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.0
 [5.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.0.0
 [3.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.13.0
