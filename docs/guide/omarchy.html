@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Omarchy: darkmux on Linux | darkmux user guide</title>
+<meta name="description" content="Running darkmux on Omarchy (Arch Linux) on an Apple Silicon Mac under Asahi: building from source, a local model on the Apple GPU through omarchy-mlx, and what Linux needs that macOS gives for free.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand"><img src="../media/icon/mark-trapezoid-out.svg" width="22" height="22" alt="">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> omarchy</span>
+    <div class="links">
+      <a href="../guide/">Guide</a>
+      <a href="../demo/">Demo</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">11 <span class="dot">·</span> machine setup</div>
+    <h1>Omarchy: darkmux on Linux</h1>
+    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a>, an Arch Linux setup, on an Apple Silicon Mac running the Asahi kernel: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux does not give you for free. Linux support is in progress; the last section says what does not work yet.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Build and install</h2>
+    <p>There is no Homebrew here, so darkmux builds from source. Omarchy ships <code>mise</code>; it installs the Rust toolchain the repo pins without touching the system.</p>
+    <pre><code>mise use -g rust@1.97.1
+git clone https://github.com/kstrat2001/darkmux ~/Work/darkmux
+cd ~/Work/darkmux
+cargo install --path . --locked
+ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   # ~/.cargo/bin is not on Omarchy's PATH
+darkmux init</code></pre>
+    <p><code>init</code> writes <code>~/.darkmux/config.json</code> and <code>profiles.json</code> and installs the agent skills. With no LM Studio it cannot fill in a worker model; the next section adds one.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>A local model without LM Studio</h2>
+    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver, and installs <code>mlx_lm.server</code>, which serves the OpenAI chat API. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux only sends requests, and the server owns what is loaded. Install it from the Omarchy menu (Install &gt; AI) or with the project's script, then serve a model sized for your memory:</p>
+    <pre><code>~/.local/share/mlx-omarchy/venv/bin/mlx_lm.server \
+  --model mlx-community/Qwen3-1.7B-4bit --host 127.0.0.1 --port 8080 \
+  --prefill-step-size 512 --prompt-cache-size 1 --decode-concurrency 1 \
+  --chat-template-args '{"enable_thinking":false}'</code></pre>
+    <p>Then add an endpoint and a profile to <code>~/.darkmux/profiles.json</code>:</p>
+    <pre><code>"profiles": {
+  "mlx-small": {
+    "description": "Qwen3-1.7B on the local mlx_lm.server.",
+    "models": [{ "id": "mlx-community/Qwen3-1.7B-4bit", "endpoint": "mlx-local" }]
+  }
+},
+"endpoints": {
+  "mlx-local": { "url": "http://127.0.0.1:8080/v1", "dialect": "chat-completions-max-tokens" }
+}</code></pre>
+    <p>A role with no tools runs on the host against that endpoint, with no Docker and no LM Studio:</p>
+    <pre><code>darkmux dispatch pr-reviewer --profile mlx-small "In two sentences: what is one risk of merging a change that adds a new required config field?"</code></pre>
+    <p class="session-caption">Verified 2026-10-11 on a 13" M2 MacBook Pro (8 GB), omarchy-mlx v0.7.32, system Mesa 26.2.4: the dispatch returned a verdict in about a minute, the model's first load included. On 8 GB, Qwen3-4B-Instruct-2507-4bit ran the GPU out of memory on a ~3.5k-token prompt; stay at 1.7B there, or close other GPU users.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Docker, for roles with tools</h2>
+    <p><strong>Not yet verified end to end on Omarchy.</strong> Every role with tools (coder, reviewer, lab workloads) runs in the <code>darkmux-runtime</code> container. On macOS, Docker Desktop lets a container reach a server on the Mac's <code>127.0.0.1</code> as <code>host.docker.internal</code>. Docker Engine on Linux does neither: the name is not defined, and a container reaches the host over the <code>docker0</code> bridge, so the server has to listen there and the firewall has to let that one port in. darkmux maps the name for you on Linux (<code>darkmux-platform</code>); the rest is yours to run, because darkmux never runs <code>sudo</code>:</p>
+    <pre><code>sudo usermod -aG docker "$USER"
+sudo systemctl enable --now docker.service
+sudo ufw allow in on docker0 to any port 8080 proto tcp
+sudo ufw status verbose</code></pre>
+    <p>Log out and back in for the group to apply. Then serve the model on the bridge address instead of <code>127.0.0.1</code> (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge), so only containers reach it.</p>
+    <p>darkmux keeps the container on its own network rather than the host's. Host networking would make a <code>127.0.0.1</code> server reachable with no setup at all, and it would also give every tool call the run of every port on the machine.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What does not work yet</h2>
+    <ul>
+      <li><strong>radio and compaction</strong> run on the utility model, which only LM Studio can serve today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
+      <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only: RAM headroom, the host probe, machine uid.</li>
+      <li><strong>The viewer's machine facts</strong> (memory, CPU, power) are empty, and the residency planner sees no memory pools, until each probe has a Linux strategy.</li>
+      <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>
