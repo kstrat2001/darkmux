@@ -2462,6 +2462,28 @@ pub struct DockerRunConfig {
     /// to: the platform's answer (`darkmux_platform`). `HostGateway` adds
     /// `--add-host=host.docker.internal:host-gateway`; `Builtin` adds nothing.
     pub container_host_access: darkmux_platform::ContainerHostAccess,
+    /// (omarchy) Which user the container runs as, from
+    /// [`resolve_container_user`]: the operator's override, else the
+    /// platform's answer. `Host` adds `--user=<uid>[:<gid>]` and
+    /// `-e HOME=/tmp` (the image's home belongs to the image's own uid);
+    /// `Image` adds nothing.
+    pub container_user: darkmux_platform::ContainerUser,
+}
+
+/// (omarchy) Which user the dispatch container runs as: the operator's
+/// override (`runtime.container_user` / `DARKMUX_CONTAINER_USER`) when set,
+/// else `platform`'s answer. An override that doesn't parse refuses the
+/// dispatch, naming the setting, rather than falling back.
+pub(crate) fn resolve_container_user(
+    override_value: Option<&str>,
+    platform: &dyn darkmux_platform::Platform,
+) -> Result<darkmux_platform::ContainerUser> {
+    match override_value {
+        None => Ok(platform.container_user()),
+        Some(v) => darkmux_platform::ContainerUser::parse(v).map_err(|why| {
+            anyhow!("runtime.container_user (or DARKMUX_CONTAINER_USER): {why}")
+        }),
+    }
 }
 
 impl DockerRunConfig {
@@ -2614,6 +2636,13 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // (omarchy) Map host.docker.internal when the platform says to; see the field.
     if config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway {
         args.push("--add-host=host.docker.internal:host-gateway".to_string());
+    }
+
+    // (omarchy) Run as the resolved user; see the field.
+    if let Some(user) = config.container_user.docker_user() {
+        args.push(format!("--user={user}"));
+        args.push("-e".to_string());
+        args.push("HOME=/tmp".to_string());
     }
 
     // Runtime binary injection (non-default images only)
@@ -7599,6 +7628,10 @@ fn container_run_config(
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
         container_host_access: darkmux_platform::current().container_host_access(),
+        container_user: resolve_container_user(
+            darkmux_types::config_access::container_user_override().as_deref(),
+            darkmux_platform::current(),
+        )?,
         remote_chat_url: agentic_brain.0,
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing

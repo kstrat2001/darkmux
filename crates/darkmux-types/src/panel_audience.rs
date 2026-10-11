@@ -163,6 +163,7 @@ pub const CONFIG_SHOWN: &[&str] = &[
     "runtime.injected_context_fraction",
     "runtime.acp_idle_exit_minutes",
     "runtime.turn_delay_ms",
+    "runtime.container_user",
     "runtime.host_sampler_interval_ms",
     "runtime.live_sample_ms",
     "runtime.thermal.enabled",
