@@ -582,31 +582,23 @@ impl<'a> AgentLoop<'a> {
         if tool_ok {
             self.prove_work();
         }
-        self.messages.push(Message::tool_result(call.id, call.function.name, result));
+        self.push_tool_result(call.id, call.function.name, result);
         let (pending, seq_base) = pending_after(c.pending, idx, tool_seq + 1);
         self.write_checkpoint(None, pending, seq_base);
     }
 
     fn compact_after_resume(&mut self) -> Option<LoopOutcome> {
-        // (#2114 finding N1) The same soft-trim + compaction check the
-        // main loop's `tool_calls` arm runs right after ITS tool-dispatch
-        // loop, applied here too — otherwise a resume whose catch-up pass
-        // just appended a batch of large tool results sails straight into
-        // the FIRST post-resume request oversized, with neither the trim
-        // nor the compaction check that would have caught it on a live
-        // (never-killed) run. No real `latest_prompt_tokens` exists yet
+        // (#2114 finding N1) The same compaction check the main loop's
+        // `tool_calls` arm runs right after ITS tool-dispatch loop, applied
+        // here too — otherwise a resume whose catch-up pass just appended a
+        // batch of tool results sails straight into the FIRST post-resume
+        // request oversized, without the compaction check that would have
+        // caught it on a live (never-killed) run. No real
+        // `latest_prompt_tokens` exists yet
         // at this point (no request has been sent in this process), so
         // this always uses the local chars/4 estimate rather than the
         // main loop's reported-vs-estimate staleness gate — there's
         // nothing to compare the estimate against yet.
-        let trim_stats = self.soft_trim_old_results();
-        if trim_stats.results_trimmed > 0 {
-            eprintln!(
-                "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \
-                 of transcript before the post-resume compaction check (#1391/#2114)",
-                trim_stats.results_trimmed, trim_stats.bytes_reclaimed
-            );
-        }
         // (#2792) The same occupancy measure the main loop uses. This path
         // was ALREADY correct — it has always measured the current thread
         // rather than consulting a reported count, because after a resume
@@ -920,8 +912,8 @@ impl<'a> AgentLoop<'a> {
         // window happens WITHIN one, when a tool result lands after the last
         // compaction and before this line. Measured with the trigger fix
         // already in: 14 of 124 turns went out at up to 39,973 against a
-        // declared 32,000, because a result in the protected recent window is
-        // untouchable by both compaction and the soft trim.
+        // declared 32,000, because a result in the protected recent window was
+        // untouchable by both compaction and the soft trim (removed in #3202).
         //
         // MEASURE WHAT IS SENT, NOT JUST THE MESSAGES (round-2 merge gate).
         // `measure_request_context` sums message content and tool-call args.
@@ -960,10 +952,14 @@ impl<'a> AgentLoop<'a> {
         // Floor chosen for THIS path, not inherited from the soft
         // trim's 4,000 — see `hard_trim_to_fit`'s own note on why that
         // constant made the bound inert on the modal shape.
+        // (#3202) Newest first: the results about to be sent for the first
+        // time are cut before any an earlier request sent, so this request
+        // still extends that one and the engine keeps its prompt cache.
         let stats = crate::tool_result_prune::hard_trim_to_fit(
             &mut self.messages,
             message_budget,
             HARD_TRIM_MIN_BODY_BYTES,
+            crate::tool_result_prune::TrimOrder::NewestFirst,
         );
         let (sys_a, prompt_a) = measure_request_context(&self.messages);
         let after_tokens = estimate_prompt_tokens(sys_a + prompt_a, tools_bytes, prompt_anchor);
@@ -1780,7 +1776,7 @@ impl<'a> AgentLoop<'a> {
         }
         self.dispatch_calls(calls);
         // Loop back and call chat() again, unless compaction ends the dispatch.
-        self.trim_and_compact(call.bound.wire_max_tokens)
+        self.compact_if_needed(call.bound.wire_max_tokens)
     }
 
     fn refuse_invalid_calls(&mut self, calls: &[ToolCall], reason: MalformedReason) {
@@ -1955,11 +1951,7 @@ impl<'a> AgentLoop<'a> {
         }
         self.track_cadence(&call);
         self.watch_for_failure_cascade(&call, &result);
-        self.messages.push(Message::tool_result(
-            call.id,
-            call.function.name,
-            result,
-        ));
+        self.push_tool_result(call.id, call.function.name, result);
         // (#2114 finding 2) Per-tool-result checkpoint. Written
         // after EVERY tool result, not just at the turn
         // boundary above `calls`'s dispatch loop — a kill
@@ -2123,40 +2115,19 @@ impl<'a> AgentLoop<'a> {
 
     // ─── compaction ──────────────────────────────────────────────────────
 
-    /// The context check after a tool turn. `Some` ends the dispatch.
-    /// (#1391) The per-turn soft trim of old oversized tool results, except
-    /// on an endpoint that caches the prompt prefix (#3193). Trimming a
-    /// result once it ages out of the recent window rewrites a message the
-    /// previous request already sent, so the next request no longer extends
-    /// the cache entry that request wrote: every turn re-wrote its whole
-    /// conversation at the cache-write price and read back only the first
-    /// message. There the cache read costs far less than the bytes the trim
-    /// reclaims, and compaction still bounds the conversation.
-    fn soft_trim_old_results(&mut self) -> crate::tool_result_prune::ToolTrimStats {
-        if self.client.caches_prompt_prefix() {
-            return crate::tool_result_prune::ToolTrimStats::default();
-        }
-        crate::tool_result_prune::soft_trim_old_tool_results(&mut self.messages)
+    /// (#3202) Append a tool result to the conversation whole. darkmux
+    /// never rewrites it afterwards: every engine behind the loop caches the
+    /// prompt prefix (the Messages API, LM Studio, lithos-metal, Splash), and
+    /// changing a message an earlier request sent breaks that cache from the
+    /// message on. The #1391 soft trim did exactly that once a large result
+    /// aged out of a recent window; it is gone. The conversation is bounded by
+    /// compaction and, as a last resort, the pre-send bound (#2792).
+    fn push_tool_result(&mut self, call_id: String, tool_name: String, result: String) {
+        self.messages.push(Message::tool_result(call_id, tool_name, result));
     }
 
-    fn trim_and_compact(&mut self, wire_max_tokens: u32) -> Option<LoopOutcome> {
-        // (#1391) Soft-trim OLD oversized tool-result bodies before the
-        // compaction trigger is evaluated. This is a zero-model-call,
-        // purely mechanical byte reclaim (head + tail kept, middle
-        // elided behind a marker) that shrinks the transcript and pushes
-        // the FIRST compaction out — on a tight window that can be one
-        // fewer compaction per dispatch. The recent thread is protected
-        // (see TOOL_RESULT_TRIM_PRESERVE_RECENT), so the model never
-        // loses context it is actively reasoning over. Runs every turn;
-        // idempotent on bodies already reclaimed.
-        let trim_stats = self.soft_trim_old_results();
-        if trim_stats.results_trimmed > 0 {
-            eprintln!(
-                "darkmux-runtime: soft-trimmed {} old tool result(s), reclaiming {} bytes \
-                 of transcript before the compaction check (#1391)",
-                trim_stats.results_trimmed, trim_stats.bytes_reclaimed
-            );
-        }
+    /// The context check after a tool turn. `Some` ends the dispatch.
+    fn compact_if_needed(&mut self, wire_max_tokens: u32) -> Option<LoopOutcome> {
         // (#854) When the endpoint's reported count is stale (frozen
         // across turns while the thread grew), it can't gate compaction
         // — it silently suppressed it into a degenerate cycle. A local

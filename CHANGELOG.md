@@ -14,6 +14,26 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every local engine keeps its prompt cache across turns** (#3202). The soft
+  trim of large tool results (#1391) shortened a result once it was more than
+  six messages back, which rewrote a message the engine had already cached.
+  LM Studio, lithos-metal and Splash then fell back to the head of their cache
+  and prefilled the rest of the conversation again. Measured on lithos-metal
+  serving `pepper-grinder`: 526 s of a 908 s run was prefill on the eight
+  requests that missed, and the re-prefills set off the thermal rests. #3193
+  had turned the trim off on the `messages` dialect only; now it is gone on
+  every dialect. Tool results enter the conversation whole and darkmux never
+  rewrites them, so every request extends the previous one and the model
+  sees each result whole. Compaction bounds the conversation, with the
+  pre-send bound (#2792) as the last resort for a request that would not fit
+  the window; each compaction still breaks the cache once, as it must. The
+  pre-send bound now cuts the newest result first, the one going out for the
+  first time, and reaches back to one an earlier request sent only when that
+  is not enough. Tests drive the real loop on every dialect, and
+  through a resume, and check that each request extends the previous one.
+
 ## [5.1.0] - 2026-10-10
 
 Claude endpoints, efficient by default. A Claude seat now speaks Anthropic's native

@@ -586,9 +586,9 @@ impl CompactionConfig {
 /// produced no disclosure anywhere — no message, no trajectory event, no
 /// flow record, no envelope field — so a zero compaction count read
 /// identically to "never needed one." A long dispatch would run its
-/// transcript up against the primary model's context with only a soft trim
-/// between it and overflow, silently, with no context-overflow handling
-/// anywhere in the runtime to catch it.
+/// transcript up against the primary model's context with only the
+/// last-resort pre-send bound (#2792) between it and overflow, silently: no
+/// soft trim since #3202, and nothing else in the runtime to catch it.
 ///
 /// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
 /// stderr — call sites just print whatever this returns. `None` only when
@@ -1994,8 +1994,13 @@ pub(crate) fn fit_excerpt_to_compactor(
     // one measurement is enough.
     let framing = before_chars.saturating_sub(raw_message_bytes(middle));
     let raw_target = budget_chars.saturating_sub(framing);
-    let stats =
-        crate::tool_result_prune::hard_trim_to_fit(middle, raw_target, EXCERPT_MIN_BODY_BYTES);
+    // Largest first: the excerpt is a one-off text no later request extends.
+    let stats = crate::tool_result_prune::hard_trim_to_fit(
+        middle,
+        raw_target,
+        EXCERPT_MIN_BODY_BYTES,
+        crate::tool_result_prune::TrimOrder::LargestFirst,
+    );
 
     // THE WEIGHT IS NOT ONLY IN TOOL RESULTS (measured on the live dogfood
     // run). `hard_trim_to_fit` elides `role == "tool"` bodies and nothing
@@ -2811,14 +2816,14 @@ mod tests {
         );
     }
 
-    /// (#2808 round-3) THE BOUND MUST WORK ON A THREAD THE LOOP HAS ALREADY
-    /// SOFT-TRIMMED — which is every real thread by the time it compacts.
+    /// (#2808 round-3) THE BOUND MUST WORK ON A MIDDLE WHOSE RESULTS WERE
+    /// ALREADY ELIDED ONCE.
     ///
-    /// `soft_trim_old_tool_results` (#1391) runs EVERY TURN, before the
-    /// compaction check, stamping the elision sentinel on every result over
-    /// 4,000 bytes outside the protected recent window. `trim_body_to` then
-    /// refused any sentinel-bearing body outright, so by the time compaction
-    /// ran, the entire middle was untouchable to the hard bound.
+    /// The soft trim (#1391, removed in #3202) stamped the elision sentinel on
+    /// every result over 4,000 bytes; the pre-send bound (#2792) still stamps
+    /// it on what it elides. `trim_body_to` once refused any sentinel-bearing
+    /// body outright, so by the time compaction ran, the entire middle was
+    /// untouchable to the hard bound.
     ///
     /// The result was the bound reporting "the weight is not in tool-result
     /// bodies" about a middle that was ~100% tool-result bodies, and refusing
@@ -2827,27 +2832,21 @@ mod tests {
     /// reached through its fix, on the modal long-agentic shape.
     ///
     /// EVERY fixture in this arc built its middle fresh, so none of them ever
-    /// handed the bound a sentinel-bearing body. This one soft-trims first,
-    /// exactly as the loop does.
+    /// handed the bound a sentinel-bearing body. This one elides each result
+    /// once first.
     #[test]
-    fn a_middle_the_loop_already_soft_trimmed_is_still_elided_to_fit() {
+    fn a_middle_already_elided_once_is_still_elided_to_fit() {
         let body = "q".repeat(6_000);
+        let once = crate::tool_result_prune::trim_body_to(&body, 3_200)
+            .expect("fixture guard: the first elision must mark the bodies, else this pins nothing");
         let mut messages = vec![Message::system("sys"), Message::user("go")];
         for n in 0..12 {
             messages.push(Message::assistant("calling read"));
-            messages.push(Message::tool_result(format!("c{n}"), "read", &body));
+            messages.push(Message::tool_result(format!("c{n}"), "read", &once));
         }
         for n in 0..4 {
             messages.push(Message::user(format!("tail {n}")));
         }
-
-        // What the loop did on every prior turn.
-        let soft = crate::tool_result_prune::soft_trim_old_tool_results(&mut messages);
-        assert!(
-            soft.results_trimmed > 0,
-            "fixture guard: the soft pass must actually have marked bodies, \
-             else this pins nothing"
-        );
 
         let n = messages.len();
         let mut middle: Vec<Message> = messages[2..n - 4].to_vec();
@@ -2868,7 +2867,7 @@ mod tests {
 
         assert!(
             fit.fits(),
-            "an already-soft-trimmed middle must still be reducible to the \
+            "an already-elided middle must still be reducible to the \
              compactor's budget: {} chars against {}, {} elided",
             fit.after_chars,
             fit.budget_chars,

@@ -1,9 +1,11 @@
-//! (#3193) The `messages` dialect's automatic cache breakpoint sits on each
-//! request's last block, and a later request reads that cache entry back
-//! only when its own body starts with the exact same blocks. So in a real
-//! multi-turn loop, every request's messages, through its last block, must be
-//! a prefix of the next request's. These tests drive the real loop against a
-//! mock Messages server that records every request body, and check that.
+//! (#3193, #3202) Every engine the loop talks to caches the prompt prefix:
+//! the `messages` dialect's automatic breakpoint on each request's last
+//! block, and the KV cache LM Studio, lithos-metal and Splash keep behind
+//! chat-completions. A later request reuses that cache only when its own body
+//! starts with exactly the same messages. So in a real multi-turn loop, every
+//! request's messages, through its last one, must be a prefix of the next
+//! request's. These tests drive the real loop against a mock endpoint of each
+//! dialect that records every request body, and check that.
 
 use super::*;
 use crate::lmstudio::{Dialect, LmStudioClient, Message};
@@ -46,6 +48,13 @@ fn sse_reply(text: Option<&str>, calls: &[(&str, &str, &str)]) -> String {
 /// (the last one repeats; SSE when it opens with `event:`, else JSON) and
 /// records every request body.
 fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    recording_server_with_compactor(replies, String::new())
+}
+
+/// [`recording_server`], plus: a request for the model `test-compactor` is
+/// answered with `summary` and recorded as `Value::Null`, so the primary
+/// replies stay in step and the compactor's calls can be counted.
+fn recording_server_with_compactor(replies: Vec<String>, summary: String) -> (String, Arc<Mutex<Vec<Value>>>) {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -67,12 +76,17 @@ fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
             }
             let mut body = vec![0u8; len];
             let _ = reader.read_exact(&mut body);
-            let n = {
+            let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let reply = {
                 let mut all = seen.lock().unwrap();
-                all.push(serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null));
-                all.len() - 1
+                if request["model"] == "test-compactor" {
+                    all.push(Value::Null);
+                    &summary
+                } else {
+                    all.push(request);
+                    &replies[(all.iter().filter(|b| !b.is_null()).count() - 1).min(replies.len() - 1)]
+                }
             };
-            let reply = &replies[n.min(replies.len() - 1)];
             let kind = if reply.starts_with("event:") { "text/event-stream" } else { "application/json" };
             let _ = sock.write_all(
                 format!(
@@ -86,8 +100,43 @@ fn recording_server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}/v1/messages"), bodies)
 }
 
+/// (#3202) Every dialect the loop speaks. The engine behind each one caches
+/// the prompt prefix (the Messages API's breakpoint; LM Studio, lithos-metal
+/// and Splash reuse their KV cache), so the property below holds on all.
+const DIALECTS: [Dialect; 3] = [Dialect::Messages, Dialect::ChatCompletions, Dialect::ChatCompletionsMaxTokens];
+
+/// A client for `dialect` pointed at the recording server.
+fn client_for(dialect: Dialect, url: &str) -> LmStudioClient {
+    let client = LmStudioClient::with_base_url("http://unused.invalid").with_dialect(dialect);
+    match dialect {
+        Dialect::Messages => client.with_chat_url(url).with_auth_header("x-api-key", "test-key"),
+        _ => client.with_chat_url(url.replace("/messages", "/chat/completions")),
+    }
+}
+
+/// The Messages client is driven streaming (SSE replies); the
+/// chat-completions clients take one JSON reply per request.
+fn streams(dialect: Dialect) -> bool {
+    dialect == Dialect::Messages
+}
+
+/// One scripted reply in `dialect`'s wire shape: optional text, then tool
+/// calls `(id, name, input JSON)`.
+fn reply(dialect: Dialect, text: Option<&str>, calls: &[(&str, &str, &str)]) -> String {
+    if dialect == Dialect::Messages {
+        return sse_reply(text, calls);
+    }
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, input)| json!({"id": id, "type": "function", "function": {"name": name, "arguments": input}}))
+        .collect();
+    let (tool_calls, finish) =
+        if calls.is_empty() { (None, "stop") } else { (Some(Value::Array(tool_calls)), "tool_calls") };
+    super::tests::chat_response_json(text, tool_calls, finish, 10, 2).to_string()
+}
+
 /// The first point where `next` stops extending `prev` through `prev`'s
-/// last block, as `(message index, prev's message, next's message)`.
+/// last message, as `(message index, prev's message, next's message)`.
 fn first_divergence(prev: &[Value], next: &[Value]) -> Option<(usize, Value, Value)> {
     for (i, p) in prev.iter().enumerate() {
         let Some(n) = next.get(i) else {
@@ -99,60 +148,235 @@ fn first_divergence(prev: &[Value], next: &[Value]) -> Option<(usize, Value, Val
             }
             continue;
         }
-        // The last message: its blocks must open `next`'s message at `i`
-        // (`next` may have merged more blocks into the same turn).
-        let (pb, nb) = (p["content"].as_array().unwrap(), n["content"].as_array().unwrap());
-        if p["role"] != n["role"] || nb.len() < pb.len() || nb[..pb.len()] != pb[..] {
+        // The last message. On the Messages dialect its blocks must open
+        // `next`'s message at `i` (`next` may have merged more blocks into
+        // the same turn); on chat-completions it must be unchanged.
+        let extends = match (p["content"].as_array(), n["content"].as_array()) {
+            (Some(pb), Some(nb)) => p["role"] == n["role"] && nb.len() >= pb.len() && nb[..pb.len()] == pb[..],
+            _ => p == n,
+        };
+        if !extends {
             return Some((i, p.clone(), n.clone()));
         }
     }
     None
 }
 
-#[test]
-#[serial_test::serial]
-fn each_messages_request_extends_the_previous_one_through_its_last_block() {
-    // Echo results over the soft-trim threshold, several per turn, as a
-    // review's file reads are: old ones age out of the protected window.
-    let big = |tag: &str| format!(r#"{{"text":"{tag} {}"}}"#, "x".repeat(5_000));
-    let (one, two, three, four, five) = (big("one"), big("two"), big("three"), big("four"), big("five"));
-    let replies = vec![
-        sse_reply(Some("Looking."), &[("toolu_1", "echo", &one), ("toolu_2", "echo", &two)]),
-        sse_reply(None, &[("toolu_3", "echo", &three), ("toolu_4", "echo", &four)]),
-        sse_reply(Some("Again."), &[("toolu_5", "echo", &five)]),
-        sse_reply(None, &[("toolu_6", "echo", &one)]),
-        sse_reply(None, &[("toolu_7", "echo", &two)]),
-        sse_reply(Some("All done."), &[]),
-    ];
-    let (url, bodies) = recording_server(replies);
-    let client = LmStudioClient::with_base_url("http://unused.invalid")
-        .with_chat_url(url)
-        .with_dialect(Dialect::Messages)
-        .with_auth_header("x-api-key", "test-key");
-    let tmp = tempfile::Builder::new().prefix("cache-prefix").tempdir().unwrap();
-    let mut traj = Trajectory::open(tmp.path());
-    run_with_sleeper(
-        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
-        &[Tool::Echo], &mut traj, true, &compaction::CompactionConfig::never_compact(), Some(10), None,
-        Some(4_096), None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(),
-        "test-role", None, &RealSleeper,
-    )
-    .expect("the run completes");
-    let bodies = bodies.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 6, "a six-turn run sends six requests: {}", bodies.len());
+/// Every tool result in one request body, as `(call id, body)`, in either
+/// dialect's shape.
+fn tool_results(body: &Value) -> Vec<(String, String)> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    let mut out = Vec::new();
+    for m in body["messages"].as_array().into_iter().flatten() {
+        if m["role"] == "tool" {
+            out.push((text(&m["tool_call_id"]), text(&m["content"])));
+        }
+        for block in m["content"].as_array().into_iter().flatten() {
+            if block["type"] == "tool_result" {
+                out.push((text(&block["tool_use_id"]), text(&block["content"])));
+            }
+        }
+    }
+    out
+}
+
+/// Each consecutive pair of recorded requests: the tools and system prompt
+/// are unchanged, and the later request's messages extend the earlier one's
+/// through its last message.
+fn assert_each_request_extends_the_previous(dialect: Dialect, bodies: &[Value]) {
     for (n, pair) in bodies.windows(2).enumerate() {
         // The cached prefix opens with the tools and the system prompt.
-        assert_eq!(pair[0]["tools"], pair[1]["tools"], "request {} changes the tools", n + 2);
-        assert_eq!(pair[0]["system"], pair[1]["system"], "request {} changes the system prompt", n + 2);
+        assert_eq!(pair[0]["tools"], pair[1]["tools"], "{dialect:?}: request {} changes the tools", n + 2);
+        assert_eq!(pair[0]["system"], pair[1]["system"], "{dialect:?}: request {} changes the system prompt", n + 2);
         let (prev, next) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
         if let Some((i, p, q)) = first_divergence(prev, next) {
             let (p, q) = (p.to_string(), q.to_string());
             panic!(
-                "request {} stops extending request {} at message {i}:\n  request {}: …{}…\n  request {}: …{}…",
-                n + 2, n + 1, n + 1, around_first_difference(&p, &q), n + 2, around_first_difference(&q, &p)
+                "{dialect:?}: request {} stops extending request {} at message {i}:\n  request {}: …{}…\n  request {}: …{}…",
+                n + 2,
+                n + 1,
+                n + 1,
+                around_first_difference(&p, &q),
+                n + 2,
+                around_first_difference(&q, &p)
             );
         }
     }
+}
+
+/// (#3202) Every tool result goes out whole, as the tool returned it: no
+/// request carries the elision marker.
+fn assert_results_sent_whole(dialect: Dialect, bodies: &[Value]) {
+    for (n, body) in bodies.iter().enumerate() {
+        for (id, result) in tool_results(body) {
+            assert!(
+                !result.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL),
+                "{dialect:?}: request {} sends {id}'s result elided",
+                n + 1
+            );
+        }
+    }
+}
+
+/// Run `replies` from a two-message start on `dialect` and return every
+/// request body the endpoint saw.
+fn run_script(dialect: Dialect, replies: Vec<String>, max_turns: u32) -> Vec<Value> {
+    let (url, bodies) = recording_server(replies);
+    let client = client_for(dialect, &url);
+    let tmp = tempfile::Builder::new().prefix("cache-prefix").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
+        &[Tool::Echo], &mut traj, streams(dialect), &compaction::CompactionConfig::never_compact(), Some(max_turns),
+        None, Some(4_096), None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(),
+        "test-role", None, &RealSleeper,
+    )
+    .expect("the run completes");
+    let seen = bodies.lock().unwrap().clone();
+    seen
+}
+
+/// (#3193, #3202) On every dialect, each request's messages extend the
+/// previous request's unchanged, and a large result goes out in its final
+/// form the first time it is sent.
+#[test]
+#[serial_test::serial]
+fn each_request_extends_the_previous_one_on_every_dialect() {
+    // Echo results over the soft-trim threshold, several per turn, as a
+    // review's file reads are.
+    let big = |tag: &str| format!(r#"{{"text":"{tag} {}"}}"#, "x".repeat(5_000));
+    let (one, two, three, four, five) = (big("one"), big("two"), big("three"), big("four"), big("five"));
+    for dialect in DIALECTS {
+        let replies = vec![
+            reply(dialect, Some("Looking."), &[("toolu_1", "echo", &one), ("toolu_2", "echo", &two)]),
+            reply(dialect, None, &[("toolu_3", "echo", &three), ("toolu_4", "echo", &four)]),
+            reply(dialect, Some("Again."), &[("toolu_5", "echo", &five)]),
+            reply(dialect, None, &[("toolu_6", "echo", &one)]),
+            reply(dialect, None, &[("toolu_7", "echo", &two)]),
+            reply(dialect, Some("All done."), &[]),
+        ];
+        let bodies = run_script(dialect, replies, 10);
+        assert_eq!(bodies.len(), 6, "{dialect:?}: a six-turn run sends six requests: {}", bodies.len());
+        assert_each_request_extends_the_previous(dialect, &bodies);
+        assert_results_sent_whole(dialect, &bodies);
+    }
+}
+
+/// (#3202) With no soft trim, compaction is what bounds the conversation: a
+/// long run of large results reaches compaction and never sends a request
+/// over the declared window, so the last-resort pre-send bound (#2792) never
+/// has to elide a result.
+#[test]
+#[serial_test::serial]
+fn a_long_run_of_large_results_compacts_instead_of_overflowing_the_window() {
+    const TURNS: usize = 30;
+    const WINDOW: u32 = 32_000;
+    let dialect = Dialect::ChatCompletions;
+    let calls: Vec<(String, String)> = (0..TURNS)
+        .map(|n| (format!("call_{n}"), format!(r#"{{"text":"{n} {}"}}"#, "x".repeat(8_000))))
+        .collect();
+    let mut replies: Vec<String> =
+        calls.iter().map(|(id, input)| reply(dialect, None, &[(id.as_str(), "echo", input.as_str())])).collect();
+    replies.push(reply(dialect, Some("All done."), &[]));
+    // (#1389) Long enough and delimiter-free, so the narrative floor and
+    // sanitizer accept it.
+    let summary = reply(
+        dialect,
+        Some(
+            "Summary: the assistant repeatedly called the echo tool with long text and read back \
+             each result. No decisions were finalized and no files were modified. The next \
+             concrete action is to continue echoing and then report that the task is done.",
+        ),
+        &[],
+    );
+    let (url, recorded) = recording_server_with_compactor(replies, summary);
+    let client = client_for(dialect, &url);
+    let cfg = compaction::CompactionConfig {
+        compactor_context_window: None,
+        threshold_tokens: 12_000,
+        compactor_model: Some("test-compactor".to_string()),
+        threshold_ratio: None,
+        context_window: Some(WINDOW),
+        strategy: compaction::CompactionStrategy::Narrative,
+        bail_after_compactions: None,
+        custom_instructions: None,
+    };
+    let tmp = tempfile::Builder::new().prefix("cache-prefix-compacts").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
+        &[Tool::Echo], &mut traj, streams(dialect), &cfg, Some(TURNS as u32 + 5), None, Some(4_096), None,
+        Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+    )
+    .expect("the run completes");
+    let recorded = recorded.lock().unwrap().clone();
+    let compactions = recorded.iter().filter(|b| b.is_null()).count();
+    let bodies: Vec<Value> = recorded.into_iter().filter(|b| !b.is_null()).collect();
+    assert_eq!(bodies.len(), TURNS + 1, "one request per turn");
+    assert!(compactions > 0, "a {TURNS}-turn run of 8 KB results must reach compaction");
+    assert_results_sent_whole(dialect, &bodies);
+    for (n, body) in bodies.iter().enumerate() {
+        let tokens = body.to_string().len() / 4;
+        assert!(tokens <= WINDOW as usize, "request {} is ~{tokens} tokens, over the {WINDOW}-token window", n + 1);
+    }
+    let trajectory = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+    assert!(
+        !trajectory.contains("\"dispatch.pre_send_bound\""),
+        "no request needed the last-resort pre-send bound"
+    );
+}
+
+/// (#3202 review) With compaction off (an unset `internal.utility`, or one
+/// refused every time), the pre-send bound (#2792) is all that keeps a request
+/// inside the window. It must cut the result about to be sent for the first
+/// time, not an older one an earlier request already sent: the request it
+/// bounds still extends the previous one.
+///
+/// Echo results cost their size twice (the call's arguments carry the same
+/// text), so each turn grows the thread by twice what cutting its own result
+/// can reclaim. Only the FIRST request the bound fires on can fit by cutting
+/// the newest result alone, so the run ends there.
+#[test]
+#[serial_test::serial]
+fn the_pre_send_bound_cuts_the_newest_result_and_keeps_the_prefix() {
+    const TURNS: usize = 8;
+    const WINDOW: u32 = 32_000;
+    let dialect = Dialect::ChatCompletions;
+    let calls: Vec<(String, String)> = (0..TURNS)
+        .map(|n| (format!("call_{n}"), format!(r#"{{"text":"{n} {}"}}"#, "x".repeat(8_000))))
+        .collect();
+    let mut replies: Vec<String> =
+        calls.iter().map(|(id, input)| reply(dialect, None, &[(id.as_str(), "echo", input.as_str())])).collect();
+    replies.push(reply(dialect, Some("All done."), &[]));
+    let (url, bodies) = recording_server(replies);
+    let client = client_for(dialect, &url);
+    let cfg = compaction::CompactionConfig { context_window: Some(WINDOW), ..compaction::CompactionConfig::never_compact() };
+    let tmp = tempfile::Builder::new().prefix("cache-prefix-bound").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    run_with_sleeper(
+        &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user("do the task")],
+        &[Tool::Echo], &mut traj, streams(dialect), &cfg, Some(TURNS as u32 + 5), None, Some(4_096), None,
+        Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+    )
+    .expect("the run completes");
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), TURNS + 1, "one request per turn");
+    let trajectory = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+    let bound: Vec<Value> = trajectory
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "dispatch.pre_send_bound")
+        .collect();
+    assert_eq!(bound.len(), 1, "fixture guard: the bound fires on the last request only: {bound:?}");
+    assert_eq!(bound[0]["fits"], true, "fixture guard: cutting one result fits: {}", bound[0]);
+    assert_each_request_extends_the_previous(dialect, &bodies);
+    let last = tool_results(bodies.last().unwrap());
+    let (newest, earlier) = last.split_last().unwrap();
+    assert!(newest.1.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL), "the newest result is cut");
+    assert!(
+        earlier.iter().all(|(_, r)| !r.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)),
+        "no result an earlier request sent is cut"
+    );
 }
 
 /// `a` around the first byte where it differs from `b`, so a failure shows
@@ -211,52 +435,40 @@ fn killed_mid_turn() -> checkpoint::RunCheckpoint {
     }
 }
 
-/// Resume [`killed_mid_turn`] against `client` (one more turn, which ends
-/// the run) and return the request bodies the endpoint saw.
-fn resume_once(client: &LmStudioClient, streaming: bool, bodies: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+/// Resume [`killed_mid_turn`] on `dialect`: one more turn that echoes
+/// another large result, then a turn that ends the run. Returns the request
+/// bodies the endpoint saw.
+fn resume_twice(dialect: Dialect) -> Vec<Value> {
+    let seven = format!(r#"{{"text":"seven {}"}}"#, "x".repeat(5_000));
+    let replies = vec![reply(dialect, None, &[("toolu_7", "echo", &seven)]), reply(dialect, Some("All done."), &[])];
+    let (url, bodies) = recording_server(replies);
+    let client = client_for(dialect, &url);
     let tmp = tempfile::Builder::new().prefix("cache-prefix-resume").tempdir().unwrap();
     let mut traj = Trajectory::open(tmp.path());
     run_with_sleeper(
-        client, client, "claude-test", vec![], &[Tool::Echo], &mut traj, streaming,
+        &client, &client, "claude-test", vec![], &[Tool::Echo], &mut traj, streams(dialect),
         &compaction::CompactionConfig::never_compact(), Some(10), None, Some(4_096), None, Some(u32::MAX), None,
         std::collections::BTreeMap::new(), None, tmp.path(), "test-role", Some(killed_mid_turn()), &RealSleeper,
     )
     .expect("the resumed run completes");
     let seen = bodies.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1, "the resume makes one request");
+    assert_eq!(seen.len(), 2, "{dialect:?}: the resume makes two requests");
     seen
 }
 
-/// (#3193) The post-resume check (`compact_after_resume`) does not elide a
-/// result the request before the kill already sent: the first request after
-/// a resume still extends the cache entry that request wrote.
+/// (#3193, #3202) After a resume, on every dialect: the result the request
+/// before the kill already sent goes out unchanged, the catch-up's results
+/// and every later one go out in final form, and each request extends the
+/// previous one.
 #[test]
 #[serial_test::serial]
-fn a_resume_on_the_messages_dialect_does_not_elide_an_earlier_result() {
-    let (url, bodies) = recording_server(vec![sse_reply(Some("All done."), &[])]);
-    let client = LmStudioClient::with_base_url("http://unused.invalid")
-        .with_chat_url(url)
-        .with_dialect(Dialect::Messages)
-        .with_auth_header("x-api-key", "test-key");
-    let first = &resume_once(&client, true, &bodies)[0];
-    let result = &first["messages"][2]["content"][0];
-    assert_eq!(result["tool_use_id"], "toolu_1", "{first}");
-    assert_eq!(result["content"], format!("one {}", "x".repeat(5_000)), "the first result is sent whole");
-}
-
-/// (#1391) The other side of the guard: an endpoint that does not cache the
-/// prompt prefix still has old results soft-trimmed after a resume.
-#[test]
-#[serial_test::serial]
-fn a_resume_on_a_chat_completions_dialect_still_soft_trims_an_old_result() {
-    let reply = super::tests::chat_response_json(Some("All done."), None, "stop", 10, 2).to_string();
-    let (url, bodies) = recording_server(vec![reply]);
-    let client = LmStudioClient::with_base_url("http://unused.invalid")
-        .with_chat_url(url.replace("/messages", "/chat/completions"))
-        .with_dialect(Dialect::ChatCompletions);
-    let first = &resume_once(&client, false, &bodies)[0];
-    let result = &first["messages"][3];
-    assert_eq!(result["tool_call_id"], "toolu_1", "{first}");
-    let body = result["content"].as_str().unwrap();
-    assert!(body.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL), "the old result is trimmed");
+fn a_resume_extends_each_request_on_every_dialect() {
+    for dialect in DIALECTS {
+        let bodies = resume_twice(dialect);
+        assert_each_request_extends_the_previous(dialect, &bodies);
+        let first = tool_results(&bodies[0]);
+        assert_eq!(first[0].0, "toolu_1", "{dialect:?}: {}", bodies[0]);
+        assert_eq!(first[0].1, format!("one {}", "x".repeat(5_000)), "{dialect:?}: the sent result is not rewritten");
+        assert_results_sent_whole(dialect, &bodies);
+    }
 }

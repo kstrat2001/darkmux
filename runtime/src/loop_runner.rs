@@ -5284,12 +5284,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resume_catch_up_trims_oversized_old_tool_results_before_the_next_request() {
-        // (#2114 finding N1) The resume catch-up pass must run the SAME
-        // soft-trim pass the main loop's tool_calls arm runs after ITS
-        // tool-dispatch loop — otherwise a resume that appends a batch of
-        // results sails into the first post-resume request without ever
-        // having had a chance to shrink an old oversized tool result.
+    fn resume_catch_up_appends_an_oversized_result_whole() {
+        // (#3202) A result the resume catch-up appends enters the
+        // conversation whole, exactly as a live turn's does: darkmux never
+        // elides a tool result outside the pre-send bound (#2792), so every
+        // engine's prompt cache stays valid.
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
@@ -5299,16 +5298,14 @@ mod tests {
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
         let server = crate::test_support::GuardedMockServer::start();
-        // The ONLY registered mock requires the elision marker to be
-        // present in the outgoing request body — if the trim never ran
-        // (or ran AFTER this request instead of before it), the body
-        // still carries the full untrimmed blob, this mock's `matches`
-        // predicate fails to match, and the client call errors instead of
-        // silently passing.
-        let expects_trimmed_body_mock = server.mock(|when, then| {
+        // The ONLY registered mock requires the whole result and no elision
+        // marker in the outgoing request body — if the catch-up trimmed the
+        // result, this mock's `matches` predicate fails to match, and the
+        // client call errors instead of silently passing.
+        let expects_whole_body_mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
+                b.contains(&"X".repeat(6_000)) && !b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
             });
             then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 100, 5));
         });
@@ -5316,73 +5313,45 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let tmp = tempfile::Builder::new().prefix("resume-trim").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
-        let tools = [Tool::Read];
-        // Compaction disabled so this test isolates the TRIM path — a
-        // separate concern from N1's "or compacted" half, already
-        // exercised by the pre-existing `loop_triggers_compaction_when_
-        // threshold_crossed` test against the SAME shared trim+compact
-        // call site this resume path now reuses.
+        let tools = [Tool::Echo];
+        // Compaction disabled, so nothing else could shorten the thread.
         let cfg = compaction::CompactionConfig::never_compact();
 
-        let make_call = |id: &str, offset: u32| ToolCall {
+        // Over the 4,000 bytes the removed #1391 soft trim cut at.
+        let echo_call = |id: &str, text: &str| ToolCall {
             id: id.to_string(),
             kind: "function".into(),
             function: crate::lmstudio::FunctionCall {
-                name: "read".into(),
-                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+                name: "echo".into(),
+                arguments: serde_json::json!({ "text": text }).to_string(),
             },
             extra_content: None,
         };
-        let assistant_with_call = |call: &ToolCall| Message {
+        let small = echo_call("call_small", "small");
+        let big = echo_call("call_big", &"X".repeat(6_000));
+        let assistant_turn = Message {
             role: "assistant".into(),
             content: None,
-            tool_calls: Some(vec![call.clone()]),
+            tool_calls: Some(vec![small.clone(), big.clone()]),
             tool_call_id: None,
             name: None,
             reasoning_content: None,
         };
 
-        let big_call = make_call("call_big", 1);
-        let filler_call = make_call("call_filler", 2);
-        let c1 = make_call("call_1", 3);
-        let c2 = make_call("call_2", 4);
-        let c3 = make_call("call_3", 5);
-        let assistant_turn3 = Message {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(vec![c1.clone(), c2.clone(), c3.clone()]),
-            tool_call_id: None,
-            name: None,
-            reasoning_content: None,
-        };
-
-        // (#1391) TOOL_RESULT_TRIM_THRESHOLD_BYTES is 4000 — comfortably
-        // exceeded so the trim actually elides a middle section.
-        let oversized_body = "X".repeat(6_000);
-
-        // Layout is deliberate: `TOOL_RESULT_TRIM_PRESERVE_RECENT` (6)
-        // protects the LAST 6 messages from trimming, so `big_call`'s
-        // result (index 3) needs at least one more message pair ahead of
-        // it than the minimum, pushing it out of that protected window
-        // once the catch-up pass appends its own two results.
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
             role_id: "test-role".to_string(),
             messages: vec![
-                Message::system("test"),                                    // 0
-                Message::user("read x.txt"),                                // 1
-                assistant_with_call(&big_call),                             // 2
-                Message::tool_result("call_big", "read", oversized_body.as_str()),  // 3 <- trim target
-                assistant_with_call(&filler_call),                          // 4
-                Message::tool_result("call_filler", "read", "small"),       // 5
-                assistant_turn3,                                            // 6
-                Message::tool_result("call_1", "read", "small"),            // 7
+                Message::system("test"),
+                Message::user("echo twice"),
+                assistant_turn,
+                Message::tool_result("call_small", "echo", "small"),
             ],
-            turns: 3,
-            total_completion_tokens: 60,
+            turns: 1,
+            total_completion_tokens: 20,
             compactions: 0,
             pending_hand_back: None,
-            pending_tool_calls: Some(vec![c2, c3]),
+            pending_tool_calls: Some(vec![big]),
             pending_tool_calls_seq_base: 1,
             pending_head_started: false,
             written_at_unix_ms: checkpoint::unix_ms(),
@@ -5396,7 +5365,7 @@ mod tests {
         .expect("resumed dispatch returns Ok");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        expects_trimmed_body_mock.assert_hits(1);
+        expects_whole_body_mock.assert_hits(1);
     }
 
     #[test]
@@ -7400,7 +7369,7 @@ mod tests {
     /// that fix measured 4 of 27 turns still going out at ~38.4-38.9k against a
     /// declared 32,000. Compaction runs BETWEEN turns; a tool result landing
     /// after the last compaction and before the send grows the thread WITHIN
-    /// one, and the soft trim protects exactly that recent window. On a
+    /// one, and the soft trim then protected exactly that recent window. On a
     /// correctly-loaded model each of those four requests is an HTTP 400 and
     /// the dispatch dies.
     ///
@@ -7704,7 +7673,7 @@ mod tests {
 
         // n = 7: head 0..2, preserved tail 3..7, so the compactable middle is
         // exactly index 2 — one tiny message. The weight is the huge message
-        // at the TAIL, which neither the soft-trim (last 6 never trimmed) nor
+        // at the TAIL, which neither the soft trim (removed in #3202) nor
         // compaction (PRESERVE_TAIL = 4) may touch.
         let huge = "x".repeat(120_000); // ~30k tokens by chars/4
         let initial = vec![
