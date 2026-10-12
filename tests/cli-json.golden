@@ -1238,6 +1238,7 @@ UsageWindow
 UtilityBinding
   id: string
   n_ctx?: uint32 | null
+  endpoint?: string | null
 UtilityModel
   id: string
   loaded: boolean

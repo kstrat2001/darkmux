@@ -421,6 +421,16 @@ pub struct UtilityBinding {
     /// fall back to a NAMED default and say so (never silently).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
+    /// (#3207) The `endpoints` id the utility model is served from. Absent,
+    /// or naming a managed endpoint: the machine's LM Studio, loaded under
+    /// the `darkmux:` namespace (today's binding). Naming an UNMANAGED
+    /// endpoint: every utility job is sent there with the bare `id`, in the
+    /// endpoint's dialect and with its auth, and darkmux loads, ejects and
+    /// reads nothing for it; `n_ctx` is then a declared window only (the
+    /// compaction payload bound). Resolved by
+    /// [`ProfileRegistry::utility_endpoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Overflow for keys this binary does not know, re-serialized flat: a
     /// registry written by a NEWER binary that added a field to this object
     /// still reads here without losing the field.
@@ -569,7 +579,13 @@ impl Profile {
 // `window` budget is now ENFORCED on an unmanaged endpoint named by id. A
 // `window` with neither `tokens` nor `calls` (the shipped all-null shape) is
 // no budget. Additive: every earlier 2.0 registry reads unchanged.
-pub const PROFILES_SCHEMA_VERSION: &str = "2.0";
+// 2.1 (#3207): additive `endpoint` on `internal.utility` (`UtilityBinding`),
+// naming an `endpoints` entry the utility model is served from. Minor bump:
+// every 2.0 registry reads unchanged (the field is `Option`, absent = the
+// managed LM Studio binding of 2.0). A 2.0 binary given the key keeps it in
+// `UtilityBinding.extras` and refuses it at preflight (contract 7), so the
+// binary is upgraded before the key is written.
+pub const PROFILES_SCHEMA_VERSION: &str = "2.1";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
 /// optionally caps how many bundles it considers. Carried on
@@ -708,6 +724,56 @@ impl ProfileRegistry {
         self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(|u| u.n_ctx)
     }
 
+    /// (#3207) The endpoint the utility model is served from:
+    /// `internal.utility.endpoint` looked up in `endpoints` (the same id
+    /// lookup a profile model's `"endpoint": "<id>"` uses), an unresolved
+    /// reference when the map does not define it (its `kind()` refuses,
+    /// naming the id), or `None` when the binding names no endpoint (the
+    /// managed LM Studio default) or there is no binding. A blank id is no
+    /// endpoint, as a blank `id` is no binding.
+    pub fn utility_endpoint(&self) -> Option<ModelEndpoint> {
+        self.utility_model_id()?;
+        let id = self
+            .internal
+            .as_ref()
+            .and_then(|i| i.utility.as_ref())
+            .and_then(|u| u.endpoint.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        Some(self.endpoint_named(id))
+    }
+
+    /// (#3207) Whether the utility binding is on an UNMANAGED endpoint:
+    /// darkmux sends its jobs there and owns no instance of it. `false` for
+    /// no binding, no endpoint, a managed endpoint, or an endpoint that does
+    /// not resolve (that error is refused where the binding is used).
+    pub fn utility_is_unmanaged(&self) -> bool {
+        self.utility_endpoint().is_some_and(|ep| matches!(ep.kind(), Ok(EndpointKind::Unmanaged)))
+    }
+
+    /// (#3207) Whether anything this registry declares needs LM Studio: a
+    /// profile model on a managed endpoint (a model with no endpoint is
+    /// one), or a utility binding that is not on an unmanaged endpoint. An
+    /// endpoint that does not resolve counts as needing it (nothing is
+    /// assumed away), and so does a registry declaring no model and no
+    /// binding at all (no evidence either way).
+    pub fn needs_lmstudio(&self) -> bool {
+        let mut declared = false;
+        for m in self.profiles.values().flat_map(|p| p.models.iter()) {
+            declared = true;
+            if !matches!(m.endpoint_kind(), Ok(EndpointKind::Unmanaged)) {
+                return true;
+            }
+        }
+        if self.utility_model_id().is_some() {
+            declared = true;
+            if !self.utility_is_unmanaged() {
+                return true;
+            }
+        }
+        !declared
+    }
+
     /// (#1054) Resolve which profile a dispatch should use, given an optional
     /// explicit `--profile <name>` request.
     ///
@@ -782,6 +848,10 @@ impl ProfileRegistry {
             if let Err(reason) = def.validate() {
                 out.push(format!("endpoint \"{id}\": {reason}"));
             }
+        }
+        // (#3207) The utility binding names its endpoint the way a model does.
+        if let Some(EndpointSource::Unresolved(id)) = self.utility_endpoint().map(|e| e.source) {
+            out.push(format!("internal.utility names endpoint \"{id}\", {}", self.unresolved_reason(&id)));
         }
         for (pname, profile) in &self.profiles {
             for m in &profile.models {
@@ -1293,6 +1363,78 @@ mod tests {
         assert_eq!(p.default_model_id(), Some("model-a"));
         // No `internal` block ⇒ no machine utility model registered.
         assert_eq!(reg.utility_model_id(), None);
+    }
+
+    fn materialized(json: &str) -> ProfileRegistry {
+        let mut r: ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        r
+    }
+
+    /// (#3207) `internal.utility.endpoint` names an `endpoints` entry through
+    /// the same id lookup a profile model uses; absent (or blank) is no
+    /// endpoint; an id `endpoints` does not define is an unresolved
+    /// reference whose `kind()` refuses, and `validate` names it.
+    #[test]
+    fn the_utility_binding_resolves_its_endpoint_by_id() {
+        let r = materialized(
+            r#"{"profiles":{},"endpoints":{"mlx-local":{"url":"http://127.0.0.1:8080/v1"}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":8192,"endpoint":"mlx-local"}}}"#,
+        );
+        let ep = r.utility_endpoint().expect("the binding names an endpoint");
+        assert_eq!(ep.named_id(), Some("mlx-local"));
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
+        assert!(r.utility_is_unmanaged());
+        assert!(r.validate().is_empty(), "{:?}", r.validate());
+        let back: ProfileRegistry = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.internal.unwrap().utility.unwrap().endpoint.as_deref(), Some("mlx-local"), "round-trips");
+
+        let none = materialized(r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8}}}"#);
+        assert!(none.utility_endpoint().is_none() && !none.utility_is_unmanaged());
+        let blank = materialized(r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"  "}}}"#);
+        assert!(blank.utility_endpoint().is_none(), "a blank id is no endpoint");
+        let no_binding = materialized(r#"{"profiles":{},"endpoints":{"e":{"url":"http://h/v1"}},"internal":{"utility":{"id":"","endpoint":"e"}}}"#);
+        assert!(no_binding.utility_endpoint().is_none(), "no binding, no endpoint");
+
+        let dangling = materialized(r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"nope"}}}"#);
+        let ep = dangling.utility_endpoint().unwrap();
+        assert!(ep.kind().is_err(), "an undefined id is refused at use, never LM Studio by a guess");
+        assert!(!dangling.utility_is_unmanaged());
+        let findings = dangling.validate();
+        assert!(findings.iter().any(|f| f.contains("internal.utility") && f.contains("\"nope\"")), "{findings:?}");
+    }
+
+    /// (#3207, contract 7) The key is in the schema: the unknown-key gate
+    /// passes it, and still refuses a near-miss beside it.
+    #[test]
+    fn the_unknown_key_gate_knows_the_utility_endpoint() {
+        let path = std::path::Path::new("/x/profiles.json");
+        let ok = r#"{"profiles":{},"endpoints":{"e":{"url":"http://h/v1"}},"internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"e"}}}"#;
+        assert_eq!(
+            user_files::check_text::<ProfileRegistry>(user_files::UserFileKind::Profiles, path, ok, &|_| None),
+            None
+        );
+        let typo = r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8,"endpiont":"e"}}}"#;
+        let problem = user_files::check_text::<ProfileRegistry>(user_files::UserFileKind::Profiles, path, typo, &|_| None)
+            .expect("a near-miss is refused");
+        assert!(format!("{problem:?}").contains("internal.utility.endpiont"), "{problem:?}");
+    }
+
+    /// (#3207) Whether anything needs LM Studio: a model with no endpoint or
+    /// a managed one does, an unmanaged utility binding does not, a managed
+    /// (or endpoint-less) binding does, and an empty registry is no evidence.
+    #[test]
+    fn needs_lmstudio_reads_every_model_and_the_utility_binding() {
+        let eps = r#""endpoints":{"mlx":{"url":"http://h/v1"},"lms":{"managed":"lmstudio"}}"#;
+        let reg = |profiles: &str, utility: &str| materialized(&format!(r#"{{"profiles":{profiles},{eps},"internal":{{"utility":{utility}}}}}"#));
+        let unmanaged_models = r#"{"p":{"models":[{"id":"m","endpoint":"mlx"}]}}"#;
+        assert!(!reg(unmanaged_models, r#"{"id":"u","n_ctx":8,"endpoint":"mlx"}"#).needs_lmstudio());
+        assert!(reg(unmanaged_models, r#"{"id":"u","n_ctx":8}"#).needs_lmstudio(), "a binding with no endpoint loads into LM Studio");
+        assert!(reg(unmanaged_models, r#"{"id":"u","n_ctx":8,"endpoint":"lms"}"#).needs_lmstudio());
+        assert!(reg(unmanaged_models, r#"{"id":"u","n_ctx":8,"endpoint":"nope"}"#).needs_lmstudio(), "an unresolved endpoint assumes nothing away");
+        assert!(reg(r#"{"p":{"models":[{"id":"m","n_ctx":8}]}}"#, r#"{"id":"u","n_ctx":8,"endpoint":"mlx"}"#).needs_lmstudio());
+        assert!(!reg(unmanaged_models, r#"{"id":""}"#).needs_lmstudio(), "no binding, every model unmanaged");
+        assert!(materialized(r#"{"profiles":{}}"#).needs_lmstudio(), "an empty registry is no evidence");
     }
 
     #[test]

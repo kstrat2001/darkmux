@@ -423,3 +423,180 @@ fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
     assert_eq!(samples[1].fields["job_id"], records[0]["payload"]["job_id"]);
     assert!(samples[1].at_ms >= samples[0].at_ms);
 }
+
+/// A fake `lms` that records every invocation to `<dir>/lms.log` and fails,
+/// so a test can show darkmux never ran it (#3207).
+fn recording_fake_lms(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = dir.join("lms.log");
+    let fake = dir.join("lms");
+    std::fs::write(&fake, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (fake, log)
+}
+
+/// (#3207) A utility binding naming an UNMANAGED endpoint sends the job
+/// there: the bare binding id on the wire, the endpoint's dialect
+/// (`max_tokens`, no `max_completion_tokens`) and its auth header, and the
+/// usage record names that endpoint (its route label and its `endpoints`
+/// id). darkmux never runs `lms` for it: nothing to load, eject or read.
+/// LM Studio's own address points at a dead port, so a request that went
+/// there instead would fail.
+#[test]
+#[serial_test::serial]
+fn a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .header("authorization", "Bearer util-secret")
+            .json_body_partial(r#"{ "model": "mlx-util", "max_tokens": 128 }"#)
+            // The managed arm's low-variance setting, in the dialect that sends one.
+            .body_contains("\"temperature\":0.2")
+            .body_contains("# Radio Router");
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mlx-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "mlx-util",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "routed" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+        }));
+    });
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = registry_dir.path().join("profiles.json");
+    let body = serde_json::json!({
+        "schema_version": "2.1",
+        "default_profile": "work",
+        "profiles": { "work": { "models": [ { "id": "mock-worker", "n_ctx": 8192 } ] } },
+        "endpoints": {
+            "mlx-local": {
+                "url": format!("{}/v1", server.base_url()),
+                "dialect": "chat-completions-max-tokens",
+                "auth": { "type": "bearer", "key_env": "DARKMUX_TEST_UTIL_KEY" }
+            }
+        },
+        "internal": { "utility": { "id": "mlx-util", "n_ctx": 32768, "endpoint": "mlx-local" } }
+    });
+    std::fs::write(&profiles_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
+    let bin_dir = tempfile::tempdir().unwrap();
+    let (fake_lms, lms_log) = recording_fake_lms(bin_dir.path());
+
+    let prev: Vec<(&str, Option<String>)> = ["DARKMUX_LMSTUDIO_URL", "DARKMUX_LMS_BIN", "DARKMUX_TEST_UTIL_KEY"]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+    unsafe {
+        std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9");
+        std::env::set_var("DARKMUX_LMS_BIN", &fake_lms);
+        std::env::set_var("DARKMUX_TEST_UTIL_KEY", "util-secret");
+    }
+    let reply = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "review this",
+        timeout_seconds: 30,
+        max_tokens: 128,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: None,
+    });
+    unsafe {
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+    let reply = reply.expect("the utility call reaches the unmanaged endpoint");
+    assert_eq!(reply.content, "routed");
+    mock.assert();
+    assert!(!lms_log.exists(), "darkmux ran `lms` for an unmanaged utility binding: {:?}", std::fs::read_to_string(&lms_log));
+
+    let records = all_flow_records(&flows_dir);
+    assert_eq!(records.len(), 2, "lean: the start marker and the usage record: {records:#?}");
+    assert_eq!(records[0]["action"], "utility.start");
+    assert_eq!(records[0]["payload"]["model"], "mlx-util", "the start names the bare id: {:#}", records[0]);
+    let rec = &records[1];
+    assert_eq!(rec["action"], "telemetry.tokens");
+    assert_eq!(rec["payload"]["purpose"], "utility", "{rec}");
+    assert_eq!(rec["payload"]["requested_model"], "mlx-util", "{rec}");
+    assert_eq!(rec["payload"]["endpoint_id"], "mlx-local", "the record names the endpoint it went through: {rec}");
+    let label = rec["payload"]["endpoint"].as_str().unwrap_or_default();
+    assert!(label.contains("127.0.0.1") && label.contains("mlx-util"), "the real endpoint, not LM Studio's: {rec}");
+    assert!(!label.contains(":9/"), "never LM Studio's address: {rec}");
+    assert!(rec["session_id"].is_null(), "{rec}");
+}
+
+/// (#3207) A utility binding naming a MANAGED endpoint is today's binding:
+/// the residency preflight runs and the namespaced id goes on the wire.
+#[test]
+#[serial_test::serial]
+fn a_utility_binding_on_a_managed_endpoint_keeps_the_lm_studio_path() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions").json_body_partial(r#"{ "model": "darkmux:mock-util" }"#);
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+        }));
+    });
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = registry_dir.path().join("profiles.json");
+    std::fs::write(
+        &profiles_path,
+        r#"{"schema_version":"2.1","default_profile":"work",
+            "profiles":{"work":{"models":[{"id":"mock-worker","n_ctx":8192}]}},
+            "endpoints":{"lms":{"managed":"lmstudio"}},
+            "internal":{"utility":{"id":"mock-util","n_ctx":4096,"endpoint":"lms"}}}"#,
+    )
+    .unwrap();
+    let _state = isolated_state();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let fake_lms = bin_dir.path().join("lms");
+    std::fs::write(
+        &fake_lms,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"ps\" ]; then\n\
+         echo '[{\"identifier\":\"darkmux:mock-util\",\"modelKey\":\"mock-util\",\"status\":\"loaded\",\"contextLength\":4096}]'\n\
+         exit 0\n\
+         fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let prev_url = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+    let prev_lms = std::env::var("DARKMUX_LMS_BIN").ok();
+    unsafe {
+        std::env::set_var("DARKMUX_LMSTUDIO_URL", server.base_url());
+        std::env::set_var("DARKMUX_LMS_BIN", &fake_lms);
+    }
+    let reply = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "anything",
+        timeout_seconds: 30,
+        max_tokens: 64,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: None,
+    });
+    unsafe {
+        match prev_url {
+            Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+            None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+        }
+        match prev_lms {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    reply.expect("the managed arm round-trips through the mock LM Studio");
+    mock.assert();
+}

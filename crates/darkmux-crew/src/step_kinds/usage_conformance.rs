@@ -97,11 +97,22 @@ const ROSTER: &[CallSite] = &[
     // the usage record is the ONLY record the job leaves.
     CallSite {
         file: "src/utility.rs",
-        caller: "run_utility_single_shot",
+        caller: "utility_call",
         transport: "single_shot_chat(",
         duty: Duty::Emits {
             writer_in: ("src/utility.rs", "run_utility_single_shot"),
             test: "tests/mock_utility_single_shot_proof.rs::a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record",
+        },
+    },
+    // (#3207) The same lean job on a binding whose endpoint darkmux does not
+    // manage: the hosted transport, the same one usage record.
+    CallSite {
+        file: "src/utility.rs",
+        caller: "utility_call",
+        transport: "single_shot_chat_hosted(",
+        duty: Duty::Emits {
+            writer_in: ("src/utility.rs", "run_utility_single_shot"),
+            test: "tests/mock_utility_single_shot_proof.rs::a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms",
         },
     },
     CallSite {
@@ -354,6 +365,16 @@ fn every_hosted_call_site_passes_the_budget_gates() {
             Budget::Exempt(
                 "`darkmux doctor --probe`: an operator-run 64-token connectivity check, not work; \
                  it is the tool for checking an endpoint that a budget may be holding",
+            ),
+        ),
+        (
+            "utility_call",
+            Budget::Exempt(
+                "(#3207) a utility job on an unmanaged endpoint: darkmux's own bounded job (its own \
+                 timeout and `max_tokens`), lean by contract 2, so it has no session or run for a \
+                 budget wait to hold or stop, and no dispatch whose cap it could settle into. Its \
+                 usage record carries the endpoint's `endpoints` id, so the endpoint's window \
+                 counts what it spent against every gated call after it",
             ),
         ),
         (

@@ -406,13 +406,30 @@ pub fn utility_facts_live() -> Option<UtilityFacts> {
     Some(UtilityFacts { target, reading, foreign_holder })
 }
 
-/// The router's notice with live facts about the utility instance.
-pub fn router_wait_notice_live(waited: Duration) -> String {
-    router_wait_notice(
-        utility_facts_live().as_ref(),
-        waited,
-        Duration::from_secs(u64::from(crate::radio::ROUTER_CALL_CEILING_SECONDS)),
+/// (#3207) The router's "still waiting" notice when the utility model is on
+/// an endpoint darkmux does not manage: there is no local instance and no
+/// `lms ps` to read, so it says where the call went and that darkmux cannot
+/// see what that server is doing. `label` is the endpoint's route label.
+pub fn router_wait_notice_unmanaged(id: &str, label: &str, waited: Duration, ceiling: Duration) -> String {
+    format!(
+        "still routing after {}s: the utility model `{id}` runs on {label}, an endpoint darkmux does not manage, \
+         so darkmux cannot see what is ahead of this call there. Routing keeps waiting, up to {}s.",
+        waited.as_secs(),
+        ceiling.as_secs()
     )
+}
+
+/// The router's notice with live facts about the utility instance. (#3207)
+/// A binding on an unmanaged endpoint gets [`router_wait_notice_unmanaged`]
+/// and reads no `lms ps` at all.
+pub fn router_wait_notice_live(waited: Duration) -> String {
+    let ceiling = Duration::from_secs(u64::from(crate::radio::ROUTER_CALL_CEILING_SECONDS));
+    if let Ok(Some(target)) = crate::crew::dispatch::utility_target(None) {
+        if let Some(label) = target.route_label() {
+            return router_wait_notice_unmanaged(&target.id, &label, waited, ceiling);
+        }
+    }
+    router_wait_notice(utility_facts_live().as_ref(), waited, ceiling)
 }
 
 /// This machine's live runs, from the SAME local records `darkmux run list`
@@ -807,6 +824,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (#3207) A utility binding on an UNMANAGED endpoint has no local
+    /// instance: the facts are `None` and the router's notice names the
+    /// endpoint, and neither reads `lms` (a fake that records every call
+    /// stays silent).
+    #[test]
+    #[serial_test::serial]
+    fn an_unmanaged_utility_binding_reads_no_lms_and_says_where_the_call_went() {
+        let home = tempfile::TempDir::new().unwrap();
+        let profiles = home.path().join("profiles.json");
+        std::fs::write(
+            &profiles,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},"default_profile":"work",
+                "endpoints":{"mlx-local":{"url":"http://127.0.0.1:8080/v1","dialect":"chat-completions-max-tokens"}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":8000,"endpoint":"mlx-local"}}}"#,
+        )
+        .unwrap();
+        let lms_log = home.path().join("lms.log");
+        let fake_lms = home.path().join("lms");
+        std::fs::write(&fake_lms, format!("#!/bin/sh\necho \"$*\" >> '{}'\necho '[]'\n", lms_log.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = EnvGuard::set("DARKMUX_HOME", home.path().to_str().unwrap());
+        let _profiles = EnvGuard::set("DARKMUX_PROFILES", profiles.to_str().unwrap());
+        let _lms = EnvGuard::set("DARKMUX_LMS_BIN", fake_lms.to_str().unwrap());
+
+        assert_eq!(utility_facts_live(), None, "no local instance to read");
+        let n = router_wait_notice_live(Duration::from_secs(10));
+        assert!(n.contains("`mlx-util`") && n.contains("127.0.0.1:8080") && n.contains("does not manage"), "{n}");
+        assert!(!n.contains("LM Studio"), "{n}");
+        assert!(!lms_log.exists(), "`lms` ran: {:?}", std::fs::read_to_string(&lms_log));
     }
 
     /// Radio's own work is never "something else": a lease THIS process

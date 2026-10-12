@@ -83,6 +83,7 @@ fn main() -> ExitCode {
             println!("    [--compact-threshold-tokens N] [--compactor-model id]");
             println!("    [--compact-threshold-ratio 0.1-0.9] [--context-window N]");
             println!("    [--compactor-context-window N]");
+            println!("    [--compactor-chat-url url] [--compactor-dialect d] [--compactor-auth-header-stdin]");
             println!("    [--compact-strategy narrative|structured-slot]");
             println!("    [--bail-after-compactions N]");
             println!();
@@ -205,6 +206,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // process is still the container's init.
     // False when the remote endpoint declares no auth (or no remote brain).
     let mut auth_header_stdin: bool = false;
+    // (#3207) The compactor on an UNMANAGED utility endpoint: its full
+    // chat-completions URL, its dialect, and whether its auth header rides
+    // the stdin blob (under `compactor`). All absent: the compactor talks to
+    // LM Studio at `--base-url`, as before.
+    let mut compactor_endpoint = CompactorEndpointArgs::default();
     // Streaming is on by default (#205). Operators / tests pass
     // `--no-stream` to fall back to the Phase 2 single-shot path —
     // useful for deterministic benchmarks or when a runtime regression
@@ -759,10 +765,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
-            other => {
-                eprintln!("unknown flag: {other}");
-                return ExitCode::from(2);
-            }
+            // (#3207) The compactor's own unmanaged endpoint, parsed in one
+            // place (`CompactorEndpointArgs::parse`).
+            other => match compactor_endpoint.parse(other, args.get(i + 1)) {
+                Ok(Some(consumed)) => i += consumed,
+                Ok(None) => {
+                    eprintln!("unknown flag: {other}");
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            },
         }
     }
 
@@ -837,30 +852,20 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     };
     let resumed_from_turn_index = resume_from.as_ref().map(|c| c.turns);
 
-    // (#1187 audit finding) Build the compactor's client from `base_url`
-    // BEFORE it's consumed below, and NEVER apply `--chat-url`/
+    // (#1187 audit finding) Build the compactor's client from `base_url`,
+    // and NEVER apply `--chat-url`/
     // `--auth-header-stdin` to it — the compactor always talks to local
     // LMStudio, even on a remote-brain dispatch. See the doc comment on
     // `loop_runner::run`'s `compactor_client` parameter for why routing
     // the compactor through a remote-configured client is wrong, not just
     // different (it silently burns the wrong model's budget on Azure, or
     // 404s and fails the whole dispatch on OpenAI-style endpoints).
-    let compactor_client = match base_url.as_deref() {
-        Some(url) => LmStudioClient::with_base_url(url),
-        None => LmStudioClient::new(),
-    };
-
-    let mut client = match base_url {
-        Some(url) => LmStudioClient::with_base_url(url),
-        None => LmStudioClient::new(),
-    };
-    if let Some(url) = chat_url {
-        client = client.with_chat_url(url);
-    }
-    if let Some(d) = dialect {
-        client = client.with_dialect(d);
-    }
-    // (#1187) Read the auth header from stdin ONCE at startup — never a CLI
+    //
+    // (#3207) The one exception: a utility model on an UNMANAGED endpoint
+    // (`--compactor-chat-url`), which is the compactor's OWN endpoint, never
+    // the brain's, with its own dialect and its own auth header.
+    //
+    // (#1187) Auth headers are read from stdin ONCE at startup — never a CLI
     // arg (ps-visible), never an env var (visible to every process, no
     // permission gate), never a file (bash has no `/workspace`-escape check,
     // so any secret-bearing file the container can see is reachable by a
@@ -870,19 +875,22 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // in-memory exposure this does NOT close). A parse/read failure is
     // fatal (exit 2): a remote-brain dispatch with a broken auth pipe would
     // otherwise proceed unauthenticated and fail confusingly on the FIRST
-    // model call instead of loudly at startup.
-    if auth_header_stdin {
-        match read_auth_header_from_stdin() {
-            Ok((h, val)) => {
-                client = client.with_auth_header(h, val);
-            }
-            Err(e) => {
-                eprintln!("--auth-header-stdin: {e}");
-                return ExitCode::from(2);
-            }
+    // model call instead of loudly at startup. (#3207) The brain's header and
+    // the compactor's share the one blob (`read_stdin_auth`).
+    let stdin_auth = match read_stdin_auth(auth_header_stdin, compactor_endpoint.auth_stdin) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
         }
-    }
-    let client = client;
+    };
+    let compactor_client = build_client(
+        base_url.as_deref(),
+        compactor_endpoint.chat_url,
+        compactor_endpoint.dialect,
+        stdin_auth.compactor,
+    );
+    let client = build_client(base_url.as_deref(), chat_url, dialect, stdin_auth.brain);
 
     // Tool order matters — LLMs have positional bias when picking between
     // plausible candidates. Order reflects the workflow we want the model
@@ -1239,16 +1247,115 @@ fn print_run_summary(result: &str, wall_ms: u128) {
 /// close every exposure vector — see the residual-risk note on
 /// `auth_header_stdin`'s declaration above). Returns `(header_name,
 /// header_value)` on success.
-fn read_auth_header_from_stdin() -> Result<(String, String), String> {
-    use std::io::Read;
-    let mut contents = String::new();
-    std::io::stdin()
-        .read_to_string(&mut contents)
-        .map_err(|e| e.to_string())?;
-    parse_auth_header_json(&contents)
+/// (#1187, #3207) A model client: LM Studio at `base_url` (the runtime's
+/// default when absent), or the full `chat_url` of an endpoint darkmux does
+/// not manage, in its `dialect` and with its `auth` header. The brain's and
+/// the compactor's are built here from their own flags: the compactor never
+/// gets the brain's `--chat-url` or auth.
+fn build_client(
+    base_url: Option<&str>,
+    chat_url: Option<String>,
+    dialect: Option<lmstudio::Dialect>,
+    auth: Option<(String, String)>,
+) -> LmStudioClient {
+    let mut client = match base_url {
+        Some(url) => LmStudioClient::with_base_url(url),
+        None => LmStudioClient::new(),
+    };
+    if let Some(url) = chat_url {
+        client = client.with_chat_url(url);
+    }
+    if let Some(d) = dialect {
+        client = client.with_dialect(d);
+    }
+    if let Some((h, v)) = auth {
+        client = client.with_auth_header(h, v);
+    }
+    client
 }
 
-/// Pure JSON-validation half of [`read_auth_header_from_stdin`], split out
+/// (#3207) The compactor's own unmanaged endpoint, from
+/// `--compactor-chat-url`, `--compactor-dialect` and
+/// `--compactor-auth-header-stdin`. All absent: the compactor talks to LM
+/// Studio at `--base-url`, as before.
+#[derive(Debug, Default, PartialEq)]
+struct CompactorEndpointArgs {
+    chat_url: Option<String>,
+    dialect: Option<lmstudio::Dialect>,
+    auth_stdin: bool,
+}
+
+impl CompactorEndpointArgs {
+    /// Parse `flag` (and its `value`): `Ok(Some(n))` consumed `n` arguments,
+    /// `Ok(None)` the flag is not one of these, `Err` the message to exit 2 on.
+    fn parse(&mut self, flag: &str, value: Option<&String>) -> Result<Option<usize>, String> {
+        let needs_value = || value.cloned().ok_or_else(|| format!("{flag} requires a value"));
+        match flag {
+            "--compactor-chat-url" => self.chat_url = Some(needs_value()?),
+            "--compactor-dialect" => {
+                let v = needs_value()?;
+                self.dialect = Some(lmstudio::Dialect::parse(&v).ok_or_else(|| {
+                    format!("{flag} must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")
+                })?);
+            }
+            "--compactor-auth-header-stdin" => {
+                self.auth_stdin = true;
+                return Ok(Some(1));
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(2))
+    }
+}
+
+/// (#1187, #3207) The auth headers piped over stdin: the brain's
+/// (`--auth-header-stdin`) and the compactor's
+/// (`--compactor-auth-header-stdin`), each `None` unless its flag is set.
+#[derive(Debug, Default, PartialEq)]
+struct StdinAuth {
+    brain: Option<(String, String)>,
+    compactor: Option<(String, String)>,
+}
+
+/// Read stdin ONCE, and only when a flag asks for a header on it.
+fn read_stdin_auth(brain: bool, compactor: bool) -> Result<StdinAuth, String> {
+    if !(brain || compactor) {
+        return Ok(StdinAuth::default());
+    }
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut contents)
+        .map_err(|e| format!("--auth-header-stdin: {e}"))?;
+    stdin_auth_from(&contents, brain, compactor)
+}
+
+/// The pure half of [`read_stdin_auth`]: each header the flags ask for,
+/// parsed from the one blob, the error naming the flag.
+fn stdin_auth_from(contents: &str, brain: bool, compactor: bool) -> Result<StdinAuth, String> {
+    Ok(StdinAuth {
+        brain: brain
+            .then(|| parse_auth_header_json(contents).map_err(|e| format!("--auth-header-stdin: {e}")))
+            .transpose()?,
+        compactor: compactor
+            .then(|| parse_compactor_auth_header_json(contents).map_err(|e| format!("--compactor-auth-header-stdin: {e}")))
+            .transpose()?,
+    })
+}
+
+/// (#3207) The compactor's header from the same stdin blob, under
+/// `{"compactor": {"header": "...", "value": "..."}}`.
+fn parse_compactor_auth_header_json(contents: &str) -> Result<(String, String), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(contents).map_err(|e| format!("invalid JSON: {e}"))?;
+    let c = v.get("compactor");
+    let header = c.and_then(|c| c.get("header")).and_then(|h| h.as_str());
+    let value = c.and_then(|c| c.get("value")).and_then(|h| h.as_str());
+    match (header, value) {
+        (Some(h), Some(val)) => Ok((h.to_string(), val.to_string())),
+        _ => Err("expected {\"compactor\": {\"header\": \"...\", \"value\": \"...\"}}".to_string()),
+    }
+}
+
+/// The brain's header from the stdin blob ([`read_stdin_auth`]), split out
 /// so the parsing/validation logic is unit-testable without touching the
 /// process's real stdin.
 fn parse_auth_header_json(contents: &str) -> Result<(String, String), String> {
@@ -1442,6 +1549,100 @@ mod tests {
     }
 
     // ─── parse_auth_header_json (#1187 stdin auth) ───────────────────
+
+    /// (#3207) The compactor's header rides the same stdin blob, under
+    /// `compactor`, beside (or without) the brain's.
+    #[test]
+    fn the_compactor_header_is_read_from_its_own_key_in_the_stdin_blob() {
+        let both = r#"{"header":"api-key","value":"brain","compactor":{"header":"Authorization","value":"Bearer util"}}"#;
+        assert_eq!(parse_auth_header_json(both).unwrap(), ("api-key".to_string(), "brain".to_string()));
+        assert_eq!(
+            parse_compactor_auth_header_json(both).unwrap(),
+            ("Authorization".to_string(), "Bearer util".to_string())
+        );
+        let only = r#"{"compactor":{"header":"api-key","value":"util"}}"#;
+        assert_eq!(parse_compactor_auth_header_json(only).unwrap(), ("api-key".to_string(), "util".to_string()));
+        assert!(parse_auth_header_json(only).is_err(), "no brain header in a compactor-only blob");
+        assert!(parse_compactor_auth_header_json(r#"{"header":"h","value":"v"}"#).is_err());
+    }
+
+    /// (#3207) The compactor's flags parse into their own struct; anything
+    /// else is not theirs; a bad dialect or a missing value is refused.
+    #[test]
+    fn the_compactor_endpoint_flags_parse_on_their_own() {
+        let mut c = CompactorEndpointArgs::default();
+        let url = "http://host.docker.internal:8080/v1/chat/completions".to_string();
+        assert_eq!(c.parse("--compactor-chat-url", Some(&url)), Ok(Some(2)));
+        assert_eq!(c.parse("--compactor-dialect", Some(&"chat-completions-max-tokens".to_string())), Ok(Some(2)));
+        assert_eq!(c.parse("--compactor-auth-header-stdin", None), Ok(Some(1)));
+        assert_eq!(
+            c,
+            CompactorEndpointArgs {
+                chat_url: Some(url),
+                dialect: Some(lmstudio::Dialect::ChatCompletionsMaxTokens),
+                auth_stdin: true
+            }
+        );
+        assert_eq!(c.parse("--chat-url", Some(&"x".to_string())), Ok(None), "the brain's flag is not the compactor's");
+        assert!(c.parse("--compactor-dialect", Some(&"nope".to_string())).unwrap_err().contains("must be"));
+        assert!(c.parse("--compactor-chat-url", None).unwrap_err().contains("requires a value"));
+        assert_eq!(stdin_auth_from("", false, false), Ok(StdinAuth::default()));
+        let both = r#"{"header":"api-key","value":"b","compactor":{"header":"api-key","value":"c"}}"#;
+        let auth = stdin_auth_from(both, true, true).unwrap();
+        assert_eq!((auth.brain.unwrap().1, auth.compactor.unwrap().1), ("b".to_string(), "c".to_string()));
+        assert!(stdin_auth_from(r#"{"header":"h","value":"v"}"#, true, true).unwrap_err().starts_with("--compactor-auth-header-stdin"));
+    }
+
+    /// (#3207) A utility model on an UNMANAGED endpoint: the compaction call
+    /// goes to that endpoint's chat URL (never LM Studio at `base_url`), with
+    /// the bare compactor id, the endpoint's dialect (`max_tokens`) and its
+    /// auth header.
+    #[test]
+    #[serial_test::serial]
+    fn a_compactor_on_an_unmanaged_endpoint_is_sent_there_with_its_dialect_and_auth() {
+        use httpmock::prelude::*;
+        let lm_studio = crate::test_support::GuardedMockServer::start();
+        let never = lm_studio.mock_expect_zero("the compactor must not call LM Studio when it has its own endpoint", |when, then| {
+            when.method(POST);
+            then.status(500);
+        });
+        let endpoint = crate::test_support::GuardedMockServer::start();
+        let summary = "Summary: the assistant read the workspace file several times and inspected \
+                       what it returned. Nothing was decided and nothing was modified yet. The next \
+                       step is to keep reading the file and then act on what it contains.";
+        let hit = endpoint.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("authorization", "Bearer util-secret")
+                .json_body_partial(r#"{"model":"mlx-util"}"#)
+                .body_contains("\"max_tokens\"");
+            then.status(200).json_body(serde_json::json!({
+                "id": "c", "object": "chat.completion", "created": 0, "model": "mlx-util",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": summary }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940 },
+            }));
+        });
+        let client = build_client(
+            Some(&format!("{}/v1", lm_studio.base_url())),
+            Some(format!("{}/v1/chat/completions", endpoint.base_url())),
+            Some(lmstudio::Dialect::ChatCompletionsMaxTokens),
+            Some(("Authorization".to_string(), "Bearer util-secret".to_string())),
+        );
+        let pad = "context detail that occupies transcript space ".repeat(12);
+        let mut messages = vec![Message::system("you are an agent"), Message::user("do the thing")];
+        for i in 0..4 {
+            messages.push(Message::user(format!("user {i}: {pad}")));
+            messages.push(Message::assistant(format!("assistant {i}: {pad}")));
+        }
+        let cfg = compaction::CompactionConfig {
+            compactor_model: Some("mlx-util".to_string()),
+            ..compaction::CompactionConfig::never_compact()
+        };
+        compaction::compact(&client, &mut messages, 1, &cfg, &mut Vec::new())
+            .expect("the compaction call reaches the unmanaged endpoint");
+        hit.assert();
+        never.assert_hits(0);
+    }
 
     #[test]
     fn auth_header_json_happy_path_returns_header_and_value() {

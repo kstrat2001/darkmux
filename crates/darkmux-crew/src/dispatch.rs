@@ -450,6 +450,15 @@ pub struct CompactionDispatchArgs {
     /// `profile.runtime.compaction.custom_instructions`. Schema
     /// isolation: reads ONLY the typed field.
     pub custom_instructions: Option<String>,
+    /// (#3207) The compactor's chat-completions URL when the utility model is
+    /// on an UNMANAGED endpoint (`--compactor-chat-url`), as the container
+    /// reaches it. `None`: the compactor talks to the LM Studio at
+    /// `--base-url`, as before. Set only by the dispatch path
+    /// (`dispatch_internal::apply_unmanaged_compactor`).
+    pub compactor_chat_url: Option<String>,
+    /// (#3207) That endpoint's request dialect (`--compactor-dialect`), set
+    /// with `compactor_chat_url` and only then.
+    pub compactor_dialect: Option<darkmux_types::Dialect>,
 }
 
 /// (#590/#1282) A profile's DEFAULT model's declared `n_ctx`: the window a
@@ -526,6 +535,8 @@ impl CompactionDispatchArgs {
             strategy,
             bail_after_compactions,
             custom_instructions,
+            compactor_chat_url: None,
+            compactor_dialect: None,
         }
     }
 
@@ -805,6 +816,12 @@ pub fn dispatch_local_target(
 /// it. See `dispatch_internal::utility_local_target`'s own doc.
 pub fn utility_local_target(config_path: Option<&str>) -> Option<LocalTarget> {
     crate::dispatch_internal::utility_local_target(config_path)
+}
+
+/// (#3207) The machine utility binding with its endpoint. See
+/// `dispatch_internal::resolve_utility_target_internal`'s own doc.
+pub fn utility_target(config_path: Option<&str>) -> anyhow::Result<Option<crate::target::UtilityTarget>> {
+    crate::dispatch_internal::resolve_utility_target_internal(config_path)
 }
 
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a

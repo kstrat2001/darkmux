@@ -554,6 +554,8 @@ mod tests {
             strategy: None,
             bail_after_compactions: Some(8),
             custom_instructions: None,
+            compactor_chat_url: None,
+            compactor_dialect: None,
         };
         let ov = LoopCompactionOverride {
             threshold_tokens: Some(8_000),

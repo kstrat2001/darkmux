@@ -121,9 +121,14 @@ use std::time::Duration;
 /// unloads it, and only `darkmux machine eject` releases it. `None` when no
 /// utility model is registered or the registry does not load (the planner
 /// then has nothing to hold, which is the fail-open the registry read
-/// already has everywhere else).
+/// already has everywhere else). (#3207) `None` too when the binding is on an
+/// endpoint darkmux does not manage: nothing of it is resident here.
 pub fn standing_utility_binding(config_path: Option<&str>) -> Option<String> {
     let loaded = darkmux_profiles::profiles::load_registry_quiet(config_path).ok()?;
+    // (#3207) A binding on an unmanaged endpoint has no instance here to hold.
+    if loaded.registry.utility_is_unmanaged() {
+        return None;
+    }
     let id = loaded.registry.utility_model_id()?;
     Some(crate::dispatch_internal::compactor_wire_model_id(id))
 }
@@ -1462,6 +1467,15 @@ mod tests {
         let none = dir.path().join("none.json");
         std::fs::write(&none, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8000}]}}}"#).unwrap();
         assert_eq!(standing_utility_binding(none.to_str()), None);
+        // (#3207) A binding on an unmanaged endpoint: nothing here to hold.
+        let unmanaged = dir.path().join("unmanaged.json");
+        std::fs::write(
+            &unmanaged,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8000}]}},"endpoints":{"mlx":{"url":"http://h/v1"}},
+                "internal":{"utility":{"id":"u","n_ctx":8000,"endpoint":"mlx"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(standing_utility_binding(unmanaged.to_str()), None);
     }
 
     /// (#1487 PR2) The concurrency-safety delta test: the SAME orphan as
