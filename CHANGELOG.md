@@ -44,9 +44,6 @@ darkmux release.
   its status line now reads "not streaming", with the reason in its tooltip,
   instead of "online". Machines with an id keep the earlier rule: online unless
   presence says they are absent. (#3213)
-
-### Fixed
-
 - **`darkmux serve` reads the fleet stream incrementally and holds it compactly**
   (#3217). `/runs`, `/flow-missions` and the run and mission replays share one
   read of the hub's streams. Past its 2-second cache, every request re-read and
