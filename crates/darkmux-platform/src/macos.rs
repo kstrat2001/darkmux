@@ -53,6 +53,16 @@ impl Platform for MacPlatform {
     fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
         None
     }
+
+    /// Read through darkmux-crew's IOKit battery probe until that moves here.
+    fn battery(&self) -> Option<crate::BatteryReading> {
+        None
+    }
+
+    /// IOReport fills a Mac's cluster frequencies in darkmux-crew's probe.
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        Vec::new()
+    }
 }
 
 #[cfg(target_os = "macos")]

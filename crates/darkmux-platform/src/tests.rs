@@ -440,3 +440,59 @@ fn macos_and_other_leave_host_readings_to_their_existing_paths() {
     assert!(MacPlatform.memory_snapshot().is_none());
     assert!(OtherPlatform.cpu_ticks().is_none() && OtherPlatform.memory_snapshot().is_none());
 }
+
+/// A battery from `/sys/class/power_supply`: the Battery supply's charge,
+/// status and current, and whether any Mains supply is online.
+#[test]
+fn a_linux_battery_comes_from_power_supply() {
+    let full_on_ac = crate::linux::battery_from_supply(
+        &[("type", "Battery"), ("present", "1"), ("capacity", "100"), ("status", "Full"), ("current_now", "0"), ("time_to_empty_now", "0")],
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        full_on_ac,
+        BatteryReading { charge_pct: 100, on_ac: true, charging: false, fully_charged: Some(true), current_ma: Some(0), minutes_to_empty: None }
+    );
+    let discharging = crate::linux::battery_from_supply(
+        &[("type", "Battery"), ("capacity", "62"), ("status", "Discharging"), ("current_now", "-1250000"), ("time_to_empty_now", "5400")],
+        false,
+    )
+    .unwrap();
+    assert_eq!(discharging.current_ma, Some(-1250));
+    assert_eq!(discharging.minutes_to_empty, Some(90));
+    assert!(!discharging.on_ac && !discharging.charging && discharging.fully_charged == Some(false));
+    let held = crate::linux::battery_from_supply(&[("type", "Battery"), ("capacity", "80"), ("status", "Not charging")], true).unwrap();
+    assert!(held.on_ac && !held.charging && held.fully_charged == Some(false));
+    assert!(crate::linux::battery_from_supply(&[("type", "Battery"), ("present", "0"), ("capacity", "50")], true).is_none(), "an absent pack is no battery");
+    assert!(crate::linux::battery_from_supply(&[("type", "Battery"), ("status", "Full")], true).is_none(), "no charge, no reading");
+}
+
+#[test]
+fn this_linux_machine_reads_its_battery_if_it_has_one() {
+    if std::env::consts::OS == "linux" && std::path::Path::new("/sys/class/power_supply/macsmc-battery").exists() {
+        let b = LinuxPlatform.battery().expect("the M2's battery");
+        assert!(b.charge_pct <= 100);
+    }
+    assert!(MacPlatform.battery().is_none() && OtherPlatform.battery().is_none());
+}
+
+/// Each cluster's current frequency, in the same fastest-first order as
+/// `cpu_clusters`, from the policy's `scaling_cur_freq` (kHz).
+#[test]
+fn cluster_mhz_follows_the_cluster_order() {
+    let policies = vec![
+        (vec![0, 1, 2, 3], Some(571), Some(600_000)),
+        (vec![4, 5, 6, 7], Some(1024), Some(1_968_000)),
+    ];
+    assert_eq!(crate::linux::cluster_mhz_from_policies(policies), vec![Some(1968), Some(600)]);
+    assert_eq!(crate::linux::cluster_mhz_from_policies(vec![(vec![0], Some(1024), None)]), vec![None]);
+}
+
+#[test]
+fn this_linux_machine_reports_a_frequency_per_cluster() {
+    if std::env::consts::OS == "linux" {
+        assert_eq!(LinuxPlatform.cpu_cluster_mhz().len(), LinuxPlatform.cpu_clusters().len());
+    }
+    assert!(MacPlatform.cpu_cluster_mhz().is_empty() && OtherPlatform.cpu_cluster_mhz().is_empty());
+}

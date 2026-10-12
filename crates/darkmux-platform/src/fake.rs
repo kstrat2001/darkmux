@@ -45,4 +45,12 @@ impl Platform for FakePlatform {
     fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
         None
     }
+
+    fn battery(&self) -> Option<crate::BatteryReading> {
+        None
+    }
+
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        Vec::new()
+    }
 }
