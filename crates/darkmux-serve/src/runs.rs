@@ -8911,7 +8911,10 @@ mod tests {
             mission_rec("mission.close", "2026-09-27T10:02:00Z"),
             mission_rec("run.error", "2026-09-27T10:03:00Z"),
         ];
-        let runs = build_runs(flows.path(), None, &fleet);
+        // The window reaches the fixture's own day (2026-09-27T00:00:00Z), so
+        // the result never depends on today's date: the default 14-day window
+        // aged these records out on 2026-10-12 and the row vanished.
+        let runs = build_runs_in(flows.path(), None, &fleet, &ScanWindow::since(1_790_467_200)).runs;
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Error, "the run's bookend outranks the close: {row:?}");
     }
