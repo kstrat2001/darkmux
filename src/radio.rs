@@ -1267,4 +1267,80 @@ mod tests {
             }
         }
     }
+
+    /// (#3207) Radio's routing call on a utility binding whose endpoint
+    /// darkmux does not manage: the request reaches that endpoint (a one-shot
+    /// local server standing in for `mlx_lm.server`) with the bare id, and
+    /// `lms` is never run (a fake that records every call stays silent).
+    #[test]
+    #[serial_test::serial]
+    fn a_routing_call_on_an_unmanaged_utility_endpoint_goes_there_and_runs_no_lms() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = conn.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text[..head_end]
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if req.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"routed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+            write!(conn, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            String::from_utf8_lossy(&req).to_string()
+        });
+
+        let home = tempfile::TempDir::new().unwrap();
+        let profiles = home.path().join("profiles.json");
+        std::fs::write(
+            &profiles,
+            format!(
+                r#"{{"profiles":{{"work":{{"models":[{{"id":"stub-worker","n_ctx":8000}}]}}}},"default_profile":"work",
+                    "endpoints":{{"mlx-local":{{"url":"http://127.0.0.1:{port}/v1","dialect":"chat-completions-max-tokens"}}}},
+                    "internal":{{"utility":{{"id":"mlx-util","n_ctx":8000,"endpoint":"mlx-local"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let lms_log = home.path().join("lms.log");
+        let fake_lms = home.path().join("lms");
+        std::fs::write(&fake_lms, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n", lms_log.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let set = |k: &str, v: &str| unsafe { std::env::set_var(k, v) };
+        let prev: Vec<(&str, Option<String>)> =
+            ["DARKMUX_PROFILES", "DARKMUX_LMS_BIN", "DARKMUX_LMSTUDIO_URL"].into_iter().map(|k| (k, std::env::var(k).ok())).collect();
+        set("DARKMUX_PROFILES", profiles.to_str().unwrap());
+        set("DARKMUX_LMS_BIN", fake_lms.to_str().unwrap());
+        set("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9");
+        let reply = dispatch_router_call("review this when you get a sec");
+        for (k, v) in prev {
+            match v {
+                Some(v) => set(k, &v),
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        assert_eq!(reply.expect("the routing call reaches the endpoint"), "routed");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions"), "{request}");
+        assert!(request.contains(r#""model":"mlx-util""#), "the bare id: {request}");
+        assert!(request.contains(r#""max_tokens":1024"#), "the endpoint's dialect: {request}");
+        assert!(!lms_log.exists(), "`lms` ran: {:?}", std::fs::read_to_string(&lms_log));
+    }
 }

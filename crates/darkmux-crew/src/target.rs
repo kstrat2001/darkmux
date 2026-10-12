@@ -73,6 +73,66 @@ pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
     darkmux_flow::unmanaged_route_label(ep.host().as_deref().unwrap_or("remote"), model_id)
 }
 
+/// (#3207) The machine's utility binding (`internal.utility`) resolved to
+/// where its jobs go: the [`Target`] rules applied to the binding instead of
+/// a selected profile model. The binding's endpoint is
+/// `ProfileRegistry::utility_endpoint`, else the managed LM Studio default.
+#[derive(Debug, Clone)]
+pub struct UtilityTarget {
+    /// The binding's model id, as written (trimmed).
+    pub id: String,
+    /// The binding's declared window (`internal.utility.n_ctx`).
+    pub n_ctx: Option<u32>,
+    pub endpoint: ModelEndpoint,
+    pub kind: EndpointKind,
+    pub dialect: Dialect,
+    /// The chat-completions URL (`ModelEndpoint::chat_url`), resolved once.
+    pub chat_url: String,
+}
+
+impl UtilityTarget {
+    /// Whether darkmux manages the utility model's residency (it loads it).
+    pub fn is_managed(&self) -> bool {
+        self.kind.is_managed()
+    }
+
+    /// The model id on the wire: darkmux's own namespaced instance on a
+    /// managed endpoint (`darkmux:<key>`, #2240), the bare id on an
+    /// unmanaged one (contract 4: darkmux owns nothing there).
+    pub fn wire_model(&self) -> String {
+        match self.kind {
+            EndpointKind::Managed(_) => crate::dispatch_internal::compactor_wire_model_id(&self.id),
+            EndpointKind::Unmanaged => self.id.clone(),
+        }
+    }
+
+    /// The route label for records on an unmanaged endpoint
+    /// (`<protocol>:<host>/<model>`); `None` on a managed one, whose records
+    /// carry the LM Studio base (`usage::lmstudio_endpoint`).
+    pub fn route_label(&self) -> Option<String> {
+        (!self.is_managed()).then(|| endpoint_route_label(&self.endpoint, &self.id))
+    }
+}
+
+/// (#3207) THE utility-binding resolver: `Ok(None)` when no utility model is
+/// registered; an error when the binding names an endpoint that does not
+/// resolve or cannot be used as written (never a guess at LM Studio).
+pub fn utility_target_in(registry: &ProfileRegistry) -> Result<Option<UtilityTarget>> {
+    let Some(id) = registry.utility_model_id() else { return Ok(None) };
+    let endpoint = registry.utility_endpoint().unwrap_or_else(ModelEndpoint::managed_lmstudio);
+    let kind = endpoint.kind()?;
+    let dialect = endpoint.resolved_dialect()?;
+    let chat_url = endpoint.chat_url()?;
+    Ok(Some(UtilityTarget {
+        id: id.to_string(),
+        n_ctx: registry.utility_model_n_ctx(),
+        endpoint,
+        kind,
+        dialect,
+        chat_url,
+    }))
+}
+
 /// What [`resolve_in`] found.
 #[derive(Debug, Clone)]
 pub enum Resolution {

@@ -1931,6 +1931,29 @@ fn ensure_runtime_binary_cached_at(
     Ok(dest)
 }
 
+/// (#3207) The compactor on an unmanaged utility endpoint: its URL, its
+/// dialect, and (`needs_auth`) the flag that tells the runtime its header
+/// rides stdin. All absent for every LM Studio compactor, so that argv is
+/// unchanged. Flag names match the runtime's parser
+/// (`CompactorEndpointArgs::parse` in `runtime/src/main.rs`) verbatim.
+fn apply_compactor_endpoint_flags(
+    args: &mut Vec<String>,
+    compaction: &crate::dispatch::CompactionDispatchArgs,
+    needs_auth: bool,
+) {
+    if let Some(url) = &compaction.compactor_chat_url {
+        args.push("--compactor-chat-url".to_string());
+        args.push(url.clone());
+    }
+    if let Some(dialect) = compaction.compactor_dialect {
+        args.push("--compactor-dialect".to_string());
+        args.push(dialect.as_str().to_string());
+    }
+    if needs_auth {
+        args.push("--compactor-auth-header-stdin".to_string());
+    }
+}
+
 /// (#368) Translate the host-side `CompactionDispatchArgs` into
 /// runtime CLI flags. Each `Some(v)` becomes a `--flag v` pair on
 /// the docker run command; `None` is omitted so the runtime falls
@@ -1949,6 +1972,7 @@ fn apply_compaction_flags(
         args.push("--compactor-model".to_string());
         args.push(model.clone());
     }
+
     if let Some(share) = compaction.threshold_ratio {
         args.push("--compact-threshold-ratio".to_string());
         args.push(share.to_string());
@@ -2386,6 +2410,11 @@ pub struct DockerRunConfig {
     /// `write_remote_auth_header_stdin`) — never via a file or env var. This
     /// flag carries no secret material itself.
     pub remote_needs_auth: bool,
+    /// (#3207) Whether the compactor's unmanaged endpoint declares auth: the
+    /// container is kept on stdin (`-i`) and gets `--compactor-auth-header-stdin`,
+    /// and the secret rides the same stdin blob as the brain's, under
+    /// `compactor` (`write_auth_headers_stdin`). Carries no secret itself.
+    pub compactor_needs_auth: bool,
     /// (#2902) The endpoint's declared request dialect, passed as
     /// `--dialect` ONLY when it differs from what the runtime assumes for the
     /// kind (`chat-completions` for a `--chat-url` brain, the LM Studio shape
@@ -2426,6 +2455,14 @@ pub struct DockerRunConfig {
     /// exists before setting this — the runtime fails loudly (exit 2)
     /// rather than silently starting fresh on a missing/corrupt one.
     pub resume_checkpoint: bool,
+}
+
+impl DockerRunConfig {
+    /// (#1187, #3207) Whether the container reads an auth header from stdin:
+    /// the hosted brain's, the unmanaged compactor's, or both.
+    pub fn needs_stdin(&self) -> bool {
+        self.remote_needs_auth || self.compactor_needs_auth
+    }
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -2485,7 +2522,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // (#1187) Keep stdin open ONLY when the container needs its remote auth
     // secret piped in — every other dispatch (local, or a remote endpoint
     // with no auth) has no stdin use and omits this flag.
-    if config.remote_needs_auth {
+    if config.needs_stdin() {
         args.push("-i".to_string());
     }
 
@@ -2659,6 +2696,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // runtime's accepted flag names (runtime/src/main.rs rejects an unknown
     // flag with exit 2); None ⇒ flag omitted ⇒ runtime default.
     apply_compaction_flags(&mut args, &config.compaction);
+    apply_compactor_endpoint_flags(&mut args, &config.compaction, config.compactor_needs_auth);
 
     // Feedback templates (if a non-empty object). Guarded so a non-object
     // Value can't panic this pure function.
@@ -2951,16 +2989,51 @@ impl Drop for AutoWorkspaceCleanup {
 /// note in `runtime/src/main.rs` on `auth_header_stdin`). Call this
 /// immediately after spawning a container built with `-i` (stdin piped);
 /// the container blocks reading stdin until this returns or the pipe closes.
-fn write_remote_auth_header_stdin(
-    stdin: &mut std::process::ChildStdin,
-    header_name: &str,
-    header_value: &str,
+///
+/// (#3207) The compactor's header, when its unmanaged endpoint declares
+/// auth, rides the same blob under `"compactor": {"header", "value"}`; the
+/// brain's stays at the top level, so a dispatch with no compactor auth
+/// writes exactly the pre-#3207 bytes.
+fn write_auth_headers_stdin(
+    stdin: &mut impl std::io::Write,
+    brain: Option<&(String, String)>,
+    compactor: Option<&(String, String)>,
 ) -> Result<()> {
-    use std::io::Write;
-    let body = serde_json::json!({ "header": header_name, "value": header_value }).to_string();
     stdin
-        .write_all(body.as_bytes())
+        .write_all(auth_headers_stdin_body(brain, compactor).as_bytes())
         .context("writing remote auth header to container stdin")
+}
+
+/// Pipe the auth headers to a container spawned with `-i`, then close the
+/// pipe (EOF, unblocking the container's read). Nothing to do, and nothing
+/// touched, when neither the brain nor the compactor has a header.
+fn pipe_auth_headers(
+    child: &mut std::process::Child,
+    brain: Option<(String, String)>,
+    compactor: Option<(String, String)>,
+) -> Result<()> {
+    if brain.is_none() && compactor.is_none() {
+        return Ok(());
+    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("container spawned with -i but stdin handle is missing"))?;
+    write_auth_headers_stdin(&mut stdin, brain.as_ref(), compactor.as_ref())
+    // `stdin` drops here: the pipe closes and the container's read returns.
+}
+
+/// The stdin blob [`write_auth_headers_stdin`] writes. Pure.
+fn auth_headers_stdin_body(brain: Option<&(String, String)>, compactor: Option<&(String, String)>) -> String {
+    let mut body = serde_json::Map::new();
+    if let Some((header, value)) = brain {
+        body.insert("header".into(), header.as_str().into());
+        body.insert("value".into(), value.as_str().into());
+    }
+    if let Some((header, value)) = compactor {
+        body.insert("compactor".into(), serde_json::json!({ "header": header, "value": value }));
+    }
+    serde_json::Value::Object(body).to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3275,9 +3348,15 @@ pub fn dispatch_local_target(
 /// `crate::utility::run_utility_single_shot` addresses it
 /// ([`compactor_wire_model_id`] over the `internal.utility` binding). `None`
 /// when no binding is registered — the utility job itself then fails with
-/// the fix named, and there is nothing to check.
+/// the fix named, and there is nothing to check. (#3207) `None` too when the
+/// binding is on an endpoint darkmux does not manage (there is no local
+/// instance), or names one that does not resolve (the job refuses it).
 pub fn utility_local_target(config_path: Option<&str>) -> Option<LocalTarget> {
-    let (binding_id, _declared_n_ctx) = resolve_utility_model_internal(config_path)?;
+    let target = resolve_utility_target_internal(config_path).ok()??;
+    if !target.is_managed() {
+        return None;
+    }
+    let binding_id = target.id;
     Some(LocalTarget {
         identifier: compactor_wire_model_id(&binding_id),
         model_key: bare_model_key(&binding_id).to_string(),
@@ -6646,8 +6725,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // Resolve compaction (role override + utility model + context window).
     // (#2905) One call over the dispatch's own inputs, so the role-aware
     // window resolution is exercised by tests exactly as it runs here.
-    let DispatchCompaction { mut compaction, compactor_n_ctx, utility_model } =
+    let DispatchCompaction { mut compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
         resolve_dispatch_compaction(role, &opts)?;
+    // (#3207) The compactor's credential when the binding's endpoint declares
+    // one, piped over stdin beside the brain's (never argv, env or a file).
+    let mut compactor_auth: Option<(String, String)> = None;
 
     // (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
     // CONTEXT — namespaced — before the container starts, exactly as the
@@ -6668,7 +6750,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
     // compactor silently loaded at the primary's 262144-token window instead
     // of its own declared 120000. (#2914) The compactor's own window is
-    // `internal.utility.n_ctx` (`resolve_utility_model_internal`), declared
+    // `internal.utility.n_ctx` (`resolve_utility_target_internal`), declared
     // once for the machine; the primary's window is used ONLY when the
     // binding declares none, and that fallback is named in the load message
     // (operator sovereignty, #44) — never silently substituted.
@@ -6682,7 +6764,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // namespaced identifier, and there is no instance behind it. See
     // `ensure_utility_resident`'s doc.
     if opts.model_base_url_override.is_none() {
-        if let Some(compactor_id) = compaction.compactor_model.clone() {
+        if let Some(utility) = unmanaged_compactor.as_ref().filter(|_| compaction.compactor_model.is_some()) {
+            // (#3207) An unmanaged utility endpoint: nothing is loaded, the
+            // bare id goes on the wire, and the runtime's compactor client
+            // dials that endpoint (as the container sees it).
+            compactor_auth = prepare_unmanaged_compactor(&mut compaction, utility)?;
+        } else if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
             // (#2536) Still NOT covered, stated plainly: deleting this whole
@@ -6850,6 +6937,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // config's argv is byte-identical.
         dialect: agentic_brain.1,
         remote_needs_auth,
+        compactor_needs_auth: compactor_auth.is_some(),
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
     };
@@ -6881,7 +6969,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     apply_runtime_limit_flags(&mut cmd, opts.max_turns_override);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if remote_needs_auth {
+    if argv_config.needs_stdin() {
         cmd.stdin(Stdio::piped());
     }
 
@@ -6930,14 +7018,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // every exposure vector: the secret still lives in the runtime
     // process's memory for the dispatch's duration (see the residual-risk
     // note on `auth_header_stdin` in `runtime/src/main.rs`).
-    if let Some((header_name, header_value)) = remote_auth.take() {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("container spawned with -i but stdin handle is missing"))?;
-        write_remote_auth_header_stdin(&mut stdin, &header_name, &header_value)?;
-        drop(stdin); // close the pipe — sends EOF, unblocking the container's read
-    }
+    pipe_auth_headers(&mut child, remote_auth.take(), compactor_auth.take())?;
 
     // 7. Live trajectory tailer (#231). Background thread polls
     //    `<host_out>/.darkmux-runtime/trajectory.jsonl` every 250ms while
@@ -7041,10 +7122,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // window budget sums them.
         tailer_endpoint_id(limits_pm),
         dispatch_cap_for(limits_pm)?,
-        // (#2902 step 1b) The compactor's endpoint: always the LMStudio base,
-        // hosted brain or not (the runtime never routes the compactor through
-        // the hosted URL; `runtime/src/main.rs`, #1187).
-        Some(crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())),
+        // (#2902 step 1b) The compactor's endpoint: the LMStudio base, hosted
+        // brain or not (the runtime never routes the compactor through the
+        // hosted BRAIN's URL; `runtime/src/main.rs`, #1187), or (#3207) the
+        // utility binding's own unmanaged endpoint.
+        Some(compactor_endpoint_for(&compaction, unmanaged_compactor.as_ref(), opts.model_base_url_override.as_deref())),
         // (#2928) The live channel, unless this dispatch opted out (the lab).
         live_sender_for(opts.live_channel),
         local_stop.clone(),
@@ -8289,7 +8371,7 @@ fn spawn_guarded_tailer(
     endpoint: Option<String>,
     endpoint_id: Option<String>,
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
-    compactor_endpoint: Option<String>,
+    compactor_endpoint: Option<CompactorEndpoint>,
     live: Option<darkmux_flow::live::LiveSender>,
     local_stop: DispatchStop,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
@@ -8339,6 +8421,33 @@ fn live_sender_for(live_channel: bool) -> Option<darkmux_flow::live::LiveSender>
     darkmux_flow::live::LiveSender::for_local_daemon()
 }
 
+/// (#3207) Where a dispatch's compactor calls go, for their usage records:
+/// the endpoint label and, on an unmanaged utility endpoint, its
+/// `endpoints` id.
+#[derive(Debug, Clone, PartialEq)]
+struct CompactorEndpoint {
+    label: String,
+    id: Option<String>,
+}
+
+/// (#3207) The compactor endpoint a dispatch's tailer records: the
+/// unmanaged utility endpoint when the compactor was pointed at one
+/// (`apply_unmanaged_compactor` set its chat URL), else the LM Studio base,
+/// as before.
+fn compactor_endpoint_for(
+    compaction: &crate::dispatch::CompactionDispatchArgs,
+    unmanaged: Option<&crate::target::UtilityTarget>,
+    base_url_override: Option<&str>,
+) -> CompactorEndpoint {
+    match unmanaged.filter(|_| compaction.compactor_chat_url.is_some()) {
+        Some(u) => CompactorEndpoint {
+            label: crate::target::endpoint_route_label(&u.endpoint, &u.id),
+            id: u.endpoint.named_id().map(str::to_string),
+        },
+        None => CompactorEndpoint { label: crate::usage::lmstudio_endpoint(base_url_override), id: None },
+    }
+}
+
 /// Run the live trajectory tailer to completion. Polls until `stop_flag`
 /// is set, then does one final flush pass to drain any straggler lines
 /// the container wrote between the last poll tick and exit. Returns the
@@ -8372,7 +8481,7 @@ fn run_tailer(
     endpoint: Option<String>,
     endpoint_id: Option<String>,
     dispatch_cap: Option<Mutex<crate::dispatch_budget::DispatchBudget>>,
-    compactor_endpoint: Option<String>,
+    compactor_endpoint: Option<CompactorEndpoint>,
     live: Option<darkmux_flow::live::LiveSender>,
     local_stop: DispatchStop,
 ) -> TrajectorySummary {
@@ -8397,7 +8506,8 @@ fn run_tailer(
     .with_endpoint(endpoint)
     .with_endpoint_id(endpoint_id)
     .with_dispatch_cap(dispatch_cap)
-    .with_compactor_endpoint(compactor_endpoint)
+    .with_compactor_endpoint(compactor_endpoint.as_ref().map(|c| c.label.clone()))
+    .with_compactor_endpoint_id(compactor_endpoint.and_then(|c| c.id))
     .with_record_context(record_context)
     // (#2928) The live channel, off when `runtime.live_sample_ms` is 0.
     .with_live(live, darkmux_types::config_access::live_sample_ms());
@@ -10011,7 +10121,13 @@ struct TailerState {
     /// runtime never routes the compactor through a hosted brain's URL or
     /// auth (`runtime/src/main.rs`, #1187). Stamped on every
     /// `call_kind: "compaction"` usage record. `None` only in test fixtures.
+    /// (#3207) The utility endpoint's route label instead, when the binding
+    /// is on an unmanaged endpoint the runtime's compactor client dials.
     compactor_endpoint: Option<String>,
+    /// (#3207) That unmanaged endpoint's `endpoints` id, stamped on each
+    /// compaction usage record so the endpoint's window counts it. `None`
+    /// for an LM Studio compactor (as before) and an inline endpoint.
+    compactor_endpoint_id: Option<String>,
     /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
     /// forwarded from the call site — provenance the runtime cannot know
     /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
@@ -10159,6 +10275,7 @@ impl TailerState {
             endpoint_id: None,
             dispatch_cap: None,
             compactor_endpoint: None,
+            compactor_endpoint_id: None,
             record_context: None,
             live: None,
         }
@@ -10203,6 +10320,12 @@ impl TailerState {
     /// (#2902 step 1b) The compactor's endpoint fact; see the field.
     fn with_compactor_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.compactor_endpoint = endpoint;
+        self
+    }
+
+    /// (#3207) The compactor's unmanaged `endpoints` id; see the field.
+    fn with_compactor_endpoint_id(mut self, endpoint_id: Option<String>) -> Self {
+        self.compactor_endpoint_id = endpoint_id;
         self
     }
 
@@ -10414,6 +10537,7 @@ impl TailerState {
             endpoint_id: None,
             dispatch_cap: None,
             compactor_endpoint: None,
+            compactor_endpoint_id: None,
             record_context: None,
             live: None,
         }
@@ -10781,6 +10905,7 @@ impl TailerState {
             c,
             self.compactor_model.as_deref(),
             self.compactor_endpoint.as_deref().unwrap_or_default(),
+            self.compactor_endpoint_id.as_deref(),
             &self.role_id,
             &self.model,
         );
@@ -11418,6 +11543,7 @@ fn compaction_call_tokens_payload(
     c: &darkmux_trajectory::CompactionCall,
     compactor_model: Option<&str>,
     endpoint: &str,
+    endpoint_id: Option<&str>,
     parent_role_id: &str,
     parent_model: &str,
 ) -> UsagePayload {
@@ -11431,9 +11557,10 @@ fn compaction_call_tokens_payload(
             requested_model: &requested_model,
             reported_model: model_id(c.reported_model.as_deref()).as_deref(),
             endpoint,
-            // A compactor call goes to the machine's LMStudio, never through
-            // a hosted brain's endpoint.
-            endpoint_id: None,
+            // A compactor call never goes through a hosted BRAIN's endpoint:
+            // it goes to the machine's LM Studio (no id), or (#3207) to the
+            // utility binding's own unmanaged endpoint (its id).
+            endpoint_id,
         },
         &darkmux_trajectory::UsageCounts::of(c.usage.as_ref()),
     );
@@ -12418,14 +12545,17 @@ fn resolve_dispatch_model_with_hosts(
 /// is a genuinely different, disclosed degraded mode now, not a silent
 /// substitution.
 ///
-/// The window is the SECOND element: `internal.utility.n_ctx`, `None` when
-/// none is declared. Since #2914 this is the only source of the
-/// compactor's own window — never a profile's `models[]` entry, which
-/// would make the utility model a work model.
-pub(crate) fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {
-    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
-    let id = loaded.registry.utility_model_id()?.to_string();
-    Some((id, loaded.registry.utility_model_n_ctx()))
+/// The window is `n_ctx`: `internal.utility.n_ctx`, `None` when none is
+/// declared. Since #2914 this is the only source of the compactor's own
+/// window — never a profile's `models[]` entry, which would make the
+/// utility model a work model.
+///
+/// (#3207) With its endpoint ([`crate::target::utility_target_in`]): `Err`
+/// when the binding names an endpoint that does not resolve or cannot be
+/// used as written, never a fall to LM Studio.
+pub(crate) fn resolve_utility_target_internal(config_path: Option<&str>) -> Result<Option<crate::target::UtilityTarget>> {
+    let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else { return Ok(None) };
+    crate::target::utility_target_in(&loaded.registry)
 }
 
 /// (#2905) What `dispatch()` resolves about compaction before the container
@@ -12437,6 +12567,11 @@ struct DispatchCompaction {
     compaction: crate::dispatch::CompactionDispatchArgs,
     compactor_n_ctx: Option<u32>,
     utility_model: Option<String>,
+    /// (#3207) The binding on an UNMANAGED endpoint, when it is this
+    /// dispatch's compactor: no residency, the bare id, and the runtime's
+    /// compactor client pointed at that endpoint. `None` otherwise (no
+    /// binding, a managed one, or a caller-pinned compactor).
+    unmanaged_compactor: Option<crate::target::UtilityTarget>,
 }
 
 /// (#2905) `dispatch()`'s compaction resolution, extracted so a test drives
@@ -12453,17 +12588,22 @@ fn resolve_dispatch_compaction(
 ) -> Result<DispatchCompaction> {
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
-    let utility = resolve_utility_model_internal(opts.config_path.as_deref());
-    let utility_model = utility.as_ref().map(|(id, _)| id.clone());
+    // (#3207) The binding with its endpoint: one naming an endpoint that does
+    // not resolve fails the dispatch here, naming the id, rather than
+    // compacting on LM Studio by a guess.
+    let utility = resolve_utility_target_internal(opts.config_path.as_deref())?;
+    let utility_model = utility.as_ref().map(|u| u.id.clone());
     compaction.apply_utility_model(utility_model.as_deref());
     // The binding's window applies only when the binding IS the compactor
     // (the common case). A caller that pinned a different compactor on
     // `opts.compaction` gets no window from the binding; the primary's
     // window is then the named fallback, as before.
-    let compactor_n_ctx = match (&compaction.compactor_model, &utility) {
-        (Some(compactor), Some((id, n_ctx))) if bare_model_key(compactor) == bare_model_key(id) => *n_ctx,
-        _ => None,
+    let binding_compacts = match (&compaction.compactor_model, &utility) {
+        (Some(compactor), Some(u)) => bare_model_key(compactor) == bare_model_key(&u.id),
+        _ => false,
     };
+    let compactor_n_ctx = utility.as_ref().filter(|_| binding_compacts).and_then(|u| u.n_ctx);
+    let unmanaged_compactor = utility.filter(|u| binding_compacts && !u.is_managed());
     let primary_window = resolve_dispatch_windows_with(
         role,
         opts.profile_name.as_deref(),
@@ -12472,7 +12612,7 @@ fn resolve_dispatch_compaction(
         opts.allow_utility_model,
     )?;
     ensure_context_window(&mut compaction, primary_window);
-    Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
+    Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model, unmanaged_compactor })
 }
 
 /// (#632) Resolve the context window the runtime needs to compute its
@@ -12606,7 +12746,7 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
 
 // (#2914) `profile_model_n_ctx` — the #1616 lookup of the compactor's `n_ctx`
 // by id in the resolved profile's `models[]` — is gone. The compactor's own
-// window is `internal.utility.n_ctx` (`resolve_utility_model_internal`); a
+// window is `internal.utility.n_ctx` (`resolve_utility_target_internal`); a
 // profile entry for the utility model is a leftover `darkmux doctor` flags,
 // never a source.
 
@@ -12886,6 +13026,61 @@ fn apply_compactor_residency(
         ensure_utility_resident(Some(compactor_id), Some(context_window), ensure_resident);
     compaction.compactor_model = Some(compactor_wire_model_id(compactor_id));
     warning
+}
+
+/// (#3207) `dispatch()`'s setup of a compactor on an UNMANAGED utility
+/// endpoint: [`apply_unmanaged_compactor`] with the endpoint's chat URL as
+/// the container reaches it, then the endpoint's auth header when compaction
+/// is on (`None` when it was refused, or the endpoint declares no auth).
+fn prepare_unmanaged_compactor(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    utility: &crate::target::UtilityTarget,
+) -> Result<Option<(String, String)>> {
+    let compactor_id = compaction.compactor_model.clone().unwrap_or_default();
+    let chat_url = loopback_to_docker_host(&utility.chat_url);
+    match apply_unmanaged_compactor(compaction, &compactor_id, utility, chat_url) {
+        Some(_refused) => Ok(None),
+        None => remote_auth_header(&utility.endpoint),
+    }
+}
+
+/// (#3207) The compactor on an UNMANAGED utility endpoint: the window the
+/// runtime bounds a compaction payload by (the binding's declared `n_ctx`,
+/// else the primary's, disclosed), the BARE id on the wire (contract 4:
+/// darkmux owns no instance there), and the runtime's compactor client
+/// pointed at the endpoint (`chat_url`, as the container reaches it) in the
+/// endpoint's dialect. Nothing is loaded, so nothing can fail to load. With
+/// no window at all, compaction is refused for the dispatch exactly as on
+/// the managed arm (#3074), and the refusal is returned.
+fn apply_unmanaged_compactor(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    compactor_id: &str,
+    utility: &crate::target::UtilityTarget,
+    chat_url: String,
+) -> Option<String> {
+    let (window, used_fallback) = apply_compactor_window(compaction, utility.n_ctx);
+    let Some(window) = window else {
+        compaction.compactor_model = None;
+        let warning = format!(
+            "darkmux dispatch: compactor `{compactor_id}` has no resolved context window \
+             (neither `internal.utility.n_ctx` nor primary model context window is set); \
+             refusing compaction for this dispatch. Declare `n_ctx` in ~/.darkmux/profiles.json. (#3074, #3207)"
+        );
+        eprintln!("{warning}");
+        return Some(warning);
+    };
+    if used_fallback {
+        eprintln!(
+            "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in `internal.utility`; \
+             bounding its compaction payload by the primary model's context window ({window}) as a \
+             fallback. Declare the window its endpoint serves: \
+             `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N, ... }} }}`. (#3207)"
+        );
+    }
+    compaction.compactor_model = Some(utility.wire_model());
+    compaction.compactor_chat_url = Some(chat_url);
+    compaction.compactor_dialect = Some(utility.dialect);
+    None
 }
 
 /// (#408) Whether a selected-vs-loaded model mismatch should be fatal.

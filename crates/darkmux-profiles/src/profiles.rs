@@ -163,7 +163,7 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
 /// (#1426 ship-2) The `crews` map retired from the schema, so it is no longer
 /// quarantined per-entry — a `crews` key overflows into `ProfileRegistry.extras`
 /// and the load survives it; the unknown-key gate refuses it.
-fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
+pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     let mut root: serde_json::Value = serde_json::from_str(raw)?;
 
     let mut quarantined: Vec<QuarantinedEntry> = Vec::new();

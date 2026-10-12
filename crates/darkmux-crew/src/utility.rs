@@ -109,8 +109,8 @@ pub(crate) fn utility_load_window(binding_id: &str, declared_n_ctx: Option<u32>,
 /// countable tokens. The caller (radio's router) turns any error into a
 /// refusal.
 pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
-    let Some((binding_id, declared_n_ctx)) =
-        crate::dispatch_internal::resolve_utility_model_internal(job.config_path)
+    let Some(target) = crate::dispatch_internal::resolve_utility_target_internal(job.config_path)
+        .with_context(|| format!("resolving the utility model's endpoint for `{}`", job.role_id))?
     else {
         bail!(
             "darkmux: no machine utility model is registered, and `{}` is a utility job that runs \
@@ -145,42 +145,11 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     };
     let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
 
-    // Residency + the wire id, mirroring the compactor's own treatment
-    // (`apply_compactor_residency`): the binding is loaded at ITS declared
-    // window under the `darkmux:` namespace, and the SAME namespaced
-    // identifier goes on the wire (#2240). A non-LMStudio base skips both.
-    let wire_model = match job.base_url_override {
-        Some(_) => binding_id.clone(),
-        None => {
-            let (window, disclosure) = utility_load_window(&binding_id, declared_n_ctx, job.role_id);
-            if let Some(line) = disclosure {
-                eprintln!("{line}");
-            }
-            let source = if declared_n_ctx.is_some() {
-                crate::dispatch_internal::WindowSource::UtilityBinding
-            } else {
-                crate::dispatch_internal::WindowSource::UtilityFallback
-            };
-            crate::dispatch_internal::ensure_model_loaded_at_ctx_from(
-                &crate::dispatch_internal::utility_residency_pm(&binding_id, window),
-                source,
-            )
-            .with_context(|| format!("loading the utility model `{binding_id}` for `{}`", job.role_id))?;
-            crate::dispatch_internal::compactor_wire_model_id(&binding_id)
-        }
-    };
-
-    let req = crate::single_shot::SingleShotRequest {
-        base_url: job.base_url_override,
-        model: &wire_model,
-        system: &system_prompt,
-        user: job.message,
-        // A bounded classification wants a low-variance decision, the same
-        // setting the work single-shot primitive uses.
-        temperature: 0.2,
-        max_tokens: job.max_tokens,
-        timeout_seconds: job.timeout_seconds,
-    };
+    // Where the job goes, decided once (#3207): the mock harness's base, an
+    // unmanaged endpoint the binding names, or the managed LM Studio.
+    let route = utility_route(&target, job.base_url_override);
+    let wire_model = utility_wire_model(route, &target, job.role_id)?;
+    let call = || utility_call(route, job, &wire_model, &system_prompt);
     // (#2915) The job is VISIBLE while it runs: one lean `utility.start`
     // (no session) right before the call, so the viewer's fleet card shows
     // the job from here until its usage record (or `utility.error`) lands.
@@ -217,7 +186,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
             tx.send(&live_utility_edge(&fields, "end", job.role_id, &wire_model, ended_at_ms));
         }
     };
-    let reply = match crate::single_shot::single_shot_chat(&req) {
+    let reply = match call() {
         Ok(r) => r,
         Err(e) => {
             send_live_end(&mut live, crate::usage::unix_ms_now());
@@ -245,12 +214,16 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
 
     // The one record: the job's usage, attributed to the job's role, on the
     // utility model, with no session.
+    // (#3207) The endpoint the call really went to: an unmanaged endpoint's
+    // route label and `endpoints` id (so its window budget counts the job),
+    // else the LM Studio base, as before.
+    let (endpoint_label, endpoint_id) = route.endpoint_facts(&wire_model);
     let mut payload = reply.usage_payload(
         crate::usage::CallKind::SingleShot,
         Some(job.role_id),
         &wire_model,
-        &crate::usage::lmstudio_endpoint(job.base_url_override),
-        None,
+        &endpoint_label,
+        endpoint_id,
     );
     if job_kind.is_some() {
         let ended_at_ms = crate::usage::unix_ms_now();
@@ -260,6 +233,111 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, &ExecutionId::mint(), payload));
 
     Ok(UtilityReply { content: reply.content })
+}
+
+/// (#3207) Where one utility job's call goes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UtilityRoute<'a> {
+    /// The mock harness's non-LMStudio base URL (`UtilityJob::base_url_override`).
+    Base(&'a str),
+    /// The machine's LM Studio: residency, then the namespaced id.
+    Managed,
+    /// An endpoint darkmux does not manage: the bare id, its dialect and auth.
+    Unmanaged(&'a darkmux_types::ModelEndpoint),
+}
+
+impl UtilityRoute<'_> {
+    /// The endpoint a call on this route reaches, for its usage record: an
+    /// unmanaged endpoint's route label and `endpoints` id, else the LM
+    /// Studio base (the harness's, or the configured one) and no id.
+    fn endpoint_facts(&self, wire_model: &str) -> (String, Option<&str>) {
+        match *self {
+            UtilityRoute::Unmanaged(endpoint) => {
+                (crate::target::endpoint_route_label(endpoint, wire_model), endpoint.named_id())
+            }
+            UtilityRoute::Base(base) => (crate::usage::lmstudio_endpoint(Some(base)), None),
+            UtilityRoute::Managed => (crate::usage::lmstudio_endpoint(None), None),
+        }
+    }
+}
+
+/// The id a utility job puts on the wire, after any residency it needs.
+/// Managed: the binding is loaded at ITS declared window under the
+/// `darkmux:` namespace, and the SAME namespaced identifier goes on the wire
+/// (#2240), mirroring the compactor's own treatment
+/// (`apply_compactor_residency`). A non-LMStudio base, and (#3207) an
+/// unmanaged endpoint, where darkmux owns no instance, skip both and put the
+/// bare id on the wire.
+fn utility_wire_model(route: UtilityRoute<'_>, target: &crate::target::UtilityTarget, role_id: &str) -> Result<String> {
+    let binding_id = &target.id;
+    if route != UtilityRoute::Managed {
+        return Ok(binding_id.clone());
+    }
+    let (window, disclosure) = utility_load_window(binding_id, target.n_ctx, role_id);
+    if let Some(line) = disclosure {
+        eprintln!("{line}");
+    }
+    let source = if target.n_ctx.is_some() {
+        crate::dispatch_internal::WindowSource::UtilityBinding
+    } else {
+        crate::dispatch_internal::WindowSource::UtilityFallback
+    };
+    crate::dispatch_internal::ensure_model_loaded_at_ctx_from(
+        &crate::dispatch_internal::utility_residency_pm(binding_id, window),
+        source,
+    )
+    .with_context(|| format!("loading the utility model `{binding_id}` for `{role_id}`"))?;
+    Ok(crate::dispatch_internal::compactor_wire_model_id(binding_id))
+}
+
+/// A bounded classification wants a low-variance decision, the same setting
+/// the work single-shot primitive uses.
+const UTILITY_TEMPERATURE: f32 = 0.2;
+
+/// The one model call of a utility job, on its route: the hosted transport
+/// (the endpoint's URL, dialect and auth, #3207) for an unmanaged endpoint,
+/// the LM Studio single-shot otherwise. Message assembly is the same on both
+/// (contract 6).
+fn utility_call(
+    route: UtilityRoute<'_>,
+    job: &UtilityJob<'_>,
+    wire_model: &str,
+    system_prompt: &str,
+) -> Result<crate::single_shot::SingleShotReply> {
+    match route {
+        UtilityRoute::Unmanaged(endpoint) => {
+            crate::single_shot::single_shot_chat_hosted(&crate::single_shot::HostedSingleShotRequest {
+                endpoint,
+                model: wire_model,
+                system: system_prompt,
+                user: job.message,
+                max_tokens: job.max_tokens,
+                timeout_seconds: job.timeout_seconds,
+                temperature: Some(UTILITY_TEMPERATURE),
+            })
+        }
+        UtilityRoute::Base(_) | UtilityRoute::Managed => {
+            crate::single_shot::single_shot_chat(&crate::single_shot::SingleShotRequest {
+                base_url: job.base_url_override,
+                model: wire_model,
+                system: system_prompt,
+                user: job.message,
+                temperature: UTILITY_TEMPERATURE,
+                max_tokens: job.max_tokens,
+                timeout_seconds: job.timeout_seconds,
+            })
+        }
+    }
+}
+
+/// The route for `target`: an explicit base URL (the mock harness) wins, as
+/// it always has; else the binding's endpoint decides.
+fn utility_route<'a>(target: &'a crate::target::UtilityTarget, base_url_override: Option<&'a str>) -> UtilityRoute<'a> {
+    match base_url_override {
+        Some(base) => UtilityRoute::Base(base),
+        None if target.is_managed() => UtilityRoute::Managed,
+        None => UtilityRoute::Unmanaged(&target.endpoint),
+    }
 }
 
 /// (#2928) One edge (`start` | `end`) of a host-side utility job as a live

@@ -2253,6 +2253,74 @@
         assert_eq!(resolve(Some("alt")), "alt");
     }
 
+    /// (#3207) `dispatch()`'s compaction resolution reads the utility
+    /// binding's endpoint: an unmanaged one is carried as the compactor's
+    /// (with the bare id and its declared window), a managed or absent one is
+    /// not, and one that does not resolve fails the dispatch naming the id
+    /// rather than compacting on LM Studio by a guess.
+    #[test]
+    #[serial]
+    fn dispatch_compaction_reads_the_utility_endpoint() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let role = windows_role(&["coding"]);
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        let resolve = |utility: &str, opts: &mut crate::dispatch::DispatchOpts| {
+            let pf = state.join("profiles-3207.json");
+            std::fs::write(
+                &pf,
+                format!(
+                    r#"{{"profiles":{{"p":{{"models":[{{"id":"w","n_ctx":32000}}]}}}},"default_profile":"p",
+                        "endpoints":{{"mlx":{{"url":"http://127.0.0.1:8080/v1"}},"lms":{{"managed":"lmstudio"}}}},
+                        "internal":{{"utility":{utility}}}}}"#
+                ),
+            )
+            .unwrap();
+            opts.config_path = Some(pf.to_str().unwrap().to_string());
+            resolve_dispatch_compaction(&role, opts)
+        };
+        let unmanaged = resolve(r#"{"id":"mlx-util","n_ctx":16384,"endpoint":"mlx"}"#, &mut opts).unwrap();
+        let u = unmanaged.unmanaged_compactor.expect("the unmanaged binding compacts");
+        assert_eq!((u.id.as_str(), u.n_ctx), ("mlx-util", Some(16_384)));
+        assert_eq!(unmanaged.compaction.compactor_model.as_deref(), Some("mlx-util"));
+        assert!(resolve(r#"{"id":"u","n_ctx":8,"endpoint":"lms"}"#, &mut opts).unwrap().unmanaged_compactor.is_none());
+        assert!(resolve(r#"{"id":"u","n_ctx":8}"#, &mut opts).unwrap().unmanaged_compactor.is_none());
+        let err = resolve(r#"{"id":"u","n_ctx":8,"endpoint":"nope"}"#, &mut opts).expect_err("a dangling endpoint fails the dispatch");
+        assert!(format!("{err:#}").contains("`nope`"), "{err:#}");
+    }
+
+    /// (#3207) The compactor's credential comes from the utility endpoint's
+    /// own auth, and only when compaction is on.
+    #[test]
+    #[serial]
+    fn prepare_unmanaged_compactor_reads_the_endpoints_auth() {
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1",
+                "auth":{"type":"bearer","key_env":"DARKMUX_TEST_3207_UTIL_KEY"}}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":16384,"endpoint":"mlx"}}}"#,
+        )
+        .unwrap();
+        reg.materialize_endpoints();
+        let utility = crate::target::utility_target_in(&reg).unwrap().unwrap();
+        let prev = std::env::var("DARKMUX_TEST_3207_UTIL_KEY").ok();
+        unsafe { std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", "util-secret") };
+        let mut on = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
+        let header = prepare_unmanaged_compactor(&mut on, &utility);
+        let mut no_window = utility.clone();
+        no_window.n_ctx = None;
+        let mut off = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
+        let refused = prepare_unmanaged_compactor(&mut off, &no_window);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", v),
+                None => std::env::remove_var("DARKMUX_TEST_3207_UTIL_KEY"),
+            }
+        }
+        assert_eq!(header.unwrap(), Some(("Authorization".to_string(), "Bearer util-secret".to_string())));
+        assert_eq!(on.compactor_chat_url.as_deref(), Some("http://host.docker.internal:8080/v1/chat/completions"));
+        assert_eq!(refused.unwrap(), None, "no compaction, no credential read");
+    }
+
     /// (#2902 step 3) The defect the one resolver closes: with several
     /// models in a profile, the compaction window came from the profile's
     /// DEFAULT model even when `select_model` picked another. Here the
@@ -5103,6 +5171,8 @@
                 strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
                 bail_after_compactions: Some(10u32),
                 custom_instructions: Some("Be terse.".to_string()),
+                compactor_chat_url: None,
+                compactor_dialect: None,
             },
             feedback_templates: serde_json::json!({
                 "error": "An error occurred."
@@ -5126,6 +5196,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -5364,6 +5435,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: base_url,
             workspace_read_only: false,
@@ -5595,6 +5667,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -5720,6 +5793,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -5779,6 +5853,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -7142,7 +7217,8 @@
             .spawn()
             .expect("spawning cat");
         let mut stdin = child.stdin.take().expect("stdin piped");
-        write_remote_auth_header_stdin(&mut stdin, "api-key", "super-secret-do-not-log").unwrap();
+        let brain = ("api-key".to_string(), "super-secret-do-not-log".to_string());
+        write_auth_headers_stdin(&mut stdin, Some(&brain), None).unwrap();
         drop(stdin); // EOF — cat exits once its input closes
 
         let mut out = String::new();
@@ -7152,6 +7228,89 @@
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["header"], "api-key");
         assert_eq!(v["value"], "super-secret-do-not-log");
+    }
+
+    /// (#3207) The brain-only blob is the pre-#3207 bytes exactly; the
+    /// compactor's header rides under `compactor`, with or without the
+    /// brain's.
+    #[test]
+    fn the_stdin_auth_blob_carries_the_compactor_header_beside_the_brains() {
+        let brain = ("api-key".to_string(), "b".to_string());
+        let compactor = ("Authorization".to_string(), "Bearer c".to_string());
+        assert_eq!(
+            auth_headers_stdin_body(Some(&brain), None),
+            serde_json::json!({ "header": "api-key", "value": "b" }).to_string(),
+            "a dispatch with no compactor auth writes exactly what it did before"
+        );
+        let both: serde_json::Value = serde_json::from_str(&auth_headers_stdin_body(Some(&brain), Some(&compactor))).unwrap();
+        assert_eq!((both["header"].as_str(), both["value"].as_str()), (Some("api-key"), Some("b")));
+        assert_eq!((both["compactor"]["header"].as_str(), both["compactor"]["value"].as_str()), (Some("Authorization"), Some("Bearer c")));
+        let only: serde_json::Value = serde_json::from_str(&auth_headers_stdin_body(None, Some(&compactor))).unwrap();
+        assert!(only.get("header").is_none(), "{only}");
+        assert_eq!(only["compactor"]["value"], "Bearer c");
+    }
+
+    /// (#3207) The compactor's unmanaged endpoint reaches the container as
+    /// its own flags, and its auth keeps stdin open with its own flag;
+    /// without them the argv carries none of it.
+    #[test]
+    fn build_docker_run_argv_carries_an_unmanaged_compactor_endpoint() {
+        let plain = build_docker_run_argv(&base_argv_config());
+        for flag in ["--compactor-chat-url", "--compactor-dialect", "--compactor-auth-header-stdin", "-i"] {
+            assert!(!plain.iter().any(|a| a == flag), "`{flag}` on a plain dispatch: {plain:?}");
+        }
+        let mut config = base_argv_config();
+        config.compaction.compactor_chat_url = Some("http://host.docker.internal:8080/v1/chat/completions".into());
+        config.compaction.compactor_dialect = Some(darkmux_types::Dialect::ChatCompletionsMaxTokens);
+        config.compactor_needs_auth = true;
+        let argv = build_docker_run_argv(&config);
+        assert!(argv.windows(2).any(|w| w[0] == "--compactor-chat-url" && w[1] == "http://host.docker.internal:8080/v1/chat/completions"), "{argv:?}");
+        assert!(argv.windows(2).any(|w| w[0] == "--compactor-dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "--compactor-auth-header-stdin"), "{argv:?}");
+        let fence = argv.iter().position(|a| a == "--").unwrap();
+        assert!(argv[..fence].iter().any(|a| a == "-i"), "stdin is kept open for the compactor's header: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--auth-header-stdin"), "the brain has no header here: {argv:?}");
+    }
+
+    /// (#3207) An unmanaged compactor: the bare id, the endpoint's URL and
+    /// dialect, and the binding's window; the primary's window as a named
+    /// fallback; and no window at all refuses compaction, as on LM Studio.
+    #[test]
+    fn apply_unmanaged_compactor_points_the_compactor_at_its_endpoint() {
+        let reg = {
+            let mut r: darkmux_types::ProfileRegistry = serde_json::from_str(
+                r#"{"profiles":{},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1","dialect":"chat-completions-max-tokens"}},
+                    "internal":{"utility":{"id":"mlx-util","n_ctx":16384,"endpoint":"mlx"}}}"#,
+            )
+            .unwrap();
+            r.materialize_endpoints();
+            r
+        };
+        let utility = crate::target::utility_target_in(&reg).unwrap().unwrap();
+        let mut c = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), context_window: Some(32_000), ..Default::default() };
+        assert_eq!(apply_unmanaged_compactor(&mut c, "mlx-util", &utility, "http://x/v1/chat/completions".into()), None);
+        assert_eq!(c.compactor_model.as_deref(), Some("mlx-util"), "the bare id, never `darkmux:`");
+        assert_eq!(c.compactor_chat_url.as_deref(), Some("http://x/v1/chat/completions"));
+        assert_eq!(c.compactor_dialect, Some(darkmux_types::Dialect::ChatCompletionsMaxTokens));
+        assert_eq!(c.compactor_context_window, Some(16_384), "the binding's own window");
+
+        let mut undeclared = utility.clone();
+        undeclared.n_ctx = None;
+        let mut c = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), context_window: Some(32_000), ..Default::default() };
+        assert_eq!(apply_unmanaged_compactor(&mut c, "mlx-util", &undeclared, "u".into()), None);
+        assert_eq!(c.compactor_context_window, Some(32_000), "the primary's, as the named fallback");
+        let mut c = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
+        let refusal = apply_unmanaged_compactor(&mut c, "mlx-util", &undeclared, "u".into()).expect("no window, no compaction");
+        assert!(refusal.contains("refusing compaction"), "{refusal}");
+        assert_eq!((c.compactor_model, c.compactor_chat_url), (None, None));
+
+        // The tailer's label and id follow the compactor that was set up.
+        let set = crate::dispatch::CompactionDispatchArgs { compactor_chat_url: Some("u".into()), ..Default::default() };
+        let ce = compactor_endpoint_for(&set, Some(&utility), None);
+        assert_eq!(ce.id.as_deref(), Some("mlx"));
+        assert!(ce.label.contains("127.0.0.1") && ce.label.contains("mlx-util"), "{ce:?}");
+        let lm = compactor_endpoint_for(&crate::dispatch::CompactionDispatchArgs::default(), Some(&utility), None);
+        assert_eq!(lm, CompactorEndpoint { label: crate::usage::lmstudio_endpoint(None), id: None }, "no compactor URL, LM Studio as before");
     }
 
     #[test]
@@ -7262,6 +7421,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -7399,6 +7559,8 @@
             strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
             bail_after_compactions: None,
             custom_instructions: None,
+            compactor_chat_url: None,
+            compactor_dialect: None,
         };
         apply_compaction_flags(&mut args, &compaction);
         assert!(args.iter().any(|a| a == "--compact-threshold-tokens"));
@@ -14010,6 +14172,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            compactor_needs_auth: false,
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
@@ -19118,6 +19281,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["requested_model"], "darkmux:compactor-4b");
         assert_eq!(p["reported_model"], "compactor-4b");
         assert_eq!(p["endpoint"], "http://h:1234/v1");
+        assert!(p.get("endpoint_id").is_none(), "an LM Studio compactor names no `endpoints` id (#3207): {p}");
         assert!(
             p.get("remote").is_none(),
             "a usage record states facts; it never classifies local/cloud: {p}"
@@ -19139,6 +19303,71 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             (0, 0, 0),
             "never blended into the specialist's own totals"
         );
+    }
+
+    /// (#3207) A compactor on the utility binding's UNMANAGED endpoint: the
+    /// tailer `dispatch()` spawns stamps that endpoint's label and
+    /// `endpoints` id on each compaction usage record, so the record names
+    /// the real endpoint and the endpoint's window counts the call. An LM
+    /// Studio compactor's records carry no id (the conformance test above).
+    #[test]
+    #[serial]
+    fn a_compaction_on_an_unmanaged_utility_endpoint_names_it_on_its_usage_record() {
+        let tmp = TempDir::new().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(out_dir.join(".darkmux-runtime")).unwrap();
+        std::fs::write(
+            out_dir.join(".darkmux-runtime").join("trajectory.jsonl"),
+            r#"{"type":"compaction.call","generation":1,"requested_model":"mlx-util","reported_model":"mlx-util","usage":{"prompt_tokens":500,"completion_tokens":80,"total_tokens":580,"reasoning_tokens":null,"cached_tokens":null}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let flows = tmp.path().join("flows");
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", &flows);
+        }
+        let stop = Arc::new(AtomicBool::new(true));
+        let (_guard, handle) = spawn_guarded_tailer(
+            &stop,
+            out_dir,
+            crate::test_session("sess-unmanaged-compactor"),
+            darkmux_types::execution_id::ExecutionId::mint(),
+            "coder".to_string(),
+            "darkmux:m".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            600,
+            None,
+            Some("mlx-util".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some(CompactorEndpoint { label: "openai:127.0.0.1:8080/mlx-util".into(), id: Some("mlx-local".into()) }),
+            None,
+            DispatchStop::new("test-container".into()),
+        );
+        handle.join().expect("tailer thread");
+        let records = drain_flow_records_for_session(&flows, &crate::test_session("sess-unmanaged-compactor"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Compaction, "unmanaged compaction call");
+        assert_eq!(rec["payload"]["endpoint"], "openai:127.0.0.1:8080/mlx-util", "{rec}");
+        assert_eq!(rec["payload"]["endpoint_id"], "mlx-local", "{rec}");
+        assert_eq!(rec["payload"]["requested_model"], "mlx-util", "the bare id: {rec}");
     }
 
     /// (#2915) The runtime's `compaction.start` (written BEFORE the
@@ -19341,6 +19570,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             user: "u",
             max_tokens: 77,
             timeout_seconds: 15,
+            temperature: None,
         })
         .expect("mock answers");
         let request = rx.recv().unwrap();

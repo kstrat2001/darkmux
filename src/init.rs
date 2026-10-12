@@ -577,11 +577,29 @@ fn apply_utility_plan(text: &str, current: &str, plan: &UtilityPlan) -> Option<S
     }
 }
 
+/// (#3207) Whether the registry text's utility binding names an unmanaged
+/// endpoint. Parsed the way the loader parses it (#1282: a mistyped entry is
+/// quarantined, the rest stands), so a broken profile elsewhere cannot switch
+/// this guard off. A registry that does not parse at all is not (the fill
+/// goes on as before).
+fn utility_on_unmanaged_endpoint(text: &str) -> bool {
+    darkmux_profiles::profiles::parse_registry_lenient(text).is_ok_and(|mut r| {
+        r.materialize_endpoints();
+        r.utility_is_unmanaged()
+    })
+}
+
 fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<UtilityPlan>, String> {
     let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
     let Some((current, window)) = shipped_utility_binding(&text) else {
         return Ok(None);
     };
+    // (#3207) A binding on an endpoint darkmux does not manage is served
+    // there, not by LM Studio: its downloads and RAM headroom say nothing
+    // about it, so init leaves it as written.
+    if utility_on_unmanaged_endpoint(&text) {
+        return Ok(None);
+    }
     // An unreachable lms was already reported by the worker fill.
     let Ok(available) = darkmux_profiles::lms::list_available() else {
         return Ok(None);

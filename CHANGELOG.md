@@ -14,6 +14,28 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **The utility model can run on an endpoint darkmux does not manage** (#3207).
+  `internal.utility` takes an optional `endpoint` naming an `endpoints` entry:
+  `"utility": { "id": "mlx-community/Qwen3-1.7B-4bit", "n_ctx": 32768, "endpoint": "mlx-local" }`.
+  On an unmanaged endpoint (one with a `url`, such as `mlx_lm.server` on a Linux
+  machine with no LM Studio), radio routing and compaction are sent there with
+  the bare model id, in the endpoint's dialect and with its auth; darkmux never
+  runs `lms`, loads, ejects or reads `lms ps` for the binding, and `n_ctx` is the
+  window that bounds a compaction payload. Each job stays lean (`utility.start`
+  plus its usage record), and the usage record names the real endpoint and its
+  `endpoints` id, so the endpoint's window budget counts it. With no `endpoint`,
+  or one naming a managed endpoint, nothing changes. `darkmux doctor` describes
+  the binding from its endpoint, and its `lms binary` and `unreachable residents`
+  rows pass when nothing in the registry needs LM Studio, and `darkmux init`
+  leaves such a binding as written rather than planning it from LM Studio's
+  downloads. Profiles schema 2.1
+  (an additive key): an older darkmux refuses the key at preflight, so upgrade
+  before writing it. The runtime's compactor gains `--compactor-chat-url`,
+  `--compactor-dialect` and `--compactor-auth-header-stdin`, so a dispatch needs
+  the runtime image built for this darkmux.
+
 ### Fixed
 
 - The fleet view no longer shows a machine as online when darkmux has no

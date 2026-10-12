@@ -1185,6 +1185,7 @@ impl DispatchSingleShotStepKind {
                     user: &user,
                     max_tokens,
                     timeout_seconds,
+                    temperature: None,
                 },
                 endpoint_label.as_deref(),
                 session,
@@ -2592,6 +2593,7 @@ fn map_hosted_item(
         user,
         max_tokens: clamped,
         timeout_seconds,
+        temperature: None,
     };
     // The body every attempt posts: an unreported spend is charged against
     // the prompt it carries. A dialect that cannot be resolved fails the

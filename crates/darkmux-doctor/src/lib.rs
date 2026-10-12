@@ -1011,6 +1011,11 @@ fn check_serve_reads() -> Check {
 /// wiring); doctor flags "registered but not loaded" before you dispatch.
 fn check_utility_model_binding() -> Check {
     let registry = darkmux_profiles::profiles::load_registry(None).ok().map(|l| l.registry);
+    // (#3207) A binding that names an endpoint is described from the
+    // endpoint, and an unmanaged one never reads `lms ps`.
+    if let Some(c) = registry.as_ref().and_then(utility_endpoint_status) {
+        return c;
+    }
     let registry_util = registry.as_ref().and_then(|r| r.utility_model_id().map(str::to_string));
     let n_ctx = registry.as_ref().and_then(|r| r.utility_model_n_ctx());
     // Only query LMStudio when there's a binding to check.
@@ -1020,6 +1025,55 @@ fn check_utility_model_binding() -> Check {
         None
     };
     utility_binding_status(registry_util.as_deref(), n_ctx, loaded.as_deref())
+}
+
+/// (#3207) The `utility model` row for a binding that names an endpoint
+/// (`internal.utility.endpoint`): `None` when it names none, or a managed one
+/// (the LM Studio row below describes it, as before). On an UNMANAGED endpoint
+/// it passes and says where its jobs go, since darkmux loads nothing there and
+/// there is nothing to find in `lms ps`. An endpoint that does not resolve, or
+/// cannot be used as written, fails with the reason: every utility job, and
+/// every dispatch that compacts, refuses it.
+fn utility_endpoint_status(registry: &darkmux_types::ProfileRegistry) -> Option<Check> {
+    let name = "utility model".to_string();
+    let id = registry.utility_model_id()?;
+    let ep = registry.utility_endpoint()?;
+    let named = ep.named_id().unwrap_or("(unnamed)").to_string();
+    match ep.kind() {
+        Ok(darkmux_types::EndpointKind::Managed(_)) => None,
+        Ok(darkmux_types::EndpointKind::Unmanaged) => {
+            let window = match registry.utility_model_n_ctx() {
+                Some(n) => format!("n_ctx {n}"),
+                None => "no window declared".to_string(),
+            };
+            Some(Check {
+                name,
+                status: Status::Pass,
+                message: format!(
+                    "utility model `{id}` runs on endpoint `{named}` ({}), which darkmux does not manage: \
+                     radio routing and compaction are sent there with the bare id, and nothing is loaded ({window})",
+                    ep.host().unwrap_or_else(|| "no host".to_string())
+                ),
+                hint: registry.utility_model_n_ctx().is_none().then(|| {
+                    format!(
+                        "Declare the window the endpoint serves, so a compaction payload is bounded by it rather \
+                         than by the work model's: `\"internal\": {{ \"utility\": {{ \"id\": \"{id}\", \"n_ctx\": N, \
+                         \"endpoint\": \"{named}\" }} }}`. (#3207)"
+                    )
+                }),
+            })
+        }
+        Err(e) => Some(Check {
+            name,
+            status: Status::Fail,
+            message: format!("utility model `{id}` names endpoint `{named}`, which cannot be used: {e}"),
+            hint: Some(
+                "Radio routing and every dispatch that compacts refuse this binding until it is fixed: define the \
+                 endpoint under `endpoints`, fix its id, or drop `endpoint` to run the utility model on LM Studio. (#3207)"
+                    .into(),
+            ),
+        }),
+    }
 }
 
 /// Pure decision for `check_utility_model_binding`, split out so every arm is
@@ -1374,6 +1428,11 @@ fn check_unreachable_darkmux_residents() -> Check {
             };
         }
     };
+    // (#3207) Nothing here needs LM Studio: no darkmux resident can exist to
+    // be stranded, and a missing LM Studio is the expected state.
+    if !registry.needs_lmstudio() {
+        return lmstudio_unneeded_check("unreachable residents");
+    }
     let loaded = match darkmux_profiles::lms::list_loaded() {
         Ok(l) => l,
         Err(_) => {
@@ -6291,7 +6350,33 @@ pub fn check_mission_config_registry(catalog: &darkmux_crew::mission_config::Kin
     }
 }
 
+/// (#3207) The row an LM Studio check reports when the registry declares
+/// nothing that needs LM Studio: every profile model and the utility binding
+/// are on endpoints darkmux does not manage (`ProfileRegistry::needs_lmstudio`).
+fn lmstudio_unneeded_check(name: &str) -> Check {
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: "not checked: nothing in the profile registry needs LM Studio (every model and the utility \
+                  binding are on endpoints darkmux does not manage)"
+            .into(),
+        hint: None,
+    }
+}
+
+/// (#3207) Whether the profile registry loads and declares nothing that needs
+/// LM Studio. A registry that does not load says nothing either way (`false`).
+fn lmstudio_unneeded() -> bool {
+    darkmux_profiles::profiles::load_registry(None).is_ok_and(|l| !l.registry.needs_lmstudio())
+}
+
 fn check_lms_binary() -> Check {
+    lms_binary_status(lmstudio_unneeded())
+}
+
+/// [`check_lms_binary`] with the registry's answer supplied: when nothing needs
+/// LM Studio, a missing `lms` is not a failure (#3207).
+fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
     // (#2149) Resolved through `config_access::lms_bin()` — the ONE place
     // `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` precedence lives.
     // This check previously read `DARKMUX_LMS_BIN` directly and never saw
@@ -6319,6 +6404,16 @@ fn check_lms_binary() -> Check {
             name: "lms binary".into(),
             status: Status::Pass,
             message: format!("found `{bin}` {how}{via}"),
+            hint: None,
+        }
+    } else if lmstudio_unneeded {
+        Check {
+            name: "lms binary".into(),
+            status: Status::Pass,
+            message: format!(
+                "`{bin}`{via} not found {how}, and nothing in the profile registry needs LM Studio (every model \
+                 and the utility binding are on endpoints darkmux does not manage)"
+            ),
             hint: None,
         }
     } else {
@@ -13007,6 +13102,95 @@ mod tests {
         assert!(c.message.contains("role_profiles.radio-router") && c.message.contains("radio"), "{}", c.message);
         let hint = c.hint.clone().unwrap_or_default();
         assert!(hint.contains("internal.utility"), "the fix: {hint}");
+    }
+
+    /// (#3207) A utility binding on an UNMANAGED endpoint passes and says
+    /// where its jobs go; a managed or absent endpoint leaves the LM Studio
+    /// row in charge; an endpoint that does not resolve fails, naming it.
+    #[test]
+    fn the_utility_row_describes_an_endpoint_binding() {
+        let unmanaged = materialized(
+            r#"{"profiles":{},"endpoints":{"mlx-local":{"url":"http://127.0.0.1:8080/v1"}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":8192,"endpoint":"mlx-local"}}}"#,
+        );
+        let c = super::utility_endpoint_status(&unmanaged).expect("an unmanaged binding has its own row");
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("`mlx-util`") && c.message.contains("`mlx-local`") && c.message.contains("127.0.0.1"), "{}", c.message);
+        assert!(c.message.contains("8192") && c.message.contains("does not manage"), "{}", c.message);
+        assert!(c.hint.is_none(), "a declared window needs no nudge: {:?}", c.hint);
+        let undeclared = materialized(
+            r#"{"profiles":{},"endpoints":{"mlx-local":{"url":"http://127.0.0.1:8080/v1"}},
+                "internal":{"utility":{"id":"mlx-util","endpoint":"mlx-local"}}}"#,
+        );
+        assert!(super::utility_endpoint_status(&undeclared).unwrap().hint.unwrap_or_default().contains("n_ctx"));
+        let managed = materialized(
+            r#"{"profiles":{},"endpoints":{"lms":{"managed":"lmstudio"}},"internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"lms"}}}"#,
+        );
+        assert!(super::utility_endpoint_status(&managed).is_none(), "a managed endpoint keeps today's row");
+        let none = materialized(r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8}}}"#);
+        assert!(super::utility_endpoint_status(&none).is_none(), "no endpoint keeps today's row");
+        let dangling = materialized(r#"{"profiles":{},"internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"nope"}}}"#);
+        let c = super::utility_endpoint_status(&dangling).expect("a dangling endpoint is reported");
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("`nope`"), "{}", c.message);
+    }
+
+    /// (#3207) The live rows read the registry: with every model and the
+    /// utility binding on an unmanaged endpoint, a missing `lms` passes and
+    /// the residents check is not run (the fake `lms` path does not exist).
+    #[serial_test::serial]
+    #[test]
+    fn the_lm_studio_rows_stand_down_when_nothing_needs_lm_studio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = tmp.path().join("profiles.json");
+        std::fs::write(
+            &profiles,
+            r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"mlx"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1"}},
+                "internal":{"utility":{"id":"u","n_ctx":8192,"endpoint":"mlx"}}}"#,
+        )
+        .unwrap();
+        let keys = ["DARKMUX_PROFILES", "DARKMUX_LMS_BIN"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_PROFILES", &profiles);
+            std::env::set_var("DARKMUX_LMS_BIN", tmp.path().join("no-such-lms"));
+        }
+        let lms = check_lms_binary();
+        let residents = check_unreachable_darkmux_residents();
+        let utility = check_utility_model_binding();
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(lms.status, Status::Pass, "{}", lms.message);
+        assert_eq!(residents.status, Status::Pass, "{}", residents.message);
+        assert!(residents.message.contains("nothing in the profile registry needs LM Studio"), "{}", residents.message);
+        assert_eq!(utility.status, Status::Pass, "the utility row never asks LM Studio: {}", utility.message);
+        assert!(utility.message.contains("does not manage"), "{}", utility.message);
+    }
+
+    /// (#3207) A missing `lms` is not a failure when nothing in the registry
+    /// needs LM Studio, and still is when something does.
+    #[serial_test::serial]
+    #[test]
+    fn a_missing_lms_passes_only_when_nothing_needs_lm_studio() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "darkmux-doctor-test-nonexistent-lms-3207") };
+        let unneeded = super::lms_binary_status(true);
+        let needed = super::lms_binary_status(false);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        assert_eq!(unneeded.status, Status::Pass, "{}", unneeded.message);
+        assert!(unneeded.message.contains("nothing in the profile registry needs LM Studio"), "{}", unneeded.message);
+        assert_eq!(needed.status, Status::Fail, "{}", needed.message);
     }
 
     /// (#2914) The binding check reports the declared window, and points a

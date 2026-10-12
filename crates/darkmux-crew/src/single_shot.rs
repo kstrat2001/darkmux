@@ -215,7 +215,7 @@ pub fn hosted_chat_body(
     max_tokens: u32,
     reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
-    hosted_chat_body_in(darkmux_types::Dialect::ChatCompletions, model, system, user, max_tokens, reasoning_effort)
+    hosted_chat_body_in(darkmux_types::Dialect::ChatCompletions, model, system, user, max_tokens, None, reasoning_effort)
 }
 
 /// [`hosted_chat_body`] in an endpoint's declared dialect (#2902): an
@@ -227,6 +227,7 @@ fn hosted_chat_body_in(
     system: &str,
     user: &str,
     max_tokens: u32,
+    temperature: Option<f32>,
     reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
     chat_body(&ChatBody {
@@ -234,7 +235,7 @@ fn hosted_chat_body_in(
         model,
         messages: chat_messages(system, user),
         max_tokens,
-        temperature: None,
+        temperature,
         reasoning_effort,
     })
 }
@@ -288,6 +289,12 @@ pub struct HostedSingleShotRequest<'a> {
     pub user: &'a str,
     pub max_tokens: u32,
     pub timeout_seconds: u32,
+    /// (#3207) Sent only where [`chat_body`] sends one (the
+    /// `chat-completions-max-tokens` dialect). `None` for every work seat,
+    /// whose hosted body is unchanged; the utility job passes the same 0.2
+    /// its managed arm sends, so a routing decision on an unmanaged
+    /// `max_tokens` server is as low-variance as on LM Studio.
+    pub temperature: Option<f32>,
 }
 
 impl HostedSingleShotRequest<'_> {
@@ -300,6 +307,7 @@ impl HostedSingleShotRequest<'_> {
             self.system,
             self.user,
             self.max_tokens,
+            self.temperature,
             self.endpoint.reasoning_effort.as_deref(),
         ))
     }
