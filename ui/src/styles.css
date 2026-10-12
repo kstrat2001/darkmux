@@ -721,6 +721,16 @@ body {
      chip keeps its size either way. */
   padding: 3px calc(6px - 0.04em) 1px calc(6px + 0.04em);
 }
+/* The 1px shift above is right for one font only: the viewer uses the system
+   monospace, and on a phone the caps sat low in the chip (operator
+   screenshot, 2026-10-12). Where the browser can trim the line box to the
+   capitals, the padding is symmetric and the letters center in any font. */
+@supports (text-box: trim-both cap alphabetic) {
+  .chip--sm {
+    text-box: trim-both cap alphabetic;
+    padding: 4px calc(6px - 0.04em) 4px calc(6px + 0.04em);
+  }
+}
 /* The HUB badge (`components/HubBadge.tsx`): never shrinks below its word, so
    a long machine name ellipsizes beside it instead. */
 .hub-badge {
