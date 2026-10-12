@@ -14,6 +14,17 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-10-12
+
+The utility model (radio routing and compaction) can run on a server darkmux does
+not manage, so a machine with no LM Studio, such as a Linux laptop serving
+`mlx_lm.server`, can hold the radio router seat. The fleet also holds up better:
+a dual-booted or sleeping peer no longer stalls the fleet view, and `darkmux
+serve` reads the hub stream incrementally instead of re-parsing it per request
+(measured live: 130 MB instead of 505 MB after three `/runs`, a warm `/runs` in
+1.9 s instead of 8.1 s). Profiles schema 2.1 adds `internal.utility.endpoint`;
+an older darkmux refuses the key, so upgrade every machine before writing it.
+
 ### Added
 
 - **The utility model can run on an endpoint darkmux does not manage** (#3207).
@@ -3461,6 +3472,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.2.0
 [5.1.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.1
 [5.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.0
 [5.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.0.0
