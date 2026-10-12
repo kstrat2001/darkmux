@@ -44,6 +44,26 @@ impl Platform for LinuxPlatform {
             .and_then(|c| apple_chip_from_compatible(&c))
             .or_else(|| model_name_from_cpuinfo(&read_to_string("/proc/cpuinfo")?))
     }
+
+    /// `MemTotal` rounded up to a whole GiB: the kernel reports what it can
+    /// use, after firmware and its own reservations (7.36 GiB on an 8 GB M2),
+    /// and that share is always under a GiB.
+    fn ram_installed_bytes(&self) -> Option<u64> {
+        installed_ram_from_meminfo(&read_to_string("/proc/meminfo")?)
+    }
+}
+
+/// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.
+pub(crate) fn installed_ram_from_meminfo(meminfo: &str) -> Option<u64> {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some((kib * 1024).div_ceil(GIB) * GIB)
 }
 
 #[cfg(target_os = "linux")]

@@ -29,4 +29,8 @@ impl Platform for FakePlatform {
     fn cpu_brand(&self) -> Option<String> {
         None
     }
+
+    fn ram_installed_bytes(&self) -> Option<u64> {
+        None
+    }
 }

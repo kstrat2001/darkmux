@@ -44,6 +44,11 @@ pub trait Platform: Send + Sync {
     /// fleet card's hardware line. `None` when the platform can't say:
     /// callers show "not reported", never a placeholder.
     fn cpu_brand(&self) -> Option<String>;
+
+    /// The machine's installed memory, in bytes, as it is sold, for DISPLAY
+    /// (the fleet card's `· 8 GB`). Never a planning budget: what darkmux can
+    /// actually use is a separate, smaller fact.
+    fn ram_installed_bytes(&self) -> Option<u64>;
 }
 
 /// Which user a dispatch container runs as.
