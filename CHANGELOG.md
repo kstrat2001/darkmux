@@ -50,6 +50,29 @@ darkmux release.
   its status line now reads "not streaming", with the reason in its tooltip,
   instead of "online". Machines with an id keep the earlier rule: online unless
   presence says they are absent. (#3213)
+- **`darkmux serve` reads the fleet stream incrementally and holds it compactly**
+  (#3217). `/runs`, `/flow-missions` and the run and mission replays share one
+  read of the hub's streams. Past its 2-second cache, every request re-read and
+  re-parsed the whole 10,000-entry window into JSON values, cloned it out of the
+  cache, and a remote `/runs` wrote all of it to a file for its `run-list` child
+  to parse again; a fleet peer on an 8 GB machine grew to 1.24 GB this way. The
+  daemon now reads each stream from the last entry it saw, parses each entry
+  once, and shares the window between requests. A record is held with the fields
+  the readers use, its payload only where a reader acts on it, its
+  de-duplication identity, and its text for the replays, which still serve whole
+  records. Entries the hub trims leave the window, and a stream that no longer
+  holds the last entry read (deleted, rewritten, a restarted hub) is read afresh.
+  The `run-list` handoff file carries the compact form. Measured in process on a
+  10,000-entry fixture (22 MB of record text, release build, a local Redis): a
+  repeated `/runs` went from 132 ms and a 132 MB allocation peak to 17 ms and
+  3.6 MB, a request inside the cache window from 87 ms and 88 MB to 14 ms and
+  3.6 MB, and the window kept between requests from 66 MB to 45 MB. The `/runs`
+  body and `darkmux run list --json` are unchanged.
+  One request reads the hub at a time, with no lock held across the read: the
+  others wait at most one round trip's bound (1.5 s) and are served the last
+  window, and a failed read is not retried inside its 2-second window. A Redis
+  connect is now bounded too: redis-rs read its setup replies with no timeout, so
+  a hub that accepted the connection and never answered held it for good.
 - A dual-booted or sleeping peer no longer stalls the fleet view. A roster
   machine that drops connections without refusing them (a laptop booted into
   its other OS, or asleep) held every gather about 30 seconds, ureq's default

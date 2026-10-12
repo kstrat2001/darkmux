@@ -4571,6 +4571,342 @@
         // real roster file, a real loopback HTTP call between them —
         // actually composes end to end, at a gate that cannot silently
         // skip.
+
+        // ─── #3217 the fleet window is read incrementally ───────────────
+        //
+        // `/runs`, `/flow-missions` and the catalog routes share one cached
+        // read of the hub's streams. These drive that read through
+        // `read_fleet_cached` with their own cache, an explicit clock (no
+        // sleeps, no fixed timestamps against the scan window) and this
+        // test's own `redis-server`, and count entry parses with
+        // `STREAM_ENTRY_PARSES` rather than timing anything.
+        mod fleet_window_reads {
+            use super::*;
+            use std::time::{Duration, SystemTime};
+            use crate::fleet_fixture;
+
+            fn now_secs() -> u64 {
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+            }
+
+            fn parses() -> u64 {
+                crate::fleet_window::STREAM_ENTRY_PARSES.load(std::sync::atomic::Ordering::Relaxed)
+            }
+
+            fn conn(url: &str) -> redis::Connection {
+                redis::Client::open(url).expect("client").get_connection().expect("conn")
+            }
+
+            fn xadd_all(url: &str, stream: &str, records: &[serde_json::Value]) {
+                let mut pipe = redis::pipe();
+                for r in records {
+                    pipe.cmd("XADD").arg(stream).arg("*").arg("schema").arg("1.8.0").arg("record").arg(r.to_string()).ignore();
+                }
+                let () = pipe.query(&mut conn(url)).expect("XADD pipeline");
+            }
+
+            fn xadd_with_id(url: &str, stream: &str, id: &str, record: &serde_json::Value) {
+                let _: String = redis::cmd("XADD")
+                    .arg(stream)
+                    .arg(id)
+                    .arg("record")
+                    .arg(record.to_string())
+                    .query(&mut conn(url))
+                    .expect("XADD with id");
+            }
+
+            /// The records a read holds, in the full form the catalog routes
+            /// serve.
+            fn values(read: &FleetRead) -> Vec<serde_json::Value> {
+                read.records.iter().map(|r| r.full()).collect()
+            }
+
+            /// What a cold, uncached read of the hub returns now: the truth an
+            /// incremental read must equal.
+            fn fresh(url: &str, scope: FleetScope) -> Vec<serde_json::Value> {
+                super::super::read_flow_records_from_redis(url, None, scope).expect("fresh read").records
+            }
+
+            fn read_at(caches: &FleetCaches, url: &str, scope: FleetScope, at: SystemTime) -> FleetRead {
+                let url = url.to_string();
+                read_fleet_cached(caches, scope, at, move || Some(darkmux_flow::RawRedisUrl::new(url)))
+            }
+
+            /// (a) A second read inside the cache window, and another after it
+            /// with nothing new on the stream, parse nothing: the window is
+            /// already held.
+            #[test]
+            #[serial]
+            fn a_repeated_read_does_not_parse_entries_it_already_holds() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(50, now_secs()));
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                let first = read_at(&caches, &redis.url, FleetScope::Work, t0);
+                assert_eq!(first.records.len(), 50);
+                let before = parses();
+                // Inside the cache window the hub is not asked at all.
+                let asked = std::cell::Cell::new(false);
+                let within = read_fleet_cached(&caches, FleetScope::Work, t0 + Duration::from_millis(500), || {
+                    asked.set(true);
+                    None
+                });
+                assert!(!asked.get(), "a read inside the cache window went to the hub");
+                let after = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(parses() - before, 0, "a repeated read re-parsed entries it already held");
+                assert_eq!(values(&within), values(&first));
+                assert_eq!(values(&after), fresh(&redis.url, FleetScope::Work));
+                assert_eq!(after.state, source_state::SourceState::Ok);
+            }
+
+            /// (b) Entries appended since the last read are picked up, and only
+            /// they are parsed.
+            #[test]
+            #[serial]
+            fn new_entries_are_read_and_only_they_are_parsed() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let records = fleet_fixture::realistic_records(53, now_secs());
+                xadd_all(&redis.url, WORK_STREAM, &records[..50]);
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                read_at(&caches, &redis.url, FleetScope::Work, t0);
+                xadd_all(&redis.url, WORK_STREAM, &records[50..]);
+                let before = parses();
+                let next = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(parses() - before, 3, "only the three new entries are parsed");
+                assert_eq!(next.records.len(), 53);
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
+            }
+
+            /// (b) The same for the telemetry stream a dispatch replay reads
+            /// beside the work stream, merged in hub order.
+            #[test]
+            #[serial]
+            fn a_samples_read_is_incremental_on_both_streams() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let work = fleet_fixture::realistic_records(20, now_secs());
+                let sample = |i: usize| serde_json::json!({ "ts": fleet_fixture::iso(now_secs() - 5), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
+                xadd_all(&redis.url, WORK_STREAM, &work[..10]);
+                xadd_all(&redis.url, TELEMETRY_STREAM, &(0..10).map(sample).collect::<Vec<_>>());
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
+                xadd_all(&redis.url, TELEMETRY_STREAM, &[sample(10), sample(11)]);
+                xadd_all(&redis.url, WORK_STREAM, &work[10..]);
+                let before = parses();
+                let next = read_at(&caches, &redis.url, FleetScope::WithSamples, t0 + Duration::from_secs(10));
+                assert_eq!(parses() - before, 12, "two new samples and ten new work records");
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::WithSamples));
+                // The work-scope read shares the work stream's window: nothing to parse.
+                let before = parses();
+                let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(parses() - before, 0);
+                assert_eq!(values(&work_only), fresh(&redis.url, FleetScope::Work));
+            }
+
+            /// (c) Records trimmed off the head of the stream age out of the
+            /// window, as they would from a fresh read.
+            #[test]
+            #[serial]
+            fn entries_trimmed_off_the_stream_leave_the_window() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let records = fleet_fixture::realistic_records(42, now_secs());
+                xadd_all(&redis.url, WORK_STREAM, &records[..40]);
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                read_at(&caches, &redis.url, FleetScope::Work, t0);
+                let _: u64 = redis::cmd("XTRIM").arg(WORK_STREAM).arg("MAXLEN").arg(15).query(&mut conn(&redis.url)).unwrap();
+                xadd_all(&redis.url, WORK_STREAM, &records[40..]);
+                let next = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(next.records.len(), 17);
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
+            }
+
+            /// (c) A stream that no longer holds the last entry read (deleted
+            /// and rewritten, a hub restarted empty, ids gone backwards, or
+            /// trimmed past it) is read afresh: nothing stale or duplicated.
+            #[test]
+            #[serial]
+            fn a_stream_that_lost_the_last_entry_read_is_read_afresh() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let records = fleet_fixture::realistic_records(60, now_secs());
+                let caches = FleetCaches::default();
+                let mut at = SystemTime::now();
+                let mut step = |caches: &FleetCaches| {
+                    at += Duration::from_secs(10);
+                    read_at(caches, &redis.url, FleetScope::Work, at)
+                };
+                xadd_all(&redis.url, WORK_STREAM, &records[..20]);
+                step(&caches);
+
+                // Deleted and rewritten with new entries.
+                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
+                xadd_all(&redis.url, WORK_STREAM, &records[20..25]);
+                let next = step(&caches);
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after a delete and rewrite");
+                assert_eq!(next.records.len(), 5);
+
+                // Ids gone backwards: a hub restarted with a lower id sequence.
+                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
+                for (i, r) in records[25..28].iter().enumerate() {
+                    xadd_with_id(&redis.url, WORK_STREAM, &format!("1-{}", i + 1), r);
+                }
+                let next = step(&caches);
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after ids went backwards");
+                assert_eq!(next.records.len(), 3);
+
+                // Trimmed past the last entry read, then written to.
+                xadd_all(&redis.url, WORK_STREAM, &records[28..30]);
+                step(&caches);
+                let _: u64 = redis::cmd("XTRIM").arg(WORK_STREAM).arg("MAXLEN").arg(0).query(&mut conn(&redis.url)).unwrap();
+                xadd_all(&redis.url, WORK_STREAM, &records[30..34]);
+                let next = step(&caches);
+                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after a trim past the cursor");
+                assert_eq!(next.records.len(), 4);
+
+                // Emptied entirely.
+                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
+                assert!(step(&caches).records.is_empty(), "an emptied stream serves nothing");
+            }
+
+            /// A window read from one hub is never continued against another
+            /// (a changed `redis.host`), even when the new hub happens to hold
+            /// an entry with the same id as the last one read.
+            #[test]
+            #[serial]
+            fn a_window_read_from_another_hub_starts_over() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let (a, b) = (spawn_redis(), spawn_redis());
+                let records = fleet_fixture::realistic_records(6, now_secs());
+                for (i, r) in records[..3].iter().enumerate() {
+                    xadd_with_id(&a.url, WORK_STREAM, &format!("5-{i}"), r);
+                }
+                for (i, r) in records[3..].iter().enumerate() {
+                    xadd_with_id(&b.url, WORK_STREAM, &format!("5-{}", i + 2), r);
+                }
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                read_at(&caches, &a.url, FleetScope::Work, t0);
+                let next = read_at(&caches, &b.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(values(&next), fresh(&b.url, FleetScope::Work));
+            }
+
+            /// (#3217) The connect sends `AUTH` and `SELECT` itself, after the
+            /// response bound is on the socket: a password, a named user and a
+            /// database still connect to the right place, and a wrong password
+            /// is refused.
+            #[test]
+            #[serial]
+            fn a_url_with_credentials_and_a_database_still_connects() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let mut admin = conn(&redis.url);
+                let _: () = redis::cmd("SELECT").arg(2).query(&mut admin).unwrap();
+                let _: () = redis::cmd("SET").arg("which-db").arg("two").query(&mut admin).unwrap();
+                let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("s3cret").query(&mut admin).unwrap();
+                let hostport = redis.url.trim_start_matches("redis://").to_string();
+                for userinfo in [":s3cret@", "default:s3cret@"] {
+                    let url = format!("redis://{userinfo}{hostport}/2");
+                    let mut c = super::super::bounded_redis_connection(&url, "a probe").unwrap_or_else(|e| panic!("{userinfo}: {e:#}"));
+                    let got: String = redis::cmd("GET").arg("which-db").query(&mut c).unwrap();
+                    assert_eq!(got, "two", "{userinfo} reached database 2");
+                }
+                assert!(super::super::bounded_redis_connection(&format!("redis://:wrong@{hostport}/2"), "a probe").is_err());
+                assert!(super::super::bounded_redis_connection(&format!("redis://{hostport}"), "a probe")
+                    .and_then(|mut c| Ok(redis::cmd("GET").arg("which-db").query::<Option<String>>(&mut c)?))
+                    .is_err(), "no password, no read");
+            }
+
+            /// A hub that stops answering: the last window read is served as
+            /// `Stale` with its age; with none read yet, nothing, `Unavailable`.
+            #[test]
+            #[serial]
+            fn an_unreachable_hub_serves_the_last_window_as_stale() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let url = redis.url.clone();
+                xadd_all(&url, WORK_STREAM, &fleet_fixture::realistic_records(10, now_secs()));
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                let first = read_at(&caches, &url, FleetScope::Work, t0);
+                drop(redis);
+                let later = read_at(&caches, &url, FleetScope::Work, t0 + Duration::from_secs(10));
+                assert_eq!(later.state, source_state::SourceState::Stale { age_ms: 10_000, detail: FLEET_READ_ERROR_DETAIL });
+                assert_eq!(values(&later), values(&first));
+                // The samples scope has no telemetry window yet: nothing to serve.
+                let samples = read_at(&caches, &url, FleetScope::WithSamples, t0 + Duration::from_secs(10));
+                assert_eq!(samples.state, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL });
+                assert!(samples.records.is_empty());
+            }
+
+            /// (d) `/runs` built from the incremental, compact window equals
+            /// `/runs` built from a fresh full read of the same stream, on a
+            /// realistic fixture: the rows, the usage and the off-row counts.
+            #[test]
+            #[serial]
+            fn runs_from_the_compact_window_equal_runs_from_a_full_read() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+                let redis = spawn_redis();
+                let records = fleet_fixture::realistic_records(1_200, now_secs());
+                xadd_all(&redis.url, WORK_STREAM, &records[..1_000]);
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                read_at(&caches, &redis.url, FleetScope::Work, t0);
+                xadd_all(&redis.url, WORK_STREAM, &records[1_000..]);
+                let window = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
+                let full = fresh(&redis.url, FleetScope::Work);
+                let flows = tempfile::tempdir().unwrap();
+                let a = runs::build_runs_with_usage(flows.path(), None, &window.records, None);
+                let b = runs::build_runs_with_usage(flows.path(), None, &full[..], None);
+                assert!(a.runs.len() >= 10, "the fixture must build real rows: {}", a.runs.len());
+                // Row order is not part of the comparison: `build_runs` folds
+                // through hash maps, so two builds over one input already list
+                // rows in different orders (the viewer and `run list` sort).
+                let sorted = |runs: &[runs::Run]| {
+                    let mut rows: Vec<serde_json::Value> = runs.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+                    rows.sort_by_key(|r| r["id"].to_string());
+                    rows
+                };
+                assert_eq!(sorted(&a.runs), sorted(&b.runs));
+                assert_eq!(serde_json::to_value(&a.usage).unwrap(), serde_json::to_value(&b.usage).unwrap());
+                let missions_a = serde_json::to_value(super::super::scan_flow_missions(flows.path(), &window.records)).unwrap();
+                let missions_b = serde_json::to_value(super::super::scan_flow_missions(flows.path(), &full[..])).unwrap();
+                assert_eq!(missions_a, missions_b);
+            }
+        }
     }
 
     // ─── path_is_within (the lab-run path guard) ───────────────────────────
@@ -7134,17 +7470,17 @@
         #[test]
         fn snapshot_round_trips_every_source_state() {
             let cases = vec![
-                FleetRead { records: sample_records(), state: source_state::SourceState::Ok },
-                FleetRead { records: Vec::new(), state: source_state::SourceState::Off },
+                FleetRead { records: sample_records().into(), state: source_state::SourceState::Ok },
+                FleetRead { records: FleetRecords::default(), state: source_state::SourceState::Off },
                 FleetRead {
-                    records: sample_records(),
+                    records: sample_records().into(),
                     state: source_state::SourceState::Stale {
                         age_ms: 4200,
                         detail: FLEET_READ_ERROR_DETAIL,
                     },
                 },
                 FleetRead {
-                    records: Vec::new(),
+                    records: FleetRecords::default(),
                     state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
                 },
             ];
@@ -7207,7 +7543,7 @@
                 std::env::remove_var("DARKMUX_REDIS_URL");
             }
             let planted =
-                FleetRead { records: sample_records(), state: source_state::SourceState::Ok };
+                FleetRead { records: sample_records().into(), state: source_state::SourceState::Ok };
             let file = write_fleet_snapshot_file(&planted).expect("write snapshot");
             unsafe {
                 std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());

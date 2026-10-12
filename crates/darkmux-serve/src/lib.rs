@@ -58,6 +58,9 @@ mod redaction_stream;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
+mod fleet_window;
+pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
+pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
 mod routes;
 mod runs;
 mod run_lifecycle;
@@ -3590,9 +3593,10 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
 /// local dispatch would be counted twice.
 fn scan_flow_missions(
     flows_dir: &std::path::Path,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
 ) -> Vec<wire::FlowMissionSummary> {
     use std::collections::{BTreeSet, HashMap};
+    let fleet: FleetRecords = fleet.into();
     struct Agg {
         records: u64,
         dispatches: BTreeSet<String>,
@@ -3648,9 +3652,10 @@ fn scan_flow_missions(
     };
 
     // Fleet first — its records win the de-dup (see this function's doc).
-    let mut fleet_seen: std::collections::HashSet<String> =
+    let mut fleet_seen: std::collections::HashSet<RecordIdentity> =
         std::collections::HashSet::with_capacity(fleet.len());
-    for v in fleet {
+    for r in fleet.iter() {
+        let v = r.value();
         // A fleet record carries no day-file to name it, so its date comes
         // from its own `ts` (`YYYY-MM-DD` prefix of an ISO-8601 UTC stamp).
         let date = v
@@ -3658,13 +3663,13 @@ fn scan_flow_missions(
             .and_then(|t| t.as_str())
             .map(|t| t.chars().take(10).collect::<String>())
             .unwrap_or_default();
-        fleet_seen.insert(flow_record_identity(v));
+        fleet_seen.insert(r.identity());
         fold(&mut by_mission, &date, v);
     }
     // Then the local day-files, skipping anything the fleet already
     // supplied — this machine's own records are written to BOTH sinks.
     for_each_flow_record_across_days(flows_dir, |date, v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&flow_record_identity(v)) {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
             return std::ops::ControlFlow::Continue(());
         }
         fold(&mut by_mission, date, v);
@@ -3815,24 +3820,27 @@ async fn catalog_records_response(
 
 fn collect_records_by_field(
     flows_dir: &std::path::Path,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     field: &str,
     id: &str,
 ) -> (Vec<serde_json::Value>, bool, usize) {
+    let fleet: FleetRecords = fleet.into();
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
     let mut records_scanned = 0usize;
-    let mut fleet_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for v in fleet {
-        if v.get(field).and_then(|f| f.as_str()) != Some(id) {
+    let mut fleet_seen: std::collections::HashSet<RecordIdentity> = std::collections::HashSet::new();
+    for r in fleet.iter() {
+        // `field` is a top-level id, held in the compact form; the route
+        // serves the whole record (#3217).
+        if r.value().get(field).and_then(|f| f.as_str()) != Some(id) {
             continue;
         }
         if records.len() >= MAX_CATALOG_RECORDS {
             truncated = true;
             break;
         }
-        fleet_seen.insert(flow_record_identity(v));
-        records.push(v.clone());
+        fleet_seen.insert(r.identity());
+        records.push(r.full());
     }
     if !truncated {
         for_each_flow_record_across_days(flows_dir, |_date, v| {
@@ -3842,7 +3850,7 @@ fn collect_records_by_field(
                     truncated = true;
                     return std::ops::ControlFlow::Break(());
                 }
-                if fleet_seen.is_empty() || !fleet_seen.contains(&flow_record_identity(v)) {
+                if fleet_seen.is_empty() || !fleet_seen.contains(&RecordIdentity::of(v)) {
                     records.push(v.clone());
                 }
             }
@@ -3899,11 +3907,12 @@ struct HostSampleJoinStats {
 /// why an open/abandoned run needs it.
 fn join_host_samples_into_session_records(
     flows_dir: &std::path::Path,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     records: &mut Vec<serde_json::Value>,
     now_ms: u64,
 ) -> HostSampleJoinStats {
     use darkmux_flow::{Edge, FlowAction};
+    let fleet: FleetRecords = fleet.into();
     let edge = |r: &serde_json::Value| darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).map(|b| b.edge);
     let is_start = |r: &serde_json::Value| edge(r) == Some(Edge::Start);
     let is_terminal = |r: &serde_json::Value| {
@@ -3966,12 +3975,14 @@ fn join_host_samples_into_session_records(
         }
     };
     let mut joined: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<RecordIdentity> = std::collections::HashSet::new();
     let mut records_scanned = fleet.len();
-    for v in fleet {
-        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) {
-            seen.insert(flow_record_identity(v));
-            joined.push(v.clone());
+    for r in fleet.iter() {
+        // The sample's action, machine and `ts` are top-level, held in the
+        // compact form; the join serves the whole sample (#3217).
+        if runs::is_host_sample_in_window(r.value(), &machine_uid, start_ms, end_ms) {
+            seen.insert(r.identity());
+            joined.push(r.full());
         }
     }
     // (found live 2026-09-06) Bounded to the day files this run's own
@@ -3983,7 +3994,7 @@ fn join_host_samples_into_session_records(
     let to_day = runs::day_string_from_epoch_ms(end_ms);
     let days_scanned = for_each_flow_record_in_day_range(flows_dir, &from_day, &to_day, |_date, v| {
         records_scanned += 1;
-        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) && !seen.contains(&flow_record_identity(v)) {
+        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) && !seen.contains(&RecordIdentity::of(v)) {
             joined.push(v.clone());
         }
         std::ops::ControlFlow::Continue(())
@@ -4136,22 +4147,6 @@ fn union_flow_records(
 
 pub(crate) use darkmux_flow::flow_record_identity;
 
-/// The cached fleet snapshot: when it was read, and what it held.
-///
-/// (#2479 audit) `SystemTime`, not `Instant`, deliberately: this is the
-/// OUTSIDE-WORLD bucket, not the process's-own-activity one. The daemon is
-/// long-running and the record it caches is read from OTHER machines over
-/// Redis — a hub never sleeps by fleet topology convention, but a peer
-/// (this laptop) can, and the freshness this cache reports is exactly the
-/// "how long ago, on a wristwatch" question an operator asks of a fleet
-/// panel. `Instant::elapsed()` does not advance across a host sleep, so a
-/// snapshot captured before a multi-hour lid-close would report as
-/// milliseconds old on wake — silently serving a stale fleet view as fresh
-/// with no staleness marker, the exact failure class this issue is about.
-/// See [`fleet_flow_records`]'s freshness check and the `Stale` arm's
-/// `age_ms` below.
-type FleetCache = Option<(std::time::SystemTime, Vec<serde_json::Value>)>;
-
 /// Wall-clock milliseconds between `captured` and `now` (#2479 audit).
 /// `now` is an explicit argument — no internal `SystemTime::now()` call —
 /// so the sleep-crossing behavior is directly unit-testable without
@@ -4167,11 +4162,6 @@ fn wall_clock_age_ms_at(captured: std::time::SystemTime, now: std::time::SystemT
     now.duration_since(captured)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(u64::MAX)
-}
-
-/// Live wrapper around [`wall_clock_age_ms_at`] for production call sites.
-fn wall_clock_age_ms(captured: std::time::SystemTime) -> u64 {
-    wall_clock_age_ms_at(captured, std::time::SystemTime::now())
 }
 
 /// Whether a fleet-cache entry captured at `captured` is still fresh at
@@ -4201,7 +4191,7 @@ fn wall_clock_cache_is_fresh(
 /// visibly, and makes the next aggregation added here confront the question
 /// at compile time rather than by remembering to.
 pub struct FleetRead {
-    pub records: Vec<serde_json::Value>,
+    pub records: FleetRecords,
     pub state: source_state::SourceState,
 }
 
@@ -4268,28 +4258,46 @@ const FLEET_READ_ERROR_DETAIL: &str = "could not read the fleet stream from Redi
 /// nothing to actually preserve there. `kind` + `age_ms` is the whole of
 /// what needs to cross the process boundary; `detail` is reconstructed on
 /// read from the shared constant.
-#[derive(serde::Serialize, serde::Deserialize)]
+///
+/// (#3217) The records cross in the fleet window's compact form, each with
+/// its identity, not as the whole records: the child (`run list`, `mission
+/// status`) reads them the way `/runs` does, and the whole window's text
+/// was written, then parsed again in the child, for every remote `/runs`.
+/// A file in the pre-#3217 shape (`records`) does not parse as this one, so
+/// a child reading a file written by another binary falls back to a live
+/// read.
+#[derive(serde::Serialize)]
+struct FleetSnapshotOut<'a> {
+    kind: &'static str,
+    age_ms: Option<u64>,
+    compact_records: Vec<fleet_window::SnapshotRecordOut<'a>>,
+}
+
+#[derive(serde::Deserialize)]
 struct FleetSnapshotFile {
     kind: String,
     age_ms: Option<u64>,
-    records: Vec<serde_json::Value>,
+    compact_records: Vec<fleet_window::SnapshotRecordIn>,
 }
 
-impl FleetSnapshotFile {
-    fn from_fleet_read(read: &FleetRead) -> Self {
+impl<'a> FleetSnapshotOut<'a> {
+    fn from_fleet_read(read: &'a FleetRead) -> Self {
         let (kind, age_ms) = match &read.state {
             source_state::SourceState::Ok => ("ok", None),
             source_state::SourceState::Stale { age_ms, .. } => ("stale", Some(*age_ms)),
             source_state::SourceState::Unavailable { .. } => ("unavailable", None),
             source_state::SourceState::Off => ("off", None),
         };
-        FleetSnapshotFile { kind: kind.to_string(), age_ms, records: read.records.clone() }
+        FleetSnapshotOut { kind, age_ms, compact_records: read.records.to_snapshot() }
     }
+}
 
+impl FleetSnapshotFile {
     /// `None` on an unrecognized `kind` — a snapshot written by a NEWER
     /// binary than the one reading it (a future state added here) must
     /// fall back to a live read rather than silently mapping to the wrong
-    /// state (#1269-style leniency: lenient on read, but never wrong).
+    /// state (#1269-style leniency: lenient on read, but never wrong). The
+    /// same for a malformed record identity.
     fn into_fleet_read(self) -> Option<FleetRead> {
         let state = match self.kind.as_str() {
             "ok" => source_state::SourceState::Ok,
@@ -4303,7 +4311,7 @@ impl FleetSnapshotFile {
             "off" => source_state::SourceState::Off,
             _ => return None,
         };
-        Some(FleetRead { records: self.records, state })
+        Some(FleetRead { records: FleetRecords::from_snapshot(self.compact_records)?, state })
     }
 }
 
@@ -4312,6 +4320,7 @@ impl FleetSnapshotFile {
 /// the caller for as long as the child reading it might still be running —
 /// dropping it deletes the file. These records are real operator flow
 /// data, so the file is scoped to one handoff and never left behind.
+/// Streamed to the file, never assembled in memory first (#3217).
 pub(crate) fn write_fleet_snapshot_file(read: &FleetRead) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write;
     let mut file = tempfile::Builder::new().prefix("darkmux-fleet-snapshot-").tempfile()?;
@@ -4320,9 +4329,11 @@ pub(crate) fn write_fleet_snapshot_file(read: &FleetRead) -> std::io::Result<tem
         use std::os::unix::fs::PermissionsExt;
         file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    let json = serde_json::to_vec(&FleetSnapshotFile::from_fleet_read(read))?;
-    file.write_all(&json)?;
-    file.flush()?;
+    {
+        let mut out = std::io::BufWriter::new(file.as_file_mut());
+        serde_json::to_writer(&mut out, &FleetSnapshotOut::from_fleet_read(read))?;
+        out.flush()?;
+    }
     Ok(file)
 }
 
@@ -4343,135 +4354,52 @@ fn read_fleet_snapshot_file(path: &StdPath) -> Option<FleetRead> {
 /// is already inside `spawn_blocking`. Returns EMPTY — never an error — when
 /// Redis is unconfigured, unreachable, or malformed: a degraded fleet view
 /// must degrade to local-only, exactly as `aggregate_flow_records_for_date`
-/// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
-/// COUNT 10000` cap as every other read of this stream.
+/// already does for `GET /flow/:date`. Bounded by the same `COUNT 10000` cap
+/// as every other read of this stream, and read incrementally into the
+/// shared, compact fleet window (#3217, [`fleet_window`]).
 pub(crate) fn fleet_flow_records() -> FleetRead {
     fleet_flow_records_in(FleetScope::Work)
 }
 
-/// What a read of the hub's streams returns. Machine samples are half the
-/// entries a full read parses (measured: 300 ms for 10k work entries, 610 ms
-/// with 10k samples beside them), and only a session's host charts use them,
-/// so the run and mission listings read the work stream alone. (#2101)
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FleetScope {
-    /// Work records only.
-    Work,
-    /// Work records and the machine-telemetry stream.
-    WithSamples,
+/// (#1705) The process's one fleet window, behind the short-TTL cache the
+/// viewer's polls share (the read costs ~344ms over a tailnet when it has to
+/// fetch the whole window). See [`fleet_window::read_fleet_cached`].
+///
+/// (#2479 audit) The cache is judged by wall clock (`SystemTime`), not
+/// `Instant`, deliberately: this is the OUTSIDE-WORLD bucket. The daemon is
+/// long-running and the window holds records read from OTHER machines over
+/// Redis; a peer (this laptop) can sleep, and `Instant::elapsed()` does not
+/// advance across a host sleep, so a window read before a multi-hour
+/// lid-close would report as milliseconds old on wake and be served as fresh
+/// with no staleness marker. A clock that stepped backward is treated as
+/// NOT fresh (one extra round trip, self-healing), and a backward step in an
+/// age report reads as maximally stale ([`wall_clock_age_ms_at`]).
+fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
+    static FLEET_CACHES: std::sync::OnceLock<FleetCaches> = std::sync::OnceLock::new();
+    read_fleet_cached(FLEET_CACHES.get_or_init(FleetCaches::default), scope, std::time::SystemTime::now(), darkmux_flow::redis_url)
 }
 
-fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
-    // (#1705) Short-TTL shared cache. The read costs ~344ms over a tailnet
-    // (measured: `XREVRANGE … COUNT 10000` against the hub), and the viewer
-    // polls `/runs` and `/flow-missions` on a timer — so without this the
-    // fleet half would tax every poll of every lens separately. #1570 made
-    // exactly this argument for `GET /flow/:date` and solved it by
-    // concurrency; these two aggregations fold the fleet records BEFORE
-    // walking the local day-files (the de-dup needs them first), so they
-    // amortize instead.
-    //
-    // The TTL is a NAMED CONSTANT, not an adaptive guess — a sampling
-    // cadence that tunes itself silently is unauditable (the observability
-    // doctrine's "cadence is a recorded knob"). 2s is well under any
-    // human-perceptible staleness in a lens that renders whole missions,
-    // and well over the poll interval it is protecting.
-    const FLEET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-    static FLEET_CACHES: [std::sync::OnceLock<std::sync::Mutex<FleetCache>>; 2] =
-        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
-    let cache = FLEET_CACHES[scope as usize].get_or_init(|| std::sync::Mutex::new(None));
-    // A stale entry is deliberately RETAINED rather than cleared: the
-    // failure path below serves it if the refresh fails.
-    // A hit inside the TTL is a SUCCESSFUL read at most `FLEET_CACHE_TTL`
-    // old, never a fallback: the failure path below deliberately leaves the
-    // cache timestamp untouched, so a stale entry can only be served after
-    // the TTL has already expired — i.e. through the `Stale` arm, never
-    // here.
-    //
-    // (#2479 audit) Wall-clock (`SystemTime`), not `Instant::elapsed()` —
-    // see [`FleetCache`]'s doc. `duration_since` returning `Err` (the
-    // system clock stepped backward since `at` was captured) is treated as
-    // NOT fresh rather than fresh: it forces exactly one extra Redis round
-    // trip and self-heals on the next call, which is the safe direction to
-    // fail in — the unsafe direction would be trusting a clock that just
-    // proved itself unreliable to also say the cache is still good.
-    if let Ok(guard) = cache.lock() {
-        if let Some((at, records)) = guard.as_ref() {
-            if wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), FLEET_CACHE_TTL) {
-                return FleetRead { records: records.clone(), state: source_state::SourceState::Ok };
-            }
-        }
-    }
-
-    let Some(url) = darkmux_flow::redis_url() else {
-        // Not a degradation — a single-machine install has no fleet
-        // substrate by design, and warning about it would be the bug.
-        return FleetRead { records: Vec::new(), state: source_state::SourceState::Off };
-    };
-    match read_flow_records_from_redis(url.expose_for_probe(), None, scope).map(|r| r.records) {
-        Ok(records) => {
-            if let Ok(mut guard) = cache.lock() {
-                *guard = Some((std::time::SystemTime::now(), records.clone()));
-            }
-            FleetRead { records, state: source_state::SourceState::Ok }
-        }
-        Err(e) => {
-            // (#1707 gate) Serve the LAST-KNOWN-GOOD snapshot rather than
-            // nothing. Returning empty would make a live remote mission
-            // VANISH from the lenses for the duration of a blip — which is
-            // precisely the "empty lens indistinguishable from an idle
-            // fleet" silence #1705 exists to kill, reintroduced for outage
-            // windows. A row that is a few seconds stale, next to a
-            // `/fleet/machines/live` heartbeat that tells the truth, beats a
-            // row that disappears.
-            //
-            // Never interpolate the url (#661 Slice 5) — it can carry an
-            // inline password.
-            let stale = cache
-                .lock()
-                .ok()
-                .and_then(|guard| guard.as_ref().map(|(at, records)| (*at, records.clone())));
-            // `detail` is one of OUR literals, never `{e}` — a Redis error can
-            // embed the connection URL, and the env tier of `redis_url()`
-            // carries an inline password. The full error goes to stderr (this
-            // process's own log); the wire gets the classification only.
-            // (#1914) Hoisted to `FLEET_READ_ERROR_DETAIL` — the snapshot
-            // round-trip below needs the SAME literal to reconstruct this
-            // state from a file without deserializing a `&'static str`.
-            const DETAIL: &str = FLEET_READ_ERROR_DETAIL;
-            match stale {
-                Some((at, records)) => {
-                    eprintln!(
-                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                         serving the last-known-good fleet snapshot ({} records) plus this \
-                         machine's own",
-                        records.len()
-                    );
-                    FleetRead {
-                        records,
-                        state: source_state::SourceState::Stale {
-                            // (#2479 audit) Wall-clock via `wall_clock_age_ms`
-                            // — see [`FleetCache`]'s doc. Unlike `Instant`,
-                            // this is not monotonic-by-construction, so the
-                            // helper's own doc covers the backward-jump case.
-                            age_ms: wall_clock_age_ms(at),
-                            detail: DETAIL,
-                        },
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                         no previous snapshot — serving this machine's records only"
-                    );
-                    FleetRead {
-                        records: Vec::new(),
-                        state: source_state::SourceState::Unavailable { detail: DETAIL },
-                    }
-                }
-            }
-        }
-    }
+/// A sync Redis connection with the connect AND every reply bounded (#278,
+/// #1570, #3217). Never interpolates `url` into the error: it can carry an
+/// inline password (#661 Slice 5); `what` names the read instead.
+///
+/// (#3217) `get_connection_with_timeout` bounds the TCP connect only: redis-rs
+/// then sends its setup commands (`CLIENT SETINFO`, `AUTH`, `SELECT`) and reads
+/// their replies with no timeout, so a hub that accepted the connection and
+/// never answered held this connect for good (measured: 300 s and counting).
+/// [`darkmux_flow::open_redis_connection_bounded`], the wall-clock-bounded
+/// connect the flow sinks already use, bounds the whole of it.
+fn bounded_redis_connection(url: &str, what: &str) -> anyhow::Result<redis::Connection> {
+    use anyhow::Context;
+    let client = redis::Client::open(url).with_context(|| format!("opening Redis client for {what}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278), the setup included: twice it,
+    // wall clock.
+    let conn = darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT)
+        .with_context(|| format!("connecting to Redis for {what}"))?;
+    // (#1570) The connect above is bounded; the reads after it were not.
+    // This is the exact read that took 30s and 408'd the viewer.
+    bound_redis_response(&conn);
+    Ok(conn)
 }
 
 /// (#1570) Apply the per-command response deadline to a freshly obtained
@@ -4505,16 +4433,7 @@ fn read_flow_records_from_redis(
     // NOTE: never interpolate `url` into a log/error — it may carry an inline
     // password (the env-URL tier). Use the non-secret `{date}` for context.
     // (#661 Slice 5 — sealing a pre-existing raw-URL log the audit flagged.)
-    let client = redis::Client::open(url)
-        .with_context(|| format!("opening Redis client for /flow aggregation (date {date_label})"))?;
-    // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
-    // must not wedge the HTTP handler thread for the OS default 75s.
-    let mut conn = client
-        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to Redis for /flow aggregation (date {date_label})"))?;
-    // (#1570) The connect above is bounded; the XREVRANGE below was not. This
-    // is the exact read that took 30s and 408'd the viewer.
-    bound_redis_response(&conn);
+    let mut conn = bounded_redis_connection(url, &format!("/flow aggregation (date {date_label})"))?;
     let stream = darkmux_types::config_access::redis_stream(); // (#875)
     let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
     // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
@@ -5643,3 +5562,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+/// The realistic fleet stream the #3217 tests and measurements share.
+#[cfg(test)]
+#[path = "../tests/support/fleet_fixture.rs"]
+mod fleet_fixture;

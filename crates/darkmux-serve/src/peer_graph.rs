@@ -169,7 +169,7 @@ fn classify_peer(owner: &str, roster: &FleetRoster, live_machines: &HashSet<Stri
 pub(crate) fn try_peer_graph(
     mission_id: &str,
     flows_dir: &StdPath,
-    fleet_records: &[serde_json::Value],
+    fleet_records: impl Into<crate::FleetRecords>,
     already_relayed: bool,
 ) -> Option<serde_json::Value> {
     if already_relayed {
