@@ -1795,6 +1795,79 @@ pub(crate) mod tests {
         FakePeer::serve(vec![(darkmux_fleet::CARD_PATH, status, body)])
     }
 
+    /// (#3220) [`Scripted`], except that `dead` is asked for its card for
+    /// real, at an address that drops the TCP handshake (no answer, no RST):
+    /// a dual-booted laptop whose other OS is running, or a sleeping one.
+    struct WithBlackholedPeer {
+        scripted: Scripted,
+        dead: &'static str,
+    }
+
+    impl FleetSources for WithBlackholedPeer {
+        fn gathered_by(&self) -> GatheredBy {
+            self.scripted.gathered_by()
+        }
+        fn local_identity(&self) -> LocalIdentity {
+            self.scripted.local_identity()
+        }
+        fn roster(&self) -> Result<crate::ResolvedRoster, &'static str> {
+            self.scripted.roster()
+        }
+        fn presence(&self) -> (Vec<PresenceBeat>, SourceState) {
+            self.scripted.presence()
+        }
+        fn hub_time_ms(&self) -> Option<u64> {
+            self.scripted.hub_time_ms()
+        }
+        fn local_card(&self) -> MachineCard {
+            self.scripted.local_card()
+        }
+        fn verify_peer(&self, entry: &MachineEntry) -> Result<SettledTarget, UnreachableReason> {
+            if entry.id == self.dead {
+                return Ok(darkmux_fleet::unverified_target_for_test(darkmux_fleet::BLACKHOLE_ADDR_FOR_TEST));
+            }
+            self.scripted.verify_peer(entry)
+        }
+        fn fetch_card(&self, target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
+            if entry.id == self.dead {
+                return fetch_listener_card(target, entry, known_version);
+            }
+            self.scripted.fetch_card(target, entry, known_version)
+        }
+    }
+
+    /// (#3220) The promise: a peer that cannot be reached costs the view at
+    /// most its own card bound, and every other card renders. Before the fix
+    /// the dead peer held the gather ~30 s (ureq's default connect timeout),
+    /// the daemon's whole request budget, so `/fleet/view` answered 408 and
+    /// every card read "checking...". The gather runs on a thread so a
+    /// regression fails within seconds, not after 30 s.
+    #[test]
+    fn a_blackholed_peer_reads_unreachable_within_its_bound_and_the_rest_render() {
+        let scripted = scripted(identity("laptop", None, None), vec![entry("darkbook"), entry("studio")]);
+        peer_says(&scripted, "studio", 0, available("studio"), AcceptsState::Unknown);
+        let src = WithBlackholedPeer { scripted, dead: "darkbook" };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(gather_view(&src, FLEET_VIEW_CACHE_TTL));
+        });
+        let bound = PEER_CARD_TIMEOUT + Duration::from_millis(1000);
+        let Ok(view) = rx.recv_timeout(bound + Duration::from_secs(2)) else {
+            panic!("the gather was still waiting on the dead peer after {:?}", started.elapsed());
+        };
+        assert!(view.gather_ms < bound.as_millis() as u64, "gather took {} ms", view.gather_ms);
+        let dead = row(&view, "darkbook");
+        assert!(
+            matches!(dead.card, CardOutcome::Unreachable { reason: UnreachableReason::ListenerOff, .. }),
+            "{:?}",
+            dead.card
+        );
+        assert!(dead.fetch_ms.is_some_and(|ms| ms < bound.as_millis() as u64), "{:?}", dead.fetch_ms);
+        let CardOutcome::Available { card, .. } = &row(&view, "studio").card else { panic!("studio's card renders") };
+        assert_eq!(card.specs.machine_id.as_deref(), Some("studio"));
+    }
+
     fn reason_of(f: &Fetched) -> UnreachableReason {
         match &f.outcome {
             CardOutcome::Unreachable { reason, .. } => *reason,
