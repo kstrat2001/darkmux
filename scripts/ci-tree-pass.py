@@ -125,7 +125,7 @@ def lookup(kind, workflow_path):
                 runs[rid] = _api(f"repos/{repo}/actions/runs/{rid}")
         evidence = trusted_evidence(arts, runs, workflow_path, name)
     except Exception as e:  # noqa: BLE001 -- any failure means: run the steps
-        print(f"::warning::tree-pass lookup failed ({e}); running the full job")
+        print(f"::warning::tree-pass lookup failed ({e}); treating it as a miss")
         evidence = None
     if evidence:
         _output(hit="true", evidence=evidence)
@@ -135,7 +135,7 @@ def lookup(kind, workflow_path):
         )
     else:
         _output(hit="false", evidence="")
-        print(f"no trusted record for tree {tree} ({kind}); running the full job")
+        print(f"no trusted record for tree {tree} ({kind}): a miss")
 
 
 def record(kind, out_dir):

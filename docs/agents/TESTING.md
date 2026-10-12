@@ -106,6 +106,12 @@ For a red CI run, `scripts/ci-failures.py <run-id>` prints only the failing
 tests' blocks, with their panic messages and the summary, instead of the job
 log: one measured run went from 12,183 log lines to 4.
 
+**A green long job may be a skip (#3137).** `ci.yml`'s macOS build + test +
+lint and both `release-verify.yml` jobs record the tree they passed
+(`scripts/ci-tree-pass.py`); a later run over an identical tree (main after a
+squash, a re-dispatch) skips its heavy steps, and its summary names the run that
+is the evidence. Read that run, not the skip, when you need the test output.
+
 ## Releasing — the gate, and where the steps live
 
 **Cutting a release? Invoke the `darkmux-point-release` skill and follow it.
