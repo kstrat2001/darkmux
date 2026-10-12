@@ -224,33 +224,19 @@ fn read_linux_meminfo_gb() -> Option<u32> {
     None
 }
 
-/// Stable per-machine hardware identity — the macOS `IOPlatformUUID`
-/// (`ioreg -rd1 -c IOPlatformExpertDevice`). Survives renames, hostname
-/// changes, and OS reinstalls; only a logic-board swap resets it. This is the
-/// canonical machine IDENTITY (#640), distinct from the operator-set display
-/// label. `None` off Mac or if `ioreg` is unavailable — callers treat that as
-/// *unknown identity* and never fall back to a name string.
+/// Stable per-install identity (#640: the IDENTITY, distinct from the
+/// operator-set display label), from the platform strategy
+/// (`darkmux_platform::Platform::machine_uid`): the `IOPlatformUUID` on macOS
+/// (survives renames and OS reinstalls; only a logic-board swap resets it),
+/// `/etc/machine-id` on Linux (new on a reinstall). `None` where the platform
+/// has none to read: callers treat that as *unknown identity* and never fall
+/// back to a name string.
 ///
-/// Cached: the `ioreg` shell-out runs once per process (the uid is immutable
-/// for the process lifetime), so this is cheap to call per record / per
-/// heartbeat.
+/// Cached: the probe runs once per process (the uid is immutable for the
+/// process lifetime), so this is cheap to call per record / per heartbeat.
 pub fn machine_uid() -> Option<&'static str> {
     static UID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    UID.get_or_init(probe_machine_uid).as_deref()
-}
-
-fn probe_machine_uid() -> Option<String> {
-    if std::env::consts::OS != "macos" {
-        return None;
-    }
-    let out = Command::new("ioreg")
-        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_io_platform_uuid(&String::from_utf8_lossy(&out.stdout))
+    UID.get_or_init(|| darkmux_platform::current().machine_uid()).as_deref()
 }
 
 /// One-line `"<cpu brand> · <N> GB"` hardware summary for THIS machine —
@@ -315,50 +301,9 @@ fn probe_cpu_brand() -> Option<String> {
     }
 }
 
-/// Pull the `IOPlatformUUID` value out of `ioreg -rd1 -c
-/// IOPlatformExpertDevice` output (a line shaped like
-/// `    "IOPlatformUUID" = "XXXXXXXX-...."`). Pure — testable without
-/// shelling out.
-fn parse_io_platform_uuid(ioreg_output: &str) -> Option<String> {
-    for line in ioreg_output.lines() {
-        // Match the quoted key so a hypothetical sibling like
-        // `"IOPlatformUUIDExtra"` can't grab the value.
-        if line.contains("\"IOPlatformUUID\"") {
-            if let Some(eq) = line.find('=') {
-                let uuid = line[eq + 1..].trim().trim_matches('"').trim();
-                if !uuid.is_empty() {
-                    return Some(uuid.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_io_platform_uuid_from_sample() {
-        let sample = r#"
-    "IOPlatformUUID" = "00000000-0000-4000-8000-ABCDEF000009"
-    "IOPlatformSerialNumber" = "C02XYZ123"
-"#;
-        assert_eq!(
-            parse_io_platform_uuid(sample).as_deref(),
-            Some("00000000-0000-4000-8000-ABCDEF000009")
-        );
-    }
-
-    #[test]
-    fn parse_uuid_none_when_absent() {
-        assert_eq!(parse_io_platform_uuid("no uuid here\nother stuff"), None);
-        // An empty value must NOT leak as Some("") — the #640 contract hinges
-        // on None-vs-name, so an empty identity would be a silent downstream
-        // bug (treated as a valid-but-blank machine).
-        assert_eq!(parse_io_platform_uuid("\"IOPlatformUUID\" = \"\"\n"), None);
-    }
 
     #[test]
     #[ignore]

@@ -10,4 +10,5 @@ authors = ["Kain Osterholt"]
 rust-version = "1.86"
 
 [dependencies]
+darkmux-platform = { path = "../darkmux-platform" }
 serde = { version = "1.0", features = ["derive"] }

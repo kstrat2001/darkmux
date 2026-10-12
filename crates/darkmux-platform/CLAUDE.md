@@ -25,4 +25,4 @@ Outside this crate, a line naming the OS (`target_os`, `consts::OS`) is allowed 
 
 ## Migration order
 
-What blocks Linux use first: container host access and container user (done; the user is overridable as `runtime.container_user`, the platform answering only when it is unset), then the memory snapshot (the residency planner, machine lens and scheduler read empty pools off macOS), machine uid (presence and fleet), the host probe (viewer telemetry), secrets (Keychain), service management (launchd / systemd).
+What blocks Linux use first: container host access and container user (done; the user is overridable as `runtime.container_user`, the platform answering only when it is unset), then machine uid (done: `/etc/machine-id` on Linux, one uid per install; a dual-boot Mac's two OSes are grouped as one machine by a separate hashed hardware id, not by this uid), the memory snapshot (the residency planner, machine lens and scheduler read empty pools off macOS), the host probe (viewer telemetry), secrets (Keychain), service management (launchd / systemd).
