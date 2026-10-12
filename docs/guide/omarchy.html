@@ -198,10 +198,14 @@ loginctl show-user "$USER" -p Linger      # Linger=yes</code></pre>
 for u in darkmux-serve mlx-local; do echo "$u $(systemctl --user is-enabled $u) $(systemctl --user is-active $u)"; done</code></pre>
     <p>Tailscale, Docker and SSH are system services: they start at boot whether anyone is logged in. Each line should say <code>enabled active</code>. (<code>containerd</code> shows as not enabled; Docker starts it.) A user unit made with <code>systemd-run</code> says <code>transient</code>: it doesn't survive a reboot, so write it as a unit file as above.</p>
     <h3>4. Reach it over the tailnet</h3>
-    <p>From another machine on the tailnet, by the name you gave it:</p>
+    <p>The simplest way in is Tailscale SSH: Tailscale authenticates you by your tailnet login, so there are no keys to copy to each device, and it works from a phone. On the runner:</p>
+    <pre><code>sudo tailscale set --ssh</code></pre>
+    <p>Then, from any device on the tailnet, including a phone with an SSH app (Blink Shell, Termius) and Tailscale connected, connect by the name you gave the runner, with no password or key:</p>
     <pre><code>ssh &lt;you&gt;@omarchy-book
 darkmux doctor
 systemctl --user status darkmux-serve mlx-local</code></pre>
+    <p>Depending on your tailnet's access policy, the first connection (and one every so often after) prints a <code>login.tailscale.com</code> link to approve in a browser. Plain OpenSSH works too (the runner's <code>sshd</code> already listens): add each device's public key to <code>~/.ssh/authorized_keys</code>, allow it through the firewall only on the tailnet (<code>sudo ufw allow in on tailscale0 to any port 22 proto tcp</code>), and once a key works, turn passwords off (<code>PasswordAuthentication no</code> in a file under <code>/etc/ssh/sshd_config.d/</code>).</p>
+    <p class="session-caption">Tailscale SSH verified 2026-10-12 from an iPhone on the tailnet to the M2.</p>
     <p>Its viewer is on the machine itself (<code>http://127.0.0.1:8765/</code>); from elsewhere, the fleet viewer on any other machine shows its card and runs.</p>
     <h3>5. Turn the desktop off</h3>
     <p>Omarchy logs you straight into Hyprland at boot (SDDM autologin). For a session, log out of the desktop; the next boot brings it back. To boot without it:</p>
@@ -211,7 +215,7 @@ sudo systemctl start sddm                       # the desktop now, for one sessi
     <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those over SSH instead.</p>
     <h3>6. Check it from the fleet</h3>
     <p>From another machine's fleet viewer, the card should stay live with its hardware line, and a dispatch on the runner should show in its scope. On the runner, <code>free -h</code> shows what the desktop was holding.</p>
-    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: steps 3 and 4's services, with the units above. Steps 1, 2, 5 and 6 are written from the machine's configuration (SDDM autologin, the default lid policy, linger off) and have not been run there yet; this page is updated as they are.</p>
+    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: step 3 with the units above, and step 4 by Tailscale SSH. Steps 1, 2, 5 and 6 are written from the machine's configuration (SDDM autologin, the default lid policy, linger off) and have not been run there yet; this page is updated as they are.</p>
   </div>
 </section>
 
