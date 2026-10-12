@@ -63,6 +63,7 @@ bash mlx-install.sh</code></pre>
     <p>It ends with a smoke test that names your GPU and runs a matrix multiply on it. If a download fails partway (it fetches its patches one by one from GitHub), run it again.</p>
     <h3>Pick a model that fits</h3>
     <p>The model shares memory with everything else on the machine, and its working memory (the KV cache) grows with the prompt. darkmux's role prompts alone are about 3,500 tokens. On an 8 GB M2, <code>mlx-community/Qwen3-1.7B-4bit</code> runs them; <code>Qwen3-4B-Instruct-2507-4bit</code> ran the GPU out of memory on the same prompt. With more memory, go bigger.</p>
+    <p>The GPU's limit is lower than the machine's. The Asahi Vulkan driver gives each process a GPU memory heap of half the RAM (about 3.7 GiB on 8 GB), and omarchy-mlx raises that only on machines with more than 32 GB. As the context fills the heap, generation slows sharply before it fails: on the 8 GB M2, Qwen3-1.7B decoded at 3.4 tokens/s and dropped to 0.8 at about 6,900 tokens of context, then later stopped with <code>VK_ERROR_OUT_OF_DEVICE_MEMORY</code>. Keep prompt plus output under that on 8 GB. <code>HK_SYSMEM</code> (bytes) in the server's environment raises the heap: with <code>HK_SYSMEM=5000000000</code> the same run held 3.3 tokens/s through 7,200 tokens. It is a ceiling, not a reservation, so the GPU can then take memory the rest of the machine needs; raise it only on a machine doing little else.</p>
     <h3>Serve it as a user service</h3>
     <p>A systemd user unit keeps the server up across logouts and reboots (with linger, under "Run it headless" below):</p>
     <pre><code>cat &gt; ~/.config/systemd/user/mlx-local.service &lt;&lt;'UNIT'
@@ -91,6 +92,11 @@ curl -s http://127.0.0.1:8080/v1/models</code></pre>
 "endpoints": {
   "mlx-local": { "url": "http://127.0.0.1:8080/v1", "dialect": "chat-completions-max-tokens" }
 }</code></pre>
+    <p>darkmux's utility model (radio's routing seat, and compaction of long runs) defaults to an LM Studio model. Point it at the same server instead, with the endpoint's id and a context that fits:</p>
+    <pre><code>"internal": {
+  "utility": { "id": "mlx-community/Qwen3-1.7B-4bit", "endpoint": "mlx-local", "n_ctx": 8192 }
+}</code></pre>
+    <p>No <code>lms</code> runs for it. <code>darkmux doctor</code> passes <code>lms binary</code> once nothing in <code>profiles.json</code> needs LM Studio: <code>init</code> writes LM Studio profiles (<code>fast</code>, <code>balanced</code>, <code>deep</code>), so remove those first if you have no LM Studio. <code>models loaded</code> still warns, since it asks <code>lms</code>. Compaction runs inside the container, so it also needs a runtime image released after this setting landed; with the image from an earlier release, compaction still addresses LM Studio.</p>
     <p>A role with no tools runs on the host against that endpoint, with no Docker and no LM Studio:</p>
     <pre><code>darkmux dispatch pr-reviewer --profile mlx-small "In two sentences: what is one risk of merging a change that adds a new required config field?"</code></pre>
     <p class="session-caption">Verified 2026-10-11 on a 13" M2 MacBook Pro (8 GB), omarchy-mlx v0.7.32, system Mesa 26.2.4: the dispatch returned a verdict in about a minute, the model's first load included. On 8 GB, Qwen3-4B-Instruct-2507-4bit ran the GPU out of memory on a ~3.5k-token prompt; stay at 1.7B there, or close other GPU users.</p>
@@ -277,12 +283,12 @@ brightnessctl -d apple-panel-bl set 50%    # back on</code></pre>
   <div class="wrap">
     <h2>What does not work yet</h2>
     <ul>
-      <li><strong>radio and compaction</strong> run on the utility model, which only LM Studio can serve today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
-      <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, and the Machine tab's memory gauge (pool, swap, margin) read on Linux. Battery, power and cluster MHz are next; GPU and thermal state have no Linux source yet and read "not reported". The residency planner still sees no memory pools (it only manages LM Studio models).</li>
+      <li><strong>Compaction on a local server</strong> needs the next runtime image release; radio's routing seat uses the server today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
+      <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, and the Machine tab's memory gauge (pool, swap, margin) read on Linux. Battery and cluster MHz read too. Power is next; GPU and thermal state have no Linux source yet and read "not reported". The residency planner still sees no memory pools (it only manages LM Studio models).</li>
       <li><strong>A model on an unmanaged endpoint counts as "other" memory</strong> on the Machine tab, not as darkmux's: darkmux attributes only the models it manages.</li>
       <li><strong>A role with no tools on an unmanaged endpoint</strong> runs host-side and writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet either (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
       <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
-      <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only.</li>
+      <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, warns on <code>models loaded</code> with no LM Studio, and warns on rows whose probes are macOS-only.</li>
       <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process DRM usage in <code>fdinfo</code>, so the lens shows GPU as "—".</li>
       <li><strong>The daemon's memory</strong> grows with each runs-board refresh on a fleet peer (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); cap malloc arenas as above.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
