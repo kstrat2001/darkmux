@@ -38,6 +38,12 @@ darkmux release.
 
 ### Fixed
 
+- The HUB badge and the other small chips center their letters on a phone.
+  Their padding was tuned to one font's capitals, and the viewer uses the
+  system monospace, so on a phone the letters sat low. Where the browser can
+  trim the line box to the capitals (`text-box`), the padding is symmetric and
+  the letters center in any font; other browsers keep the earlier padding.
+
 - The fleet view no longer shows a machine as online when darkmux has no
   presence evidence for it. A machine that publishes no machine id (a Linux peer
   before it reports one) lands in the "unknown" bucket; with no presence record
