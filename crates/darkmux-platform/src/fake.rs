@@ -46,4 +46,16 @@ impl Platform for FakePlatform {
     fn ram_installed_bytes(&self) -> Option<u64> {
         None
     }
+
+    fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
+        Vec::new()
+    }
+
+    fn cpu_ticks(&self) -> Option<Vec<crate::CpuTicks>> {
+        None
+    }
+
+    fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
+        None
+    }
 }

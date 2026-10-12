@@ -57,6 +57,21 @@ impl Platform for LinuxPlatform {
     fn ram_installed_bytes(&self) -> Option<u64> {
         installed_ram_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
+
+    /// `cpufreq` policies grouped into clusters by `cpu_capacity`.
+    fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
+        clusters_from_policies(read_policies())
+    }
+
+    /// `/proc/stat`'s per-CPU lines.
+    fn cpu_ticks(&self) -> Option<Vec<crate::CpuTicks>> {
+        cpu_ticks_from_stat(&read_to_string("/proc/stat")?)
+    }
+
+    /// `/proc/meminfo`.
+    fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
+        memory_from_meminfo(&read_to_string("/proc/meminfo")?)
+    }
 }
 
 /// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.
@@ -178,4 +193,107 @@ pub(crate) fn ids_from_status(status: &str) -> Option<(u32, u32)> {
             .ok()
     };
     Some((effective("Uid:")?, effective("Gid:")?))
+}
+
+/// Per-CPU ticks from `/proc/stat` (`cpuN user nice system idle iowait irq
+/// softirq ...`, in USER_HZ). `system` folds in irq and softirq and `idle`
+/// folds in iowait, so busy = user + nice + system the way mach counts it.
+/// The aggregate `cpu` line is skipped. `None` with no per-CPU line.
+pub(crate) fn cpu_ticks_from_stat(stat: &str) -> Option<Vec<crate::CpuTicks>> {
+    let ticks: Vec<crate::CpuTicks> = stat
+        .lines()
+        .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+        .filter_map(|l| {
+            let f: Vec<u64> = l
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            let at = |i: usize| f.get(i).copied().unwrap_or(0);
+            (f.len() >= 4).then(|| crate::CpuTicks {
+                user: at(0),
+                nice: at(1),
+                system: at(2) + at(5) + at(6),
+                idle: at(3) + at(4),
+            })
+        })
+        .collect();
+    (!ticks.is_empty()).then_some(ticks)
+}
+
+/// Each `cpufreq` policy's CPUs and their `cpu_capacity`.
+#[cfg(target_os = "linux")]
+fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
+    let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+        return Vec::new();
+    };
+    let mut policies: Vec<(Vec<usize>, Option<u64>)> = dir
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
+        .filter_map(|e| {
+            let cpus: Vec<usize> = std::fs::read_to_string(e.path().join("related_cpus"))
+                .ok()?
+                .split_whitespace()
+                .filter_map(|c| c.parse().ok())
+                .collect();
+            let first = *cpus.first()?;
+            let capacity =
+                std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{first}/cpu_capacity"))
+                    .ok()
+                    .and_then(|c| c.trim().parse().ok());
+            Some((cpus, capacity))
+        })
+        .collect();
+    policies.sort_by_key(|(cpus, _)| cpus.first().copied());
+    policies
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
+    Vec::new()
+}
+
+/// Clusters from `(cpus, capacity)` policies, fastest first. With more than
+/// one capacity the highest is "Performance" and the rest "Efficiency"; one
+/// kind is "CPU".
+pub(crate) fn clusters_from_policies(
+    mut policies: Vec<(Vec<usize>, Option<u64>)>,
+) -> Vec<crate::CpuClusterInfo> {
+    policies.sort_by(|a, b| b.1.cmp(&a.1));
+    let top = policies.first().and_then(|p| p.1);
+    let mixed = policies.iter().any(|p| p.1 != top);
+    policies
+        .into_iter()
+        .map(|(cpus, capacity)| crate::CpuClusterInfo {
+            name: match (mixed, capacity == top) {
+                (false, _) => "CPU",
+                (true, true) => "Performance",
+                (true, false) => "Efficiency",
+            }
+            .to_string(),
+            logical_cpus: cpus.len(),
+        })
+        .collect()
+}
+
+/// A memory snapshot from `/proc/meminfo`; `None` without `MemTotal`.
+pub(crate) fn memory_from_meminfo(meminfo: &str) -> Option<crate::MemorySnapshot> {
+    let kib = |key: &str| -> Option<u64> {
+        meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix(key))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|k| k * 1024)
+    };
+    Some(crate::MemorySnapshot {
+        capacity_bytes: kib("MemTotal:")?,
+        free_bytes: kib("MemFree:"),
+        available_bytes: kib("MemAvailable:"),
+        swap_used_bytes: kib("SwapTotal:")
+            .zip(kib("SwapFree:"))
+            .map(|(t, f)| t.saturating_sub(f)),
+    })
 }

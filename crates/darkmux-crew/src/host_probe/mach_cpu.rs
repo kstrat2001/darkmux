@@ -299,20 +299,35 @@ mod imp {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use imp::{mem_pct, per_core_ticks, perf_levels};
 
-// Non-Apple-Silicon fallback: every reader reports "not measured" rather
+// Not Apple Silicon macOS: the readings come from the platform strategy
+// (`darkmux_platform`: `/proc/stat`, `cpufreq`, `/proc/meminfo` on Linux;
+// nothing elsewhere), reported as "not measured" when it has none rather
 // than a fabricated zero. The pure helpers above stay compiled and tested
 // everywhere so the arithmetic is covered on any CI host.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn perf_levels() -> Vec<PerfLevel> {
-    Vec::new()
+    darkmux_platform::current()
+        .cpu_clusters()
+        .into_iter()
+        .enumerate()
+        .map(|(index, c)| PerfLevel { index, name: c.name, logical_cpus: c.logical_cpus })
+        .collect()
 }
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn per_core_ticks() -> Option<Vec<CoreTicks>> {
-    None
+    // The platform's counters are 64-bit; `range_busy_pct` takes deltas with
+    // `wrapping_sub` on u32, which truncation keeps correct.
+    let ticks = darkmux_platform::current().cpu_ticks()?;
+    Some(
+        ticks
+            .into_iter()
+            .map(|t| CoreTicks { user: t.user as u32, system: t.system as u32, idle: t.idle as u32, nice: t.nice as u32 })
+            .collect(),
+    )
 }
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn mem_pct() -> Option<u64> {
-    None
+    darkmux_platform::current().memory_snapshot()?.used_pct()
 }
 
 #[cfg(test)]
