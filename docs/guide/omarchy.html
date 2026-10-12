@@ -45,6 +45,7 @@ cargo install --git https://github.com/kstrat2001/darkmux --branch omarchy --loc
 ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   # ~/.cargo/bin is not on Omarchy's PATH
 darkmux --version
 darkmux init</code></pre>
+    <p class="session-caption">Verified 2026-10-12 on a 13" M2 (8 GB): the <code>cargo install --git</code> line built the branch in under four minutes with other memory users closed. <code>--version</code> may show a <code>✱</code> after the commit: cargo's checkout looks modified to the build's git probe; the build is the commit named.</p>
     <p>Re-run the <code>cargo install</code> line to update. <code>init</code> writes <code>~/.darkmux/config.json</code> and <code>profiles.json</code> and installs the agent skills. With no LM Studio it cannot fill in a worker model; the model section below adds one.</p>
   </div>
 </section>
