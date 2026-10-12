@@ -2294,6 +2294,9 @@
     #[test]
     #[serial]
     fn prepare_unmanaged_compactor_reads_the_endpoints_auth() {
+        // The credential read writes a liveness line under the state root:
+        // keep it in this test's own tree, never the operator's ~/.darkmux.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let mut reg: darkmux_types::ProfileRegistry = serde_json::from_str(
             r#"{"profiles":{},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1",
                 "auth":{"type":"bearer","key_env":"DARKMUX_TEST_3207_UTIL_KEY"}}},
