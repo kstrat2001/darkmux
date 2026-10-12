@@ -22,6 +22,11 @@ name: Release verification (full release-mode gate)
 on:
   workflow_dispatch: {}
 
+# (#3137) Each job skips when this exact tree already passed it, naming the run
+# that is the evidence in its summary; see `scripts/ci-tree-pass.py`. A release
+# often dispatches this on the release PR's branch and again on main after the
+# squash, which is the same tree.
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -57,22 +62,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Has this tree already passed?
+        id: tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-tree-pass.py lookup --kind release-verify-workspace --workflow .github/workflows/release-verify.yml
+
       - name: Install Rust stable toolchain
+        if: steps.tree.outputs.hit != 'true'
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build artifacts
+        if: steps.tree.outputs.hit != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Build release (whole workspace, no warnings allowed)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo build --workspace --release --all-targets
 
       - name: Test release (whole workspace)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo test -q --workspace --release
 
       - name: Clippy release (whole workspace, all targets, no warnings allowed)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+      - name: Record that this tree passed
+        id: rec
+        if: steps.tree.outputs.hit != 'true'
+        run: python3 scripts/ci-tree-pass.py record --kind release-verify-workspace --out "$RUNNER_TEMP/tree-pass"
+      - name: Upload the record
+        if: steps.tree.outputs.hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rec.outputs.name }}
+          path: ${{ runner.temp }}/tree-pass/record.json
+          if-no-files-found: error
+          retention-days: 30
 
   release-verify-runtime:
     name: release verify — runtime crate (macos-latest)
@@ -82,21 +111,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Has this tree already passed?
+        id: tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-tree-pass.py lookup --kind release-verify-runtime --workflow .github/workflows/release-verify.yml
+
       - name: Install Rust stable toolchain
+        if: steps.tree.outputs.hit != 'true'
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build artifacts
+        if: steps.tree.outputs.hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime
 
       - name: Build release (runtime crate, no warnings allowed)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo build --manifest-path runtime/Cargo.toml --release --all-targets
 
       - name: Test release (runtime crate)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo test -q --manifest-path runtime/Cargo.toml --release
 
       - name: Clippy release (runtime crate, all targets, no warnings allowed)
+        if: steps.tree.outputs.hit != 'true'
         run: cargo clippy --manifest-path runtime/Cargo.toml --release --all-targets -- -D warnings
+
+      - name: Record that this tree passed
+        id: rec
+        if: steps.tree.outputs.hit != 'true'
+        run: python3 scripts/ci-tree-pass.py record --kind release-verify-runtime --out "$RUNNER_TEMP/tree-pass"
+      - name: Upload the record
+        if: steps.tree.outputs.hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rec.outputs.name }}
+          path: ${{ runner.temp }}/tree-pass/record.json
+          if-no-files-found: error
+          retention-days: 30
