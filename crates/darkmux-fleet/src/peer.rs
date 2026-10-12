@@ -534,6 +534,10 @@ fn with_fleet_token(req: ureq::Request, target: &SettledTarget, token: Option<&s
 /// GET `path` from a verified target with the fleet token (when this
 /// machine has one) and `headers`. `timeout` is ONE bound on the whole
 /// request (connect, sending and reading the answer), not a per-read wait.
+/// The connect is bounded by it explicitly (#3220): ureq's agent-level
+/// connect timeout (30 s unless set) takes precedence over a request's
+/// `timeout`, so a peer that drops the handshake (a sleeping or dual-booted
+/// machine) would otherwise hold the caller 30 s whatever `timeout` says.
 pub fn fleet_get(
     target: &SettledTarget,
     path: &str,
@@ -541,7 +545,8 @@ pub fn fleet_get(
     headers: &[(&str, &str)],
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     let token = darkmux_flow::serve_token();
-    let mut req = base_agent(&target.0).build().get(&format!("{}{path}", target.base())).timeout(timeout);
+    let agent = base_agent(&target.0).timeout_connect(timeout).build();
+    let mut req = agent.get(&format!("{}{path}", target.base())).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -588,6 +593,13 @@ pub fn post_json_with_token_for_test(
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     post_json_with(target, path, body, read_timeout, Some(token))
 }
+
+/// Tests only: an address whose TCP connect is dropped, never refused (a
+/// TEST-NET-1 address, RFC 5737): what a dual-booted or sleeping roster peer
+/// looks like on the tailnet (#3220). On a network that answers it with an
+/// immediate "unreachable" instead, a test using it still passes, only faster.
+#[cfg(any(test, feature = "test-support"))]
+pub const BLACKHOLE_ADDR_FOR_TEST: &str = "http://192.0.2.1:8766";
 
 /// Tests only: a target at `base` (`http://host:port`), not verified by
 /// any provider, pinned to its host when that is an IP literal (so a test
@@ -1121,5 +1133,28 @@ mod tests {
         assert_eq!(learn("mini"), None, "`mini` is m2's learned name");
         assert_eq!(learn("MINI"), None, "a case variant of m2's learned name is refused too");
         assert_eq!(learn("studio-now").as_deref(), Some("studio-now"), "a new name is learned");
+    }
+
+    /// (#3220) A peer that drops the TCP handshake (no answer, no RST) costs
+    /// `fleet_get` its own bound, not ureq's 30 s default connect timeout,
+    /// which takes precedence over a request's `timeout`. The call runs on a
+    /// thread so a regression fails here within seconds, not after 30 s.
+    #[test]
+    fn a_blackholed_peer_fails_within_the_request_bound() {
+        let bound = Duration::from_millis(500);
+        let t = unverified_target_for_test(BLACKHOLE_ADDR_FOR_TEST);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let r = fleet_get(&t, "/x", bound, &[]);
+            let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+        });
+        let got = rx.recv_timeout(bound + Duration::from_secs(2));
+        let waited = started.elapsed();
+        let Ok(result) = got else {
+            panic!("fleet_get with a {bound:?} bound was still connecting after {waited:?}");
+        };
+        assert_eq!(result, Err(ureq::ErrorKind::ConnectionFailed), "a dropped connect reads as the listener being off");
+        assert!(waited < bound + Duration::from_millis(500), "took {waited:?} against a {bound:?} bound");
     }
 }
