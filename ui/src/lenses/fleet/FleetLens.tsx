@@ -19,13 +19,6 @@ import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machPresent, LIVE_WINDOW_MS } from "../../lib/flow";
 
-/** (#3213) A flow-only card's absence as `buildFleetCardBase` reads it. The
- *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
- *  carry presence evidence (beats and online/offline edges always carry a
- *  uid), so with none it reads `null`: standing unknown, never online. Every
- *  other machine keeps reading absent only on positive evidence. */
-export const absentOrUnknown = (present: boolean | null, m: string): boolean | null =>
-  m === NO_UID_KEY && present === null ? null : present === false;
 import { NO_UID_KEY, findUid, isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
@@ -42,6 +35,14 @@ import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { workStatusKind } from "../../components/WorkStatus";
+
+/** (#3213) A flow-only card's absence as `buildFleetCardBase` reads it. The
+ *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
+ *  carry presence evidence (beats and online/offline edges always carry a
+ *  uid), so with none it reads `null`: standing unknown, never online. Every
+ *  other machine keeps reading absent only on positive evidence. */
+export const absentOrUnknown = (present: boolean | null, m: string): boolean | null =>
+  m === NO_UID_KEY && present === null ? null : present === false;
 
 /** `sc()`. One token-class chip (value over label).
  *

@@ -403,7 +403,9 @@ function cardIdentity(
       spec,
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
-      note: null,
+      // (#3213) No card was read for it, so it gets a reason; `null` would say
+      // the card was read and the status line would claim "online".
+      note: machAbsent === null ? "it carries no machine id, so nothing can say whether it is up" : null,
       hub: false,
       servesRadio: false,
       servesProfiles: 0,

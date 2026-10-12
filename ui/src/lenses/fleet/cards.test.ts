@@ -767,7 +767,9 @@ describe("buildFleetCard", () => {
   it("(#3213) a card whose presence is unknown reads standing 'unknown', not online", () => {
     const unknown = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ null, "unknown", T_MAX);
     expect(unknown.standing).toBe("unknown");
-    expect(faceOf(unknown).status).not.toBe(CardStatus.Idle);
+    // Its status line says what is true: not online, a reason in the tooltip.
+    expect(faceOf(unknown).status).toBe(CardStatus.NotStreaming);
+    expect(statusReason(unknown.note, faceOf(unknown).status)).toBe("not streaming: it carries no machine id, so nothing can say whether it is up");
     const present = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ false, "u-live", T_MAX);
     expect(present.standing).toBe("online");
     const absent = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "u-gone", T_MAX);
