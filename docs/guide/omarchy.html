@@ -138,6 +138,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now darkmux-serve
 journalctl --user -u darkmux-serve -n 20</code></pre>
     <p>The daemon reads <code>config.json</code> once at start: after a <code>darkmux config set</code>, run <code>systemctl --user restart darkmux-serve</code>.</p>
+    <p>On a small machine, cap glibc's malloc arenas for the daemon. On a fleet peer each viewer refresh of the runs board parses the hub's whole flow stream (#3217), and glibc keeps every peak resident per thread:</p>
+    <pre><code>mkdir -p ~/.config/systemd/user/darkmux-serve.service.d
+printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=2\n' &gt; ~/.config/systemd/user/darkmux-serve.service.d/malloc.conf
+systemctl --user daemon-reload &amp;&amp; systemctl --user restart darkmux-serve</code></pre>
+    <p class="session-caption">Measured 2026-10-12 on the 8 GB M2, a peer of a hub whose stream held 10,000 records: six rounds of runs-board requests left the daemon at 558–627 MB without the cap and 226–295 MB with it (from 14 MB at start). It was 1.24 GB after a phone watched a lab run.</p>
   </div>
 </section>
 
@@ -267,6 +272,8 @@ brightnessctl -d apple-panel-bl set 50%    # back on</code></pre>
       <li><strong>A role with no tools on an unmanaged endpoint</strong> runs host-side and writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet either (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
       <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
       <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only.</li>
+      <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process DRM usage in <code>fdinfo</code>, so the lens shows GPU as "—".</li>
+      <li><strong>The daemon's memory</strong> grows with each runs-board refresh on a fleet peer (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); cap malloc arenas as above.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>
