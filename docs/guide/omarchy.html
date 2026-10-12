@@ -53,11 +53,34 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>A local model without LM Studio</h2>
-    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver, and installs <code>mlx_lm.server</code>, which serves the OpenAI chat API. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux only sends requests, and the server owns what is loaded. Install it from the Omarchy menu (Install &gt; AI) or with the project's script, then serve a model sized for your memory:</p>
-    <pre><code>~/.local/share/mlx-omarchy/venv/bin/mlx_lm.server \
-  --model mlx-community/Qwen3-1.7B-4bit --host 127.0.0.1 --port 8080 \
-  --prefill-step-size 512 --prompt-cache-size 1 --decode-concurrency 1 \
-  --chat-template-args '{"enable_thinking":false}'</code></pre>
+    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver, and installs <code>mlx_lm.server</code>, which serves the OpenAI chat API. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux only sends requests, and the server owns what is loaded. </p>
+    <h3>Install omarchy-mlx</h3>
+    <p>The Omarchy menu's entry (Install &gt; AI) checks the chip and refuses any it hasn't been tested on, a base M2 included. The project's own installer warns instead and carries on. It needs <code>openblas</code>, and installs the rest under <code>~/.local/share/mlx-omarchy</code>. Read the script before running it:</p>
+    <pre><code>sudo pacman -S --needed lapack blas openblas
+curl -fsSL https://raw.githubusercontent.com/joshuaswarren/omarchy-mlx/main/install.sh -o mlx-install.sh
+less mlx-install.sh
+bash mlx-install.sh</code></pre>
+    <p>It ends with a smoke test that names your GPU and runs a matrix multiply on it. If a download fails partway (it fetches its patches one by one from GitHub), run it again.</p>
+    <h3>Pick a model that fits</h3>
+    <p>The model shares memory with everything else on the machine, and its working memory (the KV cache) grows with the prompt. darkmux's role prompts alone are about 3,500 tokens. On an 8 GB M2, <code>mlx-community/Qwen3-1.7B-4bit</code> runs them; <code>Qwen3-4B-Instruct-2507-4bit</code> ran the GPU out of memory on the same prompt. With more memory, go bigger.</p>
+    <h3>Serve it as a user service</h3>
+    <p>A systemd user unit keeps the server up across logouts and reboots (with linger, under "Run it headless" below):</p>
+    <pre><code>cat &gt; ~/.config/systemd/user/mlx-local.service &lt;&lt;'UNIT'
+[Unit]
+Description=mlx_lm.server on 127.0.0.1:8080
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/mlx-omarchy/venv/bin/mlx_lm.server --model mlx-community/Qwen3-1.7B-4bit --host 127.0.0.1 --port 8080 --prefill-step-size 512 --prompt-cache-size 1 --decode-concurrency 1 --chat-template-args '{"enable_thinking":false}'
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now mlx-local
+curl -s http://127.0.0.1:8080/v1/models</code></pre>
+    <p>Keep the single quotes around the JSON: systemd strips double quotes from <code>ExecStart</code>, and without the single quotes the server receives <code>{enable_thinking:false}</code> and exits. The flags keep memory down on a small machine: smaller prefill steps (<code>512</code>), one cached prompt, one request at a time. <code>enable_thinking: false</code> turns off Qwen3's reasoning preamble, so a short answer stays short.</p>
     <p>Then add an endpoint and a profile to <code>~/.darkmux/profiles.json</code>:</p>
     <pre><code>"profiles": {
   "mlx-small": {
@@ -144,6 +167,51 @@ darkmux doctor
 darkmux flow note --text "hello from omarchy"</code></pre>
     <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware (<code>Apple M2 · 8 GB</code>). The daemon's log says <code>presence: heartbeat emitter started — uid=… display=…</code>. In <code>doctor</code>, expect the rows whose probes are macOS-only to warn rather than pass (RAM headroom, the host probe, the heuristics provider), and <code>lms binary</code> to fail with no LM Studio. A Redis with no password warns on <code>redis config</code>; on a password-less, tailnet-only hub that is expected. Linux has no Keychain, so a password or a fleet token comes from <code>DARKMUX_REDIS_URL</code> or <code>DARKMUX_SERVE_TOKEN</code> in the daemon's environment.</p>
     <p class="session-caption">Verified 2026-10-12: a 13" M2 on Omarchy joined a fleet hubbed on a Mac Studio over Tailscale; its note and presence reached the hub, and its card read <code>omarchy-book</code>. Taking work from other machines (fleet trust, the serve token) is not covered yet.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Optional: run it headless</h2>
+    <p>Everything above works with the desktop up. This section is optional: once the machine is on the fleet, its card and runs show in the viewer on every other machine, so it doesn't need its own screen, and it can run as a headless AI runner on your tailnet: models, Docker and darkmux running, reachable over SSH, watched from the fleet viewer.</p>
+    <p><strong>The bonus is memory.</strong> On Apple Silicon the GPU shares system memory, so the desktop (the compositor, the bar, every rendered window) comes out of the same pool as the model. Lowering the resolution saves little (a 2560&times;1600 frame is about 16 MB); not running the desktop is what counts. An example, on the 13" M2 (8 GB) this page was written on, with the Qwen3-1.7B server running:</p>
+    <table class="cfg">
+      <thead><tr><th></th><th>Available memory</th><th>Used</th></tr></thead>
+      <tbody>
+        <tr><td>Desktop up (Hyprland, the bar, a terminal)</td><td>3,628 MB</td><td>3,906 MB</td></tr>
+        <tr><td>Headless</td><td>to be measured</td><td>to be measured</td></tr>
+      </tbody>
+    </table>
+    <p class="session-caption">From <code>free -m</code>, 2026-10-12 01:49. The headless row is filled in once step 5 has been run on that machine.</p>
+    <p>Run each step in order. The first two are what keep it running; skipping them is how a headless node silently drops off the fleet.</p>
+    <h3>1. Stay awake with the lid closed (on power)</h3>
+    <p>By default closing a laptop's lid suspends it. Ignore the lid while it's on external power, and keep suspending on battery, which protects the battery:</p>
+    <pre><code>sudo mkdir -p /etc/systemd/logind.conf.d
+printf '[Login]\nHandleLidSwitchExternalPower=ignore\n' | sudo tee /etc/systemd/logind.conf.d/30-headless-lid.conf
+sudo systemctl restart systemd-logind   # may end the current desktop session</code></pre>
+    <h3>2. Keep your user services running without a login</h3>
+    <p><code>darkmux-serve</code> and <code>mlx-local</code> are user services: by default they stop when your last session ends. Linger keeps them running from boot, logged in or not:</p>
+    <pre><code>sudo loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger      # Linger=yes</code></pre>
+    <h3>3. Check every piece starts at boot</h3>
+    <pre><code>for u in tailscaled docker sshd; do echo "$u $(systemctl is-enabled $u) $(systemctl is-active $u)"; done
+for u in darkmux-serve mlx-local; do echo "$u $(systemctl --user is-enabled $u) $(systemctl --user is-active $u)"; done</code></pre>
+    <p>Tailscale, Docker and SSH are system services: they start at boot whether anyone is logged in. Each line should say <code>enabled active</code>. (<code>containerd</code> shows as not enabled; Docker starts it.) A user unit made with <code>systemd-run</code> says <code>transient</code>: it doesn't survive a reboot, so write it as a unit file as above.</p>
+    <h3>4. Reach it over the tailnet</h3>
+    <p>From another machine on the tailnet, by the name you gave it:</p>
+    <pre><code>ssh &lt;you&gt;@omarchy-book
+darkmux doctor
+systemctl --user status darkmux-serve mlx-local</code></pre>
+    <p>Its viewer is on the machine itself (<code>http://127.0.0.1:8765/</code>); from elsewhere, the fleet viewer on any other machine shows its card and runs.</p>
+    <h3>5. Turn the desktop off</h3>
+    <p>Omarchy logs you straight into Hyprland at boot (SDDM autologin). For a session, log out of the desktop; the next boot brings it back. To boot without it:</p>
+    <pre><code>sudo systemctl set-default multi-user.target    # boot to a text console; no desktop
+sudo systemctl set-default graphical.target     # undo: the desktop at boot again
+sudo systemctl start sddm                       # the desktop now, for one session</code></pre>
+    <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those over SSH instead.</p>
+    <h3>6. Check it from the fleet</h3>
+    <p>From another machine's fleet viewer, the card should stay live with its hardware line, and a dispatch on the runner should show in its scope. On the runner, <code>free -h</code> shows what the desktop was holding.</p>
+    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: steps 3 and 4's services, with the units above. Steps 1, 2, 5 and 6 are written from the machine's configuration (SDDM autologin, the default lid policy, linger off) and have not been run there yet; this page is updated as they are.</p>
   </div>
 </section>
 
