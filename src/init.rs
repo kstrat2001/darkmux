@@ -578,9 +578,12 @@ fn apply_utility_plan(text: &str, current: &str, plan: &UtilityPlan) -> Option<S
 }
 
 /// (#3207) Whether the registry text's utility binding names an unmanaged
-/// endpoint. A registry that does not parse is not (the fill goes on as before).
+/// endpoint. Parsed the way the loader parses it (#1282: a mistyped entry is
+/// quarantined, the rest stands), so a broken profile elsewhere cannot switch
+/// this guard off. A registry that does not parse at all is not (the fill
+/// goes on as before).
 fn utility_on_unmanaged_endpoint(text: &str) -> bool {
-    serde_json::from_str::<darkmux_types::ProfileRegistry>(text).is_ok_and(|mut r| {
+    darkmux_profiles::profiles::parse_registry_lenient(text).is_ok_and(|mut r| {
         r.materialize_endpoints();
         r.utility_is_unmanaged()
     })

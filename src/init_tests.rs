@@ -990,3 +990,26 @@ fn a_utility_binding_on_an_unmanaged_endpoint_is_left_alone() {
     assert_eq!(load(&env).utility_model_id(), Some(shipped_utility()), "the binding is as written");
     assert!(env.read_registry().contains("\"endpoint\": \"mlx-local\""));
 }
+
+/// (#3207 re-review) A registry the loader accepts with one entry quarantined
+/// (#1282) is the same registry to init: a mistyped profile elsewhere must not
+/// switch the guard off and let init unbind an unmanaged utility binding.
+#[test]
+fn a_utility_binding_on_an_unmanaged_endpoint_is_left_alone_beside_a_quarantined_entry() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let mut v: Value = serde_json::from_str(&example_without_placeholder()).unwrap();
+    v["endpoints"]["mlx-local"] = serde_json::json!({ "url": "http://127.0.0.1:8080/v1" });
+    v["internal"]["utility"]["endpoint"] = serde_json::json!("mlx-local");
+    v["profiles"]["broken"] = serde_json::json!({ "models": "not-a-list" });
+    let registry = serde_json::to_string_pretty(&v).unwrap();
+    env.write_registry(&registry);
+    env.lms(&[], &[]);
+    env.headroom(Some(0));
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.utility_model_unregistered_reason, None, "never unbound");
+    assert_eq!(load(&env).utility_model_id(), Some(shipped_utility()), "the binding is as written");
+    assert!(env.read_registry().contains("\"endpoint\": \"mlx-local\""));
+}
