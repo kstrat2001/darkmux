@@ -1668,18 +1668,39 @@ fn gather_residents_unknown_as(message: LedgerMessage, why: &str) -> ModelLedger
     ledger
 }
 
-/// What the kernel and process table say about the machine's memory,
-/// whatever engine holds it.
-struct MachineProbes {
+/// The ledger's memory rows: pool, swap, compressor and the margin tile.
+struct MemoryRows {
     pool: Option<PoolSnapshot>,
     swap_used_bytes: Option<u64>,
     compressor_bytes: Option<u64>,
     margin_percent: Option<u64>,
-    workers: Option<Vec<WorkerProc>>,
 }
 
-/// The machine half of a gather: every probe bounded, each failure a message.
-fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
+/// (omarchy) The memory rows from a platform snapshot: used = capacity -
+/// available, margin = available / capacity (the share free, as macOS's
+/// `kern.memorystatus_level` tile reads), no compressor reading invented.
+fn memory_rows_from_snapshot(s: &darkmux_platform::MemorySnapshot) -> MemoryRows {
+    let used_bytes = s.available_bytes.map(|a| s.capacity_bytes.saturating_sub(a));
+    let margin_percent = s
+        .available_bytes
+        .filter(|_| s.capacity_bytes > 0)
+        .map(|a| (a * 100 + s.capacity_bytes / 2) / s.capacity_bytes);
+    MemoryRows {
+        pool: Some(PoolSnapshot {
+            capacity_bytes: s.capacity_bytes,
+            used_bytes,
+            available_bytes: s.available_bytes,
+            free_bytes: s.free_bytes,
+        }),
+        swap_used_bytes: s.swap_used_bytes,
+        compressor_bytes: None,
+        margin_percent,
+    }
+}
+
+/// macOS's memory rows from its kernel counters, as the ledger has always
+/// read them.
+fn macos_memory_rows(messages: &mut Vec<LedgerMessage>) -> MemoryRows {
     // Kernel counters — ONE vm_stat read feeds the pool decomposition
     // (#1821), the compressor row, AND (unchanged) the memorystatus
     // pressure tile below.
@@ -1709,6 +1730,29 @@ fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
         messages,
     )
     .and_then(|s| s.trim().parse::<u64>().ok());
+    MemoryRows { pool, swap_used_bytes, compressor_bytes, margin_percent }
+}
+
+/// What the kernel and process table say about the machine's memory,
+/// whatever engine holds it.
+struct MachineProbes {
+    pool: Option<PoolSnapshot>,
+    swap_used_bytes: Option<u64>,
+    compressor_bytes: Option<u64>,
+    margin_percent: Option<u64>,
+    workers: Option<Vec<WorkerProc>>,
+}
+
+/// The machine half of a gather: every probe bounded, each failure a message.
+fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
+    // (omarchy) Where the platform reports memory (Linux: /proc/meminfo), it
+    // fills the pool, swap and margin rows. macOS answers nothing there, so a
+    // Mac keeps the kernel-counter path, unchanged (`macos_memory_rows`).
+    let MemoryRows { pool, swap_used_bytes, compressor_bytes, margin_percent } =
+        match darkmux_platform::current().memory_snapshot() {
+            Some(snapshot) => memory_rows_from_snapshot(&snapshot),
+            None => macos_memory_rows(messages),
+        };
 
     // LMStudio inference workers (the llmworker node processes, #1286).
     let workers = bounded_stdout(
@@ -2180,6 +2224,32 @@ pub fn render_human(ledger: &ModelLedger) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (omarchy) Where the platform reports memory (Linux), the ledger's pool,
+    /// swap and margin come from it: used = capacity - available, margin =
+    /// available / capacity. No compressor reading is invented.
+    #[test]
+    fn a_platform_memory_snapshot_fills_the_ledgers_memory_rows() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let snap = darkmux_platform::MemorySnapshot {
+            capacity_bytes: 8 * GIB,
+            free_bytes: Some(2 * GIB),
+            available_bytes: Some(5 * GIB),
+            swap_used_bytes: Some(GIB),
+        };
+        let m = memory_rows_from_snapshot(&snap);
+        assert_eq!(
+            m.pool,
+            Some(PoolSnapshot { capacity_bytes: 8 * GIB, used_bytes: Some(3 * GIB), available_bytes: Some(5 * GIB), free_bytes: Some(2 * GIB) })
+        );
+        assert_eq!(m.swap_used_bytes, Some(GIB));
+        assert_eq!(m.margin_percent, Some(63), "5 of 8 GiB available, rounded");
+        assert_eq!(m.compressor_bytes, None);
+        let bare = darkmux_platform::MemorySnapshot { capacity_bytes: 8 * GIB, free_bytes: None, available_bytes: None, swap_used_bytes: None };
+        let m = memory_rows_from_snapshot(&bare);
+        assert_eq!(m.pool.unwrap().used_bytes, None, "no available figure, no used figure");
+        assert_eq!(m.margin_percent, None);
+    }
 
     /// The probed #1286 hybrid 35B judge arch (10/40 full-attn, kv 2×256,
     /// fp16 cache — 20 KB/token).
