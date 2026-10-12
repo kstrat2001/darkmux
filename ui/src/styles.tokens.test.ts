@@ -168,7 +168,7 @@ describe("(#2863) pill text is vertically centered", () => {
     const selectors = CSS.slice(open + 1, CSS.indexOf("{", open + 1))
       .split(",")
       .map((x) => x.trim());
-    expect(selectors).toEqual([".wstatus", ".eventlog__chip", ".modelrow__tag", ".eventlog__qcount", ".signal__count", ".rv__chip"]);
+    expect(selectors).toEqual([".wstatus", ".eventlog__chip", ".modelrow__tag", ".eventlog__qcount", ".signal__count", ".rv__chip", ".chip--sm"]);
     expect(CSS.slice(open, CSS.indexOf("}", open))).toMatch(/text-box:\s*trim-both cap alphabetic/);
   });
 });
