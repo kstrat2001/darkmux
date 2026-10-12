@@ -289,3 +289,42 @@ fn this_linux_machine_names_its_chip() {
         }
     }
 }
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Linux reports usable memory (`MemTotal`), less than what is installed:
+/// firmware and the kernel keep a share. Rounded UP to a whole GiB, it reads
+/// as the machine is sold, the way macOS's `hw.memsize` does.
+#[test]
+fn linux_installed_ram_rounds_memtotal_up_to_a_whole_gib() {
+    let m2_8gb = "MemTotal:        7715696 kB\nMemFree:          823140 kB\n";
+    assert_eq!(
+        crate::linux::installed_ram_from_meminfo(m2_8gb),
+        Some(8 * GIB)
+    );
+    let exact = format!("MemTotal: {} kB\n", 16 * 1024 * 1024);
+    assert_eq!(
+        crate::linux::installed_ram_from_meminfo(&exact),
+        Some(16 * GIB),
+        "a whole GiB stays put"
+    );
+    assert_eq!(
+        crate::linux::installed_ram_from_meminfo("MemFree: 1 kB\n"),
+        None
+    );
+}
+
+#[test]
+fn macos_installed_ram_is_hw_memsize() {
+    assert_eq!(crate::macos::parse_memsize("8589934592\n"), Some(8 * GIB));
+    assert_eq!(crate::macos::parse_memsize("not a number"), None);
+    assert_eq!(OtherPlatform.ram_installed_bytes(), None);
+}
+
+#[test]
+fn this_linux_machine_reports_installed_ram() {
+    if std::env::consts::OS == "linux" {
+        let ram = LinuxPlatform.ram_installed_bytes().expect("/proc/meminfo");
+        assert_eq!(ram % GIB, 0, "a whole GiB");
+    }
+}

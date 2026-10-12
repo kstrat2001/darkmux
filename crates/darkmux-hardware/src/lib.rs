@@ -257,8 +257,7 @@ pub fn spec_summary() -> Option<String> {
     SUMMARY
         .get_or_init(|| {
             let brand = probe_cpu_brand()?;
-            let total_ram_gb = detect().total_ram_gb;
-            Some(format_spec_summary(&brand, total_ram_gb))
+            Some(format_spec_summary(&brand, ram_installed_gb()))
         })
         .clone()
 }
@@ -274,12 +273,24 @@ fn format_spec_summary(cpu_brand: &str, total_ram_gb: u32) -> String {
     }
 }
 
-/// CPU brand string (`sysctl machdep.cpu.brand_string`, e.g. `"Apple M5
-/// Max"`). macOS only; `None` elsewhere or on any probe failure — mirrors
-/// `darkmux-serve::read_cpu_brand`'s shape (that copy stays local to the
-/// `/machine/specs` handler; this one is the presence-beat's source).
+/// The presence beat's CPU half, owned: [`cpu_brand`].
 fn probe_cpu_brand() -> Option<String> {
     cpu_brand().map(str::to_string)
+}
+
+/// This machine's installed memory in bytes, for DISPLAY: the fleet card's
+/// `· 8 GB` and `/machine/specs`. From the platform strategy
+/// (`hw.memsize` on macOS; on Linux `MemTotal` rounded up to a whole GiB,
+/// since the kernel reports only what it can use). Never a planning budget:
+/// [`detect`]'s `total_ram_gb` stays the usable figure. Cached per process.
+pub fn ram_installed_bytes() -> Option<u64> {
+    static RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| darkmux_platform::current().ram_installed_bytes())
+}
+
+/// [`ram_installed_bytes`] in whole GiB, for the hardware line; `0` unknown.
+fn ram_installed_gb() -> u32 {
+    ram_installed_bytes().map_or(0, |b| (b / (1024 * 1024 * 1024)) as u32)
 }
 
 /// This machine's CPU name (`"Apple M2"`), from the platform strategy

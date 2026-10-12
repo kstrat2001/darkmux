@@ -22,7 +22,7 @@ crates/darkmux-lab/src/lab/cow_clone.rs 1
 crates/darkmux-lab/src/lab/sandbox_hash.rs 1
 crates/darkmux-profiles/src/gestalt_host/mac_probe.rs 9
 crates/darkmux-profiles/src/model_ledger.rs 4
-crates/darkmux-serve/src/lib.rs 5
+crates/darkmux-serve/src/lib.rs 2
 crates/darkmux-types/src/residency_lease.rs 5
 crates/darkmux-types/src/workdir.rs 2
 src/fleet_cli.rs 1

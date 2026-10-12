@@ -31,6 +31,33 @@ impl Platform for MacPlatform {
     fn cpu_brand(&self) -> Option<String> {
         parse_brand_string(&sysctl_brand_string()?)
     }
+
+    /// `sysctl hw.memsize`: the installed memory, exactly.
+    fn ram_installed_bytes(&self) -> Option<u64> {
+        parse_memsize(&sysctl_memsize()?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_memsize() -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_memsize() -> Option<String> {
+    None
+}
+
+/// `sysctl -n hw.memsize` output: installed bytes.
+pub(crate) fn parse_memsize(output: &str) -> Option<u64> {
+    output.trim().parse().ok()
 }
 
 #[cfg(target_os = "macos")]

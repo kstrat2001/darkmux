@@ -3011,7 +3011,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
     let residents = local_engine_residents();
     let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
-    let ram_total = read_ram_total_bytes();
+    let ram_total = darkmux_hardware::ram_installed_bytes();
     let ram_free = read_ram_free_for_ai_bytes();
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
@@ -3080,44 +3080,6 @@ pub fn local_utility_model(loaded_models: &[darkmux_types::LoadedModel]) -> Opti
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {
     let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
     wire::UtilityModel { id: id.to_string(), loaded, n_ctx }
-}
-
-/// Read total system RAM in bytes. macOS uses `sysctl hw.memsize` which
-/// returns the raw byte count. Linux reads `/proc/meminfo`'s
-/// `MemTotal` line. Other platforms return `None`. Sync — wrap in
-/// `spawn_blocking` for async contexts.
-fn read_ram_total_bytes() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb: u64 = rest
-                    .trim()
-                    .trim_end_matches(" kB")
-                    .trim()
-                    .parse()
-                    .ok()?;
-                return Some(kb.saturating_mul(1024));
-            }
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
 }
 
 /// Read the AI-available RAM ceiling in bytes — the same "real
