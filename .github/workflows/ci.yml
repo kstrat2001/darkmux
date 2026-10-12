@@ -123,6 +123,9 @@ jobs:
           # bundle, fixtures, docs/ENVIRONMENT.md, DESIGN.md (src/cli_json.rs
           # reads it), packaging/homebrew/darkmux-serve-wrapped (tests/cli.rs).
           # Add a path below only after checking nothing in Rust reads it.
+          # The formula and the packaging docs are excluded file by file, not
+          # as `packaging/homebrew/**`, because that would take the wrapper
+          # with them (#3137: a formula-pin PR ran this whole job).
           # `every`: a file must match ALL patterns, so each `!` line excludes.
           # (In the default `some` mode a `!` line matches every file outside
           # it: the old `'!runtime/**'` line made this job run on every PR by
@@ -135,15 +138,57 @@ jobs:
               - '!docs/agents/**'
               - '!{README.md,CONTRIBUTING.md,CHANGELOG.md,DISCLAIMER.md,SECURITY.md,LICENSE}'
               - '!docs/{ENGAGEMENTS,OPERATIONS}.md'
+              - '!packaging/homebrew/{darkmux.rb,README.md}'
+              - '!packaging/homebrew/tap-bootstrap/**'
+
+      # (#3137) Results keyed by TREE, not commit. A squash merge's commit on
+      # main has the same tree as the PR merge ref that already passed this
+      # job, so main's push run used to repeat the whole suite on code it had
+      # just tested. `scripts/ci-tree-pass.py` (its docstring has the design
+      # and the forgery guard) looks for a record that this tree passed; on a
+      # hit the heavy steps skip and the summary names the run that is the
+      # evidence. The job still reports success, so required checks are met.
+      #
+      # Two records, because the PR light gate does not run the leak check: a
+      # main push after an unlabeled PR skips tests and clippy but still runs
+      # the leak check, and records it. The nightly schedule never skips.
+      - name: Has this tree already passed tests + clippy?
+        id: tree_tests
+        if: steps.filter.outputs.rust == 'true' && github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-tree-pass.py lookup --kind build-test-lint --workflow .github/workflows/ci.yml
+
+      - name: Has this tree already passed the leak check?
+        id: tree_leak
+        if: steps.filter.outputs.rust == 'true' && github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-tree-pass.py lookup --kind leak-check --workflow .github/workflows/ci.yml
+
+      - name: Which steps run
+        id: gate
+        env:
+          RUST: ${{ steps.filter.outputs.rust }}
+          LEAK_WANTED: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          TESTS_HIT: ${{ steps.tree_tests.outputs.hit }}
+          LEAK_HIT: ${{ steps.tree_leak.outputs.hit }}
+        run: |
+          tests=false; leak=false
+          if [ "$RUST" = "true" ] && [ "$TESTS_HIT" != "true" ]; then tests=true; fi
+          if [ "$RUST" = "true" ] && [ "$LEAK_WANTED" = "true" ] && [ "$LEAK_HIT" != "true" ]; then leak=true; fi
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "leak=$leak" >> "$GITHUB_OUTPUT"
+          echo "tests+clippy: $tests, leak check: $leak"
 
       - name: Install Rust stable toolchain
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true' || steps.gate.outputs.leak == 'true'
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build artifacts
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true' || steps.gate.outputs.leak == 'true'
         uses: Swatinem/rust-cache@v2
 
       # Format check intentionally NOT enforced yet — the codebase has
@@ -163,13 +208,13 @@ jobs:
       # step after this one does. The leak check below still drives `cargo
       # test` children and reuses this step's build.
       - name: Install cargo-nextest
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
 
       - name: Test (whole workspace)
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true'
         run: cargo nextest run --workspace --profile ci
 
       # (#2896) The one doctest nextest skips: a `compile_fail` check that
@@ -177,7 +222,7 @@ jobs:
       # guard moved across threads let a second materialize tear the tree
       # down mid-read. ~6s warm.
       - name: Doc tests (nextest does not run them)
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true'
         run: cargo test -q --workspace --doc
 
       # (#2717) The execution-side isolation check. It re-runs each test
@@ -214,14 +259,41 @@ jobs:
       # introduces is caught on main right after merge, not before it. Label
       # a release candidate or a risky PR `full-ci` to get it at the gate.
       - name: Isolation leak check (each test unit under a sentinel tree)
-        if: steps.filter.outputs.rust == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci'))
+        if: steps.gate.outputs.leak == 'true'
         env:
           DARKMUX_LEAK_CHECK: "1"
         run: cargo test --test state_leak_execution_guard -- --nocapture
 
       - name: Clippy (whole workspace, all targets, no warnings allowed)
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.gate.outputs.tests == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # (#3137) The records, last, so each exists only when every step before
+      # it passed. Fork PR runs upload them too; the lookup ignores those.
+      - name: Record that this tree passed
+        id: rec_tests
+        if: steps.gate.outputs.tests == 'true'
+        run: python3 scripts/ci-tree-pass.py record --kind build-test-lint --out "$RUNNER_TEMP/tree-pass-tests"
+      - name: Upload the tests + clippy record
+        if: steps.gate.outputs.tests == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rec_tests.outputs.name }}
+          path: ${{ runner.temp }}/tree-pass-tests/record.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record that this tree passed the leak check
+        id: rec_leak
+        if: steps.gate.outputs.leak == 'true'
+        run: python3 scripts/ci-tree-pass.py record --kind leak-check --out "$RUNNER_TEMP/tree-pass-leak"
+      - name: Upload the leak check record
+        if: steps.gate.outputs.leak == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rec_leak.outputs.name }}
+          path: ${{ runner.temp }}/tree-pass-leak/record.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: No Rust-relevant changes — pipeline skipped
         if: steps.filter.outputs.rust != 'true'
@@ -978,6 +1050,12 @@ jobs:
         # (the case in it could not tell the two apart), which is why a
         # trailing-suffix case exists.
         run: python3 scripts/verify-tap-pin.py --self-test
+      - name: Tree-pass record guard self-test (#3137)
+        # The pure half of `scripts/ci-tree-pass.py`: which records may let a
+        # job skip. Every case is mutation-proven: dropping any repository,
+        # workflow-path, expiry or name check, or any part of the binding of a
+        # record to the tree its run demonstrably tested, turns it red.
+        run: python3 scripts/ci-tree-pass.py --self-test
       - name: No tracked file is one .gitignore says to ignore
         # Self-maintaining: it needs no list of its own, so it cannot drift
         # from `.gitignore` the way a second pattern list would. It catches
