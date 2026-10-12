@@ -213,7 +213,8 @@ systemctl --user status darkmux-serve mlx-local</code></pre>
     <pre><code>sudo systemctl stop sddm       # ends Hyprland and everything in it; user services keep running (linger)
 free -m                        # the memory the desktop was holding is back
 sudo systemctl start sddm      # the desktop again, for this boot</code></pre>
-    <p>A terminal and an agent can run right there in the text console, on the machine, with no desktop. To boot without the desktop every time:</p>
+    <p>A terminal and an agent can run right there in the text console, on the machine, with no desktop. Stopping SDDM lasts until the next boot, which brings the desktop back.</p>
+    <p><strong>Optional:</strong> to boot without the desktop every time, for a machine that only serves the fleet:</p>
     <pre><code>sudo systemctl set-default multi-user.target    # boot to a text console; no desktop
 sudo systemctl set-default graphical.target     # undo: the desktop at boot again
 sudo systemctl start sddm                       # the desktop now, for one session</code></pre>
