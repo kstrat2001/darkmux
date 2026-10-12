@@ -27,10 +27,27 @@ counts only when the run that produced it:
   - ran in this repository on this repository's own code
     (`head_repository_id == repository_id`: never a fork PR), and
   - ran the expected workflow file (`path`).
-Only people with write access can push a branch here, and they can already
-push workflow changes, so the guard is exactly as strong as branch access.
-An honest record also implies an identical workflow definition: the workflow
-file is part of the tree that was hashed.
+  - DEMONSTRABLY TESTED the tree its name claims, recomputed here from the
+    run's GitHub-held metadata, never from anything the run wrote
+    (`bound_to_tree()`).
+The first two are not enough on their own: anyone who can push a branch can
+open a throwaway PR whose own workflow (or script, or build.rs) uploads
+`ci-tree-pass.build-test-lint.<T>` for ANOTHER PR's merge tree T, computed
+locally with `git merge-tree`, without running a test; the artifact outlives
+the closed PR. The binding closes that: the verifier computes the tree the
+producing run tested and requires it to equal T.
+  - push, workflow_dispatch, schedule: the tree of the run's `head_sha`.
+  - pull_request: the run checked out GitHub's test merge of its base into
+    `head_sha`. The run object does not carry that merge commit, and its
+    `pull_requests[].base.sha` is NOT a snapshot (measured: it stays at the
+    PR's first base after main moves). So the verifier takes the base branch's
+    newest commits as of the run's `created_at` (merge ref is computed before
+    the run is created) and requires `git merge-tree <base> <head_sha>` == T
+    for one of them. Exactly one associated PR, or a miss.
+A record whose name tree differs from its run's tested tree then forges
+nothing: to bind, T must be a tree containing the producing head's own
+changes, and a head that skipped its tests via an edited workflow carries
+that edit into T.
 
 Usage (in a job; GH_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT set):
   ci-tree-pass.py lookup --kind K --workflow .github/workflows/ci.yml
@@ -39,7 +56,7 @@ Usage (in a job; GH_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT set):
       -> writes DIR/record.json; GITHUB_OUTPUT: name=ci-tree-pass.K.<tree>
   ci-tree-pass.py --self-test
 
-Any API error is a MISS: the job runs its steps. Failing open to work is safe;
+Any API or git error, an unknown event, or anything ambiguous is a MISS: the job runs its steps. Failing open to work is safe;
 failing open to a skip would not be.
 """
 import json
@@ -55,11 +72,48 @@ def artifact_name(kind: str, tree: str) -> str:
     return f"{PREFIX}.{kind}.{tree}"
 
 
-def trusted_evidence(artifacts, runs_by_id, workflow_path, name):
+BASE_CANDIDATES = 3
+SHA_EVENTS = ("push", "workflow_dispatch", "schedule")
+
+
+def bound_to_tree(run, tree, commit_tree, base_candidates, merge_tree, pr_base_refs):
+    """True only when `run` demonstrably tested `tree` (see the docstring).
+
+    The three callables read GitHub-held state: `commit_tree(sha)` is the tree
+    of a commit, `base_candidates(ref, until)` the newest commits on `ref` at
+    or before `until`, `merge_tree(base, head)` the clean merge tree or None,
+    `pr_base_refs(sha)` the base refs of the PRs GitHub associates with a
+    commit. That last one is needed because a run's own `pull_requests` is
+    EMPTIED once its PR merges (measured on #3223's run 38206242193), which is
+    exactly when main's push run looks the record up.
+    Any exception they raise is the caller's miss.
+    """
+    head = run.get("head_sha")
+    event = run.get("event")
+    if event in SHA_EVENTS:
+        return commit_tree(head) == tree
+    if event == "pull_request":
+        prs = run.get("pull_requests") or []
+        refs = [(pr.get("base") or {}).get("ref") for pr in prs] or pr_base_refs(head)
+        if len(refs) != 1:
+            return False
+        base_ref = refs[0]
+        created = run.get("created_at")
+        if not base_ref or not created:
+            return False
+        for base in base_candidates(base_ref, created)[:BASE_CANDIDATES]:
+            if merge_tree(base, head) == tree:
+                return True
+        return False
+    return False
+
+
+def trusted_evidence(artifacts, runs_by_id, workflow_path, name, bound=lambda run: False):
     """Return the html_url of the newest run whose record counts, else None.
 
     `artifacts` is the API's `artifacts` list for `name`, newest first;
-    `runs_by_id` maps run id -> the API's workflow run object.
+    `runs_by_id` maps run id -> the API's workflow run object; `bound(run)`
+    says whether that run demonstrably tested the tree in `name`.
     """
     for art in artifacts:
         if art.get("name") != name or art.get("expired"):
@@ -76,6 +130,12 @@ def trusted_evidence(artifacts, runs_by_id, workflow_path, name):
         if (run.get("repository") or {}).get("id") != repo_id:
             continue
         if run.get("path") != workflow_path:
+            continue
+        try:
+            if not bound(run):
+                continue
+        except Exception as e:  # noqa: BLE001 -- unverifiable is a miss
+            print(f"rejected: run {run.get('html_url')} could not be verified ({e})")
             continue
         return run.get("html_url")
     return None
@@ -98,6 +158,25 @@ def _tree():
     return subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
 
 
+def _merge_tree(base, head):
+    """The clean merge tree of `base` into `head`, or None (conflict, error).
+
+    Fetches both commits with enough history to find their merge base; a
+    shallow cut that hides it makes git refuse or disagree, which is a miss.
+    """
+    subprocess.run(
+        ["git", "fetch", "-q", "--no-tags", "--depth=50", "origin", base, head],
+        check=True, timeout=120,
+    )
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree", base, head],
+        capture_output=True, text=True, timeout=120,
+    )
+    if out.returncode != 0:
+        return None
+    return out.stdout.splitlines()[0].strip()
+
+
 def _output(**kv):
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         for k, v in kv.items():
@@ -116,6 +195,25 @@ def lookup(kind, workflow_path):
     tree = _tree()
     name = artifact_name(kind, tree)
     repo = os.environ["GITHUB_REPOSITORY"]
+    arts = []
+
+    def bound(run):
+        ok = bound_to_tree(
+            run, tree,
+            commit_tree=lambda sha: _api(f"repos/{repo}/git/commits/{sha}")["tree"]["sha"],
+            base_candidates=lambda ref, until: [
+                c["sha"] for c in _api(
+                    f"repos/{repo}/commits?sha={ref}&until={until}&per_page={BASE_CANDIDATES}")
+            ],
+            merge_tree=_merge_tree,
+            pr_base_refs=lambda sha: [
+                pr["base"]["ref"] for pr in _api(f"repos/{repo}/commits/{sha}/pulls")
+            ],
+        )
+        if not ok:
+            print(f"rejected: run {run.get('html_url')} ({run.get('event')}) did not test tree {tree}")
+        return ok
+
     try:
         arts = _api(f"repos/{repo}/actions/artifacts?name={name}&per_page=100")["artifacts"]
         runs = {}
@@ -123,7 +221,7 @@ def lookup(kind, workflow_path):
             rid = (art.get("workflow_run") or {}).get("id")
             if rid is not None and rid not in runs:
                 runs[rid] = _api(f"repos/{repo}/actions/runs/{rid}")
-        evidence = trusted_evidence(arts, runs, workflow_path, name)
+        evidence = trusted_evidence(arts, runs, workflow_path, name, bound=bound)
     except Exception as e:  # noqa: BLE001 -- any failure means: run the steps
         print(f"::warning::tree-pass lookup failed ({e}); treating it as a miss")
         evidence = None
@@ -135,7 +233,8 @@ def lookup(kind, workflow_path):
         )
     else:
         _output(hit="false", evidence="")
-        print(f"no trusted record for tree {tree} ({kind}): a miss")
+        print(f"{len(arts)} record(s) named for tree {tree} ({kind}), none from a run "
+              "that demonstrably tested it: a miss")
 
 
 def record(kind, out_dir):
@@ -160,6 +259,7 @@ def record(kind, out_dir):
 REPO = 100
 FORK = 200
 WF = ".github/workflows/ci.yml"
+T = "abc"
 NAME = "ci-tree-pass.build-test-lint.abc"
 
 
@@ -173,9 +273,14 @@ def _run(rid, head=REPO, repo=REPO, path=WF):
             "repository": {"id": repo}, "head_repository": {"id": head}}
 
 
+def _yes(_run):
+    return True
+
+
 SELF_TEST_CASES = [
-    # (artifacts, runs, expected evidence, why)
-    ([_art(1)], {1: _run(1)}, "run/1", "a same-repo record counts"),
+    # (artifacts, runs, expected evidence, why) -- repository/path/name guards,
+    # with the tree binding held true so each guard is tested on its own.
+    ([_art(1)], {1: _run(1)}, "run/1", "a same-repo, bound record counts"),
     ([], {}, None, "no record is a miss"),
     ([_art(1, head=FORK)], {1: _run(1, head=FORK)}, None,
      "a fork PR's record never counts (it controls its workflow file)"),
@@ -197,16 +302,86 @@ SELF_TEST_CASES = [
 ]
 
 
+# Tree binding. Commits: H_OK has tree T; H_EVIL (a branch whose own workflow
+# uploaded a record NAMED for T) has tree "evil". Merges: base B1 into H_OK is
+# T; anything into H_EVIL is "evil+..." (its own edit rides along).
+COMMIT_TREES = {"H_OK": T, "H_EVIL": "evil"}
+MERGES = {("B1", "H_OK"): T, ("B0", "H_OK"): "older", ("B1", "H_EVIL"): "evil+b1"}
+
+
+def _bt(**run):
+    run.setdefault("created_at", "2026-10-12T05:00:00Z")
+    return run
+
+
+def _pr(head, base_ref="main", n=1):
+    return _bt(event="pull_request", head_sha=head,
+               pull_requests=[{"base": {"ref": base_ref, "sha": "STALE"}}] * n)
+
+
+def _raise(*_a):
+    raise RuntimeError("api down")
+
+
+BIND_CASES = [
+    # (run, base candidates, expected, why)
+    (_bt(event="push", head_sha="H_OK"), ["B1"], True, "an honest push run that tested T binds"),
+    (_bt(event="schedule", head_sha="H_OK"), ["B1"], True, "a scheduled run binds by its head's tree"),
+    (_bt(event="push", head_sha="H_EVIL"), ["B1"], False,
+     "(a) a record named for T from a run whose head tree is not T is a miss"),
+    (_bt(event="workflow_dispatch", head_sha="H_EVIL"), ["B1"], False,
+     "(b) a dispatch on another branch whose head tree is not T is a miss"),
+    (_bt(event="workflow_dispatch", head_sha="H_OK"), ["B1"], True,
+     "a dispatch whose head tree is T binds"),
+    (_pr("H_OK"), ["B1", "B0"], True, "(c) an honest PR run: its base merged into its head is T"),
+    (_pr("H_OK"), ["B2", "B1"], True, "the base may be one of the newest few at run creation"),
+    (_pr("H_OK"), ["B0"], False, "a PR run whose merge with every candidate base is not T is a miss"),
+    (_pr("H_EVIL"), ["B1"], False,
+     "(a) a throwaway PR naming another PR's merge tree is a miss"),
+    (_pr("H_OK", n=0), ["B1"], True,
+     "a merged PR's run (its pull_requests emptied) binds through the commit's PR"),
+    (_pr("H_OK", n=2), ["B1"], False, "a PR run with two associated PRs is ambiguous: a miss"),
+    (dict(_pr("H_OK", n=0), _assoc=[]), ["B1"], False,
+     "a PR run with no PR on the run or the commit is a miss"),
+    (dict(_pr("H_OK", n=0), _assoc=["main", "ui/port"]), ["B1"], False,
+     "a commit in two PRs is ambiguous: a miss"),
+    (_pr("H_OK", base_ref=""), ["B1"], False, "a PR run with no base ref is a miss"),
+    (_bt(event="pull_request_target", head_sha="H_OK"), ["B1"], False, "an unknown event is a miss"),
+    (_bt(event="push"), ["B1"], False, "a run with no head sha is a miss"),
+    (_bt(event="pull_request", head_sha="H_OK", pull_requests=[{"base": {"ref": "main"}}],
+         created_at=""), ["B1"], False, "a PR run with no creation time is a miss"),
+    (_pr("H_OK"), ["B0", "B0", "B0", "B1"], False,
+     "only the newest few bases are candidates, not all of history"),
+]
+
+
 def self_test() -> int:
     failures = []
     for arts, runs, want, why in SELF_TEST_CASES:
-        got = trusted_evidence(arts, runs, WF, NAME)
+        got = trusted_evidence(arts, runs, WF, NAME, bound=_yes)
         if got != want:
             failures.append(f"  want {want!r}, got {got!r}: {why}")
+    for run, bases, want, why in BIND_CASES:
+        got = bound_to_tree(
+            run, T,
+            commit_tree=lambda sha: COMMIT_TREES.get(sha),
+            base_candidates=lambda ref, until, b=bases: list(b),
+            merge_tree=lambda base, head: MERGES.get((base, head)),
+            pr_base_refs=lambda sha, r=run: r.get("_assoc", ["main"]),
+        )
+        if got != want:
+            failures.append(f"  want {want!r}, got {got!r}: {why}")
+    # Unbound and unverifiable records are misses end to end.
+    for bound, why in [(lambda r: False, "an unbound record is a miss"),
+                       (_raise, "a verifier error is a miss, never a skip")]:
+        got = trusted_evidence([_art(1)], {1: _run(1)}, WF, NAME, bound=bound)
+        if got is not None:
+            failures.append(f"  want None, got {got!r}: {why}")
+    total = len(SELF_TEST_CASES) + len(BIND_CASES) + 2
     if failures:
         print("tree-pass self-test FAILED:\n" + "\n".join(failures))
         return 1
-    print(f"tree-pass self-test passed: {len(SELF_TEST_CASES)} cases")
+    print(f"tree-pass self-test passed: {total} cases")
     return 0
 
 

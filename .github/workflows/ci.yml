@@ -1044,7 +1044,8 @@ jobs:
       - name: Tree-pass record guard self-test (#3137)
         # The pure half of `scripts/ci-tree-pass.py`: which records may let a
         # job skip. Every case is mutation-proven: dropping any repository,
-        # workflow-path, expiry or name check turns it red.
+        # workflow-path, expiry or name check, or any part of the binding of a
+        # record to the tree its run demonstrably tested, turns it red.
         run: python3 scripts/ci-tree-pass.py --self-test
       - name: No tracked file is one .gitignore says to ignore
         # Self-maintaining: it needs no list of its own, so it cannot drift
