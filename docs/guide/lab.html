@@ -78,7 +78,7 @@
 
     <h3>Cross-layer telemetry (always-on)</h3>
     <p>Cross-layer telemetry is captured automatically (#557): no flag, no sidecar file. The internal runtime and dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events. That's useful for diagnosing where wall-clock latency is concentrated.</p>
-    <p>View it in the daemon's observability viewer: run <code>darkmux serve</code> and open <code>http://localhost:8765/</code>. The viewer reads live flow records straight from the daemon. A demo instance lives at <a href="../../demo/">darkmux.com/demo</a>.</p>
+    <p>View it in the daemon's observability viewer: run <code>darkmux serve</code> and open <code>http://localhost:8765/</code>. The viewer reads live flow records straight from the daemon. A demo instance lives at <a href="../demo/">darkmux.com/demo</a>.</p>
   </div>
 </section>
 
