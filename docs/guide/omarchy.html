@@ -159,9 +159,9 @@ sudo tailscale set --operator=$USER     # tailscale status / ping without sudo
 sudo tailscale up                       # prints a login URL
 tailscale ping &lt;hub's tailnet address&gt;</code></pre>
     <h3>Name it for the OS, especially on a dual-boot Mac</h3>
-    <p>Asahi installs alongside macOS, so one Mac can boot either. darkmux treats each install as its own machine: macOS identifies itself by its <code>IOPlatformUUID</code>, which Linux cannot read, and Linux by its <code>/etc/machine-id</code>. So the same laptop is two machines in the fleet, one per OS, never online together. Give the Linux side its own name with <em>omarchy</em> in it, on the tailnet and in darkmux, so each card says which OS it is; otherwise Tailscale names the second install <code>&lt;name&gt;-1</code>.</p>
-    <pre><code>sudo tailscale set --hostname omarchy-book
-darkmux config set machine_id omarchy-book</code></pre>
+    <p>Asahi installs alongside macOS, so one Mac can boot either. darkmux treats each install as its own machine: macOS identifies itself by its <code>IOPlatformUUID</code>, which Linux cannot read, and Linux by its <code>/etc/machine-id</code>. So the same laptop is two machines in the fleet, one per OS, never online together. Give the Linux side its own name with <em>omarchy</em> in it, on the tailnet and in darkmux, so each card says which OS it is; otherwise Tailscale names the second install <code>&lt;name&gt;-1</code>. The rest of this page calls that name <code>&lt;runner&gt;</code> (for example <code>laptop-omarchy</code>).</p>
+    <pre><code>sudo tailscale set --hostname &lt;runner&gt;
+darkmux config set machine_id &lt;runner&gt;</code></pre>
     <p>Showing one dual-boot laptop as one card, labeled with whichever OS is running, is planned (<a href="https://github.com/kstrat2001/darkmux/issues/3212">#3212</a>).</p>
     <h3>Point it at the hub</h3>
     <pre><code>darkmux config set fleet.mode peer
@@ -170,18 +170,18 @@ darkmux config set redis.host &lt;hub's tailnet address&gt;
 systemctl --user restart darkmux-serve
 darkmux doctor
 darkmux flow note --text "hello from omarchy"</code></pre>
-    <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware (<code>Apple M2 · 8 GB</code>). The daemon's log says <code>presence: heartbeat emitter started — uid=… display=…</code>. In <code>doctor</code>, expect the rows whose probes are macOS-only to warn rather than pass (RAM headroom, the host probe, the heuristics provider), and <code>lms binary</code> to fail with no LM Studio. A Redis with no password warns on <code>redis config</code>; on a password-less, tailnet-only hub that is expected. Linux has no Keychain, so a password or a fleet token comes from <code>DARKMUX_REDIS_URL</code> or <code>DARKMUX_SERVE_TOKEN</code> in the daemon's environment.</p>
+    <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware (for example <code>Apple M2 · 8 GB</code>). The daemon's log says <code>presence: heartbeat emitter started — uid=… display=…</code>. In <code>doctor</code>, expect the rows whose probes are macOS-only to warn rather than pass (RAM headroom, the host probe, the heuristics provider), and <code>lms binary</code> to fail with no LM Studio. A Redis with no password warns on <code>redis config</code>; on a password-less, tailnet-only hub that is expected. Linux has no Keychain, so a password or a fleet token comes from <code>DARKMUX_REDIS_URL</code> or <code>DARKMUX_SERVE_TOKEN</code> in the daemon's environment.</p>
     <h3>See the hub: the roster and the fleet token</h3>
     <p>Records flowing to the hub isn't the same as this machine knowing the other machines. Its own view lists only the machines in its roster (<code>darkmux machine list</code> says "single-machine fleet" until you add some), and it reads each peer's machine card from that peer's fleet listener, which refuses a request without the shared fleet token. Register the hub, and this machine, by tailnet name:</p>
     <pre><code>darkmux machine add &lt;hub's machine_id&gt; --address &lt;hub's tailnet name&gt; --description "fleet hub"
-darkmux machine add omarchy-book --address omarchy-book</code></pre>
+darkmux machine add &lt;runner&gt; --address &lt;runner&gt;</code></pre>
     <p>Give the daemon the fleet token. Linux has no Keychain, so it goes in the daemon's environment, in an owner-only systemd drop-in:</p>
     <pre><code>mkdir -p ~/.config/systemd/user/darkmux-serve.service.d &amp;&amp; (umask 077; printf '[Service]\nEnvironment=DARKMUX_SERVE_TOKEN=&lt;fleet token&gt;\n' &gt; ~/.config/systemd/user/darkmux-serve.service.d/fleet-token.conf) &amp;&amp; systemctl --user daemon-reload &amp;&amp; systemctl --user restart darkmux-serve
 darkmux machine list</code></pre>
     <p>The hub's row then shows its card (live, its loaded models and profiles) and the HUB badge, and the daemon log has no "token is missing or does not match" refusals. With the token set but this machine's own fleet listener off, it reads other machines' cards and takes no work from them: its log says <code>fleet work: token set; the fleet listener is off</code>.</p>
-    <p class="session-caption">Verified 2026-10-12: omarchy-book read the Mac Studio hub's card through its fleet listener (fleet mode hub), zero token refusals.</p>
+    <p class="session-caption">Verified 2026-10-12: an M2 runner read a Mac Studio hub's card through its fleet listener (fleet mode hub), zero token refusals.</p>
     <h3>Watch a small runner from a bigger machine's viewer</h3>
-    <p>Every machine's viewer shows the whole fleet, so watch an 8 GB runner from a bigger machine's viewer rather than its own. The runs board parses the hub's whole flow stream on each refresh (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); on the small machine, a phone watching a run pushed its daemon past 1 GB. From another machine's viewer, the runner's card still moves through PROMPT, GEN and TOOLS from the records it streams to the hub.</p>
+    <p>Every machine's viewer shows the whole fleet, so watch a small runner (8 GB, say) from a bigger machine's viewer rather than its own. The runs board parses the hub's whole flow stream on each refresh (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); on the small machine, a phone watching a run pushed its daemon past 1 GB. From another machine's viewer, the runner's card still moves through PROMPT, GEN and TOOLS from the records it streams to the hub.</p>
     <h3>Open a runner's viewer from any tailnet device</h3>
     <p>The daemon listens on <code>127.0.0.1:8765</code> only, and darkmux won't bind it elsewhere without read auth. To open this machine's viewer from your phone or another machine, forward a tailnet-only port to it with systemd: nothing listens on Wi-Fi, and the daemon stays on loopback. Put your machine's tailnet address (<code>tailscale ip -4</code>) in <code>ListenStream</code>:</p>
     <pre><code>cat &gt; ~/.config/systemd/user/darkmux-viewer-tailnet.socket &lt;&lt;'UNIT'
@@ -207,9 +207,9 @@ UNIT
 systemctl --user daemon-reload
 systemctl --user enable --now darkmux-viewer-tailnet.socket
 sudo ufw allow in on tailscale0 to any port 8090 proto tcp</code></pre>
-    <p>Then open <code>http://omarchy-book:8090/</code> on any device with Tailscale connected (MagicDNS resolves the short name). <code>FreeBind</code> lets the socket start before Tailscale has brought the address up. darkmux treats a request through a plain forward like this as remote, so its panels withhold this machine's addresses and paths, as for any remote viewer; fleet cards and runs show in full. To watch the whole fleet, a hub's viewer that's already on the tailnet works the same way.</p>
-    <p class="session-caption">Verified 2026-10-12: <code>http://omarchy-book:8090/</code> opened from an iPhone on the tailnet.</p>
-    <p class="session-caption">Verified 2026-10-12: a 13" M2 on Omarchy joined a fleet hubbed on a Mac Studio over Tailscale; its note and presence reached the hub, and its card read <code>omarchy-book</code>. Taking work from other machines (fleet trust, the serve token) is not covered yet.</p>
+    <p>Then open <code>http://&lt;runner&gt;:8090/</code> on any device with Tailscale connected (MagicDNS resolves the short name). <code>FreeBind</code> lets the socket start before Tailscale has brought the address up. darkmux treats a request through a plain forward like this as remote, so its panels withhold this machine's addresses and paths, as for any remote viewer; fleet cards and runs show in full. To watch the whole fleet, a hub's viewer that's already on the tailnet works the same way.</p>
+    <p class="session-caption">Verified 2026-10-12: a runner's viewer on port 8090 opened from an iPhone on the tailnet.</p>
+    <p class="session-caption">Verified 2026-10-12: a 13" M2 on Omarchy joined a fleet hubbed on a Mac Studio over Tailscale; its note and presence reached the hub, and its card showed its own name. Taking work from other machines (its own fleet listener and trust entries) is not covered yet.</p>
   </div>
 </section>
 
@@ -245,7 +245,7 @@ for u in darkmux-serve mlx-local; do echo "$u $(systemctl --user is-enabled $u) 
     <p>The simplest way in is Tailscale SSH: Tailscale authenticates you by your tailnet login, so there are no keys to copy to each device, and it works from a phone. On the runner:</p>
     <pre><code>sudo tailscale set --ssh</code></pre>
     <p>Then, from any device on the tailnet, including a phone with an SSH app (Blink Shell, Termius) and Tailscale connected, connect by the name you gave the runner, with no password or key:</p>
-    <pre><code>ssh &lt;you&gt;@omarchy-book
+    <pre><code>ssh &lt;you&gt;@&lt;runner&gt;
 darkmux doctor
 systemctl --user status darkmux-serve mlx-local</code></pre>
     <p>Depending on your tailnet's access policy, the first connection (and one every so often after) prints a <code>login.tailscale.com</code> link to approve in a browser. Plain OpenSSH works too (the runner's <code>sshd</code> already listens): add each device's public key to <code>~/.ssh/authorized_keys</code>, allow it through the firewall only on the tailnet (<code>sudo ufw allow in on tailscale0 to any port 22 proto tcp</code>), and once a key works, turn passwords off (<code>PasswordAuthentication no</code> in a file under <code>/etc/ssh/sshd_config.d/</code>).</p>
