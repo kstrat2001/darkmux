@@ -48,6 +48,7 @@
 //! side of that contract.
 
 use crate::LabRunSummary;
+use crate::{FleetRecord, FleetRecords, RecordIdentity};
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
 use darkmux_flow::{Edge, FlowAction, Grain};
@@ -508,7 +509,7 @@ pub struct RunsWithUsage {
 pub fn build_runs_with_usage(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     since_secs: Option<u64>,
 ) -> RunsWithUsage {
     let window = match since_secs {
@@ -529,7 +530,7 @@ pub fn build_runs_with_usage(
 pub fn build_runs(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
 ) -> Vec<Run> {
     build_runs_within(flows_dir, lab_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS)
 }
@@ -544,7 +545,7 @@ pub fn build_runs(
 pub fn build_runs_within(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window_days: i64,
 ) -> Vec<Run> {
     build_runs_in(flows_dir, lab_dir, fleet, &ScanWindow::within_days(window_days)).runs
@@ -553,7 +554,7 @@ pub fn build_runs_within(
 fn build_runs_in(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
 ) -> RunsWithUsage {
     build_runs_judged_by(flows_dir, lab_dir, fleet, window, &PeerClocks::cached())
@@ -564,20 +565,21 @@ fn build_runs_in(
 fn build_runs_judged_by(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
     peers: &PeerClocks,
 ) -> RunsWithUsage {
+    let fleet: FleetRecords = fleet.into();
     // (#2902 step 2b) The usage fold shares the session index's one pass.
     let mut usage_fold = crate::usage_sum::UsageFold::new(window.since_iso.clone());
-    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold), peers);
+    let flow_index = build_flow_session_index_in(flows_dir, &fleet, window, Some(&mut usage_fold), peers);
     let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
     // `Mission` JSON lives on the machine that ran it — so without this it
     // could only ever appear as a scatter of per-session ghosts. One
     // review = one row, wherever it ran.
-    let flow_missions = build_flow_mission_index_in(flows_dir, fleet, window);
+    let flow_missions = build_flow_mission_index_in(flows_dir, &fleet, window);
     // (#1523 gate CONSIDER 2) Pre-group flow sessions by `mission_id` ONCE
     // — an O(sessions) pass — rather than filtering the whole `flow_index`
     // per mission (O(missions × sessions), the shape a Studio-scale flow
@@ -789,11 +791,12 @@ fn peer_runs_from_index(
 /// gives its own callers).
 pub fn peer_mission_runs(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     known_mission_ids: &HashSet<String>,
 ) -> Vec<Run> {
-    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
-    let flow_missions = build_flow_mission_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let fleet: FleetRecords = fleet.into();
+    let flow_index = build_flow_session_index(flows_dir, &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
+    let flow_missions = build_flow_mission_index(flows_dir, &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -833,7 +836,7 @@ pub fn peer_mission_runs(
 /// promise about who the answer names.
 pub(crate) fn mission_owner_machine(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     mission_id: &str,
 ) -> Option<String> {
     build_flow_mission_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS)
@@ -959,7 +962,7 @@ impl FlowMissionAgg {
 
 fn build_flow_mission_index(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window_days: i64,
 ) -> HashMap<String, FlowMissionAgg> {
     build_flow_mission_index_in(flows_dir, fleet, &ScanWindow::within_days(window_days))
@@ -970,7 +973,7 @@ fn build_flow_mission_index(
 /// so a `--since` that widens one widens all three.
 fn build_flow_mission_index_in(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
 ) -> HashMap<String, FlowMissionAgg> {
     let mut idx: HashMap<String, FlowMissionAgg> = HashMap::new();
@@ -983,9 +986,10 @@ fn build_flow_mission_index_in(
     // Abandoned rows that never age out. This bites the single-machine
     // redis-enabled operator too, not just a fleet.
     let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
+    let fleet: FleetRecords = fleet.into();
 
-    let fleet_seen: std::collections::HashSet<String> =
-        fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
+    let fleet_seen: HashSet<RecordIdentity> =
+        fleet.iter().filter(|r| within_window(r.value())).map(FleetRecord::identity).collect();
 
     let fold = |idx: &mut HashMap<String, FlowMissionAgg>, v: &serde_json::Value| {
         let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
@@ -997,11 +1001,11 @@ fn build_flow_mission_index_in(
         idx.entry(mid.to_string()).or_default().fold_record(v);
     };
 
-    for v in fleet.iter().filter(|v| within_window(v)) {
+    for v in fleet.values().filter(|v| within_window(v)) {
         fold(&mut idx, v);
     }
     for_each_flow_record_from(flows_dir, &window.cutoff_date, |v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
             return std::ops::ControlFlow::Continue(());
         }
         fold(&mut idx, v);
@@ -1901,7 +1905,7 @@ fn envelope_status(envelope: &darkmux_crew::envelope::MissionEnvelope) -> RunSta
 pub fn local_dispatch_status(
     missions: &[Mission],
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
 ) -> HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)> {
     let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
     let mission_id_index = build_mission_id_index(&flow_index);
@@ -2658,7 +2662,7 @@ impl SessionAgg {
 /// `/runs` reaches.
 fn build_flow_session_index(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window_days: i64,
     peers: &PeerClocks,
 ) -> HashMap<String, SessionAgg> {
@@ -2672,7 +2676,7 @@ fn build_flow_session_index(
 /// cost flat and the two answers over one record set.
 fn build_flow_session_index_in(
     flows_dir: &StdPath,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
     mut usage: Option<&mut crate::usage_sum::UsageFold>,
     peers: &PeerClocks,
@@ -2692,17 +2696,18 @@ fn build_flow_session_index_in(
     // Abandoned rows that never age out. This bites the single-machine
     // redis-enabled operator too, not just a fleet.
     let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
+    let fleet: FleetRecords = fleet.into();
 
-    let fleet_seen: std::collections::HashSet<String> =
-        fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
-    for v in fleet.iter().filter(|v| within_window(v)) {
+    let fleet_seen: HashSet<RecordIdentity> =
+        fleet.iter().filter(|r| within_window(r.value())).map(FleetRecord::identity).collect();
+    for v in fleet.values().filter(|v| within_window(v)) {
         fold_session_record(&mut idx, v);
         if let Some(u) = usage.as_deref_mut() {
             u.add(v);
         }
     }
     for_each_flow_record_from(flows_dir, &window.cutoff_date, |v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
+        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
             return std::ops::ControlFlow::Continue(());
         }
         fold_session_record(&mut idx, v);
@@ -8870,7 +8875,7 @@ mod tests {
     fn a_peer_mission_row_names_the_executions_role_not_the_run_bookends_config_id() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let runs = build_runs(flows.path(), None, &peer_run_and_execution(true));
+        let runs = build_runs(flows.path(), None, peer_run_and_execution(true));
         let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
         assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
     }
@@ -8883,7 +8888,7 @@ mod tests {
     fn a_peer_mission_row_whose_starts_aged_out_still_names_the_executions_role() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let runs = build_runs(flows.path(), None, &peer_run_and_execution(false));
+        let runs = build_runs(flows.path(), None, peer_run_and_execution(false));
         let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
         assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
     }

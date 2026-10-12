@@ -498,7 +498,7 @@ fn relative_age(now: u64, then: u64) -> String {
 /// identical daemon-panel polls.
 fn peer_mission_runs(
     flows_dir: &std::path::Path,
-    fleet: &[serde_json::Value],
+    fleet: impl Into<darkmux_serve::FleetRecords>,
     known_mission_ids: &std::collections::HashSet<String>,
 ) -> Vec<Run> {
     let mut peer = darkmux_serve::peer_mission_runs(flows_dir, fleet, known_mission_ids);
