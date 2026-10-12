@@ -533,9 +533,7 @@ pub(crate) fn read_fleet_cached(
     now: SystemTime,
     redis_url: impl FnOnce() -> Option<darkmux_flow::RawRedisUrl>,
 ) -> crate::FleetRead {
-    let within_ttl = |at: Option<SystemTime>| {
-        at.is_some_and(|at| crate::wall_clock_cache_is_fresh(at, now, FLEET_CACHE_TTL))
-    };
+    let within_ttl = |at: Option<SystemTime>| at.is_some_and(|at| within_ttl_of(at, now));
     let fresh = |w: &FleetWindows| {
         within_ttl(w.work.at) && (scope == FleetScope::Work || within_ttl(w.telemetry.at))
     };
@@ -572,6 +570,7 @@ pub(crate) fn read_fleet_cached(
     let (mut work, mut telemetry) = (windows.work.clone(), windows.telemetry.clone());
     drop(windows);
     let settle = Settle(caches);
+    let attempt = std::time::Instant::now();
     let result = refresh(
         url.expose_for_probe(),
         scope,
@@ -597,7 +596,10 @@ pub(crate) fn read_fleet_cached(
             }
         }
         Err(e) => {
-            windows.failed_at = Some(now);
+            // When it failed, on the caller's clock: a failure against a
+            // hub that stalls each reply takes about the TTL itself, and
+            // stamping when the attempt began left the backoff spent.
+            windows.failed_at = Some(now + attempt.elapsed());
             // Never interpolate the url (#661 Slice 5): it can carry an
             // inline password. The full error goes to stderr; the wire gets
             // the classification only.
@@ -611,6 +613,17 @@ pub(crate) fn read_fleet_cached(
     drop(windows);
     drop(settle);
     read
+}
+
+/// Whether a time stamped `at` is within [`FLEET_CACHE_TTL`] of `now`. A time
+/// up to a TTL AFTER `now` counts too: another request that read the clock
+/// later published it while this one waited on the lock. A larger gap is a
+/// clock that stepped backward, and stays not fresh (#2479).
+fn within_ttl_of(at: SystemTime, now: SystemTime) -> bool {
+    crate::wall_clock_cache_is_fresh(at, now, FLEET_CACHE_TTL)
+        || at
+            .duration_since(now)
+            .is_ok_and(|ahead| ahead < FLEET_CACHE_TTL)
 }
 
 /// Wait, at most [`refresh_wait`], for the refresh in flight. `Err` is the
@@ -978,6 +991,90 @@ mod tests {
             };
         }
         caches
+    }
+
+    /// The backoff runs from when the attempt failed, not from when the
+    /// request that made it began: a failure against a hub that answers the
+    /// connect and then goes silent takes the connect plus two replies' bounds
+    /// (about the TTL itself), so stamping the request's entry time left the
+    /// backoff already spent and the next request went straight back to the
+    /// hub. The clock here advances by the attempt's real duration.
+    #[test]
+    fn a_failure_backs_off_from_when_it_failed_not_when_it_began() {
+        let hub = silent_hub("", true);
+        let t0 = SystemTime::now();
+        let caches = Arc::new(seeded_past_ttl(&hub.url, t0));
+        let first_at = t0 + std::time::Duration::from_secs(10);
+        let began = std::time::Instant::now();
+        let url = hub.url.clone();
+        let first = read_fleet_cached(&caches, FleetScope::Work, first_at, || {
+            Some(darkmux_flow::RawRedisUrl::new(url))
+        });
+        let took = began.elapsed();
+        assert!(
+            matches!(first.state, SourceState::Stale { .. }),
+            "{:?}",
+            first.state
+        );
+        assert_eq!(hub.accepts.load(Ordering::SeqCst), 1);
+        // The next request arrives just after the failure, by the same clock.
+        let next_at = first_at + took + std::time::Duration::from_millis(50);
+        let url = hub.url.clone();
+        let next = within(std::time::Duration::from_millis(500), move || {
+            read_fleet_cached(&caches, FleetScope::Work, next_at, || {
+                Some(darkmux_flow::RawRedisUrl::new(url))
+            })
+            .state
+        })
+        .expect(
+            "a request just after a failure went back to the hub (the backoff was already spent)",
+        );
+        assert!(matches!(next, SourceState::Stale { .. }), "{next:?}");
+        assert_eq!(
+            hub.accepts.load(Ordering::SeqCst),
+            1,
+            "a request inside the backoff asked the hub again"
+        );
+    }
+
+    /// A request that read the clock before another request published a
+    /// newer window (it waited on the lock meanwhile) is served that window:
+    /// a window up to a TTL newer than the request is fresh, not a reason to
+    /// read the hub again and move the window's time backward.
+    #[test]
+    fn a_window_published_after_the_request_began_is_fresh() {
+        let t0 = SystemTime::now();
+        let caches = seeded_past_ttl(
+            "redis://127.0.0.1:1",
+            t0 + std::time::Duration::from_millis(800),
+        );
+        let asked = std::cell::Cell::new(false);
+        let read = read_fleet_cached(&caches, FleetScope::Work, t0, || {
+            asked.set(true);
+            None
+        });
+        assert!(
+            !asked.get(),
+            "a window newer than the request sent it to the hub"
+        );
+        assert_eq!(read.state, SourceState::Ok);
+        assert_eq!(read.records.len(), 1);
+
+        // A window an hour ahead is a clock that stepped backward (#2479):
+        // not fresh, so the hub is asked.
+        let caches = seeded_past_ttl(
+            "redis://127.0.0.1:1",
+            t0 + std::time::Duration::from_secs(3_600),
+        );
+        let asked = std::cell::Cell::new(false);
+        read_fleet_cached(&caches, FleetScope::Work, t0, || {
+            asked.set(true);
+            None
+        });
+        assert!(
+            asked.get(),
+            "a window from a clock that stepped back was served as fresh"
+        );
     }
 
     /// Eight requests past the TTL against a hub that answers the connect and
