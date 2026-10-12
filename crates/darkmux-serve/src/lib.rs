@@ -4383,54 +4383,23 @@ fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
 /// #1570, #3217). Never interpolates `url` into the error: it can carry an
 /// inline password (#661 Slice 5); `what` names the read instead.
 ///
-/// (#3217) redis-rs sends its connection-setup commands (`AUTH`, `SELECT`,
-/// `CLIENT SETINFO`) and reads their replies inside the connect, before any
-/// read timeout can be set, so a hub that accepts the TCP connection and never
-/// answers held the connect for good (measured: 300 s and counting). With
-/// `CLIENT SETINFO` compiled out (`disable-client-setinfo`, Cargo.toml) and the
-/// credentials and database taken off the connection info, the setup sends
-/// nothing; this function sends `AUTH` and `SELECT` itself, after the bound is
-/// on the socket. A URL asking for RESP3 still sends `HELLO` inside the
-/// connect; no darkmux URL does.
+/// (#3217) `get_connection_with_timeout` bounds the TCP connect only: redis-rs
+/// then sends its setup commands (`CLIENT SETINFO`, `AUTH`, `SELECT`) and reads
+/// their replies with no timeout, so a hub that accepted the connection and
+/// never answered held this connect for good (measured: 300 s and counting).
+/// [`darkmux_flow::open_redis_connection_bounded`], the wall-clock-bounded
+/// connect the flow sinks already use, bounds the whole of it.
 fn bounded_redis_connection(url: &str, what: &str) -> anyhow::Result<redis::Connection> {
     use anyhow::Context;
-    use redis::IntoConnectionInfo;
-    let mut info = url.into_connection_info().with_context(|| format!("reading the Redis URL for {what}"))?;
-    let username = info.redis.username.take();
-    let password = info.redis.password.take();
-    let db = std::mem::take(&mut info.redis.db);
-    let client = redis::Client::open(info).with_context(|| format!("opening Redis client for {what}"))?;
-    // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
-    // must not wedge the HTTP handler thread for the OS default 75s.
-    let mut conn = client
-        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
+    let client = redis::Client::open(url).with_context(|| format!("opening Redis client for {what}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278), the setup included: twice it,
+    // wall clock.
+    let conn = darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for {what}"))?;
     // (#1570) The connect above is bounded; the reads after it were not.
     // This is the exact read that took 30s and 408'd the viewer.
     bound_redis_response(&conn);
-    if let Some(password) = password {
-        redis_auth(&mut conn, username.as_deref(), &password).with_context(|| format!("authenticating to Redis for {what}"))?;
-    }
-    if db != 0 {
-        redis::cmd("SELECT").arg(db).query::<()>(&mut conn).with_context(|| format!("selecting the Redis database for {what}"))?;
-    }
     Ok(conn)
-}
-
-/// `AUTH` on a connection whose replies are already bounded. As redis-rs does,
-/// a named user falls back to the password alone when the server refuses the
-/// two-argument form (one older than ACLs); a timeout or a dropped connection
-/// is not a refusal and is not retried, so it costs one bound.
-fn redis_auth(conn: &mut redis::Connection, user: Option<&str>, password: &str) -> redis::RedisResult<()> {
-    let auth = |user: Option<&str>| {
-        let mut cmd = redis::cmd("AUTH");
-        cmd.arg(user).arg(password);
-        cmd
-    };
-    match auth(user).query(conn) {
-        Err(e) if user.is_some() && !(e.is_io_error() || e.is_timeout()) => auth(None).query(conn),
-        other => other,
-    }
 }
 
 /// (#1570) Apply the per-command response deadline to a freshly obtained

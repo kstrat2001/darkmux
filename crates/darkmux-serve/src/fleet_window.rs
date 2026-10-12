@@ -883,8 +883,11 @@ mod tests {
         accepts: Arc<AtomicU64>,
     }
 
-    fn silent_hub(userinfo: &str) -> SilentHub {
-        use std::io::Read;
+    /// `answers_setup`: the hub completes redis-rs's connection setup (the
+    /// two `CLIENT SETINFO` replies) before going silent, so the connect
+    /// succeeds and the read is what stalls.
+    fn silent_hub(userinfo: &str, answers_setup: bool) -> SilentHub {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
             "redis://{userinfo}127.0.0.1:{}",
@@ -897,6 +900,9 @@ mod tests {
                 counted.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     let mut stream = stream;
+                    if answers_setup {
+                        let _ = stream.write_all(b"+OK\r\n+OK\r\n");
+                    }
                     let mut buf = [0u8; 4096];
                     while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
                 });
@@ -931,13 +937,13 @@ mod tests {
     #[test]
     fn a_connect_to_a_hub_that_never_answers_fails_within_its_bound() {
         for userinfo in ["", ":s3cret@", "user:s3cret@"] {
-            let hub = silent_hub(userinfo);
+            let hub = silent_hub(userinfo, false);
             let url = hub.url.clone();
             let url_db = format!("{url}/3");
             for url in [url, url_db] {
                 let started = std::time::Instant::now();
-                // Connect, then one command: with nothing to authenticate the
-                // connect itself sends nothing, and the command is what fails.
+                // Connect, then one command: whichever phase the silence
+                // stops, the whole costs one round trip's bound.
                 let result = within(3 * one_bound(), move || {
                     let mut conn = crate::bounded_redis_connection(&url, "a probe")?;
                     redis::cmd("PING").query::<String>(&mut conn)?;
@@ -948,7 +954,6 @@ mod tests {
                     panic!("the connect ({userinfo}) waited past {:?}", 3 * one_bound())
                 });
                 assert!(result.is_err(), "a hub that never answers cannot be read");
-                // One round trip's bound: a timed-out `AUTH` is not retried.
                 assert!(
                     elapsed < one_bound() + std::time::Duration::from_millis(300),
                     "the connect ({userinfo}) took {elapsed:?}"
@@ -975,14 +980,15 @@ mod tests {
         caches
     }
 
-    /// Eight requests past the TTL against a hub that never answers: one of
-    /// them asks the hub, the others wait at most for that one attempt, and
+    /// Eight requests past the TTL against a hub that answers the connect and
+    /// never a read (the slowest failure: the connect, then both pipelined
+    /// replies' bounds): one of them asks the hub, the others wait at most for that one attempt, and
     /// none waits behind another's I/O in turn. Every one is served the last
     /// window, marked stale, and the hub saw one connection. A read just
     /// after, inside the TTL of the failure, does not ask again.
     #[test]
     fn concurrent_reads_never_queue_behind_a_hub_that_never_answers() {
-        let hub = silent_hub("");
+        let hub = silent_hub("", true);
         let t0 = SystemTime::now();
         let caches = Arc::new(seeded_past_ttl(&hub.url, t0));
         let now = t0 + std::time::Duration::from_secs(10);
