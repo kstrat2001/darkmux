@@ -26,6 +26,34 @@ impl Platform for MacPlatform {
     fn machine_uid(&self) -> Option<String> {
         parse_io_platform_uuid(&ioreg_platform_expert()?)
     }
+
+    /// `sysctl machdep.cpu.brand_string`.
+    fn cpu_brand(&self) -> Option<String> {
+        parse_brand_string(&sysctl_brand_string()?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_brand_string() -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_brand_string() -> Option<String> {
+    None
+}
+
+/// `sysctl -n machdep.cpu.brand_string` output, trimmed; empty is `None`.
+pub(crate) fn parse_brand_string(output: &str) -> Option<String> {
+    let s = output.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 #[cfg(target_os = "macos")]

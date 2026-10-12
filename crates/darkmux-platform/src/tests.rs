@@ -225,3 +225,67 @@ fn a_fake_answers_the_machine_uid_the_test_set() {
     };
     assert_eq!(fake.machine_uid().as_deref(), Some("uid-1"));
 }
+
+/// Under Asahi the chip comes from the device tree's `compatible`, named the
+/// way macOS's `machdep.cpu.brand_string` names it, so a dual-boot Mac reads
+/// the same on both sides.
+#[test]
+fn an_apple_chip_is_named_from_the_device_tree() {
+    let m2 = "apple,j493\0apple,t8112\0apple,arm-platform\0";
+    assert_eq!(
+        crate::linux::apple_chip_from_compatible(m2).as_deref(),
+        Some("Apple M2")
+    );
+    let m1_max = "apple,j316c\0apple,t6001\0apple,arm-platform\0";
+    assert_eq!(
+        crate::linux::apple_chip_from_compatible(m1_max).as_deref(),
+        Some("Apple M1 Max")
+    );
+    assert_eq!(
+        crate::linux::apple_chip_from_compatible("apple,j999\0apple,t9999\0"),
+        None,
+        "an unknown chip is not guessed"
+    );
+    assert_eq!(
+        crate::linux::apple_chip_from_compatible("raspberrypi,4-model-b\0brcm,bcm2711\0"),
+        None
+    );
+}
+
+#[test]
+fn other_linux_names_the_cpu_from_cpuinfo() {
+    let cpuinfo = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz\n";
+    assert_eq!(
+        crate::linux::model_name_from_cpuinfo(cpuinfo).as_deref(),
+        Some("Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz")
+    );
+    assert_eq!(
+        crate::linux::model_name_from_cpuinfo("processor\t: 0\nBogoMIPS\t: 48.00\n"),
+        None
+    );
+}
+
+#[test]
+fn macos_names_the_cpu_from_sysctl_and_other_reports_none() {
+    assert_eq!(
+        crate::macos::parse_brand_string("Apple M5 Max\n").as_deref(),
+        Some("Apple M5 Max")
+    );
+    assert_eq!(crate::macos::parse_brand_string("  \n"), None);
+    assert_eq!(OtherPlatform.cpu_brand(), None);
+}
+
+#[test]
+fn this_linux_machine_names_its_chip() {
+    if std::env::consts::OS == "linux"
+        && std::path::Path::new("/proc/device-tree/compatible").exists()
+    {
+        let compatible = std::fs::read_to_string("/proc/device-tree/compatible").unwrap();
+        if compatible.contains("apple,") {
+            assert_eq!(
+                LinuxPlatform.cpu_brand(),
+                crate::linux::apple_chip_from_compatible(&compatible)
+            );
+        }
+    }
+}

@@ -24,4 +24,9 @@ impl Platform for FakePlatform {
     fn machine_uid(&self) -> Option<String> {
         self.machine_uid.clone()
     }
+
+    /// Fakes report no CPU; a test needing one asserts the strategies directly.
+    fn cpu_brand(&self) -> Option<String> {
+        None
+    }
 }
