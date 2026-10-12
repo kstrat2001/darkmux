@@ -1,13 +1,13 @@
 ---
 name: darkmux-add-machine
-description: Walk an operator through joining a new Mac to an existing fleet of darkmux machines. Read + propose pattern — operator runs every command. Configures DARKMUX_MACHINE_ID + DARKMUX_REDIS_URL on the new machine, registers it in the operator's other-machines' rosters, and runs a smoke test to confirm cross-fleet flow records land. Sibling to darkmux-bootstrap (first-time setup); use this when the operator already has a fleet running and is adding the Nth machine. (#176)
+description: Walk an operator through joining a new machine (a Mac, or Linux such as Omarchy) to an existing fleet of darkmux machines. Read + propose pattern — operator runs every command. Configures DARKMUX_MACHINE_ID + DARKMUX_REDIS_URL on the new machine, registers it in the operator's other-machines' rosters, and runs a smoke test to confirm cross-fleet flow records land. Sibling to darkmux-bootstrap (first-time setup); use this when the operator already has a fleet running and is adding the Nth machine. (#176)
 user_invocable: true
 allowed-tools: "Bash(darkmux:*),Bash(lms:*),Bash(echo:*),Bash(env:*),Bash(ls:*),Bash(ping:*),Bash(nc:*),Read"
 ---
 
 # Darkmux add machine
 
-This skill walks the operator through adding a new Mac to an existing fleet of darkmux machines. It's the sibling of `darkmux-bootstrap` (first-time setup) — use this skill when:
+This skill walks the operator through adding a new machine (a Mac, or Linux such as Omarchy) to an existing fleet of darkmux machines. It's the sibling of `darkmux-bootstrap` (first-time setup) — use this skill when:
 
 - The operator already has 1+ machines running darkmux successfully
 - A coordinator (Redis-running machine) is reachable on the operator's tailnet
@@ -24,6 +24,19 @@ Before walking through join, confirm the operator's mental model lines up with w
 - **Work goes machine to machine, and only to machines that trust the sender (#2916).** `darkmux dispatch <role> --profile <profile>@<machine>` is sent straight to that machine's fleet listener with the fleet token (the serve token, one value on every machine), and the machine resolves `<profile>` against its own registry (the `--machine` flag is gone in 5.0). The receiver runs it only if its own allow-list (`darkmux machine trust <sender> --profiles ... --roles ...`, run ON the receiver) names the sending node as the tailnet reports it, and only for a profile in that entry's scope. There is no shared work queue any more; Redis carries flow records only.
 
 Tell the operator these points up-front, then continue.
+
+## Requirements at a glance
+
+A machine is a working fleet member when ALL of these hold. Check them in this order; each step below establishes one, and a skipped one fails silently (records still flow, so the machine looks joined):
+
+1. **Tailnet.** This machine and the hub reach each other by Magic DNS name (`tailscale ping <hub>`).
+2. **Flow to the hub.** `fleet.mode peer`, `redis.enabled true`, `redis.host <hub>` (or `DARKMUX_REDIS_URL`), and a unique `machine_id`. Proof: a `darkmux flow note` shows up in the hub's viewer.
+3. **Roster, both ways.** This machine's roster lists the hub (and itself), and every other machine's roster lists this one, each by `machine_id` and tailnet DNS name (`darkmux machine add`). Without it this machine's view is a single-machine fleet, and the others never show its card.
+4. **The fleet token, on every machine, even one that only watches.** A machine reads its peers' machine cards from their fleet listeners, and a listener refuses a card request without the shared token. So the token is what makes the hub row show its card and the HUB badge, not only what lets work cross machines. macOS: Keychain item `darkmux-serve-token`. Linux: `DARKMUX_SERVE_TOKEN` in the daemon's environment (a systemd drop-in, Step 9), since there is no Keychain.
+5. **A running daemon.** `darkmux serve` under launchd (macOS) or a systemd user unit with linger (Linux), restarted after any config or token change: it reads both once at start.
+6. **Only to take work:** this machine's own fleet listener on, and trust entries for its senders (Step 10).
+
+Proof that 3–5 hold: `darkmux machine list` shows the hub `live` with its card (models, profiles), the viewer shows the HUB badge on it, and the daemon log has no "token is missing or does not match" refusals.
 
 ## Step 1 — Confirm prerequisites on this new machine
 
@@ -173,9 +186,25 @@ The new machine's `machine_id` should appear in the recent flow records. If yes,
 For machines that should run `darkmux serve` (the daemon) continuously — typically the always-on member:
 
 - Operator-managed via `launchd` on macOS (the operator's call; not opinionated by darkmux)
+- On Linux, a systemd user unit, plus linger so it runs without a login. Propose; the operator runs:
+
+  ```bash
+  mkdir -p ~/.config/systemd/user
+  printf '[Unit]\nDescription=darkmux serve daemon\nAfter=network-online.target\n\n[Service]\nExecStart=%%h/.cargo/bin/darkmux serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n' > ~/.config/systemd/user/darkmux-serve.service
+  systemctl --user daemon-reload && systemctl --user enable --now darkmux-serve
+  sudo loginctl enable-linger "$USER"
+  ```
+
+  The fleet token (requirement 4) goes in an owner-only drop-in, never a shell rc file or `config.json`:
+
+  ```bash
+  mkdir -p ~/.config/systemd/user/darkmux-serve.service.d && (umask 077; printf '[Service]\nEnvironment=DARKMUX_SERVE_TOKEN=<fleet token>\n' > ~/.config/systemd/user/darkmux-serve.service.d/fleet-token.conf) && systemctl --user daemon-reload && systemctl --user restart darkmux-serve
+  ```
+
+  The operator types the token; the skill never prints or writes it.
 - Or: just `darkmux serve` in a foreground terminal for transient use
 
-The skill does NOT auto-create the launchd plist — operator-sovereignty; system services are the operator's territory.
+The skill does NOT auto-create the launchd plist or the systemd unit — operator-sovereignty; system services are the operator's territory.
 
 ## Step 10 — Optional: let other machines send this one work (#2916)
 
@@ -190,7 +219,7 @@ darkmux doctor 2>&1 | grep -i fleet
 
 **Tailscale Serve is not part of joining the fleet.** The fleet listener binds this machine's tailnet address by itself. Serve only matters if the operator wants to open this machine's viewer from another device. Then use `tailscale serve --bg --http=<port> http://127.0.0.1:<serve.port>` (plain HTTP, tailnet-only, no tailnet settings to change). Never propose `--https` unless the operator asks: it needs the tailnet HTTPS-certificates setting, which publishes the machine name. Never propose Funnel: it exposes the daemon to the internet.
 
-Needs the fleet token (Keychain item `darkmux-serve-token`, the same value as on the sender). The `fleet` doctor rows should read: token resolves, identity names this machine, listener listening on its tailnet address, and the sender listed with its scope. Never propose a profile that runs on the utility model: it is refused anyway, since utility work never crosses machines.
+Needs the fleet token (Keychain item `darkmux-serve-token` on macOS, `DARKMUX_SERVE_TOKEN` in the daemon's environment on Linux; the same value as on the sender), which requirement 4 has already set. On Linux, restart the daemon with `systemctl --user restart darkmux-serve` in place of `brew services restart darkmux`. The `fleet` doctor rows should read: token resolves, identity names this machine, listener listening on its tailnet address, and the sender listed with its scope. Never propose a profile that runs on the utility model: it is refused anyway, since utility work never crosses machines.
 
 ## Idempotency note
 
