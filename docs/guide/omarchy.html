@@ -219,6 +219,11 @@ sudo systemctl start sddm      # the desktop again, for this boot</code></pre>
 sudo systemctl set-default graphical.target     # undo: the desktop at boot again
 sudo systemctl start sddm                       # the desktop now, for one session</code></pre>
     <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those in the text console or over SSH instead.</p>
+    <h3>Dim the screen with the lid open</h3>
+    <p>The text console never blanks by default (<code>consoleblank=0</code>), so a runner left with its lid open keeps its backlight on. Turn it off; logind lets the user at the machine set it, so no sudo:</p>
+    <pre><code>brightnessctl -d apple-panel-bl set 0      # the panel backlight off
+brightnessctl -d apple-panel-bl set 50%    # back on</code></pre>
+    <p>To blank on idle instead, run <code>setterm --blank 1 --powerdown 2</code> in the text console itself (until reboot), or add <code>consoleblank=60</code> to the kernel's boot options. <code>brightnessctl -l</code> lists the backlights; on a 13" M2 the second one (<code>228600000.dsi.0</code>) is likely the Touch Bar.</p>
     <h3>6. Check it from the fleet</h3>
     <p>From another machine's fleet viewer, the card should stay live with its hardware line, and a dispatch on the runner should show in its scope. On the runner, <code>free -h</code> shows what the desktop was holding.</p>
     <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: step 2 (linger on; both user services survived a desktop logout), step 3 with the units above, step 4 by Tailscale SSH, and step 5 by stopping SDDM from a text console (the memory table above). Step 1 is written from the machine's default lid policy and has not been run there yet; the lid stayed open.</p>
