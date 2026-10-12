@@ -74,6 +74,14 @@ def artifact_name(kind: str, tree: str) -> str:
 
 BASE_CANDIDATES = 3
 SHA_EVENTS = ("push", "workflow_dispatch", "schedule")
+# A pull_request run executes the workflow from its merge with the BASE branch,
+# so a PR into any branch but main can run that branch's (anyone's) workflow:
+# push `evil-base` = main + an edited ci.yml, open a PR of the victim's head
+# into it, and the edited workflow uploads a record named merge-tree(main, head)
+# while testing nothing. Only PRs into main, with main's commits as the base
+# candidates, can bind. (Push/dispatch/schedule records need no such pin: they
+# bind to tree(head_sha), which contains whatever workflow ran.)
+PR_BASE = "main"
 
 
 def bound_to_tree(run, tree, commit_tree, base_candidates, merge_tree, pr_base_refs):
@@ -97,11 +105,10 @@ def bound_to_tree(run, tree, commit_tree, base_candidates, merge_tree, pr_base_r
         refs = [(pr.get("base") or {}).get("ref") for pr in prs] or pr_base_refs(head)
         if len(refs) != 1:
             return False
-        base_ref = refs[0]
         created = run.get("created_at")
-        if not base_ref or not created:
+        if refs[0] != PR_BASE or not created:
             return False
-        for base in base_candidates(base_ref, created)[:BASE_CANDIDATES]:
+        for base in base_candidates(PR_BASE, created)[:BASE_CANDIDATES]:
             if merge_tree(base, head) == tree:
                 return True
         return False
@@ -346,6 +353,12 @@ BIND_CASES = [
     (dict(_pr("H_OK", n=0), _assoc=["main", "ui/port"]), ["B1"], False,
      "a commit in two PRs is ambiguous: a miss"),
     (_pr("H_OK", base_ref=""), ["B1"], False, "a PR run with no base ref is a miss"),
+    (_pr("H_OK", base_ref="evil-base"), ["B1"], False,
+     "a PR into a branch other than main is a miss: its run may use that branch's workflow"),
+    (_pr("H_OK", base_ref="ui/port"), ["B1"], False, "a PR into ui/port is a miss too"),
+    (dict(_pr("H_OK", n=0), _assoc=["evil-base"]), ["B1"], False,
+     "a merged PR into another branch, found through its commit, is a miss"),
+    (_pr("H_OK", base_ref="main"), ["B1"], True, "the honest PR into main binds"),
     (_bt(event="pull_request_target", head_sha="H_OK"), ["B1"], False, "an unknown event is a miss"),
     (_bt(event="push"), ["B1"], False, "a run with no head sha is a miss"),
     (_bt(event="pull_request", head_sha="H_OK", pull_requests=[{"base": {"ref": "main"}}],
