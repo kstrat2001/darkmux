@@ -28,7 +28,9 @@ darkmux release.
   `endpoints` id, so the endpoint's window budget counts it. With no `endpoint`,
   or one naming a managed endpoint, nothing changes. `darkmux doctor` describes
   the binding from its endpoint, and its `lms binary` and `unreachable residents`
-  rows pass when nothing in the registry needs LM Studio. Profiles schema 2.1
+  rows pass when nothing in the registry needs LM Studio, and `darkmux init`
+  leaves such a binding as written rather than planning it from LM Studio's
+  downloads. Profiles schema 2.1
   (an additive key): an older darkmux refuses the key at preflight, so upgrade
   before writing it. The runtime's compactor gains `--compactor-chat-url`,
   `--compactor-dialect` and `--compactor-auth-header-stdin`, so a dispatch needs

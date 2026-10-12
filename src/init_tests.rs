@@ -964,3 +964,29 @@ fn the_no_worker_reason_names_an_undetected_ram_size() {
     assert!(!unknown.contains("0 GB"), "{unknown}");
     assert!(unknown.contains("could not detect this machine's RAM"), "{unknown}");
 }
+
+/// (#3207 review) A shipped utility id the operator moved onto an UNMANAGED
+/// endpoint is not LM Studio's to plan: init leaves the binding as written,
+/// even when LM Studio has nothing that could serve it (which would otherwise
+/// unbind it) and with no headroom (which would otherwise resize it).
+#[test]
+#[serial_test::serial]
+fn a_utility_binding_on_an_unmanaged_endpoint_is_left_alone() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let mut v: Value = serde_json::from_str(&example_without_placeholder()).unwrap();
+    v["endpoints"]["mlx-local"] = serde_json::json!({ "url": "http://127.0.0.1:8080/v1" });
+    v["internal"]["utility"]["endpoint"] = serde_json::json!("mlx-local");
+    let registry = serde_json::to_string_pretty(&v).unwrap();
+    env.write_registry(&registry);
+    env.lms(&[], &[]);
+    env.headroom(Some(0));
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.utility_model_unregistered_reason, None, "never unbound");
+    assert_eq!(r.utility_model_unfilled_reason, None);
+    assert_eq!((r.utility_model_filled.clone(), r.utility_model_n_ctx), (None, None));
+    assert_eq!(load(&env).utility_model_id(), Some(shipped_utility()), "the binding is as written");
+    assert!(env.read_registry().contains("\"endpoint\": \"mlx-local\""));
+}

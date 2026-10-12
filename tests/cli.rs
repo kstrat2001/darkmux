@@ -3384,6 +3384,59 @@ fn a_utility_binding_on_an_unmanaged_endpoint_compacts_there_and_never_loads_it(
     assert!(!lms.lines().any(|l| l.starts_with("load") || l.starts_with("unload")), "no load or eject at all: {lms}");
 }
 
+/// (#3207 review F2) The unmanaged utility endpoint's credential reaches the
+/// container: `-i` and `--compactor-auth-header-stdin` on its argv, and the
+/// header in the stdin blob under `compactor`, the pipe then closed (the fake
+/// `docker run` reads stdin to EOF; an unclosed pipe hangs and times out).
+#[test]
+fn an_unmanaged_utility_endpoints_auth_is_piped_to_the_container() {
+    let tmp = TempDir::new().unwrap();
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "schema_version": "2.1",
+            "profiles": { "fast": { "models": [ {"id": "model-a", "n_ctx": 32000} ] } },
+            "default_profile": "fast",
+            "endpoints": {
+                "mlx-local": { "url": "http://127.0.0.1:8080/v1", "dialect": "chat-completions-max-tokens",
+                               "auth": { "type": "bearer", "key_env": "DARKMUX_TEST_3207_UTIL_KEY" } }
+            },
+            "internal": { "utility": { "id": "mlx-util", "n_ctx": 16384, "endpoint": "mlx-local" } }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("lms-ps.json"),
+        r#"[{"identifier":"darkmux:model-a","modelKey":"model-a","status":"loaded","sizeBytes":1000000000,"contextLength":32000}]"#,
+    )
+    .unwrap();
+    let (fake_bin, docker_log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", env!("CARGO_PKG_VERSION"))]);
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    darkmux_cmd()
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMS_BIN", fake_bin.join("lms"))
+        .env("DARKMUX_TEST_3207_UTIL_KEY", "util-secret")
+        .env("FAKE_DOCKER_STATE_DIR", tmp.path())
+        .env("PATH", format!("{}:{}:{real_path}", fake_bin.display(), docker_shim_dir().display()))
+        .args(["dispatch", "coder", "--skip-preflight", "smoke"])
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .expect("darkmux runs");
+    let log = fs::read_to_string(&docker_log).unwrap_or_default();
+    let run = &log[log.find("run --rm").unwrap_or_else(|| panic!("no `docker run` in {log}"))..];
+    let fence = run.find(" -- ").expect("the image fence");
+    assert!(run[..fence].contains(" -i "), "stdin is kept open for the compactor's header: {run}");
+    assert!(run.contains("--compactor-auth-header-stdin"), "{run}");
+    assert!(!run.contains("--auth-header-stdin "), "the brain is on LM Studio and has no header: {run}");
+    let blob = fs::read_to_string(tmp.path().join("docker.stdin")).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&blob).unwrap_or_else(|e| panic!("the stdin blob is not JSON ({e}): {blob:?}"));
+    assert_eq!(v["compactor"]["header"], "Authorization", "{blob}");
+    assert_eq!(v["compactor"]["value"], "Bearer util-secret", "{blob}");
+    assert!(v.get("header").is_none(), "no brain header: {blob}");
+}
+
 /// (#3207) With no `endpoint` on the binding, the container's compactor
 /// argv is today's: the namespaced id, and none of the unmanaged flags.
 #[test]
@@ -3418,7 +3471,12 @@ fn a_utility_binding_with_no_endpoint_keeps_the_lm_studio_compactor_argv() {
     // read from `run` to the end of the log.
     let run = &log[log.find("run --rm").unwrap_or_else(|| panic!("no `docker run` in {log}"))..];
     assert!(run.contains("--compactor-model darkmux:util-4b "), "{run}");
-    assert!(!run.contains("--compactor-chat-url") && !run.contains("--compactor-dialect"), "{run}");
+    for absent in ["--compactor-chat-url", "--compactor-dialect", "--compactor-auth-header-stdin", "--auth-header-stdin"] {
+        assert!(!run.contains(absent), "`{absent}` on an LM Studio compactor's argv: {run}");
+    }
+    let fence = run.find(" -- ").expect("the image fence");
+    assert!(!run[..fence].contains(" -i "), "no stdin is kept open when no header rides it: {run}");
+    assert!(!tmp.path().join("docker.stdin").exists(), "nothing was piped to the container");
 }
 
 /// (#3164) Runs a full local dispatch through the stable fakes, the model
@@ -3495,6 +3553,7 @@ fn stable_cli_fakes() -> std::path::PathBuf {
         echo \"Error response from daemon: No such image: $last\" >&2; exit 1\n\
         fi\n\
         if [ \"$1\" = pull ]; then echo 'pull denied' >&2; exit 1; fi\n\
+        if [ \"$1\" = run ]; then case \" $* \" in *\" -i \"*) cat > \"$state/docker.stdin\" ;; esac; fi\n\
         exit 0\n";
     let lms = "#!/bin/sh\n\
         if [ -n \"$FAKE_DOCKER_STATE_DIR\" ]; then echo \"$*\" >> \"$FAKE_DOCKER_STATE_DIR/lms.log\"; fi\n\
