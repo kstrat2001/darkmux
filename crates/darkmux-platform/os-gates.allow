@@ -16,7 +16,7 @@ crates/darkmux-crew/src/telemetry_sampler.rs 1
 crates/darkmux-doctor/src/checks_power.rs 3
 crates/darkmux-doctor/src/lib.rs 2
 crates/darkmux-flow/src/lib.rs 7
-crates/darkmux-hardware/src/lib.rs 4
+crates/darkmux-hardware/src/lib.rs 3
 crates/darkmux-lab/src/lab/cow_clone.rs 1
 crates/darkmux-lab/src/lab/sandbox_hash.rs 1
 crates/darkmux-profiles/src/gestalt_host/mac_probe.rs 9

@@ -17,4 +17,8 @@ impl Platform for OtherPlatform {
     fn container_user(&self) -> ContainerUser {
         ContainerUser::Image
     }
+
+    fn machine_uid(&self) -> Option<String> {
+        None
+    }
 }

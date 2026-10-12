@@ -34,6 +34,11 @@ pub trait Platform: Send + Sync {
     /// Which user a dispatch container runs as, so it can read and write the
     /// host directories bind-mounted into it.
     fn container_user(&self) -> ContainerUser;
+
+    /// This install's stable identity (#640: the identity, distinct from the
+    /// operator's display name). `None` when the platform has none to read:
+    /// callers treat that as unknown identity and never fall back to a name.
+    fn machine_uid(&self) -> Option<String>;
 }
 
 /// Which user a dispatch container runs as.

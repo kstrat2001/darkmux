@@ -29,6 +29,39 @@ impl Platform for LinuxPlatform {
             })
             .unwrap_or(ContainerUser::Image)
     }
+
+    /// The install's `/etc/machine-id`. A dual-boot Mac's macOS side has a
+    /// different identity (its `IOPlatformUUID`): one install, one uid.
+    fn machine_uid(&self) -> Option<String> {
+        machine_uid_from_disk()
+    }
+}
+
+/// `/etc/machine-id`: systemd's id for this install, stable across reboots
+/// and hostname changes, new on a reinstall. Readable by any user.
+pub(crate) fn machine_uid_from_disk() -> Option<String> {
+    read_machine_id()
+}
+
+#[cfg(target_os = "linux")]
+fn read_machine_id() -> Option<String> {
+    parse_machine_id(&std::fs::read_to_string("/etc/machine-id").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_machine_id() -> Option<String> {
+    None
+}
+
+/// A machine id is 32 lowercase hex characters (`machine-id(5)`); anything
+/// else (empty, `uninitialized` during first boot) is no identity.
+pub(crate) fn parse_machine_id(contents: &str) -> Option<String> {
+    let id = contents.trim();
+    let valid = id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    valid.then(|| id.to_string())
 }
 
 #[cfg(target_os = "linux")]

@@ -41,6 +41,7 @@ fn a_fake_answers_what_the_test_set() {
     let fake = FakePlatform {
         container_host_access: ContainerHostAccess::HostGateway,
         container_user: ContainerUser::Image,
+        machine_uid: None,
     };
     assert_eq!(fake.id(), "fake");
     assert_eq!(
@@ -137,6 +138,7 @@ fn a_fake_answers_the_container_user_the_test_set() {
             uid: 5,
             gid: Some(6),
         },
+        machine_uid: None,
     };
     assert_eq!(
         fake.container_user(),
@@ -145,4 +147,81 @@ fn a_fake_answers_the_container_user_the_test_set() {
             gid: Some(6)
         }
     );
+}
+
+/// macOS's identity is the `IOPlatformUUID`, parsed from `ioreg` exactly as
+/// `darkmux-hardware` did before this moved here.
+#[test]
+fn parses_io_platform_uuid_from_sample() {
+    let sample = r#"
+    "IOPlatformUUID" = "00000000-0000-4000-8000-ABCDEF000009"
+    "IOPlatformSerialNumber" = "C02XYZ123"
+"#;
+    assert_eq!(
+        crate::macos::parse_io_platform_uuid(sample).as_deref(),
+        Some("00000000-0000-4000-8000-ABCDEF000009")
+    );
+}
+
+#[test]
+fn parse_uuid_none_when_absent() {
+    assert_eq!(
+        crate::macos::parse_io_platform_uuid("no uuid here\nother stuff"),
+        None
+    );
+    // An empty value must NOT leak as Some("") — the #640 contract hinges
+    // on None-vs-name, so an empty identity would be a silent downstream
+    // bug (treated as a valid-but-blank machine).
+    assert_eq!(
+        crate::macos::parse_io_platform_uuid("\"IOPlatformUUID\" = \"\"\n"),
+        None
+    );
+}
+
+/// Linux's identity is the install's `/etc/machine-id`: 32 lowercase hex
+/// characters. Anything else is no identity, never a guess.
+#[test]
+fn a_linux_machine_id_is_32_hex_characters() {
+    let id = "4c6f6d6172636879626f6f6b30303031";
+    assert_eq!(
+        crate::linux::parse_machine_id(&format!("{id}\n")).as_deref(),
+        Some(id)
+    );
+    for bad in [
+        "",
+        "\n",
+        "uninitialized\n",
+        "4c6f6d61",
+        "4C6F6D6172636879626F6F6B30303031",
+        "zz6f6d6172636879626f6f6b30303031",
+    ] {
+        assert_eq!(crate::linux::parse_machine_id(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn linux_reads_the_installs_machine_id() {
+    let answer = LinuxPlatform.machine_uid();
+    if std::env::consts::OS == "linux" {
+        let raw = std::fs::read_to_string("/etc/machine-id").unwrap();
+        assert_eq!(answer, crate::linux::parse_machine_id(&raw));
+        assert!(answer.is_some(), "a systemd Linux has a machine id");
+    } else {
+        assert_eq!(answer, None);
+    }
+}
+
+#[test]
+fn an_os_with_no_strategy_has_no_machine_uid() {
+    assert_eq!(OtherPlatform.machine_uid(), None);
+}
+
+#[test]
+fn a_fake_answers_the_machine_uid_the_test_set() {
+    let fake = FakePlatform {
+        container_host_access: ContainerHostAccess::Builtin,
+        container_user: ContainerUser::Image,
+        machine_uid: Some("uid-1".to_string()),
+    };
+    assert_eq!(fake.machine_uid().as_deref(), Some("uid-1"));
 }
