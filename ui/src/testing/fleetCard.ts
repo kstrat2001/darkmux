@@ -19,7 +19,7 @@ export function buildFleetCard(
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecsResponse | null,
   presence: Presence,
-  machAbsent: boolean,
+  machAbsent: boolean | null,
   m: string,
   t: number,
   row: RowFacts | null = null,

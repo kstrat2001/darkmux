@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
-import { FleetLens, totalHint } from "./FleetLens";
+import { FleetLens, absentOrUnknown, totalHint } from "./FleetLens";
 
 import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
@@ -514,6 +514,25 @@ describe("FleetLens", () => {
     await waitFor(() => expect(bar()).toHaveAttribute("data-status-kind", "aborted"));
     expect(bar()).toHaveClass("abandoned");
     expect(bar()?.getAttribute("title")).toMatch(/· aborted$/);
+  });
+
+  // (#3213) The rendered twin of `cards.test.ts`'s unknown-standing case: a
+  // machine whose records carry no uid has no presence evidence, so its card
+  // never says "online" or "idle", however long its records stay in the window.
+  it("(#3213) a card built from uid-less records never reads online", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      flowToday: [{ ts: `${today}T00:00:01.000Z`, machine_id: "example-peer", session_id: "s-peer", action: "dispatch.start", handle: "coder" }, { ts: `${today}T00:00:02.000Z`, machine_id: "example-peer", session_id: "s-peer", action: "dispatch.complete", payload: {} }],
+      runs: [],
+    });
+    renderFleetLens();
+    const peer = () => [...document.querySelectorAll(".mach")].find((c) => c.textContent?.includes("example-peer"));
+    await waitFor(() => expect(peer()).toBeTruthy());
+    // The status line itself, word and reason: never "online" or "idle".
+    const stat = () => peer()!.querySelector(".stat");
+    await waitFor(() => expect(stat()?.textContent).toBe("not streaming"));
+    expect(stat()).toHaveAttribute("title", "not streaming: it carries no machine id, so nothing can say whether it is up");
   });
 
   // (#1923 review) The rendered-DOM twin of `cards.test.ts`'s double-count
@@ -3652,5 +3671,20 @@ describe("the hero total's hover text (#3067)", () => {
     expect(totalHint({ calls: 1, tokens: 9 }, { calls: 1, tokens: 50 }, ["studio"])).toBe(
       "Counts only machines whose records reach this viewer. Not streaming here: studio. Includes 9 tokens with no run (radio routing and probes). Includes 50 tokens on runs not listed here.",
     );
+  });
+});
+
+// (#3213) Only the no-uid bucket reads "no evidence" as unknown; every other
+// machine reads absent only on positive evidence, as before.
+describe("absentOrUnknown (#3213)", () => {
+  it("reads the no-uid bucket with no evidence as unknown (null)", () => {
+    expect(absentOrUnknown(null, "unknown")).toBeNull();
+    expect(absentOrUnknown(false, "unknown")).toBe(true);
+    expect(absentOrUnknown(true, "unknown")).toBe(false);
+  });
+  it("keeps every uid-bearing machine present unless presence says absent", () => {
+    expect(absentOrUnknown(null, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
+    expect(absentOrUnknown(false, "00000000-0000-4000-8000-ABCDEF000001")).toBe(true);
+    expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
   });
 });

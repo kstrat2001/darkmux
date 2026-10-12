@@ -106,7 +106,9 @@ export function machinePageRecords(
 export const selfUidOf = (specs: SelfIdentity | null): string | null => specs?.machine_uid ?? null;
 
 /** `uidOf()`. */
-export const uidOf = (r: NormRecord): string => r.machine_uid || "unknown";
+/** The card key every record with no hardware uid shares. */
+export const NO_UID_KEY = "unknown";
+export const uidOf = (r: NormRecord): string => r.machine_uid || NO_UID_KEY;
 
 /** (#2921) The label for a machine nothing has named. Never the hardware uid:
  * a uid lands in screenshots and identifies the physical machine. */
