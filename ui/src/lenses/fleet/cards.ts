@@ -383,6 +383,16 @@ export interface FleetCard {
   utility: UtilityStrip;
 }
 
+/** (#3213) A flow-only card's standing and status reason. `null` is no
+ *  presence evidence either way (the `unknown` bucket of uid-less records can
+ *  never have any), so it reads unknown, never online, and carries a reason:
+ *  a `null` note would say the card was read and the status line would claim
+ *  "online". */
+function flowOnlyStanding(machAbsent: boolean | null): { standing: Standing; note: string | null } {
+  if (machAbsent === null) return { standing: "unknown", note: "it carries no machine id, so nothing can say whether it is up" };
+  return { standing: machAbsent ? "offline" : "online", note: null };
+}
+
 /** What a card says about WHO the machine is and whether it is up. A machine
  * the view holds reads its hardware line, status note and standing
  * from its row; any other (an unverified source, a beating machine nobody
@@ -403,16 +413,10 @@ function cardIdentity(
       spec,
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
-      // (#3213) No card was read for it, so it gets a reason; `null` would say
-      // the card was read and the status line would claim "online".
-      note: machAbsent === null ? "it carries no machine id, so nothing can say whether it is up" : null,
+      ...flowOnlyStanding(machAbsent),
       hub: false,
       servesRadio: false,
       servesProfiles: 0,
-      // (#3213) `null` is no presence evidence either way (the `unknown` bucket
-      // of uid-less records can never have any), so it reads unknown, never
-      // online: nothing can prove that machine is up.
-      standing: machAbsent === null ? ("unknown" as const) : machAbsent ? ("offline" as const) : ("online" as const),
       availability: "known" as const,
       self: false,
     };
