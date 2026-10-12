@@ -62,6 +62,32 @@ pub trait Platform: Send + Sync {
     /// the residency planner may load against is its own, more conservative
     /// question.
     fn memory_snapshot(&self) -> Option<MemorySnapshot>;
+
+    /// The battery's charge facts, for the machine lens. `None` on a machine
+    /// with no battery, which is a reading, not a failure.
+    fn battery(&self) -> Option<BatteryReading>;
+
+    /// Each cluster's current frequency in MHz, aligned with
+    /// [`Platform::cpu_clusters`]. Empty when the platform reports none here.
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>>;
+}
+
+/// A battery's charge facts as the OS reports them. The lens derives its
+/// charge state from these with the same rules on every platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryReading {
+    pub charge_pct: u8,
+    /// A charger is attached (not the negation of `charging`: a full pack
+    /// on AC is on AC and not charging).
+    pub on_ac: bool,
+    /// Current is flowing into the pack.
+    pub charging: bool,
+    /// The OS says the pack is full; `None` when it doesn't say.
+    pub fully_charged: Option<bool>,
+    /// Current in milliamps, negative while discharging.
+    pub current_ma: Option<i64>,
+    /// The OS's time-to-empty estimate; `None` when it has none.
+    pub minutes_to_empty: Option<u32>,
 }
 
 /// One CPU cluster: `"Performance"`, `"Efficiency"`, or `"CPU"` when there is

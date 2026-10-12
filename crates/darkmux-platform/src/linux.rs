@@ -72,6 +72,17 @@ impl Platform for LinuxPlatform {
     fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
         memory_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
+
+    /// `/sys/class/power_supply`: the Battery supply, and whether a Mains
+    /// supply is online.
+    fn battery(&self) -> Option<crate::BatteryReading> {
+        read_battery()
+    }
+
+    /// Each policy's `scaling_cur_freq`, in cluster order.
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        cluster_mhz_from_policies(read_policies_with_freq())
+    }
 }
 
 /// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.
@@ -296,4 +307,86 @@ pub(crate) fn memory_from_meminfo(meminfo: &str) -> Option<crate::MemorySnapshot
             .zip(kib("SwapFree:"))
             .map(|(t, f)| t.saturating_sub(f)),
     })
+}
+
+/// The first present Battery supply, and whether any Mains supply is online.
+#[cfg(target_os = "linux")]
+fn read_battery() -> Option<crate::BatteryReading> {
+    let supplies: Vec<Vec<(String, String)>> = std::fs::read_dir("/sys/class/power_supply")
+        .ok()?
+        .flatten()
+        .map(|e| {
+            ["type", "present", "online", "capacity", "status", "current_now", "time_to_empty_now"]
+                .iter()
+                .filter_map(|k| {
+                    let v = std::fs::read_to_string(e.path().join(k)).ok()?;
+                    Some((k.to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .collect();
+    let field = |s: &Vec<(String, String)>, k: &str| s.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let on_ac = supplies
+        .iter()
+        .any(|s| field(s, "type").as_deref() == Some("Mains") && field(s, "online").as_deref() == Some("1"));
+    supplies.iter().find_map(|s| {
+        let pairs: Vec<(&str, &str)> = s.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        battery_from_supply(&pairs, on_ac)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_battery() -> Option<crate::BatteryReading> {
+    None
+}
+
+/// One power supply's sysfs fields to a battery reading: `None` unless it is
+/// a present Battery with a charge. `status` is `Charging`, `Discharging`,
+/// `Full` or `Not charging` (on AC, held below full); `current_now` is in
+/// microamps; `time_to_empty_now` in seconds, 0 meaning no estimate.
+pub(crate) fn battery_from_supply(fields: &[(&str, &str)], on_ac: bool) -> Option<crate::BatteryReading> {
+    let get = |k: &str| fields.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+    if get("type") != Some("Battery") || get("present") == Some("0") {
+        return None;
+    }
+    let charge_pct = get("capacity")?.parse::<u8>().ok()?.min(100);
+    let status = get("status");
+    Some(crate::BatteryReading {
+        charge_pct,
+        on_ac,
+        charging: status == Some("Charging"),
+        fully_charged: status.map(|s| s == "Full"),
+        current_ma: get("current_now").and_then(|v| v.parse::<i64>().ok()).map(|ua| ua / 1000),
+        minutes_to_empty: get("time_to_empty_now")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|s| *s > 0)
+            .map(|s| s / 60),
+    })
+}
+
+/// [`read_policies`] plus each policy's current frequency (kHz).
+#[cfg(target_os = "linux")]
+fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
+    read_policies()
+        .into_iter()
+        .map(|(cpus, capacity)| {
+            let khz = cpus.first().and_then(|c| {
+                let path = format!("/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq");
+                std::fs::read_to_string(path).ok()?.trim().parse().ok()
+            });
+            (cpus, capacity, khz)
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
+    Vec::new()
+}
+
+/// Each cluster's MHz, ordered exactly as [`clusters_from_policies`] orders
+/// the clusters (by capacity, highest first, stably).
+pub(crate) fn cluster_mhz_from_policies(mut policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>) -> Vec<Option<u32>> {
+    policies.sort_by(|a, b| b.1.cmp(&a.1));
+    policies.into_iter().map(|(_, _, khz)| khz.map(|k| (k / 1000) as u32)).collect()
 }
