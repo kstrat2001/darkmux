@@ -540,13 +540,7 @@ def materialize_mission(slug, plan, machine, home, now_ms):
         p.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
 
     sess_path = HERE / "sessions" / f"{slug}.jsonl"
-    # `telemetry.process` was retired in 5.0 with no replacement. This
-    # recording predates that, and doctor on the demo home would count every
-    # such record as an action darkmux does not know (448 of them), which
-    # describes the recording's age, not the demo machine. Nothing renders
-    # the action, so dropping it changes no view.
-    src = [r for r in (json.loads(l) for l in sess_path.read_text().splitlines() if l.strip())
-           if r.get("action") != "telemetry.process"]
+    src = [json.loads(l) for l in sess_path.read_text().splitlines() if l.strip()]
     start_ms = start_s * 1000
     out_recs = []
     for rec in src:
