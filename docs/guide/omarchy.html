@@ -32,41 +32,39 @@
   <div class="wrap">
     <div class="label">11 <span class="dot">·</span> machine setup</div>
     <h1>Omarchy: darkmux on Linux</h1>
-    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a>, an Arch Linux setup, on an Apple Silicon Mac running the Asahi kernel: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux does not give you for free. Linux support lives on the <a href="https://github.com/kstrat2001/darkmux/tree/omarchy"><code>omarchy</code></a> support branch until it reaches a release, and this page follows that branch; the last section says what does not work yet.</p>
+    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a> (Arch Linux) on an Apple Silicon Mac running Asahi: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux doesn't give you for free. Linux support lives on the <a href="https://github.com/kstrat2001/darkmux/tree/omarchy"><code>omarchy</code></a> branch until it reaches a release; the last section says what doesn't work yet.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>Build and install</h2>
-    <p>There is no Homebrew here, so darkmux builds from source, from the <code>omarchy</code> branch: it carries the Linux platform fixes (a container that can reach the host and its own files, a machine identity, the hardware line on the fleet card) that are not in a release yet. Omarchy ships <code>mise</code>; it installs the Rust toolchain the repo pins without touching the system.</p>
+    <p>There is no Homebrew here, so darkmux builds from the <code>omarchy</code> branch, which carries the Linux platform fixes. Omarchy ships <code>mise</code> for the Rust toolchain:</p>
     <pre><code>mise use -g rust@1.97.1
 cargo install --git https://github.com/kstrat2001/darkmux --branch omarchy --locked darkmux
-ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   # ~/.cargo/bin is not on Omarchy's PATH
+ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   <span class="comment"># ~/.cargo/bin is not on Omarchy's PATH</span>
 darkmux --version
 darkmux init</code></pre>
-    <p class="session-caption">Verified 2026-10-12 on a 13" M2 (8 GB): the <code>cargo install --git</code> line built the branch in under four minutes with other memory users closed. <code>--version</code> may show a <code>✱</code> after the commit: cargo's checkout looks modified to the build's git probe; the build is the commit named.</p>
-    <p>Re-run the <code>cargo install</code> line to update. <code>init</code> writes <code>~/.darkmux/config.json</code> and <code>profiles.json</code> and installs the agent skills. With no LM Studio it cannot fill in a worker model; the model section below adds one.</p>
+    <p>Re-run the <code>cargo install</code> line to update. A <code>✱</code> after the commit in <code>--version</code> is harmless: cargo's checkout looks modified to the build's git probe. With no LM Studio, <code>init</code> can't fill in a worker model; the next section adds one.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>A local model without LM Studio</h2>
-    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver, and installs <code>mlx_lm.server</code>, which serves the OpenAI chat API. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux only sends requests, and the server owns what is loaded. </p>
+    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver and installs <code>mlx_lm.server</code>, an OpenAI-compatible chat server. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux sends requests, and the server owns what is loaded.</p>
     <h3>Install omarchy-mlx</h3>
-    <p>The Omarchy menu's entry (Install &gt; AI) checks the chip and refuses any it hasn't been tested on, a base M2 included. The project's own installer warns instead and carries on. It needs <code>openblas</code>, and installs the rest under <code>~/.local/share/mlx-omarchy</code>. Read the script before running it:</p>
+    <p>The Omarchy menu's entry (Install &gt; AI) refuses chips it hasn't been tested on; the project's own installer warns instead and carries on. Read the script before running it:</p>
     <pre><code>sudo pacman -S --needed lapack blas openblas
 curl -fsSL https://raw.githubusercontent.com/joshuaswarren/omarchy-mlx/main/install.sh -o mlx-install.sh
 less mlx-install.sh
 bash mlx-install.sh</code></pre>
-    <p>It ends with a smoke test that names your GPU and runs a matrix multiply on it. If a download fails partway (it fetches its patches one by one from GitHub), run it again.</p>
+    <p>It ends with a smoke test on your GPU. If a download fails partway, run it again.</p>
     <h3>Pick a model that fits</h3>
-    <p>The model shares memory with everything else on the machine, and its working memory (the KV cache) grows with the prompt. darkmux's role prompts alone are about 3,500 tokens. On an 8 GB M2, <code>mlx-community/Qwen3-1.7B-4bit</code> runs them; <code>Qwen3-4B-Instruct-2507-4bit</code> ran the GPU out of memory on the same prompt. With more memory, go bigger.</p>
-    <p>The GPU's limit is lower than the machine's. The Asahi Vulkan driver gives each process a GPU memory heap of half the RAM (about 3.7 GiB on 8 GB), and omarchy-mlx raises that only on machines with more than 32 GB. As the context fills the heap, generation slows sharply before it fails: on the 8 GB M2, Qwen3-1.7B decoded at 3.4 tokens/s and dropped to 0.8 at about 6,900 tokens of context, then later stopped with <code>VK_ERROR_OUT_OF_DEVICE_MEMORY</code>. Keep prompt plus output under that on 8 GB. <code>HK_SYSMEM</code> (bytes) in the server's environment raises the heap: with <code>HK_SYSMEM=5000000000</code> the same run held 3.3 tokens/s through 7,200 tokens. It is a ceiling, not a reservation, so the GPU can then take memory the rest of the machine needs; raise it only on a machine doing little else.</p>
+    <p>The model shares memory with everything else on the machine, and its KV cache grows with the prompt; darkmux's role prompts alone are about 3,500 tokens. The Asahi Vulkan driver also caps each process's GPU heap at half the RAM, and as the context fills it, generation slows sharply, then fails with <code>VK_ERROR_OUT_OF_DEVICE_MEMORY</code>. Pick a model that fits your RAM with room to spare. The examples below use the small <code>mlx-community/Qwen3-1.7B-4bit</code>; with more memory, go bigger.</p>
     <h3>Serve it as a user service</h3>
-    <p>A systemd user unit keeps the server up across logouts and reboots (with linger, under "Run it headless" below):</p>
-    <pre><code>cat &gt; ~/.config/systemd/user/mlx-local.service &lt;&lt;'UNIT'
+    <pre><code>mkdir -p ~/.config/systemd/user
+cat &gt; ~/.config/systemd/user/mlx-local.service &lt;&lt;'UNIT'
 [Unit]
 Description=mlx_lm.server on 127.0.0.1:8080
 After=network-online.target
@@ -81,8 +79,10 @@ UNIT
 systemctl --user daemon-reload
 systemctl --user enable --now mlx-local
 curl -s http://127.0.0.1:8080/v1/models</code></pre>
-    <p>Keep the single quotes around the JSON: systemd strips double quotes from <code>ExecStart</code>, and without the single quotes the server receives <code>{enable_thinking:false}</code> and exits. The flags keep memory down on a small machine: smaller prefill steps (<code>512</code>), one cached prompt, one request at a time. <code>enable_thinking: false</code> turns off Qwen3's reasoning preamble, so a short answer stays short.</p>
-    <p>Then add an endpoint and a profile to <code>~/.darkmux/profiles.json</code>:</p>
+    <div class="callout warn">
+      <strong>Keep the single quotes around the JSON.</strong> systemd strips double quotes from <code>ExecStart</code>; without the single quotes the server receives <code>{enable_thinking:false}</code> and exits. (<code>enable_thinking: false</code> turns off Qwen3's reasoning preamble, so a short answer stays short.)
+    </div>
+    <p>Add an endpoint and a profile to <code>~/.darkmux/profiles.json</code>:</p>
     <pre><code>"profiles": {
   "mlx-small": {
     "description": "Qwen3-1.7B on the local mlx_lm.server.",
@@ -92,43 +92,38 @@ curl -s http://127.0.0.1:8080/v1/models</code></pre>
 "endpoints": {
   "mlx-local": { "url": "http://127.0.0.1:8080/v1", "dialect": "chat-completions-max-tokens" }
 }</code></pre>
-    <p>darkmux's utility model (radio's routing seat, and compaction of long runs) defaults to an LM Studio model. Point it at the same server instead, with the endpoint's id and a context that fits:</p>
+    <p>darkmux's utility model (radio's routing seat, and compaction of long runs) defaults to an LM Studio model. Point it at the same server:</p>
     <pre><code>"internal": {
   "utility": { "id": "mlx-community/Qwen3-1.7B-4bit", "endpoint": "mlx-local", "n_ctx": 8192 }
 }</code></pre>
-    <p>No <code>lms</code> runs for it. <code>darkmux doctor</code> passes <code>lms binary</code> once nothing in <code>profiles.json</code> needs LM Studio: <code>init</code> writes LM Studio profiles (<code>fast</code>, <code>balanced</code>, <code>deep</code>), so remove those first if you have no LM Studio. <code>models loaded</code> still warns, since it asks <code>lms</code>. Compaction runs inside the container, so it also needs a runtime image released after this setting landed; with the image from an earlier release, compaction still addresses LM Studio.</p>
-    <p>A role with no tools runs on the host against that endpoint, with no Docker and no LM Studio:</p>
+    <p>If you have no LM Studio, remove the profiles <code>init</code> wrote for it (<code>fast</code>, <code>balanced</code>, <code>deep</code>) so <code>darkmux doctor</code> passes <code>lms binary</code>. A role with no tools now runs on the host against the endpoint, with no Docker and no LM Studio:</p>
     <pre><code>darkmux dispatch pr-reviewer --profile mlx-small "In two sentences: what is one risk of merging a change that adds a new required config field?"</code></pre>
-    <p class="session-caption">Verified 2026-10-11 on a 13" M2 MacBook Pro (8 GB), omarchy-mlx v0.7.32, system Mesa 26.2.4: the dispatch returned a verdict in about a minute, the model's first load included. On 8 GB, Qwen3-4B-Instruct-2507-4bit ran the GPU out of memory on a ~3.5k-token prompt; stay at 1.7B there, or close other GPU users.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Docker, for roles with tools</h2>
-    <p>Every role with tools (coder, reviewer, lab workloads) runs in the <code>darkmux-runtime</code> container. On macOS, Docker Desktop hides two differences that Docker Engine on Linux does not, and darkmux's Linux platform strategy (<code>darkmux-platform</code>) handles both:</p>
+    <p>Every role with tools (coder, reviewer, lab workloads) runs in the <code>darkmux-runtime</code> container. Docker Desktop on macOS hides two differences that Docker Engine on Linux doesn't, and darkmux handles both:</p>
     <ul>
-      <li><strong>Reaching the host.</strong> Docker Desktop defines <code>host.docker.internal</code> and forwards it to the Mac's own <code>127.0.0.1</code>. Docker Engine defines neither, so darkmux maps the name to the bridge gateway (<code>--add-host=host.docker.internal:host-gateway</code>). The model server then has to listen on the bridge, and the firewall has to let that one port in.</li>
-      <li><strong>Who owns the files.</strong> darkmux creates each dispatch's workspace and output directories private to you. Docker Desktop maps ownership across those mounts; Docker Engine keeps it, so the container runs as you (<code>--user=&lt;your uid&gt;:&lt;your gid&gt;</code>). Override it with <code>darkmux config set runtime.container_user &lt;uid&gt;:&lt;gid&gt;</code>, or <code>image</code> for the image's own user.</li>
+      <li><strong>Reaching the host.</strong> Docker Engine doesn't define <code>host.docker.internal</code>, so darkmux maps it to the bridge gateway. The model server has to listen on the bridge, and the firewall has to let that one port in.</li>
+      <li><strong>Who owns the files.</strong> Docker Engine keeps file ownership across mounts, so the container runs as you. Override it with <code>darkmux config set runtime.container_user &lt;uid&gt;:&lt;gid&gt;</code>, or <code>image</code> for the image's own user.</li>
     </ul>
-    <p>The rest is yours to run, because darkmux never runs <code>sudo</code>:</p>
-    <pre><code>sudo usermod -aG docker "$USER"
+    <p>darkmux never runs <code>sudo</code>, so the rest is yours:</p>
+    <pre><code>sudo usermod -aG docker "$USER"                       <span class="comment"># then log out and back in</span>
 sudo systemctl enable --now docker.service
 sudo ufw allow in on docker0 to any port 8080 proto tcp
 sudo ufw status verbose</code></pre>
-    <p>Log out and back in for the group to apply. Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A model on an endpoint darkmux does not manage needs its context window declared for a role with tools, which compacts against it: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
+    <p>Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A role with tools compacts against the model's context window, which an unmanaged endpoint has to declare: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
     <pre><code>darkmux dispatch code-reviewer --profile mlx-small "Use the exec tool to run: echo hello-from-container. Then reply with the output in one sentence."</code></pre>
-    <p class="session-caption">Verified 2026-10-11 on the same M2 with a build of the <code>omarchy</code> branch: two turns, one real <code>exec</code> tool call in the container, exit 0, 79 s.</p>
-    <p>darkmux keeps the container on its own network rather than the host's. Host networking would make a <code>127.0.0.1</code> server reachable with no setup at all, and it would also give every tool call the run of every port on the machine.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Keep the daemon running</h2>
-    <p><code>darkmux serve</code> runs the viewer (<code>http://127.0.0.1:8765/</code>), presence, and the flow sinks a fleet reads. On macOS Homebrew's <code>brew services</code> keeps it up; on Omarchy it is a systemd user service:</p>
-    <pre><code>mkdir -p ~/.config/systemd/user
-cat &gt; ~/.config/systemd/user/darkmux-serve.service &lt;&lt;'UNIT'
+    <p><code>darkmux serve</code> runs the viewer (<code>http://127.0.0.1:8765/</code>), presence, and the flow sinks a fleet reads. On macOS, <code>brew services</code> keeps it up; on Omarchy it's a systemd user service:</p>
+    <pre><code>cat &gt; ~/.config/systemd/user/darkmux-serve.service &lt;&lt;'UNIT'
 [Unit]
 Description=darkmux serve daemon (viewer, fleet presence, flow sinks)
 After=network-online.target
@@ -144,31 +139,25 @@ systemctl --user daemon-reload
 systemctl --user enable --now darkmux-serve
 journalctl --user -u darkmux-serve -n 20</code></pre>
     <p>The daemon reads <code>config.json</code> once at start: after a <code>darkmux config set</code>, run <code>systemctl --user restart darkmux-serve</code>.</p>
-    <p>On a small machine, cap glibc's malloc arenas for the daemon. On a fleet peer each viewer refresh of the runs board parses the hub's whole flow stream (#3217), and glibc keeps every peak resident per thread:</p>
-    <pre><code>mkdir -p ~/.config/systemd/user/darkmux-serve.service.d
-printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=2\n' &gt; ~/.config/systemd/user/darkmux-serve.service.d/malloc.conf
-systemctl --user daemon-reload &amp;&amp; systemctl --user restart darkmux-serve</code></pre>
-    <p class="session-caption">Measured 2026-10-12 on the 8 GB M2, a peer of a hub whose stream held 10,000 records: six rounds of runs-board requests left the daemon at 558–627 MB without the cap and 226–295 MB with it (from 14 MB at start). It was 1.24 GB after a phone watched a lab run.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Join a fleet</h2>
-    <p>A fleet is a few of your machines on a <a href="https://tailscale.com">Tailscale</a> tailnet, streaming flow records to one hub's Redis, so every machine's viewer shows every machine. The full model is in the <a href="fleet.html">fleet guide</a>; this is the Omarchy part.</p>
+    <p>A fleet is a few of your machines on a <a href="https://tailscale.com">Tailscale</a> tailnet, streaming flow records to one hub's Redis. The full model is in the <a href="fleet.html">fleet guide</a>; this is the Omarchy part.</p>
     <h3>Tailscale</h3>
-    <p>Tailscale is in Arch's repositories. Update the system first: a stale package database asks the mirror for a file it no longer has (404), and refreshing the database without upgrading (<code>pacman -Sy</code> alone) leaves a partial upgrade, which Arch does not support.</p>
-    <pre><code>omarchy-update                          # or: sudo pacman -Syu
+    <p>Update the system first: a stale package database asks the mirror for a file it no longer has, and <code>pacman -Sy</code> alone leaves a partial upgrade, which Arch doesn't support.</p>
+    <pre><code>omarchy-update                          <span class="comment"># or: sudo pacman -Syu</span>
 sudo pacman -S tailscale
 sudo systemctl enable --now tailscaled
-sudo tailscale set --operator=$USER     # tailscale status / ping without sudo
-sudo tailscale up                       # prints a login URL
+sudo tailscale set --operator=$USER     <span class="comment"># tailscale status / ping without sudo</span>
+sudo tailscale up                       <span class="comment"># prints a login URL</span>
 tailscale ping &lt;hub's tailnet address&gt;</code></pre>
-    <h3>Name it for the OS, especially on a dual-boot Mac</h3>
-    <p>Asahi installs alongside macOS, so one Mac can boot either. darkmux treats each install as its own machine: macOS identifies itself by its <code>IOPlatformUUID</code>, which Linux cannot read, and Linux by its <code>/etc/machine-id</code>. So the same laptop is two machines in the fleet, one per OS, never online together. Give the Linux side its own name with <em>omarchy</em> in it, on the tailnet and in darkmux, so each card says which OS it is; otherwise Tailscale names the second install <code>&lt;name&gt;-1</code>. The rest of this page calls that name <code>&lt;runner&gt;</code> (for example <code>laptop-omarchy</code>).</p>
+    <h3>Name it for the OS</h3>
+    <p>Asahi installs alongside macOS, and darkmux treats each install as its own machine (macOS by its <code>IOPlatformUUID</code>, Linux by <code>/etc/machine-id</code>). So a dual-boot laptop is two machines in the fleet, never online together. Give the Linux side its own name with <em>omarchy</em> in it, so each card says which OS it is; otherwise Tailscale names it <code>&lt;name&gt;-1</code>. The rest of this page calls it <code>&lt;runner&gt;</code> (for example <code>laptop-omarchy</code>). Showing a dual-boot laptop as one card is planned (<a href="https://github.com/kstrat2001/darkmux/issues/3212">#3212</a>).</p>
     <pre><code>sudo tailscale set --hostname &lt;runner&gt;
 darkmux config set machine_id &lt;runner&gt;</code></pre>
-    <p>Showing one dual-boot laptop as one card, labeled with whichever OS is running, is planned (<a href="https://github.com/kstrat2001/darkmux/issues/3212">#3212</a>).</p>
     <h3>Point it at the hub</h3>
     <pre><code>darkmux config set fleet.mode peer
 darkmux config set redis.enabled true
@@ -176,20 +165,17 @@ darkmux config set redis.host &lt;hub's tailnet address&gt;
 systemctl --user restart darkmux-serve
 darkmux doctor
 darkmux flow note --text "hello from omarchy"</code></pre>
-    <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware (for example <code>Apple M2 · 8 GB</code>). The daemon's log says <code>presence: heartbeat emitter started — uid=… display=…</code>. In <code>doctor</code>, expect the rows whose probes are macOS-only to warn rather than pass (RAM headroom, the host probe, the heuristics provider), and <code>lms binary</code> to fail with no LM Studio. A Redis with no password warns on <code>redis config</code>; on a password-less, tailnet-only hub that is expected. Linux has no Keychain, so a password or a fleet token comes from <code>DARKMUX_REDIS_URL</code> or <code>DARKMUX_SERVE_TOKEN</code> in the daemon's environment.</p>
-    <h3>See the hub: the roster and the fleet token</h3>
-    <p>Records flowing to the hub isn't the same as this machine knowing the other machines. Its own view lists only the machines in its roster (<code>darkmux machine list</code> says "single-machine fleet" until you add some), and it reads each peer's machine card from that peer's fleet listener, which refuses a request without the shared fleet token. Register the hub, and this machine, by tailnet name:</p>
+    <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware. In <code>doctor</code>, rows whose probes are macOS-only warn rather than pass, and a password-less, tailnet-only hub warns on <code>redis config</code>; both are expected.</p>
+    <h3>The roster and the fleet token</h3>
+    <p>Records reaching the hub isn't the same as this machine knowing the others. Its view lists only the machines in its roster, and it reads each peer's card from that peer's fleet listener, which refuses a request without the shared fleet token. Register the hub, and this machine, by tailnet name:</p>
     <pre><code>darkmux machine add &lt;hub's machine_id&gt; --address &lt;hub's tailnet name&gt; --description "fleet hub"
 darkmux machine add &lt;runner&gt; --address &lt;runner&gt;</code></pre>
-    <p>Give the daemon the fleet token. Linux has no Keychain, so it goes in the daemon's environment, in an owner-only systemd drop-in:</p>
+    <p>Linux has no Keychain, so the token goes in the daemon's environment, in an owner-only systemd drop-in (a Redis password the same way, as <code>DARKMUX_REDIS_URL</code>):</p>
     <pre><code>mkdir -p ~/.config/systemd/user/darkmux-serve.service.d &amp;&amp; (umask 077; printf '[Service]\nEnvironment=DARKMUX_SERVE_TOKEN=&lt;fleet token&gt;\n' &gt; ~/.config/systemd/user/darkmux-serve.service.d/fleet-token.conf) &amp;&amp; systemctl --user daemon-reload &amp;&amp; systemctl --user restart darkmux-serve
 darkmux machine list</code></pre>
-    <p>The hub's row then shows its card (live, its loaded models and profiles) and the HUB badge, and the daemon log has no "token is missing or does not match" refusals. With the token set but this machine's own fleet listener off, it reads other machines' cards and takes no work from them: its log says <code>fleet work: token set; the fleet listener is off</code>.</p>
-    <p class="session-caption">Verified 2026-10-12: an M2 runner read a Mac Studio hub's card through its fleet listener (fleet mode hub), zero token refusals.</p>
-    <h3>Watch a small runner from a bigger machine's viewer</h3>
-    <p>Every machine's viewer shows the whole fleet, so watch a small runner (8 GB, say) from a bigger machine's viewer rather than its own. The runs board parses the hub's whole flow stream on each refresh (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); on the small machine, a phone watching a run pushed its daemon past 1 GB. From another machine's viewer, the runner's card still moves through PROMPT, GEN and TOOLS from the records it streams to the hub.</p>
+    <p>The hub's row then shows its live card and the HUB badge, and the daemon log has no "token is missing or does not match" refusals. With this machine's own fleet listener off, it reads other machines' cards and takes no work from them; taking work is in the <a href="fleet.html#part-2">fleet guide</a>.</p>
     <h3>Open a runner's viewer from any tailnet device</h3>
-    <p>The daemon listens on <code>127.0.0.1:8765</code> only, and darkmux won't bind it elsewhere without read auth. To open this machine's viewer from your phone or another machine, forward a tailnet-only port to it with systemd: nothing listens on Wi-Fi, and the daemon stays on loopback. Put your machine's tailnet address (<code>tailscale ip -4</code>) in <code>ListenStream</code>:</p>
+    <p>The daemon listens on <code>127.0.0.1:8765</code> only. To open it from your phone or another machine, forward a tailnet-only port to it with systemd: nothing listens on Wi-Fi, and the daemon stays on loopback. Put this machine's tailnet address (<code>tailscale ip -4</code>) in <code>ListenStream</code>:</p>
     <pre><code>cat &gt; ~/.config/systemd/user/darkmux-viewer-tailnet.socket &lt;&lt;'UNIT'
 [Unit]
 Description=darkmux viewer on the tailnet (:8090 -&gt; 127.0.0.1:8765)
@@ -213,69 +199,60 @@ UNIT
 systemctl --user daemon-reload
 systemctl --user enable --now darkmux-viewer-tailnet.socket
 sudo ufw allow in on tailscale0 to any port 8090 proto tcp</code></pre>
-    <p>Then open <code>http://&lt;runner&gt;:8090/</code> on any device with Tailscale connected (MagicDNS resolves the short name). <code>FreeBind</code> lets the socket start before Tailscale has brought the address up. darkmux treats a request through a plain forward like this as remote, so its panels withhold this machine's addresses and paths, as for any remote viewer; fleet cards and runs show in full. To watch the whole fleet, a hub's viewer that's already on the tailnet works the same way.</p>
-    <p class="session-caption">Verified 2026-10-12: a runner's viewer on port 8090 opened from an iPhone on the tailnet.</p>
-    <p class="session-caption">Verified 2026-10-12: a 13" M2 on Omarchy joined a fleet hubbed on a Mac Studio over Tailscale; its note and presence reached the hub, and its card showed its own name. Taking work from other machines (its own fleet listener and trust entries) is not covered yet.</p>
+    <p>Then open <code>http://&lt;runner&gt;:8090/</code> on any device with Tailscale connected. <code>FreeBind</code> lets the socket start before Tailscale has its address up. darkmux treats a request through this forward as remote, so its panels withhold this machine's addresses and paths; fleet cards and runs show in full.</p>
   </div>
 </section>
 
-<section>
+<section id="lean">
   <div class="wrap">
-    <h2>Optional: run it headless</h2>
-    <p>Everything above works with the desktop up. This section is optional: once the machine is on the fleet, its card and runs show in the viewer on every other machine, so it doesn't need its own screen, and it can run as a headless AI runner on your tailnet: models, Docker and darkmux running, reachable over SSH, watched from the fleet viewer.</p>
-    <p><strong>The bonus is memory.</strong> On Apple Silicon the GPU shares system memory, so the desktop (the compositor, the bar, every rendered window) comes out of the same pool as the model. Lowering the resolution saves little (a 2560&times;1600 frame is about 16 MB); not running the desktop is what counts. An example, on the 13" M2 (8 GB) this page was written on, with the Qwen3-1.7B server running:</p>
-    <table class="cfg">
-      <thead><tr><th></th><th>Available memory</th><th>Used</th></tr></thead>
-      <tbody>
-        <tr><td>Desktop up (Hyprland, the bar, a terminal)</td><td>3,628 MB</td><td>3,906 MB</td></tr>
-        <tr><td>Headless (SDDM stopped, from a text console)</td><td>4,953 MB</td><td>2,581 MB</td></tr>
-        <tr><td><strong>Freed</strong></td><td><strong>+1,325 MB</strong></td><td><strong>&minus;1,325 MB</strong></td></tr>
-      </tbody>
-    </table>
-    <p class="session-caption">From <code>free -m</code> on 2026-10-12, both with the model server running: the desktop row at 01:49, the headless row after step 5. About 1.3 GB, nearly a fifth of the machine's usable memory, back for models and builds.</p>
-    <p>Run each step in order. The first two are what keep it running; skipping them is how a headless node silently drops off the fleet.</p>
-    <h3>1. Stay awake with the lid closed (on power)</h3>
-    <p>By default closing a laptop's lid suspends it. Ignore the lid while it's on external power, and keep suspending on battery, which protects the battery:</p>
-    <pre><code>sudo mkdir -p /etc/systemd/logind.conf.d
+    <h2>Optional: run it lean</h2>
+    <p>None of this is needed on a machine with plenty of RAM. But it's a nice Linux flex. On Apple Silicon the GPU shares memory with everything, including the desktop, and on Linux you can shut the whole desktop off and run the Mac as a lean headless box on your tailnet. You can't do that on macOS.</p>
+
+    <h3>Trim the memory</h3>
+    <ul>
+      <li><strong>The model server.</strong> The <code>mlx-local</code> unit above already runs lean: small prefill steps (<code>512</code>), one cached prompt, one request at a time.</li>
+      <li><strong>The GPU heap.</strong> omarchy-mlx raises the half-the-RAM heap only on machines with more than 32 GB. <code>HK_SYSMEM</code> (bytes) in the server's environment raises it, for example <code>Environment=HK_SYSMEM=5000000000</code> in the unit's <code>[Service]</code> section.</li>
+      <li><strong>The daemon.</strong> glibc keeps each thread's memory peak resident. Cap its malloc arenas (below).</li>
+    </ul>
+    <pre><code>mkdir -p ~/.config/systemd/user/darkmux-serve.service.d
+printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=2\n' &gt; ~/.config/systemd/user/darkmux-serve.service.d/malloc.conf
+systemctl --user daemon-reload &amp;&amp; systemctl --user restart darkmux-serve</code></pre>
+    <div class="callout warn">
+      <strong><code>HK_SYSMEM</code> is a ceiling, not a reservation.</strong> The GPU can then take memory the rest of the machine needs; raise it only on a machine doing little else.
+    </div>
+
+    <h3>Run it headless</h3>
+    <p>The desktop (the compositor, the bar, every window) comes out of the same memory pool as the model. Lowering the resolution saves little; not running the desktop is what counts. Once the machine is on the fleet, its card and runs show in every other machine's viewer, so it doesn't need its own screen. Run these in order; the first two keep it on the fleet.</p>
+    <pre><code><span class="comment"># 1. Stay awake with the lid closed, on external power (battery still suspends).</span>
+sudo mkdir -p /etc/systemd/logind.conf.d
 printf '[Login]\nHandleLidSwitchExternalPower=ignore\n' | sudo tee /etc/systemd/logind.conf.d/30-headless-lid.conf
-sudo systemctl restart systemd-logind   # may end the current desktop session</code></pre>
-    <h3>2. Keep your user services running without a login</h3>
-    <p><code>darkmux-serve</code> and <code>mlx-local</code> are user services: by default they stop when your last session ends. Linger keeps them running from boot, logged in or not:</p>
-    <pre><code>sudo loginctl enable-linger "$USER"
-loginctl show-user "$USER" -p Linger      # Linger=yes</code></pre>
-    <h3>3. Check every piece starts at boot</h3>
-    <pre><code>for u in tailscaled docker sshd; do echo "$u $(systemctl is-enabled $u) $(systemctl is-active $u)"; done
-for u in darkmux-serve mlx-local; do echo "$u $(systemctl --user is-enabled $u) $(systemctl --user is-active $u)"; done</code></pre>
-    <p>Tailscale, Docker and SSH are system services: they start at boot whether anyone is logged in. Each line should say <code>enabled active</code>. (<code>containerd</code> shows as not enabled; Docker starts it.) A user unit made with <code>systemd-run</code> says <code>transient</code>: it doesn't survive a reboot, so write it as a unit file as above.</p>
-    <h3>4. Reach it over the tailnet</h3>
-    <p>The simplest way in is Tailscale SSH: Tailscale authenticates you by your tailnet login, so there are no keys to copy to each device, and it works from a phone. On the runner:</p>
-    <pre><code>sudo tailscale set --ssh</code></pre>
-    <p>Then, from any device on the tailnet, including a phone with an SSH app (Blink Shell, Termius) and Tailscale connected, connect by the name you gave the runner, with no password or key:</p>
-    <pre><code>ssh &lt;you&gt;@&lt;runner&gt;
-darkmux doctor
-systemctl --user status darkmux-serve mlx-local</code></pre>
-    <p>Depending on your tailnet's access policy, the first connection (and one every so often after) prints a <code>login.tailscale.com</code> link to approve in a browser. Plain OpenSSH works too (the runner's <code>sshd</code> already listens): add each device's public key to <code>~/.ssh/authorized_keys</code>, allow it through the firewall only on the tailnet (<code>sudo ufw allow in on tailscale0 to any port 22 proto tcp</code>), and once a key works, turn passwords off (<code>PasswordAuthentication no</code> in a file under <code>/etc/ssh/sshd_config.d/</code>).</p>
-    <p class="session-caption">Tailscale SSH verified 2026-10-12 from an iPhone on the tailnet to the M2.</p>
-    <p>Its viewer is on the machine itself (<code>http://127.0.0.1:8765/</code>); from elsewhere, the fleet viewer on any other machine shows its card and runs.</p>
-    <h3>5. Turn the desktop off</h3>
-    <p>Omarchy logs you straight into Hyprland at boot (SDDM autologin), and logging out doesn't help: SDDM logs you straight back in. Stop the display manager instead, from a text console so nothing you need is inside the desktop when it goes: press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F3</kbd>, log in, and run:</p>
-    <pre><code>sudo systemctl stop sddm       # ends Hyprland and everything in it; user services keep running (linger)
-free -m                        # the memory the desktop was holding is back
-sudo systemctl start sddm      # the desktop again, for this boot</code></pre>
-    <p>A terminal and an agent can run right there in the text console, on the machine, with no desktop. Stopping SDDM lasts until the next boot, which brings the desktop back.</p>
-    <p><strong>Optional:</strong> to boot without the desktop every time, for a machine that only serves the fleet:</p>
-    <pre><code>sudo systemctl set-default multi-user.target    # boot to a text console; no desktop
-sudo systemctl set-default graphical.target     # undo: the desktop at boot again
-sudo systemctl start sddm                       # the desktop now, for one session</code></pre>
-    <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those in the text console or over SSH instead.</p>
-    <h3>Dim the screen with the lid open</h3>
-    <p>The text console never blanks by default (<code>consoleblank=0</code>), so a runner left with its lid open keeps its backlight on. Turn it off; logind lets the user at the machine set it, so no sudo:</p>
-    <pre><code>brightnessctl -d apple-panel-bl set 0      # the panel backlight off
-brightnessctl -d apple-panel-bl set 50%    # back on</code></pre>
-    <p>To blank on idle instead, run <code>setterm --blank 1 --powerdown 2</code> in the text console itself (until reboot), or add <code>consoleblank=60</code> to the kernel's boot options. <code>brightnessctl -l</code> lists the backlights; on a 13" M2 the second one (<code>228600000.dsi.0</code>) is likely the Touch Bar.</p>
-    <h3>6. Check it from the fleet</h3>
-    <p>From another machine's fleet viewer, the card should stay live with its hardware line, and a dispatch on the runner should show in its scope. On the runner, <code>free -h</code> shows what the desktop was holding.</p>
-    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: step 2 (linger on; both user services survived a desktop logout), step 3 with the units above, step 4 by Tailscale SSH, and step 5 by stopping SDDM from a text console (the memory table above). Step 1 is written from the machine's default lid policy and has not been run there yet; the lid stayed open.</p>
+sudo systemctl restart systemd-logind   <span class="comment"># may end the current desktop session</span>
+
+<span class="comment"># 2. Keep user services (darkmux-serve, mlx-local) running without a login.</span>
+sudo loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger      <span class="comment"># Linger=yes</span>
+
+<span class="comment"># 3. Check every piece starts at boot: each line should say "enabled active".</span>
+for u in tailscaled docker sshd; do echo "$u $(systemctl is-enabled $u) $(systemctl is-active $u)"; done
+for u in darkmux-serve mlx-local; do echo "$u $(systemctl --user is-enabled $u) $(systemctl --user is-active $u)"; done
+
+<span class="comment"># 4. Reach it over the tailnet with Tailscale SSH: no keys to copy, works from a phone.</span>
+sudo tailscale set --ssh
+ssh &lt;you&gt;@&lt;runner&gt;                       <span class="comment"># from any tailnet device</span></code></pre>
+    <p>A unit that says <code>transient</code> in step 3 was made with <code>systemd-run</code> and won't survive a reboot; write it as a unit file. Depending on your tailnet's access policy, Tailscale SSH may print a <code>login.tailscale.com</code> link to approve now and then. Plain OpenSSH works too; open port 22 only on the tailnet (<code>sudo ufw allow in on tailscale0 to any port 22 proto tcp</code>) and use keys, not passwords.</p>
+    <p>Then turn the desktop off. Omarchy logs you straight into Hyprland (SDDM autologin), so logging out doesn't help; stop the display manager from a text console instead. Press Ctrl+Alt+F3, log in, and run:</p>
+    <pre><code>sudo systemctl stop sddm       <span class="comment"># ends Hyprland; user services keep running (linger)</span>
+free -m                        <span class="comment"># the memory the desktop was holding is back</span>
+sudo systemctl start sddm      <span class="comment"># the desktop again, for this boot</span>
+
+<span class="comment"># To boot without the desktop every time:</span>
+sudo systemctl set-default multi-user.target    <span class="comment"># boot to a text console</span>
+sudo systemctl set-default graphical.target     <span class="comment"># undo</span>
+
+<span class="comment"># The text console never blanks, so turn the panel off with the lid open (no sudo):</span>
+brightnessctl -d apple-panel-bl set 0
+brightnessctl -d apple-panel-bl set 50%</code></pre>
+    <p>Anything running inside the desktop session ends with it; run terminals and agents in the text console or over SSH instead.</p>
   </div>
 </section>
 
@@ -283,14 +260,12 @@ brightnessctl -d apple-panel-bl set 50%    # back on</code></pre>
   <div class="wrap">
     <h2>What does not work yet</h2>
     <ul>
-      <li><strong>Compaction on a local server</strong> needs the next runtime image release; radio's routing seat uses the server today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
-      <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, and the Machine tab's memory gauge (pool, swap, margin) read on Linux. Battery and cluster MHz read too. Power is next; GPU and thermal state have no Linux source yet and read "not reported". The residency planner still sees no memory pools (it only manages LM Studio models).</li>
-      <li><strong>A model on an unmanaged endpoint counts as "other" memory</strong> on the Machine tab, not as darkmux's: darkmux attributes only the models it manages.</li>
-      <li><strong>A role with no tools on an unmanaged endpoint</strong> runs host-side and writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet either (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
-      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
+      <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, battery and cluster MHz read on Linux. Power is next; GPU and thermal state read "not reported". The residency planner sees no memory pools (it only manages LM Studio models).</li>
+      <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process usage in <code>fdinfo</code>, so the lens shows "—".</li>
+      <li><strong>A model on an unmanaged endpoint</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it manages.</li>
+      <li><strong>A role with no tools on an unmanaged endpoint</strong> writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
+      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container</strong> dials the container itself: darkmux rewrites a loopback LM Studio address, not an unmanaged endpoint's URL. Use <code>host.docker.internal</code> (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
       <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, warns on <code>models loaded</code> with no LM Studio, and warns on rows whose probes are macOS-only.</li>
-      <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process DRM usage in <code>fdinfo</code>, so the lens shows GPU as "—".</li>
-      <li><strong>The daemon's memory</strong> grows with each runs-board refresh on a fleet peer (<a href="https://github.com/kstrat2001/darkmux/issues/3217">#3217</a>); cap malloc arenas as above.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>
