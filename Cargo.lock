@@ -895,6 +895,7 @@ version = "5.2.0"
 dependencies = [
  "anyhow",
  "darkmux-gestalt",
+ "darkmux-platform",
  "darkmux-types",
  "dirs",
  "schemars 1.2.2",
