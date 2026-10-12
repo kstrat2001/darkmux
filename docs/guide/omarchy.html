@@ -208,14 +208,18 @@ systemctl --user status darkmux-serve mlx-local</code></pre>
     <p class="session-caption">Tailscale SSH verified 2026-10-12 from an iPhone on the tailnet to the M2.</p>
     <p>Its viewer is on the machine itself (<code>http://127.0.0.1:8765/</code>); from elsewhere, the fleet viewer on any other machine shows its card and runs.</p>
     <h3>5. Turn the desktop off</h3>
-    <p>Omarchy logs you straight into Hyprland at boot (SDDM autologin). For a session, log out of the desktop; the next boot brings it back. To boot without it:</p>
+    <p>Omarchy logs you straight into Hyprland at boot (SDDM autologin), and logging out doesn't help: SDDM logs you straight back in. Stop the display manager instead, from a text console so nothing you need is inside the desktop when it goes: press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F3</kbd>, log in, and run:</p>
+    <pre><code>sudo systemctl stop sddm       # ends Hyprland and everything in it; user services keep running (linger)
+free -m                        # the memory the desktop was holding is back
+sudo systemctl start sddm      # the desktop again, for this boot</code></pre>
+    <p>A terminal and an agent can run right there in the text console, on the machine, with no desktop. To boot without the desktop every time:</p>
     <pre><code>sudo systemctl set-default multi-user.target    # boot to a text console; no desktop
 sudo systemctl set-default graphical.target     # undo: the desktop at boot again
 sudo systemctl start sddm                       # the desktop now, for one session</code></pre>
-    <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those over SSH instead.</p>
+    <p>Anything running inside the desktop session ends with it, a terminal and an agent in it included; run those in the text console or over SSH instead.</p>
     <h3>6. Check it from the fleet</h3>
     <p>From another machine's fleet viewer, the card should stay live with its hardware line, and a dispatch on the runner should show in its scope. On the runner, <code>free -h</code> shows what the desktop was holding.</p>
-    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: step 2 (linger on), step 3 with the units above, and step 4 by Tailscale SSH. Steps 1, 5 and 6 are written from the machine's configuration (SDDM autologin, the default lid policy) and have not been run there yet; this page is updated as they are.</p>
+    <p class="session-caption">Run on a 13" M2 (8 GB), 2026-10-12: step 2 (linger on; both user services survived a desktop logout), step 3 with the units above, and step 4 by Tailscale SSH. Steps 1, 5 and 6 are written from the machine's configuration (SDDM autologin, the default lid policy) and have not been run there yet; this page is updated as they are.</p>
   </div>
 </section>
 
