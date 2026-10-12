@@ -612,6 +612,11 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
         "consumer: folds a session's records into its run attempts, builds none",
     ),
     (
+        "crates/darkmux-serve/src/fleet_window.rs",
+        "consumer: holds the hub's records for the fleet readers and matches on actions to keep \
+         a payload; its tests build sample records as fixtures, it publishes none",
+    ),
+    (
         "crates/darkmux-crew/src/dispatch_internal_tests.rs",
         "tests for a scanned producer, in a sibling file rather than behind the `#[cfg(test)]` \
          marker the scanner cuts at",

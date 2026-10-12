@@ -62,6 +62,11 @@ darkmux release.
   3.6 MB, a request inside the cache window from 87 ms and 88 MB to 14 ms and
   3.6 MB, and the window kept between requests from 66 MB to 45 MB. The `/runs`
   body and `darkmux run list --json` are unchanged.
+  One request reads the hub at a time, with no lock held across the read: the
+  others wait at most one round trip's bound (1.5 s) and are served the last
+  window, and a failed read is not retried inside its 2-second window. A Redis
+  connect is now bounded too: redis-rs read its setup replies with no timeout, so
+  a hub that accepted the connection and never answered held it for good.
 
 ## [5.1.1] - 2026-10-11
 

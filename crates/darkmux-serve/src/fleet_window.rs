@@ -441,8 +441,8 @@ pub(crate) fn advance(
     out
 }
 
-/// One stream's held window.
-#[derive(Default)]
+/// One stream's held window. Cloning it copies a pointer to the records.
+#[derive(Default, Clone)]
 struct StreamWindow {
     /// When it was last brought up to date; `None` before the first read.
     at: Option<SystemTime>,
@@ -455,14 +455,33 @@ struct StreamWindow {
 }
 
 /// The fleet read's cache: the work stream's window and the telemetry
-/// stream's, shared by every reader in the process.
+/// stream's, shared by every reader in the process, and the condition a
+/// request waiting on another's refresh sleeps on.
 #[derive(Default)]
-pub(crate) struct FleetCaches(Mutex<FleetWindows>);
+pub(crate) struct FleetCaches {
+    windows: Mutex<FleetWindows>,
+    settled: std::sync::Condvar,
+}
 
 #[derive(Default)]
 struct FleetWindows {
     work: StreamWindow,
     telemetry: StreamWindow,
+    /// A request is reading the hub right now (outside the lock).
+    refreshing: bool,
+    /// When the last refresh failed; cleared by a successful one. Inside the
+    /// TTL of a failure nothing asks the hub again.
+    failed_at: Option<SystemTime>,
+}
+
+/// The longest a request waits on another request's refresh: one round
+/// trip's bound, the connect plus one reply. A refresh still going past it
+/// (a slow hub, a cold read of the whole window, or a silent one: the
+/// incremental read pipelines two commands and redis-rs waits out each
+/// reply's bound, so the refresher itself gives up after the connect plus
+/// two) does not hold the waiter, which is served the last window instead.
+fn refresh_wait() -> std::time::Duration {
+    darkmux_flow::REDIS_CONNECT_TIMEOUT + darkmux_flow::REDIS_RESPONSE_TIMEOUT
 }
 
 /// What a read of the hub's streams returns. Machine samples are half the
@@ -490,10 +509,15 @@ const FLEET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 /// older than [`FLEET_CACHE_TTL`] at `now`. Explicit cache, clock and URL so
 /// a test drives the window without sleeping or touching the environment.
 ///
-/// One lock covers the check and the refresh, so concurrent requests past
-/// the TTL make one round trip and parse each new entry once; the others
-/// wait for it and are served the same window. The refresh is bounded by the
-/// Redis connect and response timeouts.
+/// Single-flight, and never holding the lock across I/O: the first request
+/// past the TTL reads the hub with the lock released, on its own copy of the
+/// windows (a pointer copy), and installs the result. A request arriving
+/// meanwhile waits for that one refresh, at most [`refresh_wait`], and is
+/// served what it produced, or the last window when it failed or is still
+/// going. A failed refresh is recorded, and inside the TTL of a failure no
+/// request asks the hub again: a hub that accepts and never answers costs
+/// one bounded attempt per TTL, not one per request, in turn. Each new entry
+/// is parsed once.
 ///
 /// Degradation is unchanged from the full-read cache it replaces: no URL is
 /// `Off` (a standalone install, not a fault); a failed read serves the
@@ -509,14 +533,31 @@ pub(crate) fn read_fleet_cached(
     now: SystemTime,
     redis_url: impl FnOnce() -> Option<darkmux_flow::RawRedisUrl>,
 ) -> crate::FleetRead {
-    let mut windows = caches.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let fresh = |w: &StreamWindow| {
-        w.at.is_some_and(|at| crate::wall_clock_cache_is_fresh(at, now, FLEET_CACHE_TTL))
+    let within_ttl = |at: Option<SystemTime>| {
+        at.is_some_and(|at| crate::wall_clock_cache_is_fresh(at, now, FLEET_CACHE_TTL))
     };
-    if fresh(&windows.work) && (scope == FleetScope::Work || fresh(&windows.telemetry)) {
+    let fresh = |w: &FleetWindows| {
+        within_ttl(w.work.at) && (scope == FleetScope::Work || within_ttl(w.telemetry.at))
+    };
+    let mut windows = caches
+        .windows
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if fresh(&windows) {
         return crate::FleetRead {
             records: windows.assemble(scope),
             state: SourceState::Ok,
+        };
+    }
+    if within_ttl(windows.failed_at) {
+        return windows.degraded(scope, now);
+    }
+    if windows.refreshing {
+        windows = match wait_for_refresh(caches, windows, scope, now, fresh, |w| {
+            within_ttl(w.failed_at)
+        }) {
+            Ok(windows) => windows,
+            Err(read) => return read,
         };
     }
     let Some(url) = redis_url() else {
@@ -527,55 +568,113 @@ pub(crate) fn read_fleet_cached(
             state: SourceState::Off,
         };
     };
-    match windows.refresh(url.expose_for_probe(), scope, now) {
-        Ok(()) => crate::FleetRead {
-            records: windows.assemble(scope),
-            state: SourceState::Ok,
-        },
+    windows.refreshing = true;
+    let (mut work, mut telemetry) = (windows.work.clone(), windows.telemetry.clone());
+    drop(windows);
+    let settle = Settle(caches);
+    let result = refresh(
+        url.expose_for_probe(),
+        scope,
+        now,
+        &mut work,
+        &mut telemetry,
+    );
+    let mut windows = caches
+        .windows
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // A stream read successfully keeps its new window even when the other
+    // failed; one that failed is unchanged.
+    windows.work = work;
+    windows.telemetry = telemetry;
+    windows.refreshing = false;
+    let read = match result {
+        Ok(()) => {
+            windows.failed_at = None;
+            crate::FleetRead {
+                records: windows.assemble(scope),
+                state: SourceState::Ok,
+            }
+        }
         Err(e) => {
+            windows.failed_at = Some(now);
             // Never interpolate the url (#661 Slice 5): it can carry an
             // inline password. The full error goes to stderr; the wire gets
             // the classification only.
-            let read_at = match scope {
-                FleetScope::Work => windows.work.at,
-                FleetScope::WithSamples => windows
-                    .work
-                    .at
-                    .zip(windows.telemetry.at)
-                    .map(|(a, b)| a.min(b)),
-            };
-            match read_at {
-                Some(at) => {
-                    let records = windows.assemble(scope);
-                    eprintln!(
-                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                         serving the last-known-good fleet snapshot ({} records) plus this \
-                         machine's own",
-                        records.len()
-                    );
-                    crate::FleetRead {
-                        records,
-                        state: SourceState::Stale {
-                            age_ms: crate::wall_clock_age_ms_at(at, now),
-                            detail: crate::FLEET_READ_ERROR_DETAIL,
-                        },
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                         no previous snapshot — serving this machine's records only"
-                    );
-                    crate::FleetRead {
-                        records: FleetRecords::default(),
-                        state: SourceState::Unavailable {
-                            detail: crate::FLEET_READ_ERROR_DETAIL,
-                        },
-                    }
-                }
-            }
+            eprintln!(
+                "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
+                 serving the last-known-good fleet snapshot, if any, plus this machine's own"
+            );
+            windows.degraded(scope, now)
         }
+    };
+    drop(windows);
+    drop(settle);
+    read
+}
+
+/// Wait, at most [`refresh_wait`], for the refresh in flight. `Err` is the
+/// answer: the refreshed window, or the last one when it failed or is still
+/// going. `Ok` hands the lock back to read the hub: the refresh succeeded but
+/// covered the other scope's streams.
+fn wait_for_refresh<'a>(
+    caches: &'a FleetCaches,
+    windows: std::sync::MutexGuard<'a, FleetWindows>,
+    scope: FleetScope,
+    now: SystemTime,
+    fresh: impl Fn(&FleetWindows) -> bool,
+    failed_recently: impl Fn(&FleetWindows) -> bool,
+) -> Result<std::sync::MutexGuard<'a, FleetWindows>, crate::FleetRead> {
+    let windows = caches
+        .settled
+        .wait_timeout_while(windows, refresh_wait(), |w| w.refreshing)
+        .unwrap_or_else(PoisonError::into_inner)
+        .0;
+    if fresh(&windows) {
+        return Err(crate::FleetRead {
+            records: windows.assemble(scope),
+            state: SourceState::Ok,
+        });
     }
+    // Never wait twice.
+    if windows.refreshing || failed_recently(&windows) {
+        return Err(windows.degraded(scope, now));
+    }
+    Ok(windows)
+}
+
+/// Wakes the requests waiting on a refresh when it ends, and clears the
+/// in-flight mark even if the refresh panicked, so no request waits on a
+/// refresh that will never finish.
+struct Settle<'a>(&'a FleetCaches);
+
+impl Drop for Settle<'_> {
+    fn drop(&mut self) {
+        self.0
+            .windows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refreshing = false;
+        self.0.settled.notify_all();
+    }
+}
+
+/// Bring the streams `scope` covers up to date, on the caller's copies.
+fn refresh(
+    url: &str,
+    scope: FleetScope,
+    now: SystemTime,
+    work: &mut StreamWindow,
+    telemetry: &mut StreamWindow,
+) -> anyhow::Result<()> {
+    let mut conn = crate::bounded_redis_connection(url, "the fleet window")?;
+    let work_stream = darkmux_types::config_access::redis_stream(); // (#875)
+    refresh_stream(&mut conn, work, url, &work_stream, now)?;
+    if scope == FleetScope::WithSamples {
+        let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
+        refresh_stream(&mut conn, telemetry, url, &telemetry_stream, now)?;
+    }
+    Ok(())
 }
 
 impl FleetWindows {
@@ -599,16 +698,35 @@ impl FleetWindows {
         FleetRecords(Arc::new(out))
     }
 
-    fn refresh(&mut self, url: &str, scope: FleetScope, now: SystemTime) -> anyhow::Result<()> {
-        let mut conn = crate::bounded_redis_connection(url, "the fleet window")?;
-        let work = darkmux_types::config_access::redis_stream(); // (#875)
-        refresh_stream(&mut conn, &mut self.work, url, &work, now)?;
-        if scope == FleetScope::WithSamples {
-            let telemetry = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
-            refresh_stream(&mut conn, &mut self.telemetry, url, &telemetry, now)?;
+    /// The last window `scope` covers, marked `Stale` with its age, or
+    /// nothing, `Unavailable`, when it was never read.
+    fn degraded(&self, scope: FleetScope, now: SystemTime) -> crate::FleetRead {
+        let read_at = match scope {
+            FleetScope::Work => self.work.at,
+            FleetScope::WithSamples => self.work.at.zip(self.telemetry.at).map(|(a, b)| a.min(b)),
+        };
+        match read_at {
+            Some(at) => crate::FleetRead {
+                records: self.assemble(scope),
+                state: SourceState::Stale {
+                    age_ms: crate::wall_clock_age_ms_at(at, now),
+                    detail: crate::FLEET_READ_ERROR_DETAIL,
+                },
+            },
+            None => crate::FleetRead {
+                records: FleetRecords::default(),
+                state: SourceState::Unavailable {
+                    detail: crate::FLEET_READ_ERROR_DETAIL,
+                },
+            },
         }
-        Ok(())
     }
+}
+
+/// Which hub and stream a window was read from, as a digest (the URL can
+/// carry a password).
+fn source_key(url: &str, stream: &str) -> [u8; 32] {
+    *blake3::hash(format!("{url}\u{1f}{stream}").as_bytes()).as_bytes()
 }
 
 /// Bring one stream's window up to date.
@@ -619,7 +737,7 @@ fn refresh_stream(
     stream: &str,
     now: SystemTime,
 ) -> anyhow::Result<()> {
-    let source = *blake3::hash(format!("{url}\u{1f}{stream}").as_bytes()).as_bytes();
+    let source = source_key(url, stream);
     if window.source != Some(source) {
         *window = StreamWindow {
             source: Some(source),
@@ -755,6 +873,210 @@ mod tests {
 
     fn ids(records: &[Arc<FleetRecord>]) -> Vec<Option<StreamId>> {
         records.iter().map(|r| r.hub_id).collect()
+    }
+
+    /// A hub that accepts connections and never answers anything: the
+    /// worst a peer that is half up (a wedged Redis, a stalled tailnet
+    /// relay) can do. Counts the connections it accepted.
+    struct SilentHub {
+        url: String,
+        accepts: Arc<AtomicU64>,
+    }
+
+    fn silent_hub(userinfo: &str) -> SilentHub {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "redis://{userinfo}127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let accepts = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 4096];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        SilentHub { url, accepts }
+    }
+
+    /// Run `f` on a thread and wait at most `limit` for it: a test of a
+    /// bound that is missing must fail in seconds, not hang the suite.
+    fn within<T: Send + 'static>(
+        limit: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    /// One Redis round trip's worth of bound: the connect, then one reply.
+    fn one_bound() -> std::time::Duration {
+        darkmux_flow::REDIS_CONNECT_TIMEOUT + darkmux_flow::REDIS_RESPONSE_TIMEOUT
+    }
+
+    /// The connect itself is bounded against a hub that accepts and never
+    /// answers: redis-rs reads its connection-setup replies (`CLIENT
+    /// SETINFO`, `AUTH`, `SELECT`) before any read timeout is set, so it
+    /// waited on them forever. Plain, with a password, with a user, and with
+    /// a database.
+    #[test]
+    fn a_connect_to_a_hub_that_never_answers_fails_within_its_bound() {
+        for userinfo in ["", ":s3cret@", "user:s3cret@"] {
+            let hub = silent_hub(userinfo);
+            let url = hub.url.clone();
+            let url_db = format!("{url}/3");
+            for url in [url, url_db] {
+                let started = std::time::Instant::now();
+                // Connect, then one command: with nothing to authenticate the
+                // connect itself sends nothing, and the command is what fails.
+                let result = within(3 * one_bound(), move || {
+                    let mut conn = crate::bounded_redis_connection(&url, "a probe")?;
+                    redis::cmd("PING").query::<String>(&mut conn)?;
+                    anyhow::Ok(())
+                });
+                let elapsed = started.elapsed();
+                let result = result.unwrap_or_else(|| {
+                    panic!("the connect ({userinfo}) waited past {:?}", 3 * one_bound())
+                });
+                assert!(result.is_err(), "a hub that never answers cannot be read");
+                // One round trip's bound: a timed-out `AUTH` is not retried.
+                assert!(
+                    elapsed < one_bound() + std::time::Duration::from_millis(300),
+                    "the connect ({userinfo}) took {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    /// A window read long enough ago to be past the TTL, from `url`.
+    fn seeded_past_ttl(url: &str, read_at: SystemTime) -> FleetCaches {
+        let caches = FleetCaches::default();
+        {
+            let mut windows = caches.windows.lock().unwrap();
+            windows.work = StreamWindow {
+                at: Some(read_at),
+                source: Some(source_key(
+                    url,
+                    &darkmux_types::config_access::redis_stream(),
+                )),
+                cursor: Some((1, 0)),
+                records: Arc::new(vec![rec("1-0", "dispatch.tool")]),
+            };
+        }
+        caches
+    }
+
+    /// Eight requests past the TTL against a hub that never answers: one of
+    /// them asks the hub, the others wait at most for that one attempt, and
+    /// none waits behind another's I/O in turn. Every one is served the last
+    /// window, marked stale, and the hub saw one connection. A read just
+    /// after, inside the TTL of the failure, does not ask again.
+    #[test]
+    fn concurrent_reads_never_queue_behind_a_hub_that_never_answers() {
+        let hub = silent_hub("");
+        let t0 = SystemTime::now();
+        let caches = Arc::new(seeded_past_ttl(&hub.url, t0));
+        let now = t0 + std::time::Duration::from_secs(10);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Arc::new(std::sync::Barrier::new(8));
+        for _ in 0..8 {
+            let (caches, url, tx, start) = (
+                Arc::clone(&caches),
+                hub.url.clone(),
+                tx.clone(),
+                Arc::clone(&start),
+            );
+            std::thread::spawn(move || {
+                start.wait();
+                let began = std::time::Instant::now();
+                let read = read_fleet_cached(&caches, FleetScope::Work, now, || {
+                    Some(darkmux_flow::RawRedisUrl::new(url))
+                });
+                let _ = tx.send((began.elapsed(), read.state, read.records.len()));
+            });
+        }
+        let deadline = std::time::Instant::now() + 4 * one_bound();
+        let mut results = Vec::new();
+        while results.len() < 8 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(r) => results.push(r),
+                Err(_) => panic!(
+                    "{} of 8 reads returned within {:?}: {results:?}",
+                    results.len(),
+                    4 * one_bound()
+                ),
+            }
+        }
+        let mut took: Vec<std::time::Duration> = results.iter().map(|r| r.0).collect();
+        took.sort();
+        eprintln!("8 concurrent reads against a silent hub: {took:?}");
+        let margin = std::time::Duration::from_millis(300);
+        // The one that asked: the connect, then its two pipelined replies'
+        // bounds. The seven that waited: at most one round trip's bound.
+        assert!(
+            took[7]
+                < darkmux_flow::REDIS_CONNECT_TIMEOUT
+                    + 2 * darkmux_flow::REDIS_RESPONSE_TIMEOUT
+                    + margin,
+            "the read that asked the hub took {:?}",
+            took[7]
+        );
+        assert!(
+            took[6] < refresh_wait() + margin,
+            "a read waited {:?} on another's refresh: {took:?}",
+            took[6]
+        );
+        for (_, state, len) in &results {
+            assert!(
+                matches!(state, SourceState::Stale { age_ms: 10_000, .. }),
+                "{state:?}"
+            );
+            assert_eq!(*len, 1, "the last window is served");
+        }
+        assert_eq!(
+            hub.accepts.load(Ordering::SeqCst),
+            1,
+            "one attempt reached the hub, not one per request"
+        );
+
+        // Inside the TTL of that failure, nothing asks the hub again.
+        let url = hub.url.clone();
+        let again = within(one_bound(), move || {
+            let began = std::time::Instant::now();
+            let read = read_fleet_cached(
+                &caches,
+                FleetScope::Work,
+                now + std::time::Duration::from_millis(500),
+                || Some(darkmux_flow::RawRedisUrl::new(url)),
+            );
+            (began.elapsed(), read.state)
+        })
+        .expect("a read inside the failure's TTL returns at once");
+        assert!(
+            again.0 < std::time::Duration::from_millis(100),
+            "{:?}",
+            again.0
+        );
+        assert!(
+            matches!(again.1, SourceState::Stale { .. }),
+            "{:?}",
+            again.1
+        );
+        assert_eq!(
+            hub.accepts.load(Ordering::SeqCst),
+            1,
+            "a read inside the failure's TTL asked the hub again"
+        );
     }
 
     #[test]

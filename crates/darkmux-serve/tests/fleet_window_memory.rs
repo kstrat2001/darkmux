@@ -67,6 +67,11 @@ fn spawn_redis() -> Option<Redis> {
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success());
+    // A job that opted in must never silently skip (#1662).
+    assert!(
+        available || std::env::var("DARKMUX_E2E_REQUIRED").is_err(),
+        "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set"
+    );
     if !available {
         eprintln!("skipping: redis-server not on PATH");
         return None;

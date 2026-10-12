@@ -252,6 +252,7 @@ pub fn realistic_records(n: usize, now_secs: u64) -> Vec<serde_json::Value> {
         // A usage record written under a spelling this binary does not know:
         // the usage fold still counts it by its category and source.
         if mission % 5 == 0 {
+            // flow-action-guard:allow — a deliberately unknown action: the usage fold counts it by category and source
             recs.push(base("telemetry.usage_legacy", "telemetry", "tokens", &run_sid, None, json!({ "prompt_tokens": 7_000, "completion_tokens": 300, "total_tokens": 7_300, "endpoint": "lmstudio:127.0.0.1:1234/qwen3-coder" })));
         }
         let status = if mission % 3 == 1 {

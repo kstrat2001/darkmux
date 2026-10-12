@@ -42,7 +42,13 @@ serde = { version = "1.0", features = ["derive"] }
 # ones a verb shares with the daemon (`Run`, `MissionGraph`) carry the derive.
 schemars = "1.2"
 serde_json.workspace = true
-redis = { version = "0.27", default-features = false, features = ["streams"] }
+# `disable-client-setinfo` (#3217): redis-rs reads its connection-setup replies
+# before any read timeout can be set, so a hub that accepts and never answers held
+# a connect for good. Without `CLIENT SETINFO` the setup sends nothing for a
+# plain URL, and `bounded_redis_connection` sends `AUTH`/`SELECT` itself, bounded.
+# A crate feature, not a dependency; it unifies across the build, so no darkmux
+# connection names its client library to the server any more.
+redis = { version = "0.27", default-features = false, features = ["streams", "disable-client-setinfo"] }
 # (#1914) Promoted from dev-only: the fleet-snapshot handoff file a spawned
 # `run-list` panel child reads (`write_fleet_snapshot_file` in lib.rs,
 # `needs_fleet_snapshot` in panel.rs) is production code, not test fixture

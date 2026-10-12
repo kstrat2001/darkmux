@@ -4814,6 +4814,35 @@
                 assert_eq!(values(&next), fresh(&b.url, FleetScope::Work));
             }
 
+            /// (#3217) The connect sends `AUTH` and `SELECT` itself, after the
+            /// response bound is on the socket: a password, a named user and a
+            /// database still connect to the right place, and a wrong password
+            /// is refused.
+            #[test]
+            #[serial]
+            fn a_url_with_credentials_and_a_database_still_connects() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let mut admin = conn(&redis.url);
+                let _: () = redis::cmd("SELECT").arg(2).query(&mut admin).unwrap();
+                let _: () = redis::cmd("SET").arg("which-db").arg("two").query(&mut admin).unwrap();
+                let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("s3cret").query(&mut admin).unwrap();
+                let hostport = redis.url.trim_start_matches("redis://").to_string();
+                for userinfo in [":s3cret@", "default:s3cret@"] {
+                    let url = format!("redis://{userinfo}{hostport}/2");
+                    let mut c = super::super::bounded_redis_connection(&url, "a probe").unwrap_or_else(|e| panic!("{userinfo}: {e:#}"));
+                    let got: String = redis::cmd("GET").arg("which-db").query(&mut c).unwrap();
+                    assert_eq!(got, "two", "{userinfo} reached database 2");
+                }
+                assert!(super::super::bounded_redis_connection(&format!("redis://:wrong@{hostport}/2"), "a probe").is_err());
+                assert!(super::super::bounded_redis_connection(&format!("redis://{hostport}"), "a probe")
+                    .and_then(|mut c| Ok(redis::cmd("GET").arg("which-db").query::<Option<String>>(&mut c)?))
+                    .is_err(), "no password, no read");
+            }
+
             /// A hub that stops answering: the last window read is served as
             /// `Stale` with its age; with none read yet, nothing, `Unavailable`.
             #[test]
