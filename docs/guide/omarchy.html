@@ -32,21 +32,20 @@
   <div class="wrap">
     <div class="label">11 <span class="dot">·</span> machine setup</div>
     <h1>Omarchy: darkmux on Linux</h1>
-    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a>, an Arch Linux setup, on an Apple Silicon Mac running the Asahi kernel: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux does not give you for free. Linux support is in progress; the last section says what does not work yet.</p>
+    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a>, an Arch Linux setup, on an Apple Silicon Mac running the Asahi kernel: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux does not give you for free. Linux support lives on the <a href="https://github.com/kstrat2001/darkmux/tree/omarchy"><code>omarchy</code></a> support branch until it reaches a release, and this page follows that branch; the last section says what does not work yet.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>Build and install</h2>
-    <p>There is no Homebrew here, so darkmux builds from source. Omarchy ships <code>mise</code>; it installs the Rust toolchain the repo pins without touching the system.</p>
+    <p>There is no Homebrew here, so darkmux builds from source, from the <code>omarchy</code> branch: it carries the Linux platform fixes (a container that can reach the host and its own files, a machine identity, the hardware line on the fleet card) that are not in a release yet. Omarchy ships <code>mise</code>; it installs the Rust toolchain the repo pins without touching the system.</p>
     <pre><code>mise use -g rust@1.97.1
-git clone https://github.com/kstrat2001/darkmux ~/Work/darkmux
-cd ~/Work/darkmux
-cargo install --path . --locked
+cargo install --git https://github.com/kstrat2001/darkmux --branch omarchy --locked darkmux
 ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   # ~/.cargo/bin is not on Omarchy's PATH
+darkmux --version
 darkmux init</code></pre>
-    <p><code>init</code> writes <code>~/.darkmux/config.json</code> and <code>profiles.json</code> and installs the agent skills. With no LM Studio it cannot fill in a worker model; the next section adds one.</p>
+    <p>Re-run the <code>cargo install</code> line to update. <code>init</code> writes <code>~/.darkmux/config.json</code> and <code>profiles.json</code> and installs the agent skills. With no LM Studio it cannot fill in a worker model; the model section below adds one.</p>
   </div>
 </section>
 
@@ -89,8 +88,61 @@ sudo ufw allow in on docker0 to any port 8080 proto tcp
 sudo ufw status verbose</code></pre>
     <p>Log out and back in for the group to apply. Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A model on an endpoint darkmux does not manage needs its context window declared for a role with tools, which compacts against it: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
     <pre><code>darkmux dispatch code-reviewer --profile mlx-small "Use the exec tool to run: echo hello-from-container. Then reply with the output in one sentence."</code></pre>
-    <p class="session-caption">Verified 2026-10-11 on the same M2 with a build of the <code>omarchy</code> branch (the two platform changes above are not in a release yet): two turns, one real <code>exec</code> tool call in the container, exit 0, 79 s.</p>
+    <p class="session-caption">Verified 2026-10-11 on the same M2 with a build of the <code>omarchy</code> branch: two turns, one real <code>exec</code> tool call in the container, exit 0, 79 s.</p>
     <p>darkmux keeps the container on its own network rather than the host's. Host networking would make a <code>127.0.0.1</code> server reachable with no setup at all, and it would also give every tool call the run of every port on the machine.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Keep the daemon running</h2>
+    <p><code>darkmux serve</code> runs the viewer (<code>http://127.0.0.1:8765/</code>), presence, and the flow sinks a fleet reads. On macOS Homebrew's <code>brew services</code> keeps it up; on Omarchy it is a systemd user service:</p>
+    <pre><code>mkdir -p ~/.config/systemd/user
+cat &gt; ~/.config/systemd/user/darkmux-serve.service &lt;&lt;'UNIT'
+[Unit]
+Description=darkmux serve daemon (viewer, fleet presence, flow sinks)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/darkmux serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now darkmux-serve
+journalctl --user -u darkmux-serve -n 20</code></pre>
+    <p>The daemon reads <code>config.json</code> once at start: after a <code>darkmux config set</code>, run <code>systemctl --user restart darkmux-serve</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Join a fleet</h2>
+    <p>A fleet is a few of your machines on a <a href="https://tailscale.com">Tailscale</a> tailnet, streaming flow records to one hub's Redis, so every machine's viewer shows every machine. The full model is in the <a href="fleet.html">fleet guide</a>; this is the Omarchy part.</p>
+    <h3>Tailscale</h3>
+    <p>Tailscale is in Arch's repositories. Update the system first: a stale package database asks the mirror for a file it no longer has (404), and refreshing the database without upgrading (<code>pacman -Sy</code> alone) leaves a partial upgrade, which Arch does not support.</p>
+    <pre><code>omarchy-update                          # or: sudo pacman -Syu
+sudo pacman -S tailscale
+sudo systemctl enable --now tailscaled
+sudo tailscale set --operator=$USER     # tailscale status / ping without sudo
+sudo tailscale up                       # prints a login URL
+tailscale ping &lt;hub's tailnet address&gt;</code></pre>
+    <h3>Name it for the OS, especially on a dual-boot Mac</h3>
+    <p>Asahi installs alongside macOS, so one Mac can boot either. darkmux treats each install as its own machine: macOS identifies itself by its <code>IOPlatformUUID</code>, which Linux cannot read, and Linux by its <code>/etc/machine-id</code>. So the same laptop is two machines in the fleet, one per OS, never online together. Give the Linux side its own name with <em>omarchy</em> in it, on the tailnet and in darkmux, so each card says which OS it is; otherwise Tailscale names the second install <code>&lt;name&gt;-1</code>.</p>
+    <pre><code>sudo tailscale set --hostname omarchy-book
+darkmux config set machine_id omarchy-book</code></pre>
+    <p>Showing one dual-boot laptop as one card, labeled with whichever OS is running, is planned (<a href="https://github.com/kstrat2001/darkmux/issues/3212">#3212</a>).</p>
+    <h3>Point it at the hub</h3>
+    <pre><code>darkmux config set fleet.mode peer
+darkmux config set redis.enabled true
+darkmux config set redis.host &lt;hub's tailnet address&gt;
+systemctl --user restart darkmux-serve
+darkmux doctor
+darkmux flow note --text "hello from omarchy"</code></pre>
+    <p>The note appears in every fleet viewer, and the machine shows as a card with its name and hardware (<code>Apple M2 · 8 GB</code>). The daemon's log says <code>presence: heartbeat emitter started — uid=… display=…</code>. In <code>doctor</code>, expect the rows whose probes are macOS-only to warn rather than pass (RAM headroom, the host probe, the heuristics provider), and <code>lms binary</code> to fail with no LM Studio. A Redis with no password warns on <code>redis config</code>; on a password-less, tailnet-only hub that is expected. Linux has no Keychain, so a password or a fleet token comes from <code>DARKMUX_REDIS_URL</code> or <code>DARKMUX_SERVE_TOKEN</code> in the daemon's environment.</p>
+    <p class="session-caption">Verified 2026-10-12: a 13" M2 on Omarchy joined a fleet hubbed on a Mac Studio over Tailscale; its note and presence reached the hub, and its card read <code>omarchy-book</code>. Taking work from other machines (fleet trust, the serve token) is not covered yet.</p>
   </div>
 </section>
 
@@ -99,9 +151,10 @@ sudo ufw status verbose</code></pre>
     <h2>What does not work yet</h2>
     <ul>
       <li><strong>radio and compaction</strong> run on the utility model, which only LM Studio can serve today (<a href="https://github.com/kstrat2001/darkmux/issues/3207">#3207</a>).</li>
-      <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only: RAM headroom, the host probe, machine uid.</li>
-      <li><strong>The viewer's machine facts</strong> (memory, CPU, power) are empty, and the residency planner sees no memory pools, until each probe has a Linux strategy.</li>
-      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL, as above.</li>
+      <li><strong>Machine telemetry</strong> (CPU, memory, GPU, power) reads empty, and the residency planner sees no memory pools, until the host probe and the memory snapshot have Linux strategies.</li>
+      <li><strong>A role with no tools on an unmanaged endpoint</strong> runs host-side and writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet either (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
+      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container.</strong> darkmux rewrites a loopback LM Studio address for the container, but not an unmanaged endpoint's URL, so a role with tools on a <code>127.0.0.1</code> endpoint dials the container itself. Use <code>host.docker.internal</code> in the endpoint URL (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
+      <li><strong><code>darkmux doctor</code></strong> fails the <code>lms binary</code> row with no LM Studio installed, and warns on rows whose probes are macOS-only.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>
