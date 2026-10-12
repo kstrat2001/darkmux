@@ -8946,7 +8946,8 @@ body {
   .modelrow__tag,
   .eventlog__qcount,
   .signal__count,
-  .rv__chip {
+  .rv__chip,
+  .chip--sm {
     text-box: trim-both cap alphabetic;
     padding-top: 4px;
     padding-bottom: 4px;
