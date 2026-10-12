@@ -49,6 +49,61 @@ pub trait Platform: Send + Sync {
     /// (the fleet card's `· 8 GB`). Never a planning budget: what darkmux can
     /// actually use is a separate, smaller fact.
     fn ram_installed_bytes(&self) -> Option<u64>;
+
+    /// The CPU's clusters, fastest first (the order macOS's `hw.perflevelN`
+    /// uses), for the machine lens. Empty when the platform can't say.
+    fn cpu_clusters(&self) -> Vec<CpuClusterInfo>;
+
+    /// Cumulative busy/idle ticks per logical CPU, in CPU-number order; the
+    /// lens takes the delta between two reads. `None` when unreadable.
+    fn cpu_ticks(&self) -> Option<Vec<CpuTicks>>;
+
+    /// Memory as the machine lens OBSERVES it. Not a planning figure: what
+    /// the residency planner may load against is its own, more conservative
+    /// question.
+    fn memory_snapshot(&self) -> Option<MemorySnapshot>;
+}
+
+/// One CPU cluster: `"Performance"`, `"Efficiency"`, or `"CPU"` when there is
+/// only one kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuClusterInfo {
+    pub name: String,
+    pub logical_cpus: usize,
+}
+
+/// One logical CPU's cumulative ticks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuTicks {
+    pub user: u64,
+    pub nice: u64,
+    pub system: u64,
+    pub idle: u64,
+}
+
+/// A memory reading. Every figure but capacity is optional: a platform
+/// reports what it can read, never a stand-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    /// What the OS can use (Linux `MemTotal`), not the installed figure.
+    pub capacity_bytes: u64,
+    /// Truly free right now.
+    pub free_bytes: Option<u64>,
+    /// What can be handed out without swapping, reclaimable cache included.
+    pub available_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
+}
+
+impl MemorySnapshot {
+    /// Percent in use: `(capacity - available) / capacity`, rounded.
+    pub fn used_pct(&self) -> Option<u64> {
+        let available = self.available_bytes?;
+        if self.capacity_bytes == 0 {
+            return None;
+        }
+        let used = self.capacity_bytes.saturating_sub(available);
+        Some((used * 100 + self.capacity_bytes / 2) / self.capacity_bytes)
+    }
 }
 
 /// Which user a dispatch container runs as.

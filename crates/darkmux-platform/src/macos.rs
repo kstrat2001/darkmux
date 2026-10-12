@@ -36,6 +36,23 @@ impl Platform for MacPlatform {
     fn ram_installed_bytes(&self) -> Option<u64> {
         parse_memsize(&sysctl_memsize()?)
     }
+
+    /// Read through darkmux-crew's mach probe (`host_probe::mach_cpu`) until
+    /// that FFI moves here; answering nothing keeps a Mac's lens unchanged.
+    fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
+        Vec::new()
+    }
+
+    /// See [`Self::cpu_clusters`].
+    fn cpu_ticks(&self) -> Option<Vec<crate::CpuTicks>> {
+        None
+    }
+
+    /// See [`Self::cpu_clusters`]: macOS's memory figures still come from
+    /// its own `vm_stat` and mach readers.
+    fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]

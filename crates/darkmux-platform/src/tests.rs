@@ -328,3 +328,115 @@ fn this_linux_machine_reports_installed_ram() {
         assert_eq!(ram % GIB, 0, "a whole GiB");
     }
 }
+
+// ── host readings for the machine lens (observation only) ──
+
+#[test]
+fn per_cpu_ticks_come_from_proc_stat_in_cpu_order() {
+    let stat = "cpu  10 1 5 100 2 1 1 0 0 0\ncpu0 4 1 2 50 1 0 0 0 0 0\ncpu1 6 0 3 50 1 1 1 0 0 0\nintr 123\n";
+    let ticks = crate::linux::cpu_ticks_from_stat(stat).unwrap();
+    assert_eq!(ticks.len(), 2, "the aggregate `cpu` line is not a core");
+    // system folds in irq + softirq; idle folds in iowait.
+    assert_eq!(
+        ticks[0],
+        CpuTicks {
+            user: 4,
+            nice: 1,
+            system: 2,
+            idle: 51
+        }
+    );
+    assert_eq!(
+        ticks[1],
+        CpuTicks {
+            user: 6,
+            nice: 0,
+            system: 5,
+            idle: 51
+        }
+    );
+    assert_eq!(crate::linux::cpu_ticks_from_stat("intr 1\n"), None);
+}
+
+/// Clusters are listed fastest first, the order macOS's `hw.perflevelN`
+/// uses: Asahi's P cores have capacity 1024, its E cores less.
+#[test]
+fn cpu_clusters_come_from_cpufreq_policies_fastest_first() {
+    let policies = vec![
+        (vec![0, 1, 2, 3], Some(571)),
+        (vec![4, 5, 6, 7], Some(1024)),
+    ];
+    let clusters = crate::linux::clusters_from_policies(policies);
+    assert_eq!(
+        clusters,
+        vec![
+            CpuClusterInfo {
+                name: "Performance".into(),
+                logical_cpus: 4
+            },
+            CpuClusterInfo {
+                name: "Efficiency".into(),
+                logical_cpus: 4
+            },
+        ]
+    );
+    // One cluster (a homogeneous CPU) is just "CPU".
+    let single = crate::linux::clusters_from_policies(vec![(vec![0, 1], Some(1024))]);
+    assert_eq!(
+        single,
+        vec![CpuClusterInfo {
+            name: "CPU".into(),
+            logical_cpus: 2
+        }]
+    );
+    assert!(crate::linux::clusters_from_policies(vec![]).is_empty());
+}
+
+#[test]
+fn a_linux_memory_snapshot_comes_from_meminfo() {
+    let meminfo = "MemTotal: 7715696 kB\nMemFree: 2171000 kB\nMemAvailable: 5071000 kB\nSwapTotal: 7714800 kB\nSwapFree: 6849000 kB\n";
+    let m = crate::linux::memory_from_meminfo(meminfo).unwrap();
+    assert_eq!(
+        m.capacity_bytes,
+        7715696 * 1024,
+        "capacity is usable MemTotal, never rounded"
+    );
+    assert_eq!(m.free_bytes, Some(2171000 * 1024));
+    assert_eq!(m.available_bytes, Some(5071000 * 1024));
+    assert_eq!(m.swap_used_bytes, Some((7714800 - 6849000) * 1024));
+    assert_eq!(
+        m.used_pct(),
+        Some(34),
+        "(total - available) / total, rounded"
+    );
+    assert!(
+        crate::linux::memory_from_meminfo("MemFree: 1 kB\n").is_none(),
+        "no capacity, no snapshot"
+    );
+}
+
+#[test]
+fn this_linux_machine_reads_its_cpus_and_memory() {
+    if std::env::consts::OS == "linux" {
+        let ticks = LinuxPlatform.cpu_ticks().expect("/proc/stat");
+        let clusters = LinuxPlatform.cpu_clusters();
+        assert_eq!(
+            clusters.iter().map(|c| c.logical_cpus).sum::<usize>(),
+            ticks.len()
+        );
+        assert!(LinuxPlatform
+            .memory_snapshot()
+            .unwrap()
+            .used_pct()
+            .is_some());
+    }
+}
+
+/// macOS reads these through darkmux-crew's mach probe until that moves
+/// here; its strategy answers nothing, so nothing changes on a Mac.
+#[test]
+fn macos_and_other_leave_host_readings_to_their_existing_paths() {
+    assert!(MacPlatform.cpu_clusters().is_empty() && MacPlatform.cpu_ticks().is_none());
+    assert!(MacPlatform.memory_snapshot().is_none());
+    assert!(OtherPlatform.cpu_ticks().is_none() && OtherPlatform.memory_snapshot().is_none());
+}
