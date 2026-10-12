@@ -35,6 +35,57 @@ impl Platform for LinuxPlatform {
     fn machine_uid(&self) -> Option<String> {
         machine_uid_from_disk()
     }
+
+    /// On Apple Silicon (Asahi), the chip named from the device tree the way
+    /// macOS names it; otherwise `/proc/cpuinfo`'s `model name` (x86 has
+    /// one; most ARM boards don't, and get `None`).
+    fn cpu_brand(&self) -> Option<String> {
+        read_to_string("/proc/device-tree/compatible")
+            .and_then(|c| apple_chip_from_compatible(&c))
+            .or_else(|| model_name_from_cpuinfo(&read_to_string("/proc/cpuinfo")?))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_to_string(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_to_string(_path: &str) -> Option<String> {
+    None
+}
+
+/// Apple SoCs Asahi Linux runs on, by the device tree's `apple,tNNNN`, named
+/// as macOS's `machdep.cpu.brand_string` names them.
+const APPLE_CHIPS: &[(&str, &str)] = &[
+    ("apple,t8103", "Apple M1"),
+    ("apple,t6000", "Apple M1 Pro"),
+    ("apple,t6001", "Apple M1 Max"),
+    ("apple,t6002", "Apple M1 Ultra"),
+    ("apple,t8112", "Apple M2"),
+    ("apple,t6020", "Apple M2 Pro"),
+    ("apple,t6021", "Apple M2 Max"),
+    ("apple,t6022", "Apple M2 Ultra"),
+];
+
+/// The chip in a device tree `compatible` list (NUL-separated). An Apple SoC
+/// not in the table is `None`, never a guess.
+pub(crate) fn apple_chip_from_compatible(compatible: &str) -> Option<String> {
+    compatible.split('\0').find_map(|c| {
+        APPLE_CHIPS
+            .iter()
+            .find(|(id, _)| *id == c)
+            .map(|(_, name)| name.to_string())
+    })
+}
+
+/// The first `model name` in `/proc/cpuinfo`.
+pub(crate) fn model_name_from_cpuinfo(cpuinfo: &str) -> Option<String> {
+    cpuinfo.lines().find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        (key.trim() == "model name" && !value.trim().is_empty()).then(|| value.trim().to_string())
+    })
 }
 
 /// `/etc/machine-id`: systemd's id for this install, stable across reboots

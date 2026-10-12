@@ -21,4 +21,8 @@ impl Platform for OtherPlatform {
     fn machine_uid(&self) -> Option<String> {
         None
     }
+
+    fn cpu_brand(&self) -> Option<String> {
+        None
+    }
 }

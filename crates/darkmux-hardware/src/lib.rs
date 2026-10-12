@@ -279,26 +279,17 @@ fn format_spec_summary(cpu_brand: &str, total_ram_gb: u32) -> String {
 /// `darkmux-serve::read_cpu_brand`'s shape (that copy stays local to the
 /// `/machine/specs` handler; this one is the presence-beat's source).
 fn probe_cpu_brand() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    cpu_brand().map(str::to_string)
+}
+
+/// This machine's CPU name (`"Apple M2"`), from the platform strategy
+/// (`darkmux_platform::Platform::cpu_brand`): `sysctl` on macOS, the device
+/// tree or `/proc/cpuinfo` on Linux. Cached once per process. The one source
+/// for the presence beat's hardware line and `darkmux-serve`'s
+/// `/machine/specs`.
+pub fn cpu_brand() -> Option<&'static str> {
+    static BRAND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BRAND.get_or_init(|| darkmux_platform::current().cpu_brand()).as_deref()
 }
 
 #[cfg(test)]

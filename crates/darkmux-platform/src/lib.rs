@@ -39,6 +39,11 @@ pub trait Platform: Send + Sync {
     /// operator's display name). `None` when the platform has none to read:
     /// callers treat that as unknown identity and never fall back to a name.
     fn machine_uid(&self) -> Option<String>;
+
+    /// The CPU's marketing name (`"Apple M2"`, `"Apple M5 Max"`), for the
+    /// fleet card's hardware line. `None` when the platform can't say:
+    /// callers show "not reported", never a placeholder.
+    fn cpu_brand(&self) -> Option<String>;
 }
 
 /// Which user a dispatch container runs as.

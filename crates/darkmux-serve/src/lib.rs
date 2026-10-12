@@ -3013,7 +3013,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
     let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = read_ram_total_bytes();
     let ram_free = read_ram_free_for_ai_bytes();
-    let cpu_brand = read_cpu_brand();
+    let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
     // label — it defaults to the hostname, macOS reports both the short and
@@ -3127,32 +3127,6 @@ fn read_ram_total_bytes() -> Option<u64> {
 /// macOS-shaped).
 fn read_ram_free_for_ai_bytes() -> Option<u64> {
     darkmux_doctor::ai_headroom_bytes()
-}
-
-/// Read the CPU brand string. macOS: `sysctl machdep.cpu.brand_string`
-/// (e.g. `"Apple M5 Max"`). Other platforms return `None`. Sync — wrap
-/// in `spawn_blocking` for async contexts.
-fn read_cpu_brand() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
 }
 
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
