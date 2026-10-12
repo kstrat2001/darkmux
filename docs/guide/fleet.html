@@ -143,6 +143,83 @@ darkmux doctor 2&gt;&amp;1 | grep -i fleet   <span class="comment"># fleet token
       <strong>Upgrade every machine.</strong> A 3.x daemon still claims work off the old Redis queue (<code>darkmux:work</code>) and re-creates it when it starts, so the unauthenticated queue stays open until no machine runs 3.x. <code>darkmux doctor</code> names any daemon still consuming it. Mixed versions also do not talk: a 5.0 machine sending to a 3.x one gets "no answer" (3.x has no fleet listener), and a 3.x machine's <code>--machine</code> dispatch waits on a queue no 5.0 machine reads, until its timeout.
     </div>
     <p>The sender checks the receiver too. Every request that carries the fleet token (a <code>profile@machine</code> dispatch, <code>machine status</code>/<code>resources &lt;id&gt;</code>, <code>machine list</code>, and the daemon's peer mission-graph proxy) first resolves the roster address, asks Tailscale which node is there, and refuses unless it is a tailnet node; the first contact pins that node in the roster (as <code>machine add</code> does), every later request checks it is the same node, and the connection goes to that verified address. Only this machine's own daemon and loopback (same-host) entries skip the check, and those never receive the token: whatever listens on a loopback port gets nothing (your own daemon does not ask for it from this machine), so reaching a peer through an ssh tunnel with the token is not supported. Anything a peer sends back has its control characters, bidirectional overrides and zero-width characters removed before it is printed; a field shown in a table or on one line also loses its newlines and tabs and is cut to its column, so a peer cannot print a line of its own.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 360 516" role="img" aria-labelledby="dg-job-t dg-job-d">
+    <title id="dg-job-t">One fleet job, step by step</title>
+    <desc id="dg-job-d">On the laptop, the sender: resolve the studio's roster address and ask tailscale whois which node is there, refusing an address that is not a tailnet node; check that node is the one pinned in the roster, pinning it on first contact, refusing a different node; then POST /fleet/work with the fleet token to the studio's listener on port 8766, where no answer means nothing is listening. Nothing is sent before those checks pass. On the studio, the receiver: check the fleet token; ask tailscale whois who is calling, refusing when it cannot tell or the caller is not a tailnet node; look the caller up in the allow-list, fleet.accept_work; resolve the profile and check the job against the entry's scope, refusing a role or profile outside it, a profile not defined there, or a job addressed to another machine; take the seat under fleet.busy_policy, refusing or queueing when busy; then run the job and reply to the waiting laptop.</desc>
+    <defs>
+      <marker id="dg-job-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+    </defs>
+    <text class="t" x="10" y="14">laptop (sender)</text>
+
+    <rect class="box" x="10" y="24" width="164" height="40" rx="5"/>
+    <text x="18" y="40">resolve the address</text>
+    <text class="m" x="18" y="56">tailscale whois</text>
+    <text class="w" x="182" y="38">not a tailnet node:</text>
+    <text class="w" x="182" y="51">nothing was sent</text>
+    <path class="e" d="M30 64V74" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="76" width="164" height="40" rx="5"/>
+    <text x="18" y="92">check the pin</text>
+    <text class="m" x="18" y="108">first contact pins it</text>
+    <text class="w" x="182" y="90">a different node:</text>
+    <text class="w" x="182" y="103">nothing was sent</text>
+    <path class="e" d="M30 116V126" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box k" x="10" y="128" width="164" height="40" rx="5"/>
+    <text x="18" y="144">POST /fleet/work</text>
+    <text class="m" x="18" y="160">with the fleet token</text>
+    <text class="w" x="182" y="142">no answer from …:8766:</text>
+    <text class="w" x="182" y="155">nothing is listening</text>
+
+    <line class="frame" x1="4" y1="182" x2="356" y2="182"/>
+    <text class="t" x="44" y="198">studio (receiver, :8766)</text>
+    <path class="e" d="M30 168V204" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="206" width="164" height="40" rx="5"/>
+    <text x="18" y="222">fleet token</text>
+    <text class="m" x="18" y="238">must match</text>
+    <text class="w" x="182" y="220">fleet token is missing</text>
+    <text class="w" x="182" y="233">or does not match</text>
+    <path class="e" d="M30 246V256" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="258" width="164" height="40" rx="5"/>
+    <text x="18" y="274">who is calling?</text>
+    <text class="m" x="18" y="290">tailscale whois</text>
+    <text class="w" x="182" y="272">cannot tell which machine,</text>
+    <text class="w" x="182" y="285">or not a tailnet node</text>
+    <path class="e" d="M30 298V308" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="310" width="164" height="40" rx="5"/>
+    <text x="18" y="326">allow-list</text>
+    <text class="m" x="18" y="342">fleet.accept_work</text>
+    <text class="w" x="182" y="324">does not accept work</text>
+    <text class="w" x="182" y="337">from &lt;node&gt;</text>
+    <path class="e" d="M30 350V360" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="362" width="164" height="40" rx="5"/>
+    <text x="18" y="378">profile and scope</text>
+    <text class="m" x="18" y="394">role, profile, boundary</text>
+    <text class="w" x="182" y="374">not in the allow-list</text>
+    <text class="w" x="182" y="387">scope; profile undefined;</text>
+    <text class="w" x="182" y="400">this is &lt;x&gt;, not &lt;y&gt;</text>
+    <path class="e" d="M30 402V412" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box" x="10" y="414" width="164" height="40" rx="5"/>
+    <text x="18" y="430">take the seat</text>
+    <text class="m" x="18" y="446">fleet.busy_policy</text>
+    <text class="w" x="182" y="428">busy (or the job waits</text>
+    <text class="w" x="182" y="441">in the queue)</text>
+    <path class="e" d="M30 454V464" marker-end="url(#dg-job-a)"/>
+
+    <rect class="box g" x="10" y="466" width="164" height="40" rx="5"/>
+    <text x="18" y="482">run, then reply</text>
+    <text class="m" x="18" y="498">exit code and output</text>
+    <text class="g" x="182" y="480">back to the laptop,</text>
+    <text class="g" x="182" y="493">which waits by default</text>
+  </svg>
+  <figcaption>The order both machines check in, and where each refusal from <a href="#troubleshooting">When things go wrong</a> comes from (in orange). The laptop's checks run before anything leaves it, so a wrong address never receives the fleet token.</figcaption>
+</figure>
     <p>The listener protects itself too: at most 32 connections at once and 6 per peer address (the 4 requests a machine may have in flight plus 2 card reads, so a peer whose waited jobs hold their connections can still read this machine&rsquo;s card), 3 seconds to send the request headers, at most 4 requests in flight per trusted machine once it is identified, and refusals logged at most 5 per peer per minute (the rest are counted and reported each minute). A node that routes a subnet can spread connections over many addresses, so the per-address cap bounds a single address, not a single node; the per-machine cap applies only after the token and identity checks. A job from another machine is never attributed to one of this machine's missions (its phase id is dropped).</p>
     <div class="callout">
       <strong>Fail closed.</strong> If Tailscale cannot say who is calling (it is stopped, logged out, or the connection came over the office LAN rather than the tailnet), the request is refused. A hardware id is never used to decide: every flow record carries one, so any machine could repeat it.
@@ -162,7 +239,60 @@ darkmux machine list</code></pre>
 <section>
   <div class="wrap">
     <h2>The big picture: how the fleet coordinates</h2>
-    <p>Three layers, so the commands above make sense:</p>
+    <p>Four layers, so the commands above make sense:</p>
+<figure class="diagram">
+  <svg viewBox="0 0 360 480" role="img" aria-labelledby="dg-topo-t dg-topo-d">
+    <title id="dg-topo-t">Fleet topology</title>
+    <desc id="dg-topo-d">Every machine is on one tailnet. The hub holds the Redis stream darkmux:flow, and every machine writes its flow records there. Each machine runs a daemon on loopback, 127.0.0.1:8765, and a fleet listener on its own tailnet address, port 8766. The laptop sends a job to the studio's fleet listener with POST /fleet/work and reads its card with GET /fleet/card, with the fleet token; the hub is not on that path. A browser on the tailnet reaches a daemon through tailscale serve on port 80 or 443, which proxies to 127.0.0.1:8765.</desc>
+    <defs>
+      <marker id="dg-topo-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+      <marker id="dg-topo-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah d" d="M0 0L10 5L0 10z"/></marker>
+    </defs>
+    <rect class="frame" x="4" y="4" width="352" height="470" rx="10"/>
+    <text class="m" x="344" y="20" text-anchor="end">tailnet</text>
+
+    <rect class="box k" x="40" y="26" width="280" height="50" rx="6"/>
+    <text class="t" x="52" y="46">hub</text>
+    <text class="m" x="52" y="64">Redis stream darkmux:flow</text>
+
+    <path class="e d" d="M70 116V80" marker-end="url(#dg-topo-ad)"/>
+    <text class="m" x="78" y="101">flow records</text>
+    <path class="e d" d="M40 360H20V51H36" marker-end="url(#dg-topo-ad)"/>
+
+    <rect class="box" x="40" y="116" width="280" height="100" rx="6"/>
+    <text class="t" x="52" y="136">laptop</text>
+    <rect class="box" x="52" y="146" width="124" height="56" rx="4"/>
+    <text x="60" y="168">daemon</text>
+    <text class="m" x="60" y="188">127.0.0.1:8765</text>
+    <rect class="box k" x="184" y="146" width="124" height="56" rx="4"/>
+    <text x="192" y="168">fleet listener</text>
+    <text class="m" x="192" y="188">tailnet IP:8766</text>
+
+    <text class="m" x="124" y="250">with the fleet token</text>
+    <text class="a" x="124" y="276">POST /fleet/work</text>
+    <text class="a" x="124" y="291">GET /fleet/card</text>
+
+    <rect class="box" x="40" y="300" width="280" height="100" rx="6"/>
+    <text class="t" x="52" y="320">studio (worker)</text>
+    <rect class="box" x="52" y="330" width="124" height="56" rx="4"/>
+    <text x="60" y="352">daemon</text>
+    <text class="m" x="60" y="372">127.0.0.1:8765</text>
+    <rect class="box k" x="184" y="330" width="124" height="56" rx="4"/>
+    <text x="192" y="352">fleet listener</text>
+    <text class="m" x="192" y="372">tailnet IP:8766</text>
+
+    <path class="e" d="M114 216V258H246V326" marker-end="url(#dg-topo-a)"/>
+    <rect class="box" x="52" y="424" width="124" height="40" rx="4"/>
+    <text x="60" y="442">tailscale serve</text>
+    <text class="m" x="60" y="457">:80 or :443</text>
+    <path class="e d" d="M114 424V390" marker-end="url(#dg-topo-ad)"/>
+    <rect class="box" x="232" y="424" width="88" height="40" rx="4"/>
+    <text x="240" y="442">browser</text>
+    <text class="m" x="240" y="457">phone</text>
+    <path class="e d" d="M232 444H180" marker-end="url(#dg-topo-ad)"/>
+  </svg>
+  <figcaption>One tailnet. Records go to the hub's Redis; work and cards go straight from machine to machine, to the receiver's fleet listener, never through the hub. The hub is a machine too: it runs the same daemon and listener and writes its own records. Every daemon stays on loopback; <code>tailscale serve</code> is only for a browser, on any machine.</figcaption>
+</figure>
 <figure class="shot">
   <img src="../media/console-flow.png" alt="The darkmux console showing flow status: the sink composition, active kinds, and per-day record counts." loading="lazy">
   <figcaption><code>darkmux flow status</code> in the console. The sink composition is what makes a fleet a fleet — every machine writing into the same stream.</figcaption>
@@ -196,7 +326,7 @@ old-mini       live  -           -             4.9.1        card unavailable (pe
 
 <section>
   <div class="wrap">
-    <h2>When things go wrong</h2>
+    <h2 id="troubleshooting">When things go wrong</h2>
     <p>The substrate degrades gracefully. Knowing the modes saves you confused debugging.</p>
 
     <h3>Hub drops off the network</h3>
