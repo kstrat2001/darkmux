@@ -391,7 +391,7 @@ function cardIdentity(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecsResponse | null,
-  machAbsent: boolean,
+  machAbsent: boolean | null,
   m: string,
   roster: readonly RosterName[],
   row: RowFacts | null,
@@ -407,7 +407,10 @@ function cardIdentity(
       hub: false,
       servesRadio: false,
       servesProfiles: 0,
-      standing: machAbsent ? ("offline" as const) : ("online" as const),
+      // (#3213) `null` is no presence evidence either way (the `unknown` bucket
+      // of uid-less records can never have any), so it reads unknown, never
+      // online: nothing can prove that machine is up.
+      standing: machAbsent === null ? ("unknown" as const) : machAbsent ? ("offline" as const) : ("online" as const),
       availability: "known" as const,
       self: false,
     };
@@ -459,7 +462,7 @@ export function buildFleetCardBase(
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecsResponse | null,
   presence: Presence,
-  machAbsent: boolean,
+  machAbsent: boolean | null,
   m: string,
   t: number,
   row: RowFacts | null = null,

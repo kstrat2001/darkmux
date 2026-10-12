@@ -18,7 +18,15 @@ import { useCardOrderGate } from "./cardOrderGate";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machPresent, LIVE_WINDOW_MS } from "../../lib/flow";
-import { findUid, isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
+
+/** (#3213) A flow-only card's absence as `buildFleetCardBase` reads it. The
+ *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
+ *  carry presence evidence (beats and online/offline edges always carry a
+ *  uid), so with none it reads `null`: standing unknown, never online. Every
+ *  other machine keeps reading absent only on positive evidence. */
+export const absentOrUnknown = (present: boolean | null, m: string): boolean | null =>
+  m === NO_UID_KEY && present === null ? null : present === false;
+import { NO_UID_KEY, findUid, isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
@@ -825,7 +833,7 @@ export function FleetLens({
         liveMachines,
         specs,
         presence,
-        machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
+        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m),
         m,
         playheadT,
         null,

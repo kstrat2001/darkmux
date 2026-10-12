@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
-import { FleetLens, totalHint } from "./FleetLens";
+import { FleetLens, absentOrUnknown, totalHint } from "./FleetLens";
 
 import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
@@ -3652,5 +3652,20 @@ describe("the hero total's hover text (#3067)", () => {
     expect(totalHint({ calls: 1, tokens: 9 }, { calls: 1, tokens: 50 }, ["studio"])).toBe(
       "Counts only machines whose records reach this viewer. Not streaming here: studio. Includes 9 tokens with no run (radio routing and probes). Includes 50 tokens on runs not listed here.",
     );
+  });
+});
+
+// (#3213) Only the no-uid bucket reads "no evidence" as unknown; every other
+// machine reads absent only on positive evidence, as before.
+describe("absentOrUnknown (#3213)", () => {
+  it("reads the no-uid bucket with no evidence as unknown (null)", () => {
+    expect(absentOrUnknown(null, "unknown")).toBeNull();
+    expect(absentOrUnknown(false, "unknown")).toBe(true);
+    expect(absentOrUnknown(true, "unknown")).toBe(false);
+  });
+  it("keeps every uid-bearing machine present unless presence says absent", () => {
+    expect(absentOrUnknown(null, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
+    expect(absentOrUnknown(false, "00000000-0000-4000-8000-ABCDEF000001")).toBe(true);
+    expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
   });
 });

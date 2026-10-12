@@ -14,6 +14,14 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The fleet view no longer shows a machine as online when darkmux has no
+  presence evidence for it. A machine that publishes no machine id (a Linux peer
+  before it reports one) lands in the "unknown" bucket; with no presence record
+  its card now reads standing "unknown" instead of "online". Machines with an id
+  keep the earlier rule: online unless presence says they are absent. (#3213)
+
 ## [5.1.1] - 2026-10-11
 
 Every local engine keeps its prompt cache. darkmux no longer trims old tool results

@@ -760,6 +760,20 @@ describe("buildFleetCard", () => {
   // for, rather than a new "silent"/"unknown" state. `entry.id` stands in
   // for `m` directly, matching how `FleetLens.tsx` calls this for a roster
   // entry with no known uid.
+  // (#3213) A flow-only card with no presence evidence either way (the
+  // `unknown` bucket of uid-less records never has any: beats and online/
+  // offline edges always carry a uid) reads its standing as unknown, never
+  // online. A real true/false reading is unchanged.
+  it("(#3213) a card whose presence is unknown reads standing 'unknown', not online", () => {
+    const unknown = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ null, "unknown", T_MAX);
+    expect(unknown.standing).toBe("unknown");
+    expect(faceOf(unknown).status).not.toBe(CardStatus.Idle);
+    const present = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ false, "u-live", T_MAX);
+    expect(present.standing).toBe("online");
+    const absent = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "u-gone", T_MAX);
+    expect(absent.standing).toBe("offline");
+  });
+
   it("(#1855) a rostered entry with no known identity reads 'offline', not 'idle'", () => {
     const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio", T_MAX);
     expect(faceOf(card).status).toBe(CardStatus.Offline);
