@@ -44,6 +44,15 @@ darkmux release.
   its status line now reads "not streaming", with the reason in its tooltip,
   instead of "online". Machines with an id keep the earlier rule: online unless
   presence says they are absent. (#3213)
+- A dual-booted or sleeping peer no longer stalls the fleet view. A roster
+  machine that drops connections without refusing them (a laptop booted into
+  its other OS, or asleep) held every gather about 30 seconds, ureq's default
+  connect timeout, although each card is bounded at 2 seconds; the daemon's
+  `/fleet/view` hit its own 30-second budget and answered 408, so every card
+  read "checking...". Every request to a peer is now bounded as a whole,
+  connect included: the down peer reads unreachable within 2 seconds and the
+  other cards render. The same bound now holds for every other read of a peer:
+  the mission-graph relay and the CLI's read of one machine. (#3220)
 
 ## [5.1.1] - 2026-10-11
 
