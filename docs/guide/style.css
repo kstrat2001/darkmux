@@ -445,6 +445,35 @@ footer a:hover { color: var(--accent); }
   line-height: 1.5;
 }
 
+/* ── Diagrams ──
+ * Inline SVG drawn with the tokens above, so a palette change carries. Each
+ * viewBox is about 360 units wide and drawn for a phone first: at 390 px the
+ * 12-unit text renders near 11 px. The site is dark only (no light theme), so
+ * the tokens need no second set. Each SVG carries role="img", a <title> and a
+ * <desc> that states the diagram in words. */
+.diagram { margin: 28px 0 6px; }
+.diagram svg { display: block; margin: 0 auto; width: 100%; max-width: 480px; height: auto; }
+.diagram figcaption { font-size: 13px; color: var(--muted); margin-top: 10px; line-height: 1.5; }
+.diagram text { font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; fill: var(--text); }
+.diagram text.t { font-weight: 700; }
+.diagram text.m { fill: var(--muted); font-size: 11px; }
+.diagram text.a { fill: var(--accent); font-size: 11px; }
+.diagram text.w { fill: var(--warn); font-size: 11px; }
+.diagram text.g { fill: var(--good); font-size: 11px; }
+.diagram .box { fill: var(--bg-elev); stroke: var(--muted); stroke-width: 1; }
+.diagram .box.k { stroke: var(--accent); }
+.diagram .box.w { stroke: var(--warn); }
+.diagram .box.g { stroke: var(--good); }
+.diagram .frame { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 5 4; }
+.diagram .e { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.diagram .e.d { stroke: var(--muted); stroke-dasharray: 4 3; }
+.diagram .e.w { stroke: var(--warn); }
+.diagram .e.g { stroke: var(--good); }
+.diagram .ah { fill: var(--accent); }
+.diagram .ah.d { fill: var(--muted); }
+.diagram .ah.w { fill: var(--warn); }
+.diagram .ah.g { fill: var(--good); }
+
 /* ── Session cards (ported from the home page's Get going, 2026-08-28) ──
    One card that reads as a terminal session: copyable command rows, verbatim
    output rows under the command that produced them, an attribution caption.

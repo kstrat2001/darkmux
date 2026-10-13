@@ -115,12 +115,88 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
     <p class="session-caption">The answering seat honors <code>runtime.max_tokens_per_call</code> as its per-call budget and otherwise uses 16,384; a reasoning model that spends the whole budget thinking gets reported as a failed answer, not a blank line. In the editor integration (<code>darkmux acp</code>) the host profile and humor are also session pickers (presets 10 / 50 / 75 / 100) that never touch <code>config.json</code>.</p>
     <h3>Where the answering seat comes from</h3>
     <p>Radio picks the seat in this order: the session's "radio host" choice, then this machine's own <code>radio.answerer_profile</code>, then its <code>role_profiles.radio-host</code> binding, then the fleet hub's default (<code>fleet.defaults.radio.answerer_profile</code>, set on the hub, always a <code>&lt;profile&gt;@&lt;machine&gt;</code> address), then the machine's <code>default_profile</code>. The hub's default is read from the hub's machine card over the verified fleet listener, never from Redis, and only from a card that declares <code>fleet.mode hub</code>. Each machine keeps the last copy it read and uses it when the hub cannot be asked. Every answer prints one line saying which it used, for example <code>radio: answering seat: deep@studio, fleet default from the hub, last seen 3m ago</code>; <code>darkmux doctor</code> shows the same resolution in its <code>fleet defaults</code> row.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 360 620" role="img" aria-labelledby="dg-seat-t dg-seat-d">
+        <title id="dg-seat-t">How radio picks its answering seat</title>
+        <desc id="dg-seat-d">Five sources are read in order, and the first one set wins: the session's radio host choice, this machine's radio.answerer_profile, this machine's role_profiles.radio-host binding, the hub's fleet.defaults.radio.answerer_profile, then default_profile. If the seat does not name another machine, radio answers on this machine. If it names another machine, radio first asks that machine's fleet listener whether it would take the job. Routable: the job is submitted and the answer printed. Refused, for trust, profile or busy: radio prints the refusal and exits 1, and never answers on this machine instead. Unreachable, so nothing was sent: radio answers once on this machine's own seat, the role_profiles.radio-host binding when it names this machine, else default_profile, and never on a hosted endpoint or a busy model.</desc>
+        <defs>
+          <marker id="dg-seat-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="dg-seat-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah d" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+        <text class="m" x="10" y="14">first one set wins</text>
+
+        <rect class="box" x="10" y="22" width="270" height="38" rx="5"/>
+        <text x="20" y="38">1 session's radio host</text>
+        <text class="m" x="20" y="53">the editor session's pick</text>
+        <rect class="box" x="10" y="74" width="270" height="38" rx="5"/>
+        <text x="20" y="90">2 this machine's setting</text>
+        <text class="m" x="20" y="105">radio.answerer_profile</text>
+        <rect class="box" x="10" y="126" width="270" height="38" rx="5"/>
+        <text x="20" y="142">3 this machine's binding</text>
+        <text class="m" x="20" y="157">role_profiles.radio-host</text>
+        <rect class="box" x="10" y="178" width="270" height="38" rx="5"/>
+        <text x="20" y="194">4 the hub's default</text>
+        <text class="m" x="20" y="209">fleet.defaults.radio.answerer_profile</text>
+        <rect class="box" x="10" y="230" width="270" height="38" rx="5"/>
+        <text x="20" y="246">5 built-in</text>
+        <text class="m" x="20" y="261">default_profile</text>
+
+        <path class="e d" d="M30 60V72" marker-end="url(#dg-seat-ad)"/>
+        <path class="e d" d="M30 112V124" marker-end="url(#dg-seat-ad)"/>
+        <path class="e d" d="M30 164V176" marker-end="url(#dg-seat-ad)"/>
+        <path class="e d" d="M30 216V228" marker-end="url(#dg-seat-ad)"/>
+        <text class="m" x="38" y="70">unset</text>
+        <text class="m" x="38" y="122">unset</text>
+        <text class="m" x="38" y="174">unset</text>
+        <text class="m" x="38" y="226">unset</text>
+
+        <path class="e" d="M280 41H300M280 93H300M280 145H300M280 197H300M280 249H300M300 41V296"/>
+        <path class="e" d="M300 286V298" marker-end="url(#dg-seat-a)"/>
+
+        <rect class="box k" x="90" y="300" width="260" height="40" rx="5"/>
+        <text x="100" y="316">names another machine?</text>
+        <text class="m" x="100" y="332">&lt;profile&gt;@&lt;machine&gt;</text>
+
+        <path class="e" d="M130 340V358" marker-end="url(#dg-seat-a)"/>
+        <text class="m" x="136" y="354">no</text>
+        <rect class="box" x="10" y="360" width="150" height="40" rx="5"/>
+        <text x="20" y="376">answer here</text>
+        <text class="m" x="20" y="392">on this machine</text>
+
+        <path class="e" d="M300 340V358" marker-end="url(#dg-seat-a)"/>
+        <text class="m" x="306" y="354">yes</text>
+        <rect class="box" x="180" y="360" width="170" height="40" rx="5"/>
+        <text x="190" y="376">ask the peer first</text>
+        <text class="m" x="190" y="392">a check on its :8766</text>
+
+        <path class="e" d="M344 400V572"/>
+        <path class="e g" d="M344 440H334" marker-end="url(#dg-seat-a)"/>
+        <path class="e w" d="M344 496H334" marker-end="url(#dg-seat-a)"/>
+        <path class="e" d="M344 568H334" marker-end="url(#dg-seat-a)"/>
+
+        <rect class="box g" x="10" y="416" width="322" height="44" rx="5"/>
+        <text x="20" y="433">routable: submit, print the answer</text>
+        <text class="m" x="20" y="449">the peer runs it on its own profile</text>
+
+        <rect class="box w" x="10" y="470" width="322" height="56" rx="5"/>
+        <text x="20" y="487">refused: trust, profile, busy</text>
+        <text class="w" x="20" y="503">print the refusal and exit 1;</text>
+        <text class="w" x="20" y="517">never answered on this machine</text>
+
+        <rect class="box k" x="10" y="536" width="322" height="74" rx="5"/>
+        <text x="20" y="553">unreachable: nothing was sent</text>
+        <text class="a" x="20" y="569">answer once on this machine's seat:</text>
+        <text class="a" x="20" y="583">role_profiles.radio-host here, else</text>
+        <text class="a" x="20" y="597">default_profile; never hosted or busy</text>
+      </svg>
+      <figcaption>The seat decision, then what happens when the seat is on a fleet peer. The hub's default is always a <code>&lt;profile&gt;@&lt;machine&gt;</code> address. A refusal is an answer from the peer, so radio reports it; only a peer that never answered the check is answered past, one step, and the answer says so.</figcaption>
+    </figure>
     <h3>Answer on another machine</h3>
     <p>The answering seat can run on a fleet peer. Write the profile as an address, <code>&lt;profile&gt;@&lt;machine&gt;</code>, on the machine you type <code>darkmux radio</code> on (the laptop):</p>
     <pre><code>darkmux config set radio.answerer_profile deep@studio</code></pre>
     <p>A <code>role_profiles.radio-host</code> binding takes the same address. <code>darkmux config set</code> refuses a malformed one. The question is routed on the laptop as usual, then the answering seat's request is submitted to the studio's fleet listener, the studio runs it on its own <code>deep</code> profile, and the answer comes back and is printed. The laptop needs no profile called <code>deep</code>. The busy check is the studio's: it applies its own busy policy when the job arrives, and the laptop does not look for a local instance. The studio has to trust the laptop for that profile and for the <code>radio-host</code> role:</p>
     <pre><code>darkmux machine trust macbook-pro --profiles deep --roles radio-host</code></pre>
-    <p>If the studio refuses (it does not trust the sender, does not define <code>deep</code>, or is busy), radio prints the refusal naming <code>deep@studio</code>, then the plain routing refusal, and exits 1. It never answers on the laptop instead. The studio builds the persona itself, from its own <code>radio-host</code> role prompt (an override of that prompt on the laptop does not travel), with the humor and surface you set on the laptop, and runs one plain exchange with no tools, whether its <code>deep</code> is a local or a hosted profile. The per-call budget is the smaller of the laptop's <code>runtime.max_tokens_per_call</code> (else 16,384) and the studio's own, so the machine that runs the model keeps the last word on its limit. An address naming the machine you are on is a local seat: a hosted profile written that way still withholds grounding. A peer is one of your own machines, so the answer is grounded as on this machine: the config surface, mission board, and recent outputs go to the studio. If the studio's <code>deep</code> is itself a hosted endpoint, they go on to that endpoint from there. See the <a href="fleet.html">fleet guide</a> for trust and the roster.</p>
+    <p>If the studio refuses (it does not trust the sender, does not define <code>deep</code>, or is busy), radio prints that the answering seat was unavailable, with the refusal naming <code>deep@studio</code>, says your question was not answered, and exits 1. It never answers on the laptop instead. If the studio cannot be reached at all (its listener is off, or the check before the job got no answer, so nothing was sent), radio answers once on the laptop's own seat instead: its <code>role_profiles.radio-host</code> binding when that names no other machine, else its <code>default_profile</code>, never a hosted endpoint and never a busy model, and the answer starts with a line naming the seat and why <code>deep@studio</code> was not reached. The studio builds the persona itself, from its own <code>radio-host</code> role prompt (an override of that prompt on the laptop does not travel), with the humor and surface you set on the laptop, and runs one plain exchange with no tools, whether its <code>deep</code> is a local or a hosted profile. The per-call budget is the smaller of the laptop's <code>runtime.max_tokens_per_call</code> (else 16,384) and the studio's own, so the machine that runs the model keeps the last word on its limit. An address naming the machine you are on is a local seat: a hosted profile written that way still withholds grounding. A peer is one of your own machines, so the answer is grounded as on this machine: the config surface, mission board, and recent outputs go to the studio. If the studio's <code>deep</code> is itself a hosted endpoint, they go on to that endpoint from there. See the <a href="fleet.html">fleet guide</a> for trust and the roster.</p>
   </div>
 </section>
 

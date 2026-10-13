@@ -93,7 +93,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
 <section>
   <div class="wrap">
     <h2>Missions + phases</h2>
-    <p>A <strong>mission</strong> is a named objective: a directory under <code>~/.darkmux/missions/&lt;mission-id&gt;/</code> holding <code>mission.json</code> (description, a list of <code>phase_ids</code>, and a status: active/finalized/aborted) plus the mission's own <code>phases/</code> subdirectory. A <strong>phase</strong> is a time-boxed work unit inside a mission: its own JSON file at <code>~/.darkmux/missions/&lt;mission-id&gt;/phases/&lt;phase-id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps. Everything for one mission lives under that one directory. Nothing is split across separate top-level <code>missions/</code> and <code>phases/</code> trees.</p>
+    <p>A <strong>mission</strong> is a named objective: a directory under <code>~/.darkmux/missions/&lt;mission-id&gt;/</code> holding <code>mission.json</code> (description, a list of <code>phase_ids</code>, and a status: active/finalized/aborted) plus the mission's own <code>phases/</code> subdirectory. A <strong>phase</strong> is a time-boxed work unit inside a mission: its own JSON file at <code>~/.darkmux/missions/&lt;mission-id&gt;/phases/&lt;phase-id&gt;.json</code> with status (planned/running/complete/abandoned), its <code>task_ids</code>, and timestamps (a phase has no <code>depends_on</code>: dependencies live on tasks). Everything for one mission lives under that one directory. Nothing is split across separate top-level <code>missions/</code> and <code>phases/</code> trees.</p>
 
     <p class="muted"><em>Note for operators with existing state:</em> 5.0 reads only the current layout, and says nothing about the old ones. State under <code>~/.darkmux/crew/</code>, a mission's legacy <code>sprints/</code> directory and the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape are not read, and <code>darkmux doctor</code> no longer names them (a <code>mission.json</code> that still says <code>sprint_ids</code> loads as a mission with no phases). Step 6 of the <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/upgrade/darkmux-upgrade/SKILL.md">one-time upgrade skill</a> lists where each one moves; keep the old mission files, since nothing can migrate them in place any more.</p>
 
@@ -255,10 +255,65 @@ darkmux mission finalize draft-blog-post
     </div>
 
     <h3>Drive the lifecycle</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 360 412" role="img" aria-labelledby="dg-life-t dg-life-d">
+        <title id="dg-life-t">Mission lifecycle</title>
+        <desc id="dg-life-d">mission launch creates a mission in Active. From Active there are two terminals. Finalized, the success terminal, is reached when the mission's graph run ends or by mission finalize. Aborted, the teardown terminal, is reached by mission abort. On finalize every open phase becomes Complete, a Planned phase being started first; at the end of a graph run each phase is set from its recorded outcome; on abort every open phase becomes Abandoned. A phase that is already Complete or Abandoned keeps its status. A phase goes from Planned to Running to Complete, or to Abandoned from Planned or Running.</desc>
+        <defs>
+          <marker id="dg-life-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="dg-life-ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah g" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="dg-life-aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah w" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="dg-life-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah d" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+        <rect class="box" x="110" y="8" width="140" height="28" rx="14"/>
+        <text x="180" y="26" text-anchor="middle">mission launch</text>
+        <path class="e" d="M180 36V60" marker-end="url(#dg-life-a)"/>
+
+        <rect class="box k" x="120" y="62" width="120" height="36" rx="5"/>
+        <text class="t" x="180" y="78" text-anchor="middle">Active</text>
+        <text class="m" x="180" y="92" text-anchor="middle">the graph runs</text>
+
+        <text class="g" x="10" y="114">graph run ends,</text>
+        <text class="g" x="10" y="127">or mission finalize</text>
+        <path class="e g" d="M150 98V134H90V168" marker-end="url(#dg-life-ag)"/>
+        <text class="w" x="222" y="120">mission abort</text>
+        <path class="e w" d="M210 98V134H270V168" marker-end="url(#dg-life-aw)"/>
+
+        <rect class="box g" x="10" y="170" width="160" height="36" rx="5"/>
+        <text class="t" x="90" y="186" text-anchor="middle">Finalized</text>
+        <text class="m" x="90" y="200" text-anchor="middle">success terminal</text>
+        <rect class="box w" x="190" y="170" width="160" height="36" rx="5"/>
+        <text class="t" x="270" y="186" text-anchor="middle">Aborted</text>
+        <text class="m" x="270" y="200" text-anchor="middle">teardown terminal</text>
+
+        <path class="e d" d="M90 206V222" marker-end="url(#dg-life-ad)"/>
+        <path class="e d" d="M270 206V222" marker-end="url(#dg-life-ad)"/>
+        <rect class="box" x="10" y="224" width="340" height="70" rx="5"/>
+        <text class="g" x="20" y="241">finalize: open phases → Complete</text>
+        <text class="g" x="20" y="255">graph run end: each from its outcome</text>
+        <text class="w" x="20" y="269">abort: open phases → Abandoned</text>
+        <text class="m" x="20" y="283">a phase already terminal keeps it</text>
+
+        <text class="m" x="10" y="318">phase status</text>
+        <rect class="box" x="10" y="338" width="76" height="30" rx="5"/>
+        <text x="48" y="357" text-anchor="middle">Planned</text>
+        <path class="e" d="M86 353H104" marker-end="url(#dg-life-a)"/>
+        <rect class="box" x="106" y="338" width="76" height="30" rx="5"/>
+        <text x="144" y="357" text-anchor="middle">Running</text>
+        <path class="e g" d="M182 353H196V332H208" marker-end="url(#dg-life-ag)"/>
+        <path class="e w" d="M182 353H196V374H208" marker-end="url(#dg-life-aw)"/>
+        <path class="e w" d="M48 368V402H256V392" marker-end="url(#dg-life-aw)"/>
+        <rect class="box g" x="210" y="318" width="92" height="28" rx="5"/>
+        <text x="256" y="336" text-anchor="middle">Complete</text>
+        <rect class="box w" x="210" y="360" width="92" height="30" rx="5"/>
+        <text x="256" y="379" text-anchor="middle">Abandoned</text>
+      </svg>
+      <figcaption>A mission ends in exactly one of two terminals, and the status says how it ended. Phases are not driven by hand: the graph moves them while the mission is Active, and the terminal settles any still open.</figcaption>
+    </figure>
     <pre><code><span class="comment"># Mission state machine</span>
 darkmux mission launch &lt;config&gt;   <span class="comment"># mint + start the instance → Active (stamps started_ts)</span>
 darkmux mission finalize &lt;id&gt;     <span class="comment"># → Finalized (success terminal: phases → Complete, worktrees torn down)</span>
-darkmux mission abort &lt;id&gt;        <span class="comment"># → Finalized (kill terminal: phases → Abandoned, worktrees torn down)</span></code></pre>
+darkmux mission abort &lt;id&gt;        <span class="comment"># → Aborted (teardown terminal: phases → Abandoned, worktrees torn down)</span></code></pre>
     <p>There's no manual per-phase lifecycle any more: the mission graph derives each phase's status, and the whole-mission terminals (<code>finalize</code>/<code>abort</code>) reconcile the phases for you. Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these. The phase-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
   </div>
 </section>
