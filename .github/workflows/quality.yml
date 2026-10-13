@@ -1003,7 +1003,7 @@ jobs:
     runs-on: ubuntu-latest
     # (#2896) On main pushes and the schedule, and on a PR labeled `full-ci`.
     # It held a macOS slot for ~700s on every PR. It fails on a failing test,
-    # stale generated bindings, or the CRAP ratchet (#3198, its last step).
+    # stale generated bindings, or the CRAP ratchet (#3198).
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     permissions:
       contents: write   # pushes the badge branch (main only)
@@ -1119,6 +1119,19 @@ jobs:
           fi
           echo "generated bindings match the Rust types"
 
+      # (#3198) The CRAP ratchet: no function's CRAP rises above its entry in
+      # scripts/crap-baseline.json, and no new function is above 10. CRAP
+      # needs this job's coverage, so it runs where coverage runs: on every
+      # push to main (a regression is caught there, after the merge) and on a
+      # PR labeled `full-ci` (caught before it). It runs only when the tests
+      # all passed, since a failed test leaves a partial profile whose low
+      # coverage would read as a rise. Unlike the report above it gates: a
+      # missing or broken export fails it, rather than passing unjudged.
+      # It sits before the main-only badge push, so a failed or raced push
+      # cannot skip it; a red ratchet skips that commit's badge instead.
+      - name: No Rust function above its CRAP limit
+        run: python3 scripts/complexity-ratchet.py --crap crap.json
+
       # (#1792) Publish the badge to an orphan `badges` branch that shields.io
       # reads. Deliberately NOT a third-party service: no account, no data
       # leaving the repo, no token beyond GITHUB_TOKEN. main-only, so a PR
@@ -1151,18 +1164,6 @@ jobs:
           git diff --cached --quiet && { echo "unchanged"; exit 0; }
           git commit -qm "coverage badge: $(python3 -c "import json;print(json.load(open('coverage.json'))['message'])")"
           git push -q origin badges
-
-      # (#3198) The CRAP ratchet: no function's CRAP rises above its entry in
-      # scripts/crap-baseline.json, and no new function is above 10. CRAP
-      # needs this job's coverage, so it runs where coverage runs: on every
-      # push to main (a regression is caught there, after the merge) and on a
-      # PR labeled `full-ci` (caught before it). It runs only when the tests
-      # all passed, since a failed test leaves a partial profile whose low
-      # coverage would read as a rise. Unlike the report above it gates: a
-      # missing or broken export fails it, rather than passing unjudged.
-      # It is last so a failure here never skips the badge.
-      - name: No Rust function above its CRAP limit
-        run: python3 scripts/complexity-ratchet.py --crap crap.json
 
       - uses: actions/upload-artifact@v4
         if: always()
