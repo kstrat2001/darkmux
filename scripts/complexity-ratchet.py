@@ -40,6 +40,16 @@
 # function fell, or is gone (split, renamed, deleted), passes with a notice
 # naming `--prune`, which lowers or drops it so the gain is kept.
 #
+# CRAP (`--crap <crap.json>`, Rust only, #3198): the same ratchet on
+#   CRAP = complexity^2 * (1 - line coverage)^3 + complexity,
+# read from the `crap-report.py --json` export of CI's coverage run (the
+# `crap-report` artifact of quality.yml's coverage job), never measured here.
+# No new function above CRAP 10, and no function's CRAP rises above its entry
+# in scripts/crap-baseline.json; `--prune` and `--init` work as above. A
+# complexity-allowlist max applies to CRAP too (that function, fully tested).
+# A function with no coverage data (not built on the measuring platform) is
+# held at its baseline: never judged, never a gain, kept by prune.
+#
 # Stdlib only. `--self-test` proves each rule can fail.
 
 import json
@@ -55,6 +65,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "complexity-baseline.json")
 ALLOWLIST = os.path.join(ROOT, "scripts", "complexity-allowlist.json")
 LIMIT = 10
+CRAP_BASELINE = os.path.join(ROOT, "scripts", "crap-baseline.json")
+CRAP_LIMIT = 10
 CEILING = 25
 RUST_ROOTS = ("src/", "crates/", "runtime/", "plugins/")
 TS_MESSAGE = re.compile(r"^(?:.*?'(?P<name>[^']+)'|[^']*?) has a complexity of (?P<cc>\d+)")
@@ -244,7 +256,7 @@ def unique(pairs):
 
 # --- judging ------------------------------------------------------------------
 
-def judge(measured, baseline, allowlist):
+def judge(measured, baseline, allowlist, limit=LIMIT, metric="complexity"):
     """Every way `measured` breaks the ratchet, as lines to print."""
     problems = []
     for key, spec in sorted(allowlist.items()):
@@ -252,17 +264,17 @@ def judge(measured, baseline, allowlist):
             problems.append(f"{key}: an allowlist entry needs a reason and a max of at most {CEILING}")
     for key, cc in sorted(measured.items()):
         if key in allowlist:
-            limit, why = allowlist[key]["max"], "its allowlisted max"
+            cap, why = allowlist[key]["max"], "its allowlisted max"
         elif key in baseline:
-            limit, why = baseline[key], "its baseline"
+            cap, why = baseline[key], "its baseline"
         else:
-            limit, why = LIMIT, "the limit for a function not in the baseline"
-        if cc > limit:
-            problems.append(f"{key}: complexity {cc}, above {why} ({limit})")
+            cap, why = limit, "the limit for a function not in the baseline"
+        if cc > cap:
+            problems.append(f"{key}: {metric} {cc}, above {why} ({cap})")
     return problems
 
 
-def gains(measured, baseline):
+def gains(measured, baseline, limit=LIMIT):
     """Every baseline entry its function has beaten (fell, or is gone), as
     lines to print. A notice, never a failure: a PR that simplifies or splits
     a function must not go red for it."""
@@ -270,15 +282,24 @@ def gains(measured, baseline):
     for key, was in sorted(baseline.items()):
         now = measured.get(key, 0)
         if now < was:
-            state = "is gone or at most the limit" if now <= LIMIT else f"fell to {now}"
+            state = "is gone or at most the limit" if now <= limit else f"fell to {now}"
             notes.append(f"{key}: baseline {was}, the function {state}")
     return notes
 
 
-def pruned(measured, baseline):
+def pruned(measured, baseline, limit=LIMIT):
     """The baseline with every entry lowered to what was measured, and the
     entries at or under the limit dropped. Never adds, never raises."""
-    return {k: min(v, measured[k]) for k, v in baseline.items() if measured.get(k, 0) > LIMIT}
+    return {k: min(v, measured[k]) for k, v in baseline.items() if measured.get(k, 0) > limit}
+
+
+def crap_scores(rows, baseline):
+    """key -> CRAP from `crap-report.py --json` rows. A row with no coverage
+    data scores its baseline entry (held: not judged, no gain, kept by prune),
+    or is left out when it has none."""
+    scored = unique([(r["key"], r["crap"]) for r in rows if r["crap"] is not None])
+    held = {r["key"]: baseline[r["key"]] for r in rows if r["crap"] is None and r["key"] in baseline}
+    return {**held, **scored}
 
 
 # --- files --------------------------------------------------------------------
@@ -375,6 +396,37 @@ def rust_self_test():
     assert not any("in_tests" in k for k in keys), "test code is not measured"
 
 
+def crap_self_test():
+    """The CRAP ratchet: the same rules as complexity, judged at CRAP_LIMIT on
+    the scores `crap-report.py --json` wrote."""
+    row = lambda key, crap: {"key": key, "cc": 1, "cov": None if crap is None else 1.0, "crap": crap}
+    base = {"a::slow": 40.0, "a::dark": 30.0}
+    rows = [row("a::slow", 40.0), row("a::new", 4.0), row("a::dark", None), row("a::unbuilt", None)]
+    scores = crap_scores(rows, base)
+    assert scores == {"a::slow": 40.0, "a::new": 4.0, "a::dark": 30.0}, \
+        "a function with no coverage data is held at its baseline, and is not judged when it has none"
+    lim = dict(limit=CRAP_LIMIT, metric="CRAP")
+    assert not judge(scores, base, {}, **lim), "every function at its baseline or under the limit passes"
+    assert judge({"a::slow": 40.1}, base, {}, **lim), "a rise above the recorded CRAP fails"
+    assert judge({"a::new": CRAP_LIMIT + 0.1}, base, {}, **lim), "a new function above the CRAP limit fails"
+    assert not judge({"a::new": CRAP_LIMIT}, base, {}, **lim), "a new function at the CRAP limit passes"
+    assert "CRAP 40.1, above its baseline (40.0)" in judge({"a::slow": 40.1}, base, {}, **lim)[0]
+    assert not judge({"a::h": 22.0}, {}, {"a::h": {"max": 22, "reason": "x"}}, **lim), \
+        "a complexity-allowlisted function may reach its max in CRAP too (fully tested at that complexity)"
+    assert judge({"a::h": 22.5}, {}, {"a::h": {"max": 22, "reason": "x"}}, **lim)
+    assert gains({"a::slow": 12.0}, base, limit=CRAP_LIMIT) and not gains(scores, base, limit=CRAP_LIMIT), \
+        "a fall is noted; a function with no data is no gain"
+    assert pruned({"a::slow": 12.0, "a::dark": 30.0}, base, limit=CRAP_LIMIT) == {"a::slow": 12.0, "a::dark": 30.0}
+    assert pruned({"a::slow": 9.5, "a::dark": 30.0}, base, limit=CRAP_LIMIT) == {"a::dark": 30.0}, \
+        "a function tested down to the limit leaves the baseline"
+    assert pruned(crap_scores(rows, base), base, limit=CRAP_LIMIT) == base, "prune keeps a no-data entry"
+    try:
+        crap_scores([row("k", 3.0), row("k", 20.0)], {})
+        raise AssertionError("a shared key must fail")
+    except SystemExit as e:
+        assert "k" in str(e)
+
+
 def self_test():
     assert not judge({"a::f": 3, "a::g": 20}, {"a::g": 20}, {}), "a baseline function at its baseline passes"
     assert judge({"a::f": LIMIT + 1}, {}, {}), "a new function above the limit fails"
@@ -392,6 +444,7 @@ def self_test():
     assert pruned({"a::g": 25}, {"a::g": 20}) == {"a::g": 20}, "prune never raises"
 
     rust_self_test()
+    crap_self_test()
 
     results = [
         {"filePath": os.path.join(ROOT, "ui/src/lib/a.ts"), "messages": [
@@ -415,10 +468,48 @@ def self_test():
     print("complexity-ratchet self-test passed")
 
 
+def crap_main(args):
+    path = args[args.index("--crap") + 1]
+    if not os.path.isfile(path):
+        sys.exit(f"crap-ratchet: no CRAP export at {path}; the CRAP report step did not write one, so nothing was judged")
+    rows = json.load(open(path))
+    if len(rows) < 1000 or not any(r["crap"] is not None for r in rows):
+        sys.exit(f"crap-ratchet: the CRAP export looks broken ({len(rows)} functions); "
+                 "is it `crap-report.py --json` from this checkout's coverage run?")
+    baseline = load(CRAP_BASELINE, "rust")
+    measured = crap_scores(rows, baseline)
+    if "--init" in args:
+        if baseline:
+            sys.exit("crap-ratchet: a baseline exists; --init only sets the first one")
+        store(CRAP_BASELINE, "rust", {k: v for k, v in measured.items() if v > CRAP_LIMIT})
+        return
+    if "--prune" in args:
+        store(CRAP_BASELINE, "rust", pruned(measured, baseline, CRAP_LIMIT))
+        baseline = load(CRAP_BASELINE, "rust")
+    notes = gains(measured, baseline, CRAP_LIMIT)
+    if notes:
+        print(f"crap-ratchet: {len(notes)} baseline entr{'y' if len(notes) == 1 else 'ies'} beaten; keep the gain with "
+              "`python3 scripts/complexity-ratchet.py --crap crap.json --prune` (crap.json from the coverage job's "
+              "`crap-report` artifact) and commit the baseline:")
+        for n in notes:
+            print(f"  {n}")
+    problems = judge(measured, baseline, load(ALLOWLIST, "rust"), CRAP_LIMIT, "CRAP")
+    if problems:
+        print(f"crap-ratchet: {len(problems)} problem(s). Test a function's untested branches, or split it by "
+              "responsibility, rather than raise a limit.")
+        for p in problems:
+            print(f"  {p}")
+        sys.exit(1)
+    print(f"crap-ratchet passed: {len(measured)} functions scored, {len(baseline)} in the baseline")
+
+
 def main():
     args = sys.argv[1:]
     if "--self-test" in args:
         self_test()
+        return
+    if "--crap" in args:
+        crap_main(args)
         return
     lang = args[args.index("--lang") + 1] if "--lang" in args else sys.exit("complexity-ratchet: --lang rust|ts")
     measured = {"rust": measure_rust, "ts": measure_ts}[lang]()
