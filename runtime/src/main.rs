@@ -186,26 +186,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Err(e) => return e.exit(),
     };
 
-    // System prompt: a default that names the runtime + names the
-    // available tools. Real dispatches override this via --system with
-    // the role's .md prompt (see darkmux's dispatch path).
-    let system_prompt = system.unwrap_or_else(|| {
-        "You are running inside the darkmux-runtime container. \
-         You have access to six tools:\n\
-         \n\
-         - `echo`   — echoes its `text` argument back (sanity check)\n\
-         - `bash`   — runs a bash command with cwd=/workspace; returns exit + stdout + stderr\n\
-         - `read`   — reads from a file inside /workspace; requires offset (1-indexed start line) and limit (max lines; 0 = read entire file from offset to end). Prefer specifying a small limit when you only need a region — pair with `search` to find the right offset. For multiple reads in one turn, emit multiple `read` tool_calls in one assistant response.\n\
-         - `write`  — writes a NEW file (or fully replaces one) inside /workspace\n\
-         - `edit`   — applies one or more targeted patches in a single call (edits[] array; each entry replaces old_string with new_string against the current file state); prefer this over `write` for modifications, and batch related changes into one call's edits[] array rather than emitting many edit calls\n\
-         - `search` — finds a literal substring pattern in a file or directory tree, returning `path:line:content` matches. Use this to LOCATE text (function names, imports, error strings) before reading or editing — much cheaper than reading whole files when you only need to find specific identifiers\n\
-         \n\
-         All file paths must resolve inside /workspace. Paths that escape \
-         (via .. or symlinks or absolute paths outside /workspace) are \
-         rejected by the runtime. Use tools as needed; stop when the task \
-         is done."
-            .into()
-    });
+    let system_prompt = system.unwrap_or_else(default_system_prompt);
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key
@@ -569,6 +550,28 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// System prompt: a default that names the runtime + names the
+/// available tools. Real dispatches override this via --system with
+/// the role's .md prompt (see darkmux's dispatch path). Model-facing text
+/// (contract 6): moved here verbatim, never reworded.
+fn default_system_prompt() -> String {
+    "You are running inside the darkmux-runtime container. \
+     You have access to six tools:\n\
+     \n\
+     - `echo`   — echoes its `text` argument back (sanity check)\n\
+     - `bash`   — runs a bash command with cwd=/workspace; returns exit + stdout + stderr\n\
+     - `read`   — reads from a file inside /workspace; requires offset (1-indexed start line) and limit (max lines; 0 = read entire file from offset to end). Prefer specifying a small limit when you only need a region — pair with `search` to find the right offset. For multiple reads in one turn, emit multiple `read` tool_calls in one assistant response.\n\
+     - `write`  — writes a NEW file (or fully replaces one) inside /workspace\n\
+     - `edit`   — applies one or more targeted patches in a single call (edits[] array; each entry replaces old_string with new_string against the current file state); prefer this over `write` for modifications, and batch related changes into one call's edits[] array rather than emitting many edit calls\n\
+     - `search` — finds a literal substring pattern in a file or directory tree, returning `path:line:content` matches. Use this to LOCATE text (function names, imports, error strings) before reading or editing — much cheaper than reading whole files when you only need to find specific identifiers\n\
+     \n\
+     All file paths must resolve inside /workspace. Paths that escape \
+     (via .. or symlinks or absolute paths outside /workspace) are \
+     rejected by the runtime. Use tools as needed; stop when the task \
+     is done."
+        .into()
 }
 
 /// The flags of `darkmux-runtime run`, as parsed by [`parse_run_args`].
