@@ -31,6 +31,7 @@ use darkmux_types::shell::quote as shell_quote;
 use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
@@ -6000,6 +6001,9 @@ fn admit_container_start(
     )
 }
 
+/// A container dispatch end to end: the refusals and the route first, then
+/// everything the container needs before its `dispatch.start`, then the run
+/// itself ([`run_container`]), which owns the bookends.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
     // ack gate, any session id or flow record. Every host-side dispatch
@@ -6015,18 +6019,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    Non-blocking; the dispatch proceeds either way (#104 S3).
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
 
-    // (#1177 / #1187) A resolved model naming a remote OpenAI-compatible
-    // endpoint forks two ways, decided by whether the ROLE grants any tools:
-    //
-    //   - Tool-less role (e.g. `pr-reviewer`, empty `tool_palette.allow`) →
-    //     the light single-shot `dispatch_unmanaged` path: one chat-completions
-    //     call, no Docker, no container. Structurally can't use tools
-    //     anyway, so the heavier container path would add cost for nothing.
-    //   - Tool-granting role (e.g. `code-reviewer`) → falls through to the
-    //     SAME container path local dispatches use, just with the remote
-    //     endpoint's URL + auth threaded into the container as its "brain"
-    //     instead of local LMStudio (#1187 — agentic-remote). `agentic_pm`
-    //     carries the resolved remote model forward past this point.
     // (#2162) A pure `SystemTime::now()` read with no dependency on anything
     // computed after it. Needed by the resume-checkpoint hoist below (to name
     // the intended no-`--workdir` workspace path) and (#2902 step 5) by the
@@ -6038,9 +6030,53 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // One execution, whichever way this dispatch runs (hosted single-shot or
     // container): every record of it below names this id.
     let execution = execution_for(opts.resume_from.as_deref());
+    let brain = match route_hosted_or_container(&opts, &execution)? {
+        ControlFlow::Break(hosted) => return Ok(hosted),
+        ControlFlow::Continue(brain) => brain,
+    };
+    let run = prepare_container_run(&opts, &execution, unix_micros, brain)?;
+    run_container(&opts, &execution, run)
+}
+
+/// The brain a container dispatch runs with: a hosted endpoint's model
+/// staffing the container (agentic-remote, #1187), or a managed target
+/// (#3035), or neither (a local LMStudio model resolved later).
+struct ContainerBrain {
+    /// (#1187) The resolved remote model, carried past the route.
+    agentic_pm: Option<crate::target::Target>,
+    managed_pm: Option<crate::target::Target>,
+}
+
+impl ContainerBrain {
+    /// (#3035) The endpoint whose limits this container run is held to:
+    /// its window gate, its per-dispatch cap and its `endpoint_id` stamp.
+    fn limits_pm(&self) -> Option<&crate::target::Target> {
+        self.agentic_pm.as_ref().or(self.managed_pm.as_ref())
+    }
+}
+
+/// (#1177 / #1187) A resolved model naming a remote OpenAI-compatible
+/// endpoint forks two ways, decided by whether the ROLE grants any tools:
+///
+///   - Tool-less role (e.g. `pr-reviewer`, empty `tool_palette.allow`) →
+///     the light single-shot `dispatch_unmanaged` path: one chat-completions
+///     call, no Docker, no container. Structurally can't use tools
+///     anyway, so the heavier container path would add cost for nothing.
+///   - Tool-granting role (e.g. `code-reviewer`) → falls through to the
+///     SAME container path local dispatches use, just with the remote
+///     endpoint's URL + auth threaded into the container as its "brain"
+///     instead of local LMStudio (#1187 — agentic-remote). `agentic_pm`
+///     carries the resolved remote model forward past this point.
+///
+/// `Break` carries the finished hosted single-shot result; `Continue` the
+/// container path's brain.
+fn route_hosted_or_container(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+) -> Result<ControlFlow<DispatchResult, ContainerBrain>> {
     // (#3035) A managed target's endpoint carries limits like any other: its
     // window gate, its per-dispatch cap and its `endpoint_id` stamp.
-    let (hosted, managed_pm) = split_route(route_dispatch(&opts)?);
+    let (hosted, managed_pm) = split_route(route_dispatch(opts)?);
     let mut agentic_pm: Option<crate::target::Target> = None;
     if let Some((role, system_prompt, pm)) = hosted {
         // (#1199) `force_container` routes even a tool-less role through the
@@ -6074,64 +6110,149 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // still covers this guard.
                 bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
-            return dispatch_unmanaged(&opts, &execution, &role, &system_prompt, &pm);
+            return dispatch_unmanaged(opts, execution, &role, &system_prompt, &pm).map(ControlFlow::Break);
         }
     }
+    Ok(ControlFlow::Continue(ContainerBrain { agentic_pm, managed_pm }))
+}
 
-    let limits_pm = agentic_pm.as_ref().or(managed_pm.as_ref());
+/// Everything a container dispatch settles before its `dispatch.start`.
+struct ContainerRun {
+    // Field order is drop order: the workspace cleanup, then the execution
+    // lock, as when both were `dispatch()`'s own locals.
+    /// (#888) Reclaims an auto workspace on an early exit; disarmed once the
+    /// terminal record is written.
+    workspace_cleanup: AutoWorkspaceCleanup,
+    /// Held, with this dispatch's own, until the run returns; see
+    /// [`resume_preflight`].
+    _execution_lock: ExecutionLock,
+    brain: ContainerBrain,
+    image: RuntimeImage,
+    role: crate::types::Role,
+    system_prompt: String,
+    allowed_tools: Option<Vec<String>>,
+    model: String,
+    resolved_profile: String,
+    /// (#1187 follow-up) The hosted brain's route label, raw.
+    unmanaged_endpoint_raw_label: Option<String>,
+    workspace: PathBuf,
+    host_out: PathBuf,
+    /// (#1187) The hosted brain's auth header, held only here until it is
+    /// piped over the container's stdin.
+    remote_auth: Option<(String, String)>,
+}
+
+/// The container path up to its `dispatch.start`, in the order the steps
+/// always ran: the resume preflight and the budget gate, the workdir's git
+/// check, the image, the role and its prompt, the workdir and any resume
+/// checkpoint, the model, the workspace, the out-dir, and the brain's
+/// credential. The first refusal wins, and none of them emits a bookend.
+fn prepare_container_run(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    unix_micros: u128,
+    brain: ContainerBrain,
+) -> Result<ContainerRun> {
     // A resume runs on the image its origin recorded and is the only live
     // execution of that origin; see [`resume_preflight`]. Settled BEFORE the
     // budget gate: a resume that is going to be refused must not first sit in
     // a `wait` on the endpoint's window, behind the very run it collides with.
-    // The lock is held, with this dispatch's own, until the function returns.
+    // The lock is held, with this dispatch's own, until the run returns.
     let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
-    admit_container_start(&opts, &execution, limits_pm)?;
+    admit_container_start(opts, execution, brain.limits_pm())?;
+    let workdir_split_gitdirs = warn_split_gitdirs(opts);
+    let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
+    let (role, system_prompt, allowed_tools) =
+        container_role(opts, brain.agentic_pm.is_some(), &workdir_split_gitdirs)?;
+    let workspace_plan = plan_workspace(opts, unix_micros)?;
+    let (model, resolved_profile, unmanaged_endpoint_raw_label) =
+        resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
+    record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
+    let (workspace, workspace_cleanup, host_out) = materialize_dirs(
+        opts,
+        unix_micros,
+        workspace_plan,
+        &mut execution_lock,
+        image_arg.as_deref(),
+        execution,
+    )?;
 
-    // (#2294) PREFLIGHT: does this workdir's git directory live outside
-    // what gets bind-mounted? A `.git` that is a POINTER FILE (`gitdir:
-    // <path>`) rather than the ordinary directory means yes — the real git
-    // directory sits somewhere only the host can see, while
-    // `apply_volume_mounts` mounts `workspace` and `host_out` and nothing
-    // else. Every git command the dispatch runs then fails with a
-    // confusing `fatal: not a git repository: <host path>` deep inside the
-    // sandbox, naming a path the operator never typed.
-    //
-    // TWO producers of this shape live in this repo, not one:
-    //   - `src/coder_phase.rs` creates a git WORKTREE per phase and
-    //     dispatches the coder into it via the workdir.
-    //   - `crates/darkmux-lab/src/crawl/unit_step.rs` mounts the
-    //     materialized snapshot dir `tree/<snapshot>` (#3188; so the container's
-    //     `/workspace/<source>/…` paths resolve), and each `<snapshot>/<source>`
-    //     under it is a detached worktree of a bare mirror outside the
-    //     mount. Hence `find_split_gitdirs`'s one-level child scan — the
-    //     mount root itself has no `.git` at all, so a workdir-only check
-    //     is structurally blind to the crawl, which is the case that hurts
-    //     most: `templates/builtin/roles/crawler.md` INSTRUCTS the model to
-    //     run `git log` and `git show`. That scan returns EVERY sibling
-    //     checkout, not the first: `crawl::unit_step` passes the shared
-    //     `tree/` root for every unit regardless of which source the unit
-    //     works on, so naming one arbitrary sibling would describe a
-    //     directory this dispatch isn't touching.
-    //
-    // Deliberately NOT refused: both producers above are ordinary darkmux
-    // work, so hard-refusing would break the coder and crawl workflows
-    // outright. Also deliberately NOT auto-mounted: making git "just work"
-    // for a worktree needs the WHOLE main repository's `.git` mounted
-    // (git's `commondir` indirection needs objects/refs/HEAD alongside the
-    // worktree's own `worktrees/<name>` subdir), which exposes every
-    // sibling worktree's refs/branches/index to the container — a real
-    // widening of what the sandbox can see, for a capability the role has
-    // a fallback for.
-    //
-    // What happens instead, in three places, all fed by this one detection:
-    //   1. here — a loud host warning naming the shape and its remedy;
-    //   2. the system prompt below — the model is TOLD git is unavailable,
-    //      so it stops retrying (the operator-facing warning alone leaves
-    //      the model burning turns, and on the coder-phase/crawl paths the
-    //      operator has no available action anyway);
-    //   3. a `Level::Warn` flow record once the session id exists, so the
-    //      run record answers "why did this run spend eight turns on git?"
-    //      later. Record exhaustively, display selectively.
+    // (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
+    // same `remote_auth_header` the light single-shot path uses). Deliberately
+    // held ONLY in this local variable, never written to any file or env var
+    // — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
+    // it's the deliberate general-purpose escape hatch), so a mounted
+    // secret-bearing file is reachable by a model-issued `cat`, and an env var
+    // is reachable even more trivially (`env`, visible to every process, no
+    // permission gate at all). Instead, once the container spawns, the
+    // secret is piped over its STDIN — a channel the container reads exactly
+    // once at startup, before the agent loop (and any chance of a tool call)
+    // exists, and which leaves no artifact on any filesystem afterward.
+    let remote_auth = brain.agentic_pm.as_ref().map(|t| remote_auth_header(&t.endpoint)).transpose()?.flatten();
+    Ok(ContainerRun {
+        workspace_cleanup,
+        _execution_lock: execution_lock,
+        brain,
+        image,
+        role,
+        system_prompt,
+        allowed_tools,
+        model,
+        resolved_profile,
+        unmanaged_endpoint_raw_label,
+        workspace,
+        host_out,
+        remote_auth,
+    })
+}
+
+/// (#2294) PREFLIGHT: does this workdir's git directory live outside
+/// what gets bind-mounted? A `.git` that is a POINTER FILE (`gitdir:
+/// <path>`) rather than the ordinary directory means yes — the real git
+/// directory sits somewhere only the host can see, while
+/// `apply_volume_mounts` mounts `workspace` and `host_out` and nothing
+/// else. Every git command the dispatch runs then fails with a
+/// confusing `fatal: not a git repository: <host path>` deep inside the
+/// sandbox, naming a path the operator never typed.
+///
+/// TWO producers of this shape live in this repo, not one:
+///   - `src/coder_phase.rs` creates a git WORKTREE per phase and
+///     dispatches the coder into it via the workdir.
+///   - `crates/darkmux-lab/src/crawl/unit_step.rs` mounts the
+///     materialized snapshot dir `tree/<snapshot>` (#3188; so the container's
+///     `/workspace/<source>/…` paths resolve), and each `<snapshot>/<source>`
+///     under it is a detached worktree of a bare mirror outside the
+///     mount. Hence `find_split_gitdirs`'s one-level child scan — the
+///     mount root itself has no `.git` at all, so a workdir-only check
+///     is structurally blind to the crawl, which is the case that hurts
+///     most: `templates/builtin/roles/crawler.md` INSTRUCTS the model to
+///     run `git log` and `git show`. That scan returns EVERY sibling
+///     checkout, not the first: `crawl::unit_step` passes the shared
+///     `tree/` root for every unit regardless of which source the unit
+///     works on, so naming one arbitrary sibling would describe a
+///     directory this dispatch isn't touching.
+///
+/// Deliberately NOT refused: both producers above are ordinary darkmux
+/// work, so hard-refusing would break the coder and crawl workflows
+/// outright. Also deliberately NOT auto-mounted: making git "just work"
+/// for a worktree needs the WHOLE main repository's `.git` mounted
+/// (git's `commondir` indirection needs objects/refs/HEAD alongside the
+/// worktree's own `worktrees/<name>` subdir), which exposes every
+/// sibling worktree's refs/branches/index to the container — a real
+/// widening of what the sandbox can see, for a capability the role has
+/// a fallback for.
+///
+/// What happens instead, in three places, all fed by this one detection:
+///   1. here — a loud host warning naming the shape and its remedy;
+///   2. the system prompt ([`container_system_prompt`]) — the model is TOLD
+///      git is unavailable, so it stops retrying (the operator-facing
+///      warning alone leaves the model burning turns, and on the
+///      coder-phase/crawl paths the operator has no available action anyway);
+///   3. a `Level::Warn` flow record once the session id exists
+///      ([`record_split_gitdirs`]), so the run record answers "why did this
+///      run spend eight turns on git?" later. Record exhaustively, display
+///      selectively.
+fn warn_split_gitdirs(opts: &DispatchOpts) -> Vec<darkmux_types::workdir::SplitGitdir> {
     let workdir_split_gitdirs = opts
         .workdir
         .as_deref()
@@ -6144,15 +6265,32 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             emit_preflight_warning_once(&split_gitdir_warning(workdir, &workdir_split_gitdirs));
         }
     }
+    workdir_split_gitdirs
+}
 
+/// The image a container dispatch runs, checked before any role-load,
+/// model-probe or workspace work.
+struct RuntimeImage {
+    /// (#703) `true` only when the operator named a NON-darkmux image, whose
+    /// container gets darkmux's runtime binary injected.
+    inject: bool,
+    /// The darkmux runtime image that was checked: the one that runs, or the
+    /// source of the injected binary.
+    darkmux_image: crate::runtime_image::ResolvedImage,
+    /// The human-readable ref, for records and messages.
+    image: String,
+    /// What `docker run` is given.
+    run_image: String,
+}
+
+/// Resolve and check the runtime image, then say which one runs.
+fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
     // into it (bind-mount + entrypoint override) so the coder runs in the
     // operator's environment and can compile/test in-sandbox. The default path
     // runs a darkmux image directly (binary baked in, no injection).
-    let inject = image_arg
-        .as_deref()
-        .is_some_and(|img| !is_darkmux_runtime_image(img));
+    let inject = image_arg.is_some_and(|img| !is_darkmux_runtime_image(img));
 
     // Pre-flight: Docker reachable + a darkmux runtime image present. That
     // image is needed either as the image we RUN (default path) or as the
@@ -6160,7 +6298,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // — pulling the version-pinned GHCR image on demand if no local image
     // exists (#759), so a `brew install` user with no source checkout can
     // dispatch. Bails loud + operator-actionable BEFORE the role-load /
-    // model-probe / workspace-setup work below.
+    // model-probe / workspace-setup work.
     //
     // (#2923) A darkmux runtime image named with `--image` (e.g.
     // `darkmux-runtime:4.0-rc`) IS the image that runs, so it is the one
@@ -6172,8 +6310,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // image is resolved and version-checked either way: the gate is what
     // keeps a mismatched runtime from running, and a debug flag (or the
     // `skip_preflight` mission step key) must not open it.
-    let explicit_darkmux_image = image_arg.as_deref().filter(|_| !inject);
-    let darkmux_image = if opts.skip_preflight {
+    let explicit_darkmux_image = image_arg.filter(|_| !inject);
+    let darkmux_image = if skip_preflight {
         ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
         check_docker_preflight(explicit_darkmux_image)?
@@ -6185,7 +6323,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // between the check and `docker run` cannot swap in an unchecked image.
     // `image` stays the human-readable ref for records and messages.
     let image = image_arg
-        .clone()
+        .map(str::to_string)
         .unwrap_or_else(|| darkmux_image.reference.clone());
     let run_image = if inject {
         image.clone()
@@ -6200,13 +6338,44 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             format!(" ({})", short_image_id(&darkmux_image.id))
         }
     );
+    Ok(RuntimeImage { inject, darkmux_image, image, run_image })
+}
 
-    // 1. Load the role manifest + .md prompt.
+/// Step 1, load the role manifest + .md prompt: the role, its assembled
+/// system prompt, and the runtime tool catalog its palette allows.
+fn container_role(
+    opts: &DispatchOpts,
+    agentic: bool,
+    workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+) -> Result<(crate::types::Role, String, Option<Vec<String>>)> {
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let role = roles
-        .iter()
+        .into_iter()
         .find(|r| r.id == opts.role_id)
         .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
+    let system_prompt = container_system_prompt(&role, opts, agentic, workdir_split_gitdirs)?;
+    warn_unknown_role_vocab(&role, &opts.role_id);
+    // Compute the runtime tool catalog from the role's tool_palette
+    // (allow minus deny). When the palette is empty, returns None and
+    // the runtime falls back to its full catalog (back-compat). When
+    // restrictive, denied tools never reach the model — they're not in
+    // the chat-completions `tools[]` field, so the model structurally
+    // cannot call them. This is the runtime-side gate that prevents
+    // a model from ignoring its .md doctrine and calling a denied tool
+    // (the gap that let D call `edit` despite code-reviewer denying it).
+    let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
+    Ok((role, system_prompt, allowed_tools))
+}
+
+/// The container's system prompt, assembled in its fixed order: the role
+/// prompt, the autonomous-dispatch preamble, operator identity, then the
+/// workspace notes.
+fn container_system_prompt(
+    role: &crate::types::Role,
+    opts: &DispatchOpts,
+    agentic: bool,
+    workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+) -> Result<String> {
     // (#1550 cluster item 3) See the hosted-dispatch call site's comment —
     // `load_role_prompt_for` honors an explicit `role.prompt_path` first.
     let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
@@ -6239,22 +6408,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // #1405 review). A dispatch whose resolved brain is a remote endpoint is
     // skipped here (the agentic-remote container path, where `agentic_pm` is
     // set) and never augmented on the single-shot `dispatch_unmanaged` path
-    // above (whose system prompt comes from `try_resolve_unmanaged_target`,
+    // (whose system prompt comes from `try_resolve_unmanaged_target`,
     // which builds it without identity).
-    let system_prompt = if identity_augmentation_allowed(agentic_pm.is_some()) {
+    let system_prompt = if identity_augmentation_allowed(agentic) {
         crate::dispatch::augment_prompt_with_identity(&system_prompt)
     } else {
         system_prompt
     };
-    // (#2294) Consumer 2 of the preflight detection above: tell the MODEL
-    // that git is dead in this workspace. Without it the model retries
-    // git indefinitely — see `no_git_system_prompt_note`'s own doc for why
-    // no existing detector brakes that, and why warning the operator alone
-    // isn't a remedy on the paths that produce this shape.
+    // (#2294) Consumer 2 of the preflight detection ([`warn_split_gitdirs`]):
+    // tell the MODEL that git is dead in this workspace. Without it the model
+    // retries git indefinitely — see `no_git_system_prompt_note`'s own doc
+    // for why no existing detector brakes that, and why warning the operator
+    // alone isn't a remedy on the paths that produce this shape.
     let system_prompt = with_workspace_notes(
         system_prompt,
         opts.workdir.as_deref(),
-        &workdir_split_gitdirs,
+        workdir_split_gitdirs,
     );
     // (#2294) A no-op in production; in tests this is the seam
     // `dispatch_appends_the_no_git_note_at_the_call_site` reads, so deleting
@@ -6262,40 +6431,48 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // clean. Placed after the LAST thing that composes the prompt so it
     // pins what actually reaches the runtime.
     capture_assembled_system_prompt(&system_prompt);
-    // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
-    // (typos like "exce" for "exec", future tokens not yet wired)
-    // get silently dropped by `role_to_runtime`; without this warning
-    // the operator sees `tool_palette filtered to []` and has no
-    // signal about WHY their role got zero tools.
+    Ok(system_prompt)
+}
+
+/// #340 — surface unknown role-vocab tokens loudly. Unknown tokens
+/// (typos like "exce" for "exec", future tokens not yet wired)
+/// get silently dropped by `role_to_runtime`; without this warning
+/// the operator sees `tool_palette filtered to []` and has no
+/// signal about WHY their role got zero tools.
+fn warn_unknown_role_vocab(role: &crate::types::Role, role_id: &str) {
     let unknown_tokens = unknown_role_vocab_tokens(&role.tool_palette);
     if !unknown_tokens.is_empty() {
         eprintln!(
             "darkmux dispatch: role `{}` declares unknown tool-vocab tokens: [{}] \
              — these will be silently dropped from the runtime catalog (likely typos). \
              Known tokens: {}",
-            opts.role_id,
+            role_id,
             unknown_tokens.join(", "),
             known_role_vocab_csv()
         );
     }
-    // Compute the runtime tool catalog from the role's tool_palette
-    // (allow minus deny). When the palette is empty, returns None and
-    // the runtime falls back to its full catalog (back-compat). When
-    // restrictive, denied tools never reach the model — they're not in
-    // the chat-completions `tools[]` field, so the model structurally
-    // cannot call them. This is the runtime-side gate that prevents
-    // a model from ignoring its .md doctrine and calling a denied tool
-    // (the gap that let D call `edit` despite code-reviewer denying it).
-    let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
+}
 
-    // (#510) Validate the operator-provided `--workdir` BEFORE the model-
-    // selection step below. Workdir validation is a cheap, deterministic,
-    // network-free guard (symlink check + canonicalize + is_dir); model
-    // selection needs LMStudio. Validating first means a bad workdir
-    // (symlink escape, missing dir) fails fast with the right error
-    // instead of surfacing a confusing "model selection failed" when no
-    // model happens to be loaded. The canonical path is reused at
-    // workspace resolution (step 4) so we validate exactly once.
+/// The workdir and resume checkpoint, validated before model selection.
+struct WorkspacePlan {
+    /// The operator's `--workdir`, canonicalized; reused verbatim when the
+    /// workspace is resolved, so it is validated exactly once.
+    validated_workdir: Option<PathBuf>,
+    /// The workspace path the dispatch will mount, named without creating it.
+    intended_workspace: PathBuf,
+    /// A resume's already-read, already-validated checkpoint.
+    resume_checkpoint_contents: Option<String>,
+}
+
+/// (#510) Validate the operator-provided `--workdir` BEFORE the model-
+/// selection step. Workdir validation is a cheap, deterministic,
+/// network-free guard (symlink check + canonicalize + is_dir); model
+/// selection needs LMStudio. Validating first means a bad workdir
+/// (symlink escape, missing dir) fails fast with the right error
+/// instead of surfacing a confusing "model selection failed" when no
+/// model happens to be loaded. The canonical path is reused at
+/// workspace resolution (step 4) so we validate exactly once.
+fn plan_workspace(opts: &DispatchOpts, unix_micros: u128) -> Result<WorkspacePlan> {
     let validated_workdir = match opts.workdir.as_deref() {
         Some(custom) => Some(darkmux_types::workdir::validate_workdir(custom)?),
         None => None,
@@ -6320,7 +6497,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // return (#2561) and `check_docker_preflight` both ran above.
     //
     // `intended_workspace` mirrors, without creating it, whatever step 4
-    // below will actually resolve `workspace` to: the operator's own
+    // will actually resolve `workspace` to: the operator's own
     // `--workdir` (canonicalized above and reused verbatim by step 4, so
     // this is exact), or the deterministic no-`--workdir` auto-tempdir name
     // (role_id + this unix_micros).
@@ -6353,24 +6530,34 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         ),
         None => None,
     };
+    Ok(WorkspacePlan { validated_workdir, intended_workspace, resume_checkpoint_contents })
+}
 
-    // 2. Resolve the model. (#450 / #590) `select_model(role, profile,
-    //    skill_lookup)` capability-scores the role's requested vector against
-    //    the profile's candidate models; with no offer vectors it falls back
-    //    to the profile's default model (ModelRole removed in #601).
-    //    The profile is the `--profile` override when set (#549), else the
-    //    registry's `default_profile`. If no profile is configured (or it
-    //    selects no model), the dispatch fails with an error naming the fix.
-    //
-    //    NOT the long-form probe-then-pin path documented in #408 —
-    //    that's phase 2+ scope when the recommendation registry
-    //    activates per-hardware tuple selection.
+/// Step 2, resolve the model: the wire id, the profile it came from, and
+/// (for a hosted brain) the endpoint's raw route label.
+///
+///    (#450 / #590) `select_model(role, profile,
+///    skill_lookup)` capability-scores the role's requested vector against
+///    the profile's candidate models; with no offer vectors it falls back
+///    to the profile's default model (ModelRole removed in #601).
+///    The profile is the `--profile` override when set (#549), else the
+///    registry's `default_profile`. If no profile is configured (or it
+///    selects no model), the dispatch fails with an error naming the fix.
+///
+///    NOT the long-form probe-then-pin path documented in #408 —
+///    that's phase 2+ scope when the recommendation registry
+///    activates per-hardware tuple selection.
+fn resolve_container_model(
+    role: &crate::types::Role,
+    opts: &DispatchOpts,
+    agentic_pm: Option<&crate::target::Target>,
+) -> Result<(String, String, Option<String>)> {
     // (#1187) An agentic-remote dispatch already has its model resolved (via
     // `try_resolve_unmanaged_target`'s profile-based lookup, done up front so
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
-    let (model, resolved_profile) = if let Some(t) = &agentic_pm {
+    let (model, resolved_profile) = if let Some(t) = agentic_pm {
         (t.model.id.clone(), t.profile_name.clone())
     } else {
         let r = resolve_dispatch_internal(
@@ -6384,7 +6571,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         (r.wire_id, r.profile_name)
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
-    // that must land in `dispatch_start_payload`'s `endpoint` field below, the
+    // that must land in `dispatch_start_payload`'s `endpoint` field, the
     // SAME field the light single-shot `dispatch_unmanaged` path already sets
     // (see its `label` var). Missing this was a real gap: the viewer's route
     // display (`sp.endpoint` in `ui/src/lenses/session/sessionRun.ts`; the
@@ -6394,7 +6581,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // dispatch that correctly ran on Azure would still show up in the
     // viewer as a local dispatch, an operator-sovereignty violation (the
     // operator has no way to tell where the model actually ran).
-    let unmanaged_endpoint_raw_label = agentic_pm.as_ref().and_then(crate::target::Target::route_label);
+    let unmanaged_endpoint_raw_label = agentic_pm.and_then(crate::target::Target::route_label);
     darkmux_types::diag_eprintln!(
         "darkmux dispatch: model={model}{}",
         unmanaged_endpoint_raw_label
@@ -6402,27 +6589,31 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .map(|l| format!(", brain: {l}"))
             .unwrap_or_default()
     );
+    Ok((model, resolved_profile, unmanaged_endpoint_raw_label))
+}
 
+/// (#2294) Consumer 3 of the preflight detection: a durable record.
+/// Emitted here rather than at the detection site because this is the
+/// first point a `session_id` exists to hang it on. Without it the
+/// finding lives only in whatever terminal happened to be attached, and
+/// "why did this run burn eight turns on git?" is unanswerable from the
+/// run's own artifacts afterward. Record exhaustively, display
+/// selectively — nothing renders this by default; it is there to be
+/// asked for.
+///
+/// NOT deduplicated the way the console warning is: this record is
+/// session-scoped, and a crawl unit's own session has to carry its own
+/// answer. It is also NOT a liveness bookend, so on a very busy day
+/// `darkmux_serve::read_flow_records_from_file`'s ring can crop it out
+/// of what the daemon serves; the day file itself always has it.
+fn record_split_gitdirs(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    model: &str,
+    workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+) {
     // 3. The session is the caller's (`opts.session`): it names this
-    // dispatch's run, so every record below carries that run with no
-    // lookup.
-    let session = opts.session.clone();
-    let phase_id = opts.phase_id.clone();
-
-    // (#2294) Consumer 3 of the preflight detection: a durable record.
-    // Emitted here rather than at the detection site because this is the
-    // first point a `session_id` exists to hang it on. Without it the
-    // finding lives only in whatever terminal happened to be attached, and
-    // "why did this run burn eight turns on git?" is unanswerable from the
-    // run's own artifacts afterward. Record exhaustively, display
-    // selectively — nothing renders this by default; it is there to be
-    // asked for.
-    //
-    // NOT deduplicated the way the console warning is: this record is
-    // session-scoped, and a crawl unit's own session has to carry its own
-    // answer. It is also NOT a liveness bookend, so on a very busy day
-    // `darkmux_serve::read_flow_records_from_file`'s ring can crop it out
-    // of what the daemon serves; the day file itself always has it.
+    // dispatch's run, so every record carries that run with no lookup.
     if let Some(workdir) = opts.workdir.as_deref() {
         if !workdir_split_gitdirs.is_empty() {
             let checkouts: Vec<GitCheckout> = workdir_split_gitdirs.iter().map(|found| git_checkout(workdir, found)).collect();
@@ -6433,10 +6624,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
                 darkmux_flow::Level::Warn,
                 &opts.role_id,
-                &session,
-                &execution,
-                Some(&model),
-                phase_id.as_deref(),
+                &opts.session,
+                execution,
+                Some(model),
+                opts.phase_id.as_deref(),
                 darkmux_flow::Payload::DispatchWorkdirGitUnavailable(DispatchWorkdirGitUnavailablePayload {
                     issue: 2294,
                     workdir: workdir.display().to_string(),
@@ -6449,40 +6640,39 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             ));
         }
     }
+}
 
-    // (#1483) The mission-graph step this dispatch runs as (when it's a
-    // graph step). Stamped onto every live per-event flow record's payload
-    // so the viewer attributes the turn/tool/token climb to the seat card
-    // even when `session_id` isn't the `step-<id>` default (coder-phase's
-    // shared `mission-run-<…>` session). `None` for a non-graph dispatch.
-    let step_id = opts.step_id.clone();
-
-    // 4. Workspace resolution. Two paths (#206):
-    //
-    //    a) `--workdir <path>` → mount operator's chosen path at
-    //       /workspace inside the container. The path must already
-    //       exist; container writes persist there post-dispatch.
-    //       This is the path real engagement work uses (refactor /
-    //       audit / feature dispatches against an existing repo).
-    //
-    //    b) No `--workdir` → allocate a fresh tempdir. Useful for
-    //       toy tests, sanity probes, and one-shot dispatches that
-    //       don't need persistent operator workspace state.
-    //
-    //    NEITHER path auto-cleans the workspace dir — the operator
-    //    can inspect trajectory.jsonl + any files the agent wrote
-    //    after the container exits. That's half the point of the
-    //    workspace model (operator visibility into what the dispatch
-    //    did).
+/// Step 4, workspace resolution. Two paths (#206):
+///
+///    a) `--workdir <path>` → mount operator's chosen path at
+///    /workspace inside the container. The path must already
+///    exist; container writes persist there post-dispatch.
+///    This is the path real engagement work uses (refactor /
+///    audit / feature dispatches against an existing repo).
+///
+///    b) No `--workdir` → allocate a fresh tempdir. Useful for
+///    toy tests, sanity probes, and one-shot dispatches that
+///    don't need persistent operator workspace state.
+///
+///    NEITHER path auto-cleans the workspace dir — the operator
+///    can inspect trajectory.jsonl + any files the agent wrote
+///    after the container exits. That's half the point of the
+///    workspace model (operator visibility into what the dispatch
+///    did).
+fn create_workspace(
+    opts: &DispatchOpts,
+    validated_workdir: Option<PathBuf>,
+    intended_workspace: &Path,
+) -> Result<PathBuf> {
     let workspace = match validated_workdir {
-        // Already validated above (#510) — reuse the canonical path.
+        // Already validated (#510) — reuse the canonical path.
         // Symlink-escape guard via the shared validator (#255 Wave-E.2);
         // same scope as #227 + #232 — symlink-only, `..`-traversal is
         // operator-explicit and intentionally out of scope.
         Some(validated) => validated,
         None => {
-            // (#2162) Reuses `intended_workspace` computed above (before
-            // model selection) rather than re-deriving the format string
+            // (#2162) Reuses `intended_workspace` computed before model
+            // selection rather than re-deriving the format string
             // here — one place decides the name, so the resume-checkpoint
             // hoist's early validation and this actual creation can never
             // drift apart.
@@ -6492,7 +6682,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // exclusive-create guard rather than `create_dir_all`, which
             // would silently succeed on (and mount) a pre-planted symlink
             // or leftover dir.
-            create_dir_exclusive_unique_0700(&intended_workspace).with_context(|| {
+            create_dir_exclusive_unique_0700(intended_workspace).with_context(|| {
                 format!("creating dispatch workspace: {}", intended_workspace.display())
             })?
         }
@@ -6507,33 +6697,65 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         workspace.display(),
         workspace_source
     );
+    Ok(workspace)
+}
+
+/// The workspace, the guard that reclaims an auto one, and the out-dir,
+/// made in that order.
+fn materialize_dirs(
+    opts: &DispatchOpts,
+    unix_micros: u128,
+    workspace_plan: WorkspacePlan,
+    execution_lock: &mut ExecutionLock,
+    image_arg: Option<&str>,
+    execution: &ExecutionId,
+) -> Result<(PathBuf, AutoWorkspaceCleanup, PathBuf)> {
+    let workspace = create_workspace(opts, workspace_plan.validated_workdir, &workspace_plan.intended_workspace)?;
 
     // (#888) Reclaim the auto-allocated scratch workspace if the dispatch
     // `?`-returns or panics before the container runs to completion. Tracks
     // the tempdir ONLY for the no-`--workdir` case; an operator `--workdir`
-    // is never cleaned. Disarmed at the terminal-record point below.
-    let mut workspace_cleanup = AutoWorkspaceCleanup {
-        workspace: if opts.workdir.is_some() {
-            None
-        } else {
-            Some(workspace.clone())
-        },
+    // is never cleaned. Disarmed at the terminal-record point.
+    let workspace_cleanup = AutoWorkspaceCleanup {
+        workspace: opts.workdir.is_none().then(|| workspace.clone()),
         armed: true,
     };
+    let host_out = prepare_host_out(
+        opts,
+        unix_micros,
+        execution_lock,
+        (&workspace, image_arg),
+        execution,
+        workspace_plan.resume_checkpoint_contents.as_deref(),
+    )?;
+    Ok((workspace, workspace_cleanup, host_out))
+}
 
-    // 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
-    //     `.darkmux-runtime/{trajectory.jsonl, compaction-<gen>.json}` here,
-    //     SEPARATE from /workspace so a
-    //     `--workdir` repo never gets a `.darkmux-runtime` dropping in
-    //     the tree it's operating on. Mounted at `/darkmux-out` inside
-    //     the container (see the `-v` arg below).
-    //
-    //     Derived from the container_name's unique micros component so
-    //     two concurrent dispatches never collide. Like the workspace,
-    //     this is NOT auto-cleaned — the operator inspects
-    //     trajectory.jsonl after the container exits.
-    //     (#2153) `opts.host_out` lets a caller name this dir up front —
-    //     see `resolve_host_out`'s own doc.
+/// 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
+/// `.darkmux-runtime/{trajectory.jsonl, compaction-<gen>.json}` here,
+/// SEPARATE from /workspace so a
+/// `--workdir` repo never gets a `.darkmux-runtime` dropping in
+/// the tree it's operating on. Mounted at `/darkmux-out` inside
+/// the container (see the `-v` arg in `build_docker_run_argv`).
+///
+/// Derived from the container_name's unique micros component so
+/// two concurrent dispatches never collide. Like the workspace,
+/// this is NOT auto-cleaned — the operator inspects
+/// trajectory.jsonl after the container exits.
+/// (#2153) `opts.host_out` lets a caller name this dir up front —
+/// see `resolve_host_out`'s own doc.
+///
+/// Then, in order: this dispatch's own origin stamp, any staged resume
+/// checkpoint, and the prompt file.
+fn prepare_host_out(
+    opts: &DispatchOpts,
+    unix_micros: u128,
+    execution_lock: &mut ExecutionLock,
+    mounted: (&Path, Option<&str>),
+    execution: &ExecutionId,
+    resume_checkpoint_contents: Option<&str>,
+) -> Result<PathBuf> {
+    let (workspace, image_arg) = mounted;
     let host_out = resolve_host_out(opts.host_out.as_deref(), &opts.role_id, unix_micros)?;
     darkmux_types::diag_eprintln!(
         "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
@@ -6545,23 +6767,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
     stamp_own_execution(
-        &mut execution_lock,
+        execution_lock,
         &host_out,
-        (&workspace, opts.workspace_read_only, image_arg.as_deref()),
-        &execution,
+        (workspace, opts.workspace_read_only, image_arg),
+        execution,
     )?;
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
-    // hoisted before model selection, above — so all that remains here is
-    // landing the already-read, already-validated contents into THIS
-    // dispatch's fresh `host_out`. A resume that was going to be refused
-    // never reaches this point at all.
-    if let Some(contents) = resume_checkpoint_contents.as_deref() {
+    // hoisted before model selection ([`plan_workspace`]) — so all that
+    // remains here is landing the already-read, already-validated contents
+    // into THIS dispatch's fresh `host_out`. A resume that was going to be
+    // refused never reaches this point at all.
+    if let Some(contents) = resume_checkpoint_contents {
         write_staged_resume_checkpoint(contents, &host_out)
             .context("darkmux dispatch --resume-from")?;
         // `opts.resume_from` is `Some` whenever `resume_checkpoint_contents`
-        // is (they're set together, above) — `.unwrap()` is safe here.
+        // is (they're set together, in `plan_workspace`) — `.unwrap()` is
+        // safe here.
         eprintln!(
             "darkmux dispatch: resuming from checkpoint at {} (staged into {})",
             opts.resume_from.as_deref().unwrap().display(),
@@ -6576,23 +6799,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // and be visible in `ps`. The container reads it back from the bind mount.
     fs::write(host_out.join(PROMPT_FILE_NAME), &opts.message)
         .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
+    Ok(host_out)
+}
 
-    // (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
-    // same `remote_auth_header` the light single-shot path uses). Deliberately
-    // held ONLY in this local variable, never written to any file or env var
-    // — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
-    // it's the deliberate general-purpose escape hatch), so a mounted
-    // secret-bearing file is reachable by a model-issued `cat`, and an env var
-    // is reachable even more trivially (`env`, visible to every process, no
-    // permission gate at all). Instead, once the container spawns below, the
-    // secret is piped over its STDIN — a channel the container reads exactly
-    // once at startup, before the agent loop (and any chance of a tool call)
-    // exists, and which leaves no artifact on any filesystem afterward.
-    let mut remote_auth: Option<(String, String)> = None;
-    if let Some(t) = &agentic_pm {
-        remote_auth = remote_auth_header(&t.endpoint)?;
-    }
-    let remote_needs_auth = remote_auth.is_some();
+/// The container run, from its `dispatch.start` to its terminal record.
+/// It owns the bookend guard (contract 2): `dispatch.start` opens it, and
+/// every exit closes it exactly once, explicitly on the two mid-run exits
+/// and the clean one, and through the guard's Drop on any `?` or panic.
+fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: ContainerRun) -> Result<DispatchResult> {
+    let session = opts.session.clone();
+    let phase_id = opts.phase_id.clone();
+    let model = run.model.clone();
 
     // (#638) Session liveness heartbeat. (#3125) Spawned before the
     // `dispatch.start` below, which promises the beat only once it published. While THIS dispatch process lives,
@@ -6615,24 +6832,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id.
-    let dispatch_start_payload = dispatch_start_payload(
-        &image,
-        &opts.message,
-        &system_prompt,
-        &workspace,
-        agentic_pm.is_some(),
-        opts.max_turns_override,
-        opts.timeout_override_seconds,
-        allowed_tools.as_deref(),
-        &opts.brief_refs,
-    )?;
-    let dispatch_start_payload = container_start_payload(
-        dispatch_start_payload,
-        unmanaged_endpoint_raw_label.as_deref(),
-        opts.resume_from.as_deref(),
-        session_emitter.as_ref(),
-        &opts.record_context,
-    );
+    let dispatch_start_payload = container_dispatch_start_payload(opts, &run, session_emitter.as_ref())?;
     // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
     // `open()` — arms it, so any `?`-return or panic before the clean
     // `dispatch.complete` below emits a `dispatch.error` terminal so the
@@ -6656,7 +6856,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         darkmux_flow::Level::Info,
         &opts.role_id,
         &session,
-        &execution,
+        execution,
         Some(&model),
         phase_id.as_deref(),
         dispatch_start_payload,
@@ -6670,7 +6870,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 &format!("{err:#}"),
                 dispatch_start_instant.elapsed().as_millis() as u64,
                 summary,
-                unmanaged_endpoint_raw_label.as_deref(),
+                run.unmanaged_endpoint_raw_label.as_deref(),
                 opts.resume_from.as_deref(),
             );
             merge_record_context(&mut payload, &opts.record_context);
@@ -6678,25 +6878,334 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 level,
                 &opts.role_id,
                 &session,
-                &execution,
+                execution,
                 Some(&model),
                 phase_id.as_deref(),
                 payload,
             ));
         };
 
-    // 6. Spawn the docker container. Async via `spawn()` (vs the older
-    //    `output()`) so the live trajectory tailer (step 7) can run in
-    //    parallel and emit flow records mid-dispatch — without that,
-    //    topology edges go stale during long streaming turns (#231).
-    //    `--rm` cleans up the container on exit.
-    // (#363) Generate a unique container name so the watchdog thread
-    // (below) can `docker kill` it after the wall-clock deadline.
-    // Without --name, we'd have no stable handle to kill. session_id
-    // is already unique-per-dispatch and reads well in `docker ps`
-    // when debugging. Sanitize since docker container names allow only
-    // [a-zA-Z0-9][a-zA-Z0-9_.-]*.
-    let container_name = format!(
+    let remote_auth = run.remote_auth.take();
+    let mut launched = launch_container(opts, execution, &run, remote_auth)?;
+    // (#2925) This dispatch's own stop: see `DispatchStop`.
+    let local_stop = DispatchStop::new(launched.container_name.clone());
+    let (_observer_guards, threads) = spawn_observers(opts, execution, &run, &launched, &local_stop)?;
+    panic_after_guard_spawn_if_asked();
+
+    let output = match launched.child.wait_with_output() {
+        Ok(o) => {
+            // (#2131 review round 2, F1) Deregister HERE — right after
+            // the child has been reaped — rather than letting
+            // `container_child_registration` live to the natural end of
+            // this function's scope. The post-processing
+            // below (the interrupt check, envelope enrichment, the
+            // tailer/sampler joins) has no more use for this
+            // registration: the pid is dead the moment `wait_with_output`
+            // returns, and holding the registration open regardless just
+            // widens the window where the OS could recycle the pid
+            // number and a later `kill_all` would signal an unrelated
+            // process. The `Err` arm below doesn't need this — it
+            // returns immediately, and `container_child_registration`'s
+            // own `Drop` (RAII, from the spawn site) covers that exit
+            // path exactly the same way it covers every earlier `?`.
+            drop(launched.container_child_registration);
+            o
+        }
+        Err(e) => {
+            // (#889) The wait itself failed — the container may still be
+            // running (orphaned). The bare `?` here used to return before
+            // signaling the watchdog or killing the container: the watchdog
+            // thread would linger to its inactivity deadline and fire a
+            // spurious kill, and a genuinely-orphaned container would run
+            // until that deadline (or forever, if hung). Do the same
+            // teardown the success path does — stop the watchdog + sampler
+            // threads — plus a best-effort `docker kill` by the
+            // deterministic container name, then surface the wait error.
+            //
+            // (#2131 review round 2, F5) The tailer gets the same teardown
+            // the success path gives it: signal it to stop and join it.
+            // Without this, a `wait_with_output` failure left the tailer
+            // thread leaked: its own loop only exits on `stop_flag` or a
+            // caught signal, neither of which this branch used to touch, so
+            // it polled `trajectory.jsonl` forever in the background.
+            let trajectory_summary = threads.teardown(&launched.container_name);
+            let err = anyhow::Error::from(e).context("waiting for darkmux-runtime container");
+            close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
+            // (#2131 review round 2, NEW-2) No explicit deregister here —
+            // `container_child_registration` (declared at the spawn
+            // site) deregisters on Drop, which fires when this early
+            // `return` unwinds the scope. See that guard's own doc for
+            // why an explicit call at every exit path was the wrong
+            // shape (a leaked registration on a future `?` return this
+            // function grows).
+            return Err(err);
+        }
+    };
+
+    // (#2233) Disarm ONLY on a proven-clean exit — and note this is the
+    // opposite of where the first version of this fix put it.
+    //
+    // `wait_with_output()` returning `Ok` does NOT mean the container
+    // exited; it means the docker CLI process did. A SIGKILL on the CLI's
+    // pid — which is the only signal `child_registry::kill_all` ever sends,
+    // at all four of its call sites — closes the pipes, returns `Ok` with a
+    // signal-killed status, and leaves the container `Up` under dockerd with
+    // its model still loaded. That is not speculation: the NEW-1 comment a
+    // few dozen lines below records it measured live (`docker ps` showed the
+    // container `Up` after `kill -9` on the CLI pid; `--rm` never fired).
+    //
+    // So a success status is the ONLY evidence the container actually
+    // finished, and it is the only case that disarms. Every non-success path
+    // leaves the guard armed, and its Drop is fire-and-forget
+    // (`docker_kill_by_name` discards both stdout and stderr, emits no flow
+    // record) — so on the paths that already kill (the `Err` arm above, the
+    // interrupt teardown below, the watchdog) it is a silent redundant kill
+    // of a container that is dead or dying. There is no path on which the
+    // status is non-success and the container should stay alive.
+    //
+    // The cost, stated plainly: a healthy dispatch still adds zero
+    // subprocesses; a failing one adds one `docker kill`. That buys the
+    // whole spawn-to-wait span being uniformly armed, with no line whose
+    // POSITION is load-bearing — which is what the previous placement got
+    // wrong, since it rested on the premise this comment just disproved.
+    if output.status.success() {
+        launched.container_kill_guard.disarm();
+    }
+
+    // (#2131 review round 2, NEW-1 / NEW-4) The trajectory tailer polls
+    // this SAME flag every poll tick and, on catching a signal, kills
+    // this dispatch's registered child pid (see the tailer loop's own
+    // comment) — which is the DOCKER CLI PROCESS, not the container.
+    // `docker run` in attached/foreground mode does not forward a
+    // SIGKILL to the container it's running (SIGKILL can't be caught or
+    // proxied at all, unlike SIGTERM); killing just the CLI unblocks
+    // THIS wait (its stdout/stderr pipes close when the process dies)
+    // but otherwise leaves the container running, orphaned under
+    // dockerd. Measured live: `docker ps` still showed the container
+    // `Up` after `kill -9` on the CLI's own pid; `--rm` never fired.
+    // (NEW-1) So: explicitly `docker kill` the container by its
+    // deterministic name here too — the SAME call the inactivity
+    // watchdog and the wait-error branch just above already make — so
+    // the error text below ("the container ... was killed") is actually
+    // true, not just a claim about the CLI wrapper.
+    //
+    // (NEW-4) Gated on `!output.status.success()` — `interrupt::is_set()`
+    // is STICKY (that module's own doc: "one flag, set once, never
+    // cleared"), so a signal that arrived at ANY point during this
+    // dispatch — including one this run had nothing to do with, or one
+    // that arrived in the race window right as the container was
+    // finishing cleanly on its own — would otherwise turn a genuinely
+    // CLEAN exit-0 result into a discarded "interrupted" error. Prefer
+    // the real result on a clean exit: fall through to normal envelope
+    // parsing below instead, and let the LAUNCHER decide what a
+    // signal-observed-but-clean-exit run means — its own guard already
+    // reads this same global flag independently.
+    if run_was_killed(&local_stop, output.status.success()) {
+        let trajectory_summary = threads.teardown(&launched.container_name);
+        stop_session_emitter(session_emitter);
+        // (#2131 review round 2, F1) `container_child_registration` is
+        // already deregistered by this point — this branch only runs
+        // after a SUCCESSFUL `wait_with_output`, which dropped it
+        // explicitly in the `Ok` arm above (the child is dead either
+        // way; there is nothing left to deregister here).
+        //
+        // (#2925) A stop scoped to this dispatch is reported as itself,
+        // not as a signal: the launcher reads the signal wording as "the
+        // whole run was interrupted", which a phase stop is not.
+        let err = killed_mid_run_error(&launched.container_name, &local_stop);
+        close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
+        return Err(err);
+    }
+
+    let outcome = collect_container_outcome(
+        threads,
+        session_emitter,
+        output,
+        dispatch_start_instant,
+        &run.host_out,
+        &launched.container_name,
+        (launched.inactivity_timeout_seconds, launched.inactivity_timeout_seconds_source),
+    );
+    close_container_run(opts, execution, &mut run, &mut bookend, outcome)
+}
+
+/// The `dispatch.start` payload of a container run: the runtime metadata
+/// (#204), then the container-path fields.
+fn container_dispatch_start_payload(
+    opts: &DispatchOpts,
+    run: &ContainerRun,
+    session_emitter: Option<&darkmux_flow::session_presence::SessionEmitter>,
+) -> Result<darkmux_flow::Payload> {
+    let dispatch_start_payload = dispatch_start_payload(
+        &run.image.image,
+        &opts.message,
+        &run.system_prompt,
+        &run.workspace,
+        run.brain.agentic_pm.is_some(),
+        opts.max_turns_override,
+        opts.timeout_override_seconds,
+        run.allowed_tools.as_deref(),
+        &opts.brief_refs,
+    )?;
+    Ok(container_start_payload(
+        dispatch_start_payload,
+        run.unmanaged_endpoint_raw_label.as_deref(),
+        opts.resume_from.as_deref(),
+        session_emitter,
+        &opts.record_context,
+    ))
+}
+
+/// The spawned container, and what the run resolved on the way to it.
+struct LaunchedContainer {
+    // Field order is drop order: the kill guard, then the pid registration,
+    // then the child, as when all three were `dispatch()`'s own locals.
+    /// (#2233) Armed from spawn; disarmed only on a success exit status.
+    container_kill_guard: ContainerKillGuard,
+    /// (#2131 review round 2) The child's pid, registered for `kill_all`.
+    container_child_registration: PidRegistration,
+    child: std::process::Child,
+    container_name: String,
+    compaction: crate::dispatch::CompactionDispatchArgs,
+    utility_model: Option<String>,
+    unmanaged_compactor: Option<crate::target::UtilityTarget>,
+    inactivity_timeout_seconds: u64,
+    inactivity_timeout_seconds_source: InactivityBudgetSource,
+}
+
+/// 6. Spawn the docker container. Async via `spawn()` (vs the older
+///    `output()`) so the live trajectory tailer (step 7) can run in
+///    parallel and emit flow records mid-dispatch — without that,
+///    topology edges go stale during long streaming turns (#231).
+///    `--rm` cleans up the container on exit.
+///
+/// Before the spawn: the container's name, the compactor, the shared cache
+/// and the inactivity budget. Right after it: the pid registration, the
+/// kill guard, and the secrets piped over stdin.
+fn launch_container(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    run: &ContainerRun,
+    mut remote_auth: Option<(String, String)>,
+) -> Result<LaunchedContainer> {
+    let container_name = container_name_for(&opts.session);
+    record_origin_container(&run.host_out, &container_name, opts.resume_from.as_deref());
+
+    // Resolve compaction (role override + utility model + context window).
+    // (#2905) One call over the dispatch's own inputs, so the role-aware
+    // window resolution is exercised by tests exactly as it runs here.
+    let DispatchCompaction { compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
+        resolve_dispatch_compaction(&run.role, opts)?;
+    let (compaction, mut compactor_auth) =
+        prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref())?;
+
+    // Shared toolchain cache: resolve the host dir + best-effort create so
+    // the bind-mount target exists (#703 Slice 3). If create fails the mount
+    // still works (docker creates the source) — just uncached.
+    let cache_dir = shared_cache_dir_for(opts.remote_origin.as_deref());
+    if let Some(c) = &cache_dir {
+        let _ = fs::create_dir_all(c);
+    }
+
+    // (#2480) Resolved ONCE here, and reused by all three consumers — the
+    // container-forwarded `DARKMUX_INACTIVITY_TIMEOUT_SECONDS*` env vars,
+    // the host watchdog deadline, and the timeout stderr
+    // the watchdog prepends — so no two of them can disagree about the
+    // budget or about where it came from. See
+    // `effective_inactivity_timeout_seconds`'s own doc for the precedence.
+    //
+    // (#2480 review, blocker 2 — DISCLOSED, not fixed) This one line is NOT
+    // covered by any fast test: mutating it to `effective_inactivity_
+    // timeout_seconds(None)` compiles and leaves the whole crate suite
+    // green. It sits inside `dispatch()`, past the point where a real
+    // `docker run` is required, and the two consumers take ~30
+    // resolved locals between them, so pinning it means either a container
+    // run or an `argv_config_for(...)` extraction with a worse signature
+    // than the literal it replaces. What IS pinned is the segment that was
+    // actually broken — `DispatchOpts` -> crew-of-one step config ->
+    // `DispatchOpts` (`build_graph_step_config_carries_the_cli_flags`,
+    // mutation-proven on both halves) — plus
+    // `effective_inactivity_timeout_seconds` itself and
+    // `DockerRunConfig.inactivity_timeout_seconds` -> argv (the golden).
+    // The gap is the single assignment joining them.
+    let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) =
+        effective_inactivity_timeout_seconds(opts.timeout_override_seconds);
+
+    let argv_config = container_run_config(
+        opts,
+        execution,
+        run,
+        ContainerMounts { container_name: &container_name, compaction: &compaction, cache_dir },
+        (remote_auth.is_some(), compactor_auth.is_some()),
+        (inactivity_timeout_seconds, inactivity_timeout_seconds_source),
+    )?;
+    let mut child = spawn_container(&argv_config, opts.max_turns_override)?;
+
+    // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
+    // the child exists — mirrors the hosted-curl path's own
+    // register/deregister bracket. Before this, the
+    // docker/coder/crawl dispatch path registered NOTHING, so
+    // `darkmux_types::child_registry::kill_all` (armed launchers'
+    // watchdogs, and the trajectory tailer's own interrupt check)
+    // had no pid to signal — a caught SIGTERM/SIGINT/SIGHUP on a
+    // coder-phase or crawl run was silently swallowed until the
+    // dispatch's own inactivity timeout. Held as a `PidRegistration`
+    // guard (its own doc explains why) rather than paired explicit
+    // register/deregister calls — several `?` returns follow before the
+    // run's normal exit, and a leaked registration is a live hazard,
+    // not just untidy bookkeeping.
+    let container_child_pid = child.id();
+    let container_child_registration = PidRegistration::new(container_child_pid);
+
+    // (#2233) Armed the moment the container exists, and disarmed only on a
+    // SUCCESS exit status after the wait (see that site for why a bare
+    // `Ok` is not evidence the container is gone). `PidRegistration` above does NOT
+    // cover this — it deregisters a pid on Drop and never kills anything —
+    // and the inactivity watchdog that would eventually `docker kill` this
+    // container is not running yet. Without this guard, the two `?`
+    // returns in the remote-auth stdin block immediately below returned an
+    // error while the container ran on, orphaned, holding its LMStudio model
+    // load. Declared after the registration, so reverse-declaration Drop order
+    // stops the container before dropping its pid registration — note that is
+    // a tidy ordering rather than a load-bearing one: the kill is by container
+    // NAME and never consults the registry, and deregistering never touches
+    // docker, so neither order is observable. Do not build on it. See the
+    // guard's own doc.
+    let container_kill_guard = ContainerKillGuard::new(container_name.clone());
+
+    // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
+    // before the trajectory tailer starts, before anything else runs. The
+    // container's startup code blocks reading stdin until this write (and
+    // the subsequent drop, which closes the pipe / sends EOF) completes, so
+    // this must happen promptly; it never touches a file or env var, so
+    // there's no FILESYSTEM artifact left anywhere for a `bash`-capable
+    // model to find — the whole file-based exposure the earlier design
+    // (superseded within this same change) had. This does not eliminate
+    // every exposure vector: the secret still lives in the runtime
+    // process's memory for the dispatch's duration (see the residual-risk
+    // note on `auth_header_stdin` in `runtime/src/main.rs`).
+    pipe_auth_headers(&mut child, remote_auth.take(), compactor_auth.take())?;
+    Ok(LaunchedContainer {
+        container_kill_guard,
+        container_child_registration,
+        child,
+        container_name,
+        compaction,
+        utility_model,
+        unmanaged_compactor,
+        inactivity_timeout_seconds,
+        inactivity_timeout_seconds_source,
+    })
+}
+
+/// (#363) The container's name, unique per dispatch, so the watchdog
+/// thread can `docker kill` it after the wall-clock deadline.
+/// Without --name, we'd have no stable handle to kill. session_id
+/// is already unique-per-dispatch and reads well in `docker ps`
+/// when debugging. Sanitize since docker container names allow only
+/// [a-zA-Z0-9][a-zA-Z0-9_.-]*.
+fn container_name_for(session: &SessionId) -> String {
+    format!(
         "darkmux-dispatch-{}",
         session
             .wire()
@@ -6707,12 +7216,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 '-'
             })
             .collect::<String>()
-    );
-    record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());
+    )
+}
 
-    // Build the complete docker-run argv via the pure function (#842).
-    // All inputs are resolved above; this is a single deterministic call.
-    let feedback_json = if let Some(templates) = role.feedback_templates.as_ref() {
+/// The role's feedback templates as the runtime takes them: `null` when the
+/// role declares none, or an empty list.
+fn feedback_templates_json(role: &crate::types::Role) -> serde_json::Value {
+    if let Some(templates) = role.feedback_templates.as_ref() {
         if !templates.is_empty() {
             serde_json::to_value(templates).unwrap_or(serde_json::Value::Null)
         } else {
@@ -6720,51 +7230,54 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         }
     } else {
         serde_json::Value::Null
-    };
+    }
+}
 
-    // Resolve compaction (role override + utility model + context window).
-    // (#2905) One call over the dispatch's own inputs, so the role-aware
-    // window resolution is exercised by tests exactly as it runs here.
-    let DispatchCompaction { mut compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
-        resolve_dispatch_compaction(role, &opts)?;
-    // (#3207) The compactor's credential when the binding's endpoint declares
-    // one, piped over stdin beside the brain's (never argv, env or a file).
+/// (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
+/// CONTEXT — namespaced — before the container starts, exactly as the
+/// dispatch model already is (#1135). Pre-#1280 this path only eprintln'd a
+/// warning, and its claim that compaction "will fail if it isn't resident"
+/// was wrong: LMStudio JIT-loads a downloaded-but-unloaded model on the chat
+/// call, UNNAMESPACED and at the model default (~4096) — so a compaction
+/// payload overflows 4096 into truncated/garbage summaries mid-long-dispatch
+/// (the #1135 silent-truncation mechanism on the path that exists to SAVE
+/// long dispatches), and the bare load fails `is_darkmux_owned` so `model
+/// eject` can't reclaim it (a RAM leak on the always-on hub). Loading it
+/// here — at ITS OWN declared context, under `darkmux:`, closes both.
+///
+/// (#1616) `compaction.context_window` is the PRIMARY model's declared
+/// `n_ctx` (see `CompactionDispatchArgs::from_profile` — it reads
+/// `profile.default_model_id()`'s window, needed for the compaction
+/// TRIGGER formula). Passing that same number as the LOAD ctx for a
+/// DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
+/// compactor silently loaded at the primary's 262144-token window instead
+/// of its own declared 120000. (#2914) The compactor's own window is
+/// `internal.utility.n_ctx` (`resolve_utility_target_internal`), declared
+/// once for the machine; the primary's window is used ONLY when the
+/// binding declares none, and that fallback is named in the load message
+/// (operator sovereignty, #44) — never silently substituted.
+///
+/// Warns rather than aborting; skipped for the mock-model harness (no real
+/// LMStudio to load into, same gate as the dispatch model's residency).
+///
+/// (#2536) "Warn, don't abort" no longer means "degrade gracefully". A
+/// compaction-LESS dispatch still runs, but a dispatch that DOES compact now
+/// dies at its first compaction when this load failed — the wire carries the
+/// namespaced identifier, and there is no instance behind it. See
+/// `ensure_utility_resident`'s doc.
+///
+/// Returns the compaction args as the container gets them, and (#3207) the
+/// compactor's credential when the binding's endpoint declares one, piped
+/// over stdin beside the brain's (never argv, env or a file).
+fn prepare_compactor(
+    opts: &DispatchOpts,
+    mut compaction: crate::dispatch::CompactionDispatchArgs,
+    compactor_n_ctx: Option<u32>,
+    unmanaged_compactor: Option<&crate::target::UtilityTarget>,
+) -> Result<(crate::dispatch::CompactionDispatchArgs, Option<(String, String)>)> {
     let mut compactor_auth: Option<(String, String)> = None;
-
-    // (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
-    // CONTEXT — namespaced — before the container starts, exactly as the
-    // dispatch model already is (#1135). Pre-#1280 this path only eprintln'd a
-    // warning, and its claim that compaction "will fail if it isn't resident"
-    // was wrong: LMStudio JIT-loads a downloaded-but-unloaded model on the chat
-    // call, UNNAMESPACED and at the model default (~4096) — so a compaction
-    // payload overflows 4096 into truncated/garbage summaries mid-long-dispatch
-    // (the #1135 silent-truncation mechanism on the path that exists to SAVE
-    // long dispatches), and the bare load fails `is_darkmux_owned` so `model
-    // eject` can't reclaim it (a RAM leak on the always-on hub). Loading it
-    // here — at ITS OWN declared context, under `darkmux:`, closes both.
-    //
-    // (#1616) `compaction.context_window` is the PRIMARY model's declared
-    // `n_ctx` (see `CompactionDispatchArgs::from_profile` — it reads
-    // `profile.default_model_id()`'s window, needed for the compaction
-    // TRIGGER formula). Passing that same number as the LOAD ctx for a
-    // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
-    // compactor silently loaded at the primary's 262144-token window instead
-    // of its own declared 120000. (#2914) The compactor's own window is
-    // `internal.utility.n_ctx` (`resolve_utility_target_internal`), declared
-    // once for the machine; the primary's window is used ONLY when the
-    // binding declares none, and that fallback is named in the load message
-    // (operator sovereignty, #44) — never silently substituted.
-    //
-    // Warns rather than aborting; skipped for the mock-model harness (no real
-    // LMStudio to load into, same gate as the dispatch model's residency).
-    //
-    // (#2536) "Warn, don't abort" no longer means "degrade gracefully". A
-    // compaction-LESS dispatch still runs, but a dispatch that DOES compact now
-    // dies at its first compaction when this load failed — the wire carries the
-    // namespaced identifier, and there is no instance behind it. See
-    // `ensure_utility_resident`'s doc.
     if opts.model_base_url_override.is_none() {
-        if let Some(utility) = unmanaged_compactor.as_ref().filter(|_| compaction.compactor_model.is_some()) {
+        if let Some(utility) = unmanaged_compactor.filter(|_| compaction.compactor_model.is_some()) {
             // (#3207) An unmanaged utility endpoint: nothing is loaded, the
             // bare id goes on the wire, and the runtime's compactor client
             // dials that endpoint (as the container sees it).
@@ -6789,7 +7302,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
             // all the way through `from_profile` + `apply_utility_model` —
             // no compactor is going to be loaded, and `apply_compaction_flags`
-            // (below, at the docker-spawn site) will therefore omit
+            // (at the docker-spawn site) will therefore omit
             // `--compactor-model` entirely. Before this, that silence was
             // the ONLY signal: no message, no trajectory event, no flow
             // record, no envelope field distinguished "never needed one"
@@ -6829,45 +7342,40 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             eprintln!("{warning}");
         }
     }
+    Ok((compaction, compactor_auth))
+}
 
-    // Shared toolchain cache: resolve the host dir + best-effort create so
-    // the bind-mount target exists (#703 Slice 3). If create fails the mount
-    // still works (docker creates the source) — just uncached.
-    let cache_dir = shared_cache_dir_for(opts.remote_origin.as_deref());
-    if let Some(c) = &cache_dir {
-        let _ = fs::create_dir_all(c);
-    }
+/// What the container mounts and is named, for [`container_run_config`].
+struct ContainerMounts<'a> {
+    container_name: &'a str,
+    compaction: &'a crate::dispatch::CompactionDispatchArgs,
+    cache_dir: Option<PathBuf>,
+}
 
-    // (#2480) Resolved ONCE here, and reused by all three consumers — the
-    // container-forwarded `DARKMUX_INACTIVITY_TIMEOUT_SECONDS*` env vars
-    // below, the host watchdog deadline further down, and the timeout stderr
-    // the watchdog prepends — so no two of them can disagree about the
-    // budget or about where it came from. See
-    // `effective_inactivity_timeout_seconds`'s own doc for the precedence.
-    //
-    // (#2480 review, blocker 2 — DISCLOSED, not fixed) This one line is NOT
-    // covered by any fast test: mutating it to `effective_inactivity_
-    // timeout_seconds(None)` compiles and leaves the whole crate suite
-    // green. It sits inside `dispatch()`, past the point where a real
-    // `docker run` is required, and the two consumers below take ~30
-    // resolved locals between them, so pinning it means either a container
-    // run or an `argv_config_for(...)` extraction with a worse signature
-    // than the literal it replaces. What IS pinned is the segment that was
-    // actually broken — `DispatchOpts` -> crew-of-one step config ->
-    // `DispatchOpts` (`build_graph_step_config_carries_the_cli_flags`,
-    // mutation-proven on both halves) — plus
-    // `effective_inactivity_timeout_seconds` itself and
-    // `DockerRunConfig.inactivity_timeout_seconds` -> argv (the golden).
-    // The gap is the single assignment joining them.
-    let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) =
-        effective_inactivity_timeout_seconds(opts.timeout_override_seconds);
-
+/// Build the complete docker-run argv's inputs (#842). All inputs are
+/// resolved by now; this is a single deterministic assembly, in the field
+/// order that decides which config reads (and which `docker` calls) come
+/// first. `auth` is whether the brain and the compactor each need a
+/// credential on stdin; `inactivity` the resolved budget and its source.
+fn container_run_config(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    run: &ContainerRun,
+    mounts: ContainerMounts<'_>,
+    auth: (bool, bool),
+    inactivity: (u64, InactivityBudgetSource),
+) -> Result<DockerRunConfig> {
+    let ContainerMounts { container_name, compaction, cache_dir } = mounts;
+    let (remote_needs_auth, compactor_needs_auth) = auth;
+    let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) = inactivity;
+    let agentic_pm = run.brain.agentic_pm.as_ref();
+    let feedback_json = feedback_templates_json(&run.role);
     // (#2902) The container's hosted-brain flags, from the resolved target.
-    let agentic_brain = agentic_brain_flags(agentic_pm.as_ref());
-    let argv_config = DockerRunConfig {
-        container_name: container_name.clone(),
-        workspace: workspace.clone(),
-        host_out: host_out.clone(),
+    let agentic_brain = agentic_brain_flags(agentic_pm);
+    Ok(DockerRunConfig {
+        container_name: container_name.to_string(),
+        workspace: run.workspace.clone(),
+        host_out: run.host_out.clone(),
         // (#2295) The attachment directories the briefed mods want readable
         // inside the container. Resolved off the SAME ref list the brief was
         // rendered from, so the paths the block names are the paths mounted.
@@ -6875,25 +7383,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             &opts.brief_refs,
             &crate::mods::mods_dir(),
         )?,
-        inject,
-        runtime_binary: if inject {
-            Some(ensure_runtime_binary_cached(&darkmux_image.id)?)
+        inject: run.image.inject,
+        runtime_binary: if run.image.inject {
+            Some(ensure_runtime_binary_cached(&run.image.darkmux_image.id)?)
         } else {
             None
         },
-        image: run_image.clone(),
+        image: run.image.run_image.clone(),
         role_id: opts.role_id.clone(),
         // (#2386) The SAME id `materialize_finding` keys stored findings by.
         execution: execution.clone(),
-        model: model.clone(),
-        system_prompt: system_prompt.clone(),
-        output_schema: role.output_schema.clone(),
+        model: run.model.clone(),
+        system_prompt: run.system_prompt.clone(),
+        output_schema: run.role.output_schema.clone(),
         message: opts.message.clone(),
         json: opts.json,
-        allowed_tools: allowed_tools.clone(),
+        allowed_tools: run.allowed_tools.clone(),
         compaction: compaction.clone(),
         feedback_templates: feedback_json,
-        cache_dir: cache_dir.clone(),
+        cache_dir,
         feedback_injection: darkmux_types::config_access::feedback_injection(),
         // (#2094 finding 4) Never rest an agentic-REMOTE dispatch
         // (`agentic_pm.is_some()`, i.e. this container's brain is a hosted
@@ -6903,8 +7411,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // its endpoint budget, `endpoints.<id>.limits`) should not pay
         // latency for a knob that does nothing for it. Forced to `0`
         // regardless of the operator's configured `turn_delay_ms` — see
-        // the matching `dispatch_start_payload["turn_delay_ms"]` stamp
-        // above, which mirrors this same override via `effective_turn_delay_ms`.
+        // the matching `dispatch_start_payload["turn_delay_ms"]` stamp,
+        // which mirrors this same override via `effective_turn_delay_ms`.
         turn_delay_ms: effective_turn_delay_ms(
             darkmux_types::config_access::turn_delay_ms(),
             agentic_pm.is_some(),
@@ -6927,7 +7435,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         max_pause_ms_env: Some(darkmux_types::config_access::thermal_pace_staleness_ceiling_ms()),
         // (#2114 follow-up / #2162) The trigger: `validate_resume_checkpoint`
         // (before model selection) and `write_staged_resume_checkpoint`
-        // (once `host_out` exists) above already verified + staged the
+        // (once `host_out` exists) already verified + staged the
         // checkpoint into `host_out` when `opts.resume_from` is `Some` —
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
@@ -6937,17 +7445,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // config's argv is byte-identical.
         dialect: agentic_brain.1,
         remote_needs_auth,
-        compactor_needs_auth: compactor_auth.is_some(),
+        compactor_needs_auth,
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
-    };
+    })
+}
 
+/// Check the run config, build the `docker run` command from it, and spawn
+/// it with its output piped (and its stdin, when a secret rides it).
+fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32>) -> Result<std::process::Child> {
     // (#907) Validate the image ref before it reaches docker as a positional
     // arg. The `--` fence in build_docker_run_argv already prevents flag
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
-    preflight_docker_config(&argv_config)?;
-    let argv = build_docker_run_argv(&argv_config);
+    preflight_docker_config(argv_config)?;
+    let argv = build_docker_run_argv(argv_config);
 
     // `build_docker_run_argv` returns a FULL command — the program (`docker`)
     // at [0], then `run` + the #839 hardening OPTIONS + the `--` image fence +
@@ -6966,59 +7478,98 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // host side; pass via --max-turns / --max-tokens CLI flags to
     // the runtime container. Both default unlimited (omitted flag
     // → runtime's `Option<u32>` stays None → no cap applied).
-    apply_runtime_limit_flags(&mut cmd, opts.max_turns_override);
+    apply_runtime_limit_flags(&mut cmd, max_turns_override);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if argv_config.needs_stdin() {
         cmd.stdin(Stdio::piped());
     }
 
-    let mut child = cmd.spawn().context("spawning darkmux-runtime container")?;
+    cmd.spawn().context("spawning darkmux-runtime container")
+}
 
-    // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
-    // the child exists — mirrors the hosted-curl path's own
-    // register/deregister bracket above (~1594/1596). Before this, the
-    // docker/coder/crawl dispatch path registered NOTHING, so
-    // `darkmux_types::child_registry::kill_all` (armed launchers'
-    // watchdogs, and the trajectory tailer's own interrupt check just
-    // below) had no pid to signal — a caught SIGTERM/SIGINT/SIGHUP on a
-    // coder-phase or crawl run was silently swallowed until the
-    // dispatch's own inactivity timeout. Held as a `PidRegistration`
-    // guard (its own doc explains why) rather than paired explicit
-    // register/deregister calls — several `?` returns follow before this
-    // function's normal exit, and a leaked registration is a live hazard,
-    // not just untidy bookkeeping.
-    let container_child_pid = child.id();
-    let container_child_registration = PidRegistration::new(container_child_pid);
+/// (#threshold) Effective compaction threshold the runtime triggers at:
+/// absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
+/// default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
+/// context telemetry so the viewer draws the trigger line.
+/// Both triggers can be set; the runtime's needs_compaction fires at whichever
+/// trips FIRST (min), so draw the effective earliest trigger — not just the
+/// absolute one. Fall back to ratio×window, then the 0.5×window default.
+fn effective_compaction_threshold(compaction: &crate::dispatch::CompactionDispatchArgs) -> Option<u32> {
+    let abs_threshold = compaction.threshold_tokens;
+    let formula_threshold = compaction
+        .threshold_ratio
+        .zip(compaction.context_window)
+        .map(|(r, w)| (w as f32 * r) as u32);
+    match (abs_threshold, formula_threshold) {
+        (Some(a), Some(f)) => Some(a.min(f)),
+        (a, f) => a
+            .or(f)
+            .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32)),
+    }
+}
 
-    // (#2233) Armed the moment the container exists, and disarmed only on a
-    // SUCCESS exit status after the wait below (see that site for why a bare
-    // `Ok` is not evidence the container is gone). `PidRegistration` above does NOT
-    // cover this — it deregisters a pid on Drop and never kills anything —
-    // and the inactivity watchdog that would eventually `docker kill` this
-    // container is still ~140 lines away. Without this guard, the two `?`
-    // returns in the remote-auth stdin block immediately below returned an
-    // error while the container ran on, orphaned, holding its LMStudio model
-    // load. Declared after the registration, so reverse-declaration Drop order
-    // stops the container before dropping its pid registration — note that is
-    // a tidy ordering rather than a load-bearing one: the kill is by container
-    // NAME and never consults the registry, and deregistering never touches
-    // docker, so neither order is observable. Do not build on it. See the
-    // guard's own doc.
-    let mut container_kill_guard = ContainerKillGuard::new(container_name.clone());
+/// The three panic-safe `StopFlagGuard`s of the threads that watch the
+/// container, held to the natural end of the run.
+struct ObserverGuards {
+    // Field order is drop order: the reverse of the order they were armed in,
+    // as when all three were `dispatch()`'s own locals.
+    _sampler_stop_guard: StopFlagGuard,
+    _watchdog_abandon_guard: StopFlagGuard,
+    _tailer_stop_guard: StopFlagGuard,
+}
 
-    // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
-    // before the trajectory tailer starts, before anything else runs. The
-    // container's startup code blocks reading stdin until this write (and
-    // the subsequent drop, which closes the pipe / sends EOF) completes, so
-    // this must happen promptly; it never touches a file or env var, so
-    // there's no FILESYSTEM artifact left anywhere for a `bash`-capable
-    // model to find — the whole file-based exposure the earlier design
-    // (superseded within this same change) had. This does not eliminate
-    // every exposure vector: the secret still lives in the runtime
-    // process's memory for the dispatch's duration (see the residual-risk
-    // note on `auth_header_stdin` in `runtime/src/main.rs`).
-    pipe_auth_headers(&mut child, remote_auth.take(), compactor_auth.take())?;
+/// The threads that watch the container, and the flags that end them.
+struct ContainerThreads {
+    stop_flag: Arc<AtomicBool>,
+    tailer_handle: thread::JoinHandle<TrajectorySummary>,
+    timeout_fired: Arc<AtomicBool>,
+    watchdog_done: Arc<AtomicBool>,
+    kill_disposition: Arc<AtomicU8>,
+    watchdog_handle: thread::JoinHandle<WatchdogWake>,
+    sampler_stop: Arc<AtomicBool>,
+    sampler_handle: thread::JoinHandle<SamplerOutcome>,
+}
+
+impl ContainerThreads {
+    /// The teardown both early exits share; see
+    /// [`teardown_container_threads`].
+    fn teardown(self, container_name: &str) -> TrajectorySummary {
+        teardown_container_threads(
+            container_name,
+            &self.watchdog_done,
+            self.watchdog_handle,
+            SamplerThread {
+                stop: &self.sampler_stop,
+                handle: self.sampler_handle,
+                bound: sampler_join_bound(),
+            },
+            &self.stop_flag,
+            self.tailer_handle,
+        )
+    }
+}
+
+/// Start the three threads that watch the container: the live trajectory
+/// tailer, the inactivity watchdog and the telemetry sampler, in that order.
+fn spawn_observers(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    run: &ContainerRun,
+    launched: &LaunchedContainer,
+    local_stop: &DispatchStop,
+) -> Result<(ObserverGuards, ContainerThreads)> {
+    let ContainerRun { brain, model, resolved_profile, host_out, unmanaged_endpoint_raw_label, .. } = run;
+    let LaunchedContainer { container_name, compaction, utility_model, unmanaged_compactor, .. } = launched;
+    let limits_pm = brain.limits_pm();
+    let session = &opts.session;
+    let phase_id = &opts.phase_id;
+    // (#1483) The mission-graph step this dispatch runs as (when it's a
+    // graph step). Stamped onto every live per-event flow record's payload
+    // so the viewer attributes the turn/tool/token climb to the seat card
+    // even when `session_id` isn't the `step-<id>` default (coder-phase's
+    // shared `mission-run-<…>` session). `None` for a non-graph dispatch.
+    let step_id = &opts.step_id;
 
     // 7. Live trajectory tailer (#231). Background thread polls
     //    `<host_out>/.darkmux-runtime/trajectory.jsonl` every 250ms while
@@ -7046,7 +7597,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // initial deadline. A dispatch making compactions every ~5-10 min
     // stays alive indefinitely (bounded by the other runtime caps).
     // (#2480) Host-side watchdog deadline — reuses the SAME resolved value
-    // forwarded into the container above (`DockerRunConfig.
+    // forwarded into the container (`DockerRunConfig.
     // inactivity_timeout_seconds`) rather than re-resolving, so both sides
     // can't disagree about the budget when `--timeout` overrides it.
     // (#2479 audit) `Instant`, deliberately, not a bug: this deadline
@@ -7058,34 +7609,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // process that was not running is not idle either). Converting this
     // to wall clock would fire the watchdog on a healthy dispatch the
     // instant the operator's laptop woke up from an afternoon nap.
-    let inactivity_secs = inactivity_timeout_seconds;
+    let inactivity_secs = launched.inactivity_timeout_seconds;
     let inactivity_deadline = Arc::new(Mutex::new(inactivity_deadline_after(inactivity_secs, Duration::ZERO)));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    // (#2925) This dispatch's own stop: see `DispatchStop`.
-    let local_stop = DispatchStop::new(container_name.clone());
-    // (#threshold) Effective compaction threshold the runtime triggers at:
-    // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
-    // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
-    // context telemetry so the viewer draws the trigger line.
-    // Both triggers can be set; the runtime's needs_compaction fires at whichever
-    // trips FIRST (min), so draw the effective earliest trigger — not just the
-    // absolute one. Fall back to ratio×window, then the 0.5×window default.
-    let abs_threshold = compaction.threshold_tokens;
-    let formula_threshold = compaction
-        .threshold_ratio
-        .zip(compaction.context_window)
-        .map(|(r, w)| (w as f32 * r) as u32);
-    let compaction_threshold = match (abs_threshold, formula_threshold) {
-        (Some(a), Some(f)) => Some(a.min(f)),
-        (a, f) => a
-            .or(f)
-            .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32)),
-    };
+    let compaction_threshold = effective_compaction_threshold(compaction);
     // (#2234) `_tailer_stop_guard` is armed the moment `spawn_guarded_tailer`
     // is called — see that function's own doc, and `StopFlagGuard`'s. Held
-    // to the natural end of this function's scope (never explicitly dropped
-    // early), so it backstops every panic between here and this function's
+    // to the natural end of the run (never explicitly dropped
+    // early), so it backstops every panic between here and the run's
     // return, including every line after the tailer thread itself is
     // spawned.
     let (_tailer_stop_guard, tailer_handle) = spawn_guarded_tailer(
@@ -7126,7 +7658,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // brain or not (the runtime never routes the compactor through the
         // hosted BRAIN's URL; `runtime/src/main.rs`, #1187), or (#3207) the
         // utility binding's own unmanaged endpoint.
-        Some(compactor_endpoint_for(&compaction, unmanaged_compactor.as_ref(), opts.model_base_url_override.as_deref())),
+        Some(compactor_endpoint_for(compaction, unmanaged_compactor.as_ref(), opts.model_base_url_override.as_deref())),
         // (#2928) The live channel, unless this dispatch opted out (the lab).
         live_sender_for(opts.live_channel),
         local_stop.clone(),
@@ -7163,10 +7695,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // ever ADD urgency, never suppress a kill.
     let watchdog_abandoned = local_stop.watchdog_handoff();
     // (#2232) What the persistent kill established, as a `KillDisposition`
-    // code. Read once, below, to decide what the timeout marker may claim —
-    // only `Confirmed` licenses "was killed by the watchdog".
+    // code. Read once, after the wait, to decide what the timeout marker may
+    // claim — only `Confirmed` licenses "was killed by the watchdog".
     //
-    // Initialized to `Unconfirmed`, not `Confirmed`: the read below is gated
+    // Initialized to `Unconfirmed`, not `Confirmed`: the read is gated
     // on `timeout_fired`, so today the watchdog has always stored a real
     // disposition before anything looks — but a watchdog that panicked
     // between setting that flag and reaching its store would leave the
@@ -7230,7 +7762,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         execution.clone(),
         model.clone(),
         // (#1934) This dispatch's own declared compactor/utility model ids,
-        // resolved earlier in this same function — threaded through so the
+        // resolved earlier in this same run — threaded through so the
         // sampler can tag each `telemetry.lms` load with the SEAT it
         // belongs to (`role_for_load`), rather than leaving the viewer to
         // guess from a bare model id which load was the primary and which
@@ -7252,185 +7784,99 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         pacer_for(limits_pm, opts.config_path.as_deref())?,
         local_stop.clone(),
     );
+    Ok((
+        ObserverGuards { _sampler_stop_guard, _watchdog_abandon_guard, _tailer_stop_guard },
+        ContainerThreads {
+            stop_flag,
+            tailer_handle,
+            timeout_fired,
+            watchdog_done,
+            kill_disposition,
+            watchdog_handle,
+            sampler_stop,
+            sampler_handle,
+        },
+    ))
+}
 
-    // (#2642) External, whole-`dispatch()`-level panic-injection hook for
-    // the process-survives thread-leak proof in
-    // `tests/dispatch_panic_thread_leak_proof.rs`. Gated on an env var so
-    // it is cold on every real operator dispatch — nobody sets this var
-    // by accident, the name says exactly what it does — but it is REAL,
-    // unconditional production code, not `#[cfg(test)]`: that integration
-    // test links this crate as an ordinary library dependency, which
-    // Cargo builds WITHOUT `cfg(test)` set, so a `#[cfg(test)]`-gated
-    // branch here would simply not exist in the binary the test actually
-    // calls into and would prove nothing.
-    //
-    // Lands HERE deliberately, not earlier and not later: every one of
-    // the three panic-safe `StopFlagGuard`s (`_tailer_stop_guard`,
-    // `_watchdog_abandon_guard`, `_sampler_stop_guard`) is armed and its
-    // real spawned thread is genuinely running by this point — panicking
-    // before any of them exist would prove nothing about guard behavior
-    // (no guard exists yet to catch it) — and NONE of `dispatch()`'s own
-    // explicit stop-and-join calls below (inside the `wait_with_output()`
-    // match arms) have run yet — panicking after one of those would only
-    // re-prove what the per-guard wiring tests in
-    // `dispatch_internal_tests.rs` already prove one function-call deep,
-    // not the whole-process property #2642 actually asks for.
+/// (#2642) External, whole-`dispatch()`-level panic-injection hook for
+/// the process-survives thread-leak proof in
+/// `tests/dispatch_panic_thread_leak_proof.rs`. Gated on an env var so
+/// it is cold on every real operator dispatch — nobody sets this var
+/// by accident, the name says exactly what it does — but it is REAL,
+/// unconditional production code, not `#[cfg(test)]`: that integration
+/// test links this crate as an ordinary library dependency, which
+/// Cargo builds WITHOUT `cfg(test)` set, so a `#[cfg(test)]`-gated
+/// branch here would simply not exist in the binary the test actually
+/// calls into and would prove nothing.
+///
+/// Called at one point deliberately, not earlier and not later: every one of
+/// the three panic-safe `StopFlagGuard`s (`_tailer_stop_guard`,
+/// `_watchdog_abandon_guard`, `_sampler_stop_guard`) is armed and its
+/// real spawned thread is genuinely running by then — panicking
+/// before any of them exist would prove nothing about guard behavior
+/// (no guard exists yet to catch it) — and NONE of `dispatch()`'s own
+/// explicit stop-and-join calls (after the `wait_with_output()`)
+/// have run yet — panicking after one of those would only
+/// re-prove what the per-guard wiring tests in
+/// `dispatch_internal_tests.rs` already prove one function-call deep,
+/// not the whole-process property #2642 actually asks for.
+fn panic_after_guard_spawn_if_asked() {
     if std::env::var_os("DARKMUX_TEST_PANIC_AFTER_GUARD_SPAWN").is_some() {
         panic!(
             "darkmux: #2642 test-injected panic between guard spawn and \
              dispatch()'s own stop-and-join calls"
         );
     }
+}
 
-    let output = match child.wait_with_output() {
-        Ok(o) => {
-            // (#2131 review round 2, F1) Deregister HERE — right after
-            // the child has been reaped — rather than letting
-            // `container_child_registration` live to the natural end of
-            // this function's scope. The ~280 lines of post-processing
-            // below (the interrupt check, envelope enrichment, the
-            // tailer/sampler joins) have no more use for this
-            // registration: the pid is dead the moment `wait_with_output`
-            // returns, and holding the registration open regardless just
-            // widens the window where the OS could recycle the pid
-            // number and a later `kill_all` would signal an unrelated
-            // process. The `Err` arm below doesn't need this — it
-            // returns immediately, and `container_child_registration`'s
-            // own `Drop` (RAII, from the spawn site) covers that exit
-            // path exactly the same way it covers every earlier `?`.
-            drop(container_child_registration);
-            o
-        }
-        Err(e) => {
-            // (#889) The wait itself failed — the container may still be
-            // running (orphaned). The bare `?` here used to return before
-            // signaling the watchdog or killing the container: the watchdog
-            // thread would linger to its inactivity deadline and fire a
-            // spurious kill, and a genuinely-orphaned container would run
-            // until that deadline (or forever, if hung). Do the same
-            // teardown the success path does — stop the watchdog + sampler
-            // threads — plus a best-effort `docker kill` by the
-            // deterministic container name, then surface the wait error.
-            //
-            // (#2131 review round 2, F5) The tailer gets the same teardown
-            // the success path gives it: signal it to stop and join it.
-            // Without this, a `wait_with_output` failure left the tailer
-            // thread leaked: its own loop only exits on `stop_flag` or a
-            // caught signal, neither of which this branch used to touch, so
-            // it polled `trajectory.jsonl` forever in the background.
-            let trajectory_summary = teardown_container_threads(
-                &container_name,
-                &watchdog_done,
-                watchdog_handle,
-                SamplerThread {
-                    stop: &sampler_stop,
-                    handle: sampler_handle,
-                    bound: sampler_join_bound(),
-                },
-                &stop_flag,
-                tailer_handle,
-            );
-            let err = anyhow::Error::from(e).context("waiting for darkmux-runtime container");
-            close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
-            // (#2131 review round 2, NEW-2) No explicit deregister here —
-            // `container_child_registration` (declared at the spawn
-            // site) deregisters on Drop, which fires when this early
-            // `return` unwinds the scope. See that guard's own doc for
-            // why an explicit call at every exit path was the wrong
-            // shape (a leaked registration on a future `?` return this
-            // function grows).
-            return Err(err);
-        }
-    };
-
-    // (#2233) Disarm ONLY on a proven-clean exit — and note this is the
-    // opposite of where the first version of this fix put it.
-    //
-    // `wait_with_output()` returning `Ok` does NOT mean the container
-    // exited; it means the docker CLI process did. A SIGKILL on the CLI's
-    // pid — which is the only signal `child_registry::kill_all` ever sends,
-    // at all four of its call sites — closes the pipes, returns `Ok` with a
-    // signal-killed status, and leaves the container `Up` under dockerd with
-    // its model still loaded. That is not speculation: the NEW-1 comment a
-    // few dozen lines below records it measured live (`docker ps` showed the
-    // container `Up` after `kill -9` on the CLI pid; `--rm` never fired).
-    //
-    // So a success status is the ONLY evidence the container actually
-    // finished, and it is the only case that disarms. Every non-success path
-    // leaves the guard armed, and its Drop is fire-and-forget
-    // (`docker_kill_by_name` discards both stdout and stderr, emits no flow
-    // record) — so on the paths that already kill (the `Err` arm above, the
-    // interrupt teardown below, the watchdog) it is a silent redundant kill
-    // of a container that is dead or dying. There is no path on which the
-    // status is non-success and the container should stay alive.
-    //
-    // The cost, stated plainly: a healthy dispatch still adds zero
-    // subprocesses; a failing one adds one `docker kill`. That buys the
-    // whole spawn-to-wait span being uniformly armed, with no line whose
-    // POSITION is load-bearing — which is what the previous placement got
-    // wrong, since it rested on the premise this comment just disproved.
-    if output.status.success() {
-        container_kill_guard.disarm();
+/// (#638) The container has exited — the session is no longer running.
+/// Stop the liveness heartbeat and DELete its key so the live view drops
+/// the session immediately, before the terminal record (which then renders
+/// it terminal). A crash that bypassed this path leaves the key to age out
+/// via TTL instead.
+fn stop_session_emitter(session_emitter: Option<darkmux_flow::session_presence::SessionEmitter>) {
+    if let Some(em) = session_emitter {
+        em.stop();
     }
+}
 
-    // (#2131 review round 2, NEW-1 / NEW-4) The trajectory tailer polls
-    // this SAME flag every poll tick and, on catching a signal, kills
-    // this dispatch's registered child pid (see the tailer loop's own
-    // comment) — which is the DOCKER CLI PROCESS, not the container.
-    // `docker run` in attached/foreground mode does not forward a
-    // SIGKILL to the container it's running (SIGKILL can't be caught or
-    // proxied at all, unlike SIGTERM); killing just the CLI unblocks
-    // THIS wait (its stdout/stderr pipes close when the process dies)
-    // but otherwise leaves the container running, orphaned under
-    // dockerd. Measured live: `docker ps` still showed the container
-    // `Up` after `kill -9` on the CLI's own pid; `--rm` never fired.
-    // (NEW-1) So: explicitly `docker kill` the container by its
-    // deterministic name here too — the SAME call the inactivity
-    // watchdog and the wait-error branch just above already make — so
-    // the error text below ("the container ... was killed") is actually
-    // true, not just a claim about the CLI wrapper.
-    //
-    // (NEW-4) Gated on `!output.status.success()` — `interrupt::is_set()`
-    // is STICKY (that module's own doc: "one flag, set once, never
-    // cleared"), so a signal that arrived at ANY point during this
-    // dispatch — including one this run had nothing to do with, or one
-    // that arrived in the race window right as the container was
-    // finishing cleanly on its own — would otherwise turn a genuinely
-    // CLEAN exit-0 result into a discarded "interrupted" error. Prefer
-    // the real result on a clean exit: fall through to normal envelope
-    // parsing below instead, and let the LAUNCHER decide what a
-    // signal-observed-but-clean-exit run means — its own guard already
-    // reads this same global flag independently.
-    if run_was_killed(&local_stop, output.status.success()) {
-        let trajectory_summary = teardown_container_threads(
-            &container_name,
-            &watchdog_done,
-            watchdog_handle,
-            SamplerThread {
-                stop: &sampler_stop,
-                handle: sampler_handle,
-                bound: sampler_join_bound(),
-            },
-            &stop_flag,
-            tailer_handle,
-        );
-        if let Some(em) = session_emitter {
-            em.stop();
-        }
-        // (#2131 review round 2, F1) `container_child_registration` is
-        // already deregistered by this point — this branch only runs
-        // after a SUCCESSFUL `wait_with_output`, which dropped it
-        // explicitly in the `Ok` arm above (the child is dead either
-        // way; there is nothing left to deregister here).
-        //
-        // (#2925) A stop scoped to this dispatch is reported as itself,
-        // not as a signal: the launcher reads the signal wording as "the
-        // whole run was interrupted", which a phase stop is not.
-        let err = killed_mid_run_error(&container_name, &local_stop);
-        close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
-        return Err(err);
-    }
+/// What a container that exited on its own left behind, once every thread
+/// watching it is stopped and joined.
+struct ContainerOutcome {
+    wall_ms: u64,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    trajectory_summary: TrajectorySummary,
+    host_stats: HostStats,
+    host_extras: HostExtras,
+    thermal_ladder_summary: Option<crate::thermal_governor::ThermalLadderSummary>,
+}
 
+/// After a natural exit: stop and join the watchdog, then the sampler, stop
+/// the heartbeat, read the container's output, then stop and join the
+/// tailer for its final flush.
+fn collect_container_outcome(
+    threads: ContainerThreads,
+    session_emitter: Option<darkmux_flow::session_presence::SessionEmitter>,
+    output: std::process::Output,
+    dispatch_start_instant: Instant,
+    host_out: &Path,
+    container_name: &str,
+    inactivity: (u64, InactivityBudgetSource),
+) -> ContainerOutcome {
+    let (inactivity_secs, inactivity_timeout_seconds_source) = inactivity;
+    let ContainerThreads {
+        stop_flag,
+        tailer_handle,
+        timeout_fired,
+        watchdog_done,
+        kill_disposition,
+        watchdog_handle,
+        sampler_stop,
+        sampler_handle,
+    } = threads;
     // Tell the watchdog we're done so it doesn't fire spuriously after
     // a natural exit. Best-effort join (it's a kill-only thread —
     // panic-resilience isn't load-bearing).
@@ -7452,14 +7898,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // is already `Option`.
     let (host_stats, host_extras, thermal_ladder_summary) = join_sampler(sampler_handle, sampler_join_bound());
 
-    // (#638) The container has exited — the session is no longer running.
-    // Stop the liveness heartbeat and DELete its key so the live view drops
-    // the session immediately, before the dispatch.complete record below
-    // (which then renders it terminal). A crash that bypassed this path
-    // leaves the key to age out via TTL instead.
-    if let Some(em) = session_emitter {
-        em.stop();
-    }
+    stop_session_emitter(session_emitter);
 
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
@@ -7479,7 +7918,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // side pass: the runtime's own test asserts the container path and is
     // correct to. Translation belongs to whoever owns the boundary, and the
     // host is the only party that knows both views.
-    let stdout = rewrite_container_paths_for_host(stdout, &host_out);
+    let stdout = rewrite_container_paths_for_host(stdout, host_out);
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // (#363) If the watchdog fired, prepend a structured timeout
@@ -7493,7 +7932,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // so `kill_disposition` is final — and it decides whether this text
         // may claim the container was killed.
         stderr = inactivity_timeout_stderr(
-            &container_name,
+            container_name,
             inactivity_secs,
             // (#2480 review, finding 5) The SAME resolved pair the container
             // and the watchdog ran on — so the remedy sentence names the knob
@@ -7512,19 +7951,54 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let trajectory_summary = tailer_handle
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
+    ContainerOutcome {
+        wall_ms,
+        exit_code,
+        stdout,
+        stderr,
+        trajectory_summary,
+        host_stats,
+        host_extras,
+        thermal_ladder_summary,
+    }
+}
 
+/// The clean end of a container run: enrich the envelope, write the
+/// terminal record through the bookend guard, keep the workspace, complete
+/// the execution, and emit the runtime-turns telemetry.
+fn close_container_run(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    run: &mut ContainerRun,
+    bookend: &mut DispatchBookendGuard<'_>,
+    outcome: ContainerOutcome,
+) -> Result<DispatchResult> {
+    let ContainerOutcome {
+        wall_ms,
+        exit_code,
+        stdout,
+        stderr,
+        trajectory_summary,
+        host_stats,
+        host_extras,
+        thermal_ladder_summary,
+    } = outcome;
+    let session = &opts.session;
+    let phase_id = &opts.phase_id;
+    let model = &run.model;
+    let host_out = &run.host_out;
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let bounds = resolved_runtime_bounds(agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?;
+    let bounds = resolved_runtime_bounds(run.brain.agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?;
     let stdout = runtime_stdout_for_caller(opts.json, stdout, |stdout| {
         enrich_envelope_with_summary(
             stdout,
-            &model,
+            model,
             &trajectory_summary,
             &host_stats,
             &host_extras,
-            &host_out,
+            host_out,
             bounds,
             thermal_ladder_summary,
         )
@@ -7545,36 +8019,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &stderr,
         exit_code,
         &trajectory_summary,
-        unmanaged_endpoint_raw_label.as_deref(),
+        run.unmanaged_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
         opts.resume_from.as_deref(),
         thermal_ladder_summary,
     );
     let (mut dispatch_complete_payload, level) = terminal_payload(exit_code, dispatch_complete_payload);
-    // (#1959) Same provenance merge as `dispatch_start_payload` above.
+    // (#1959) Same provenance merge as `dispatch_start_payload`.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     // (#717, #1230 Packet 0) Emit the terminal record through the bookend
     // guard's `close()` — this both writes the record and disarms the
     // guard, so it never emits a second terminal on the function's normal
     // return (clean complete, or the container-ran-but-failed
-    // `dispatch.error` above are both covered the same way).
+    // `dispatch.error` are both covered the same way).
     bookend.close(crate::dispatch::build_dispatch_record(
         level,
         &opts.role_id,
-        &session,
-        &execution,
-        Some(&model),
+        session,
+        execution,
+        Some(model),
         phase_id.as_deref(),
         dispatch_complete_payload,
     ));
     // (#888) The container ran to its terminal record — retain the auto
     // workspace for inspection (status quo). Only error/panic exits BEFORE
     // this point reclaim it.
-    workspace_cleanup.disarm();
+    run.workspace_cleanup.disarm();
     // A clean exit completes the execution: a resume of this out-dir, or of
     // the one this resumed, is refused from here on.
-    complete_execution_on_success(exit_code, &host_out, opts.resume_from.as_deref());
+    complete_execution_on_success(exit_code, host_out, opts.resume_from.as_deref());
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the
@@ -7585,9 +8059,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         darkmux_flow::Level::Info,
         darkmux_flow::FlowSource::Runtime,
         &opts.role_id,
-        &session,
-        &execution,
-        Some(&model),
+        session,
+        execution,
+        Some(model),
         phase_id.as_deref(),
         darkmux_flow::Payload::TelemetryRuntime(TelemetryRuntimePayload {
             turns: trajectory_summary.fold.turns() as u64,
@@ -7608,13 +8082,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         exit_code,
         stdout,
         stderr,
-        session_id: session,
-        execution: Some(execution),
+        session_id: session.clone(),
+        execution: Some(execution.clone()),
         // Host path where the runtime's `.darkmux-runtime/` bookkeeping
         // landed (mounted at `/darkmux-out` in the container). Callers
         // that keep the run's artifacts (coding_task) copy them out of it
         // with the contained copier; counts come from `trajectory` below.
-        out_dir: Some(host_out),
+        out_dir: Some(host_out.clone()),
         trajectory: Some(trajectory_summary.fold),
     })
 }
@@ -9217,32 +9691,707 @@ fn run_telemetry_sampler(
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
-    mut budget_pacer: Option<crate::budget::BudgetPacer>,
+    budget_pacer: Option<crate::budget::BudgetPacer>,
     // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
     local_stop: DispatchStop,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
+    let records = SamplerRecords { role_id, session, execution, model, phase_id, record_context };
+    let mut sampler = DispatchSampler::start(
+        &records,
+        [compactor_model, utility_model],
+        host_out,
+        thermal_config,
+        budget_pacer,
+        local_stop,
+    );
+    while !stop_flag.load(Ordering::SeqCst) {
+        sampler.tick(&records);
+        // Teardown mid-interval: return what was observed, never a
+        // default. A killed or short dispatch still has real stats.
+        if nap_until_stopped(&stop_flag) {
+            break;
+        }
+    }
+    sampler.finish()
+}
+
+/// Wait out the sample interval, but poll the stop flag every
+/// `SAMPLER_POLL_INTERVAL` so teardown after `wait_with_output()`
+/// is prompt (≤500ms) rather than blocking for a full 2s tick.
+/// `true` when the stop flag was seen set before the interval ran out.
+fn nap_until_stopped(stop_flag: &AtomicBool) -> bool {
+    let mut slept = Duration::ZERO;
+    while slept < TELEMETRY_SAMPLE_INTERVAL {
+        if stop_flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
+        thread::sleep(nap);
+        slept += nap;
+    }
+    false
+}
+
+/// Who the sampler's records are about: this dispatch's identity, and the
+/// crawl's provenance when it is a crawl unit.
+struct SamplerRecords {
+    role_id: String,
+    session: SessionId,
+    execution: ExecutionId,
+    model: String,
+    phase_id: Option<String>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
+}
+
+impl SamplerRecords {
+    /// (#2774 tiers 2/4) A governor's `dispatch.rest` decision, plus the
+    /// per-tier extras: the duty-cycle events want to carry `delay_ms`, the
+    /// tier-4 hold wants `episode`, and neither deserves a bespoke one-off
+    /// closure. `level` is explicit (not always `Info`) because tier 4's hold
+    /// is operator-actionable, not routine pacing telemetry.
+    fn emit_rest_with_extra(&self, level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: RestExtra) {
+        let mut payload = darkmux_flow::Payload::DispatchRest(DispatchRestPayload {
+            reason: Some(reason.to_string()),
+            state: Some(state.to_string()),
+            pause: Some(pause),
+            delay_ms: extra.delay_ms,
+            episode: extra.episode,
+            checklist: extra.checklist,
+            resume_hint: extra.resume_hint,
+            ..Default::default()
+        });
+        // (#2779) `simulated_host_source` when — and only when — this
+        // decision was made on scenario readings. Absent on a real run, so
+        // its PRESENCE alone answers "were these readings real".
+        crate::host_source::stamp(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
+            level,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+
+    fn emit_rest(&self, reason: &str, state: &str, pause: bool) {
+        self.emit_rest_with_extra(darkmux_flow::Level::Info, reason, state, pause, RestExtra::default());
+    }
+
+    fn emit(&self, source: darkmux_flow::FlowSource, payload: darkmux_flow::Payload) {
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            source,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+
+    /// An operator-actionable gap, not routine telemetry: a `Warn` record,
+    /// through `merge_record_context` so the crawl's own identifying fields
+    /// (unit, source, sha, rule) ride along, same as `emit_rest`.
+    fn emit_warning(&self, source: darkmux_flow::FlowSource, mut payload: darkmux_flow::Payload) {
+        merge_record_context(&mut payload, &self.record_context);
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Warn,
+            source,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+}
+
+/// The dispatch-side telemetry sampler's state between ticks.
+struct DispatchSampler {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
     // `SystemTime`.
-    let started = Instant::now();
-    let mut raw: Vec<HostSampleAt> = Vec::new();
+    started: Instant,
+    raw: Vec<HostSampleAt>,
     // (#2108) The power/thermal half of the same series, reduced by
     // `reduce_host_extras` at the end exactly as `raw` is by
     // `reduce_host_stats`. Kept as a SECOND list rather than widening
     // `HostSampleAt` so the cpu/mem/gpu reduction the envelope has emitted
     // since #2107 stays byte-identical.
-    let mut extras: Vec<HostExtraAt> = Vec::new();
+    extras: Vec<HostExtraAt>,
+    // Field order is drop order: the sampler lock is released before the
+    // probe is dropped, as when both were this thread's own locals.
+    // (#2413) See `DispatchSampler::start`.
+    sampler_lock: Option<crate::host_sampler_lock::SamplerLockGuard>,
     // A probe PRIVATE to this dispatch: `cpu_pct` and every power rail are
     // counter deltas, so a probe of our own gives deltas that line up with
     // this sampler's own 2s cadence rather than with whoever sampled last.
     // Construction is ~80-100ms once; each sample is ~5-10ms.
-    let mut probe = crate::host_probe::HostProbe::new();
-    // (N6 of the #2110/#2109 review) Clear any pace.json already sitting
-    // in this out-dir BEFORE the sampler's first tick — see
-    // `clear_stale_pace_file`'s own doc for why.
-    clear_stale_pace_file(&host_out);
-    // (#2110/#2109) The thermal governor/breaker — see its module doc.
+    probe: crate::host_probe::HostProbe,
+    host_out: PathBuf,
+    thermal_stop_file: Option<PathBuf>,
+    // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
+    // looked crawl-shaped but the STOP path came back `None` because
+    // derivation failed (not because this simply isn't a crawl dispatch) —
+    // see `stop_file_unresolved_reason`'s own doc for the distinction.
+    thermal_stop_unresolved_reason: Option<&'static str>,
+    governors: crate::governor_tick::GovernorPair,
+    // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
+    // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
+    budget_pacer: Option<crate::budget::BudgetPacer>,
+    // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
+    local_stop: DispatchStop,
+    machine_sampler_interval_ms: u64,
+    // (#2413 review finding) The MEASURED write duration of the PREVIOUS
+    // `machine.telemetry` emission — `None` until the first one has
+    // happened. A record cannot honestly report its OWN write cost (the
+    // write hasn't happened yet when the payload is built), so this stamps
+    // last time's measured cost instead of a build-only proxy mislabeled
+    // as "the write".
+    prev_record_write_ms: Option<u64>,
+    // (#2413 M2, review round 2) `at_ms` of the last `machine.telemetry`
+    // EMISSION (not heartbeat) — feeds `telemetry_emission_due` so the
+    // curve honors `machine_sampler_interval_ms` instead of the 2s outer
+    // loop tick. `None` before the first emission.
+    last_telemetry_emit_at_ms: Option<u64>,
+    // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
+    // all moved into `LmsTelemetryTracker` — see its doc for why the state
+    // machine lives behind an injected-effect seam instead of inline here.
+    lms_tracker: LmsTelemetryTracker,
+    // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
+    // last thermal sample — NOT a hardcoded per-tick constant. A tick can
+    // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
+    // `lms list_loaded()` call can stall up to ~30s), and the whole
+    // process can sleep/suspend between ticks — feeding a fixed 2000ms in
+    // either case would under-report real elapsed time to the governor's
+    // hysteresis/max-pause/heartbeat accounting, which could let a
+    // thermal-critical pause's written_at_ms go stale past what the
+    // runtime's own ceiling honors. `0` on the very first tick is correct
+    // (there is no "last sample" yet).
+    prev_thermal_at_ms: u64,
+}
+
+impl DispatchSampler {
+    /// Everything the sampler sets up before its first tick, in the order
+    /// it always ran: the probe, the stale pace file, the thermal governor
+    /// and its start warnings, the STOP path, the battery governor, the
+    /// host source's warning, and the machine sampler lock.
+    fn start(
+        records: &SamplerRecords,
+        utility_ids: [Option<String>; 2],
+        host_out: PathBuf,
+        thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+        budget_pacer: Option<crate::budget::BudgetPacer>,
+        local_stop: DispatchStop,
+    ) -> Self {
+        let started = Instant::now();
+        let probe = crate::host_probe::HostProbe::new();
+        // (N6 of the #2110/#2109 review) Clear any pace.json already sitting
+        // in this out-dir BEFORE the sampler's first tick — see
+        // `clear_stale_pace_file`'s own doc for why.
+        clear_stale_pace_file(&host_out);
+        let record_context = records.record_context.as_ref();
+        let thermal_governor = start_thermal_governor(thermal_config, &records.session, record_context);
+        let thermal_stop_file = crate::thermal_governor::stop_file_path_from_record_context(record_context);
+        let thermal_stop_unresolved_reason = crate::thermal_governor::stop_file_unresolved_reason(record_context);
+        // (#2706) The battery governor rides this SAME tick — the probe
+        // already reads `sample.battery` every 2s, so no separate poller is
+        // needed, exactly as the thermal governor rides the thermal half.
+        //
+        // `pause_supported(true)`: this sampler exists only on the
+        // CONTAINER-backed dispatch path (its caller `spawn_guarded_sampler`
+        // is reached after a `child` is spawned), whose pause is an in-memory
+        // rest at a turn boundary — `runtime/src/pace.rs`'s bounded ≤2s poll
+        // loop, which keeps the whole conversation in memory and continues
+        // from exactly where it rested. That run type CAN be resumed, so it
+        // is allowed to pause. A run type that could not would pass `false`
+        // and get `BatteryEvent::PauseUnsupported` instead of a park it could
+        // not leave.
+        let battery_governor =
+            crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
+        // (#2779) The two governors tick THROUGH the shared seam, not as two
+        // inline calls here. The order, the `is_pausing` gate and the one-clock
+        // rule live in `governor_tick::GovernorPair::tick` so a scenario test
+        // proves the REAL wiring rather than a reimplementation of it — see
+        // that module's doc for the F1 inversion it exists to keep proven.
+        let governors = crate::governor_tick::GovernorPair::new(thermal_governor, battery_governor);
+        // (#2779) A simulated host source is never silent. Same surface and
+        // same shape as the ladder's disarm notes, rendered off
+        // `host_source::provenance()` so doctor and the dispatch cannot
+        // disagree about what is driving the readings.
+        if let Some(warning) = crate::host_source::provenance().warning() {
+            eprintln!("darkmux: ⚠ host source — {warning}");
+        }
+        // (#2413) This dispatch is, by definition, LIVE for as long as this
+        // sampler thread runs — so if it becomes the machine's singleton host
+        // sampler, it always emits at the base `host_sampler_interval_ms()`
+        // cadence (never the daemon's idle 10x backoff, which exists only
+        // because the DAEMON runs when nothing may be live). `try_acquire`
+        // returns `None` when a daemon (or another dispatch) already holds a
+        // fresh lock — in that case this dispatch emits NO `machine.telemetry`
+        // records at all, matching the rule "at most one emitter per machine."
+        // The guard lives in the sampler's state: RAII releases it on every
+        // exit from `run_telemetry_sampler` (normal return, a stop seen
+        // mid-interval, or a panic-unwind through it), same lifecycle
+        // contract as every other bookend guard in this codebase.
+        let machine_sampler_interval_ms = darkmux_types::config_access::host_sampler_interval_ms();
+        let sampler_lock = if machine_sampler_interval_ms > 0 {
+            crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms)
+        } else {
+            None
+        };
+        // (#2914) One utility seat, under every id this dispatch declared for
+        // it: the compactor's resolved wire id and the binding (normally the same
+        // model; a pinned compactor that differs still shares the seat).
+        let lms_tracker = LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect());
+        Self {
+            started,
+            raw: Vec::new(),
+            extras: Vec::new(),
+            sampler_lock,
+            probe,
+            host_out,
+            thermal_stop_file,
+            thermal_stop_unresolved_reason,
+            governors,
+            budget_pacer,
+            local_stop,
+            machine_sampler_interval_ms,
+            prev_record_write_ms: None,
+            last_telemetry_emit_at_ms: None,
+            lms_tracker,
+            prev_thermal_at_ms: 0,
+        }
+    }
+
+    /// One tick: the lms deltas, one host reading, what the governors and
+    /// the budget pacer decide on it, the reading recorded for the
+    /// reduction, and the machine-scoped curve.
+    fn tick(&mut self, records: &SamplerRecords) {
+        // lms load/unload deltas — the seed/diff rule, the `role`/`baseline`
+        // tagging, and the skip-on-failed-probe behavior all live in
+        // `LmsTelemetryTracker::tick` so they are unit-testable without a
+        // live `lms` or a live flow sink. Nothing but the wiring is here.
+        self.lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
+            records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
+        });
+
+        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
+        // per-cluster frequency, power and thermal state the same probe
+        // reads for free. Inference runs in LMStudio (off-container), so the
+        // load worth watching is the HOST's, not the runtime container's
+        // (which idles waiting on the model and reads ~0 — the
+        // wrong-question problem, #814/#1064). Each read is best-effort and
+        // unprivileged; a tick emits whichever fields succeed.
+        let sample = self.probe.sample();
+        let at_ms = self.started.elapsed().as_millis() as u64;
+        // (N1 of the #2110/#2109 review) REAL elapsed since the last
+        // thermal tick, not TELEMETRY_SAMPLE_INTERVAL_MS — see
+        // `prev_thermal_at_ms`'s own doc for why the constant was
+        // wrong. `saturating_sub` on two `started.elapsed()` reads is
+        // monotonic (never underflows) regardless of how long this
+        // iteration's earlier work (the lms diff above) took.
+        let thermal_elapsed_ms = at_ms.saturating_sub(self.prev_thermal_at_ms);
+        self.prev_thermal_at_ms = at_ms;
+        // (#2779) BOTH governors decide here, through the shared seam — the
+        // order, the `is_pausing` gate and the one-clock rule are the
+        // seam's, not this loop's. This loop reports what they decided.
+        let tick_events = self.governors.tick(
+            &crate::host_source::HostReading {
+                thermal: sample.thermal.clone(),
+                battery: sample.battery,
+            },
+            thermal_elapsed_ms,
+            &self.host_out,
+            self.thermal_stop_file.as_deref(),
+        );
+        // Every state change (pause/resume/breaker) is a
+        // `dispatch.rest`-family flow record, so a slowed or stopped run
+        // is attributable on the flow stream.
+        if let Some(event) = tick_events.thermal {
+            self.on_thermal_event(records, event);
+        }
+        // (#2706) The battery governor's decision for this tick — made in
+        // `governors.tick` above, fed the SAME reading and the SAME
+        // measured `thermal_elapsed_ms` the thermal governor got (one
+        // clock, so their heartbeat accounting can never disagree), and
+        // gated on the thermal governor's POST-decision `is_pausing`.
+        //
+        // (#2774 review F1 / #2779) That gate is deliberately `is_pausing`,
+        // NOT `is_pacing` — and it now lives in
+        // `governor_tick::GovernorPair::tick` rather than inline here, so
+        // a scenario test can prove it. See that module's doc for what the
+        // `is_pacing` version cost: a live battery-critical pause rewritten
+        // to `pause: false` for the whole duration of a duty-cycle episode,
+        // the run still working, the battery still draining.
+        //
+        // A machine with NO battery decides nothing at all: `sample.battery`
+        // is `None` on a desktop, and the governor's first act is to return
+        // on that — before any config read, threshold comparison or file
+        // write.
+        if let Some(event) = tick_events.battery {
+            on_battery_event(records, event);
+        }
+        self.pace_budget(records, thermal_elapsed_ms);
+        self.record_host_sample(at_ms, &sample);
+        self.machine_telemetry_tick(at_ms, &sample);
+    }
+
+    fn on_thermal_event(&self, records: &SamplerRecords, event: crate::thermal_governor::ThermalEvent) {
+        match event {
+            crate::thermal_governor::ThermalEvent::Paused { state } => {
+                records.emit_rest("thermal", &state, true);
+            }
+            crate::thermal_governor::ThermalEvent::Resumed { state } => {
+                records.emit_rest("thermal", &state, false);
+            }
+            crate::thermal_governor::ThermalEvent::Breaker { state } => {
+                self.on_thermal_breaker(records, &state);
+            }
+            crate::thermal_governor::ThermalEvent::DutyCycleEntered { state, delay_ms } => {
+                // (#2774 tier 2) `pause: false` — this is NOT a rest
+                // the run stops for; it is the duty-cycle instruction
+                // itself. `delay_ms` rides the SAME `dispatch.rest`
+                // record family so a reader watching that one action
+                // string sees every pacing decision, tier 2 included.
+                records.emit_rest_with_extra(
+                    darkmux_flow::Level::Info,
+                    "thermal-duty-cycle",
+                    &state,
+                    false,
+                    RestExtra { delay_ms: Some(delay_ms), ..Default::default() },
+                );
+            }
+            crate::thermal_governor::ThermalEvent::DutyCycleExited { state } => {
+                records.emit_rest("thermal-duty-cycle", &state, false);
+            }
+            crate::thermal_governor::ThermalEvent::OperatorHold { state, episode } => {
+                self.hold_for_operator(records, &state, episode);
+            }
+        }
+    }
+
+    fn on_thermal_breaker(&self, records: &SamplerRecords, state: &str) {
+        records.emit_rest("thermal-critical", state, true);
+        // (#2110/#2109 review finding 5, widened by #2456) Two
+        // DISTINCT ways the breaker can fail to stop a crawl,
+        // both surfaced through the same warning shape because
+        // from the operator's point of view they mean the
+        // same thing — "the breaker tried and could not write
+        // a STOP" — and both must be LOUD, never a silent
+        // no-op that lets the crawl keep dispatching units
+        // past a tripped breaker with no trace of why:
+        //
+        // - No trustworthy STOP path could even be DERIVED
+        //   (finding 5's original case — never write one at a
+        //   guessed path).
+        // - A path WAS derived, but the write itself was
+        //   REFUSED (#2456 — a symlink was sitting at the path
+        //   or its parent).
+        //
+        // The two are DISTINGUISHABLE in the record — `cause`
+        // is `"path_underivable"` vs `"write_refused"` — because
+        // the remedies differ sharply: the first is a crawl
+        // `record_context` bug, the second means something is
+        // sitting at the STOP path as a symlink and wants an
+        // operator to go LOOK. The selection lives in
+        // `thermal_governor::stop_unresolved_cause` (a pure,
+        // unit-tested function) rather than inline here: this
+        // sampler runs on its own thread inside a live dispatch
+        // and no test reaches it, so an inline version was
+        // pinned by nothing.
+        self.warn_stop_unresolved(records, state);
+        // (#2774 tier 5) A literal `critical` OS thermal state
+        // — not the speed-limit-sustained trigger, and not the
+        // pre-existing max-pause-exceeded-while-paused
+        // escalation, both of which also reach this arm — gets
+        // the operator's own "hard stop plus eject" treatment
+        // on top of the breaker's existing pause+STOP-file
+        // behavior. Scoped to the literal state name (the
+        // issue's own condition), deliberately NOT widened to
+        // the speed-limit trigger: that one is a proxy signal,
+        // this is the hardware's own worst-case report.
+        //
+        // (#2774 review C6) **What "hard stop" reaches, stated
+        // exactly:** THIS dispatch (the pace file pauses it)
+        // and, if this is a crawl unit, that crawl's remaining
+        // units (the STOP file the breaker wrote).
+        // Plus every `darkmux:`-namespaced resident on
+        // this host, which the eject below releases. It does
+        // NOT reach other concurrent dispatches, other
+        // missions, or the fleet: a MACHINE-WIDE thermal
+        // broadcast is #2774's open half and is not built.
+        // An earlier wording here said "no question asked,"
+        // which read as a claim about scope it never had.
+        if state == "critical" {
+            let trip_wall = SystemTime::now();
+            tier5_eject_on_critical(&self.host_out, trip_wall, &|payload| {
+                records.emit(darkmux_flow::FlowSource::Thermal, payload)
+            });
+        }
+    }
+
+    /// (#2774 tier 4) The episode-limit hold: told to the operator on
+    /// stderr and in a `Warn` rest record, then the same STOP warning the
+    /// breaker gives.
+    fn hold_for_operator(&self, records: &SamplerRecords, state: &str, episode: u32) {
+        // (#2774 tier 4) LOUD and operator-actionable, never a
+        // diagnosis (CLAUDE.md: darkmux describes, never
+        // adjudicates) — the checklist names things to CHECK,
+        // it does not assert what is wrong. `resume_hint` names
+        // the concrete, already-wired mechanism
+        // (`--resume-from`, #2114 follow-up) rather than
+        // leaving the operator to guess how to continue.
+        let checklist = "worth checking: ambient temperature / air conditioning, an external \
+             fan or active cooling on this machine, proximity to other hot machines, and \
+             airflow obstruction";
+        // (#2774 review F2) Built from this dispatch's OWN
+        // the host-only origin record — the same file the resume gate
+        // reads — so the command the operator pastes is one
+        // darkmux accepts. The earlier bare
+        // `--resume-from <dir>` form was refused by
+        // `validate_resume_checkpoint` for every dispatch; see
+        // `resume_hint_from_origin`'s own doc.
+        let resume_hint =
+            resume_hint_from_origin(&self.host_out, &records.role_id);
+        // (#2774 round-3 C9) "this mission", not "this run":
+        // F5 made the episode count MISSION-scoped (seeded
+        // across dispatches from the ladder-state file), so a
+        // unit whose own governor saw exactly one episode
+        // legitimately prints "2 time(s)". The old wording made
+        // that read as a bug in the count.
+        eprintln!(
+            "darkmux: this machine reached `serious` {episode} time(s) this mission — \
+             pausing indefinitely, no further turns until you say to. {checklist}. \
+             To continue: {resume_hint}"
+        );
+        records.emit_rest_with_extra(
+            darkmux_flow::Level::Warn,
+            "thermal-episode-limit",
+            state,
+            true,
+            RestExtra {
+                episode: Some(u64::from(episode)),
+                checklist: Some(checklist.to_string()),
+                resume_hint: Some(resume_hint),
+                ..Default::default()
+            },
+        );
+        // (#2774 tier 4) Tier 4 also drops the crawl's STOP
+        // file (see `enter_paused`'s own doc) — same
+        // "the breaker tried and could not stop the crawl"
+        // warning shape the Breaker arm uses, reused
+        // rather than re-derived, since both mean the same
+        // thing to an operator reading the flow stream.
+        self.warn_stop_unresolved(records, state);
+    }
+
+    /// (N3, final re-check) The breaker (or the tier-4 hold) could not stop
+    /// the crawl: say why, as a `Warn` — this is an operator-actionable gap,
+    /// not routine telemetry.
+    fn warn_stop_unresolved(&self, records: &SamplerRecords, state: &str) {
+        let unresolved = crate::thermal_governor::stop_unresolved_cause(
+            self.thermal_stop_file.as_deref(),
+            self.thermal_stop_unresolved_reason,
+            self.governors.thermal.last_stop_write_error(),
+        );
+        if let Some((cause, reason)) = unresolved {
+            let payload = thermal_stop_unresolved_payload(
+                cause.as_str(),
+                reason,
+                state,
+                crate::host_source::provenance(),
+            );
+            records.emit_warning(darkmux_flow::FlowSource::Thermal, payload);
+        }
+    }
+
+    /// (#2902 step 5) The endpoint budget of an agentic-remote brain,
+    /// whose calls the runtime makes inside the container: under `wait`
+    /// a full window pauses the runtime between turns through the pace
+    /// file (reason `budget`), yielding to a thermal or battery pause
+    /// that already holds it. Decided AFTER both governors, so it reads
+    /// their post-decision state; reported as `dispatch.rest` like theirs.
+    fn pace_budget(&mut self, records: &SamplerRecords, thermal_elapsed_ms: u64) {
+        let Some(pacer) = self.budget_pacer.as_mut() else { return };
+        let others = self.governors.other_pacing();
+        let caller = crate::budget::BudgetCaller {
+            role_id: Some(&records.role_id),
+            session: &records.session,
+            execution: &records.execution,
+            model: Some(&records.model),
+            phase_id: records.phase_id.as_deref(),
+            profiles_file: None,
+        };
+        let event =
+            crate::budget::with_env(|env| pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env));
+        match event {
+            Some(crate::budget::PacerEvent::Paused { state }) => {
+                records.emit_rest(crate::budget::PACE_REASON, &state, true)
+            }
+            Some(crate::budget::PacerEvent::Resumed { state }) => {
+                records.emit_rest(crate::budget::PACE_REASON, &state, false)
+            }
+            Some(crate::budget::PacerEvent::Stopped { reason }) => {
+                // (#2902 step 5 review MF1) The run was stopped while the
+                // pacer held it (`mission abort` writes only terminal state;
+                // this is where it reaches a paused container). End it
+                // the way an interrupt does, for THIS dispatch only (#2925): the
+                // tailer kills this container on the stop, and the launcher
+                // takes its abort path. The process-global interrupt flag is
+                // not touched: it would end every other phase's dispatch. The
+                // pace file still says pause, so no turn goes out first.
+                self.local_stop.request(reason);
+            }
+            None => {}
+        }
+    }
+
+    /// Keep the tick's readings for the end-of-run reduction.
+    fn record_host_sample(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        // (#2107) Record the raw reading, timestamped against this
+        // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
+        // pure fold over `raw` computed once at the end
+        // (`reduce_host_stats`) — this loop's only job is to capture
+        // what was observed, not to fold it live, so the reduction
+        // logic has exactly one implementation, shared with the unit
+        // tests that drive it directly.
+        self.raw.extend(host_sample_at(at_ms, sample));
+        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
+        // all failed: a tick that read power but not utilization is still a
+        // power measurement, and `reduce_host_extras` skips the `None`s
+        // rather than zeroing them. Deliberately NOT emitted as a flow
+        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
+        // viewer contract, and widening it is a schema change with no
+        // consumer yet; the reduction reaches the envelope instead.
+        self.extras.extend(host_extra_at(at_ms, sample));
+    }
+
+    /// (#2413) The machine-scoped `machine.telemetry` curve — emitted
+    /// ONLY when this dispatch is the machine's singleton host sampler
+    /// (no daemon, and no other dispatch, currently holds the lock).
+    /// Every tick, never every Nth: unlike the retired per-dispatch
+    /// curve, a dispatch-owned sampler exists only because a dispatch
+    /// (itself) is live, so there is no idle backoff to apply here —
+    /// that only makes sense for the DAEMON's sampler (see
+    /// `darkmux-serve::host_sampler`), which keeps running when nothing
+    /// is live. `heartbeat` returning `false` means another process won
+    /// a steal race; drop the guard so this loop stops trying (and lets
+    /// whoever won be the sole emitter, per the "at most one" rule).
+    fn machine_telemetry_tick(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        if let Some(guard) = self.sampler_lock.as_ref() {
+            if guard.heartbeat(self.machine_sampler_interval_ms) {
+                self.emit_machine_telemetry(at_ms, sample);
+            } else {
+                self.sampler_lock = None;
+            }
+        } else if self.machine_sampler_interval_ms > 0 {
+            // (#2413 C1) Retry every tick even after failing (or never
+            // holding) the lock — a file read every `TELEMETRY_SAMPLE_
+            // INTERVAL_MS` (2s) is cheap, and it means a live dispatch
+            // takes over the machine's sampler role as soon as whoever
+            // held it (typically the daemon) dies mid-run, instead of the
+            // machine going emitter-less until this dispatch happens to
+            // restart. `0` (disabled) never retries, matching the initial
+            // acquire's own `> 0` gate.
+            // (#2413 C2, and round 3 MF1) This is the SAME "opportunistic,
+            // usually-declined" shape as the daemon's own per-tick retry
+            // (see `darkmux-serve::host_sampler`'s identical comment) —
+            // `try_acquire` never records a routine decline as contention
+            // (the channel is retired; see `host_sampler_lock`'s module
+            // doc), so this call is exactly as quiet as the initial
+            // acquire.
+            self.sampler_lock = crate::host_sampler_lock::try_acquire("dispatch", self.machine_sampler_interval_ms);
+            if self.sampler_lock.is_some() {
+                // Fresh acquisition: the next tick's heartbeat branch
+                // above will find `last_telemetry_emit_at_ms` still
+                // reflecting whatever it was before (`None` at dispatch
+                // start, or a stale past value if we previously held and
+                // lost the lock) — either way `telemetry_emission_due`
+                // treats a `None` as always-due, and a stale `Some` from
+                // long before `at_ms` also reads as due, so the newly
+                // reacquired sampler emits promptly rather than waiting a
+                // full stale interval.
+                self.last_telemetry_emit_at_ms = None;
+            }
+        }
+    }
+
+    /// One `machine.telemetry` emission, when one is due.
+    fn emit_machine_telemetry(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        // (#2413 M2 / round 3 MF2) The outer loop ticks every
+        // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
+        // diffs and thermal governor, which want fine-grained
+        // sampling, but wrong for the `machine.telemetry` curve,
+        // which must honor the operator's `host_sampler_interval_ms`
+        // knob (`machine_sampler_interval_ms` here) or it silently
+        // emits ~2.5x more records than its own `interval_ms` field
+        // claims. The heartbeat still runs every tick (cheap,
+        // keeps the lock's staleness window nowhere near tripping);
+        // only the flow-record emission itself is gated — decided
+        // and built by `maybe_build_machine_telemetry_record`
+        // (extracted so this call site is directly testable with a
+        // fake clock; see that function's own test).
+        //
+        // (#2111 review finding, kept) `at_ms` is RELATIVE to
+        // this sampler's own start (`started.elapsed()`) — correct
+        // for the reduction math and the thermal governor's gap
+        // timing, but wrong for a flow record's `sampled_at_ms`:
+        // `machine.thermal` (the daemon sampler) and
+        // `/machine/resources` both stamp real UNIX epoch ms, so a
+        // relative offset here would read as 1970 next to either
+        // of them on a chart. `epoch_ms_now()` is the one shared
+        // wall-clock read every `sampled_at_ms` producer uses.
+        let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
+        let Some((mut rec, new_last_emit_at_ms)) = maybe_build_machine_telemetry_record(
+            self.last_telemetry_emit_at_ms,
+            at_ms,
+            sampled_at_epoch_ms,
+            self.machine_sampler_interval_ms,
+            sample,
+        ) else {
+            return;
+        };
+        // (CLAUDE.md "samplers stamp their own cost") This
+        // record's OWN write hasn't happened yet — it can't
+        // honestly report its own cost — so it carries the
+        // PREVIOUS emission's measured write duration instead.
+        // `None` on the first emission (no previous write to
+        // report).
+        if let (Some(ms), Some(darkmux_flow::Payload::MachineTelemetry(p))) =
+            (self.prev_record_write_ms, rec.payload.as_mut())
+        {
+            p.prev_record_write_ms = Some(ms);
+        }
+        let write_start = Instant::now();
+        let _ = darkmux_flow::record(rec);
+        self.prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
+        self.last_telemetry_emit_at_ms = Some(new_last_emit_at_ms);
+    }
+
+    /// The run's readings, reduced: what was observed, never a default.
+    fn finish(self) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
+        (
+            reduce_host_stats(&self.raw),
+            reduce_host_extras(&self.extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+            self.governors.thermal.ladder_summary(),
+        )
+    }
+}
+
+/// (#2110/#2109) The thermal governor/breaker — see its module doc — built
+/// for this dispatch, with its start warnings printed.
+fn start_thermal_governor(
+    thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+    session: &SessionId,
+    record_context: Option<&darkmux_flow::payload::RecordContext>,
+) -> crate::thermal_governor::ThermalGovernor {
     // `stop_file` resolves once, up front: the crawl `STOP` path (if this
     // dispatch is a crawl unit) never changes mid-dispatch.
     // (#2454) `.owned_by` stamps this mission into any STOP file the
@@ -9257,7 +10406,7 @@ fn run_telemetry_sampler(
     // this, "the delay doubles for the rest of the run" and "the Nth
     // `serious` episode" would both silently reset every single unit.
     let thermal_ladder_state_file =
-        crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
+        crate::thermal_governor::ladder_state_file_path_from_record_context(record_context);
     let thermal_governor =
         crate::thermal_governor::ThermalGovernor::new(thermal_config)
             .owned_by(session.mission_id())
@@ -9292,622 +10441,61 @@ fn run_telemetry_sampler(
     for line in thermal_governor.dispatch_start_warnings() {
         eprintln!("{line}");
     }
-    let thermal_stop_file =
-        crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
-    // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
-    // looked crawl-shaped but the STOP path above came back `None` because
-    // derivation failed (not because this simply isn't a crawl dispatch) —
-    // see `stop_file_unresolved_reason`'s own doc for the distinction.
-    let thermal_stop_unresolved_reason =
-        crate::thermal_governor::stop_file_unresolved_reason(record_context.as_ref());
-    // (#2706) The battery governor rides this SAME tick — the probe above
-    // already reads `sample.battery` every 2s, so no separate poller is
-    // needed, exactly as the thermal governor rides the thermal half.
-    //
-    // `pause_supported(true)`: this sampler exists only on the
-    // CONTAINER-backed dispatch path (its caller `spawn_guarded_sampler`
-    // is reached after a `child` is spawned), whose pause is an in-memory
-    // rest at a turn boundary — `runtime/src/pace.rs`'s bounded ≤2s poll
-    // loop, which keeps the whole conversation in memory and continues
-    // from exactly where it rested. That run type CAN be resumed, so it
-    // is allowed to pause. A run type that could not would pass `false`
-    // and get `BatteryEvent::PauseUnsupported` instead of a park it could
-    // not leave.
-    let battery_governor =
-        crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
-    // (#2779) The two governors tick THROUGH the shared seam, not as two
-    // inline calls here. The order, the `is_pausing` gate and the one-clock
-    // rule live in `governor_tick::GovernorPair::tick` so a scenario test
-    // proves the REAL wiring rather than a reimplementation of it — see
-    // that module's doc for the F1 inversion it exists to keep proven.
-    let mut governors = crate::governor_tick::GovernorPair::new(thermal_governor, battery_governor);
-    // (#2779) A simulated host source is never silent. Same surface and
-    // same shape as the ladder's disarm notes above, rendered off
-    // `host_source::provenance()` so doctor and the dispatch cannot
-    // disagree about what is driving the readings.
-    if let Some(warning) = crate::host_source::provenance().warning() {
-        eprintln!("darkmux: ⚠ host source — {warning}");
-    }
-    // (#2774 tiers 2/4) A governor's `dispatch.rest` decision, plus the
-    // per-tier extras: the duty-cycle events want to carry `delay_ms`, the
-    // tier-4 hold wants `episode`, and neither deserves a bespoke one-off
-    // closure. `level` is explicit (not always `Info`) because tier 4's hold
-    // is operator-actionable, not routine pacing telemetry.
-    let emit_rest_with_extra =
-        |level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: RestExtra| {
-            let mut payload = darkmux_flow::Payload::DispatchRest(DispatchRestPayload {
-                reason: Some(reason.to_string()),
-                state: Some(state.to_string()),
-                pause: Some(pause),
-                delay_ms: extra.delay_ms,
-                episode: extra.episode,
-                checklist: extra.checklist,
-                resume_hint: extra.resume_hint,
-                ..Default::default()
-            });
-            // (#2779) `simulated_host_source` when — and only when — this
-            // decision was made on scenario readings. Absent on a real run, so
-            // its PRESENCE alone answers "were these readings real".
-            crate::host_source::stamp(&mut payload);
-            merge_record_context(&mut payload, &record_context);
-            let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
-                level,
-                &role_id,
-                &session,
-                &execution,
-                Some(&model),
-                phase_id.as_deref(),
-                payload,
-            ));
-        };
-    let emit_rest = |reason: &str, state: &str, pause: bool| {
-        emit_rest_with_extra(darkmux_flow::Level::Info, reason, state, pause, RestExtra::default());
-    };
-    let emit = |source: darkmux_flow::FlowSource, payload: darkmux_flow::Payload| {
-        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-            darkmux_flow::Level::Info,
-            source,
-            &role_id,
-            &session,
-            &execution,
-            Some(&model),
-            phase_id.as_deref(),
-            payload,
-        ));
-    };
-    // (#2413) This dispatch is, by definition, LIVE for as long as this
-    // sampler thread runs — so if it becomes the machine's singleton host
-    // sampler, it always emits at the base `host_sampler_interval_ms()`
-    // cadence (never the daemon's idle 10x backoff, which exists only
-    // because the DAEMON runs when nothing may be live). `try_acquire`
-    // returns `None` when a daemon (or another dispatch) already holds a
-    // fresh lock — in that case this dispatch emits NO `machine.telemetry`
-    // records at all, matching the rule "at most one emitter per machine."
-    // The guard is a local: RAII releases it on every exit from this
-    // function (normal return, the early `return` mid-loop below, or a
-    // panic-unwind through this scope), same lifecycle contract as every
-    // other bookend guard in this codebase.
-    let machine_sampler_interval_ms = darkmux_types::config_access::host_sampler_interval_ms();
-    let mut sampler_lock = if machine_sampler_interval_ms > 0 {
-        crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms)
-    } else {
-        None
-    };
-    // (#2413 review finding) The MEASURED write duration of the PREVIOUS
-    // `machine.telemetry` emission — `None` until the first one has
-    // happened. A record cannot honestly report its OWN write cost (the
-    // write hasn't happened yet when the payload is built), so this stamps
-    // last time's measured cost instead of a build-only proxy mislabeled
-    // as "the write".
-    let mut prev_record_write_ms: Option<u64> = None;
-    // (#2413 M2, review round 2) `at_ms` of the last `machine.telemetry`
-    // EMISSION (not heartbeat) — feeds `telemetry_emission_due` so the
-    // curve honors `machine_sampler_interval_ms` instead of the 2s outer
-    // loop tick. `None` before the first emission.
-    let mut last_telemetry_emit_at_ms: Option<u64> = None;
+    thermal_governor
+}
 
-    // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
-    // all moved into `LmsTelemetryTracker` — see its doc for why the state
-    // machine lives behind an injected-effect seam instead of inline here.
-    // (#2914) One utility seat, under every id this dispatch declared for
-    // it: the compactor's resolved wire id and the binding (normally the same
-    // model; a pinned compactor that differs still shares the seat).
-    let mut lms_tracker = LmsTelemetryTracker::new(
-        model.clone(),
-        [compactor_model.clone(), utility_model.clone()].into_iter().flatten().collect(),
-    );
-    // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
-    // last thermal sample — NOT a hardcoded per-tick constant. A tick can
-    // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
-    // `lms list_loaded()` call above can stall up to ~30s), and the whole
-    // process can sleep/suspend between ticks — feeding a fixed 2000ms in
-    // either case would under-report real elapsed time to the governor's
-    // hysteresis/max-pause/heartbeat accounting, which could let a
-    // thermal-critical pause's written_at_ms go stale past what the
-    // runtime's own ceiling honors. `0` on the very first tick is correct
-    // (there is no "last sample" yet).
-    let mut prev_thermal_at_ms: u64 = 0;
-
-    loop {
-        if stop_flag.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // lms load/unload deltas — the seed/diff rule, the `role`/`baseline`
-        // tagging, and the skip-on-failed-probe behavior all live in
-        // `LmsTelemetryTracker::tick` so they are unit-testable without a
-        // live `lms` or a live flow sink. Nothing but the wiring is here.
-        lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
-            emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
-        });
-
-        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
-        // per-cluster frequency, power and thermal state the same probe
-        // reads for free. Inference runs in LMStudio (off-container), so the
-        // load worth watching is the HOST's, not the runtime container's
-        // (which idles waiting on the model and reads ~0 — the
-        // wrong-question problem, #814/#1064). Each read is best-effort and
-        // unprivileged; a tick emits whichever fields succeed.
-        let sample = probe.sample();
-        let at_ms = started.elapsed().as_millis() as u64;
-        // (N1 of the #2110/#2109 review) REAL elapsed since the last
-        // thermal tick, not TELEMETRY_SAMPLE_INTERVAL_MS — see
-        // `prev_thermal_at_ms`'s own doc above for why the constant was
-        // wrong. `saturating_sub` on two `started.elapsed()` reads is
-        // monotonic (never underflows) regardless of how long this
-        // iteration's earlier work (the lms diff above) took.
-        let thermal_elapsed_ms = at_ms.saturating_sub(prev_thermal_at_ms);
-        prev_thermal_at_ms = at_ms;
-        // (#2779) BOTH governors decide here, through the shared seam — the
-        // order, the `is_pausing` gate and the one-clock rule are the
-        // seam's, not this loop's. This loop reports what they decided.
-        let tick_events = governors.tick(
-            &crate::host_source::HostReading {
-                thermal: sample.thermal.clone(),
-                battery: sample.battery,
-            },
-            thermal_elapsed_ms,
-            &host_out,
-            thermal_stop_file.as_deref(),
+/// (#2706) The battery governor's decision for one tick, reported: a rest
+/// record, or a `Warn` when a pause was asked for and this run cannot take
+/// one.
+fn on_battery_event(records: &SamplerRecords, event: crate::power_policy::BatteryEvent) {
+    // The `state` string carries BOTH numbers the decision was made
+    // on (the observation and the operator's floor), or for a blind
+    // probe the charge it is holding at (#3074), so the flow record
+    // answers "why did this rest" without a reader having to go look
+    // up the config that was in force at the time.
+    if let Some((level, state, pause)) = event.rest_decision() {
+        records.emit_rest_with_extra(
+            level,
+            crate::power_policy::PACE_REASON,
+            &state,
+            pause,
+            RestExtra::default(),
         );
-        // Every state change (pause/resume/breaker) is a
-        // `dispatch.rest`-family flow record, so a slowed or stopped run
-        // is attributable on the flow stream.
-        if let Some(event) = tick_events.thermal {
-            match event {
-                crate::thermal_governor::ThermalEvent::Paused { state } => {
-                    emit_rest("thermal", &state, true);
-                }
-                crate::thermal_governor::ThermalEvent::Resumed { state } => {
-                    emit_rest("thermal", &state, false);
-                }
-                crate::thermal_governor::ThermalEvent::Breaker { state } => {
-                    emit_rest("thermal-critical", &state, true);
-                    // (#2110/#2109 review finding 5, widened by #2456) Two
-                    // DISTINCT ways the breaker can fail to stop a crawl,
-                    // both surfaced through the same warning shape because
-                    // from the operator's point of view they mean the
-                    // same thing — "the breaker tried and could not write
-                    // a STOP" — and both must be LOUD, never a silent
-                    // no-op that lets the crawl keep dispatching units
-                    // past a tripped breaker with no trace of why:
-                    //
-                    // - No trustworthy STOP path could even be DERIVED
-                    //   (finding 5's original case — never write one at a
-                    //   guessed path).
-                    // - A path WAS derived, but the write itself was
-                    //   REFUSED (#2456 — a symlink was sitting at the path
-                    //   or its parent).
-                    //
-                    // The two are DISTINGUISHABLE in the record — `cause`
-                    // is `"path_underivable"` vs `"write_refused"` — because
-                    // the remedies differ sharply: the first is a crawl
-                    // `record_context` bug, the second means something is
-                    // sitting at the STOP path as a symlink and wants an
-                    // operator to go LOOK. The selection lives in
-                    // `thermal_governor::stop_unresolved_cause` (a pure,
-                    // unit-tested function) rather than inline here: this
-                    // sampler runs on its own thread inside a live dispatch
-                    // and no test reaches it, so an inline version was
-                    // pinned by nothing.
-                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
-                        thermal_stop_file.as_deref(),
-                        thermal_stop_unresolved_reason,
-                        governors.thermal.last_stop_write_error(),
-                    );
-                    if let Some((cause, reason)) = unresolved {
-                        // (N3, final re-check) Warn — this is an
-                        // operator-actionable gap, not routine
-                        // telemetry — through merge_record_context so
-                        // the crawl's own identifying fields (unit,
-                        // source, sha, rule) ride along, same as
-                        // `emit_rest` above.
-                        let mut payload = thermal_stop_unresolved_payload(
-                            cause.as_str(),
-                            reason,
-                            &state,
-                            crate::host_source::provenance(),
-                        );
-                        merge_record_context(&mut payload, &record_context);
-                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Warn,
-                            darkmux_flow::FlowSource::Thermal,
-                            &role_id,
-                            &session,
-                            &execution,
-                            Some(&model),
-                            phase_id.as_deref(),
-                            payload,
-                        ));
-                    }
-                    // (#2774 tier 5) A literal `critical` OS thermal state
-                    // — not the speed-limit-sustained trigger, and not the
-                    // pre-existing max-pause-exceeded-while-paused
-                    // escalation, both of which also reach this arm — gets
-                    // the operator's own "hard stop plus eject" treatment
-                    // on top of the breaker's existing pause+STOP-file
-                    // behavior. Scoped to the literal state name (the
-                    // issue's own condition), deliberately NOT widened to
-                    // the speed-limit trigger: that one is a proxy signal,
-                    // this is the hardware's own worst-case report.
-                    //
-                    // (#2774 review C6) **What "hard stop" reaches, stated
-                    // exactly:** THIS dispatch (the pace file pauses it)
-                    // and, if this is a crawl unit, that crawl's remaining
-                    // units (the STOP file the breaker arm above already
-                    // wrote). Plus every `darkmux:`-namespaced resident on
-                    // this host, which the eject below releases. It does
-                    // NOT reach other concurrent dispatches, other
-                    // missions, or the fleet: a MACHINE-WIDE thermal
-                    // broadcast is #2774's open half and is not built.
-                    // An earlier wording here said "no question asked,"
-                    // which read as a claim about scope it never had.
-                    if state == "critical" {
-                        let trip_wall = SystemTime::now();
-                        tier5_eject_on_critical(&host_out, trip_wall, &|payload| {
-                            emit(darkmux_flow::FlowSource::Thermal, payload)
-                        });
-                    }
-                }
-                crate::thermal_governor::ThermalEvent::DutyCycleEntered { state, delay_ms } => {
-                    // (#2774 tier 2) `pause: false` — this is NOT a rest
-                    // the run stops for; it is the duty-cycle instruction
-                    // itself. `delay_ms` rides the SAME `dispatch.rest`
-                    // record family so a reader watching that one action
-                    // string sees every pacing decision, tier 2 included.
-                    emit_rest_with_extra(
-                        darkmux_flow::Level::Info,
-                        "thermal-duty-cycle",
-                        &state,
-                        false,
-                        RestExtra { delay_ms: Some(delay_ms), ..Default::default() },
-                    );
-                }
-                crate::thermal_governor::ThermalEvent::DutyCycleExited { state } => {
-                    emit_rest("thermal-duty-cycle", &state, false);
-                }
-                crate::thermal_governor::ThermalEvent::OperatorHold { state, episode } => {
-                    // (#2774 tier 4) LOUD and operator-actionable, never a
-                    // diagnosis (CLAUDE.md: darkmux describes, never
-                    // adjudicates) — the checklist names things to CHECK,
-                    // it does not assert what is wrong. `resume_hint` names
-                    // the concrete, already-wired mechanism
-                    // (`--resume-from`, #2114 follow-up) rather than
-                    // leaving the operator to guess how to continue.
-                    let checklist = "worth checking: ambient temperature / air conditioning, an external \
-                         fan or active cooling on this machine, proximity to other hot machines, and \
-                         airflow obstruction";
-                    // (#2774 review F2) Built from this dispatch's OWN
-                    // the host-only origin record — the same file the resume gate
-                    // reads — so the command the operator pastes is one
-                    // darkmux accepts. The earlier bare
-                    // `--resume-from <dir>` form was refused by
-                    // `validate_resume_checkpoint` for every dispatch; see
-                    // `resume_hint_from_origin`'s own doc.
-                    let resume_hint =
-                        resume_hint_from_origin(&host_out, &role_id);
-                    // (#2774 round-3 C9) "this mission", not "this run":
-                    // F5 made the episode count MISSION-scoped (seeded
-                    // across dispatches from the ladder-state file), so a
-                    // unit whose own governor saw exactly one episode
-                    // legitimately prints "2 time(s)". The old wording made
-                    // that read as a bug in the count.
-                    eprintln!(
-                        "darkmux: this machine reached `serious` {episode} time(s) this mission — \
-                         pausing indefinitely, no further turns until you say to. {checklist}. \
-                         To continue: {resume_hint}"
-                    );
-                    emit_rest_with_extra(
-                        darkmux_flow::Level::Warn,
-                        "thermal-episode-limit",
-                        &state,
-                        true,
-                        RestExtra {
-                            episode: Some(u64::from(episode)),
-                            checklist: Some(checklist.to_string()),
-                            resume_hint: Some(resume_hint),
-                            ..Default::default()
-                        },
-                    );
-                    // (#2774 tier 4) Tier 4 also drops the crawl's STOP
-                    // file (see `enter_paused`'s own doc) — same
-                    // "the breaker tried and could not stop the crawl"
-                    // warning shape the Breaker arm above uses, reused
-                    // rather than re-derived, since both mean the same
-                    // thing to an operator reading the flow stream.
-                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
-                        thermal_stop_file.as_deref(),
-                        thermal_stop_unresolved_reason,
-                        governors.thermal.last_stop_write_error(),
-                    );
-                    if let Some((cause, reason)) = unresolved {
-                        let mut payload = thermal_stop_unresolved_payload(
-                            cause.as_str(),
-                            reason,
-                            &state,
-                            crate::host_source::provenance(),
-                        );
-                        merge_record_context(&mut payload, &record_context);
-                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Warn,
-                            darkmux_flow::FlowSource::Thermal,
-                            &role_id,
-                            &session,
-                            &execution,
-                            Some(&model),
-                            phase_id.as_deref(),
-                            payload,
-                        ));
-                    }
-                }
-            }
-        }
-        // (#2706) The battery governor's decision for this tick — made in
-        // `governors.tick` above, fed the SAME reading and the SAME
-        // measured `thermal_elapsed_ms` the thermal governor got (one
-        // clock, so their heartbeat accounting can never disagree), and
-        // gated on the thermal governor's POST-decision `is_pausing`.
-        //
-        // (#2774 review F1 / #2779) That gate is deliberately `is_pausing`,
-        // NOT `is_pacing` — and it now lives in
-        // `governor_tick::GovernorPair::tick` rather than inline here, so
-        // a scenario test can prove it. See that module's doc for what the
-        // `is_pacing` version cost: a live battery-critical pause rewritten
-        // to `pause: false` for the whole duration of a duty-cycle episode,
-        // the run still working, the battery still draining.
-        //
-        // A machine with NO battery decides nothing at all: `sample.battery`
-        // is `None` on a desktop, and the governor's first act is to return
-        // on that — before any config read, threshold comparison or file
-        // write.
-        if let Some(event) = tick_events.battery {
-            // The `state` string carries BOTH numbers the decision was made
-            // on (the observation and the operator's floor), or for a blind
-            // probe the charge it is holding at (#3074), so the flow record
-            // answers "why did this rest" without a reader having to go look
-            // up the config that was in force at the time.
-            if let Some((level, state, pause)) = event.rest_decision() {
-                emit_rest_with_extra(
-                    level,
-                    crate::power_policy::PACE_REASON,
-                    &state,
-                    pause,
-                    RestExtra::default(),
-                );
-            } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
-                // WARN, not Info: the operator asked for a pause and is
-                // not getting one. Loud beats quiet — a silent
-                // non-pause is exactly the "silently disables itself"
-                // failure #2706 exists to prevent. Names the numbers
-                // and the field, and gives no advice, same contract as
-                // the start refusal.
-                let mut payload = battery_pause_unsupported_payload(
-                    charge_pct,
-                    floor_pct,
-                    crate::host_source::provenance(),
-                );
-                merge_record_context(&mut payload, &record_context);
-                let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                    darkmux_flow::Level::Warn,
-                    darkmux_flow::FlowSource::Battery,
-                    &role_id,
-                    &session,
-                    &execution,
-                    Some(&model),
-                    phase_id.as_deref(),
-                    payload,
-                ));
-            }
-        }
-
-        // (#2902 step 5) The endpoint budget of an agentic-remote brain,
-        // whose calls the runtime makes inside the container: under `wait`
-        // a full window pauses the runtime between turns through the pace
-        // file (reason `budget`), yielding to a thermal or battery pause
-        // that already holds it. Decided AFTER both governors, so it reads
-        // their post-decision state; reported as `dispatch.rest` like theirs.
-        if let Some(pacer) = budget_pacer.as_mut() {
-            let others = governors.other_pacing();
-            let caller = crate::budget::BudgetCaller {
-                role_id: Some(&role_id),
-                session: &session,
-                execution: &execution,
-                model: Some(&model),
-                phase_id: phase_id.as_deref(),
-                profiles_file: None,
-            };
-            let event =
-                crate::budget::with_env(|env| pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, env));
-            match event {
-                Some(crate::budget::PacerEvent::Paused { state }) => {
-                    emit_rest(crate::budget::PACE_REASON, &state, true)
-                }
-                Some(crate::budget::PacerEvent::Resumed { state }) => {
-                    emit_rest(crate::budget::PACE_REASON, &state, false)
-                }
-                Some(crate::budget::PacerEvent::Stopped { reason }) => {
-                    // (#2902 step 5 review MF1) The run was stopped while the
-                    // pacer held it (`mission abort` writes only terminal state;
-                    // this is where it reaches a paused container). End it
-                    // the way an interrupt does, for THIS dispatch only (#2925): the
-                    // tailer kills this container on the stop, and the launcher
-                    // takes its abort path. The process-global interrupt flag is
-                    // not touched: it would end every other phase's dispatch. The
-                    // pace file still says pause, so no turn goes out first.
-                    local_stop.request(reason);
-                }
-                None => {}
-            }
-        }
-
-        if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
-            // (#2107) Record the raw reading, timestamped against this
-            // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
-            // pure fold over `raw` computed once at the end
-            // (`reduce_host_stats`) — this loop's only job is to capture
-            // what was observed, not to fold it live, so the reduction
-            // logic has exactly one implementation, shared with the unit
-            // tests that drive it directly.
-            raw.push(HostSampleAt {
-                at_ms,
-                cpu: sample.cpu_pct,
-                mem: sample.mem_pct,
-                gpu: sample.gpu_pct,
-            });
-        }
-        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
-        // all failed: a tick that read power but not utilization is still a
-        // power measurement, and `reduce_host_extras` skips the `None`s
-        // rather than zeroing them. Deliberately NOT emitted as a flow
-        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
-        // viewer contract, and widening it is a schema change with no
-        // consumer yet; the reduction reaches the envelope instead.
-        if sample.power.is_some() || sample.thermal.is_some() {
-            extras.push(HostExtraAt {
-                at_ms,
-                power: sample.power,
-                thermal: sample.thermal.clone(),
-            });
-        }
-
-        // (#2413) The machine-scoped `machine.telemetry` curve — emitted
-        // ONLY when this dispatch is the machine's singleton host sampler
-        // (no daemon, and no other dispatch, currently holds the lock).
-        // Every tick, never every Nth: unlike the retired per-dispatch
-        // curve, a dispatch-owned sampler exists only because a dispatch
-        // (itself) is live, so there is no idle backoff to apply here —
-        // that only makes sense for the DAEMON's sampler (see
-        // `darkmux-serve::host_sampler`), which keeps running when nothing
-        // is live. `heartbeat` returning `false` means another process won
-        // a steal race; drop the guard so this loop stops trying (and lets
-        // whoever won be the sole emitter, per the "at most one" rule).
-        if let Some(guard) = sampler_lock.as_ref() {
-            if guard.heartbeat(machine_sampler_interval_ms) {
-                // (#2413 M2 / round 3 MF2) The outer loop ticks every
-                // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
-                // diffs and thermal governor above, which want fine-grained
-                // sampling, but wrong for the `machine.telemetry` curve,
-                // which must honor the operator's `host_sampler_interval_ms`
-                // knob (`machine_sampler_interval_ms` here) or it silently
-                // emits ~2.5x more records than its own `interval_ms` field
-                // claims. The heartbeat above still runs every tick (cheap,
-                // keeps the lock's staleness window nowhere near tripping);
-                // only the flow-record emission itself is gated — decided
-                // and built by `maybe_build_machine_telemetry_record`
-                // (extracted so this call site is directly testable with a
-                // fake clock; see that function's own test).
-                //
-                // (#2111 review finding, kept) `at_ms` above is RELATIVE to
-                // this sampler's own start (`started.elapsed()`) — correct
-                // for the reduction math and the thermal governor's gap
-                // timing, but wrong for a flow record's `sampled_at_ms`:
-                // `machine.thermal` (the daemon sampler) and
-                // `/machine/resources` both stamp real UNIX epoch ms, so a
-                // relative offset here would read as 1970 next to either
-                // of them on a chart. `epoch_ms_now()` is the one shared
-                // wall-clock read every `sampled_at_ms` producer uses.
-                let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
-                if let Some((mut rec, new_last_emit_at_ms)) = maybe_build_machine_telemetry_record(
-                    last_telemetry_emit_at_ms,
-                    at_ms,
-                    sampled_at_epoch_ms,
-                    machine_sampler_interval_ms,
-                    &sample,
-                ) {
-                    // (CLAUDE.md "samplers stamp their own cost") This
-                    // record's OWN write hasn't happened yet — it can't
-                    // honestly report its own cost — so it carries the
-                    // PREVIOUS emission's measured write duration instead.
-                    // `None` on the first emission (no previous write to
-                    // report).
-                    if let (Some(ms), Some(darkmux_flow::Payload::MachineTelemetry(p))) =
-                        (prev_record_write_ms, rec.payload.as_mut())
-                    {
-                        p.prev_record_write_ms = Some(ms);
-                    }
-                    let write_start = Instant::now();
-                    let _ = darkmux_flow::record(rec);
-                    prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
-                    last_telemetry_emit_at_ms = Some(new_last_emit_at_ms);
-                }
-            } else {
-                sampler_lock = None;
-            }
-        } else if machine_sampler_interval_ms > 0 {
-            // (#2413 C1) Retry every tick even after failing (or never
-            // holding) the lock — a file read every `TELEMETRY_SAMPLE_
-            // INTERVAL_MS` (2s) is cheap, and it means a live dispatch
-            // takes over the machine's sampler role as soon as whoever
-            // held it (typically the daemon) dies mid-run, instead of the
-            // machine going emitter-less until this dispatch happens to
-            // restart. `0` (disabled) never retries, matching the initial
-            // acquire's own `> 0` gate above.
-            // (#2413 C2, and round 3 MF1) This is the SAME "opportunistic,
-            // usually-declined" shape as the daemon's own per-tick retry
-            // (see `darkmux-serve::host_sampler`'s identical comment) —
-            // `try_acquire` never records a routine decline as contention
-            // (the channel is retired; see `host_sampler_lock`'s module
-            // doc), so this call is exactly as quiet as the initial
-            // acquire above.
-            sampler_lock = crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms);
-            if sampler_lock.is_some() {
-                // Fresh acquisition: the next tick's heartbeat branch
-                // above will find `last_telemetry_emit_at_ms` still
-                // reflecting whatever it was before (`None` at dispatch
-                // start, or a stale past value if we previously held and
-                // lost the lock) — either way `telemetry_emission_due`
-                // treats a `None` as always-due, and a stale `Some` from
-                // long before `at_ms` also reads as due, so the newly
-                // reacquired sampler emits promptly rather than waiting a
-                // full stale interval.
-                last_telemetry_emit_at_ms = None;
-            }
-        }
-
-        // Wait out the sample interval, but poll the stop flag every
-        // `SAMPLER_POLL_INTERVAL` so teardown after `wait_with_output()`
-        // is prompt (≤500ms) rather than blocking for a full 2s tick.
-        let mut slept = Duration::ZERO;
-        while slept < TELEMETRY_SAMPLE_INTERVAL {
-            if stop_flag.load(Ordering::SeqCst) {
-                // Teardown mid-interval: return what was observed, never a
-                // default. A killed or short dispatch still has real stats.
-                return (
-                    reduce_host_stats(&raw),
-                    reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-                    governors.thermal.ladder_summary(),
-                );
-            }
-            let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
-            thread::sleep(nap);
-            slept += nap;
-        }
+    } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
+        // WARN, not Info: the operator asked for a pause and is
+        // not getting one. Loud beats quiet — a silent
+        // non-pause is exactly the "silently disables itself"
+        // failure #2706 exists to prevent. Names the numbers
+        // and the field, and gives no advice, same contract as
+        // the start refusal.
+        let payload = battery_pause_unsupported_payload(
+            charge_pct,
+            floor_pct,
+            crate::host_source::provenance(),
+        );
+        records.emit_warning(darkmux_flow::FlowSource::Battery, payload);
     }
-    (
-        reduce_host_stats(&raw),
-        reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-        governors.thermal.ladder_summary(),
-    )
+}
+
+/// (#2107) The utilization half of one reading, for `reduce_host_stats`:
+/// `None` when the probe read none of cpu, mem or gpu.
+fn host_sample_at(at_ms: u64, sample: &crate::host_probe::HostSampleFull) -> Option<HostSampleAt> {
+    (sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some()).then_some(HostSampleAt {
+        at_ms,
+        cpu: sample.cpu_pct,
+        mem: sample.mem_pct,
+        gpu: sample.gpu_pct,
+    })
+}
+
+/// (#2108) The power/thermal half of one reading, for `reduce_host_extras`:
+/// `None` when the probe read neither.
+fn host_extra_at(at_ms: u64, sample: &crate::host_probe::HostSampleFull) -> Option<HostExtraAt> {
+    (sample.power.is_some() || sample.thermal.is_some()).then(|| HostExtraAt {
+        at_ms,
+        power: sample.power,
+        thermal: sample.thermal.clone(),
+    })
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,

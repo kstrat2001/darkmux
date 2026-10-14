@@ -419,15 +419,20 @@ fn every_hosted_call_site_passes_the_budget_gates() {
     // the pacer rides the host sampler between turns.
     let di = prod("src/dispatch_internal.rs");
     let dispatch = fn_body(&di, "dispatch");
-    let gate = dispatch.find("admit_container_start(&opts, &execution, limits_pm)?").expect("pre-start gate (not a comment)");
-    let spawn = dispatch.find("bookend.open(").expect("the start record");
-    assert!(gate < spawn, "the pre-start gate runs before the dispatch starts");
+    let prepare = dispatch.find("prepare_container_run(").expect("the container path's preparation");
+    let run = dispatch.find("run_container(").expect("the container run");
+    assert!(prepare < run, "the container run starts after its preparation");
+    assert!(
+        fn_body(&di, "prepare_container_run").contains("admit_container_start(opts, execution, brain.limits_pm())?"),
+        "pre-start gate (not a comment)"
+    );
+    assert!(fn_body(&di, "run_container").contains("bookend.open("), "the start record opens in the run, after the gate");
     assert!(fn_body(&di, "admit_container_start").contains("crate::budget::admit_endpoint("), "the pre-start gate gates on the endpoint's window");
     assert!(fn_body(&di, "pacer_for").contains("crate::budget::BudgetPacer::new("), "the pacer gets the budget");
     assert!(
-        dispatch.contains("pacer_for(limits_pm, opts.config_path.as_deref())?"),
+        fn_body(&di, "spawn_observers").contains("pacer_for(limits_pm, opts.config_path.as_deref())?"),
         "(#3035) the pacer is built from the brain's endpoint, managed or hosted (behavior: \
          `a_managed_brains_window_pauses_the_runtime_between_turns_through_the_pace_file`)"
     );
-    assert!(fn_body(&di, "run_telemetry_sampler").contains("pacer.on_tick("), "the pacer ticks");
+    assert!(fn_body(&di, "pace_budget").contains("pacer.on_tick("), "the pacer ticks");
 }

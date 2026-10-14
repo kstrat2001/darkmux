@@ -490,7 +490,7 @@ fn a_critical_breaker_event_is_what_tier_five_s_eject_keys_on() {
     let src = include_str!("dispatch_internal.rs");
     assert!(
         src.contains("if state == \"critical\" {")
-            && src.contains("tier5_eject_on_critical(&host_out, trip_wall,"),
+            && src.contains("tier5_eject_on_critical(&self.host_out, trip_wall,"),
         "the Breaker arm must still gate the tier-5 eject on the LITERAL `critical` state — \
          widening it to every breaker trigger would eject the machine's models on a \
          speed-limit proxy signal"

@@ -102,11 +102,12 @@ fn duty_for_kind(kind_id: &str) -> Option<Duty> {
         // the container path (and, for an endpoint-bearing profile, the
         // hosted one below). Not unit-drivable: it spawns a real Docker
         // container, which is why the structural half of this module
-        // exists at all.
+        // exists at all. `dispatch` hands the container run to
+        // `run_container`, which owns the bookends and spawns the beat.
         "dispatch.internal" => Duty::ModelWork(Site {
             file: "src/dispatch_internal.rs",
-            func: "dispatch",
-            anchor: "darkmux-dispatch-",
+            func: "run_container",
+            anchor: "waiting for darkmux-runtime container",
         }),
         "dispatch.single_shot" => Duty::ModelWork(Site {
             file: "src/step_kinds/builtins.rs",
