@@ -16552,6 +16552,9 @@ mod roster_identity_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod lms_checks_tests;
+
 #[cfg(test)]
 mod machine_uid_row_tests {
     use super::*;

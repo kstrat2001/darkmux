@@ -14802,3 +14802,301 @@ fn profile_list_withholds_an_endpoint_host_from_a_remote_viewer() {
     assert!(remote.contains("onpeer: unmanaged @ (shown on this machine only)"), "{remote}");
     assert!(run(false).contains("onpeer: unmanaged @ peer2:1234"), "this machine reads the host");
 }
+
+// ===== `machine eject` and `profile` at the boundary (#3198) ===========
+//
+// Characterization tests for `cmd_model_eject` and `cmd_profile`, ahead of
+// the engine facade (docs/architecture/ENGINES.md, stage 0): each pins what
+// the operator sees and the exit code, through the real binary, against a
+// fake `lms` (`DARKMUX_LMS_BIN`). Nothing here reaches LM Studio.
+
+/// A fake `lms` with a state dir: `ps --json` lists `<state>/loaded/*`,
+/// `unload <id>` appends to `<state>/unload.log` and removes the load, except
+/// an identifier containing `stuck`, which fails with stderr `boom`.
+fn fake_lms_with_loads(tmp: &TempDir, loads: &[(&str, u64)]) -> std::path::PathBuf {
+    let state = tmp.path().join("lms-state");
+    fs::create_dir_all(state.join("loaded")).unwrap();
+    for (id, ctx) in loads {
+        fs::write(
+            state.join("loaded").join(id.replace(':', "_")),
+            format!(r#"{{"identifier":"{id}","modelKey":"{}","status":"idle","contextLength":{ctx}}}"#, id.trim_start_matches("darkmux:")),
+        )
+        .unwrap();
+    }
+    let s = state.display();
+    let script = format!(
+        r#"#!/bin/sh
+case "$1" in
+  ps)
+    [ "$2" = "--json" ] || exit 1
+    printf '['; sep=''
+    for f in "{s}"/loaded/*; do [ -e "$f" ] || continue; printf '%s' "$sep"; cat "$f"; sep=','; done
+    printf ']'; exit 0 ;;
+  unload)
+    echo "$2" >> "{s}/unload.log"
+    case "$2" in *stuck*) echo "boom" >&2; exit 1 ;; esac
+    rm -f "{s}/loaded/$(echo "$2" | tr ':' '_')"; exit 0 ;;
+esac
+exit 1
+"#
+    );
+    let fake = tmp.path().join("fake-lms");
+    fs::write(&fake, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fake
+}
+
+fn unload_log(tmp: &TempDir) -> String {
+    fs::read_to_string(tmp.path().join("lms-state").join("unload.log")).unwrap_or_default()
+}
+
+/// `(exit code, stdout, stderr)` of `darkmux <args>` against `lms`. The
+/// daemon address is a closed port and Redis is unset, so a verb that would
+/// ask a local daemon or the fleet stream for the fleet view (`profile list
+/// --remote`) gathers it from the child's own empty roster instead.
+fn run_with_lms(lms: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = darkmux_cmd()
+        .env("DARKMUX_LMS_BIN", lms)
+        .env("DARKMUX_SERVE_BIND", "127.0.0.1")
+        .env("DARKMUX_SERVE_PORT", "9")
+        .env_remove("DARKMUX_REDIS_URL")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn machine_eject_with_nothing_loaded_says_so_and_exits_zero() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout, "no darkmux-managed loads to eject\n", "no user-load line when there are none");
+    assert_eq!(unload_log(&tmp), "");
+}
+
+#[test]
+fn machine_eject_with_only_user_loads_touches_none_and_counts_them() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("user-model", 4096)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        "no darkmux-managed loads to eject\n\
+         (1 user-loaded model(s) untouched — use `lms unload <identifier>` for those)\n"
+    );
+    assert_eq!(unload_log(&tmp), "", "a user load is never unloaded");
+}
+
+#[test]
+fn machine_eject_dry_run_lists_what_it_would_eject_and_unloads_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192), ("darkmux:b", 4096), ("user-model", 2048)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject", "--dry-run"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        "would eject darkmux:a (ctx=8192)\n\
+         would eject darkmux:b (ctx=4096)\n\
+         would eject 2 model(s), respected 1 user-loaded model(s) [DRY RUN]\n"
+    );
+    assert_eq!(unload_log(&tmp), "", "a dry run unloads nothing");
+}
+
+#[test]
+fn machine_eject_unloads_every_managed_load() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192), ("darkmux:b", 4096)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout, "eject darkmux:a (ctx=8192)\neject darkmux:b (ctx=4096)\nejected 2 model(s)\n");
+    assert_eq!(stderr, "", "no failure is reported");
+    assert_eq!(unload_log(&tmp), "darkmux:a\ndarkmux:b\n");
+}
+
+#[test]
+fn machine_eject_reports_a_stuck_load_and_exits_one() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192), ("darkmux:stuck", 4096), ("user-model", 2048)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(1), "an eject that left a load behind did not fully happen");
+    assert!(stderr.contains("could not eject darkmux:stuck — ") && stderr.contains("boom"), "{stderr}");
+    assert_eq!(
+        stdout,
+        "eject darkmux:a (ctx=8192)\nejected 1 model(s), respected 1 user-loaded model(s), 1 FAILED to eject\n"
+    );
+}
+
+#[test]
+fn machine_eject_where_every_load_fails_is_not_nothing_to_eject() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:stuck", 4096)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stderr.contains("could not eject darkmux:stuck"), "{stderr}");
+    assert_eq!(stdout, "ejected 0 model(s), 1 FAILED to eject\n");
+}
+
+#[test]
+fn machine_eject_fails_when_lms_cannot_say_what_is_loaded() {
+    let tmp = TempDir::new().unwrap();
+    let lms = tmp.path().join("fake-lms");
+    fs::write(&lms, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lms, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_ne!(code, Some(0), "an unknown resident set is not \"nothing to eject\"");
+    assert_eq!(stdout, "", "{stdout}");
+    assert!(stderr.contains("cannot tell whether any models are loaded"), "{stderr}");
+}
+
+/// A fake `lms` whose `ls --json` lists one 7B model with a 32K window.
+fn fake_lms_catalog(tmp: &TempDir) -> std::path::PathBuf {
+    let fake = tmp.path().join("fake-lms");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+[ "$1" = "ls" ] || exit 1
+echo '[{"modelKey":"known-7b","type":"llm","paramsString":"7B","sizeBytes":4000000000,"maxContextLength":32768}]'
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fake
+}
+
+/// The draft's comment lines, from the JSON `profile draft` prints.
+fn draft_notes(stdout: &str, name: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    v[name]["_comment"].to_string()
+}
+
+#[test]
+fn profile_draft_of_a_listed_model_reads_its_catalog_entry() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    let (code, stdout, stderr) =
+        run_with_lms(&lms, &["profile", "draft", "p", "--model", "known-7b", "--task-class", "fast"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let notes = draft_notes(&stdout, "p");
+    assert!(notes.contains("bucket=Tiny"), "the 7B catalog entry sizes it: {notes}");
+    assert!(!notes.contains("does not declare maxContextLength"), "the catalog gives the window: {notes}");
+    assert!(!stderr.contains("note:"), "no override was given, so none is ignored: {stderr}");
+    assert!(stderr.contains("Copy the above into the `profiles` block"), "{stderr}");
+}
+
+#[test]
+fn profile_draft_of_a_listed_model_ignores_params_and_max_ctx_overrides() {
+    for flag in [["--params", "70B"], ["--max-ctx", "4096"]] {
+        let tmp = TempDir::new().unwrap();
+        let lms = fake_lms_catalog(&tmp);
+        let mut args = vec!["profile", "draft", "p", "--model", "known-7b", "--task-class", "fast"];
+        args.extend(flag);
+        let (code, stdout, stderr) = run_with_lms(&lms, &args);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stderr.contains("--params/--max-ctx overrides ignored"), "{flag:?}: {stderr}");
+        let notes = draft_notes(&stdout, "p");
+        assert!(notes.contains("bucket=Tiny"), "{flag:?}: the catalog sizes it, not --params: {notes}");
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_ne!(v["p"]["models"][0]["n_ctx"], 4096, "{flag:?}: the catalog's window, not --max-ctx, caps it: {v}");
+    }
+}
+
+#[test]
+fn profile_draft_of_an_unlisted_model_needs_params() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    let (code, stdout, stderr) =
+        run_with_lms(&lms, &["profile", "draft", "p", "--model", "not-downloaded"]);
+    assert_ne!(code, Some(0));
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("model `not-downloaded` not found in `lms ls`"), "{stderr}");
+    assert!(stderr.contains("Re-run with `--params <NB>`"), "{stderr}");
+}
+
+#[test]
+fn profile_draft_of_an_unlisted_model_drafts_from_params_and_max_ctx() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    let base = ["profile", "draft", "p", "--model", "not-downloaded", "--params", "70B"];
+    let (code, stdout, stderr) = run_with_lms(&lms, &base);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("not found in `lms ls`; using --params=70B"), "{stderr}");
+    let notes = draft_notes(&stdout, "p");
+    assert!(notes.contains("bucket=Large"), "--params sizes it: {notes}");
+    assert!(notes.contains("does not declare maxContextLength"), "no --max-ctx, no window: {notes}");
+
+    let mut with_ctx = base.to_vec();
+    with_ctx.extend(["--max-ctx", "65536"]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &with_ctx);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!draft_notes(&stdout, "p").contains("does not declare maxContextLength"), "--max-ctx gives the window: {stdout}");
+}
+
+#[test]
+fn profile_draft_treats_a_failed_lms_listing_as_not_listed() {
+    let tmp = TempDir::new().unwrap();
+    let lms = tmp.path().join("fake-lms");
+    fs::write(&lms, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lms, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (code, _, stderr) = run_with_lms(&lms, &["profile", "draft", "p", "--model", "m"]);
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("model `m` not found in `lms ls`"), "{stderr}");
+    let (code, stdout, stderr) =
+        run_with_lms(&lms, &["profile", "draft", "p", "--model", "m", "--params", "7B"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(draft_notes(&stdout, "p").contains("bucket=Tiny"), "{stdout}");
+}
+
+#[test]
+fn profile_draft_refuses_an_unknown_task_class() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    let (code, stdout, stderr) =
+        run_with_lms(&lms, &["profile", "draft", "p", "--model", "known-7b", "--task-class", "huge"]);
+    assert_ne!(code, Some(0));
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("unknown task-class 'huge'. Try: fast | mid | long"), "{stderr}");
+}
+
+#[test]
+fn profile_list_remote_answers_from_the_roster_not_the_local_list() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    // An empty roster: `--remote` answers for the peers (there are none),
+    // never with this machine's own list, and exits 0.
+    let (code, stdout, stderr) = run_with_lms(&lms, &["profile", "list", "--remote"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("no peers in the roster"), "{stdout}");
+}
+
+#[test]
+fn profile_list_machine_names_an_unknown_peer() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_catalog(&tmp);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["profile", "list", "--machine", "no-such-peer"]);
+    assert_ne!(code, Some(0));
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("no machine named `no-such-peer` in the roster"), "{stderr}");
+}
