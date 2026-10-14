@@ -269,25 +269,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut traj = open_trajectory(&model, &initial_messages, &tool_names);
 
     let compaction_cfg = compaction.into_config();
-    // (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
-    // json_schema response_format so every model turn is grammar-constrained to
-    // that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).
-    // `strict: true` is deliberate and DIFFERS from the compactor's
-    // `structured_output_response_format_schema()` (strict: false, which keeps
-    // forward-compat tolerance for unknown fields): a role's output feeds a
-    // downstream parser that wants a hard contract, so the schema is authored
-    // strict-safe (every property in `required`, `additionalProperties: false`,
-    // optionals nullable via `anyOf` — NOT the `"type":["string","null"]` union,
-    // which LMStudio's grammar compiler rejects with "'type' must be a string").
-    // Don't "unify" the two paths — the divergence is by use case.
-    let response_format = response_schema.as_deref().and_then(|s| {
-        serde_json::from_str::<serde_json::Value>(s).ok()
-    }).map(|schema| {
-        serde_json::json!({
-            "type": "json_schema",
-            "json_schema": { "name": "role_output", "strict": true, "schema": schema }
-        })
-    });
+    let response_format = response_format_for(response_schema.as_deref());
     // (#2165) Stamp the resolved bound provenance ONCE, before the loop
     // starts — every emission site downstream reads it back via
     // `bounds::bound_sources()` rather than re-deriving it.
@@ -1040,6 +1022,26 @@ fn open_trajectory(
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(model, system_chars, prompt_chars, tool_names);
     traj
+}
+
+/// (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
+/// json_schema response_format so every model turn is grammar-constrained to
+/// that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).
+/// `strict: true` is deliberate and DIFFERS from the compactor's
+/// `structured_output_response_format_schema()` (strict: false, which keeps
+/// forward-compat tolerance for unknown fields): a role's output feeds a
+/// downstream parser that wants a hard contract, so the schema is authored
+/// strict-safe (every property in `required`, `additionalProperties: false`,
+/// optionals nullable via `anyOf` — NOT the `"type":["string","null"]` union,
+/// which LMStudio's grammar compiler rejects with "'type' must be a string").
+/// Don't "unify" the two paths — the divergence is by use case.
+fn response_format_for(response_schema: Option<&str>) -> Option<serde_json::Value> {
+    response_schema.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).map(|schema| {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": "role_output", "strict": true, "schema": schema }
+        })
+    })
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
