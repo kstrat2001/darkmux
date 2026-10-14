@@ -575,6 +575,12 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          `dispatch.rest` and `dispatch.error`; it builds no record",
     ),
     (
+        "crates/darkmux-crew/tests/dispatch_boundary.rs",
+        "consumer: boundary pins for `dispatch` and its sampler that read the flow stream \
+         back and match on `dispatch.rest`, `machine.telemetry` and the thermal actions; \
+         it builds no record",
+    ),
+    (
         "crates/darkmux-flow/src/action.rs",
         "the action vocabulary itself: every wire string is declared there, and nothing \
          there builds a record",
