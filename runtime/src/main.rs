@@ -1663,4 +1663,244 @@ mod tests {
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["final_assistant"], tricky);
     }
+
+    // ─── run's flag parser and the pure pieces split out of run_dispatch ──
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    fn parse(words: &[&str]) -> Result<RunArgs, Refusal> {
+        parse_run_args(&argv(words), None)
+    }
+
+    fn refusal(words: &[&str]) -> Refusal {
+        parse(words).expect_err("expected a refusal")
+    }
+
+    #[test]
+    fn every_text_and_count_flag_lands_in_its_own_field() {
+        let a = parse(&[
+            "--model", "m", "--prompt", "p", "--system", "s", "--response-schema", "rs",
+            "--base-url", "bu", "--chat-url", "cu", "--resume", "r", "--role-id", "ri",
+            "--execution-id", "ei", "--compactor-model", "cm",
+            "--compactor-custom-instructions", "cci", "--max-tokens-per-call-source", "s1",
+            "--reasoning-checkpoint-interval-source", "s2",
+            "--generation-checkpoint-interval-source", "s3",
+            "--compact-threshold-tokens", "1", "--compactor-context-window", "2",
+            "--context-window", "3", "--bail-after-compactions", "4", "--max-turns", "5",
+            "--reasoning-checkpoint-interval", "6", "--generation-checkpoint-interval", "7",
+            "--max-stall-recoveries", "8", "--max-tokens-per-call", "9", "--max-tokens", "10",
+        ])
+        .unwrap();
+        let text = [
+            &a.model, &a.prompt, &a.system, &a.response_schema, &a.endpoints.base_url,
+            &a.endpoints.chat_url, &a.resume_checkpoint_path, &a.role_id, &a.execution_id,
+            &a.compaction.compactor_model, &a.compaction.compactor_custom_instructions,
+            &a.bound_sources.max_tokens_per_call_source,
+            &a.bound_sources.reasoning_checkpoint_interval_source,
+            &a.bound_sources.generation_checkpoint_interval_source,
+        ];
+        let text: Vec<Option<&str>> = text.iter().map(|v| v.as_deref()).collect();
+        assert_eq!(
+            text,
+            ["m", "p", "s", "rs", "bu", "cu", "r", "ri", "ei", "cm", "cci", "s1", "s2", "s3"]
+                .map(Some)
+        );
+        let counts = [
+            a.compaction.compact_threshold_tokens, a.compaction.compactor_context_window,
+            a.compaction.context_window, a.compaction.bail_after_compactions, a.max_turns,
+            a.reasoning_checkpoint_interval, a.generation_checkpoint_interval,
+            a.max_stall_recoveries, a.max_tokens_per_call, a.max_tokens,
+        ];
+        assert_eq!(counts, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(Some));
+    }
+
+    #[test]
+    fn switches_flip_their_defaults_and_streaming_starts_on() {
+        let a = parse(&[]).unwrap();
+        assert!(a.streaming && !a.json_mode && !a.endpoints.auth_header_stdin);
+        let a = parse(&["--no-stream", "--json", "--auth-header-stdin"]).unwrap();
+        assert!(!a.streaming && a.json_mode && a.endpoints.auth_header_stdin);
+    }
+
+    #[test]
+    fn only_the_check_in_flags_refuse_through_process_exit() {
+        for flag in PROCESS_EXIT_FLAGS {
+            let r = refusal(&[flag]);
+            assert_eq!(r, Refusal { message: format!("{flag} requires a value"), process_exit: true });
+        }
+        for flag in ["--model", "--max-tokens-per-call-source", "--max-tokens-per-call"] {
+            let r = refusal(&[flag]);
+            assert_eq!(r, Refusal { message: format!("{flag} requires a value"), process_exit: false });
+        }
+    }
+
+    #[test]
+    fn only_the_check_in_intervals_refuse_zero() {
+        assert_eq!(
+            refusal(&["--reasoning-checkpoint-interval", "0"]).message,
+            "--reasoning-checkpoint-interval requires a positive integer (got: 0)"
+        );
+        assert_eq!(
+            refusal(&["--generation-checkpoint-interval", "0"]).message,
+            "--generation-checkpoint-interval requires a positive integer (got: 0)"
+        );
+        // ODDITY (pinned, not endorsed): every other count accepts 0 although
+        // its refusal says "positive".
+        assert_eq!(parse(&["--max-turns", "0"]).unwrap().max_turns, Some(0));
+        assert_eq!(
+            refusal(&["--max-turns", "x"]).message,
+            "--max-turns requires a positive integer (got: x)"
+        );
+        assert_eq!(
+            refusal(&["--max-stall-recoveries", "-1"]).message,
+            "--max-stall-recoveries requires a non-negative integer (got: -1)"
+        );
+    }
+
+    #[test]
+    fn a_later_prompt_overrides_a_prompt_file_but_not_the_reverse() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("brief.txt");
+        std::fs::write(&file, "from the file").unwrap();
+        let file = file.to_str().unwrap();
+        let a = parse(&["--prompt-file", file, "--prompt", "from argv"]).unwrap();
+        assert_eq!(a.prompt.as_deref(), Some("from argv"));
+        assert_eq!(
+            refusal(&["--prompt", "from argv", "--prompt-file", file]).message,
+            "--prompt and --prompt-file are mutually exclusive"
+        );
+        assert_eq!(parse(&["--prompt-file", file]).unwrap().prompt.as_deref(), Some("from the file"));
+    }
+
+    #[test]
+    fn the_ratio_range_refusal_prints_the_parsed_value() {
+        assert_eq!(
+            refusal(&["--compact-threshold-ratio", "1.0"]).message,
+            "--compact-threshold-ratio must be in range 0.1-0.9 (got: 1)"
+        );
+        assert_eq!(
+            refusal(&["--compact-threshold-ratio", "half"]).message,
+            "--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: half)"
+        );
+        let a = parse(&["--compact-threshold-ratio", "0.5"]).unwrap();
+        assert_eq!(a.compaction.compact_threshold_ratio, Some(0.5));
+    }
+
+    #[test]
+    fn bad_feedback_templates_keep_the_earlier_map() {
+        let a = parse(&[
+            "--feedback-templates-json", r#"{"k":"v"}"#, "--feedback-templates-json", "{not json",
+        ])
+        .unwrap();
+        assert_eq!(a.feedback_templates.get("k").map(String::as_str), Some("v"));
+        assert_eq!(
+            refusal(&["--feedback-templates-json"]).message,
+            "--feedback-templates-json requires a JSON-string value"
+        );
+    }
+
+    #[test]
+    fn the_flags_with_their_own_missing_value_wording() {
+        assert_eq!(
+            refusal(&["--allowed-tools"]).message,
+            "--allowed-tools requires a comma-separated list"
+        );
+        assert_eq!(
+            refusal(&["--compact-strategy"]).message,
+            "--compact-strategy requires a value (`narrative` or `structured-slot`)"
+        );
+        assert_eq!(refusal(&["--dialect"]).message, "--dialect requires a value");
+        assert_eq!(
+            refusal(&["--dialect", "soap"]).message,
+            "--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got \"soap\")"
+        );
+        let a = parse(&["--allowed-tools", " read, ,bash ,"]).unwrap();
+        assert_eq!(a.allowed_tools, Some(vec!["read".to_string(), "bash".to_string()]));
+    }
+
+    #[test]
+    fn strays_are_unknown_flags_and_the_compactor_endpoint_still_parses() {
+        assert_eq!(refusal(&["stray"]).message, "unknown flag: stray");
+        assert_eq!(refusal(&["--compactor-dialect"]).message, "--compactor-dialect requires a value");
+        let a = parse(&["--compactor-chat-url", "http://c", "--compactor-auth-header-stdin"]).unwrap();
+        assert_eq!(a.endpoints.compactor.chat_url.as_deref(), Some("http://c"));
+        assert!(a.endpoints.compactor.auth_stdin);
+    }
+
+    #[test]
+    fn resume_flag_overrides_the_env_value() {
+        let env = Some("/env/checkpoint.json".to_string());
+        let a = parse_run_args(&[], env.clone()).unwrap();
+        assert_eq!(a.resume_checkpoint_path.as_deref(), Some("/env/checkpoint.json"));
+        let a = parse_run_args(&argv(&["--resume", "/flag.json"]), env).unwrap();
+        assert_eq!(a.resume_checkpoint_path.as_deref(), Some("/flag.json"));
+    }
+
+    #[test]
+    fn model_is_required_before_prompt() {
+        let e = required_model_and_prompt(None, None).unwrap_err();
+        assert!(e.message.starts_with("--model is required"), "{}", e.message);
+        let e = required_model_and_prompt(Some("m".into()), None).unwrap_err();
+        assert_eq!(e.message, "--prompt is required");
+    }
+
+    #[test]
+    fn a_bad_response_schema_is_dropped_silently() {
+        assert_eq!(response_format_for(Some("{not json")), None);
+        assert_eq!(response_format_for(None), None);
+        let rf = response_format_for(Some(r#"{"type":"object"}"#)).unwrap();
+        assert_eq!(
+            rf,
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": "role_output", "strict": true, "schema": {"type": "object"} }
+            })
+        );
+    }
+
+    fn outcome(reason: loop_runner::TerminalReason, messages: Vec<Message>, final_answer: Option<&str>) -> loop_runner::LoopOutcome {
+        loop_runner::LoopOutcome {
+            terminal_reason: reason,
+            messages,
+            final_answer: final_answer.map(str::to_string),
+            turn_delay_effective_ms: 0,
+            failed_to_run: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exit_status_is_one_for_errors_and_escalations_only() {
+        use loop_runner::{EscalationReason, TerminalReason};
+        assert_eq!(exit_status(None), 1);
+        let stop = outcome(TerminalReason::Stop, vec![], None);
+        let max = outcome(TerminalReason::MaxTurns, vec![], None);
+        let esc = outcome(TerminalReason::EscalationTriggered(EscalationReason::CompactionLimitReached), vec![], None);
+        assert_eq!(exit_status(Some(&stop)), 0);
+        assert_eq!(exit_status(Some(&max)), 0);
+        assert_eq!(exit_status(Some(&esc)), 1);
+        assert_eq!(result_str(Some(&stop)), "stop");
+        assert_eq!(result_str(Some(&max)), "max_turns");
+        assert_eq!(result_str(None), "error");
+        assert_eq!(
+            result_str(Some(&esc)),
+            loop_runner::escalation_reason_str(EscalationReason::CompactionLimitReached)
+        );
+    }
+
+    #[test]
+    fn final_assistant_prefers_the_loop_answer_then_the_last_assistant_message() {
+        use loop_runner::TerminalReason::Stop;
+        let msgs = vec![Message::assistant("first"), Message::user("u"), Message::assistant("last")];
+        assert_eq!(final_assistant(&outcome(Stop, msgs.clone(), Some("answer"))), "answer");
+        assert_eq!(final_assistant(&outcome(Stop, msgs.clone(), Some("  "))), "last");
+        assert_eq!(final_assistant(&outcome(Stop, msgs, None)), "last");
+        // ODDITY (pinned): a contentless LAST assistant message gives
+        // `<empty>` even when an earlier one had content.
+        let mut contentless = Message::assistant("");
+        contentless.content = None;
+        let msgs = vec![Message::assistant("earlier"), contentless];
+        assert_eq!(final_assistant(&outcome(Stop, msgs, None)), "<empty>");
+    }
 }
