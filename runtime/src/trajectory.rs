@@ -42,6 +42,20 @@ pub struct CallTokens<'a> {
 /// MUST match the mount point in darkmux-crew's dispatch_internal.rs.
 pub const RUNTIME_OUT_BASE: &str = "/darkmux-out";
 
+/// (#316) Env override of [`RUNTIME_OUT_BASE`]. The host never sets it; it
+/// exists so a test can drive the real binary on a host that cannot create
+/// `/darkmux-out` and still read what the run recorded there.
+pub const OUT_DIR_ENV: &str = "DARKMUX_RUNTIME_OUT_DIR";
+
+/// The out-dir this run writes its bookkeeping to: [`OUT_DIR_ENV`] when set
+/// and non-empty, otherwise [`RUNTIME_OUT_BASE`].
+pub fn out_base() -> std::path::PathBuf {
+    match std::env::var_os(OUT_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => dir.into(),
+        _ => RUNTIME_OUT_BASE.into(),
+    }
+}
+
 /// Cap on the recorded tool-argument string. A search pattern, file path, or
 /// shell command is far under this; only a `write`/`edit` file-content arg
 /// exceeds it, and a truncated head is enough to recall what was attempted.
