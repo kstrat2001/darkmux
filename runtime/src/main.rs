@@ -210,15 +210,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // history when `resume_from` is `Some`. A missing/corrupt checkpoint
     // fails the dispatch loudly here, before anything else runs, rather
     // than silently starting fresh under a name that looked like a resume.
-    let resume_from: Option<checkpoint::RunCheckpoint> = match &resume_checkpoint_path {
-        Some(path) => match checkpoint::read_checkpoint(Path::new(path)) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("--resume {path}: {e:#}");
-                return ExitCode::from(2);
-            }
-        },
-        None => None,
+    let resume_from = match load_resume_checkpoint(resume_checkpoint_path.as_deref()) {
+        Ok(resume_from) => resume_from,
+        Err(e) => return e.exit(),
     };
     let resumed_from_turn_index = resume_from.as_ref().map(|c| c.turns);
 
@@ -752,11 +746,13 @@ struct RunArgs {
     feedback_templates: std::collections::BTreeMap<String, String>,
 }
 
-/// A refused `run` argument: the stderr line, and whether it exits through
-/// `std::process::exit(2)` rather than returning exit code 2. The exit code
-/// is the same; the check-in interval flags have always used the former.
+/// A dispatch refused before it starts (a bad flag, an unreadable
+/// checkpoint, a broken auth pipe): the stderr line, and whether it exits
+/// through `std::process::exit(2)` rather than returning exit code 2. The
+/// exit code is the same; the check-in interval flags have always used the
+/// former.
 #[derive(Debug, PartialEq)]
-struct ArgError {
+struct Refusal {
     message: String,
     process_exit: bool,
 }
@@ -769,10 +765,15 @@ const PROCESS_EXIT_FLAGS: [&str; 4] = [
     "--generation-checkpoint-interval-source",
 ];
 
-impl ArgError {
+impl Refusal {
+    /// `message`, exiting 2 by return.
+    fn new(message: String) -> Self {
+        Refusal { message, process_exit: false }
+    }
+
     /// `message`, refusing `flag` the way that flag always exits.
     fn refuse(flag: &str, message: String) -> Self {
-        ArgError { message, process_exit: PROCESS_EXIT_FLAGS.contains(&flag) }
+        Refusal { message, process_exit: PROCESS_EXIT_FLAGS.contains(&flag) }
     }
 
     /// Print the refusal and exit 2.
@@ -786,8 +787,8 @@ impl ArgError {
 }
 
 /// The value after `flag`, or the "`flag` requires a value" refusal.
-fn required<'a>(flag: &str, value: Option<&'a String>) -> Result<&'a String, ArgError> {
-    value.ok_or_else(|| ArgError::refuse(flag, format!("{flag} requires a value")))
+fn required<'a>(flag: &str, value: Option<&'a String>) -> Result<&'a String, Refusal> {
+    value.ok_or_else(|| Refusal::refuse(flag, format!("{flag} requires a value")))
 }
 
 type TextSlot = fn(&mut RunArgs) -> &mut Option<String>;
@@ -829,7 +830,7 @@ const COUNT_FLAGS: [(&str, CountSlot, u32, &str); 10] = [
 /// Parse `run`'s flags. `resume_env` is `DARKMUX_RESUME_CHECKPOINT`, which
 /// `--resume` overrides. Refuses the first bad flag; never checks that the
 /// required flags are present ([`RunArgs::take_model_and_prompt`] does).
-fn parse_run_args(args: &[String], resume_env: Option<String>) -> Result<RunArgs, ArgError> {
+fn parse_run_args(args: &[String], resume_env: Option<String>) -> Result<RunArgs, Refusal> {
     let mut parsed =
         RunArgs { resume_checkpoint_path: resume_env, streaming: true, ..RunArgs::default() };
     let mut i = 0;
@@ -841,7 +842,7 @@ fn parse_run_args(args: &[String], resume_env: Option<String>) -> Result<RunArgs
 
 impl RunArgs {
     /// Apply one flag (and its value): how many arguments it consumed.
-    fn apply(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         if let Some((_, slot)) = TEXT_FLAGS.iter().find(|(f, _)| *f == flag) {
             *slot(self) = Some(required(flag, value)?.clone());
             return Ok(2);
@@ -866,7 +867,7 @@ impl RunArgs {
 
     /// The flags with their own value rules, then the compactor's endpoint
     /// flags, then the unknown-flag refusal.
-    fn apply_special(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_special(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         match flag {
             "--prompt-file" => self.apply_prompt_file(flag, value),
             "--dialect" => self.apply_dialect(flag, value),
@@ -880,28 +881,28 @@ impl RunArgs {
 
     // (#3207) The compactor's own unmanaged endpoint, parsed in one
     // place (`CompactorEndpointArgs::parse`); anything else is unknown.
-    fn apply_compactor_endpoint(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_compactor_endpoint(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         match self.compactor_endpoint.parse(flag, value) {
             Ok(Some(consumed)) => Ok(consumed),
-            Ok(None) => Err(ArgError::refuse(flag, format!("unknown flag: {flag}"))),
-            Err(e) => Err(ArgError::refuse(flag, e)),
+            Ok(None) => Err(Refusal::refuse(flag, format!("unknown flag: {flag}"))),
+            Err(e) => Err(Refusal::refuse(flag, e)),
         }
     }
 
-    fn apply_dialect(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_dialect(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = required(flag, value)?;
-        self.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| ArgError::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
+        self.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| Refusal::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
         Ok(2)
     }
 
-    fn apply_ratio(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_ratio(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         self.compact_threshold_ratio = Some(parse_ratio(flag, required(flag, value)?)?);
         Ok(2)
     }
 
-    fn apply_allowed_tools(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_allowed_tools(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = value.ok_or_else(|| {
-            ArgError::refuse(flag, "--allowed-tools requires a comma-separated list".into())
+            Refusal::refuse(flag, "--allowed-tools requires a comma-separated list".into())
         })?;
         self.allowed_tools = Some(parse_tool_list(v));
         Ok(2)
@@ -911,38 +912,38 @@ impl RunArgs {
     // so a substantial brief never lands on the `docker run` command
     // line (where it would hit ARG_MAX and show up in `ps`). The host
     // writes the message into a per-dispatch mount; this reads it back.
-    fn apply_prompt_file(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_prompt_file(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         if self.prompt.is_some() {
-            return Err(ArgError::refuse(
+            return Err(Refusal::refuse(
                 flag,
                 "--prompt and --prompt-file are mutually exclusive".into(),
             ));
         }
         let v = required(flag, value)?;
         let contents = std::fs::read_to_string(v)
-            .map_err(|e| ArgError::refuse(flag, format!("--prompt-file {v}: {e}")))?;
+            .map_err(|e| Refusal::refuse(flag, format!("--prompt-file {v}: {e}")))?;
         self.prompt = Some(contents);
         Ok(2)
     }
 
-    fn apply_compact_strategy(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_compact_strategy(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = value.ok_or_else(|| {
-            ArgError::refuse(
+            Refusal::refuse(
                 flag,
                 "--compact-strategy requires a value (`narrative` or `structured-slot`)".into(),
             )
         })?;
         let s = compaction::CompactionStrategy::from_cli_str(v)
-            .map_err(|msg| ArgError::refuse(flag, format!("--compact-strategy: {msg}")))?;
+            .map_err(|msg| Refusal::refuse(flag, format!("--compact-strategy: {msg}")))?;
         self.compact_strategy = Some(s);
         Ok(2)
     }
 
     /// Bad JSON warns and keeps whatever was set before (the defaults,
     /// unless an earlier `--feedback-templates-json` parsed).
-    fn apply_feedback_templates(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+    fn apply_feedback_templates(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = value.ok_or_else(|| {
-            ArgError::refuse(flag, "--feedback-templates-json requires a JSON-string value".into())
+            Refusal::refuse(flag, "--feedback-templates-json requires a JSON-string value".into())
         })?;
         match serde_json::from_str::<std::collections::BTreeMap<String, String>>(v) {
             Ok(map) => self.feedback_templates = map,
@@ -957,11 +958,11 @@ impl RunArgs {
 }
 
 /// A `u32` flag's value, at least `min`, or the refusal naming `noun`.
-fn parse_count(flag: &str, v: &str, min: u32, noun: &str) -> Result<u32, ArgError> {
+fn parse_count(flag: &str, v: &str, min: u32, noun: &str) -> Result<u32, Refusal> {
     v.parse::<u32>()
         .ok()
         .filter(|n| *n >= min)
-        .ok_or_else(|| ArgError::refuse(flag, format!("{flag} requires {noun} (got: {v})")))
+        .ok_or_else(|| Refusal::refuse(flag, format!("{flag} requires {noun} (got: {v})")))
 }
 
 /// `--model` and `--prompt`, which every dispatch needs; `--model` is
@@ -969,25 +970,36 @@ fn parse_count(flag: &str, v: &str, min: u32, noun: &str) -> Result<u32, ArgErro
 fn required_model_and_prompt(
     model: Option<String>,
     prompt: Option<String>,
-) -> Result<(String, String), ArgError> {
+) -> Result<(String, String), Refusal> {
     let model = model.ok_or_else(|| {
-        ArgError::refuse(
+        Refusal::refuse(
             "--model",
             "--model is required (e.g. darkmux:qwen3.6-35b-a3b-turboquant-mlx)".into(),
         )
     })?;
     let prompt =
-        prompt.ok_or_else(|| ArgError::refuse("--prompt", "--prompt is required".into()))?;
+        prompt.ok_or_else(|| Refusal::refuse("--prompt", "--prompt is required".into()))?;
     Ok((model, prompt))
 }
 
+/// The checkpoint `--resume`/`DARKMUX_RESUME_CHECKPOINT` named, if any. A
+/// missing/corrupt checkpoint is refused rather than silently starting
+/// fresh under a name that looked like a resume.
+fn load_resume_checkpoint(path: Option<&str>) -> Result<Option<checkpoint::RunCheckpoint>, Refusal> {
+    path.map(|path| {
+        checkpoint::read_checkpoint(Path::new(path))
+            .map_err(|e| Refusal::new(format!("--resume {path}: {e:#}")))
+    })
+    .transpose()
+}
+
 /// `--compact-threshold-ratio`: a fraction in 0.1-0.9.
-fn parse_ratio(flag: &str, v: &str) -> Result<f32, ArgError> {
+fn parse_ratio(flag: &str, v: &str) -> Result<f32, Refusal> {
     let f = v.parse::<f32>().map_err(|_| {
-        ArgError::refuse(flag, format!("--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: {v})"))
+        Refusal::refuse(flag, format!("--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: {v})"))
     })?;
     if !(0.1..=0.9).contains(&f) {
-        return Err(ArgError::refuse(
+        return Err(Refusal::refuse(
             flag,
             format!("--compact-threshold-ratio must be in range 0.1-0.9 (got: {f})"),
         ));
