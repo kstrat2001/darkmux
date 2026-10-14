@@ -6732,18 +6732,18 @@ fn materialize_dirs(
 }
 
 /// 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
-///     `.darkmux-runtime/{trajectory.jsonl, compaction-<gen>.json}` here,
-///     SEPARATE from /workspace so a
-///     `--workdir` repo never gets a `.darkmux-runtime` dropping in
-///     the tree it's operating on. Mounted at `/darkmux-out` inside
-///     the container (see the `-v` arg in `build_docker_run_argv`).
+/// `.darkmux-runtime/{trajectory.jsonl, compaction-<gen>.json}` here,
+/// SEPARATE from /workspace so a
+/// `--workdir` repo never gets a `.darkmux-runtime` dropping in
+/// the tree it's operating on. Mounted at `/darkmux-out` inside
+/// the container (see the `-v` arg in `build_docker_run_argv`).
 ///
-///     Derived from the container_name's unique micros component so
-///     two concurrent dispatches never collide. Like the workspace,
-///     this is NOT auto-cleaned — the operator inspects
-///     trajectory.jsonl after the container exits.
-///     (#2153) `opts.host_out` lets a caller name this dir up front —
-///     see `resolve_host_out`'s own doc.
+/// Derived from the container_name's unique micros component so
+/// two concurrent dispatches never collide. Like the workspace,
+/// this is NOT auto-cleaned — the operator inspects
+/// trajectory.jsonl after the container exits.
+/// (#2153) `opts.host_out` lets a caller name this dir up front —
+/// see `resolve_host_out`'s own doc.
 ///
 /// Then, in order: this dispatch's own origin stamp, any staged resume
 /// checkpoint, and the prompt file.
