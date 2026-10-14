@@ -141,39 +141,35 @@ fn test_workspace_writable(workspace: &Path) -> bool {
 
 /// `darkmux-runtime run --model <id> --system <text> --prompt <text>` driver.
 fn run_dispatch(args: &[String]) -> ExitCode {
-    let RunArgs {
-        model,
-        prompt,
-        system,
-        resume_checkpoint_path,
-        role_id,
-        execution_id,
-        response_schema,
-        endpoints,
-        streaming,
-        json_mode,
-        allowed_tools,
-        compaction,
-        max_turns,
-        max_tokens,
-        max_tokens_per_call,
-        reasoning_checkpoint_interval,
-        generation_checkpoint_interval,
-        max_stall_recoveries,
-        bound_sources,
-        feedback_templates,
-    } = match parse_run_args(args, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok()) {
-        Ok(parsed) => parsed,
-        Err(e) => return e.exit(),
-    };
-    let role_id = role_id.unwrap_or_default();
+    match prepare_dispatch(args) {
+        Ok(dispatch) => dispatch.run(),
+        Err(e) => e.exit(),
+    }
+}
 
-    let (model, prompt) = match required_model_and_prompt(model, prompt) {
-        Ok(required) => required,
-        Err(e) => return e.exit(),
-    };
+/// A dispatch ready to run: its flags, its first messages, its clients and
+/// its tools, every startup refusal before the status line already passed.
+struct Dispatch {
+    /// What the loop and the output still read; `model`, `prompt`,
+    /// `system` and `endpoints` are taken out.
+    args: RunArgs,
+    model: String,
+    initial_messages: Vec<Message>,
+    resume_from: Option<checkpoint::RunCheckpoint>,
+    /// (#2114) The envelope's `resumed_from`, when a checkpoint was loaded.
+    resumed_from: Option<darkmux_trajectory::ResumedFrom>,
+    client: LmStudioClient,
+    compactor_client: LmStudioClient,
+    tools: Vec<Tool>,
+}
 
-    let system_prompt = system.unwrap_or_else(default_system_prompt);
+/// Parse and check the flags, build the first messages, load (and later
+/// validate) any resume checkpoint, read the stdin auth and build the
+/// clients, in that order: the first refusal wins.
+fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
+    let mut args = parse_run_args(argv, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok())?;
+    let (model, prompt) = required_model_and_prompt(args.model.take(), args.prompt.take())?;
+    let system_prompt = args.system.take().unwrap_or_else(default_system_prompt);
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key
@@ -183,7 +179,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // the shape check alone accepted the tool description's own example,
     // which a reviewer seat then copied onto six mods that linked to
     // nothing. Set BEFORE the loop starts, from the values the host passed.
-    crate::tools::set_dispatch_context(execution_id.clone(), &prompt);
+    crate::tools::set_dispatch_context(args.execution_id.clone(), &prompt);
 
     let initial_messages = vec![
         Message::system(system_prompt),
@@ -197,11 +193,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // history when `resume_from` is `Some`. A missing/corrupt checkpoint
     // fails the dispatch loudly here, before anything else runs, rather
     // than silently starting fresh under a name that looked like a resume.
-    let resume_from = match load_resume_checkpoint(resume_checkpoint_path.as_deref()) {
-        Ok(resume_from) => resume_from,
-        Err(e) => return e.exit(),
-    };
-    let resumed_from_turn_index = resume_from.as_ref().map(|c| c.turns);
+    let resume_from = load_resume_checkpoint(args.resume_checkpoint_path.as_deref())?;
+    let resumed_from = args
+        .resume_checkpoint_path
+        .clone()
+        .zip(resume_from.as_ref().map(|c| c.turns))
+        .map(|(path, turn_index)| darkmux_trajectory::ResumedFrom {
+            path,
+            turn_index: u64::from(turn_index),
+        });
 
     // (#1187 audit finding) Build the compactor's client from `base_url`,
     // and NEVER apply `--chat-url`/
@@ -228,10 +228,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // otherwise proceed unauthenticated and fail confusingly on the FIRST
     // model call instead of loudly at startup. (#3207) The brain's header and
     // the compactor's share the one blob (`read_stdin_auth`).
-    let (client, compactor_client) = match build_clients(endpoints) {
-        Ok(clients) => clients,
-        Err(e) => return e.exit(),
-    };
+    let (client, compactor_client) = build_clients(std::mem::take(&mut args.endpoints))?;
 
     // Tool order matters — LLMs have positional bias when picking between
     // plausible candidates. Order reflects the workflow we want the model
@@ -241,73 +238,93 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // no use in real dispatches; sending it adds tool-catalog overhead
     // the model would never invoke.
     let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
-    let tools = advertised_tools(&full_catalog, allowed_tools.as_deref());
-    // (#2268) The advertised set is a FACT about this run and belongs in
-    // the artifact: the crawler's `create_finding` was silently absent from
-    // every request for two releases, and the first place that was visible
-    // was the model's own reasoning ("The tools I have are: search, read,
-    // bash"). Recorded on `dispatch.start` so the next such gap is a grep.
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let tools = advertised_tools(&full_catalog, args.allowed_tools.as_deref());
 
-    if let Err(e) = validate_resume(
+    validate_resume(
         resume_from.as_ref(),
-        resume_checkpoint_path.as_deref(),
+        args.resume_checkpoint_path.as_deref(),
         &tools,
         &initial_messages[0],
-    ) {
-        return e.exit();
-    }
+    )?;
 
-    print_dispatching_line(json_mode, &model);
-
-    if let Err(e) = compaction.validate() {
-        return e.exit();
-    }
-
-    let mut traj = open_trajectory(&model, &initial_messages, &tool_names);
-
-    let compaction_cfg = compaction.into_config();
-    let response_format = response_format_for(response_schema.as_deref());
-    bound_sources.stamp();
-    let run_result = loop_runner::run_resumable(
-        &client,
-        &compactor_client,
-        &model,
+    Ok(Dispatch {
+        args,
+        model,
         initial_messages,
-        &tools,
-        &mut traj,
-        streaming,
-        &compaction_cfg,
-        max_turns,
-        max_tokens,
-        max_tokens_per_call,
-        reasoning_checkpoint_interval,
-        generation_checkpoint_interval,
-        max_stall_recoveries,
-        feedback_templates,
-        response_format,
-        // (#2114 finding 3) pace.json / checkpoint.json live in the
-        // out-dir mount, not the workspace — see `loop_runner::
-        // run_resumable`'s doc on this param for why.
-        &trajectory::out_base(),
-        &role_id,
         resume_from,
-    );
+        resumed_from,
+        client,
+        compactor_client,
+        tools,
+    })
+}
 
-    let outcome = outcome_or_report(run_result);
+impl Dispatch {
+    /// The status line, the compaction-input refusal, then the run itself:
+    /// trajectory, loop, `dispatch.complete`, output and exit code.
+    fn run(self) -> ExitCode {
+        let Dispatch {
+            args,
+            model,
+            initial_messages,
+            resume_from,
+            resumed_from,
+            client,
+            compactor_client,
+            tools,
+        } = self;
+        print_dispatching_line(args.json_mode, &model);
 
-    let result_str = result_str(outcome.as_ref());
+        if let Err(e) = args.compaction.validate() {
+            return e.exit();
+        }
 
-    let wall_ms = close_trajectory(&mut traj, result_str, outcome.as_ref());
+        // (#2268) The advertised set is a FACT about this run and belongs in
+        // the artifact: the crawler's `create_finding` was silently absent from
+        // every request for two releases, and the first place that was visible
+        // was the model's own reasoning ("The tools I have are: search, read,
+        // bash"). Recorded on `dispatch.start` so the next such gap is a grep.
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let mut traj = open_trajectory(&model, &initial_messages, &tool_names);
 
-    let resumed_from = resume_checkpoint_path.zip(resumed_from_turn_index).map(|(path, turn_index)| {
-        darkmux_trajectory::ResumedFrom { path, turn_index: u64::from(turn_index) }
-    });
-    match &outcome {
-        Some(o) => print_success(o, json_mode, result_str, wall_ms, resumed_from),
-        None => print_failure(json_mode, result_str, wall_ms, &model),
+        let compaction_cfg = args.compaction.into_config();
+        let response_format = response_format_for(args.response_schema.as_deref());
+        args.bound_sources.stamp();
+        let run_result = loop_runner::run_resumable(
+            &client,
+            &compactor_client,
+            &model,
+            initial_messages,
+            &tools,
+            &mut traj,
+            args.streaming,
+            &compaction_cfg,
+            args.max_turns,
+            args.max_tokens,
+            args.max_tokens_per_call,
+            args.reasoning_checkpoint_interval,
+            args.generation_checkpoint_interval,
+            args.max_stall_recoveries,
+            args.feedback_templates,
+            response_format,
+            // (#2114 finding 3) pace.json / checkpoint.json live in the
+            // out-dir mount, not the workspace — see `loop_runner::
+            // run_resumable`'s doc on this param for why.
+            &trajectory::out_base(),
+            args.role_id.as_deref().unwrap_or_default(),
+            resume_from,
+        );
+
+        let outcome = outcome_or_report(run_result);
+        let result_str = result_str(outcome.as_ref());
+        let wall_ms = close_trajectory(&mut traj, result_str, outcome.as_ref());
+
+        match &outcome {
+            Some(o) => print_success(o, args.json_mode, result_str, wall_ms, resumed_from),
+            None => print_failure(args.json_mode, result_str, wall_ms, &model),
+        }
+        ExitCode::from(exit_status(outcome.as_ref()))
     }
-    ExitCode::from(exit_status(outcome.as_ref()))
 }
 
 /// System prompt: a default that names the runtime + names the
@@ -756,7 +773,13 @@ impl RunArgs {
 
     fn apply_dialect(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = required(flag, value)?;
-        self.endpoints.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| Refusal::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
+        let dialect = lmstudio::Dialect::parse(v).ok_or_else(|| {
+            Refusal::refuse(
+                flag,
+                format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})"),
+            )
+        })?;
+        self.endpoints.dialect = Some(dialect);
         Ok(2)
     }
 
@@ -983,6 +1006,7 @@ fn outcome_or_report(
 ///   - Some(outcome) + terminal_reason=Stop  → "stop"
 ///   - Some(outcome) + terminal_reason=MaxTurns → "max_turns"
 ///   - None (loop errored) → "error"
+///
 /// Pre-fix MAX_TURNS was an Err indistinguishable from
 /// infrastructure failures; structured terminal reason lets
 /// downstream consumers (qa-review skill, lab adapter, future
