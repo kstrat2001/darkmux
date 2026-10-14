@@ -886,7 +886,7 @@
         let full = include_str!("dispatch_internal.rs");
         let src = &full[..full.rfind("mod tests;").unwrap()];
         assert_eq!(
-            src.matches("record_origin_container(&host_out, &container_name, opts.resume_from.as_deref());").count(),
+            src.matches("record_origin_container(&run.host_out, &container_name, opts.resume_from.as_deref());").count(),
             1,
             "dispatch() records its container, and on the origin when it resumes"
         );
@@ -954,7 +954,7 @@
         let full = include_str!("dispatch_internal.rs");
         let src = &full[..full.rfind("mod tests;").expect("the test module declaration")];
         assert_eq!(
-            src.matches("stamp_own_execution(\n        &mut execution_lock,").count(),
+            src.matches("stamp_own_execution(\n        execution_lock,").count(),
             1,
             "dispatch() stamps its identity and takes its lock through stamp_own_execution"
         );
@@ -20536,8 +20536,13 @@ fn every_sampler_join_in_dispatch_is_the_bounded_one() {
     );
     assert_eq!(
         src.matches("bound: sampler_join_bound(),").count(),
+        1,
+        "the early-exit teardown hands the sampler over with the derived bound"
+    );
+    assert_eq!(
+        src.matches("let trajectory_summary = threads.teardown(&launched.container_name);").count(),
         2,
-        "both early-exit teardowns hand the sampler over with the derived bound"
+        "both early exits tear down through that one teardown"
     );
 }
 
