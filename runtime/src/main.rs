@@ -149,11 +149,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         role_id,
         execution_id,
         response_schema,
-        base_url,
-        chat_url,
-        dialect,
-        auth_header_stdin,
-        compactor_endpoint,
+        endpoints,
         streaming,
         json_mode,
         allowed_tools,
@@ -241,20 +237,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // otherwise proceed unauthenticated and fail confusingly on the FIRST
     // model call instead of loudly at startup. (#3207) The brain's header and
     // the compactor's share the one blob (`read_stdin_auth`).
-    let stdin_auth = match read_stdin_auth(auth_header_stdin, compactor_endpoint.auth_stdin) {
-        Ok(auth) => auth,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
+    let (client, compactor_client) = match build_clients(endpoints) {
+        Ok(clients) => clients,
+        Err(e) => return e.exit(),
     };
-    let compactor_client = build_client(
-        base_url.as_deref(),
-        compactor_endpoint.chat_url,
-        compactor_endpoint.dialect,
-        stdin_auth.compactor,
-    );
-    let client = build_client(base_url.as_deref(), chat_url, dialect, stdin_auth.brain);
 
     // Tool order matters — LLMs have positional bias when picking between
     // plausible candidates. Order reflects the workflow we want the model
@@ -606,45 +592,7 @@ struct RunArgs {
     // (#1038) Raw JSON-schema string for the role's output, wrapped into an
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     response_schema: Option<String>,
-    base_url: Option<String>,
-    // (#1187) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
-    // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
-    // LMStudio, the host passes the FULL chat-completions URL here (Azure
-    // needs a `?api-version=` query string that `base_url` + the client's
-    // unconditional `/chat/completions` suffix can't express). When set,
-    // this overrides `base_url` for request routing.
-    chat_url: Option<String>,
-    // (#2902) The endpoint's declared request dialect, when it differs from
-    // what `--chat-url` presence implies.
-    dialect: Option<lmstudio::Dialect>,
-    // (#1187) When true, read the remote endpoint's auth header as JSON
-    // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
-    // host pipes it in immediately after spawning this container (with `-i`)
-    // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
-    // `/workspace`-escape check (it's the general-purpose escape hatch), so
-    // a secret-bearing file anywhere the container can see is reachable by
-    // a model-issued `cat` at any point during the run. Stdin is read
-    // exactly once, before the agent loop (and any tool call) exists, and
-    // leaves no FILESYSTEM artifact afterward (host or container). This
-    // closes the file-based exposure entirely, but is not a complete
-    // isolation boundary: the secret still lives in this process's memory
-    // for the dispatch's duration, and a same-uid `bash` process could in
-    // principle attempt `/proc/<this-process's-pid>/mem` inspection
-    // depending on the host's `kernel.yama.ptrace_scope` — a residual risk
-    // `--cap-drop=ALL` doesn't close (it blocks `ptrace()`, not a same-uid
-    // `/proc/<pid>/mem` read). (#2481) Since `docker run --init` gave the
-    // container a real PID 1 (docker's tini, which reaps the orphans #2215's
-    // bash-tool fix can leave behind), this process is PID 2, not PID 1 —
-    // the attack this note describes is unaffected (same-uid `/proc/<pid>/mem`
-    // access doesn't care which pid), but a reader shouldn't infer this
-    // process is still the container's init.
-    // False when the remote endpoint declares no auth (or no remote brain).
-    auth_header_stdin: bool,
-    // (#3207) The compactor on an UNMANAGED utility endpoint: its full
-    // chat-completions URL, its dialect, and whether its auth header rides
-    // the stdin blob (under `compactor`). All absent: the compactor talks to
-    // LM Studio at `--base-url`, as before.
-    compactor_endpoint: CompactorEndpointArgs,
+    endpoints: EndpointArgs,
     // Streaming is on by default (#205). Operators / tests pass
     // `--no-stream` to fall back to the Phase 2 single-shot path —
     // useful for deterministic benchmarks or when a runtime regression
@@ -746,6 +694,52 @@ struct RunArgs {
     feedback_templates: std::collections::BTreeMap<String, String>,
 }
 
+/// Where the brain and the compactor are reached (`--base-url`,
+/// `--chat-url`, `--dialect`, `--auth-header-stdin` and the compactor's own
+/// endpoint flags); [`build_clients`] turns them into clients.
+#[derive(Debug, Default)]
+struct EndpointArgs {
+    base_url: Option<String>,
+    // (#1187) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
+    // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
+    // LMStudio, the host passes the FULL chat-completions URL here (Azure
+    // needs a `?api-version=` query string that `base_url` + the client's
+    // unconditional `/chat/completions` suffix can't express). When set,
+    // this overrides `base_url` for request routing.
+    chat_url: Option<String>,
+    // (#2902) The endpoint's declared request dialect, when it differs from
+    // what `--chat-url` presence implies.
+    dialect: Option<lmstudio::Dialect>,
+    // (#1187) When true, read the remote endpoint's auth header as JSON
+    // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
+    // host pipes it in immediately after spawning this container (with `-i`)
+    // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
+    // `/workspace`-escape check (it's the general-purpose escape hatch), so
+    // a secret-bearing file anywhere the container can see is reachable by
+    // a model-issued `cat` at any point during the run. Stdin is read
+    // exactly once, before the agent loop (and any tool call) exists, and
+    // leaves no FILESYSTEM artifact afterward (host or container). This
+    // closes the file-based exposure entirely, but is not a complete
+    // isolation boundary: the secret still lives in this process's memory
+    // for the dispatch's duration, and a same-uid `bash` process could in
+    // principle attempt `/proc/<this-process's-pid>/mem` inspection
+    // depending on the host's `kernel.yama.ptrace_scope` — a residual risk
+    // `--cap-drop=ALL` doesn't close (it blocks `ptrace()`, not a same-uid
+    // `/proc/<pid>/mem` read). (#2481) Since `docker run --init` gave the
+    // container a real PID 1 (docker's tini, which reaps the orphans #2215's
+    // bash-tool fix can leave behind), this process is PID 2, not PID 1 —
+    // the attack this note describes is unaffected (same-uid `/proc/<pid>/mem`
+    // access doesn't care which pid), but a reader shouldn't infer this
+    // process is still the container's init.
+    // False when the remote endpoint declares no auth (or no remote brain).
+    auth_header_stdin: bool,
+    // (#3207) The compactor on an UNMANAGED utility endpoint: its full
+    // chat-completions URL, its dialect, and whether its auth header rides
+    // the stdin blob (under `compactor`). All absent: the compactor talks to
+    // LM Studio at `--base-url`, as before.
+    compactor: CompactorEndpointArgs,
+}
+
 /// A dispatch refused before it starts (a bad flag, an unreadable
 /// checkpoint, a broken auth pipe): the stderr line, and whether it exits
 /// through `std::process::exit(2)` rather than returning exit code 2. The
@@ -800,8 +794,8 @@ const TEXT_FLAGS: [(&str, TextSlot); 14] = [
     ("--prompt", |a| &mut a.prompt),
     ("--system", |a| &mut a.system),
     ("--response-schema", |a| &mut a.response_schema),
-    ("--base-url", |a| &mut a.base_url),
-    ("--chat-url", |a| &mut a.chat_url),
+    ("--base-url", |a| &mut a.endpoints.base_url),
+    ("--chat-url", |a| &mut a.endpoints.chat_url),
     ("--resume", |a| &mut a.resume_checkpoint_path),
     ("--role-id", |a| &mut a.role_id),
     ("--execution-id", |a| &mut a.execution_id),
@@ -857,7 +851,7 @@ impl RunArgs {
     /// The flags that take no value.
     fn apply_switch(&mut self, flag: &str) -> Option<usize> {
         match flag {
-            "--auth-header-stdin" => self.auth_header_stdin = true,
+            "--auth-header-stdin" => self.endpoints.auth_header_stdin = true,
             "--no-stream" => self.streaming = false,
             "--json" => self.json_mode = true,
             _ => return None,
@@ -882,7 +876,7 @@ impl RunArgs {
     // (#3207) The compactor's own unmanaged endpoint, parsed in one
     // place (`CompactorEndpointArgs::parse`); anything else is unknown.
     fn apply_compactor_endpoint(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
-        match self.compactor_endpoint.parse(flag, value) {
+        match self.endpoints.compactor.parse(flag, value) {
             Ok(Some(consumed)) => Ok(consumed),
             Ok(None) => Err(Refusal::refuse(flag, format!("unknown flag: {flag}"))),
             Err(e) => Err(Refusal::refuse(flag, e)),
@@ -891,7 +885,7 @@ impl RunArgs {
 
     fn apply_dialect(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
         let v = required(flag, value)?;
-        self.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| Refusal::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
+        self.endpoints.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| Refusal::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
         Ok(2)
     }
 
@@ -1102,6 +1096,22 @@ fn build_client(
         client = client.with_auth_header(h, v);
     }
     client
+}
+
+/// The brain's client and the compactor's, in that order, after reading the
+/// stdin auth blob (a read or parse failure is refused).
+fn build_clients(endpoints: EndpointArgs) -> Result<(LmStudioClient, LmStudioClient), Refusal> {
+    let EndpointArgs { base_url, chat_url, dialect, auth_header_stdin, compactor } = endpoints;
+    let stdin_auth =
+        read_stdin_auth(auth_header_stdin, compactor.auth_stdin).map_err(Refusal::new)?;
+    let compactor_client = build_client(
+        base_url.as_deref(),
+        compactor.chat_url,
+        compactor.dialect,
+        stdin_auth.compactor,
+    );
+    let client = build_client(base_url.as_deref(), chat_url, dialect, stdin_auth.brain);
+    Ok((client, compactor_client))
 }
 
 /// (#3207) The compactor's own unmanaged endpoint, from
