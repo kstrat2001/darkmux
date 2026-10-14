@@ -266,16 +266,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         return e.exit();
     }
 
-    // Open the trajectory recorder against the mounted out-dir (SEPARATE
-    // from /workspace so the runtime never writes its own bookkeeping into
-    // the tree it's operating on). The container is --rm, so this is what
-    // survives it.
-    let mut traj = trajectory::Trajectory::open(&trajectory::out_base());
-    // (#3014) A SIGTERM/SIGINT closes the trajectory with `interrupted`.
-    interrupt::install_for(&traj);
-    let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
-    let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
-    traj.append_dispatch_start(&model, system_chars, prompt_chars, &tool_names);
+    let mut traj = open_trajectory(&model, &initial_messages, &tool_names);
 
     // (#368) Compaction config from explicit CLI args; no env-var
     // fallback (operator's tuning surface is the profile JSON, not
@@ -1025,6 +1016,24 @@ fn parse_ratio(flag: &str, v: &str) -> Result<f32, Refusal> {
 /// `--allowed-tools`: the comma-separated names, trimmed, blanks dropped.
 fn parse_tool_list(v: &str) -> Vec<String> {
     v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Open the trajectory recorder against the mounted out-dir (SEPARATE
+/// from /workspace so the runtime never writes its own bookkeeping into
+/// the tree it's operating on). The container is --rm, so this is what
+/// survives it. Installs the signal handler and records `dispatch.start`.
+fn open_trajectory(
+    model: &str,
+    initial_messages: &[Message],
+    tool_names: &[&str],
+) -> trajectory::Trajectory {
+    let mut traj = trajectory::Trajectory::open(&trajectory::out_base());
+    // (#3014) A SIGTERM/SIGINT closes the trajectory with `interrupted`.
+    interrupt::install_for(&traj);
+    let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
+    let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
+    traj.append_dispatch_start(model, system_chars, prompt_chars, tool_names);
+    traj
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
