@@ -140,646 +140,46 @@ fn test_workspace_writable(workspace: &Path) -> bool {
 }
 
 /// `darkmux-runtime run --model <id> --system <text> --prompt <text>` driver.
-///
-/// Parses flags by hand to keep zero clap dependency in the runtime.
-/// Will gain a proper parser in Phase 4.
 fn run_dispatch(args: &[String]) -> ExitCode {
-    let mut model: Option<String> = None;
-    let mut prompt: Option<String> = None;
-    let mut system: Option<String> = None;
-    // (#2114) Path to a `checkpoint.json` (under the out-dir mount,
-    // `/darkmux-out` in production) written by a prior,
-    // interrupted dispatch. When set, the loop reloads the checkpoint's
-    // message history instead of starting from `--system`/`--prompt` — see
-    // `checkpoint::read_checkpoint`. `--resume` takes precedence over the
-    // env var when both are present (flag wins, matching the CLI-over-env
-    // precedence every other runtime flag/env pair in this file follows).
-    let mut resume_checkpoint_path: Option<String> =
-        std::env::var("DARKMUX_RESUME_CHECKPOINT").ok();
-    // (v3 checkpoint schema, security audit, #2114 resume follow-up) The
-    // role id THIS dispatch is running as — host-supplied, since the
-    // runtime has no other way to know it. Stamped into every
-    // `checkpoint.json` write so a LATER `--resume-from` can refuse,
-    // host-side, to resume a checkpoint recorded under a different role
-    // (`dispatch_internal::stage_resume_checkpoint`). NOT required for a
-    // fresh (non-resuming) dispatch to run — an absent/empty value just
-    // means a future resume attempt's role comparison will (correctly)
-    // never match anything but another equally-unlabeled checkpoint.
-    let mut role_id: String = String::new();
-    // (#2386) The host's session id for this dispatch, when it passed one —
-    // see the `--execution-id` arm below.
-    let mut execution_id: Option<String> = None;
-    // (#1038) Raw JSON-schema string for the role's output, wrapped into an
-    // LMStudio json_schema response_format before the loop. None ⇒ free-form.
-    let mut response_schema: Option<String> = None;
-    let mut base_url: Option<String> = None;
-    // (#1187) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
-    // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
-    // LMStudio, the host passes the FULL chat-completions URL here (Azure
-    // needs a `?api-version=` query string that `base_url` + the client's
-    // unconditional `/chat/completions` suffix can't express). When set,
-    // this overrides `base_url` for request routing.
-    let mut chat_url: Option<String> = None;
-    // (#2902) The endpoint's declared request dialect, when it differs from
-    // what `--chat-url` presence implies.
-    let mut dialect: Option<lmstudio::Dialect> = None;
-    // (#1187) When true, read the remote endpoint's auth header as JSON
-    // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
-    // host pipes it in immediately after spawning this container (with `-i`)
-    // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
-    // `/workspace`-escape check (it's the general-purpose escape hatch), so
-    // a secret-bearing file anywhere the container can see is reachable by
-    // a model-issued `cat` at any point during the run. Stdin is read
-    // exactly once, before the agent loop (and any tool call) exists, and
-    // leaves no FILESYSTEM artifact afterward (host or container). This
-    // closes the file-based exposure entirely, but is not a complete
-    // isolation boundary: the secret still lives in this process's memory
-    // for the dispatch's duration, and a same-uid `bash` process could in
-    // principle attempt `/proc/<this-process's-pid>/mem` inspection
-    // depending on the host's `kernel.yama.ptrace_scope` — a residual risk
-    // `--cap-drop=ALL` doesn't close (it blocks `ptrace()`, not a same-uid
-    // `/proc/<pid>/mem` read). (#2481) Since `docker run --init` gave the
-    // container a real PID 1 (docker's tini, which reaps the orphans #2215's
-    // bash-tool fix can leave behind), this process is PID 2, not PID 1 —
-    // the attack this note describes is unaffected (same-uid `/proc/<pid>/mem`
-    // access doesn't care which pid), but a reader shouldn't infer this
-    // process is still the container's init.
-    // False when the remote endpoint declares no auth (or no remote brain).
-    let mut auth_header_stdin: bool = false;
-    // (#3207) The compactor on an UNMANAGED utility endpoint: its full
-    // chat-completions URL, its dialect, and whether its auth header rides
-    // the stdin blob (under `compactor`). All absent: the compactor talks to
-    // LM Studio at `--base-url`, as before.
-    let mut compactor_endpoint = CompactorEndpointArgs::default();
-    // Streaming is on by default (#205). Operators / tests pass
-    // `--no-stream` to fall back to the Phase 2 single-shot path —
-    // useful for deterministic benchmarks or when a runtime regression
-    // is suspected to involve the streaming layer specifically.
-    let mut streaming: bool = true;
-    // `--json` flips stdout to a single structured envelope at end of
-    // dispatch (Phase-A). Default stays human-readable for direct CLI
-    // use; JSON is opt-in for consumers like the qa-review skill that
-    // need machine-parseable output. All progress/status lines go to
-    // stderr when JSON is set so stdout is clean for `jq`.
-    let mut json_mode: bool = false;
-    // `--allowed-tools <comma-separated-names>` filters the runtime's
-    // hardcoded tool catalog to a subset (computed dispatcher-side from
-    // the role's tool_palette.allow minus tool_palette.deny). When
-    // absent, the runtime exposes the full catalog (back-compat).
-    //
-    // The catalog IS the capability surface — the model can only call
-    // tools that appear in the `tools[]` field of the chat-completions
-    // request. Filtering here ensures denied tools never reach the
-    // model, regardless of whether the model follows its system-prompt
-    // doctrine. Pre-filter, a model could ignore "you must not edit"
-    // in the system prompt and call `edit` anyway because the tool
-    // existed in the catalog.
-    let mut allowed_tools: Option<Vec<String>> = None;
-    // (#368 / #482) Compaction config flags — explicit values from the
-    // host (which derives them from `profile.runtime.compaction.*` in
-    // the typed schema landed in #357). The runtime requires at least
-    // one of `--context-window` or `--compact-threshold-tokens` per
-    // #482's `validate_compaction_cli_inputs`; the absolute fallback
-    // const that pre-#482 covered the all-None case is gone. Env vars
-    // are NOT consulted.
-    let mut compact_threshold_tokens: Option<u32> = None;
-    let mut compactor_model: Option<String> = None;
-    // (#2808) The window the COMPACTOR loads at, resolved host-side by
-    // `resolve_compactor_load_window` and passed through so compaction can
-    // size its excerpt to the model that has to READ it. Absent ⇒ unbounded,
-    // exactly as before.
-    let mut compactor_context_window: Option<u32> = None;
-    // (#368) Formula-based trigger: max_history_share fraction +
-    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
-    // Both must be set for the formula trigger to activate; either
-    // missing → formula disabled, absolute-threshold-only behavior.
-    let mut compact_threshold_ratio: Option<f32> = None;
-    let mut context_window: Option<u32> = None;
-    // (#372 T2-C) Compaction strategy override. When None, runtime
-    // uses default Narrative; operator opts into tier-2 by setting
-    // `profile.runtime.compaction.strategy: "structured-slot"` which
-    // host plumbs via `--compact-strategy structured-slot`.
-    let mut compact_strategy: Option<compaction::CompactionStrategy> = None;
-    // (#377) Escalation bound — after this many compactions, the
-    // runtime exits with TerminalReason::EscalationTriggered. Host
-    // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
-    // (typed field landed in #357; consumer is #377). None = unbounded.
-    let mut bail_after_compactions: Option<u32> = None;
-    // (#383) Operator-tunable custom instructions for the compactor.
-    // Host plumbs from `profile.runtime.compaction.custom_instructions`
-    // (typed field, schema-isolation doctrine). None = no augmentation.
-    let mut compactor_custom_instructions: Option<String> = None;
-
-    // (#457) Operator-opt-in caps on per-dispatch turn count + cumulative
-    // completion tokens. Host derives from `DARKMUX_RUNTIME_MAX_TURNS` /
-    // `DARKMUX_RUNTIME_MAX_TOKENS` env vars. Both default unlimited;
-    // the inactivity timeout (#458) catches the genuine-stuck case.
-    let mut max_turns: Option<u32> = None;
-    let mut max_tokens: Option<u32> = None;
-    // (#1221) Per-call completion-token cap override. Host derives from
-    // `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL`. None = the built-in default
-    // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
-    let mut max_tokens_per_call: Option<u32> = None;
-    let mut reasoning_checkpoint_interval: Option<u32> = None;
-    // (#2171) Host derives from `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`.
-    // None = the built-in default (`loop_runner::GENERATION_CHECKPOINT_INTERVAL`
-    // = 4000).
-    let mut generation_checkpoint_interval: Option<u32> = None;
-    // (#2190) The stall-recovery budget override. Host derives from
-    // `DARKMUX_RUNTIME_MAX_STALL_RECOVERIES` / `config.runtime.
-    // max_stall_recoveries`. None = the built-in default
-    // (`loop_runner::MAX_STALL_RECOVERIES` = 2). No `-source` companion
-    // flag — unlike the three per-call knobs above, this budget isn't a
-    // `BoundKind` the runtime stamps per-hit provenance for.
-    let mut max_stall_recoveries: Option<u32> = None;
-    // (#2165) Provenance for the three knobs above — which of
-    // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
-    // value the host just forwarded. The host computes this via
-    // `darkmux_types::config_access`'s `_with_source` accessors (this crate
-    // can't depend on `darkmux-types` — see `runtime/Cargo.toml`'s doc) and
-    // passes it as a companion `--<flag>-source` flag. Unrecognized/absent
-    // falls to "built-in" via `BoundSource::from_cli_str`.
-    let mut max_tokens_per_call_source: Option<String> = None;
-    let mut reasoning_checkpoint_interval_source: Option<String> = None;
-    // (#2171 rebase onto #2165) Same companion-source pattern, for the
-    // generation check-in.
-    let mut generation_checkpoint_interval_source: Option<String> = None;
-
-    // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
-    // serializes Role.feedback_templates to JSON; runtime parses into
-    // a BTreeMap<signal_kind, template_string>. Empty/absent = the
-    // FeedbackInjector uses its hardcoded defaults.
-    let mut feedback_templates: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--model" => {
-                if let Some(v) = args.get(i + 1) {
-                    model = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--model requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--prompt" => {
-                if let Some(v) = args.get(i + 1) {
-                    prompt = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--prompt requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            // (#386) Read the user prompt from a mounted file instead of argv,
-            // so a substantial brief never lands on the `docker run` command
-            // line (where it would hit ARG_MAX and show up in `ps`). The host
-            // writes the message into a per-dispatch mount; this reads it back.
-            "--prompt-file" => {
-                if prompt.is_some() {
-                    eprintln!("--prompt and --prompt-file are mutually exclusive");
-                    return ExitCode::from(2);
-                }
-                if let Some(v) = args.get(i + 1) {
-                    match std::fs::read_to_string(v) {
-                        Ok(contents) => prompt = Some(contents),
-                        Err(e) => {
-                            eprintln!("--prompt-file {v}: {e}");
-                            return ExitCode::from(2);
-                        }
-                    }
-                    i += 2;
-                } else {
-                    eprintln!("--prompt-file requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--system" => {
-                if let Some(v) = args.get(i + 1) {
-                    system = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--system requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--response-schema" => {
-                if let Some(v) = args.get(i + 1) {
-                    response_schema = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--response-schema requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--base-url" => {
-                if let Some(v) = args.get(i + 1) {
-                    base_url = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--base-url requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--chat-url" => {
-                if let Some(v) = args.get(i + 1) {
-                    chat_url = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--chat-url requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--dialect" => match args.get(i + 1).map(|v| (v, lmstudio::Dialect::parse(v))) {
-                Some((_, Some(d))) => {
-                    dialect = Some(d);
-                    i += 2;
-                }
-                Some((v, None)) => {
-                    eprintln!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})");
-                    return ExitCode::from(2);
-                }
-                None => {
-                    eprintln!("--dialect requires a value");
-                    return ExitCode::from(2);
-                }
-            },
-            "--auth-header-stdin" => {
-                auth_header_stdin = true;
-                i += 1;
-            }
-            "--resume" => {
-                if let Some(v) = args.get(i + 1) {
-                    resume_checkpoint_path = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--resume requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--role-id" => {
-                if let Some(v) = args.get(i + 1) {
-                    role_id = v.clone();
-                    i += 2;
-                } else {
-                    eprintln!("--role-id requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            // (#2386) The host's session id — the `<dispatch>` half of every
-            // finding key this dispatch's `create_finding` calls will be
-            // stored under (`dispatch_internal.rs::materialize_finding`
-            // builds `<execution_id>/<emit_seq>`). Optional: a host that does
-            // not pass it leaves the runtime unable to name a key, and both
-            // tools fall back to their pre-#2386 behavior rather than
-            // guessing one.
-            "--execution-id" => {
-                if let Some(v) = args.get(i + 1) {
-                    execution_id = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--execution-id requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--no-stream" => {
-                streaming = false;
-                i += 1;
-            }
-            "--json" => {
-                json_mode = true;
-                i += 1;
-            }
-            "--allowed-tools" => {
-                if let Some(v) = args.get(i + 1) {
-                    let names: Vec<String> = v
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    allowed_tools = Some(names);
-                    i += 2;
-                } else {
-                    eprintln!("--allowed-tools requires a comma-separated list");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compact-threshold-tokens" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            compact_threshold_tokens = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--compact-threshold-tokens requires a positive integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--compact-threshold-tokens requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compactor-model" => {
-                if let Some(v) = args.get(i + 1) {
-                    compactor_model = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--compactor-model requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compact-threshold-ratio" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<f32>() {
-                        Ok(f) if (0.1..=0.9).contains(&f) => {
-                            compact_threshold_ratio = Some(f);
-                            i += 2;
-                        }
-                        Ok(f) => {
-                            eprintln!(
-                                "--compact-threshold-ratio must be in range 0.1-0.9 (got: {f})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--compact-threshold-ratio requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compactor-context-window" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            compactor_context_window = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--compactor-context-window requires a positive integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--compactor-context-window requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--context-window" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            context_window = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--context-window requires a positive integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--context-window requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compact-strategy" => {
-                if let Some(v) = args.get(i + 1) {
-                    match compaction::CompactionStrategy::from_cli_str(v) {
-                        Ok(s) => {
-                            compact_strategy = Some(s);
-                            i += 2;
-                        }
-                        Err(msg) => {
-                            eprintln!("--compact-strategy: {msg}");
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "--compact-strategy requires a value (`narrative` or `structured-slot`)"
-                    );
-                    return ExitCode::from(2);
-                }
-            }
-            "--bail-after-compactions" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            bail_after_compactions = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--bail-after-compactions requires a positive integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--bail-after-compactions requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--compactor-custom-instructions" => {
-                if let Some(v) = args.get(i + 1) {
-                    compactor_custom_instructions = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--compactor-custom-instructions requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--max-turns" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            max_turns = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!("--max-turns requires a positive integer (got: {v})");
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--max-turns requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--reasoning-checkpoint-interval" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) if n > 0 => {
-                            reasoning_checkpoint_interval = Some(n);
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!(
-                                "--reasoning-checkpoint-interval requires a positive integer (got: {v})"
-                            );
-                            std::process::exit(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--reasoning-checkpoint-interval requires a value");
-                    std::process::exit(2);
-                }
-            }
-            "--reasoning-checkpoint-interval-source" => {
-                if let Some(v) = args.get(i + 1) {
-                    reasoning_checkpoint_interval_source = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--reasoning-checkpoint-interval-source requires a value");
-                    std::process::exit(2);
-                }
-            }
-            "--generation-checkpoint-interval" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) if n > 0 => {
-                            generation_checkpoint_interval = Some(n);
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!(
-                                "--generation-checkpoint-interval requires a positive integer (got: {v})"
-                            );
-                            std::process::exit(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--generation-checkpoint-interval requires a value");
-                    std::process::exit(2);
-                }
-            }
-            "--generation-checkpoint-interval-source" => {
-                if let Some(v) = args.get(i + 1) {
-                    generation_checkpoint_interval_source = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--generation-checkpoint-interval-source requires a value");
-                    std::process::exit(2);
-                }
-            }
-            // (#2190) The stall-recovery budget override — how many useless
-            // turns (empty `tool_calls`, or a runaway-reasoning cut) the
-            // runtime tolerates before escalating out of local-tier.
-            "--max-stall-recoveries" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            max_stall_recoveries = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--max-stall-recoveries requires a non-negative integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--max-stall-recoveries requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--max-tokens-per-call" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            max_tokens_per_call = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "--max-tokens-per-call requires a positive integer (got: {v})"
-                            );
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--max-tokens-per-call requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--max-tokens-per-call-source" => {
-                if let Some(v) = args.get(i + 1) {
-                    max_tokens_per_call_source = Some(v.clone());
-                    i += 2;
-                } else {
-                    eprintln!("--max-tokens-per-call-source requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--max-tokens" => {
-                if let Some(v) = args.get(i + 1) {
-                    match v.parse::<u32>() {
-                        Ok(n) => {
-                            max_tokens = Some(n);
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!("--max-tokens requires a positive integer (got: {v})");
-                            return ExitCode::from(2);
-                        }
-                    }
-                } else {
-                    eprintln!("--max-tokens requires a value");
-                    return ExitCode::from(2);
-                }
-            }
-            "--feedback-templates-json" => {
-                if let Some(v) = args.get(i + 1) {
-                    match serde_json::from_str::<std::collections::BTreeMap<String, String>>(v) {
-                        Ok(map) => {
-                            feedback_templates = map;
-                            i += 2;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "--feedback-templates-json failed to parse: {e}. \
-                                 Expected JSON object of {{signal_kind: template_string}}. \
-                                 Ignoring; runtime will use defaults. (#457 Step 2)"
-                            );
-                            i += 2;
-                        }
-                    }
-                } else {
-                    eprintln!("--feedback-templates-json requires a JSON-string value");
-                    return ExitCode::from(2);
-                }
-            }
-            // (#3207) The compactor's own unmanaged endpoint, parsed in one
-            // place (`CompactorEndpointArgs::parse`).
-            other => match compactor_endpoint.parse(other, args.get(i + 1)) {
-                Ok(Some(consumed)) => i += consumed,
-                Ok(None) => {
-                    eprintln!("unknown flag: {other}");
-                    return ExitCode::from(2);
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(2);
-                }
-            },
-        }
-    }
+    let RunArgs {
+        model,
+        prompt,
+        system,
+        resume_checkpoint_path,
+        role_id,
+        execution_id,
+        response_schema,
+        base_url,
+        chat_url,
+        dialect,
+        auth_header_stdin,
+        compactor_endpoint,
+        streaming,
+        json_mode,
+        allowed_tools,
+        compact_threshold_tokens,
+        compactor_model,
+        compactor_context_window,
+        compact_threshold_ratio,
+        context_window,
+        compact_strategy,
+        bail_after_compactions,
+        compactor_custom_instructions,
+        max_turns,
+        max_tokens,
+        max_tokens_per_call,
+        reasoning_checkpoint_interval,
+        generation_checkpoint_interval,
+        max_stall_recoveries,
+        max_tokens_per_call_source,
+        reasoning_checkpoint_interval_source,
+        generation_checkpoint_interval_source,
+        feedback_templates,
+    } = match parse_run_args(args, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok()) {
+        Ok(parsed) => parsed,
+        Err(e) => return e.exit(),
+    };
+    let role_id = role_id.unwrap_or_default();
 
     let model = match model {
         Some(m) => m,
@@ -1180,6 +580,415 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// The flags of `darkmux-runtime run`, as parsed by [`parse_run_args`].
+///
+/// Parsed by hand to keep zero clap dependency in the runtime.
+#[derive(Debug, Default)]
+struct RunArgs {
+    model: Option<String>,
+    prompt: Option<String>,
+    system: Option<String>,
+    // (#2114) Path to a `checkpoint.json` (under the out-dir mount,
+    // `/darkmux-out` in production) written by a prior,
+    // interrupted dispatch. When set, the loop reloads the checkpoint's
+    // message history instead of starting from `--system`/`--prompt` — see
+    // `checkpoint::read_checkpoint`. `--resume` takes precedence over the
+    // env var when both are present (flag wins, matching the CLI-over-env
+    // precedence every other runtime flag/env pair in this file follows).
+    resume_checkpoint_path: Option<String>,
+    // (v3 checkpoint schema, security audit, #2114 resume follow-up) The
+    // role id THIS dispatch is running as — host-supplied, since the
+    // runtime has no other way to know it. Stamped into every
+    // `checkpoint.json` write so a LATER `--resume-from` can refuse,
+    // host-side, to resume a checkpoint recorded under a different role
+    // (`dispatch_internal::stage_resume_checkpoint`). NOT required for a
+    // fresh (non-resuming) dispatch to run — an absent/empty value just
+    // means a future resume attempt's role comparison will (correctly)
+    // never match anything but another equally-unlabeled checkpoint.
+    // Absent reads as the empty string.
+    role_id: Option<String>,
+    // (#2386) The host's session id — the `<dispatch>` half of every
+    // finding key this dispatch's `create_finding` calls will be
+    // stored under (`dispatch_internal.rs::materialize_finding`
+    // builds `<execution_id>/<emit_seq>`). Optional: a host that does
+    // not pass it leaves the runtime unable to name a key, and both
+    // tools fall back to their pre-#2386 behavior rather than
+    // guessing one.
+    execution_id: Option<String>,
+    // (#1038) Raw JSON-schema string for the role's output, wrapped into an
+    // LMStudio json_schema response_format before the loop. None ⇒ free-form.
+    response_schema: Option<String>,
+    base_url: Option<String>,
+    // (#1187) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
+    // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
+    // LMStudio, the host passes the FULL chat-completions URL here (Azure
+    // needs a `?api-version=` query string that `base_url` + the client's
+    // unconditional `/chat/completions` suffix can't express). When set,
+    // this overrides `base_url` for request routing.
+    chat_url: Option<String>,
+    // (#2902) The endpoint's declared request dialect, when it differs from
+    // what `--chat-url` presence implies.
+    dialect: Option<lmstudio::Dialect>,
+    // (#1187) When true, read the remote endpoint's auth header as JSON
+    // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
+    // host pipes it in immediately after spawning this container (with `-i`)
+    // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
+    // `/workspace`-escape check (it's the general-purpose escape hatch), so
+    // a secret-bearing file anywhere the container can see is reachable by
+    // a model-issued `cat` at any point during the run. Stdin is read
+    // exactly once, before the agent loop (and any tool call) exists, and
+    // leaves no FILESYSTEM artifact afterward (host or container). This
+    // closes the file-based exposure entirely, but is not a complete
+    // isolation boundary: the secret still lives in this process's memory
+    // for the dispatch's duration, and a same-uid `bash` process could in
+    // principle attempt `/proc/<this-process's-pid>/mem` inspection
+    // depending on the host's `kernel.yama.ptrace_scope` — a residual risk
+    // `--cap-drop=ALL` doesn't close (it blocks `ptrace()`, not a same-uid
+    // `/proc/<pid>/mem` read). (#2481) Since `docker run --init` gave the
+    // container a real PID 1 (docker's tini, which reaps the orphans #2215's
+    // bash-tool fix can leave behind), this process is PID 2, not PID 1 —
+    // the attack this note describes is unaffected (same-uid `/proc/<pid>/mem`
+    // access doesn't care which pid), but a reader shouldn't infer this
+    // process is still the container's init.
+    // False when the remote endpoint declares no auth (or no remote brain).
+    auth_header_stdin: bool,
+    // (#3207) The compactor on an UNMANAGED utility endpoint: its full
+    // chat-completions URL, its dialect, and whether its auth header rides
+    // the stdin blob (under `compactor`). All absent: the compactor talks to
+    // LM Studio at `--base-url`, as before.
+    compactor_endpoint: CompactorEndpointArgs,
+    // Streaming is on by default (#205). Operators / tests pass
+    // `--no-stream` to fall back to the Phase 2 single-shot path —
+    // useful for deterministic benchmarks or when a runtime regression
+    // is suspected to involve the streaming layer specifically.
+    streaming: bool,
+    // `--json` flips stdout to a single structured envelope at end of
+    // dispatch (Phase-A). Default stays human-readable for direct CLI
+    // use; JSON is opt-in for consumers like the qa-review skill that
+    // need machine-parseable output. All progress/status lines go to
+    // stderr when JSON is set so stdout is clean for `jq`.
+    json_mode: bool,
+    // `--allowed-tools <comma-separated-names>` filters the runtime's
+    // hardcoded tool catalog to a subset (computed dispatcher-side from
+    // the role's tool_palette.allow minus tool_palette.deny). When
+    // absent, the runtime exposes the full catalog (back-compat).
+    //
+    // The catalog IS the capability surface — the model can only call
+    // tools that appear in the `tools[]` field of the chat-completions
+    // request. Filtering here ensures denied tools never reach the
+    // model, regardless of whether the model follows its system-prompt
+    // doctrine. Pre-filter, a model could ignore "you must not edit"
+    // in the system prompt and call `edit` anyway because the tool
+    // existed in the catalog.
+    allowed_tools: Option<Vec<String>>,
+    // (#368 / #482) Compaction config flags — explicit values from the
+    // host (which derives them from `profile.runtime.compaction.*` in
+    // the typed schema landed in #357). The runtime requires at least
+    // one of `--context-window` or `--compact-threshold-tokens` per
+    // #482's `validate_compaction_cli_inputs`; the absolute fallback
+    // const that pre-#482 covered the all-None case is gone. Env vars
+    // are NOT consulted.
+    compact_threshold_tokens: Option<u32>,
+    compactor_model: Option<String>,
+    // (#2808) The window the COMPACTOR loads at, resolved host-side by
+    // `resolve_compactor_load_window` and passed through so compaction can
+    // size its excerpt to the model that has to READ it. Absent ⇒ unbounded,
+    // exactly as before.
+    compactor_context_window: Option<u32>,
+    // (#368) Formula-based trigger: max_history_share fraction +
+    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
+    // Both must be set for the formula trigger to activate; either
+    // missing → formula disabled, absolute-threshold-only behavior.
+    compact_threshold_ratio: Option<f32>,
+    context_window: Option<u32>,
+    // (#372 T2-C) Compaction strategy override. When None, runtime
+    // uses default Narrative; operator opts into tier-2 by setting
+    // `profile.runtime.compaction.strategy: "structured-slot"` which
+    // host plumbs via `--compact-strategy structured-slot`.
+    compact_strategy: Option<compaction::CompactionStrategy>,
+    // (#377) Escalation bound — after this many compactions, the
+    // runtime exits with TerminalReason::EscalationTriggered. Host
+    // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
+    // (typed field landed in #357; consumer is #377). None = unbounded.
+    bail_after_compactions: Option<u32>,
+    // (#383) Operator-tunable custom instructions for the compactor.
+    // Host plumbs from `profile.runtime.compaction.custom_instructions`
+    // (typed field, schema-isolation doctrine). None = no augmentation.
+    compactor_custom_instructions: Option<String>,
+    // (#457) Operator-opt-in caps on per-dispatch turn count + cumulative
+    // completion tokens. Host derives from `DARKMUX_RUNTIME_MAX_TURNS` /
+    // `DARKMUX_RUNTIME_MAX_TOKENS` env vars. Both default unlimited;
+    // the inactivity timeout (#458) catches the genuine-stuck case.
+    max_turns: Option<u32>,
+    max_tokens: Option<u32>,
+    // (#1221) Per-call completion-token cap override. Host derives from
+    // `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL`. None = the built-in default
+    // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
+    max_tokens_per_call: Option<u32>,
+    reasoning_checkpoint_interval: Option<u32>,
+    // (#2171) Host derives from `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`.
+    // None = the built-in default (`loop_runner::GENERATION_CHECKPOINT_INTERVAL`
+    // = 4000).
+    generation_checkpoint_interval: Option<u32>,
+    // (#2190) The stall-recovery budget override — how many useless
+    // turns (empty `tool_calls`, or a runaway-reasoning cut) the
+    // runtime tolerates before escalating out of local-tier. Host derives from
+    // `DARKMUX_RUNTIME_MAX_STALL_RECOVERIES` / `config.runtime.
+    // max_stall_recoveries`. None = the built-in default
+    // (`loop_runner::MAX_STALL_RECOVERIES` = 2). No `-source` companion
+    // flag — unlike the three per-call knobs above, this budget isn't a
+    // `BoundKind` the runtime stamps per-hit provenance for.
+    max_stall_recoveries: Option<u32>,
+    // (#2165) Provenance for the three knobs above — which of
+    // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
+    // value the host just forwarded. The host computes this via
+    // `darkmux_types::config_access`'s `_with_source` accessors (this crate
+    // can't depend on `darkmux-types` — see `runtime/Cargo.toml`'s doc) and
+    // passes it as a companion `--<flag>-source` flag. Unrecognized/absent
+    // falls to "built-in" via `BoundSource::from_cli_str`.
+    max_tokens_per_call_source: Option<String>,
+    reasoning_checkpoint_interval_source: Option<String>,
+    // (#2171 rebase onto #2165) Same companion-source pattern, for the
+    // generation check-in.
+    generation_checkpoint_interval_source: Option<String>,
+    // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
+    // serializes Role.feedback_templates to JSON; runtime parses into
+    // a BTreeMap<signal_kind, template_string>. Empty/absent = the
+    // FeedbackInjector uses its hardcoded defaults.
+    feedback_templates: std::collections::BTreeMap<String, String>,
+}
+
+/// A refused `run` argument: the stderr line, and whether it exits through
+/// `std::process::exit(2)` rather than returning exit code 2. The exit code
+/// is the same; the check-in interval flags have always used the former.
+#[derive(Debug, PartialEq)]
+struct ArgError {
+    message: String,
+    process_exit: bool,
+}
+
+/// The flags whose refusals exit through `std::process::exit(2)`.
+const PROCESS_EXIT_FLAGS: [&str; 4] = [
+    "--reasoning-checkpoint-interval",
+    "--reasoning-checkpoint-interval-source",
+    "--generation-checkpoint-interval",
+    "--generation-checkpoint-interval-source",
+];
+
+impl ArgError {
+    /// `message`, refusing `flag` the way that flag always exits.
+    fn refuse(flag: &str, message: String) -> Self {
+        ArgError { message, process_exit: PROCESS_EXIT_FLAGS.contains(&flag) }
+    }
+
+    /// Print the refusal and exit 2.
+    fn exit(self) -> ExitCode {
+        eprintln!("{}", self.message);
+        if self.process_exit {
+            std::process::exit(2);
+        }
+        ExitCode::from(2)
+    }
+}
+
+/// The value after `flag`, or the "`flag` requires a value" refusal.
+fn required<'a>(flag: &str, value: Option<&'a String>) -> Result<&'a String, ArgError> {
+    value.ok_or_else(|| ArgError::refuse(flag, format!("{flag} requires a value")))
+}
+
+type TextSlot = fn(&mut RunArgs) -> &mut Option<String>;
+type CountSlot = fn(&mut RunArgs) -> &mut Option<u32>;
+
+/// Flags that take any string, stored as given. A later repeat wins.
+const TEXT_FLAGS: [(&str, TextSlot); 14] = [
+    ("--model", |a| &mut a.model),
+    ("--prompt", |a| &mut a.prompt),
+    ("--system", |a| &mut a.system),
+    ("--response-schema", |a| &mut a.response_schema),
+    ("--base-url", |a| &mut a.base_url),
+    ("--chat-url", |a| &mut a.chat_url),
+    ("--resume", |a| &mut a.resume_checkpoint_path),
+    ("--role-id", |a| &mut a.role_id),
+    ("--execution-id", |a| &mut a.execution_id),
+    ("--compactor-model", |a| &mut a.compactor_model),
+    ("--compactor-custom-instructions", |a| &mut a.compactor_custom_instructions),
+    ("--max-tokens-per-call-source", |a| &mut a.max_tokens_per_call_source),
+    ("--reasoning-checkpoint-interval-source", |a| &mut a.reasoning_checkpoint_interval_source),
+    ("--generation-checkpoint-interval-source", |a| &mut a.generation_checkpoint_interval_source),
+];
+
+/// Flags that take a `u32`: the slot, the smallest value accepted, and the
+/// noun the refusal names.
+const COUNT_FLAGS: [(&str, CountSlot, u32, &str); 10] = [
+    ("--compact-threshold-tokens", |a| &mut a.compact_threshold_tokens, 0, "a positive integer"),
+    ("--compactor-context-window", |a| &mut a.compactor_context_window, 0, "a positive integer"),
+    ("--context-window", |a| &mut a.context_window, 0, "a positive integer"),
+    ("--bail-after-compactions", |a| &mut a.bail_after_compactions, 0, "a positive integer"),
+    ("--max-turns", |a| &mut a.max_turns, 0, "a positive integer"),
+    ("--reasoning-checkpoint-interval", |a| &mut a.reasoning_checkpoint_interval, 1, "a positive integer"),
+    ("--generation-checkpoint-interval", |a| &mut a.generation_checkpoint_interval, 1, "a positive integer"),
+    ("--max-stall-recoveries", |a| &mut a.max_stall_recoveries, 0, "a non-negative integer"),
+    ("--max-tokens-per-call", |a| &mut a.max_tokens_per_call, 0, "a positive integer"),
+    ("--max-tokens", |a| &mut a.max_tokens, 0, "a positive integer"),
+];
+
+/// Parse `run`'s flags. `resume_env` is `DARKMUX_RESUME_CHECKPOINT`, which
+/// `--resume` overrides. Refuses the first bad flag; never checks that the
+/// required flags are present ([`RunArgs::take_model_and_prompt`] does).
+fn parse_run_args(args: &[String], resume_env: Option<String>) -> Result<RunArgs, ArgError> {
+    let mut parsed =
+        RunArgs { resume_checkpoint_path: resume_env, streaming: true, ..RunArgs::default() };
+    let mut i = 0;
+    while i < args.len() {
+        i += parsed.apply(&args[i], args.get(i + 1))?;
+    }
+    Ok(parsed)
+}
+
+impl RunArgs {
+    /// Apply one flag (and its value): how many arguments it consumed.
+    fn apply(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        if let Some((_, slot)) = TEXT_FLAGS.iter().find(|(f, _)| *f == flag) {
+            *slot(self) = Some(required(flag, value)?.clone());
+            return Ok(2);
+        }
+        if let Some((_, slot, min, noun)) = COUNT_FLAGS.iter().find(|(f, ..)| *f == flag) {
+            *slot(self) = Some(parse_count(flag, required(flag, value)?, *min, noun)?);
+            return Ok(2);
+        }
+        self.apply_switch(flag).map_or_else(|| self.apply_special(flag, value), Ok)
+    }
+
+    /// The flags that take no value.
+    fn apply_switch(&mut self, flag: &str) -> Option<usize> {
+        match flag {
+            "--auth-header-stdin" => self.auth_header_stdin = true,
+            "--no-stream" => self.streaming = false,
+            "--json" => self.json_mode = true,
+            _ => return None,
+        }
+        Some(1)
+    }
+
+    /// The flags with their own value rules, then the compactor's endpoint
+    /// flags, then the unknown-flag refusal.
+    fn apply_special(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        match flag {
+            "--prompt-file" => self.apply_prompt_file(flag, value),
+            "--dialect" => self.apply_dialect(flag, value),
+            "--allowed-tools" => self.apply_allowed_tools(flag, value),
+            "--compact-threshold-ratio" => self.apply_ratio(flag, value),
+            "--compact-strategy" => self.apply_compact_strategy(flag, value),
+            "--feedback-templates-json" => self.apply_feedback_templates(flag, value),
+            other => self.apply_compactor_endpoint(other, value),
+        }
+    }
+
+    // (#3207) The compactor's own unmanaged endpoint, parsed in one
+    // place (`CompactorEndpointArgs::parse`); anything else is unknown.
+    fn apply_compactor_endpoint(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        match self.compactor_endpoint.parse(flag, value) {
+            Ok(Some(consumed)) => Ok(consumed),
+            Ok(None) => Err(ArgError::refuse(flag, format!("unknown flag: {flag}"))),
+            Err(e) => Err(ArgError::refuse(flag, e)),
+        }
+    }
+
+    fn apply_dialect(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        let v = required(flag, value)?;
+        self.dialect = Some(lmstudio::Dialect::parse(v).ok_or_else(|| ArgError::refuse(flag, format!("--dialect must be `chat-completions`, `chat-completions-max-tokens` or `messages` (got {v:?})")))?);
+        Ok(2)
+    }
+
+    fn apply_ratio(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        self.compact_threshold_ratio = Some(parse_ratio(flag, required(flag, value)?)?);
+        Ok(2)
+    }
+
+    fn apply_allowed_tools(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        let v = value.ok_or_else(|| {
+            ArgError::refuse(flag, "--allowed-tools requires a comma-separated list".into())
+        })?;
+        self.allowed_tools = Some(parse_tool_list(v));
+        Ok(2)
+    }
+
+    // (#386) Read the user prompt from a mounted file instead of argv,
+    // so a substantial brief never lands on the `docker run` command
+    // line (where it would hit ARG_MAX and show up in `ps`). The host
+    // writes the message into a per-dispatch mount; this reads it back.
+    fn apply_prompt_file(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        if self.prompt.is_some() {
+            return Err(ArgError::refuse(
+                flag,
+                "--prompt and --prompt-file are mutually exclusive".into(),
+            ));
+        }
+        let v = required(flag, value)?;
+        let contents = std::fs::read_to_string(v)
+            .map_err(|e| ArgError::refuse(flag, format!("--prompt-file {v}: {e}")))?;
+        self.prompt = Some(contents);
+        Ok(2)
+    }
+
+    fn apply_compact_strategy(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        let v = value.ok_or_else(|| {
+            ArgError::refuse(
+                flag,
+                "--compact-strategy requires a value (`narrative` or `structured-slot`)".into(),
+            )
+        })?;
+        let s = compaction::CompactionStrategy::from_cli_str(v)
+            .map_err(|msg| ArgError::refuse(flag, format!("--compact-strategy: {msg}")))?;
+        self.compact_strategy = Some(s);
+        Ok(2)
+    }
+
+    /// Bad JSON warns and keeps whatever was set before (the defaults,
+    /// unless an earlier `--feedback-templates-json` parsed).
+    fn apply_feedback_templates(&mut self, flag: &str, value: Option<&String>) -> Result<usize, ArgError> {
+        let v = value.ok_or_else(|| {
+            ArgError::refuse(flag, "--feedback-templates-json requires a JSON-string value".into())
+        })?;
+        match serde_json::from_str::<std::collections::BTreeMap<String, String>>(v) {
+            Ok(map) => self.feedback_templates = map,
+            Err(e) => eprintln!(
+                "--feedback-templates-json failed to parse: {e}. \
+                 Expected JSON object of {{signal_kind: template_string}}. \
+                 Ignoring; runtime will use defaults. (#457 Step 2)"
+            ),
+        }
+        Ok(2)
+    }
+}
+
+/// A `u32` flag's value, at least `min`, or the refusal naming `noun`.
+fn parse_count(flag: &str, v: &str, min: u32, noun: &str) -> Result<u32, ArgError> {
+    v.parse::<u32>()
+        .ok()
+        .filter(|n| *n >= min)
+        .ok_or_else(|| ArgError::refuse(flag, format!("{flag} requires {noun} (got: {v})")))
+}
+
+/// `--compact-threshold-ratio`: a fraction in 0.1-0.9.
+fn parse_ratio(flag: &str, v: &str) -> Result<f32, ArgError> {
+    let f = v.parse::<f32>().map_err(|_| {
+        ArgError::refuse(flag, format!("--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: {v})"))
+    })?;
+    if !(0.1..=0.9).contains(&f) {
+        return Err(ArgError::refuse(
+            flag,
+            format!("--compact-threshold-ratio must be in range 0.1-0.9 (got: {f})"),
+        ));
+    }
+    Ok(f)
+}
+
+/// `--allowed-tools`: the comma-separated names, trimmed, blanks dropped.
+fn parse_tool_list(v: &str) -> Vec<String> {
+    v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
