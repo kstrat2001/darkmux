@@ -153,14 +153,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         streaming,
         json_mode,
         allowed_tools,
-        compact_threshold_tokens,
-        compactor_model,
-        compactor_context_window,
-        compact_threshold_ratio,
-        context_window,
-        compact_strategy,
-        bail_after_compactions,
-        compactor_custom_instructions,
+        compaction,
         max_turns,
         max_tokens,
         max_tokens_per_call,
@@ -269,27 +262,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     print_dispatching_line(json_mode, &model);
 
-    // (#482) Fail loud if neither the loaded model's context window nor
-    // an explicit absolute threshold is known — pre-#482 the runtime
-    // silently fell through to a hardcoded const, which made every
-    // compaction decision downstream uncorrelated with the actual
-    // model envelope. The standard host path (`darkmux dispatch`,
-    // `darkmux lab run`) always supplies `--context-window` from the
-    // primary model's `n_ctx`; this check catches direct callers that
-    // bypass the host (or profiles missing a Primary model).
-    //
-    // Pre-flight ordering: validator runs BEFORE `Trajectory::open` so
-    // a contract failure doesn't leave a dangling `dispatch_start`
-    // record under `/workspace/.darkmux-runtime/trajectory.jsonl`
-    // ("dispatch started → no further records" reads like a crash to
-    // log scrapers).
-    if let Err(msg) = compaction::validate_compaction_cli_inputs(
-        compact_threshold_tokens,
-        compact_threshold_ratio,
-        context_window,
-    ) {
-        eprintln!("error: {msg}");
-        return ExitCode::from(2);
+    if let Err(e) = compaction.validate() {
+        return e.exit();
     }
 
     // Open the trajectory recorder against the mounted out-dir (SEPARATE
@@ -308,16 +282,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // shell env). The host's `dispatch_via_internal` derives values
     // from `profile.runtime.compaction.*` and passes them as flags.
     let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail_and_custom(
-        compact_threshold_tokens,
-        compactor_model,
-        compact_threshold_ratio,
+        compaction.compact_threshold_tokens,
+        compaction.compactor_model,
+        compaction.compact_threshold_ratio,
         compaction::CompactionWindows {
-            primary: context_window.map(compaction::PrimaryWindow),
-            compactor: compactor_context_window.map(compaction::CompactorWindow),
+            primary: compaction.context_window.map(compaction::PrimaryWindow),
+            compactor: compaction.compactor_context_window.map(compaction::CompactorWindow),
         },
-        compact_strategy,
-        bail_after_compactions,
-        compactor_custom_instructions,
+        compaction.compact_strategy,
+        compaction.bail_after_compactions,
+        compaction.compactor_custom_instructions,
     );
     // (MUST FIX 1, #2571 follow-up) Disclose at startup, loudly, when this
     // dispatch is about to run with no compactor bound but a real
@@ -581,40 +555,7 @@ struct RunArgs {
     // in the system prompt and call `edit` anyway because the tool
     // existed in the catalog.
     allowed_tools: Option<Vec<String>>,
-    // (#368 / #482) Compaction config flags — explicit values from the
-    // host (which derives them from `profile.runtime.compaction.*` in
-    // the typed schema landed in #357). The runtime requires at least
-    // one of `--context-window` or `--compact-threshold-tokens` per
-    // #482's `validate_compaction_cli_inputs`; the absolute fallback
-    // const that pre-#482 covered the all-None case is gone. Env vars
-    // are NOT consulted.
-    compact_threshold_tokens: Option<u32>,
-    compactor_model: Option<String>,
-    // (#2808) The window the COMPACTOR loads at, resolved host-side by
-    // `resolve_compactor_load_window` and passed through so compaction can
-    // size its excerpt to the model that has to READ it. Absent ⇒ unbounded,
-    // exactly as before.
-    compactor_context_window: Option<u32>,
-    // (#368) Formula-based trigger: max_history_share fraction +
-    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
-    // Both must be set for the formula trigger to activate; either
-    // missing → formula disabled, absolute-threshold-only behavior.
-    compact_threshold_ratio: Option<f32>,
-    context_window: Option<u32>,
-    // (#372 T2-C) Compaction strategy override. When None, runtime
-    // uses default Narrative; operator opts into tier-2 by setting
-    // `profile.runtime.compaction.strategy: "structured-slot"` which
-    // host plumbs via `--compact-strategy structured-slot`.
-    compact_strategy: Option<compaction::CompactionStrategy>,
-    // (#377) Escalation bound — after this many compactions, the
-    // runtime exits with TerminalReason::EscalationTriggered. Host
-    // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
-    // (typed field landed in #357; consumer is #377). None = unbounded.
-    bail_after_compactions: Option<u32>,
-    // (#383) Operator-tunable custom instructions for the compactor.
-    // Host plumbs from `profile.runtime.compaction.custom_instructions`
-    // (typed field, schema-isolation doctrine). None = no augmentation.
-    compactor_custom_instructions: Option<String>,
+    compaction: CompactionArgs,
     // (#457) Operator-opt-in caps on per-dispatch turn count + cumulative
     // completion tokens. Host derives from `DARKMUX_RUNTIME_MAX_TURNS` /
     // `DARKMUX_RUNTIME_MAX_TOKENS` env vars. Both default unlimited;
@@ -656,6 +597,71 @@ struct RunArgs {
     // a BTreeMap<signal_kind, template_string>. Empty/absent = the
     // FeedbackInjector uses its hardcoded defaults.
     feedback_templates: std::collections::BTreeMap<String, String>,
+}
+
+/// The compaction flags, as the host derived them from
+/// `profile.runtime.compaction.*`.
+#[derive(Debug, Default)]
+struct CompactionArgs {
+    // (#368 / #482) Compaction config flags — explicit values from the
+    // host (which derives them from `profile.runtime.compaction.*` in
+    // the typed schema landed in #357). The runtime requires at least
+    // one of `--context-window` or `--compact-threshold-tokens` per
+    // #482's `validate_compaction_cli_inputs`; the absolute fallback
+    // const that pre-#482 covered the all-None case is gone. Env vars
+    // are NOT consulted.
+    compact_threshold_tokens: Option<u32>,
+    compactor_model: Option<String>,
+    // (#2808) The window the COMPACTOR loads at, resolved host-side by
+    // `resolve_compactor_load_window` and passed through so compaction can
+    // size its excerpt to the model that has to READ it. Absent ⇒ unbounded,
+    // exactly as before.
+    compactor_context_window: Option<u32>,
+    // (#368) Formula-based trigger: max_history_share fraction +
+    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
+    // Both must be set for the formula trigger to activate; either
+    // missing → formula disabled, absolute-threshold-only behavior.
+    compact_threshold_ratio: Option<f32>,
+    context_window: Option<u32>,
+    // (#372 T2-C) Compaction strategy override. When None, runtime
+    // uses default Narrative; operator opts into tier-2 by setting
+    // `profile.runtime.compaction.strategy: "structured-slot"` which
+    // host plumbs via `--compact-strategy structured-slot`.
+    compact_strategy: Option<compaction::CompactionStrategy>,
+    // (#377) Escalation bound — after this many compactions, the
+    // runtime exits with TerminalReason::EscalationTriggered. Host
+    // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
+    // (typed field landed in #357; consumer is #377). None = unbounded.
+    bail_after_compactions: Option<u32>,
+    // (#383) Operator-tunable custom instructions for the compactor.
+    // Host plumbs from `profile.runtime.compaction.custom_instructions`
+    // (typed field, schema-isolation doctrine). None = no augmentation.
+    compactor_custom_instructions: Option<String>,
+}
+
+impl CompactionArgs {
+    /// (#482) Fail loud if neither the loaded model's context window nor
+    /// an explicit absolute threshold is known — pre-#482 the runtime
+    /// silently fell through to a hardcoded const, which made every
+    /// compaction decision downstream uncorrelated with the actual
+    /// model envelope. The standard host path (`darkmux dispatch`,
+    /// `darkmux lab run`) always supplies `--context-window` from the
+    /// primary model's `n_ctx`; this check catches direct callers that
+    /// bypass the host (or profiles missing a Primary model).
+    ///
+    /// Pre-flight ordering: validator runs BEFORE `Trajectory::open` so
+    /// a contract failure doesn't leave a dangling `dispatch_start`
+    /// record under `/workspace/.darkmux-runtime/trajectory.jsonl`
+    /// ("dispatch started → no further records" reads like a crash to
+    /// log scrapers).
+    fn validate(&self) -> Result<(), Refusal> {
+        compaction::validate_compaction_cli_inputs(
+            self.compact_threshold_tokens,
+            self.compact_threshold_ratio,
+            self.context_window,
+        )
+        .map_err(|msg| Refusal::new(format!("error: {msg}")))
+    }
 }
 
 /// Where the brain and the compactor are reached (`--base-url`,
@@ -763,8 +769,8 @@ const TEXT_FLAGS: [(&str, TextSlot); 14] = [
     ("--resume", |a| &mut a.resume_checkpoint_path),
     ("--role-id", |a| &mut a.role_id),
     ("--execution-id", |a| &mut a.execution_id),
-    ("--compactor-model", |a| &mut a.compactor_model),
-    ("--compactor-custom-instructions", |a| &mut a.compactor_custom_instructions),
+    ("--compactor-model", |a| &mut a.compaction.compactor_model),
+    ("--compactor-custom-instructions", |a| &mut a.compaction.compactor_custom_instructions),
     ("--max-tokens-per-call-source", |a| &mut a.max_tokens_per_call_source),
     ("--reasoning-checkpoint-interval-source", |a| &mut a.reasoning_checkpoint_interval_source),
     ("--generation-checkpoint-interval-source", |a| &mut a.generation_checkpoint_interval_source),
@@ -773,10 +779,10 @@ const TEXT_FLAGS: [(&str, TextSlot); 14] = [
 /// Flags that take a `u32`: the slot, the smallest value accepted, and the
 /// noun the refusal names.
 const COUNT_FLAGS: [(&str, CountSlot, u32, &str); 10] = [
-    ("--compact-threshold-tokens", |a| &mut a.compact_threshold_tokens, 0, "a positive integer"),
-    ("--compactor-context-window", |a| &mut a.compactor_context_window, 0, "a positive integer"),
-    ("--context-window", |a| &mut a.context_window, 0, "a positive integer"),
-    ("--bail-after-compactions", |a| &mut a.bail_after_compactions, 0, "a positive integer"),
+    ("--compact-threshold-tokens", |a| &mut a.compaction.compact_threshold_tokens, 0, "a positive integer"),
+    ("--compactor-context-window", |a| &mut a.compaction.compactor_context_window, 0, "a positive integer"),
+    ("--context-window", |a| &mut a.compaction.context_window, 0, "a positive integer"),
+    ("--bail-after-compactions", |a| &mut a.compaction.bail_after_compactions, 0, "a positive integer"),
     ("--max-turns", |a| &mut a.max_turns, 0, "a positive integer"),
     ("--reasoning-checkpoint-interval", |a| &mut a.reasoning_checkpoint_interval, 1, "a positive integer"),
     ("--generation-checkpoint-interval", |a| &mut a.generation_checkpoint_interval, 1, "a positive integer"),
@@ -854,7 +860,7 @@ impl RunArgs {
     }
 
     fn apply_ratio(&mut self, flag: &str, value: Option<&String>) -> Result<usize, Refusal> {
-        self.compact_threshold_ratio = Some(parse_ratio(flag, required(flag, value)?)?);
+        self.compaction.compact_threshold_ratio = Some(parse_ratio(flag, required(flag, value)?)?);
         Ok(2)
     }
 
@@ -893,7 +899,7 @@ impl RunArgs {
         })?;
         let s = compaction::CompactionStrategy::from_cli_str(v)
             .map_err(|msg| Refusal::refuse(flag, format!("--compact-strategy: {msg}")))?;
-        self.compact_strategy = Some(s);
+        self.compaction.compact_strategy = Some(s);
         Ok(2)
     }
 
