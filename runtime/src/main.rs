@@ -268,33 +268,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     let mut traj = open_trajectory(&model, &initial_messages, &tool_names);
 
-    // (#368) Compaction config from explicit CLI args; no env-var
-    // fallback (operator's tuning surface is the profile JSON, not
-    // shell env). The host's `dispatch_via_internal` derives values
-    // from `profile.runtime.compaction.*` and passes them as flags.
-    let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail_and_custom(
-        compaction.compact_threshold_tokens,
-        compaction.compactor_model,
-        compaction.compact_threshold_ratio,
-        compaction::CompactionWindows {
-            primary: compaction.context_window.map(compaction::PrimaryWindow),
-            compactor: compaction.compactor_context_window.map(compaction::CompactorWindow),
-        },
-        compaction.compact_strategy,
-        compaction.bail_after_compactions,
-        compaction.compactor_custom_instructions,
-    );
-    // (MUST FIX 1, #2571 follow-up) Disclose at startup, loudly, when this
-    // dispatch is about to run with no compactor bound but a real
-    // compaction trigger configured — either a context window (the
-    // formula/window-derived trigger) or an absolute
-    // `--compact-threshold-tokens` with no window at all. Before this there
-    // was no signal anywhere — no message, no trajectory event, no flow
-    // record, no envelope field — so a zero compaction count read
-    // identically to "never needed one."
-    if let Some(msg) = compaction::compactor_disclosure_message(&compaction_cfg) {
-        eprintln!("{msg}");
-    }
+    let compaction_cfg = compaction.into_config();
     // (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
     // json_schema response_format so every model turn is grammar-constrained to
     // that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).
@@ -652,6 +626,38 @@ impl CompactionArgs {
             self.context_window,
         )
         .map_err(|msg| Refusal::new(format!("error: {msg}")))
+    }
+
+    /// (#368) Compaction config from explicit CLI args; no env-var
+    /// fallback (operator's tuning surface is the profile JSON, not
+    /// shell env). The host's `dispatch_via_internal` derives values
+    /// from `profile.runtime.compaction.*` and passes them as flags.
+    /// Prints the no-compactor disclosure when it applies.
+    fn into_config(self) -> compaction::CompactionConfig {
+        let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail_and_custom(
+            self.compact_threshold_tokens,
+            self.compactor_model,
+            self.compact_threshold_ratio,
+            compaction::CompactionWindows {
+                primary: self.context_window.map(compaction::PrimaryWindow),
+                compactor: self.compactor_context_window.map(compaction::CompactorWindow),
+            },
+            self.compact_strategy,
+            self.bail_after_compactions,
+            self.compactor_custom_instructions,
+        );
+        // (MUST FIX 1, #2571 follow-up) Disclose at startup, loudly, when this
+        // dispatch is about to run with no compactor bound but a real
+        // compaction trigger configured — either a context window (the
+        // formula/window-derived trigger) or an absolute
+        // `--compact-threshold-tokens` with no window at all. Before this there
+        // was no signal anywhere — no message, no trajectory event, no flow
+        // record, no envelope field — so a zero compaction count read
+        // identically to "never needed one."
+        if let Some(msg) = compaction::compactor_disclosure_message(&compaction_cfg) {
+            eprintln!("{msg}");
+        }
+        compaction_cfg
     }
 }
 
