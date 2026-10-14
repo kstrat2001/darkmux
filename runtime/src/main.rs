@@ -181,20 +181,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     };
     let role_id = role_id.unwrap_or_default();
 
-    let model = match model {
-        Some(m) => m,
-        None => {
-            eprintln!("--model is required (e.g. darkmux:qwen3.6-35b-a3b-turboquant-mlx)");
-            return ExitCode::from(2);
-        }
-    };
-
-    let prompt = match prompt {
-        Some(p) => p,
-        None => {
-            eprintln!("--prompt is required");
-            return ExitCode::from(2);
-        }
+    let (model, prompt) = match required_model_and_prompt(model, prompt) {
+        Ok(required) => required,
+        Err(e) => return e.exit(),
     };
 
     // System prompt: a default that names the runtime + names the
@@ -970,6 +959,23 @@ fn parse_count(flag: &str, v: &str, min: u32, noun: &str) -> Result<u32, ArgErro
         .ok()
         .filter(|n| *n >= min)
         .ok_or_else(|| ArgError::refuse(flag, format!("{flag} requires {noun} (got: {v})")))
+}
+
+/// `--model` and `--prompt`, which every dispatch needs; `--model` is
+/// checked first.
+fn required_model_and_prompt(
+    model: Option<String>,
+    prompt: Option<String>,
+) -> Result<(String, String), ArgError> {
+    let model = model.ok_or_else(|| {
+        ArgError::refuse(
+            "--model",
+            "--model is required (e.g. darkmux:qwen3.6-35b-a3b-turboquant-mlx)".into(),
+        )
+    })?;
+    let prompt =
+        prompt.ok_or_else(|| ArgError::refuse("--prompt", "--prompt is required".into()))?;
+    Ok((model, prompt))
 }
 
 /// `--compact-threshold-ratio`: a fraction in 0.1-0.9.
