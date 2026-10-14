@@ -160,9 +160,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         reasoning_checkpoint_interval,
         generation_checkpoint_interval,
         max_stall_recoveries,
-        max_tokens_per_call_source,
-        reasoning_checkpoint_interval_source,
-        generation_checkpoint_interval_source,
+        bound_sources,
         feedback_templates,
     } = match parse_run_args(args, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok()) {
         Ok(parsed) => parsed,
@@ -270,22 +268,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     let compaction_cfg = compaction.into_config();
     let response_format = response_format_for(response_schema.as_deref());
-    // (#2165) Stamp the resolved bound provenance ONCE, before the loop
-    // starts — every emission site downstream reads it back via
-    // `bounds::bound_sources()` rather than re-deriving it.
-    bounds::set_bound_sources(bounds::BoundSources {
-        reasoning_checkpoint_interval: bounds::BoundSource::from_cli_str(
-            reasoning_checkpoint_interval_source.as_deref().unwrap_or(""),
-        ),
-        max_tokens_per_call: bounds::BoundSource::from_cli_str(
-            max_tokens_per_call_source.as_deref().unwrap_or(""),
-        ),
-        // (#2171 rebase onto #2165) Same companion-source pattern, for the
-        // generation check-in.
-        generation_checkpoint_interval: bounds::BoundSource::from_cli_str(
-            generation_checkpoint_interval_source.as_deref().unwrap_or(""),
-        ),
-    });
+    bound_sources.stamp();
     let run_result = loop_runner::run_resumable(
         &client,
         &compactor_client,
@@ -527,18 +510,7 @@ struct RunArgs {
     // flag — unlike the three per-call knobs above, this budget isn't a
     // `BoundKind` the runtime stamps per-hit provenance for.
     max_stall_recoveries: Option<u32>,
-    // (#2165) Provenance for the three knobs above — which of
-    // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
-    // value the host just forwarded. The host computes this via
-    // `darkmux_types::config_access`'s `_with_source` accessors (this crate
-    // can't depend on `darkmux-types` — see `runtime/Cargo.toml`'s doc) and
-    // passes it as a companion `--<flag>-source` flag. Unrecognized/absent
-    // falls to "built-in" via `BoundSource::from_cli_str`.
-    max_tokens_per_call_source: Option<String>,
-    reasoning_checkpoint_interval_source: Option<String>,
-    // (#2171 rebase onto #2165) Same companion-source pattern, for the
-    // generation check-in.
-    generation_checkpoint_interval_source: Option<String>,
+    bound_sources: BoundSourceArgs,
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
     // a BTreeMap<signal_kind, template_string>. Empty/absent = the
@@ -640,6 +612,46 @@ impl CompactionArgs {
             eprintln!("{msg}");
         }
         compaction_cfg
+    }
+}
+
+/// The `--<flag>-source` companions: where each per-call knob's value
+/// was resolved, host-side.
+#[derive(Debug, Default)]
+struct BoundSourceArgs {
+    // (#2165) Provenance for the three per-call knobs (`--max-tokens-per-call`,
+    // `--reasoning-checkpoint-interval`, `--generation-checkpoint-interval`) — which of
+    // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
+    // value the host just forwarded. The host computes this via
+    // `darkmux_types::config_access`'s `_with_source` accessors (this crate
+    // can't depend on `darkmux-types` — see `runtime/Cargo.toml`'s doc) and
+    // passes it as a companion `--<flag>-source` flag. Unrecognized/absent
+    // falls to "built-in" via `BoundSource::from_cli_str`.
+    max_tokens_per_call_source: Option<String>,
+    reasoning_checkpoint_interval_source: Option<String>,
+    // (#2171 rebase onto #2165) Same companion-source pattern, for the
+    // generation check-in.
+    generation_checkpoint_interval_source: Option<String>,
+}
+
+impl BoundSourceArgs {
+    /// (#2165) Stamp the resolved bound provenance ONCE, before the loop
+    /// starts — every emission site downstream reads it back via
+    /// `bounds::bound_sources()` rather than re-deriving it.
+    fn stamp(&self) {
+        bounds::set_bound_sources(bounds::BoundSources {
+            reasoning_checkpoint_interval: bounds::BoundSource::from_cli_str(
+                self.reasoning_checkpoint_interval_source.as_deref().unwrap_or(""),
+            ),
+            max_tokens_per_call: bounds::BoundSource::from_cli_str(
+                self.max_tokens_per_call_source.as_deref().unwrap_or(""),
+            ),
+            // (#2171 rebase onto #2165) Same companion-source pattern, for the
+            // generation check-in.
+            generation_checkpoint_interval: bounds::BoundSource::from_cli_str(
+                self.generation_checkpoint_interval_source.as_deref().unwrap_or(""),
+            ),
+        });
     }
 }
 
@@ -750,9 +762,9 @@ const TEXT_FLAGS: [(&str, TextSlot); 14] = [
     ("--execution-id", |a| &mut a.execution_id),
     ("--compactor-model", |a| &mut a.compaction.compactor_model),
     ("--compactor-custom-instructions", |a| &mut a.compaction.compactor_custom_instructions),
-    ("--max-tokens-per-call-source", |a| &mut a.max_tokens_per_call_source),
-    ("--reasoning-checkpoint-interval-source", |a| &mut a.reasoning_checkpoint_interval_source),
-    ("--generation-checkpoint-interval-source", |a| &mut a.generation_checkpoint_interval_source),
+    ("--max-tokens-per-call-source", |a| &mut a.bound_sources.max_tokens_per_call_source),
+    ("--reasoning-checkpoint-interval-source", |a| &mut a.bound_sources.reasoning_checkpoint_interval_source),
+    ("--generation-checkpoint-interval-source", |a| &mut a.bound_sources.generation_checkpoint_interval_source),
 ];
 
 /// Flags that take a `u32`: the slot, the smallest value accepted, and the
