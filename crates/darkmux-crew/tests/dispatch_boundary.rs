@@ -67,6 +67,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, DispatchResult};
+use darkmux_flow::FlowAction;
 use darkmux_types::session_id::{RunId, SessionId};
 use darkmux_types::test_isolation::IsolatedState;
 use serde_json::{json, Value};
@@ -1908,7 +1909,7 @@ fn a_breaker_on_a_crawl_unit_drops_the_crawls_stop_file_and_carries_its_context(
         let p = payload(&rig.record(action)).clone();
         assert_eq!(p["context"], json!({"unit": "unit-1", "workspace": "pin-crawl"}), "{action}: {p}");
     }
-    assert!(!rig.actions().iter().any(|a| a.starts_with("thermal.stop")), "{:?}", rig.actions());
+    assert!(!rig.actions().iter().any(|a| a == FlowAction::ThermalStopUnresolved.as_str()), "{:?}", rig.actions());
 }
 
 /// A mission's crawl unit signs the STOP it drops, so the next mission on the
@@ -1997,7 +1998,8 @@ fn a_pause_held_past_its_limit_trips_the_breaker_without_an_eject() {
     assert_eq!(r, vec![("thermal".into(), "serious".into(), true), ("thermal-critical".into(), "serious".into(), true)]);
     // Tier 5 is for a literal `critical` reading only.
     assert!(rig.lms_log().iter().all(|l| !l.starts_with("unload")), "{:?}", rig.lms_log());
-    assert!(!rig.actions().iter().any(|a| a.starts_with("thermal.tier5")), "{:?}", rig.actions());
+    let tier5 = [FlowAction::ThermalTier5Eject.as_str(), FlowAction::ThermalTier5EjectFailed.as_str()];
+    assert!(!rig.actions().iter().any(|a| tier5.contains(&a.as_str())), "{:?}", rig.actions());
 }
 
 #[test]
