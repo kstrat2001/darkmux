@@ -6,7 +6,7 @@
 //! - Tool-call loop (`loop_runner` module)
 //! - Tool palette: `search`, `read`, `edit`, `write`, `bash`, `echo`
 //!   (echo retained for sanity-check unit tests; not in the production
-//!   dispatch palette — see `runtime/src/main.rs::run_dispatch`)
+//!   dispatch palette — see `runtime/src/main.rs::prepare_dispatch`)
 //! - Token-count-aware compaction (`compaction` module)
 //! - Per-dispatch trajectory recorder (`trajectory` module)
 //!
@@ -222,7 +222,7 @@ fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     // so any secret-bearing file the container can see is reachable by a
     // model-issued `cat` at any point during the run — stdin leaves no such
     // FILESYSTEM artifact, since nothing is ever written to disk; see the
-    // longer note on `auth_header_stdin`'s declaration for the residual
+    // longer note on `EndpointArgs::auth_header_stdin` for the residual
     // in-memory exposure this does NOT close). A parse/read failure is
     // fatal (exit 2): a remote-brain dispatch with a broken auth pipe would
     // otherwise proceed unauthenticated and fail confusingly on the FIRST
@@ -859,14 +859,9 @@ fn required_model_and_prompt(
     model: Option<String>,
     prompt: Option<String>,
 ) -> Result<(String, String), Refusal> {
-    let model = model.ok_or_else(|| {
-        Refusal::refuse(
-            "--model",
-            "--model is required (e.g. darkmux:qwen3.6-35b-a3b-turboquant-mlx)".into(),
-        )
-    })?;
-    let prompt =
-        prompt.ok_or_else(|| Refusal::refuse("--prompt", "--prompt is required".into()))?;
+    let model = model
+        .ok_or_else(|| Refusal::new("--model is required (e.g. darkmux:qwen3.6-35b-a3b-turboquant-mlx)".into()))?;
+    let prompt = prompt.ok_or_else(|| Refusal::new("--prompt is required".into()))?;
     Ok((model, prompt))
 }
 
