@@ -982,7 +982,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // from /workspace so the runtime never writes its own bookkeeping into
     // the tree it's operating on). The container is --rm, so this is what
     // survives it.
-    let mut traj = trajectory::Trajectory::open(Path::new(trajectory::RUNTIME_OUT_BASE));
+    let mut traj = trajectory::Trajectory::open(&trajectory::out_base());
     // (#3014) A SIGTERM/SIGINT closes the trajectory with `interrupted`.
     interrupt::install_for(&traj);
     let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
@@ -1071,7 +1071,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         // (#2114 finding 3) pace.json / checkpoint.json live in the
         // out-dir mount, not the workspace — see `loop_runner::
         // run_resumable`'s doc on this param for why.
-        Path::new(trajectory::RUNTIME_OUT_BASE),
+        &trajectory::out_base(),
         &role_id,
         resume_from,
     );
@@ -1202,7 +1202,7 @@ fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> darkmux_t
         // landed — the out-dir (SEPARATE from /workspace). Built from the
         // shared trajectory constants so it can't drift from the write site.
         trajectory_path: Some(
-            darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE)).display().to_string(),
+            darkmux_trajectory::trajectory_path(&trajectory::out_base()).display().to_string(),
         ),
         failed_tool_invocations: None,
         resumed_from: None,
@@ -1213,7 +1213,7 @@ fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> darkmux_t
 /// its own trajectory through the one fold the host uses.
 fn print_run_summary(result: &str, wall_ms: u128) {
     let fold = darkmux_trajectory::TrajectoryFold::from_path(&darkmux_trajectory::trajectory_path(
-        Path::new(trajectory::RUNTIME_OUT_BASE),
+        &trajectory::out_base(),
     ));
     println!("--- run ---");
     println!("result:            {result}");

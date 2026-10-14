@@ -9,13 +9,12 @@
 //! a test that fails after a refactor means the refactor changed what an
 //! observer sees, not that the old behavior was right.
 //!
-//! What this file cannot see: the trajectory and every other out-dir file.
-//! `trajectory::RUNTIME_OUT_BASE` is the fixed path `/darkmux-out`, which a
-//! test host cannot create, so the recorder degrades to a no-op
-//! ("trajectory recording disabled") and `dispatch.start`,
-//! `dispatch.complete`, `pace.json` and `checkpoint.json` are never written
-//! here. The SIGTERM handler is installed only on a live recorder, so it is
-//! out of reach for the same reason.
+//! The out-dir (`/darkmux-out` in production) is read through the test seam
+//! `DARKMUX_RUNTIME_OUT_DIR` (`trajectory::out_base`): the tests at the end
+//! of this file point it at a tempdir and pin `dispatch.start`,
+//! `dispatch.complete`, bound provenance, `role_id` in `checkpoint.json` and
+//! the SIGTERM record. Every other test clears `DARKMUX_*`, so its recorder
+//! degrades to a no-op ("trajectory recording disabled").
 //!
 //! The mock endpoint is a hand-rolled `TcpListener` server rather than
 //! `httpmock`: the pins need the exact bodies and headers each request
@@ -1154,4 +1153,224 @@ fn p_feedback_templates_reach_the_model() {
     let templates = r#"{"tool_failure_cascade":"CUSTOM-CASCADE-NOTE-4411"}"#;
     assert!(injected(&["--max-turns", "6", "--feedback-templates-json", templates]));
     assert!(!injected(&["--max-turns", "6"]));
+}
+
+// ─── out-dir records (DARKMUX_RUNTIME_OUT_DIR) ──────────────────────────
+
+/// A dispatch whose out-dir is `dir` (the test seam for `/darkmux-out`).
+fn run_in(dir: &std::path::Path, base: Vec<String>, extra: &[&str]) -> Run {
+    run_with(base, extra, None, &[("DARKMUX_RUNTIME_OUT_DIR", dir.to_str().unwrap())])
+}
+
+fn trajectory_of(dir: &std::path::Path) -> Vec<Value> {
+    let path = dir.join(".darkmux-runtime/trajectory.jsonl");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no trajectory at {}: {e}", path.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn of_type<'a>(records: &'a [Value], ty: &str) -> Vec<&'a Value> {
+    records.iter().filter(|r| r["type"] == ty).collect()
+}
+
+/// A turn the model ends with an empty `tool_calls`: the loop drops it and
+/// records the recovery with the bound that applied.
+fn empty_tool_calls() -> Reply {
+    chat_reply(json!({ "role": "assistant", "content": null, "tool_calls": [] }), "tool_calls", 0)
+}
+
+/// L: with an out-dir, the run's own bookkeeping lands there: the header,
+/// `dispatch.start` (model, the two prompt lengths, the ADVERTISED tools),
+/// and a terminal `dispatch.complete` naming the result. The stderr line
+/// names the overridden path.
+#[test]
+fn l_the_out_dir_records_dispatch_start_and_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Mock::start(|_, _| answer("ok"));
+    let run = run_in(dir.path(), dispatch_args(&mock.base_url()), &["--allowed-tools", "bash,read"]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let path = dir.path().join(".darkmux-runtime/trajectory.jsonl");
+    assert!(run.stderr.contains(&format!("darkmux-runtime: trajectory → {}\n", path.display())), "{run:?}");
+
+    let t = trajectory_of(dir.path());
+    assert_eq!(t[0], json!({ "schema_version": "1.0", "type": "trajectory.header" }));
+    let start = &t[1];
+    assert_eq!(start["type"], "dispatch.start");
+    assert_eq!(start["model"], "brain-model");
+    assert_eq!(start["system_chars"], SYSTEM.len());
+    assert_eq!(start["prompt_chars"], 2);
+    assert_eq!(start["tools"], json!(["read", "bash"]));
+    let last = t.last().unwrap();
+    assert_eq!(last["type"], "dispatch.complete");
+    assert_eq!(last["result"], "stop");
+    assert_eq!(of_type(&t, "dispatch.complete").len(), 1);
+}
+
+/// Q: `dispatch.complete` carries the loop's own result, not a fixed one.
+#[test]
+fn q_dispatch_complete_names_max_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Mock::start(|_, _| tool_call(Value::Null));
+    let run = run_in(dir.path(), dispatch_args(&mock.base_url()), &["--max-turns", "1"]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let t = trajectory_of(dir.path());
+    assert_eq!(t.last().unwrap()["type"], "dispatch.complete");
+    assert_eq!(t.last().unwrap()["result"], "max_turns");
+}
+
+/// R: the `--json` envelope's `trajectory_path` is the out-dir's file, and
+/// the human summary reads its counts back from that same file.
+#[test]
+fn r_envelope_and_summary_read_the_out_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Mock::start(|_, _| answer("ok"));
+    let run = run_in(dir.path(), dispatch_args(&mock.base_url()), &["--json"]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let expected = dir.path().join(".darkmux-runtime/trajectory.jsonl");
+    assert_eq!(run.envelope()["trajectory_path"], expected.display().to_string());
+
+    let dir = tempfile::tempdir().unwrap();
+    let run = run_in(dir.path(), dispatch_args(&mock.base_url()), &[]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(run.stdout.contains("turns:             1\n"), "{run:?}");
+    assert!(run.stdout.contains("prompt tokens:     50\n"), "{run:?}");
+    assert!(run.stdout.contains("completion tokens: 3\n"), "{run:?}");
+}
+
+/// O: each `-source` flag reaches the record of the bound that acted, and an
+/// unknown tier reads `built-in`. Generation applies on a non-reasoning
+/// model's call; reasoning once the model has reasoned; the per-call cap
+/// when it is at or below the generation interval (the check-in is off).
+#[test]
+fn o_bound_sources_reach_the_recovery_record() {
+    let bound = |reasoning: bool, extra: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Mock::start(move |n, _| match n {
+            0 if reasoning => chat_reply(
+                json!({ "role": "assistant", "content": null, "reasoning_content": "thinking",
+                    "tool_calls": [{ "id": "c", "type": "function", "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x\",\"offset\":1,\"limit\":0}" } }] }),
+                "tool_calls",
+                3,
+            ),
+            0 => empty_tool_calls(),
+            1 if reasoning => empty_tool_calls(),
+            _ => answer("ok"),
+        });
+        let run = run_in(dir.path(), dispatch_args(&mock.base_url()), extra);
+        assert_eq!(run.code, Some(0), "{run:?}");
+        let t = trajectory_of(dir.path());
+        let rec = of_type(&t, "dispatch.empty_tool_calls.recovered");
+        assert_eq!(rec.len(), 1, "{t:#?}");
+        let b = &rec[0]["bound"];
+        (b["kind"].as_str().unwrap().to_string(), b["source"].as_str().unwrap().to_string())
+    };
+    let sources = [
+        "--generation-checkpoint-interval-source", "config",
+        "--reasoning-checkpoint-interval-source", "cli",
+        "--max-tokens-per-call-source", "env",
+    ];
+    assert_eq!(bound(false, &sources), ("generation_checkpoint_interval".into(), "config".into()));
+    assert_eq!(bound(false, &[]), ("generation_checkpoint_interval".into(), "built-in".into()));
+    assert_eq!(bound(true, &sources), ("reasoning_checkpoint_interval".into(), "cli".into()));
+    let capped: Vec<&str> = sources.iter().copied().chain(["--max-tokens-per-call", "3000"]).collect();
+    assert_eq!(bound(false, &capped), ("max_tokens_per_call".into(), "env".into()));
+    assert_eq!(
+        bound(false, &["--max-tokens-per-call", "3000", "--max-tokens-per-call-source", "nonsense"]),
+        ("max_tokens_per_call".into(), "built-in".into())
+    );
+}
+
+/// P: `--role-id` is stamped into `checkpoint.json`, written in the out-dir
+/// before a workspace-changing tool runs (the resume guard reads it).
+#[test]
+fn p_role_id_is_stamped_into_the_checkpoint() {
+    let role_in_checkpoint = |extra: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Mock::start(|n, _| {
+            if n == 0 {
+                chat_reply(
+                    json!({ "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "c", "type": "function", "function": { "name": "write", "arguments": "{\"path\":\"/workspace/y.txt\",\"content\":\"z\"}" } }] }),
+                    "tool_calls",
+                    3,
+                )
+            } else {
+                answer("ok")
+            }
+        });
+        let run = run_in(dir.path(), dispatch_args(&mock.base_url()), extra);
+        assert_eq!(run.code, Some(0), "{run:?}");
+        let ckpt: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("checkpoint.json")).unwrap()).unwrap();
+        ckpt["role_id"].as_str().unwrap().to_string()
+    };
+    assert_eq!(role_in_checkpoint(&["--role-id", "coder"]), "coder");
+    assert_eq!(role_in_checkpoint(&[]), "");
+}
+
+/// L: a SIGTERM mid-call ends the run with 128 + 15 and closes the
+/// trajectory with a terminal `interrupted` record (the handler is
+/// installed only on a live recorder).
+#[test]
+fn l_sigterm_closes_the_trajectory_as_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Mock::start(|_, _| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        answer("late")
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_darkmux-runtime"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("DARKMUX_") {
+            cmd.env_remove(k);
+        }
+    }
+    let args = dispatch_args(&mock.base_url());
+    let mut child = cmd
+        .args(&args)
+        .env("DARKMUX_RUNTIME_OUT_DIR", dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait for the model call to be in flight: the handler is installed
+    // before `dispatch.start`, and the call follows it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while mock.requests().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the model call never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: kill(2) on our own child's pid.
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let t = trajectory_of(dir.path());
+    let last = t.last().unwrap();
+    assert_eq!(last["type"], "dispatch.complete");
+    assert_eq!(last["result"], "interrupted");
+}
+
+/// An empty `DARKMUX_RUNTIME_OUT_DIR` is unset, never the current directory:
+/// the run falls back to `/darkmux-out` and writes nothing beside itself.
+#[test]
+fn l_an_empty_out_dir_override_is_ignored() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mock = Mock::start(|_, _| answer("ok"));
+    let args = dispatch_args(&mock.base_url());
+    let out = Command::new(env!("CARGO_BIN_EXE_darkmux-runtime"))
+        .args(&args)
+        .env("DARKMUX_RUNTIME_OUT_DIR", "")
+        .current_dir(cwd.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("darkmux-runtime: trajectory → /darkmux-out/.darkmux-runtime/trajectory.jsonl")
+            || stderr.contains("darkmux-runtime: trajectory recording disabled ("),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_dir(cwd.path()).unwrap().count(), 0);
 }
