@@ -434,5 +434,5 @@ fn every_hosted_call_site_passes_the_budget_gates() {
         "(#3035) the pacer is built from the brain's endpoint, managed or hosted (behavior: \
          `a_managed_brains_window_pauses_the_runtime_between_turns_through_the_pace_file`)"
     );
-    assert!(fn_body(&di, "run_telemetry_sampler").contains("pacer.on_tick("), "the pacer ticks");
+    assert!(fn_body(&di, "pace_budget").contains("pacer.on_tick("), "the pacer ticks");
 }

@@ -385,8 +385,8 @@
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, env)"), "the pacer tick");
-        assert!(src.contains("let others = governors.other_pacing();"), "derived from the pair");
+        assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env)"), "the pacer tick");
+        assert!(src.contains("let others = self.governors.other_pacing();"), "derived from the pair");
         assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
     }
 
@@ -17690,7 +17690,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     fn every_host_derived_record_in_this_module_is_built_by_a_stamping_builder() {
         let src = include_str!("dispatch_internal.rs");
         for (builder, expected, what) in [
-            ("thermal_stop_unresolved_payload(", 3, "2 emission sites + its definition"),
+            ("thermal_stop_unresolved_payload(", 2, "1 emission site (the breaker and the tier-4 hold share it) + its definition"),
             ("battery_pause_unsupported_payload(", 2, "1 emission site + its definition"),
         ] {
             let n = src.matches(builder).count();
@@ -20624,4 +20624,108 @@ fn a_text_mode_dispatch_never_reads_its_stdout_as_an_envelope() {
 fn a_json_dispatch_still_enriches_its_envelope() {
     let out = super::runtime_stdout_for_caller(true, r#"{"result":"stop"}"#.to_string(), |s| format!("{s}+enriched"));
     assert_eq!(out, r#"{"result":"stop"}+enriched"#);
+}
+
+// (#316 stage 3) The pure pieces `dispatch()` and the telemetry sampler were
+// split into, pinned where they decide something.
+
+/// The container name is the fixed prefix and the session's wire form,
+/// whose escapes (`_XX`) and separators (`.`) docker accepts as they are.
+/// (The `-` substitution for any other character cannot fire for a session
+/// id: the wire form never carries one. The boundary suite pins the same.)
+#[test]
+fn the_container_name_is_the_prefix_and_the_wire_form_unchanged() {
+    let session = crate::test_session("a+b/c d_e.f-g");
+    let wire = session.wire();
+    assert!(wire.contains('_') && wire.contains('.') && wire.contains('-'), "premise: {wire}");
+    assert_eq!(super::container_name_for(&session), format!("darkmux-dispatch-{wire}"));
+}
+
+/// A role with no feedback templates, or an empty set, hands the runtime
+/// `null`; a declared set goes over as its JSON object.
+#[test]
+fn the_feedback_templates_are_null_unless_the_role_declares_some() {
+    let mut role: crate::types::Role = serde_json::from_str(
+        r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+    )
+    .unwrap();
+    role.feedback_templates = None;
+    assert_eq!(super::feedback_templates_json(&role), serde_json::Value::Null, "none declared");
+    role.feedback_templates = Some(Default::default());
+    assert_eq!(super::feedback_templates_json(&role), serde_json::Value::Null, "an empty set");
+    role.feedback_templates = Some([("k".to_string(), "v".to_string())].into_iter().collect());
+    assert_eq!(super::feedback_templates_json(&role), serde_json::json!({"k": "v"}), "a declared set");
+}
+
+/// The compaction trigger the viewer draws is the earliest one the runtime
+/// fires at: the smaller of the absolute and the ratio trigger when both are
+/// set, whichever one is set otherwise, then half the window.
+#[test]
+fn the_compaction_threshold_is_the_earliest_trigger_the_runtime_fires_at() {
+    let args = |abs: Option<u32>, ratio: Option<f32>, window: Option<u32>| crate::dispatch::CompactionDispatchArgs {
+        threshold_tokens: abs,
+        threshold_ratio: ratio,
+        context_window: window,
+        ..Default::default()
+    };
+    let t = |a: &crate::dispatch::CompactionDispatchArgs| super::effective_compaction_threshold(a);
+    assert_eq!(t(&args(Some(1000), Some(0.5), Some(4000))), Some(1000), "absolute below the ratio");
+    assert_eq!(t(&args(Some(3000), Some(0.5), Some(4000))), Some(2000), "ratio below the absolute");
+    assert_eq!(t(&args(Some(3000), None, Some(4000))), Some(3000), "absolute alone");
+    assert_eq!(t(&args(None, Some(0.75), Some(4000))), Some(3000), "ratio alone");
+    assert_eq!(t(&args(None, None, Some(4000))), Some(2000), "half the window");
+    assert_eq!(t(&args(None, Some(0.75), None)), None, "a ratio with no window");
+    assert_eq!(t(&args(None, None, None)), None, "nothing to draw");
+}
+
+/// A reading with any of cpu, mem or gpu joins the utilization series; one
+/// with none of them does not.
+#[test]
+fn a_reading_joins_the_utilization_series_when_any_of_its_three_was_read() {
+    let none = crate::host_probe::HostSampleFull::default();
+    assert!(super::host_sample_at(7, &none).is_none());
+    for (cpu, mem, gpu) in [(Some(1), None, None), (None, Some(2), None), (None, None, Some(3))] {
+        let s = crate::host_probe::HostSampleFull { cpu_pct: cpu, mem_pct: mem, gpu_pct: gpu, ..Default::default() };
+        let at = super::host_sample_at(7, &s).unwrap_or_else(|| panic!("{cpu:?} {mem:?} {gpu:?}"));
+        assert_eq!((at.at_ms, at.cpu, at.mem, at.gpu), (7, cpu, mem, gpu));
+    }
+}
+
+/// A reading with power or thermal joins the extras series; one with
+/// neither does not.
+#[test]
+fn a_reading_joins_the_extras_series_when_it_read_power_or_thermal() {
+    let none = crate::host_probe::HostSampleFull::default();
+    assert!(super::host_extra_at(7, &none).is_none());
+    let power = crate::host_probe::PowerSample { cpu_mw: 1.0, gpu_mw: 2.0, ane_mw: 3.0 };
+    let with_power = crate::host_probe::HostSampleFull { power: Some(power), ..Default::default() };
+    let at = super::host_extra_at(7, &with_power).expect("power alone");
+    assert_eq!((at.at_ms, at.power, at.thermal), (7, Some(power), None));
+    let thermal = crate::host_probe::ThermalSample { state: "fair".to_string(), cpu_speed_limit_pct: 100 };
+    let with_thermal = crate::host_probe::HostSampleFull { thermal: Some(thermal.clone()), ..Default::default() };
+    let at = super::host_extra_at(7, &with_thermal).expect("thermal alone");
+    assert_eq!((at.power, at.thermal), (None, Some(thermal)));
+}
+
+/// The sampler's nap ends as soon as the stop flag is up, whether it was up
+/// before the nap or went up during it, and says so.
+#[test]
+fn the_sampler_nap_ends_at_the_stop_flag() {
+    let stop = Arc::new(AtomicBool::new(true));
+    let t0 = Instant::now();
+    assert!(super::nap_until_stopped(&stop), "already stopped");
+    assert!(t0.elapsed() < Duration::from_millis(100), "{:?}", t0.elapsed());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let raiser = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            stop.store(true, Ordering::SeqCst);
+        })
+    };
+    let t0 = Instant::now();
+    assert!(super::nap_until_stopped(&stop), "stopped mid-nap");
+    assert!(t0.elapsed() < super::TELEMETRY_SAMPLE_INTERVAL, "returned before the full interval: {:?}", t0.elapsed());
+    raiser.join().unwrap();
 }

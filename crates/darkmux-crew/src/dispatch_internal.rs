@@ -6164,28 +6164,17 @@ fn prepare_container_run(
     let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
     let (role, system_prompt, allowed_tools) =
         container_role(opts, brain.agentic_pm.is_some(), &workdir_split_gitdirs)?;
-    let WorkspacePlan { validated_workdir, intended_workspace, resume_checkpoint_contents } =
-        plan_workspace(opts, unix_micros)?;
+    let workspace_plan = plan_workspace(opts, unix_micros)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
     record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
-    let workspace = create_workspace(opts, validated_workdir, &intended_workspace)?;
-
-    // (#888) Reclaim the auto-allocated scratch workspace if the dispatch
-    // `?`-returns or panics before the container runs to completion. Tracks
-    // the tempdir ONLY for the no-`--workdir` case; an operator `--workdir`
-    // is never cleaned. Disarmed at the terminal-record point.
-    let workspace_cleanup = AutoWorkspaceCleanup {
-        workspace: opts.workdir.is_none().then(|| workspace.clone()),
-        armed: true,
-    };
-    let host_out = prepare_host_out(
+    let (workspace, workspace_cleanup, host_out) = materialize_dirs(
         opts,
         unix_micros,
+        workspace_plan,
         &mut execution_lock,
-        (&workspace, image_arg.as_deref()),
+        image_arg.as_deref(),
         execution,
-        resume_checkpoint_contents.as_deref(),
     )?;
 
     // (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
@@ -6709,6 +6698,37 @@ fn create_workspace(
         workspace_source
     );
     Ok(workspace)
+}
+
+/// The workspace, the guard that reclaims an auto one, and the out-dir,
+/// made in that order.
+fn materialize_dirs(
+    opts: &DispatchOpts,
+    unix_micros: u128,
+    workspace_plan: WorkspacePlan,
+    execution_lock: &mut ExecutionLock,
+    image_arg: Option<&str>,
+    execution: &ExecutionId,
+) -> Result<(PathBuf, AutoWorkspaceCleanup, PathBuf)> {
+    let workspace = create_workspace(opts, workspace_plan.validated_workdir, &workspace_plan.intended_workspace)?;
+
+    // (#888) Reclaim the auto-allocated scratch workspace if the dispatch
+    // `?`-returns or panics before the container runs to completion. Tracks
+    // the tempdir ONLY for the no-`--workdir` case; an operator `--workdir`
+    // is never cleaned. Disarmed at the terminal-record point.
+    let workspace_cleanup = AutoWorkspaceCleanup {
+        workspace: opts.workdir.is_none().then(|| workspace.clone()),
+        armed: true,
+    };
+    let host_out = prepare_host_out(
+        opts,
+        unix_micros,
+        execution_lock,
+        (&workspace, image_arg),
+        execution,
+        workspace_plan.resume_checkpoint_contents.as_deref(),
+    )?;
+    Ok((workspace, workspace_cleanup, host_out))
 }
 
 /// 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
@@ -9671,32 +9691,707 @@ fn run_telemetry_sampler(
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
-    mut budget_pacer: Option<crate::budget::BudgetPacer>,
+    budget_pacer: Option<crate::budget::BudgetPacer>,
     // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
     local_stop: DispatchStop,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
+    let records = SamplerRecords { role_id, session, execution, model, phase_id, record_context };
+    let mut sampler = DispatchSampler::start(
+        &records,
+        [compactor_model, utility_model],
+        host_out,
+        thermal_config,
+        budget_pacer,
+        local_stop,
+    );
+    while !stop_flag.load(Ordering::SeqCst) {
+        sampler.tick(&records);
+        // Teardown mid-interval: return what was observed, never a
+        // default. A killed or short dispatch still has real stats.
+        if nap_until_stopped(&stop_flag) {
+            break;
+        }
+    }
+    sampler.finish()
+}
+
+/// Wait out the sample interval, but poll the stop flag every
+/// `SAMPLER_POLL_INTERVAL` so teardown after `wait_with_output()`
+/// is prompt (≤500ms) rather than blocking for a full 2s tick.
+/// `true` when the stop flag was seen set before the interval ran out.
+fn nap_until_stopped(stop_flag: &AtomicBool) -> bool {
+    let mut slept = Duration::ZERO;
+    while slept < TELEMETRY_SAMPLE_INTERVAL {
+        if stop_flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
+        thread::sleep(nap);
+        slept += nap;
+    }
+    false
+}
+
+/// Who the sampler's records are about: this dispatch's identity, and the
+/// crawl's provenance when it is a crawl unit.
+struct SamplerRecords {
+    role_id: String,
+    session: SessionId,
+    execution: ExecutionId,
+    model: String,
+    phase_id: Option<String>,
+    record_context: Option<darkmux_flow::payload::RecordContext>,
+}
+
+impl SamplerRecords {
+    /// (#2774 tiers 2/4) A governor's `dispatch.rest` decision, plus the
+    /// per-tier extras: the duty-cycle events want to carry `delay_ms`, the
+    /// tier-4 hold wants `episode`, and neither deserves a bespoke one-off
+    /// closure. `level` is explicit (not always `Info`) because tier 4's hold
+    /// is operator-actionable, not routine pacing telemetry.
+    fn emit_rest_with_extra(&self, level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: RestExtra) {
+        let mut payload = darkmux_flow::Payload::DispatchRest(DispatchRestPayload {
+            reason: Some(reason.to_string()),
+            state: Some(state.to_string()),
+            pause: Some(pause),
+            delay_ms: extra.delay_ms,
+            episode: extra.episode,
+            checklist: extra.checklist,
+            resume_hint: extra.resume_hint,
+            ..Default::default()
+        });
+        // (#2779) `simulated_host_source` when — and only when — this
+        // decision was made on scenario readings. Absent on a real run, so
+        // its PRESENCE alone answers "were these readings real".
+        crate::host_source::stamp(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
+            level,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+
+    fn emit_rest(&self, reason: &str, state: &str, pause: bool) {
+        self.emit_rest_with_extra(darkmux_flow::Level::Info, reason, state, pause, RestExtra::default());
+    }
+
+    fn emit(&self, source: darkmux_flow::FlowSource, payload: darkmux_flow::Payload) {
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            source,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+
+    /// An operator-actionable gap, not routine telemetry: a `Warn` record,
+    /// through `merge_record_context` so the crawl's own identifying fields
+    /// (unit, source, sha, rule) ride along, same as `emit_rest`.
+    fn emit_warning(&self, source: darkmux_flow::FlowSource, mut payload: darkmux_flow::Payload) {
+        merge_record_context(&mut payload, &self.record_context);
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Warn,
+            source,
+            &self.role_id,
+            &self.session,
+            &self.execution,
+            Some(&self.model),
+            self.phase_id.as_deref(),
+            payload,
+        ));
+    }
+}
+
+/// The dispatch-side telemetry sampler's state between ticks.
+struct DispatchSampler {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
     // `SystemTime`.
-    let started = Instant::now();
-    let mut raw: Vec<HostSampleAt> = Vec::new();
+    started: Instant,
+    raw: Vec<HostSampleAt>,
     // (#2108) The power/thermal half of the same series, reduced by
     // `reduce_host_extras` at the end exactly as `raw` is by
     // `reduce_host_stats`. Kept as a SECOND list rather than widening
     // `HostSampleAt` so the cpu/mem/gpu reduction the envelope has emitted
     // since #2107 stays byte-identical.
-    let mut extras: Vec<HostExtraAt> = Vec::new();
+    extras: Vec<HostExtraAt>,
+    // Field order is drop order: the sampler lock is released before the
+    // probe is dropped, as when both were this thread's own locals.
+    // (#2413) See `DispatchSampler::start`.
+    sampler_lock: Option<crate::host_sampler_lock::SamplerLockGuard>,
     // A probe PRIVATE to this dispatch: `cpu_pct` and every power rail are
     // counter deltas, so a probe of our own gives deltas that line up with
     // this sampler's own 2s cadence rather than with whoever sampled last.
     // Construction is ~80-100ms once; each sample is ~5-10ms.
-    let mut probe = crate::host_probe::HostProbe::new();
-    // (N6 of the #2110/#2109 review) Clear any pace.json already sitting
-    // in this out-dir BEFORE the sampler's first tick — see
-    // `clear_stale_pace_file`'s own doc for why.
-    clear_stale_pace_file(&host_out);
-    // (#2110/#2109) The thermal governor/breaker — see its module doc.
+    probe: crate::host_probe::HostProbe,
+    host_out: PathBuf,
+    thermal_stop_file: Option<PathBuf>,
+    // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
+    // looked crawl-shaped but the STOP path came back `None` because
+    // derivation failed (not because this simply isn't a crawl dispatch) —
+    // see `stop_file_unresolved_reason`'s own doc for the distinction.
+    thermal_stop_unresolved_reason: Option<&'static str>,
+    governors: crate::governor_tick::GovernorPair,
+    // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
+    // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
+    budget_pacer: Option<crate::budget::BudgetPacer>,
+    // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
+    local_stop: DispatchStop,
+    machine_sampler_interval_ms: u64,
+    // (#2413 review finding) The MEASURED write duration of the PREVIOUS
+    // `machine.telemetry` emission — `None` until the first one has
+    // happened. A record cannot honestly report its OWN write cost (the
+    // write hasn't happened yet when the payload is built), so this stamps
+    // last time's measured cost instead of a build-only proxy mislabeled
+    // as "the write".
+    prev_record_write_ms: Option<u64>,
+    // (#2413 M2, review round 2) `at_ms` of the last `machine.telemetry`
+    // EMISSION (not heartbeat) — feeds `telemetry_emission_due` so the
+    // curve honors `machine_sampler_interval_ms` instead of the 2s outer
+    // loop tick. `None` before the first emission.
+    last_telemetry_emit_at_ms: Option<u64>,
+    // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
+    // all moved into `LmsTelemetryTracker` — see its doc for why the state
+    // machine lives behind an injected-effect seam instead of inline here.
+    lms_tracker: LmsTelemetryTracker,
+    // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
+    // last thermal sample — NOT a hardcoded per-tick constant. A tick can
+    // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
+    // `lms list_loaded()` call can stall up to ~30s), and the whole
+    // process can sleep/suspend between ticks — feeding a fixed 2000ms in
+    // either case would under-report real elapsed time to the governor's
+    // hysteresis/max-pause/heartbeat accounting, which could let a
+    // thermal-critical pause's written_at_ms go stale past what the
+    // runtime's own ceiling honors. `0` on the very first tick is correct
+    // (there is no "last sample" yet).
+    prev_thermal_at_ms: u64,
+}
+
+impl DispatchSampler {
+    /// Everything the sampler sets up before its first tick, in the order
+    /// it always ran: the probe, the stale pace file, the thermal governor
+    /// and its start warnings, the STOP path, the battery governor, the
+    /// host source's warning, and the machine sampler lock.
+    fn start(
+        records: &SamplerRecords,
+        utility_ids: [Option<String>; 2],
+        host_out: PathBuf,
+        thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+        budget_pacer: Option<crate::budget::BudgetPacer>,
+        local_stop: DispatchStop,
+    ) -> Self {
+        let started = Instant::now();
+        let probe = crate::host_probe::HostProbe::new();
+        // (N6 of the #2110/#2109 review) Clear any pace.json already sitting
+        // in this out-dir BEFORE the sampler's first tick — see
+        // `clear_stale_pace_file`'s own doc for why.
+        clear_stale_pace_file(&host_out);
+        let record_context = records.record_context.as_ref();
+        let thermal_governor = start_thermal_governor(thermal_config, &records.session, record_context);
+        let thermal_stop_file = crate::thermal_governor::stop_file_path_from_record_context(record_context);
+        let thermal_stop_unresolved_reason = crate::thermal_governor::stop_file_unresolved_reason(record_context);
+        // (#2706) The battery governor rides this SAME tick — the probe
+        // already reads `sample.battery` every 2s, so no separate poller is
+        // needed, exactly as the thermal governor rides the thermal half.
+        //
+        // `pause_supported(true)`: this sampler exists only on the
+        // CONTAINER-backed dispatch path (its caller `spawn_guarded_sampler`
+        // is reached after a `child` is spawned), whose pause is an in-memory
+        // rest at a turn boundary — `runtime/src/pace.rs`'s bounded ≤2s poll
+        // loop, which keeps the whole conversation in memory and continues
+        // from exactly where it rested. That run type CAN be resumed, so it
+        // is allowed to pause. A run type that could not would pass `false`
+        // and get `BatteryEvent::PauseUnsupported` instead of a park it could
+        // not leave.
+        let battery_governor =
+            crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
+        // (#2779) The two governors tick THROUGH the shared seam, not as two
+        // inline calls here. The order, the `is_pausing` gate and the one-clock
+        // rule live in `governor_tick::GovernorPair::tick` so a scenario test
+        // proves the REAL wiring rather than a reimplementation of it — see
+        // that module's doc for the F1 inversion it exists to keep proven.
+        let governors = crate::governor_tick::GovernorPair::new(thermal_governor, battery_governor);
+        // (#2779) A simulated host source is never silent. Same surface and
+        // same shape as the ladder's disarm notes, rendered off
+        // `host_source::provenance()` so doctor and the dispatch cannot
+        // disagree about what is driving the readings.
+        if let Some(warning) = crate::host_source::provenance().warning() {
+            eprintln!("darkmux: ⚠ host source — {warning}");
+        }
+        // (#2413) This dispatch is, by definition, LIVE for as long as this
+        // sampler thread runs — so if it becomes the machine's singleton host
+        // sampler, it always emits at the base `host_sampler_interval_ms()`
+        // cadence (never the daemon's idle 10x backoff, which exists only
+        // because the DAEMON runs when nothing may be live). `try_acquire`
+        // returns `None` when a daemon (or another dispatch) already holds a
+        // fresh lock — in that case this dispatch emits NO `machine.telemetry`
+        // records at all, matching the rule "at most one emitter per machine."
+        // The guard lives in the sampler's state: RAII releases it on every
+        // exit from `run_telemetry_sampler` (normal return, a stop seen
+        // mid-interval, or a panic-unwind through it), same lifecycle
+        // contract as every other bookend guard in this codebase.
+        let machine_sampler_interval_ms = darkmux_types::config_access::host_sampler_interval_ms();
+        let sampler_lock = if machine_sampler_interval_ms > 0 {
+            crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms)
+        } else {
+            None
+        };
+        // (#2914) One utility seat, under every id this dispatch declared for
+        // it: the compactor's resolved wire id and the binding (normally the same
+        // model; a pinned compactor that differs still shares the seat).
+        let lms_tracker = LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect());
+        Self {
+            started,
+            raw: Vec::new(),
+            extras: Vec::new(),
+            sampler_lock,
+            probe,
+            host_out,
+            thermal_stop_file,
+            thermal_stop_unresolved_reason,
+            governors,
+            budget_pacer,
+            local_stop,
+            machine_sampler_interval_ms,
+            prev_record_write_ms: None,
+            last_telemetry_emit_at_ms: None,
+            lms_tracker,
+            prev_thermal_at_ms: 0,
+        }
+    }
+
+    /// One tick: the lms deltas, one host reading, what the governors and
+    /// the budget pacer decide on it, the reading recorded for the
+    /// reduction, and the machine-scoped curve.
+    fn tick(&mut self, records: &SamplerRecords) {
+        // lms load/unload deltas — the seed/diff rule, the `role`/`baseline`
+        // tagging, and the skip-on-failed-probe behavior all live in
+        // `LmsTelemetryTracker::tick` so they are unit-testable without a
+        // live `lms` or a live flow sink. Nothing but the wiring is here.
+        self.lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
+            records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
+        });
+
+        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
+        // per-cluster frequency, power and thermal state the same probe
+        // reads for free. Inference runs in LMStudio (off-container), so the
+        // load worth watching is the HOST's, not the runtime container's
+        // (which idles waiting on the model and reads ~0 — the
+        // wrong-question problem, #814/#1064). Each read is best-effort and
+        // unprivileged; a tick emits whichever fields succeed.
+        let sample = self.probe.sample();
+        let at_ms = self.started.elapsed().as_millis() as u64;
+        // (N1 of the #2110/#2109 review) REAL elapsed since the last
+        // thermal tick, not TELEMETRY_SAMPLE_INTERVAL_MS — see
+        // `prev_thermal_at_ms`'s own doc for why the constant was
+        // wrong. `saturating_sub` on two `started.elapsed()` reads is
+        // monotonic (never underflows) regardless of how long this
+        // iteration's earlier work (the lms diff above) took.
+        let thermal_elapsed_ms = at_ms.saturating_sub(self.prev_thermal_at_ms);
+        self.prev_thermal_at_ms = at_ms;
+        // (#2779) BOTH governors decide here, through the shared seam — the
+        // order, the `is_pausing` gate and the one-clock rule are the
+        // seam's, not this loop's. This loop reports what they decided.
+        let tick_events = self.governors.tick(
+            &crate::host_source::HostReading {
+                thermal: sample.thermal.clone(),
+                battery: sample.battery,
+            },
+            thermal_elapsed_ms,
+            &self.host_out,
+            self.thermal_stop_file.as_deref(),
+        );
+        // Every state change (pause/resume/breaker) is a
+        // `dispatch.rest`-family flow record, so a slowed or stopped run
+        // is attributable on the flow stream.
+        if let Some(event) = tick_events.thermal {
+            self.on_thermal_event(records, event);
+        }
+        // (#2706) The battery governor's decision for this tick — made in
+        // `governors.tick` above, fed the SAME reading and the SAME
+        // measured `thermal_elapsed_ms` the thermal governor got (one
+        // clock, so their heartbeat accounting can never disagree), and
+        // gated on the thermal governor's POST-decision `is_pausing`.
+        //
+        // (#2774 review F1 / #2779) That gate is deliberately `is_pausing`,
+        // NOT `is_pacing` — and it now lives in
+        // `governor_tick::GovernorPair::tick` rather than inline here, so
+        // a scenario test can prove it. See that module's doc for what the
+        // `is_pacing` version cost: a live battery-critical pause rewritten
+        // to `pause: false` for the whole duration of a duty-cycle episode,
+        // the run still working, the battery still draining.
+        //
+        // A machine with NO battery decides nothing at all: `sample.battery`
+        // is `None` on a desktop, and the governor's first act is to return
+        // on that — before any config read, threshold comparison or file
+        // write.
+        if let Some(event) = tick_events.battery {
+            on_battery_event(records, event);
+        }
+        self.pace_budget(records, thermal_elapsed_ms);
+        self.record_host_sample(at_ms, &sample);
+        self.machine_telemetry_tick(at_ms, &sample);
+    }
+
+    fn on_thermal_event(&self, records: &SamplerRecords, event: crate::thermal_governor::ThermalEvent) {
+        match event {
+            crate::thermal_governor::ThermalEvent::Paused { state } => {
+                records.emit_rest("thermal", &state, true);
+            }
+            crate::thermal_governor::ThermalEvent::Resumed { state } => {
+                records.emit_rest("thermal", &state, false);
+            }
+            crate::thermal_governor::ThermalEvent::Breaker { state } => {
+                self.on_thermal_breaker(records, &state);
+            }
+            crate::thermal_governor::ThermalEvent::DutyCycleEntered { state, delay_ms } => {
+                // (#2774 tier 2) `pause: false` — this is NOT a rest
+                // the run stops for; it is the duty-cycle instruction
+                // itself. `delay_ms` rides the SAME `dispatch.rest`
+                // record family so a reader watching that one action
+                // string sees every pacing decision, tier 2 included.
+                records.emit_rest_with_extra(
+                    darkmux_flow::Level::Info,
+                    "thermal-duty-cycle",
+                    &state,
+                    false,
+                    RestExtra { delay_ms: Some(delay_ms), ..Default::default() },
+                );
+            }
+            crate::thermal_governor::ThermalEvent::DutyCycleExited { state } => {
+                records.emit_rest("thermal-duty-cycle", &state, false);
+            }
+            crate::thermal_governor::ThermalEvent::OperatorHold { state, episode } => {
+                self.hold_for_operator(records, &state, episode);
+            }
+        }
+    }
+
+    fn on_thermal_breaker(&self, records: &SamplerRecords, state: &str) {
+        records.emit_rest("thermal-critical", state, true);
+        // (#2110/#2109 review finding 5, widened by #2456) Two
+        // DISTINCT ways the breaker can fail to stop a crawl,
+        // both surfaced through the same warning shape because
+        // from the operator's point of view they mean the
+        // same thing — "the breaker tried and could not write
+        // a STOP" — and both must be LOUD, never a silent
+        // no-op that lets the crawl keep dispatching units
+        // past a tripped breaker with no trace of why:
+        //
+        // - No trustworthy STOP path could even be DERIVED
+        //   (finding 5's original case — never write one at a
+        //   guessed path).
+        // - A path WAS derived, but the write itself was
+        //   REFUSED (#2456 — a symlink was sitting at the path
+        //   or its parent).
+        //
+        // The two are DISTINGUISHABLE in the record — `cause`
+        // is `"path_underivable"` vs `"write_refused"` — because
+        // the remedies differ sharply: the first is a crawl
+        // `record_context` bug, the second means something is
+        // sitting at the STOP path as a symlink and wants an
+        // operator to go LOOK. The selection lives in
+        // `thermal_governor::stop_unresolved_cause` (a pure,
+        // unit-tested function) rather than inline here: this
+        // sampler runs on its own thread inside a live dispatch
+        // and no test reaches it, so an inline version was
+        // pinned by nothing.
+        self.warn_stop_unresolved(records, state);
+        // (#2774 tier 5) A literal `critical` OS thermal state
+        // — not the speed-limit-sustained trigger, and not the
+        // pre-existing max-pause-exceeded-while-paused
+        // escalation, both of which also reach this arm — gets
+        // the operator's own "hard stop plus eject" treatment
+        // on top of the breaker's existing pause+STOP-file
+        // behavior. Scoped to the literal state name (the
+        // issue's own condition), deliberately NOT widened to
+        // the speed-limit trigger: that one is a proxy signal,
+        // this is the hardware's own worst-case report.
+        //
+        // (#2774 review C6) **What "hard stop" reaches, stated
+        // exactly:** THIS dispatch (the pace file pauses it)
+        // and, if this is a crawl unit, that crawl's remaining
+        // units (the STOP file the breaker wrote).
+        // Plus every `darkmux:`-namespaced resident on
+        // this host, which the eject below releases. It does
+        // NOT reach other concurrent dispatches, other
+        // missions, or the fleet: a MACHINE-WIDE thermal
+        // broadcast is #2774's open half and is not built.
+        // An earlier wording here said "no question asked,"
+        // which read as a claim about scope it never had.
+        if state == "critical" {
+            let trip_wall = SystemTime::now();
+            tier5_eject_on_critical(&self.host_out, trip_wall, &|payload| {
+                records.emit(darkmux_flow::FlowSource::Thermal, payload)
+            });
+        }
+    }
+
+    /// (#2774 tier 4) The episode-limit hold: told to the operator on
+    /// stderr and in a `Warn` rest record, then the same STOP warning the
+    /// breaker gives.
+    fn hold_for_operator(&self, records: &SamplerRecords, state: &str, episode: u32) {
+        // (#2774 tier 4) LOUD and operator-actionable, never a
+        // diagnosis (CLAUDE.md: darkmux describes, never
+        // adjudicates) — the checklist names things to CHECK,
+        // it does not assert what is wrong. `resume_hint` names
+        // the concrete, already-wired mechanism
+        // (`--resume-from`, #2114 follow-up) rather than
+        // leaving the operator to guess how to continue.
+        let checklist = "worth checking: ambient temperature / air conditioning, an external \
+             fan or active cooling on this machine, proximity to other hot machines, and \
+             airflow obstruction";
+        // (#2774 review F2) Built from this dispatch's OWN
+        // the host-only origin record — the same file the resume gate
+        // reads — so the command the operator pastes is one
+        // darkmux accepts. The earlier bare
+        // `--resume-from <dir>` form was refused by
+        // `validate_resume_checkpoint` for every dispatch; see
+        // `resume_hint_from_origin`'s own doc.
+        let resume_hint =
+            resume_hint_from_origin(&self.host_out, &records.role_id);
+        // (#2774 round-3 C9) "this mission", not "this run":
+        // F5 made the episode count MISSION-scoped (seeded
+        // across dispatches from the ladder-state file), so a
+        // unit whose own governor saw exactly one episode
+        // legitimately prints "2 time(s)". The old wording made
+        // that read as a bug in the count.
+        eprintln!(
+            "darkmux: this machine reached `serious` {episode} time(s) this mission — \
+             pausing indefinitely, no further turns until you say to. {checklist}. \
+             To continue: {resume_hint}"
+        );
+        records.emit_rest_with_extra(
+            darkmux_flow::Level::Warn,
+            "thermal-episode-limit",
+            state,
+            true,
+            RestExtra {
+                episode: Some(u64::from(episode)),
+                checklist: Some(checklist.to_string()),
+                resume_hint: Some(resume_hint),
+                ..Default::default()
+            },
+        );
+        // (#2774 tier 4) Tier 4 also drops the crawl's STOP
+        // file (see `enter_paused`'s own doc) — same
+        // "the breaker tried and could not stop the crawl"
+        // warning shape the Breaker arm uses, reused
+        // rather than re-derived, since both mean the same
+        // thing to an operator reading the flow stream.
+        self.warn_stop_unresolved(records, state);
+    }
+
+    /// (N3, final re-check) The breaker (or the tier-4 hold) could not stop
+    /// the crawl: say why, as a `Warn` — this is an operator-actionable gap,
+    /// not routine telemetry.
+    fn warn_stop_unresolved(&self, records: &SamplerRecords, state: &str) {
+        let unresolved = crate::thermal_governor::stop_unresolved_cause(
+            self.thermal_stop_file.as_deref(),
+            self.thermal_stop_unresolved_reason,
+            self.governors.thermal.last_stop_write_error(),
+        );
+        if let Some((cause, reason)) = unresolved {
+            let payload = thermal_stop_unresolved_payload(
+                cause.as_str(),
+                reason,
+                state,
+                crate::host_source::provenance(),
+            );
+            records.emit_warning(darkmux_flow::FlowSource::Thermal, payload);
+        }
+    }
+
+    /// (#2902 step 5) The endpoint budget of an agentic-remote brain,
+    /// whose calls the runtime makes inside the container: under `wait`
+    /// a full window pauses the runtime between turns through the pace
+    /// file (reason `budget`), yielding to a thermal or battery pause
+    /// that already holds it. Decided AFTER both governors, so it reads
+    /// their post-decision state; reported as `dispatch.rest` like theirs.
+    fn pace_budget(&mut self, records: &SamplerRecords, thermal_elapsed_ms: u64) {
+        let Some(pacer) = self.budget_pacer.as_mut() else { return };
+        let others = self.governors.other_pacing();
+        let caller = crate::budget::BudgetCaller {
+            role_id: Some(&records.role_id),
+            session: &records.session,
+            execution: &records.execution,
+            model: Some(&records.model),
+            phase_id: records.phase_id.as_deref(),
+            profiles_file: None,
+        };
+        let event =
+            crate::budget::with_env(|env| pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env));
+        match event {
+            Some(crate::budget::PacerEvent::Paused { state }) => {
+                records.emit_rest(crate::budget::PACE_REASON, &state, true)
+            }
+            Some(crate::budget::PacerEvent::Resumed { state }) => {
+                records.emit_rest(crate::budget::PACE_REASON, &state, false)
+            }
+            Some(crate::budget::PacerEvent::Stopped { reason }) => {
+                // (#2902 step 5 review MF1) The run was stopped while the
+                // pacer held it (`mission abort` writes only terminal state;
+                // this is where it reaches a paused container). End it
+                // the way an interrupt does, for THIS dispatch only (#2925): the
+                // tailer kills this container on the stop, and the launcher
+                // takes its abort path. The process-global interrupt flag is
+                // not touched: it would end every other phase's dispatch. The
+                // pace file still says pause, so no turn goes out first.
+                self.local_stop.request(reason);
+            }
+            None => {}
+        }
+    }
+
+    /// Keep the tick's readings for the end-of-run reduction.
+    fn record_host_sample(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        // (#2107) Record the raw reading, timestamped against this
+        // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
+        // pure fold over `raw` computed once at the end
+        // (`reduce_host_stats`) — this loop's only job is to capture
+        // what was observed, not to fold it live, so the reduction
+        // logic has exactly one implementation, shared with the unit
+        // tests that drive it directly.
+        self.raw.extend(host_sample_at(at_ms, sample));
+        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
+        // all failed: a tick that read power but not utilization is still a
+        // power measurement, and `reduce_host_extras` skips the `None`s
+        // rather than zeroing them. Deliberately NOT emitted as a flow
+        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
+        // viewer contract, and widening it is a schema change with no
+        // consumer yet; the reduction reaches the envelope instead.
+        self.extras.extend(host_extra_at(at_ms, sample));
+    }
+
+    /// (#2413) The machine-scoped `machine.telemetry` curve — emitted
+    /// ONLY when this dispatch is the machine's singleton host sampler
+    /// (no daemon, and no other dispatch, currently holds the lock).
+    /// Every tick, never every Nth: unlike the retired per-dispatch
+    /// curve, a dispatch-owned sampler exists only because a dispatch
+    /// (itself) is live, so there is no idle backoff to apply here —
+    /// that only makes sense for the DAEMON's sampler (see
+    /// `darkmux-serve::host_sampler`), which keeps running when nothing
+    /// is live. `heartbeat` returning `false` means another process won
+    /// a steal race; drop the guard so this loop stops trying (and lets
+    /// whoever won be the sole emitter, per the "at most one" rule).
+    fn machine_telemetry_tick(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        if let Some(guard) = self.sampler_lock.as_ref() {
+            if guard.heartbeat(self.machine_sampler_interval_ms) {
+                self.emit_machine_telemetry(at_ms, sample);
+            } else {
+                self.sampler_lock = None;
+            }
+        } else if self.machine_sampler_interval_ms > 0 {
+            // (#2413 C1) Retry every tick even after failing (or never
+            // holding) the lock — a file read every `TELEMETRY_SAMPLE_
+            // INTERVAL_MS` (2s) is cheap, and it means a live dispatch
+            // takes over the machine's sampler role as soon as whoever
+            // held it (typically the daemon) dies mid-run, instead of the
+            // machine going emitter-less until this dispatch happens to
+            // restart. `0` (disabled) never retries, matching the initial
+            // acquire's own `> 0` gate.
+            // (#2413 C2, and round 3 MF1) This is the SAME "opportunistic,
+            // usually-declined" shape as the daemon's own per-tick retry
+            // (see `darkmux-serve::host_sampler`'s identical comment) —
+            // `try_acquire` never records a routine decline as contention
+            // (the channel is retired; see `host_sampler_lock`'s module
+            // doc), so this call is exactly as quiet as the initial
+            // acquire.
+            self.sampler_lock = crate::host_sampler_lock::try_acquire("dispatch", self.machine_sampler_interval_ms);
+            if self.sampler_lock.is_some() {
+                // Fresh acquisition: the next tick's heartbeat branch
+                // above will find `last_telemetry_emit_at_ms` still
+                // reflecting whatever it was before (`None` at dispatch
+                // start, or a stale past value if we previously held and
+                // lost the lock) — either way `telemetry_emission_due`
+                // treats a `None` as always-due, and a stale `Some` from
+                // long before `at_ms` also reads as due, so the newly
+                // reacquired sampler emits promptly rather than waiting a
+                // full stale interval.
+                self.last_telemetry_emit_at_ms = None;
+            }
+        }
+    }
+
+    /// One `machine.telemetry` emission, when one is due.
+    fn emit_machine_telemetry(&mut self, at_ms: u64, sample: &crate::host_probe::HostSampleFull) {
+        // (#2413 M2 / round 3 MF2) The outer loop ticks every
+        // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
+        // diffs and thermal governor, which want fine-grained
+        // sampling, but wrong for the `machine.telemetry` curve,
+        // which must honor the operator's `host_sampler_interval_ms`
+        // knob (`machine_sampler_interval_ms` here) or it silently
+        // emits ~2.5x more records than its own `interval_ms` field
+        // claims. The heartbeat still runs every tick (cheap,
+        // keeps the lock's staleness window nowhere near tripping);
+        // only the flow-record emission itself is gated — decided
+        // and built by `maybe_build_machine_telemetry_record`
+        // (extracted so this call site is directly testable with a
+        // fake clock; see that function's own test).
+        //
+        // (#2111 review finding, kept) `at_ms` is RELATIVE to
+        // this sampler's own start (`started.elapsed()`) — correct
+        // for the reduction math and the thermal governor's gap
+        // timing, but wrong for a flow record's `sampled_at_ms`:
+        // `machine.thermal` (the daemon sampler) and
+        // `/machine/resources` both stamp real UNIX epoch ms, so a
+        // relative offset here would read as 1970 next to either
+        // of them on a chart. `epoch_ms_now()` is the one shared
+        // wall-clock read every `sampled_at_ms` producer uses.
+        let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
+        let Some((mut rec, new_last_emit_at_ms)) = maybe_build_machine_telemetry_record(
+            self.last_telemetry_emit_at_ms,
+            at_ms,
+            sampled_at_epoch_ms,
+            self.machine_sampler_interval_ms,
+            sample,
+        ) else {
+            return;
+        };
+        // (CLAUDE.md "samplers stamp their own cost") This
+        // record's OWN write hasn't happened yet — it can't
+        // honestly report its own cost — so it carries the
+        // PREVIOUS emission's measured write duration instead.
+        // `None` on the first emission (no previous write to
+        // report).
+        if let (Some(ms), Some(darkmux_flow::Payload::MachineTelemetry(p))) =
+            (self.prev_record_write_ms, rec.payload.as_mut())
+        {
+            p.prev_record_write_ms = Some(ms);
+        }
+        let write_start = Instant::now();
+        let _ = darkmux_flow::record(rec);
+        self.prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
+        self.last_telemetry_emit_at_ms = Some(new_last_emit_at_ms);
+    }
+
+    /// The run's readings, reduced: what was observed, never a default.
+    fn finish(self) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
+        (
+            reduce_host_stats(&self.raw),
+            reduce_host_extras(&self.extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+            self.governors.thermal.ladder_summary(),
+        )
+    }
+}
+
+/// (#2110/#2109) The thermal governor/breaker — see its module doc — built
+/// for this dispatch, with its start warnings printed.
+fn start_thermal_governor(
+    thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+    session: &SessionId,
+    record_context: Option<&darkmux_flow::payload::RecordContext>,
+) -> crate::thermal_governor::ThermalGovernor {
     // `stop_file` resolves once, up front: the crawl `STOP` path (if this
     // dispatch is a crawl unit) never changes mid-dispatch.
     // (#2454) `.owned_by` stamps this mission into any STOP file the
@@ -9711,7 +10406,7 @@ fn run_telemetry_sampler(
     // this, "the delay doubles for the rest of the run" and "the Nth
     // `serious` episode" would both silently reset every single unit.
     let thermal_ladder_state_file =
-        crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
+        crate::thermal_governor::ladder_state_file_path_from_record_context(record_context);
     let thermal_governor =
         crate::thermal_governor::ThermalGovernor::new(thermal_config)
             .owned_by(session.mission_id())
@@ -9746,622 +10441,61 @@ fn run_telemetry_sampler(
     for line in thermal_governor.dispatch_start_warnings() {
         eprintln!("{line}");
     }
-    let thermal_stop_file =
-        crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
-    // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
-    // looked crawl-shaped but the STOP path above came back `None` because
-    // derivation failed (not because this simply isn't a crawl dispatch) —
-    // see `stop_file_unresolved_reason`'s own doc for the distinction.
-    let thermal_stop_unresolved_reason =
-        crate::thermal_governor::stop_file_unresolved_reason(record_context.as_ref());
-    // (#2706) The battery governor rides this SAME tick — the probe above
-    // already reads `sample.battery` every 2s, so no separate poller is
-    // needed, exactly as the thermal governor rides the thermal half.
-    //
-    // `pause_supported(true)`: this sampler exists only on the
-    // CONTAINER-backed dispatch path (its caller `spawn_guarded_sampler`
-    // is reached after a `child` is spawned), whose pause is an in-memory
-    // rest at a turn boundary — `runtime/src/pace.rs`'s bounded ≤2s poll
-    // loop, which keeps the whole conversation in memory and continues
-    // from exactly where it rested. That run type CAN be resumed, so it
-    // is allowed to pause. A run type that could not would pass `false`
-    // and get `BatteryEvent::PauseUnsupported` instead of a park it could
-    // not leave.
-    let battery_governor =
-        crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
-    // (#2779) The two governors tick THROUGH the shared seam, not as two
-    // inline calls here. The order, the `is_pausing` gate and the one-clock
-    // rule live in `governor_tick::GovernorPair::tick` so a scenario test
-    // proves the REAL wiring rather than a reimplementation of it — see
-    // that module's doc for the F1 inversion it exists to keep proven.
-    let mut governors = crate::governor_tick::GovernorPair::new(thermal_governor, battery_governor);
-    // (#2779) A simulated host source is never silent. Same surface and
-    // same shape as the ladder's disarm notes above, rendered off
-    // `host_source::provenance()` so doctor and the dispatch cannot
-    // disagree about what is driving the readings.
-    if let Some(warning) = crate::host_source::provenance().warning() {
-        eprintln!("darkmux: ⚠ host source — {warning}");
-    }
-    // (#2774 tiers 2/4) A governor's `dispatch.rest` decision, plus the
-    // per-tier extras: the duty-cycle events want to carry `delay_ms`, the
-    // tier-4 hold wants `episode`, and neither deserves a bespoke one-off
-    // closure. `level` is explicit (not always `Info`) because tier 4's hold
-    // is operator-actionable, not routine pacing telemetry.
-    let emit_rest_with_extra =
-        |level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: RestExtra| {
-            let mut payload = darkmux_flow::Payload::DispatchRest(DispatchRestPayload {
-                reason: Some(reason.to_string()),
-                state: Some(state.to_string()),
-                pause: Some(pause),
-                delay_ms: extra.delay_ms,
-                episode: extra.episode,
-                checklist: extra.checklist,
-                resume_hint: extra.resume_hint,
-                ..Default::default()
-            });
-            // (#2779) `simulated_host_source` when — and only when — this
-            // decision was made on scenario readings. Absent on a real run, so
-            // its PRESENCE alone answers "were these readings real".
-            crate::host_source::stamp(&mut payload);
-            merge_record_context(&mut payload, &record_context);
-            let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
-                level,
-                &role_id,
-                &session,
-                &execution,
-                Some(&model),
-                phase_id.as_deref(),
-                payload,
-            ));
-        };
-    let emit_rest = |reason: &str, state: &str, pause: bool| {
-        emit_rest_with_extra(darkmux_flow::Level::Info, reason, state, pause, RestExtra::default());
-    };
-    let emit = |source: darkmux_flow::FlowSource, payload: darkmux_flow::Payload| {
-        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-            darkmux_flow::Level::Info,
-            source,
-            &role_id,
-            &session,
-            &execution,
-            Some(&model),
-            phase_id.as_deref(),
-            payload,
-        ));
-    };
-    // (#2413) This dispatch is, by definition, LIVE for as long as this
-    // sampler thread runs — so if it becomes the machine's singleton host
-    // sampler, it always emits at the base `host_sampler_interval_ms()`
-    // cadence (never the daemon's idle 10x backoff, which exists only
-    // because the DAEMON runs when nothing may be live). `try_acquire`
-    // returns `None` when a daemon (or another dispatch) already holds a
-    // fresh lock — in that case this dispatch emits NO `machine.telemetry`
-    // records at all, matching the rule "at most one emitter per machine."
-    // The guard is a local: RAII releases it on every exit from this
-    // function (normal return, the early `return` mid-loop below, or a
-    // panic-unwind through this scope), same lifecycle contract as every
-    // other bookend guard in this codebase.
-    let machine_sampler_interval_ms = darkmux_types::config_access::host_sampler_interval_ms();
-    let mut sampler_lock = if machine_sampler_interval_ms > 0 {
-        crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms)
-    } else {
-        None
-    };
-    // (#2413 review finding) The MEASURED write duration of the PREVIOUS
-    // `machine.telemetry` emission — `None` until the first one has
-    // happened. A record cannot honestly report its OWN write cost (the
-    // write hasn't happened yet when the payload is built), so this stamps
-    // last time's measured cost instead of a build-only proxy mislabeled
-    // as "the write".
-    let mut prev_record_write_ms: Option<u64> = None;
-    // (#2413 M2, review round 2) `at_ms` of the last `machine.telemetry`
-    // EMISSION (not heartbeat) — feeds `telemetry_emission_due` so the
-    // curve honors `machine_sampler_interval_ms` instead of the 2s outer
-    // loop tick. `None` before the first emission.
-    let mut last_telemetry_emit_at_ms: Option<u64> = None;
+    thermal_governor
+}
 
-    // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
-    // all moved into `LmsTelemetryTracker` — see its doc for why the state
-    // machine lives behind an injected-effect seam instead of inline here.
-    // (#2914) One utility seat, under every id this dispatch declared for
-    // it: the compactor's resolved wire id and the binding (normally the same
-    // model; a pinned compactor that differs still shares the seat).
-    let mut lms_tracker = LmsTelemetryTracker::new(
-        model.clone(),
-        [compactor_model.clone(), utility_model.clone()].into_iter().flatten().collect(),
-    );
-    // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
-    // last thermal sample — NOT a hardcoded per-tick constant. A tick can
-    // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
-    // `lms list_loaded()` call above can stall up to ~30s), and the whole
-    // process can sleep/suspend between ticks — feeding a fixed 2000ms in
-    // either case would under-report real elapsed time to the governor's
-    // hysteresis/max-pause/heartbeat accounting, which could let a
-    // thermal-critical pause's written_at_ms go stale past what the
-    // runtime's own ceiling honors. `0` on the very first tick is correct
-    // (there is no "last sample" yet).
-    let mut prev_thermal_at_ms: u64 = 0;
-
-    loop {
-        if stop_flag.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // lms load/unload deltas — the seed/diff rule, the `role`/`baseline`
-        // tagging, and the skip-on-failed-probe behavior all live in
-        // `LmsTelemetryTracker::tick` so they are unit-testable without a
-        // live `lms` or a live flow sink. Nothing but the wiring is here.
-        lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
-            emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
-        });
-
-        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
-        // per-cluster frequency, power and thermal state the same probe
-        // reads for free. Inference runs in LMStudio (off-container), so the
-        // load worth watching is the HOST's, not the runtime container's
-        // (which idles waiting on the model and reads ~0 — the
-        // wrong-question problem, #814/#1064). Each read is best-effort and
-        // unprivileged; a tick emits whichever fields succeed.
-        let sample = probe.sample();
-        let at_ms = started.elapsed().as_millis() as u64;
-        // (N1 of the #2110/#2109 review) REAL elapsed since the last
-        // thermal tick, not TELEMETRY_SAMPLE_INTERVAL_MS — see
-        // `prev_thermal_at_ms`'s own doc above for why the constant was
-        // wrong. `saturating_sub` on two `started.elapsed()` reads is
-        // monotonic (never underflows) regardless of how long this
-        // iteration's earlier work (the lms diff above) took.
-        let thermal_elapsed_ms = at_ms.saturating_sub(prev_thermal_at_ms);
-        prev_thermal_at_ms = at_ms;
-        // (#2779) BOTH governors decide here, through the shared seam — the
-        // order, the `is_pausing` gate and the one-clock rule are the
-        // seam's, not this loop's. This loop reports what they decided.
-        let tick_events = governors.tick(
-            &crate::host_source::HostReading {
-                thermal: sample.thermal.clone(),
-                battery: sample.battery,
-            },
-            thermal_elapsed_ms,
-            &host_out,
-            thermal_stop_file.as_deref(),
+/// (#2706) The battery governor's decision for one tick, reported: a rest
+/// record, or a `Warn` when a pause was asked for and this run cannot take
+/// one.
+fn on_battery_event(records: &SamplerRecords, event: crate::power_policy::BatteryEvent) {
+    // The `state` string carries BOTH numbers the decision was made
+    // on (the observation and the operator's floor), or for a blind
+    // probe the charge it is holding at (#3074), so the flow record
+    // answers "why did this rest" without a reader having to go look
+    // up the config that was in force at the time.
+    if let Some((level, state, pause)) = event.rest_decision() {
+        records.emit_rest_with_extra(
+            level,
+            crate::power_policy::PACE_REASON,
+            &state,
+            pause,
+            RestExtra::default(),
         );
-        // Every state change (pause/resume/breaker) is a
-        // `dispatch.rest`-family flow record, so a slowed or stopped run
-        // is attributable on the flow stream.
-        if let Some(event) = tick_events.thermal {
-            match event {
-                crate::thermal_governor::ThermalEvent::Paused { state } => {
-                    emit_rest("thermal", &state, true);
-                }
-                crate::thermal_governor::ThermalEvent::Resumed { state } => {
-                    emit_rest("thermal", &state, false);
-                }
-                crate::thermal_governor::ThermalEvent::Breaker { state } => {
-                    emit_rest("thermal-critical", &state, true);
-                    // (#2110/#2109 review finding 5, widened by #2456) Two
-                    // DISTINCT ways the breaker can fail to stop a crawl,
-                    // both surfaced through the same warning shape because
-                    // from the operator's point of view they mean the
-                    // same thing — "the breaker tried and could not write
-                    // a STOP" — and both must be LOUD, never a silent
-                    // no-op that lets the crawl keep dispatching units
-                    // past a tripped breaker with no trace of why:
-                    //
-                    // - No trustworthy STOP path could even be DERIVED
-                    //   (finding 5's original case — never write one at a
-                    //   guessed path).
-                    // - A path WAS derived, but the write itself was
-                    //   REFUSED (#2456 — a symlink was sitting at the path
-                    //   or its parent).
-                    //
-                    // The two are DISTINGUISHABLE in the record — `cause`
-                    // is `"path_underivable"` vs `"write_refused"` — because
-                    // the remedies differ sharply: the first is a crawl
-                    // `record_context` bug, the second means something is
-                    // sitting at the STOP path as a symlink and wants an
-                    // operator to go LOOK. The selection lives in
-                    // `thermal_governor::stop_unresolved_cause` (a pure,
-                    // unit-tested function) rather than inline here: this
-                    // sampler runs on its own thread inside a live dispatch
-                    // and no test reaches it, so an inline version was
-                    // pinned by nothing.
-                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
-                        thermal_stop_file.as_deref(),
-                        thermal_stop_unresolved_reason,
-                        governors.thermal.last_stop_write_error(),
-                    );
-                    if let Some((cause, reason)) = unresolved {
-                        // (N3, final re-check) Warn — this is an
-                        // operator-actionable gap, not routine
-                        // telemetry — through merge_record_context so
-                        // the crawl's own identifying fields (unit,
-                        // source, sha, rule) ride along, same as
-                        // `emit_rest` above.
-                        let mut payload = thermal_stop_unresolved_payload(
-                            cause.as_str(),
-                            reason,
-                            &state,
-                            crate::host_source::provenance(),
-                        );
-                        merge_record_context(&mut payload, &record_context);
-                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Warn,
-                            darkmux_flow::FlowSource::Thermal,
-                            &role_id,
-                            &session,
-                            &execution,
-                            Some(&model),
-                            phase_id.as_deref(),
-                            payload,
-                        ));
-                    }
-                    // (#2774 tier 5) A literal `critical` OS thermal state
-                    // — not the speed-limit-sustained trigger, and not the
-                    // pre-existing max-pause-exceeded-while-paused
-                    // escalation, both of which also reach this arm — gets
-                    // the operator's own "hard stop plus eject" treatment
-                    // on top of the breaker's existing pause+STOP-file
-                    // behavior. Scoped to the literal state name (the
-                    // issue's own condition), deliberately NOT widened to
-                    // the speed-limit trigger: that one is a proxy signal,
-                    // this is the hardware's own worst-case report.
-                    //
-                    // (#2774 review C6) **What "hard stop" reaches, stated
-                    // exactly:** THIS dispatch (the pace file pauses it)
-                    // and, if this is a crawl unit, that crawl's remaining
-                    // units (the STOP file the breaker arm above already
-                    // wrote). Plus every `darkmux:`-namespaced resident on
-                    // this host, which the eject below releases. It does
-                    // NOT reach other concurrent dispatches, other
-                    // missions, or the fleet: a MACHINE-WIDE thermal
-                    // broadcast is #2774's open half and is not built.
-                    // An earlier wording here said "no question asked,"
-                    // which read as a claim about scope it never had.
-                    if state == "critical" {
-                        let trip_wall = SystemTime::now();
-                        tier5_eject_on_critical(&host_out, trip_wall, &|payload| {
-                            emit(darkmux_flow::FlowSource::Thermal, payload)
-                        });
-                    }
-                }
-                crate::thermal_governor::ThermalEvent::DutyCycleEntered { state, delay_ms } => {
-                    // (#2774 tier 2) `pause: false` — this is NOT a rest
-                    // the run stops for; it is the duty-cycle instruction
-                    // itself. `delay_ms` rides the SAME `dispatch.rest`
-                    // record family so a reader watching that one action
-                    // string sees every pacing decision, tier 2 included.
-                    emit_rest_with_extra(
-                        darkmux_flow::Level::Info,
-                        "thermal-duty-cycle",
-                        &state,
-                        false,
-                        RestExtra { delay_ms: Some(delay_ms), ..Default::default() },
-                    );
-                }
-                crate::thermal_governor::ThermalEvent::DutyCycleExited { state } => {
-                    emit_rest("thermal-duty-cycle", &state, false);
-                }
-                crate::thermal_governor::ThermalEvent::OperatorHold { state, episode } => {
-                    // (#2774 tier 4) LOUD and operator-actionable, never a
-                    // diagnosis (CLAUDE.md: darkmux describes, never
-                    // adjudicates) — the checklist names things to CHECK,
-                    // it does not assert what is wrong. `resume_hint` names
-                    // the concrete, already-wired mechanism
-                    // (`--resume-from`, #2114 follow-up) rather than
-                    // leaving the operator to guess how to continue.
-                    let checklist = "worth checking: ambient temperature / air conditioning, an external \
-                         fan or active cooling on this machine, proximity to other hot machines, and \
-                         airflow obstruction";
-                    // (#2774 review F2) Built from this dispatch's OWN
-                    // the host-only origin record — the same file the resume gate
-                    // reads — so the command the operator pastes is one
-                    // darkmux accepts. The earlier bare
-                    // `--resume-from <dir>` form was refused by
-                    // `validate_resume_checkpoint` for every dispatch; see
-                    // `resume_hint_from_origin`'s own doc.
-                    let resume_hint =
-                        resume_hint_from_origin(&host_out, &role_id);
-                    // (#2774 round-3 C9) "this mission", not "this run":
-                    // F5 made the episode count MISSION-scoped (seeded
-                    // across dispatches from the ladder-state file), so a
-                    // unit whose own governor saw exactly one episode
-                    // legitimately prints "2 time(s)". The old wording made
-                    // that read as a bug in the count.
-                    eprintln!(
-                        "darkmux: this machine reached `serious` {episode} time(s) this mission — \
-                         pausing indefinitely, no further turns until you say to. {checklist}. \
-                         To continue: {resume_hint}"
-                    );
-                    emit_rest_with_extra(
-                        darkmux_flow::Level::Warn,
-                        "thermal-episode-limit",
-                        &state,
-                        true,
-                        RestExtra {
-                            episode: Some(u64::from(episode)),
-                            checklist: Some(checklist.to_string()),
-                            resume_hint: Some(resume_hint),
-                            ..Default::default()
-                        },
-                    );
-                    // (#2774 tier 4) Tier 4 also drops the crawl's STOP
-                    // file (see `enter_paused`'s own doc) — same
-                    // "the breaker tried and could not stop the crawl"
-                    // warning shape the Breaker arm above uses, reused
-                    // rather than re-derived, since both mean the same
-                    // thing to an operator reading the flow stream.
-                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
-                        thermal_stop_file.as_deref(),
-                        thermal_stop_unresolved_reason,
-                        governors.thermal.last_stop_write_error(),
-                    );
-                    if let Some((cause, reason)) = unresolved {
-                        let mut payload = thermal_stop_unresolved_payload(
-                            cause.as_str(),
-                            reason,
-                            &state,
-                            crate::host_source::provenance(),
-                        );
-                        merge_record_context(&mut payload, &record_context);
-                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Warn,
-                            darkmux_flow::FlowSource::Thermal,
-                            &role_id,
-                            &session,
-                            &execution,
-                            Some(&model),
-                            phase_id.as_deref(),
-                            payload,
-                        ));
-                    }
-                }
-            }
-        }
-        // (#2706) The battery governor's decision for this tick — made in
-        // `governors.tick` above, fed the SAME reading and the SAME
-        // measured `thermal_elapsed_ms` the thermal governor got (one
-        // clock, so their heartbeat accounting can never disagree), and
-        // gated on the thermal governor's POST-decision `is_pausing`.
-        //
-        // (#2774 review F1 / #2779) That gate is deliberately `is_pausing`,
-        // NOT `is_pacing` — and it now lives in
-        // `governor_tick::GovernorPair::tick` rather than inline here, so
-        // a scenario test can prove it. See that module's doc for what the
-        // `is_pacing` version cost: a live battery-critical pause rewritten
-        // to `pause: false` for the whole duration of a duty-cycle episode,
-        // the run still working, the battery still draining.
-        //
-        // A machine with NO battery decides nothing at all: `sample.battery`
-        // is `None` on a desktop, and the governor's first act is to return
-        // on that — before any config read, threshold comparison or file
-        // write.
-        if let Some(event) = tick_events.battery {
-            // The `state` string carries BOTH numbers the decision was made
-            // on (the observation and the operator's floor), or for a blind
-            // probe the charge it is holding at (#3074), so the flow record
-            // answers "why did this rest" without a reader having to go look
-            // up the config that was in force at the time.
-            if let Some((level, state, pause)) = event.rest_decision() {
-                emit_rest_with_extra(
-                    level,
-                    crate::power_policy::PACE_REASON,
-                    &state,
-                    pause,
-                    RestExtra::default(),
-                );
-            } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
-                // WARN, not Info: the operator asked for a pause and is
-                // not getting one. Loud beats quiet — a silent
-                // non-pause is exactly the "silently disables itself"
-                // failure #2706 exists to prevent. Names the numbers
-                // and the field, and gives no advice, same contract as
-                // the start refusal.
-                let mut payload = battery_pause_unsupported_payload(
-                    charge_pct,
-                    floor_pct,
-                    crate::host_source::provenance(),
-                );
-                merge_record_context(&mut payload, &record_context);
-                let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-                    darkmux_flow::Level::Warn,
-                    darkmux_flow::FlowSource::Battery,
-                    &role_id,
-                    &session,
-                    &execution,
-                    Some(&model),
-                    phase_id.as_deref(),
-                    payload,
-                ));
-            }
-        }
-
-        // (#2902 step 5) The endpoint budget of an agentic-remote brain,
-        // whose calls the runtime makes inside the container: under `wait`
-        // a full window pauses the runtime between turns through the pace
-        // file (reason `budget`), yielding to a thermal or battery pause
-        // that already holds it. Decided AFTER both governors, so it reads
-        // their post-decision state; reported as `dispatch.rest` like theirs.
-        if let Some(pacer) = budget_pacer.as_mut() {
-            let others = governors.other_pacing();
-            let caller = crate::budget::BudgetCaller {
-                role_id: Some(&role_id),
-                session: &session,
-                execution: &execution,
-                model: Some(&model),
-                phase_id: phase_id.as_deref(),
-                profiles_file: None,
-            };
-            let event =
-                crate::budget::with_env(|env| pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, env));
-            match event {
-                Some(crate::budget::PacerEvent::Paused { state }) => {
-                    emit_rest(crate::budget::PACE_REASON, &state, true)
-                }
-                Some(crate::budget::PacerEvent::Resumed { state }) => {
-                    emit_rest(crate::budget::PACE_REASON, &state, false)
-                }
-                Some(crate::budget::PacerEvent::Stopped { reason }) => {
-                    // (#2902 step 5 review MF1) The run was stopped while the
-                    // pacer held it (`mission abort` writes only terminal state;
-                    // this is where it reaches a paused container). End it
-                    // the way an interrupt does, for THIS dispatch only (#2925): the
-                    // tailer kills this container on the stop, and the launcher
-                    // takes its abort path. The process-global interrupt flag is
-                    // not touched: it would end every other phase's dispatch. The
-                    // pace file still says pause, so no turn goes out first.
-                    local_stop.request(reason);
-                }
-                None => {}
-            }
-        }
-
-        if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
-            // (#2107) Record the raw reading, timestamped against this
-            // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
-            // pure fold over `raw` computed once at the end
-            // (`reduce_host_stats`) — this loop's only job is to capture
-            // what was observed, not to fold it live, so the reduction
-            // logic has exactly one implementation, shared with the unit
-            // tests that drive it directly.
-            raw.push(HostSampleAt {
-                at_ms,
-                cpu: sample.cpu_pct,
-                mem: sample.mem_pct,
-                gpu: sample.gpu_pct,
-            });
-        }
-        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
-        // all failed: a tick that read power but not utilization is still a
-        // power measurement, and `reduce_host_extras` skips the `None`s
-        // rather than zeroing them. Deliberately NOT emitted as a flow
-        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
-        // viewer contract, and widening it is a schema change with no
-        // consumer yet; the reduction reaches the envelope instead.
-        if sample.power.is_some() || sample.thermal.is_some() {
-            extras.push(HostExtraAt {
-                at_ms,
-                power: sample.power,
-                thermal: sample.thermal.clone(),
-            });
-        }
-
-        // (#2413) The machine-scoped `machine.telemetry` curve — emitted
-        // ONLY when this dispatch is the machine's singleton host sampler
-        // (no daemon, and no other dispatch, currently holds the lock).
-        // Every tick, never every Nth: unlike the retired per-dispatch
-        // curve, a dispatch-owned sampler exists only because a dispatch
-        // (itself) is live, so there is no idle backoff to apply here —
-        // that only makes sense for the DAEMON's sampler (see
-        // `darkmux-serve::host_sampler`), which keeps running when nothing
-        // is live. `heartbeat` returning `false` means another process won
-        // a steal race; drop the guard so this loop stops trying (and lets
-        // whoever won be the sole emitter, per the "at most one" rule).
-        if let Some(guard) = sampler_lock.as_ref() {
-            if guard.heartbeat(machine_sampler_interval_ms) {
-                // (#2413 M2 / round 3 MF2) The outer loop ticks every
-                // `TELEMETRY_SAMPLE_INTERVAL_MS` (2s) — right for the lms
-                // diffs and thermal governor above, which want fine-grained
-                // sampling, but wrong for the `machine.telemetry` curve,
-                // which must honor the operator's `host_sampler_interval_ms`
-                // knob (`machine_sampler_interval_ms` here) or it silently
-                // emits ~2.5x more records than its own `interval_ms` field
-                // claims. The heartbeat above still runs every tick (cheap,
-                // keeps the lock's staleness window nowhere near tripping);
-                // only the flow-record emission itself is gated — decided
-                // and built by `maybe_build_machine_telemetry_record`
-                // (extracted so this call site is directly testable with a
-                // fake clock; see that function's own test).
-                //
-                // (#2111 review finding, kept) `at_ms` above is RELATIVE to
-                // this sampler's own start (`started.elapsed()`) — correct
-                // for the reduction math and the thermal governor's gap
-                // timing, but wrong for a flow record's `sampled_at_ms`:
-                // `machine.thermal` (the daemon sampler) and
-                // `/machine/resources` both stamp real UNIX epoch ms, so a
-                // relative offset here would read as 1970 next to either
-                // of them on a chart. `epoch_ms_now()` is the one shared
-                // wall-clock read every `sampled_at_ms` producer uses.
-                let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
-                if let Some((mut rec, new_last_emit_at_ms)) = maybe_build_machine_telemetry_record(
-                    last_telemetry_emit_at_ms,
-                    at_ms,
-                    sampled_at_epoch_ms,
-                    machine_sampler_interval_ms,
-                    &sample,
-                ) {
-                    // (CLAUDE.md "samplers stamp their own cost") This
-                    // record's OWN write hasn't happened yet — it can't
-                    // honestly report its own cost — so it carries the
-                    // PREVIOUS emission's measured write duration instead.
-                    // `None` on the first emission (no previous write to
-                    // report).
-                    if let (Some(ms), Some(darkmux_flow::Payload::MachineTelemetry(p))) =
-                        (prev_record_write_ms, rec.payload.as_mut())
-                    {
-                        p.prev_record_write_ms = Some(ms);
-                    }
-                    let write_start = Instant::now();
-                    let _ = darkmux_flow::record(rec);
-                    prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
-                    last_telemetry_emit_at_ms = Some(new_last_emit_at_ms);
-                }
-            } else {
-                sampler_lock = None;
-            }
-        } else if machine_sampler_interval_ms > 0 {
-            // (#2413 C1) Retry every tick even after failing (or never
-            // holding) the lock — a file read every `TELEMETRY_SAMPLE_
-            // INTERVAL_MS` (2s) is cheap, and it means a live dispatch
-            // takes over the machine's sampler role as soon as whoever
-            // held it (typically the daemon) dies mid-run, instead of the
-            // machine going emitter-less until this dispatch happens to
-            // restart. `0` (disabled) never retries, matching the initial
-            // acquire's own `> 0` gate above.
-            // (#2413 C2, and round 3 MF1) This is the SAME "opportunistic,
-            // usually-declined" shape as the daemon's own per-tick retry
-            // (see `darkmux-serve::host_sampler`'s identical comment) —
-            // `try_acquire` never records a routine decline as contention
-            // (the channel is retired; see `host_sampler_lock`'s module
-            // doc), so this call is exactly as quiet as the initial
-            // acquire above.
-            sampler_lock = crate::host_sampler_lock::try_acquire("dispatch", machine_sampler_interval_ms);
-            if sampler_lock.is_some() {
-                // Fresh acquisition: the next tick's heartbeat branch
-                // above will find `last_telemetry_emit_at_ms` still
-                // reflecting whatever it was before (`None` at dispatch
-                // start, or a stale past value if we previously held and
-                // lost the lock) — either way `telemetry_emission_due`
-                // treats a `None` as always-due, and a stale `Some` from
-                // long before `at_ms` also reads as due, so the newly
-                // reacquired sampler emits promptly rather than waiting a
-                // full stale interval.
-                last_telemetry_emit_at_ms = None;
-            }
-        }
-
-        // Wait out the sample interval, but poll the stop flag every
-        // `SAMPLER_POLL_INTERVAL` so teardown after `wait_with_output()`
-        // is prompt (≤500ms) rather than blocking for a full 2s tick.
-        let mut slept = Duration::ZERO;
-        while slept < TELEMETRY_SAMPLE_INTERVAL {
-            if stop_flag.load(Ordering::SeqCst) {
-                // Teardown mid-interval: return what was observed, never a
-                // default. A killed or short dispatch still has real stats.
-                return (
-                    reduce_host_stats(&raw),
-                    reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-                    governors.thermal.ladder_summary(),
-                );
-            }
-            let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
-            thread::sleep(nap);
-            slept += nap;
-        }
+    } else if let crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } = event {
+        // WARN, not Info: the operator asked for a pause and is
+        // not getting one. Loud beats quiet — a silent
+        // non-pause is exactly the "silently disables itself"
+        // failure #2706 exists to prevent. Names the numbers
+        // and the field, and gives no advice, same contract as
+        // the start refusal.
+        let payload = battery_pause_unsupported_payload(
+            charge_pct,
+            floor_pct,
+            crate::host_source::provenance(),
+        );
+        records.emit_warning(darkmux_flow::FlowSource::Battery, payload);
     }
-    (
-        reduce_host_stats(&raw),
-        reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-        governors.thermal.ladder_summary(),
-    )
+}
+
+/// (#2107) The utilization half of one reading, for `reduce_host_stats`:
+/// `None` when the probe read none of cpu, mem or gpu.
+fn host_sample_at(at_ms: u64, sample: &crate::host_probe::HostSampleFull) -> Option<HostSampleAt> {
+    (sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some()).then_some(HostSampleAt {
+        at_ms,
+        cpu: sample.cpu_pct,
+        mem: sample.mem_pct,
+        gpu: sample.gpu_pct,
+    })
+}
+
+/// (#2108) The power/thermal half of one reading, for `reduce_host_extras`:
+/// `None` when the probe read neither.
+fn host_extra_at(at_ms: u64, sample: &crate::host_probe::HostSampleFull) -> Option<HostExtraAt> {
+    (sample.power.is_some() || sample.thermal.is_some()).then(|| HostExtraAt {
+        at_ms,
+        power: sample.power,
+        thermal: sample.thermal.clone(),
+    })
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
