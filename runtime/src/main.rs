@@ -300,66 +300,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     let wall_ms = close_trajectory(&mut traj, result_str, outcome.as_ref());
 
-    if let Some(o) = &outcome {
-        // (#1221) Prefer the answer the LOOP identified. "Last assistant
-        // message" is the checkpoint prefill on every non-terminal exit, so
-        // re-deriving it here handed the operator the model's raw scratch work
-        // as its answer.
-        let final_assistant = o
-            .final_answer
-            .clone()
-            .filter(|a| !a.trim().is_empty())
-            .or_else(|| {
-                o.messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "assistant")
-                    .and_then(|m| m.content.clone())
-            })
-            .unwrap_or_else(|| "<empty>".into());
-
-        if json_mode {
-            let mut envelope = build_json_envelope(result_str, Some(&final_assistant));
-            // (#799) Stamp the verifier-fabrication backstop: the bash commands
-            // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
-            // verification claims against this; empty on an honest run.
-            envelope.failed_tool_invocations = Some(o.failed_to_run.clone());
-            // (#2114) `resumed_from`: path + the checkpoint's OWN turn
-            // index (where the dispatch resumed FROM, not where it ended
-            // up), present only when this dispatch actually reloaded a
-            // checkpoint.
-            if let (Some(path), Some(turn_index)) = (&resume_checkpoint_path, resumed_from_turn_index) {
-                envelope.resumed_from = Some(darkmux_trajectory::ResumedFrom { path: path.clone(), turn_index: u64::from(turn_index) });
-            }
-            println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
-        } else {
-            println!("--- final assistant message ---");
-            println!("{final_assistant}");
-            println!();
-            print_run_summary(result_str, wall_ms);
-        }
-    } else {
-        if json_mode {
-            let envelope = build_json_envelope("error", None);
-            println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
-        } else {
-            // (#905) Human mode was silent on failure while the success path
-            // is verbose — print a failure summary so a non-JSON dispatch
-            // doesn't just vanish with a bare exit code.
-            println!("--- dispatch failed ---");
-            println!("model:  {model}");
-            print_run_summary(result_str, wall_ms);
-        }
-        return ExitCode::from(1);
+    let resumed_from = resume_checkpoint_path.zip(resumed_from_turn_index).map(|(path, turn_index)| {
+        darkmux_trajectory::ResumedFrom { path, turn_index: u64::from(turn_index) }
+    });
+    match &outcome {
+        Some(o) => print_success(o, json_mode, result_str, wall_ms, resumed_from),
+        None => print_failure(json_mode, result_str, wall_ms, &model),
     }
-
-    if let Some(o) = &outcome {
-        if matches!(o.terminal_reason, loop_runner::TerminalReason::EscalationTriggered(_)) {
-            return ExitCode::from(1);
-        }
-    }
-
-    ExitCode::SUCCESS
+    ExitCode::from(exit_status(outcome.as_ref()))
 }
 
 /// System prompt: a default that names the runtime + names the
@@ -1071,6 +1019,80 @@ fn close_trajectory(
     let wall_ms = traj.elapsed_ms();
     traj.append_dispatch_complete(result_str, wall_ms, outcome.map(|o| o.turn_delay_effective_ms));
     wall_ms
+}
+
+/// (#1221) Prefer the answer the LOOP identified. "Last assistant
+/// message" is the checkpoint prefill on every non-terminal exit, so
+/// re-deriving it here handed the operator the model's raw scratch work
+/// as its answer. Falls back to the last assistant message's content, then
+/// `<empty>`.
+fn final_assistant(o: &loop_runner::LoopOutcome) -> String {
+    o.final_answer
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| {
+            o.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .and_then(|m| m.content.clone())
+        })
+        .unwrap_or_else(|| "<empty>".into())
+}
+
+/// A finished loop's output: the `--json` envelope, or the final message
+/// and the run summary.
+fn print_success(
+    o: &loop_runner::LoopOutcome,
+    json_mode: bool,
+    result_str: &str,
+    wall_ms: u128,
+    resumed_from: Option<darkmux_trajectory::ResumedFrom>,
+) {
+    let final_assistant = final_assistant(o);
+    if json_mode {
+        let mut envelope = build_json_envelope(result_str, Some(&final_assistant));
+        // (#799) Stamp the verifier-fabrication backstop: the bash commands
+        // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
+        // verification claims against this; empty on an honest run.
+        envelope.failed_tool_invocations = Some(o.failed_to_run.clone());
+        // (#2114) `resumed_from`: path + the checkpoint's OWN turn
+        // index (where the dispatch resumed FROM, not where it ended
+        // up), present only when this dispatch actually reloaded a
+        // checkpoint.
+        envelope.resumed_from = resumed_from;
+        println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
+    } else {
+        println!("--- final assistant message ---");
+        println!("{final_assistant}");
+        println!();
+        print_run_summary(result_str, wall_ms);
+    }
+}
+
+/// A failed loop's output: the error envelope, or a failure summary.
+fn print_failure(json_mode: bool, result_str: &str, wall_ms: u128, model: &str) {
+    if json_mode {
+        let envelope = build_json_envelope("error", None);
+        println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
+    } else {
+        // (#905) Human mode was silent on failure while the success path
+        // is verbose — print a failure summary so a non-JSON dispatch
+        // doesn't just vanish with a bare exit code.
+        println!("--- dispatch failed ---");
+        println!("model:  {model}");
+        print_run_summary(result_str, wall_ms);
+    }
+}
+
+/// The exit code: 1 when the loop failed or escalated, else 0 (a
+/// `max_turns` exit included).
+fn exit_status(outcome: Option<&loop_runner::LoopOutcome>) -> u8 {
+    match outcome {
+        None => 1,
+        Some(o) if matches!(o.terminal_reason, loop_runner::TerminalReason::EscalationTriggered(_)) => 1,
+        Some(_) => 0,
+    }
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
