@@ -258,52 +258,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // bash"). Recorded on `dispatch.start` so the next such gap is a grep.
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
-    // (Security audit, #2114 resume follow-up) Refuses a CROSS-ROLE or
-    // CROSS-PROMPT resume — a checkpoint written under a different role,
-    // or a different system prompt than the one THIS run was launched
-    // with. It does NOT defend against a SAME-ROLE forgery: a resume
-    // replays `pending_tool_calls` verbatim (name checked against this
-    // run's own tool allowlist, arguments never validated), and restores
-    // every prior assistant/tool message from the file with zero
-    // validation at all. `/darkmux-out` stays read-write even when
-    // `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
-    // model can still get a same-role checkpoint's tool arguments — or
-    // its non-pending history — to say whatever it wants, and a later
-    // `--resume-from` under the SAME role replays it. Checkpoint
-    // integrity (making the file itself untamperable by the model it's
-    // checkpointing) is a follow-up: the real fix is uid separation
-    // between the runtime process and the tool-executing processes
-    // inside the container, so a tool call can never write the runtime's
-    // own checkpoint file. See `checkpoint::validate_for_resume`'s own
-    // doc for the full accounting, and `--resume-from`'s CLI help
-    // (`src/cli.rs`, host side) for the operator-facing version of this
-    // warning. The system-message comparison is against the fresh one
-    // main.rs just built, at `initial_messages[0]` (never the file's own
-    // claim) — compaction never rewrites it: `compaction::PRESERVE_HEAD`
-    // keeps index 0 untouched across every compaction generation. A
-    // THIRD leg (workspace mount-mode/path) is closed entirely host-side
-    // — this runtime process has no visibility into it at all; see
-    // `dispatch_internal::stage_resume_checkpoint`'s own doc.
-    if let Some(checkpoint) = &resume_from {
-        let allowed_tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        let fresh_system_message = initial_messages[0].content.as_deref().unwrap_or("");
-        if let Err(e) =
-            checkpoint::validate_for_resume(checkpoint, &allowed_tool_names, fresh_system_message)
-        {
-            eprintln!("--resume {}: {e:#}", resume_checkpoint_path.as_deref().unwrap_or(""));
-            return ExitCode::from(2);
-        }
+    if let Err(e) = validate_resume(
+        resume_from.as_ref(),
+        resume_checkpoint_path.as_deref(),
+        &tools,
+        &initial_messages[0],
+    ) {
+        return e.exit();
     }
 
-    // Status lines go to stderr in JSON mode so stdout stays clean for
-    // `jq`-style consumers. In human-readable mode they print to stdout
-    // alongside the eventual final-message block.
-    if json_mode {
-        eprintln!("dispatching to model: {model}");
-    } else {
-        println!("dispatching to model: {model}");
-        println!();
-    }
+    print_dispatching_line(json_mode, &model);
 
     // (#482) Fail loud if neither the loaded model's context window nor
     // an explicit absolute threshold is known — pre-#482 the runtime
@@ -974,6 +938,57 @@ fn required_model_and_prompt(
     let prompt =
         prompt.ok_or_else(|| Refusal::refuse("--prompt", "--prompt is required".into()))?;
     Ok((model, prompt))
+}
+
+/// (Security audit, #2114 resume follow-up) Refuses a CROSS-ROLE or
+/// CROSS-PROMPT resume — a checkpoint written under a different role,
+/// or a different system prompt than the one THIS run was launched
+/// with. It does NOT defend against a SAME-ROLE forgery: a resume
+/// replays `pending_tool_calls` verbatim (name checked against this
+/// run's own tool allowlist, arguments never validated), and restores
+/// every prior assistant/tool message from the file with zero
+/// validation at all. `/darkmux-out` stays read-write even when
+/// `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
+/// model can still get a same-role checkpoint's tool arguments — or
+/// its non-pending history — to say whatever it wants, and a later
+/// `--resume-from` under the SAME role replays it. Checkpoint
+/// integrity (making the file itself untamperable by the model it's
+/// checkpointing) is a follow-up: the real fix is uid separation
+/// between the runtime process and the tool-executing processes
+/// inside the container, so a tool call can never write the runtime's
+/// own checkpoint file. See `checkpoint::validate_for_resume`'s own
+/// doc for the full accounting, and `--resume-from`'s CLI help
+/// (`src/cli.rs`, host side) for the operator-facing version of this
+/// warning. The system-message comparison is against the fresh one
+/// main.rs just built, at `initial_messages[0]` (never the file's own
+/// claim) — compaction never rewrites it: `compaction::PRESERVE_HEAD`
+/// keeps index 0 untouched across every compaction generation. A
+/// THIRD leg (workspace mount-mode/path) is closed entirely host-side
+/// — this runtime process has no visibility into it at all; see
+/// `dispatch_internal::stage_resume_checkpoint`'s own doc.
+fn validate_resume(
+    resume_from: Option<&checkpoint::RunCheckpoint>,
+    resume_checkpoint_path: Option<&str>,
+    tools: &[Tool],
+    fresh_system: &Message,
+) -> Result<(), Refusal> {
+    let Some(checkpoint) = resume_from else { return Ok(()) };
+    let allowed_tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let fresh_system_message = fresh_system.content.as_deref().unwrap_or("");
+    checkpoint::validate_for_resume(checkpoint, &allowed_tool_names, fresh_system_message)
+        .map_err(|e| Refusal::new(format!("--resume {}: {e:#}", resume_checkpoint_path.unwrap_or(""))))
+}
+
+/// Status lines go to stderr in JSON mode so stdout stays clean for
+/// `jq`-style consumers. In human-readable mode they print to stdout
+/// alongside the eventual final-message block.
+fn print_dispatching_line(json_mode: bool, model: &str) {
+    if json_mode {
+        eprintln!("dispatching to model: {model}");
+    } else {
+        println!("dispatching to model: {model}");
+        println!();
+    }
 }
 
 /// The checkpoint `--resume`/`DARKMUX_RESUME_CHECKPOINT` named, if any. A
