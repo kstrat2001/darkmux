@@ -1773,12 +1773,12 @@ fn a_critical_machine_trips_the_breaker_writes_the_pace_file_and_ejects_darkmux_
     assert_eq!(eject["ejected"], json!([{"identifier": "darkmux:model-a", "context": 32000}]), "{eject}");
     assert_eq!(eject["user_loaded_count"], 1);
     let hw = payload(&rig.record("dispatch.complete"))["host_window"].clone();
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) || darkmux_platform::current().memory_snapshot().is_some() {
         assert_eq!((hw["thermal_worst_state"].as_str(), hw["simulated_host_source"].as_str()), (Some("critical"), Some(sim.as_str())));
     } else {
         // ODDITY: the host window exists only when the CPU/RAM/GPU probe read
-        // something, so on a host with no such probe even a scripted
-        // `critical` never reaches it.
+        // something (mach on Apple Silicon macOS, else the platform), so on a
+        // host with no such probe even a scripted `critical` never reaches it.
         assert!(hw.is_null(), "{hw}");
     }
 }
