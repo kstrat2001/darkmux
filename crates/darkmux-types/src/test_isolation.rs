@@ -1115,6 +1115,11 @@ mod tests {
     /// production ones (`mark_interrupted` and the shutdown paths that call
     /// it, and `arm()`, after which a real signal raises it) cannot, so this
     /// scan is their guard.
+    /// The macros that re-run a test in a process of its own:
+    /// `run_in_own_process!` and `dispatch_boundary.rs`'s `own_process!`,
+    /// which is the same re-run plus `--nocapture`.
+    const OWN_PROCESS_MACROS: &[&str] = &["run_in_own_process!()", "own_process!()"];
+
     const RAISERS: &[&str] = &[
         "mark_interrupted(",
         "raise_for_test(",
@@ -1214,7 +1219,7 @@ mod tests {
             for (name, body) in test_fns(&src) {
                 if RAISERS.iter().any(|r| body.contains(r)) {
                     raising += 1;
-                    if !body.contains("run_in_own_process!()") {
+                    if !OWN_PROCESS_MACROS.iter().any(|m| body.contains(m)) {
                         offenders.push(format!("{}: {name}", f.display()));
                     }
                 }
