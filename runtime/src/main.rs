@@ -294,49 +294,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         resume_from,
     );
 
-    let outcome = match run_result {
-        Ok(o) => Some(o),
-        Err(e) => {
-            eprintln!("dispatch failed: {e:#}");
-            None
-        }
-    };
+    let outcome = outcome_or_report(run_result);
 
-    // Three-way result discrimination (#325):
-    //   - Some(outcome) + terminal_reason=Stop  → "stop"
-    //   - Some(outcome) + terminal_reason=MaxTurns → "max_turns"
-    //   - None (loop errored) → "error"
-    // Pre-fix MAX_TURNS was an Err indistinguishable from
-    // infrastructure failures; structured terminal reason lets
-    // downstream consumers (qa-review skill, lab adapter, future
-    // heuristic engine) tell "model got stuck" from "container died."
-    let result_str: &str = match outcome.as_ref() {
-        Some(o) => match o.terminal_reason {
-            loop_runner::TerminalReason::Stop => "stop",
-            loop_runner::TerminalReason::MaxTurns => "max_turns",
-            // (#377) The `result` field is operator-visible in the JSON
-            // envelope; consumers (qa-review skill, lab adapter, future
-            // heuristic engine) branch on it. (#2190) Delegates to
-            // `loop_runner::escalation_reason_str` — the single source of
-            // truth for the mapping, so the envelope's `result` and the
-            // `dispatch.escalation.triggered` trajectory event's `reason`
-            // can never drift apart.
-            loop_runner::TerminalReason::EscalationTriggered(reason) => {
-                loop_runner::escalation_reason_str(reason)
-            }
-        },
-        None => "error",
-    };
+    let result_str = result_str(outcome.as_ref());
 
-    // Whether success or failure, close the trajectory. Every count of this
-    // execution (turns, tokens, rests) is in the trajectory already, written
-    // as it happened; the host folds it, so nothing here restates a total.
-    let wall_ms = traj.elapsed_ms();
-    traj.append_dispatch_complete(
-        result_str,
-        wall_ms,
-        outcome.as_ref().map(|o| o.turn_delay_effective_ms),
-    );
+    let wall_ms = close_trajectory(&mut traj, result_str, outcome.as_ref());
 
     if let Some(o) = &outcome {
         // (#1221) Prefer the answer the LOOP identified. "Last assistant
@@ -1054,6 +1016,61 @@ fn response_format_for(response_schema: Option<&str>) -> Option<serde_json::Valu
             "json_schema": { "name": "role_output", "strict": true, "schema": schema }
         })
     })
+}
+
+/// The loop's error, printed; `None` stands for it from here on.
+fn outcome_or_report(
+    run_result: anyhow::Result<loop_runner::LoopOutcome>,
+) -> Option<loop_runner::LoopOutcome> {
+    match run_result {
+        Ok(o) => Some(o),
+        Err(e) => {
+            eprintln!("dispatch failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Three-way result discrimination (#325):
+///   - Some(outcome) + terminal_reason=Stop  → "stop"
+///   - Some(outcome) + terminal_reason=MaxTurns → "max_turns"
+///   - None (loop errored) → "error"
+/// Pre-fix MAX_TURNS was an Err indistinguishable from
+/// infrastructure failures; structured terminal reason lets
+/// downstream consumers (qa-review skill, lab adapter, future
+/// heuristic engine) tell "model got stuck" from "container died."
+fn result_str(outcome: Option<&loop_runner::LoopOutcome>) -> &'static str {
+    match outcome {
+        Some(o) => match o.terminal_reason {
+            loop_runner::TerminalReason::Stop => "stop",
+            loop_runner::TerminalReason::MaxTurns => "max_turns",
+            // (#377) The `result` field is operator-visible in the JSON
+            // envelope; consumers (qa-review skill, lab adapter, future
+            // heuristic engine) branch on it. (#2190) Delegates to
+            // `loop_runner::escalation_reason_str` — the single source of
+            // truth for the mapping, so the envelope's `result` and the
+            // `dispatch.escalation.triggered` trajectory event's `reason`
+            // can never drift apart.
+            loop_runner::TerminalReason::EscalationTriggered(reason) => {
+                loop_runner::escalation_reason_str(reason)
+            }
+        },
+        None => "error",
+    }
+}
+
+/// Whether success or failure, close the trajectory. Every count of this
+/// execution (turns, tokens, rests) is in the trajectory already, written
+/// as it happened; the host folds it, so nothing here restates a total.
+/// Returns the wall time it recorded.
+fn close_trajectory(
+    traj: &mut trajectory::Trajectory,
+    result_str: &str,
+    outcome: Option<&loop_runner::LoopOutcome>,
+) -> u128 {
+    let wall_ms = traj.elapsed_ms();
+    traj.append_dispatch_complete(result_str, wall_ms, outcome.map(|o| o.turn_delay_effective_ms));
+    wall_ms
 }
 
 /// Construct the `--json` envelope. Pure function — extracted so the
