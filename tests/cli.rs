@@ -14956,7 +14956,7 @@ case "$1" in
     printf ']'; exit 0 ;;
   unload)
     echo "$2" >> "{s}/unload.log"
-    case "$2" in *stuck*) echo "boom" >&2; exit 1 ;; esac
+    case "$2" in *stuck*) echo "boom" >&2; exit 1 ;; *sticky*) exit 0 ;; esac
     rm -f "{s}/loaded/$(echo "$2" | tr ':' '_')"; exit 0 ;;
 esac
 exit 1
@@ -15067,6 +15067,22 @@ fn machine_eject_where_every_load_fails_is_not_nothing_to_eject() {
     assert_eq!(code, Some(1), "{stdout}");
     assert!(stderr.contains("could not eject darkmux:stuck"), "{stderr}");
     assert_eq!(stdout, "ejected 0 model(s), 1 FAILED to eject\n");
+}
+
+/// `lms unload` can exit 0 and leave the model resident; the eject reads
+/// `lms ps` again afterward and reports that load as not ejected.
+#[test]
+fn machine_eject_reports_a_load_still_resident_after_a_clean_unload() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192), ("darkmux:sticky", 4096)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "eject"]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stderr.contains("could not eject darkmux:sticky — model still resident after unload"),
+        "{stderr}"
+    );
+    assert_eq!(stdout, "eject darkmux:a (ctx=8192)\nejected 1 model(s), 1 FAILED to eject\n");
+    assert_eq!(unload_log(&tmp), "darkmux:a\ndarkmux:sticky\n");
 }
 
 #[test]

@@ -32,8 +32,6 @@ impl Engine for LmStudio {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// A fake `lms` answering each verb the backend delegates: `ps --json`
     /// with one resident, `ls --json` with one catalog entry, `unload x`
     /// succeeding and `unload` of anything else failing as not resident.
@@ -80,7 +78,7 @@ esac
         assert_eq!(catalog.unwrap(), vec!["m".to_string()]);
         assert!(unloaded.is_ok(), "{unloaded:?}");
         assert!(
-            lms::is_not_resident(&gone.unwrap_err()),
+            crate::engine::is_not_resident(&gone.unwrap_err()),
             "an absent instance is the typed not-resident error"
         );
         assert!(engine.host().is_some(), "LM Studio has a load lifecycle");

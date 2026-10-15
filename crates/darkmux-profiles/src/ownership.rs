@@ -92,12 +92,13 @@ fn partition_by_ownership(loaded: &[darkmux_types::LoadedModel]) -> (Vec<&darkmu
 /// The one remaining `Err` is a failure to LIST — with no listing there is
 /// no set to act on, and continuing would mean guessing.
 pub fn eject_all_managed(dry_run: bool) -> anyhow::Result<EjectSummary> {
-    let loaded = crate::lms::list_loaded()?;
+    let engine = crate::engine::local();
+    let loaded = engine.loaded()?;
     eject_managed_inner(
         &loaded,
         dry_run,
-        &|id| crate::lms::unload(id),
-        &|| crate::lms::list_loaded(),
+        &|id| engine.unload(id),
+        &|| engine.loaded(),
     )
 }
 
@@ -152,7 +153,7 @@ fn eject_each(
         if !dry_run {
             // (#3083) An instance already gone is the end state the eject wants.
             let outcome = unload(&m.identifier)
-                .or_else(|e| if crate::lms::is_not_resident(&e) { Ok(()) } else { Err(e) });
+                .or_else(|e| if crate::engine::is_not_resident(&e) { Ok(()) } else { Err(e) });
             if let Err(e) = outcome {
                 failed.push(EjectFailure {
                     identifier: m.identifier.clone(),

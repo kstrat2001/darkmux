@@ -363,13 +363,10 @@ pub fn unload(identifier: &str) -> Result<()> {
     verify_unload_outcome(out.status.success(), &out.stderr, identifier)
 }
 
-/// Whether an unload error is the typed not-resident outcome (#3083).
-pub fn is_not_resident(err: &anyhow::Error) -> bool {
-    matches!(
-        err.downcast_ref::<darkmux_gestalt::HostError>(),
-        Some(darkmux_gestalt::HostError::NotResident { .. })
-    )
-}
+/// (#316 stage 3.4) The not-resident check now lives with the engine facade;
+/// this path stays as a re-export until `lms` becomes private to the LM
+/// Studio backend (stage 3.7).
+pub use crate::engine::is_not_resident;
 
 /// Classify `lms unload` through the ONE shared classifier the gestalt host
 /// uses (#3083: two classifiers had diverged on "Model Not Found"). The typed

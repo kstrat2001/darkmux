@@ -59,7 +59,7 @@ pub trait Engine {
 
     /// Unload the resident instance named `identifier`, taken verbatim. An
     /// instance that was already gone is the typed not-resident error
-    /// (`crate::lms::is_not_resident`).
+    /// ([`is_not_resident`]).
     fn unload(&self, identifier: &str) -> Result<()>;
 
     /// The engine's load lifecycle as the planner's port, or `None` when the
@@ -72,4 +72,14 @@ pub trait Engine {
 /// call, so the fake-`lms` test seam is unchanged.
 pub fn local() -> Box<dyn Engine> {
     Box::new(LmStudio)
+}
+
+/// Whether an unload error is the typed not-resident outcome (#3083). It reads
+/// gestalt's [`HostError`](darkmux_gestalt::HostError), which every backend's
+/// unload carries, so the check is the same whatever the engine.
+pub fn is_not_resident(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<darkmux_gestalt::HostError>(),
+        Some(darkmux_gestalt::HostError::NotResident { .. })
+    )
 }
