@@ -10,9 +10,13 @@
 //! current memory ledger — ONE implementation consumed by both the
 //! `darkmux machine resources` CLI verb and the serve daemon's `/machine/resources`.
 //!
+//! `engine` (#316 stage 3) is the facade the rest of darkmux asks about a
+//! model server; its LM Studio backend delegates to `lms` and `LmsHost`.
+//!
 //! (2.0, #1405: the `runtime` module — the legacy `openclaw` shell-out
 //! runtime's config-file patcher — was removed along with that runtime.)
 
+pub mod engine;
 pub mod envelope;
 pub mod gestalt_host;
 pub mod lms;

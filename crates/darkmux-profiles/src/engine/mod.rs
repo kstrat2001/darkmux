@@ -1,0 +1,54 @@
+//! The engine facade (#316 stage 3, `docs/architecture/ENGINES.md` section 8).
+//!
+//! One interface the rest of darkmux asks about a model server, with one
+//! backend per kind of server. LM Studio is the only backend today
+//! ([`LmStudio`]), and it delegates one-to-one to `crate::lms` and
+//! [`crate::gestalt_host::LmsHost`]: same return types, same bounds, same
+//! fallbacks. The duplicate `lms ps` / `lms ls` parsers stay where they are;
+//! merging them would change behavior (ENGINES.md section 8.2).
+//!
+//! The facade sits above the gestalt [`ModelHost`] port rather than widening
+//! it: `ModelHost` is the planner's lifecycle port with planner-minimal facts,
+//! while these questions read the full [`LoadedModel`] and [`ModelMeta`]. A
+//! backend with no lifecycle (a Messages endpoint, stage 4) answers
+//! [`Engine::host`] with `None` instead of a port full of `Unsupported` stubs.
+//!
+//! The facade takes identifiers verbatim and has no ownership method: the
+//! `darkmux:` namespace (contract 4) stays the LM Studio backend's mechanism,
+//! in `crate::ownership`.
+
+mod lmstudio;
+
+pub use lmstudio::LmStudio;
+
+use crate::lms::ModelMeta;
+use anyhow::Result;
+use darkmux_gestalt::ModelHost;
+use darkmux_types::LoadedModel;
+
+/// A model server darkmux can ask questions of.
+pub trait Engine {
+    /// Every model the engine has resident. `Ok(vec![])` means the engine
+    /// reported none; anything it could not interpret is an `Err`.
+    fn loaded(&self) -> Result<Vec<LoadedModel>>;
+
+    /// Every model the engine could run here (its downloaded catalog). A
+    /// failed listing is an `Err`, never an empty catalog.
+    fn catalog(&self) -> Result<Vec<ModelMeta>>;
+
+    /// Unload the resident instance named `identifier`, taken verbatim. An
+    /// instance that was already gone is the typed not-resident error
+    /// (`crate::lms::is_not_resident`).
+    fn unload(&self, identifier: &str) -> Result<()>;
+
+    /// The engine's load lifecycle as the planner's port, or `None` when the
+    /// engine has none (darkmux cannot load or evict models there).
+    fn host(&self) -> Option<Box<dyn ModelHost>>;
+}
+
+/// The engine on this machine. Today that is always LM Studio, resolving its
+/// binary as before (`env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"`) at each
+/// call, so the fake-`lms` test seam is unchanged.
+pub fn local() -> Box<dyn Engine> {
+    Box::new(LmStudio)
+}

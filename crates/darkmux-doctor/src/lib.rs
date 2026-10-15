@@ -30,6 +30,7 @@ pub use fleet_submission::{
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
+use darkmux_profiles::engine;
 use darkmux_profiles::lms;
 use darkmux_profiles::profiles;
 use std::env;
@@ -1020,7 +1021,7 @@ fn check_utility_model_binding() -> Check {
     let n_ctx = registry.as_ref().and_then(|r| r.utility_model_n_ctx());
     // Only query LMStudio when there's a binding to check.
     let loaded = if registry_util.is_some() {
-        darkmux_profiles::lms::list_loaded().ok()
+        engine::local().loaded().ok()
     } else {
         None
     };
@@ -1433,7 +1434,7 @@ fn check_unreachable_darkmux_residents() -> Check {
     if !registry.needs_lmstudio() {
         return lmstudio_unneeded_check("unreachable residents");
     }
-    let loaded = match darkmux_profiles::lms::list_loaded() {
+    let loaded = match engine::local().loaded() {
         Ok(l) => l,
         Err(_) => {
             return Check {
@@ -6432,7 +6433,7 @@ fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
 }
 
 fn check_models_loaded() -> Check {
-    match lms::list_loaded() {
+    match engine::local().loaded() {
         Ok(models) if !models.is_empty() => Check {
             name: "models loaded".into(),
             status: Status::Pass,
@@ -6479,7 +6480,7 @@ fn check_profile_loaded_match() -> Check {
             };
         }
     };
-    let loaded = match lms::list_loaded() {
+    let loaded = match engine::local().loaded() {
         Ok(l) => l,
         Err(_) => {
             return Check {
@@ -6804,7 +6805,7 @@ fn check_ram_headroom() -> Check {
     // What's already mapped to AI counts toward the real budget — it's
     // memory the operator has *already chosen* to spend on AI, not a
     // contention pressure to subtract. See issue #67.
-    let loaded_models_size_gb = lms::list_loaded()
+    let loaded_models_size_gb = engine::local().loaded()
         .map(|models| {
             models
                 .iter()
@@ -6889,7 +6890,7 @@ fn check_ram_headroom_load_projection() -> Check {
         Ok(r) => r,
         Err(_) => return skip("the profile registry did not load (see the `profile registry` row)"),
     };
-    let loaded = match lms::list_loaded() {
+    let loaded = match engine::local().loaded() {
         Ok(l) => l,
         Err(_) => return skip("could not query lms"),
     };
@@ -7303,7 +7304,7 @@ pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 /// `None` when `vm_stat` cannot be read (non-macOS). One computation for
 /// every caller: `serve`'s /machine/specs and `init`'s utility window (#3020).
 pub fn ai_headroom_bytes() -> Option<u64> {
-    let resident_gb = lms::list_loaded()
+    let resident_gb = engine::local().loaded()
         .ok()
         .map(|models| models.iter().filter_map(|m| darkmux_types::size::parse_size_gb(&m.size)).sum::<f64>())
         .unwrap_or(0.0);
