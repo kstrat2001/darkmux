@@ -1019,7 +1019,7 @@ cat <<'EOF'
 [{"modelKey":"model-a","type":"llm","paramsString":"7B","sizeBytes":4000000000},
  {"modelKey":"unsloth/Qwen-7B","displayName":"Qwen 7B","publisher":"unsloth","type":"llm","paramsString":"7B","architecture":"qwen2","sizeBytes":5368709120,"maxContextLength":32768,"trainedForToolUse":true},
  {"modelKey":"lmstudio-community/Qwen-7B","type":"llm","paramsString":"7B","architecture":"qwen2","sizeBytes":5368709120,"maxContextLength":131072,"trainedForToolUse":true},
- {"modelKey":"big-moe-35b-a3b","type":"llm","paramsString":"35B-A3B","architecture":"qwen3moe","sizeBytes":21474836480,"maxContextLength":262144,"trainedForToolUse":true},
+ {"modelKey":"big-moe-35b-a3b","type":"llm","paramsString":"35B-A3B","architecture":"qwen3moe","sizeBytes":21474836480,"maxContextLength":32000,"trainedForToolUse":true},
  {"modelKey":"mystery-model","type":"llm"},
  {"modelKey":"nomic-embed","type":"embedding"}]
 EOF
@@ -1057,8 +1057,11 @@ EOF
         "    draft: `darkmux profile draft qwen-7b-fast --model lmstudio-community/Qwen-7B --task-class fast`\n",
         "\n",
         "✓ big-moe-35b-a3b\n",
-        "    id=big-moe-35b-a3b  params=35B-A3B  arch=Moe  size=20.0GB  maxCtx=262144\n",
-        "    suggested task class: `long` (n_ctx=262144, compactor=qwen3-4b-instruct-2507 @ 120000)\n",
+        "    id=big-moe-35b-a3b  params=35B-A3B  arch=Moe  size=20.0GB  maxCtx=32000\n",
+        // The model's own 32000 cap binds on every host: the heuristics'
+        // RAM-sized context (262144 on a 128 GB Mac, 64000 on a CI runner)
+        // would otherwise make this line machine-dependent.
+        "    suggested task class: `long` (n_ctx=32000, compactor=qwen3-4b-instruct-2507 @ 32000)\n",
         "    draft: `darkmux profile draft big-moe-35b-a3b-long --model big-moe-35b-a3b --task-class long`\n",
         "\n",
         "⚠ mystery-model\n",
