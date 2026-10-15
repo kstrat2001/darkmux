@@ -1245,10 +1245,18 @@ jobs:
     #   - `max-parallel: 10` (see COST below): a Free account runs 20 jobs at
     #     once across ALL runner types, so 22 Linux jobs at once would starve
     #     PR CI just as the macOS ones did.
-    #   - Shard count and `timeout-minutes` are unchanged: the only
-    #     throughput this file records for a full sweep is the macOS 21.4s per
-    #     mutant below, and Linux has not run one yet. Re-measure from the
-    #     first complete Linux night before re-sizing.
+    #   - MEASURED on Linux (quality run 38771514681, dispatched and then
+    #     canceled about 22 minutes into mutation): every root and crew shard
+    #     passed its baseline, in 55-102s build + 46-68s test, so no baseline
+    #     comes near 300 (nextest alone brings it under the old 120 here).
+    #     The five small crates ran to completion in 26 minutes. The tree has
+    #     outgrown the census below: a crew shard now lists 976 mutants after
+    #     its 170 macOS-only exclusions, a root shard 841. Mutation ran at
+    #     about 8 to 16s per mutant per shard, which projects the worst crew
+    #     shard at about 260 of its 300 minutes and root at about 210.
+    #     Shard count and `timeout-minutes` stay as they are on that
+    #     projection; the first complete Linux night is the number to re-size
+    #     from, since early mutants need not be representative.
     #
     # (#2499) SHARDED nightly sweep across the whole workspace (root package +
     # every crate under `crates/`) — the job used to be root-package-only
@@ -1401,19 +1409,9 @@ jobs:
       fail-fast: false
       # (#3242) Leaves room for PR CI in the account's concurrent-job limit;
       # see COST above.
-      max-parallel: 10
+      max-parallel: 11
       matrix:
         include:
-          - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
-          - { scope: root, package: "", shard: "1/4", shard_label: "1-4" }
-          - { scope: root, package: "", shard: "2/4", shard_label: "2-4" }
-          - { scope: root, package: "", shard: "3/4", shard_label: "3-4" }
-          - { scope: crew, package: "darkmux-crew", shard: "0/6", shard_label: "0-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "1/6", shard_label: "1-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "2/6", shard_label: "2-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "3/6", shard_label: "3-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "4/6", shard_label: "4-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "5/6", shard_label: "5-6" }
           - { scope: lab, package: "darkmux-lab", shard: "0/4", shard_label: "0-4" }
           - { scope: lab, package: "darkmux-lab", shard: "1/4", shard_label: "1-4" }
           - { scope: lab, package: "darkmux-lab", shard: "2/4", shard_label: "2-4" }
@@ -1425,6 +1423,16 @@ jobs:
           - { scope: doctor, package: "darkmux-doctor", shard: "", shard_label: "solo" }
           - { scope: types, package: "darkmux-types", shard: "", shard_label: "solo" }
           - { scope: profiles, package: "darkmux-profiles", shard: "", shard_label: "solo" }
+          - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
+          - { scope: root, package: "", shard: "1/4", shard_label: "1-4" }
+          - { scope: root, package: "", shard: "2/4", shard_label: "2-4" }
+          - { scope: root, package: "", shard: "3/4", shard_label: "3-4" }
+          - { scope: crew, package: "darkmux-crew", shard: "0/6", shard_label: "0-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "1/6", shard_label: "1-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "2/6", shard_label: "2-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "3/6", shard_label: "3-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "4/6", shard_label: "4-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "5/6", shard_label: "5-6" }
     steps:
       - uses: actions/checkout@v4
 
