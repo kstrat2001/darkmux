@@ -7,6 +7,7 @@ use crate::lab::manifest::{ManifestFixture, RunManifest, MANIFEST_FILE};
 use darkmux_types::session_id::{RunId, SessionId};
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
+use darkmux_profiles::engine;
 use darkmux_profiles::profiles::{get_profile, load_registry};
 use crate::workloads::load::{list_available, load};
 use crate::workloads::registry::with_provider;
@@ -411,7 +412,7 @@ impl EnvelopeWarnings {
 /// The loaded models against the profile's declared ones. A failed `lms ps`
 /// is its own warning, so a run whose profile tag went unverified says so.
 fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
-    match darkmux_profiles::lms::list_loaded() {
+    match engine::local().loaded() {
         Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \

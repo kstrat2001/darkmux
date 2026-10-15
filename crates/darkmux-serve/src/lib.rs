@@ -1,6 +1,7 @@
 //! `darkmux serve` — minimal HTTP daemon for flow record retrieval.
 
 use anyhow::{Context, Result};
+use darkmux_profiles::engine;
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
@@ -2809,10 +2810,10 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// LMStudio's CLI, or it's not on PATH) — UI surfaces this as a
 /// degraded-state pill rather than treating it as a hard error.
 ///
-/// `lms::list_loaded()` is sync (subprocess invocation), so it runs on
+/// The engine's `loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
-    let result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
+    let result = tokio::task::spawn_blocking(|| engine::local().loaded()).await;
     let (models, unreachable) = match result {
         Ok(Ok(m)) => (m, false),
         _ => (Vec::new(), true),
@@ -2965,7 +2966,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 /// ONE gather. Blocking (it shells out); each probe is independent, so one
 /// failure never cascades.
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let (loaded_models, lms_unreachable) = match darkmux_profiles::lms::list_loaded() {
+    let (loaded_models, lms_unreachable) = match engine::local().loaded() {
         Ok(m) => (m, false),
         Err(_) => (Vec::new(), true),
     };

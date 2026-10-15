@@ -20,6 +20,7 @@
 
 use crate::skills;
 use anyhow::{Context, Result, anyhow};
+use darkmux_profiles::engine;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -268,7 +269,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
             ))
         }
     };
-    let loaded: Vec<String> = darkmux_profiles::lms::list_loaded()
+    let loaded: Vec<String> = engine::local().loaded()
         .map(|v| v.into_iter().map(|m| m.model).collect())
         .unwrap_or_default();
     let ram_gb = darkmux_hardware::detect().total_ram_gb;

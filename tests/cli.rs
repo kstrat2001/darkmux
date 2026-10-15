@@ -1455,6 +1455,52 @@ fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds(
     }
 }
 
+/// (#316 stage 3.2) `mission config show`'s residency reads what LM Studio
+/// reports: a fake `lms ps` with the profile's model resident under its
+/// darkmux identifier at a sufficient window shows the reviewer `loaded`,
+/// and an `lms` that cannot run shows the residency block unavailable,
+/// never an empty listing.
+#[test]
+fn mission_config_show_residency_reads_the_engines_listing() {
+    let tmp = TempDir::new().unwrap();
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{"profiles":{"work":{"models":[{"id":"m","n_ctx":4096}]}},"default_profile":"work"}"#,
+    )
+    .unwrap();
+    let fake = write_fake_lms_ps(
+        tmp.path(),
+        r#"[{"identifier":"darkmux:m","modelKey":"m","status":"idle","contextLength":8192}]"#,
+    );
+    let show = |lms: &std::path::Path| {
+        let out = darkmux_cmd()
+            .env("DARKMUX_HOME", tmp.path())
+            .env("DARKMUX_LMS_BIN", lms)
+            .args(["mission", "config", "show", "review", "--json", "--profiles-file"])
+            .arg(&profiles_path)
+            .output()
+            .expect("mission config show review --json runs");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+        let reviewer = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p["tasks"].as_array().unwrap())
+            .find_map(|t| (t["role"]["role_id"] == "reviewer").then(|| t["role"].clone()))
+            .expect("a reviewer task must be present");
+        (v["residency"]["available"].clone(), reviewer["residency"].clone())
+    };
+    let (available, reviewer) = show(&fake);
+    assert_eq!(available, true);
+    assert_eq!(reviewer, "loaded");
+
+    let (available, reviewer) = show(&tmp.path().join("no-such-lms"));
+    assert_eq!(available, false);
+    assert_eq!(reviewer, "unavailable");
+}
+
 /// (#2310 P4c-2 review item 3 — proven; #2404 P4d round 3: `bundler`, the
 /// shipped `review.json` input this test originally used, was removed
 /// outright, so the test was retargeted to review's `mode` input; the
