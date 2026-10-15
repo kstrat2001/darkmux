@@ -30,6 +30,7 @@ use darkmux_types::session_id::SessionId;
 use darkmux_types::shell::quote as shell_quote;
 use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
+use darkmux_profiles::engine;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -9978,7 +9979,7 @@ impl DispatchSampler {
         // tagging, and the skip-on-failed-probe behavior all live in
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
-        self.lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
+        self.lms_tracker.tick(&|| engine::local().loaded(), &|payload| {
             records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
         });
 
@@ -13884,7 +13885,7 @@ pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, 
     ensure_model_resident_from(
         pm,
         source,
-        &|| lms::list_loaded().unwrap_or_default(),
+        &|| engine::local().loaded().unwrap_or_default(),
         &|identifier| lms::unload(identifier),
         &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
     )

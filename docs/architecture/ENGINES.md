@@ -143,7 +143,7 @@ Each PR is behavior-preserving, moves one question, and is verified by the exist
 | PR | Moves | Verified by |
 |---|---|---|
 | **3.1** (done: #3241) | `Engine` trait and the LM Studio backend, delegating to today's functions; the 7 doctor "what is loaded" sites | `lms_checks_tests.rs` and the doctor's inline tests, unchanged |
-| 3.2 | 11 of the other 13 "what is loaded" sites (`ownership`'s 2 move with unload in 3.4) | `tests/cli.rs`, `init_tests`, `run_tests`, serve `lib_tests`; first pin `busy_report_live`, `utility_facts_live`, eureka `collect` |
+| **3.2** (done: #3244) | 11 of the other 13 "what is loaded" sites (`ownership`'s 2 move with unload in 3.4) | `tests/cli.rs`, `init_tests`, `run_tests`, serve `lib_tests`; pinned first: `busy_report_live`, `utility_facts_live`, eureka `collect`, serve `machine_status_handler` and `gather_specs`, and `mission config show` (its listing was unread, found by mutation) |
 | 3.3 | "what could run here" and `ModelMeta` | pin `cmd_scan` first (8.3), then the move |
 | 3.4 | unload, `is_not_resident`, and `eject_all_managed`'s list | `eject_each` and residency closure tests; `cmd_model_eject` (stage 0) |
 | 3.5 | load: `LmsHost::new()` → `engine.host()` | the gestalt and concurrent-dispatch suites (their doubles are untouched) |

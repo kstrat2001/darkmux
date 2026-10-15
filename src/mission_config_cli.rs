@@ -79,6 +79,7 @@ use crate::crew::mission_config::{self, FindingSeverity, LoadedMissionConfig, Mi
 use crate::crew::step_kinds::StepKindRegistry;
 use anyhow::{anyhow, Context, Result};
 use darkmux_gestalt::{decide_residency, namespaced_identifier, Placement, ResidencyDecision, ResidentFact};
+use darkmux_profiles::engine;
 use darkmux_profiles::profiles::{resolve_role_profile_with, RoleBinding, RoleProfileSource};
 use darkmux_types::{LoadedModel, ProfileRegistry};
 use serde::Serialize;
@@ -997,7 +998,7 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
         };
     let profiles_ctx = profiles_owned.as_ref().map_err(|e| e.as_str());
 
-    let loaded_models_owned = darkmux_profiles::lms::list_loaded().map_err(|e| format!("{e:#}"));
+    let loaded_models_owned = engine::local().loaded().map_err(|e| format!("{e:#}"));
     let loaded_models = loaded_models_owned.as_deref().map_err(|e| e.as_str());
 
     let show = build_show(id, &loaded, &registry, profiles_ctx, &bindings, loaded_models, &warnings);

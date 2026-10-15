@@ -74,6 +74,7 @@
 //! from today. The router notice never reads it.
 
 use crate::radio_answer::AnswererOverrides;
+use darkmux_profiles::engine;
 use darkmux_types::LoadedModel;
 use std::time::Duration;
 
@@ -380,7 +381,7 @@ pub fn router_wait_notice(facts: Option<&UtilityFacts>, waited: Duration, ceilin
 /// registry is read the way every other reader reads it (lenient,
 /// crash-orphans swept) and only verified leases count.
 pub fn busy_report_live(target: &LocalTarget) -> Option<BusyReport> {
-    let loaded = crate::lms::list_loaded().unwrap_or_default();
+    let loaded = engine::local().loaded().unwrap_or_default();
     let leases = darkmux_types::residency_lease::live_loaded_models_by_process(std::process::id());
     busy_report(target, &loaded, &leases, &live_runs_from_local_records)
 }
@@ -399,7 +400,7 @@ pub fn answering_seat_busy(overrides: &AnswererOverrides) -> Option<BusyReport> 
 /// resolves.
 pub fn utility_facts_live() -> Option<UtilityFacts> {
     let target = crate::crew::dispatch::utility_local_target(None)?;
-    let loaded = crate::lms::list_loaded().ok();
+    let loaded = engine::local().loaded().ok();
     let reading = read_instance(&target, loaded.as_deref());
     let leases = darkmux_types::residency_lease::live_loaded_models_by_process(std::process::id());
     let foreign_holder = lease_holder(&target, &leases);
@@ -893,5 +894,52 @@ mod tests {
 
         let worker = LocalTarget { identifier: "darkmux:stub-worker".to_string(), model_key: "stub-worker".to_string() };
         assert_eq!(busy_report_live(&worker), None, "radio's own lease does not make its answering seat busy");
+    }
+
+    /// (#316 stage 3.2) Both live gatherers read LM Studio's listing: a fake
+    /// `lms ps --json` reporting the utility instance generating with two
+    /// queued and the worker instance mid-prompt reaches the facts and the
+    /// busy verdict as reported, not as an empty or failed listing.
+    #[test]
+    #[serial_test::serial]
+    fn the_live_gatherers_read_what_lms_ps_reports() {
+        let home = tempfile::TempDir::new().unwrap();
+        let profiles = home.path().join("profiles.json");
+        std::fs::write(
+            &profiles,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},
+                "default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+        )
+        .unwrap();
+        let fake_lms = home.path().join("lms");
+        std::fs::write(
+            &fake_lms,
+            r#"#!/bin/sh
+echo '[{"identifier":"darkmux:stub-util","modelKey":"stub-util","status":"generating","queued":2,"contextLength":8000},{"identifier":"darkmux:stub-worker","modelKey":"stub-worker","status":"processingPrompt","contextLength":8000}]'
+"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = EnvGuard::set("DARKMUX_HOME", home.path().to_str().unwrap());
+        let _flows = EnvGuard::set("DARKMUX_FLOWS_DIR", home.path().join("flows").to_str().unwrap());
+        let _lab = EnvGuard::set("DARKMUX_LAB_DIR", home.path().join("lab").to_str().unwrap());
+        let _profiles = EnvGuard::set("DARKMUX_PROFILES", profiles.to_str().unwrap());
+        let _lms = EnvGuard::set("DARKMUX_LMS_BIN", fake_lms.to_str().unwrap());
+
+        let facts = utility_facts_live().expect("the utility binding resolves");
+        assert_eq!(facts.reading, InstanceReading::Listed { status: "generating".to_string(), queued: Some(2) });
+
+        let worker = LocalTarget { identifier: "darkmux:stub-worker".to_string(), model_key: "stub-worker".to_string() };
+        assert_eq!(
+            busy_report_live(&worker),
+            Some(BusyReport {
+                identifier: "darkmux:stub-worker".to_string(),
+                source: BusySource::LmStudioStatus("processingPrompt".to_string()),
+                occupant: Occupant::NoneOnRecord,
+            })
+        );
     }
 }

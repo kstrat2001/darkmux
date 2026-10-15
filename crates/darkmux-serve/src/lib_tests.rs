@@ -913,6 +913,87 @@
         assert!(json["loaded_models"].is_array());
     }
 
+    /// (#316 stage 3.2) A fake `lms` for the two machine reads below: `ps
+    /// --json` reports one resident, every other verb fails.
+    fn fake_lms_with_one_resident(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("lms");
+        fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho '[{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}]'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// Run `f` with `DARKMUX_LMS_BIN` set to `bin`, restoring it after.
+    fn with_lms_bin<T>(bin: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: callers are #[serial].
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", bin) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        out
+    }
+
+    /// (#316 stage 3.2) GET /machine/status carries what `lms ps` reports,
+    /// and an `lms` that cannot run is `lms_unreachable`, never an empty
+    /// reachable listing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_status_carries_the_engines_listing() {
+        let tmp = TempDir::new().unwrap();
+        let bin = fake_lms_with_one_resident(tmp.path());
+        let status = |bin: PathBuf| async move {
+            let prev = std::env::var_os("DARKMUX_LMS_BIN");
+            // SAFETY: #[serial]; restored below.
+            unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+            let response = build_router_local(PathBuf::new())
+                .oneshot(Request::builder().uri("/machine/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                    None => std::env::remove_var("DARKMUX_LMS_BIN"),
+                }
+            }
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let listed = status(bin).await;
+        assert_eq!(listed["lms_unreachable"], false, "{listed}");
+        assert_eq!(listed["models"][0]["identifier"], "darkmux:m", "{listed}");
+        assert_eq!(listed["models"].as_array().map(Vec::len), Some(1), "{listed}");
+
+        let failed = status(tmp.path().join("no-such-lms")).await;
+        assert_eq!(failed["lms_unreachable"], true, "{failed}");
+        assert_eq!(failed["models"], serde_json::json!([]), "{failed}");
+    }
+
+    /// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
+    /// reports, and an `lms` that cannot run is `lms_unreachable`.
+    #[test]
+    #[serial_test::serial]
+    fn gather_specs_carries_the_engines_listing() {
+        let tmp = TempDir::new().unwrap();
+        let bin = fake_lms_with_one_resident(tmp.path());
+        let listed = with_lms_bin(&bin, gather_specs);
+        assert!(!listed.lms_unreachable);
+        let ids: Vec<&str> = listed.loaded_models.iter().map(|m| m.identifier.as_str()).collect();
+        assert_eq!(ids, vec!["darkmux:m"]);
+
+        let failed = with_lms_bin(&tmp.path().join("no-such-lms"), gather_specs);
+        assert!(failed.lms_unreachable);
+        assert!(failed.loaded_models.is_empty());
+    }
+
     // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
 
     /// GET /machine/resources returns the memory ledger with the fields the

@@ -3,6 +3,7 @@
 //! v0.2 in Rust. Ports the v0.1 TS prototype + the v0.2 lab foundation.
 
 use anyhow::{Context, Result};
+use darkmux_profiles::engine;
 use clap::Parser;
 
 // The clap command tree (Cli/Cmd + every subcommand's arg struct) — split
@@ -1452,7 +1453,7 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
     // condition from a PEER gets a parseable object and rc 2. One host's
     // answer to "can you see LMStudio" should not depend on which side of
     // the fleet is asking. Same shape, same exit code, both branches.
-    let loaded = match lms::list_loaded() {
+    let loaded = match engine::local().loaded() {
         Ok(loaded) => loaded,
         Err(e) => {
             if json {

@@ -50,6 +50,7 @@
 //! stream (#657). Different input data shapes — same logical rules.
 
 use anyhow::Result;
+use darkmux_profiles::engine;
 use serde::{Deserialize, Serialize};
 
 /// Semver of the rules schema. See module docs for bump rules.
@@ -188,7 +189,7 @@ impl Context {
         // an empty one, and collapsing them here made the rule pass print
         // `skipped: no models loaded` under a FAILING `lms` — a reason the
         // code could not back, stated to the operator as fact.
-        let loaded_models = darkmux_profiles::lms::list_loaded().ok();
+        let loaded_models = engine::local().loaded().ok();
         let available_models = darkmux_profiles::lms::list_available().ok();
         let total_ram_gb = darkmux_hardware::detect().total_ram_gb;
         Self {
@@ -648,5 +649,50 @@ mod tests {
             ids.contains(&"memory-headroom-tight"),
             "rule ids in payload: {ids:?}"
         );
+    }
+
+    /// (#316 stage 3.2) `Context::collect` carries LM Studio's listing as
+    /// reported: one resident from a fake `lms ps --json` is `Some([it])`,
+    /// and an `lms` that cannot run is `None` (not an empty listing, #2774
+    /// round-9 C3). The only test in this crate that touches the
+    /// environment, and it restores what it set; std only, so the crate
+    /// gains no dev-dependency.
+    #[test]
+    fn collect_reads_the_engines_listing_and_keeps_a_failure_distinct() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("darkmux-eureka-collect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("lms");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+case "$1" in
+  ps) echo '[{"identifier":"darkmux:m","modelKey":"m","status":"idle","sizeBytes":2000000000,"contextLength":4096}]' ;;
+  ls) echo '[]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: no other test in this crate reads or writes the environment.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &fake) };
+        let listed = Context::collect().loaded_models;
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", dir.join("no-such-lms")) };
+        let failed = Context::collect().loaded_models;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let listed = listed.expect("a readable listing is Some");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].identifier, "darkmux:m");
+        assert_eq!(listed[0].size, "2.00 GB");
+        assert!(failed.is_none(), "an unreadable listing is None, not empty: {failed:?}");
     }
 }
