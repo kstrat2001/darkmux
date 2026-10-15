@@ -13881,12 +13881,12 @@ pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource)
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the
 /// load messages (#2914 review, C5).
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
-    use darkmux_profiles::lms;
+    let engine = engine::local();
     ensure_model_resident_from(
         pm,
         source,
-        &|| engine::local().loaded().unwrap_or_default(),
-        &|identifier| lms::unload(identifier),
+        &|| engine.loaded().unwrap_or_default(),
+        &|identifier| engine.unload(identifier),
         &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
     )
 }
@@ -13914,7 +13914,7 @@ fn unload_stale_for_reload(
     n_ctx: u32,
 ) -> Result<()> {
     match unload(stale_identifier) {
-        Err(e) if darkmux_profiles::lms::is_not_resident(&e) => Ok(()),
+        Err(e) if engine::is_not_resident(&e) => Ok(()),
         other => other.with_context(|| {
             format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
         }),
@@ -13975,9 +13975,9 @@ fn ensure_model_resident_from(
     // The namespace convention exists precisely so this is impossible by
     // construction (#1274, ABSOLUTE for model lifecycle): darkmux loads,
     // unloads and reconciles only what IT loaded. `darkmux-gestalt` enforces
-    // that structurally through `OwnedTarget`; this legacy path reached past it
-    // to the raw `lms::unload`, so the guarantee has to be restated here until
-    // the raw call is retired in favor of the `ModelHost` seam.
+    // that structurally through `OwnedTarget`; this legacy path unloads through
+    // `Engine::unload`, which takes identifiers verbatim, so the guarantee has
+    // to be restated here until the call moves to the `ModelHost` seam.
     match decide_preflight(&pm.id, want_identifier, n_ctx, &loaded) {
         PreflightDecision::Reuse { .. } => return Ok(()),
         PreflightDecision::Reload { stale_identifier, stale_ctx } => {

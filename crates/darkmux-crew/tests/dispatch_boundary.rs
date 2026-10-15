@@ -1018,6 +1018,26 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
 
 #[test]
 #[serial]
+fn a_model_resident_at_the_wrong_context_is_unloaded_then_loaded_at_its_own() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[("darkmux:model-a", "model-a", 4096)]);
+    rig.fake("lms-ps-after-unload.json", lms_ps(&[]));
+    rig.fake("lms-ps-after-load.json", lms_ps(&[("darkmux:model-a", "model-a", 32000)]));
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    res.unwrap();
+    let lms = rig.lms_log();
+    let unload = lms.iter().position(|l| l == "unload darkmux:model-a").unwrap_or_else(|| panic!("{lms:?}"));
+    let load = lms
+        .iter()
+        .position(|l| l == "load model-a --context-length 32000 --identifier darkmux:model-a -y")
+        .unwrap_or_else(|| panic!("{lms:?}"));
+    assert!(unload < load, "the stale instance goes before the reload: {lms:?}");
+}
+
+#[test]
+#[serial]
 fn operator_identity_is_appended_to_a_local_system_prompt() {
     own_process!();
     let rig = Rig::new();
