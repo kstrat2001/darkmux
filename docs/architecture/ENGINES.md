@@ -1,6 +1,6 @@
 # One interface over many engines: design and refactor plan
 
-**Status:** proposed (2026-10-13), not built · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198
+**Status:** stages 0 to 2 done; stage 3 planned (section 8) · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198 (sections 2 to 6), d1a971568 (section 8)
 
 Every concrete claim cites the code it comes from (`path:line`) or the measurement it was taken from. Nothing here ships today; where this doc says "today", it describes the current binary.
 
@@ -87,12 +87,76 @@ Off the path (left to the ratchet as files are touched, except cheap 0%-coverage
 
 ## 7. Stages
 
-| Stage | What | Done when |
+| Stage | What | Done when | Status |
+|---|---|---|---|
+| 0 | CRAP ratchet in CI; tests for the 0%-coverage path functions | ratchet live; `cmd_model_eject`, `cmd_profile` and the two doctor checks pinned | done: #3232 |
+| 1 | `run_dispatch`: boundary tests, mutation-proved, then split by responsibility | `run_dispatch` under complexity 20; every moved branch pinned; one live dispatch identical | done: #3233, #3234, #3235 (132 → 3) |
+| 2 | `dispatch_internal::dispatch` and the telemetry sampler, same method | both under 20; live dispatch identical | done: #3237, #3238 (`dispatch` 78 → 6, `run_telemetry_sampler` 37 → 3) |
+| 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged | planned: section 8 |
+| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent | unmanaged endpoints stop being special cases; #3209 to #3211 fall out | |
+| 5 | one memory budget per machine across backends | (open question 2) | |
+| 6 | managed servers for engines without a manager | (open question 1) | |
+
+Numbering note: the titles of #3237 and #3238 say "stage 2" and "stage 3"; both are this table's stage 2. Stage 3 is the facade below.
+
+## 8. Stage 3 plan: one facade, LM Studio its only backend
+
+Measured at d1a971568. The inventory is a scan of tracked non-test `.rs` files (`rust_source`'s test reading, so `#[cfg(test)]` modules and `*_tests.rs` are out), each hit mapped to its enclosing function, complexity by RCA as `scripts/complexity-ratchet.py` reads it. A plain grep finds 72 `lms::` lines; 22 are comments and 1 is a test file, which leaves **46 code references in 15 files**, plus 3 module imports (`src/main.rs:117` re-exports `lms` for the binary, `darkmux-doctor/src/lib.rs:33`, `dispatch_internal.rs:13883`) and 4 sites that reach LM Studio without the `lms::` prefix (`LmsHost::new()` twice, `config_access::lms_bin()` spawns twice).
+
+### 8.1 Inventory, by the question each site asks
+
+| Question | Sites | Where (function, complexity) | Facade method |
+|---|---:|---|---|
+| What is loaded (`lms ps`, `lms::list_loaded`) | 20 | doctor 7 (`check_utility_model_binding` 3, `check_unreachable_darkmux_residents` 6, `check_models_loaded` 5, `check_profile_loaded_match` 9, `check_ram_headroom` 3, `check_ram_headroom_load_projection` 13, `ai_headroom_bytes` 1); serve 2 (`machine_status_handler` 3, `gather_specs` 3); radio_busy 2 (`busy_report_live` 1, `utility_facts_live` 2); ownership 2 (`eject_all_managed` 2); crew 2 (sampler `tick` 3, `ensure_model_loaded_at_ctx_from` 1); `cmd_machine_status` 12; `mission_config_cli::show` 11; `init::fill_worker_model` 6; lab `envelope_check` 3; eureka `collect` 1 | `loaded()` |
+| What is loaded, ids only, by its own unbounded spawn | 1 | `probe_loaded_model_list` 8 (`dispatch_internal.rs:14155`: `.output()`, no bound, no text fallback) | `resident_ids()`, moved verbatim |
+| What could run here (`lms ls`, `lms::list_available`) | 6 | `cmd_scan` **25**, `cmd_profile` 13, `init::fill_worker_model` 6, `init::fill_utility_model` 7, eureka `collect` 1, `check_ram_headroom_load_projection` 13 | `catalog()` |
+| Model facts type (`lms::ModelMeta`) | 11 | init 6 (`choose_worker_model`, `choose_utility_model`, `plan_utility_binding`, `worker_facts`), main 3, eureka 1 (a struct field), heuristics 1 (import) | type moves to the facade, old path re-exported until the last PR |
+| Unload, and "was it already gone" | 2 + 2 | `ensure_model_loaded_at_ctx_from` 1, `eject_all_managed` 2; `unload_stale_for_reload` 4, `eject_each` 5 (`lms::is_not_resident`) | `unload(id)`; `is_not_resident` already reads the typed `HostError`, so it moves as is |
+| Load at a context | 2 | `LmsHost::new()` in `load_at_ctx_bounded` 1 and `lms_host_factory` 1; the free `lms::load_with_identifier` has **no caller** | `host() -> Box<dyn ModelHost>` |
+| Ledger inputs (`ps` and `ls` together) | 1 | `model_ledger::gather` 1 → `gather_with_bin` 4, its own parser (`model_ledger.rs:1716`) | `gather(&dyn Engine)` (#316's 2026-08-15 phase 1) |
+| Engine version | 1 | lab `scores::detect` 1 (`lms version` spawn, `scores.rs:181`) | `version()` |
+| Which binary, from where | 1 + 1 | `model_ledger::gather`'s `lms::lms_bin()`; doctor `check_lms_binary` (`lib.rs:6373`, `lms_bin_with_source`) | `binary()` |
+| Pin a child's cwd (`lms::pin_cwd`) | 3 | `probe_loaded_model_list`, `scores::detect` twice (one is `sw_vers`, not LM Studio at all) | none: a process helper, moves to a neutral home |
+
+### 8.2 Facade shape: a new facade above `ModelHost`, not a wider `ModelHost`
+
+`ModelHost` exists as #316's comment said (`darkmux-gestalt/src/ports.rs:91`, four methods; `LmsHost` at `gestalt_host/lms_host.rs:119`, `MockHost` at `darkmux-gestalt/src/mock.rs:94`), but it is the planner's lifecycle port, and widening it is the wrong move:
+
+- **Its facts are planner-minimal.** `ResidentFact` is identifier, model key, context; `CatalogFact` is model key and size. The 20 "what is loaded" sites read `LoadedModel` (status, size, `queued`), and the catalog sites read `ModelMeta` (architecture, maximum context, tool use, type). Widening the facts drags presentation fields into a crate whose only dependency is `darkmux-types`.
+- **It has 11 implementations**, 10 of them test doubles in crew, lab and gestalt. Every new method lands on all of them.
+- **A Messages backend (stage 4) has no lifecycle.** A facade whose `host()` can be absent declares that (section 3's "plainly absent"); a widened `ModelHost` would answer with four `Unsupported` stubs.
+
+The code also shows the duplication the facade absorbs: `lms ps` is parsed four times (`lms::model_from_json` :216, `LmsHost`'s `resident_fact_from_json` :242, the ledger's `resident_from_ps_json` :1716, `probe_loaded_model_list`), `lms ls` three times, and unload twice (`lms::unload` and `LmsHost::unload`, one shared classifier since #3083). Their bounds and fallbacks differ, so stage 3 moves each **verbatim** behind the facade; merging them changes behavior and is a separate, labeled fix after stage 3.
+
+**Where:** a trait `Engine` and its LM Studio backend in `crates/darkmux-profiles/src/engine/`. Every crate holding a site (crew, doctor, eureka, heuristics, lab, serve, the root binary) already depends on `darkmux-profiles`, which depends only on `darkmux-gestalt` and `darkmux-types`: no new edge, no cycle. The backend owns `lms.rs` and `LmsHost`; `lms_host.rs` and `ownership.rs` stay where they are.
+
+### 8.3 Hotspots
+
+Only one site-holding function is over 20: **`src/main.rs::cmd_scan` (25, CRAP 42.7 in `scripts/crap-baseline.json`)**, with no test naming it. Its site is one `list_available()?` before the branching, so the swap needs no split, but it needs a pin first: a CLI test running `darkmux profile scan` against a fake `lms` (`DARKMUX_LMS_BIN`). `mission_launch::launch` (101) and the stage 1 and 2 functions hold no site. Everything else is at most 13.
+
+Boundary tests already present (read from test references, not from coverage): the doctor checks (`darkmux-doctor/src/lms_checks_tests.rs`, stage 0), `cmd_profile` (stage 0), `init::fill_*` (`src/init_tests.rs`), lab `envelope_check` (`run_tests.rs`), `cmd_machine_status` and `mission config show` (`tests/cli.rs` with a fake `lms`), the dispatch residency path (its host effects are injected closures; `crew/tests/dispatch_boundary.rs`), `eject_each` (closures), `gather_with_bin` (a stub binary). **Not pinned:** `cmd_scan`, `busy_report_live`, `utility_facts_live`, eureka `collect`, `scores::detect`, `machine_status_handler`.
+
+### 8.4 Migration order
+
+Each PR is behavior-preserving, moves one question, and is verified by the existing tests of the functions it touches plus the fake-`lms` seam (`DARKMUX_LMS_BIN`); no live run until 3.7.
+
+| PR | Moves | Verified by |
 |---|---|---|
-| 0 | CRAP ratchet in CI; tests for the 0%-coverage path functions | ratchet live; `cmd_model_eject`, `cmd_profile` and the two doctor checks pinned |
-| 1 | `run_dispatch`: boundary tests, mutation-proved, then split by responsibility | `run_dispatch` under complexity 20; every moved branch pinned; one live dispatch identical |
-| 2 | `dispatch_internal::dispatch` and the telemetry sampler, same method | both under 20; live dispatch identical |
-| 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged |
-| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent | unmanaged endpoints stop being special cases; #3209 to #3211 fall out |
-| 5 | one memory budget per machine across backends | (open question 2) |
-| 6 | managed servers for engines without a manager | (open question 1) |
+| **3.1** | `Engine` trait and the LM Studio backend, delegating to today's functions; the 7 doctor "what is loaded" sites | `lms_checks_tests.rs` and the doctor's inline tests, unchanged |
+| 3.2 | 11 of the other 13 "what is loaded" sites (`ownership`'s 2 move with unload in 3.4) | `tests/cli.rs`, `init_tests`, `run_tests`, serve `lib_tests`; first pin `busy_report_live`, `utility_facts_live`, eureka `collect` |
+| 3.3 | "what could run here" and `ModelMeta` | pin `cmd_scan` first (8.3), then the move |
+| 3.4 | unload, `is_not_resident`, and `eject_all_managed`'s list | `eject_each` and residency closure tests; `cmd_model_eject` (stage 0) |
+| 3.5 | load: `LmsHost::new()` → `engine.host()` | the gestalt and concurrent-dispatch suites (their doubles are untouched) |
+| 3.6 | the bespoke spawns into the backend verbatim (`resident_ids`, ledger `gather`, `version`); `pin_cwd` to a neutral module | `pin_cwd_conformance.rs` and `lms_bin_conformance.rs`, their path lists updated in the same PR |
+| 3.7 | `lms` becomes private to the backend, so the done-when is a compile error rather than a grep; drop `main.rs`'s re-export and the dead `load_with_identifier`; doctor's `check_lms_binary` asks `binary()`; replace the `CLAUDE.md` doctrine line (open question 4) | the full suite with `full-ci`; one live dispatch, with the operator's go-ahead |
+
+**First PR (3.1):** add `darkmux-profiles/src/engine/{mod.rs,lmstudio.rs}` with `loaded()`, `catalog()`, `unload()`, `host()` delegating one-to-one to `lms::*` and `LmsHost`, and route `darkmux-doctor`'s seven `list_loaded` calls through it. It proves the shape on the best-pinned consumer, and the doctor tests stay byte-identical.
+
+### 8.5 What stage 3 does not decide
+
+| Open question (section 4) | Stage 3 |
+|---|---|
+| 1. darkmux starts engines | untouched |
+| 2. one memory budget | untouched: the ledger reads through the facade, and the budget still knows only LM Studio |
+| 3. contract 4 generalizes | **touched, kept neutral.** The facade takes identifiers verbatim and has no ownership method; `ownership::namespaced_identifier` and `is_darkmux_owned` stay the LM Studio backend's mechanism, and `ModelHost::unload` keeps its `OwnedTarget` claim check. The two free-unload paths (dispatch reload, eject) keep their string identifiers |
+| 4. versioning | **cannot be avoided:** 3.7 replaces the "LMStudio, and only LMStudio" doctrine line and records the decision. No wire, `--json`, config or profile shape changes (contracts 1, 5, 7): `LoadedModel` and `ModelMeta` keep their fields, and `lms_bin` stays the one config key |
