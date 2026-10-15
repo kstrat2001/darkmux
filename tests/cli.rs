@@ -999,6 +999,82 @@ EOF
     assert!(!stdout.contains("nomic-embed"), "a non-LLM is not listed: {stdout}");
 }
 
+/// (#316 stage 3.3) `profile scan`'s whole stdout, byte for byte, from a
+/// catalog that reaches every branch of each uncovered model's block: a
+/// display name, an id without one, a derived-name collision, a MoE that
+/// draws a compactor, and a model not trained for tool use. Pinned before
+/// its listing moved behind the engine facade, so the move is proven to
+/// print exactly what the direct `lms ls` call printed.
+#[test]
+fn profile_scan_prints_each_catalog_entry_exactly() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, fixture_json()).unwrap();
+    let fake = tmp.path().join("fake-lms");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+[ "$1" = "ls" ] || exit 1
+cat <<'EOF'
+[{"modelKey":"model-a","type":"llm","paramsString":"7B","sizeBytes":4000000000},
+ {"modelKey":"unsloth/Qwen-7B","displayName":"Qwen 7B","publisher":"unsloth","type":"llm","paramsString":"7B","architecture":"qwen2","sizeBytes":5368709120,"maxContextLength":32768,"trainedForToolUse":true},
+ {"modelKey":"lmstudio-community/Qwen-7B","type":"llm","paramsString":"7B","architecture":"qwen2","sizeBytes":5368709120,"maxContextLength":131072,"trainedForToolUse":true},
+ {"modelKey":"big-moe-35b-a3b","type":"llm","paramsString":"35B-A3B","architecture":"qwen3moe","sizeBytes":21474836480,"maxContextLength":32000,"trainedForToolUse":true},
+ {"modelKey":"mystery-model","type":"llm"},
+ {"modelKey":"nomic-embed","type":"embedding"}]
+EOF
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_LMS_BIN", &fake)
+        .args(["profile", "scan", "--profiles-file", p.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let collides = "    ⚠ derived name `qwen-7b-fast` collides with another uncovered model — \
+                    customize the name when drafting (publisher prefix gets stripped)\n";
+    let expected = [
+        "darkmux profile scan — 5 model(s) in LMStudio, 4 not yet in any profile\n",
+        "\n",
+        "✓ Qwen 7B\n",
+        "    id=unsloth/Qwen-7B  params=7B  arch=Dense  size=5.0GB  maxCtx=32768\n",
+        "    suggested task class: `fast` (n_ctx=32000, compactor=none)\n",
+        collides,
+        "    draft: `darkmux profile draft qwen-7b-fast --model unsloth/Qwen-7B --task-class fast`\n",
+        "\n",
+        "✓ lmstudio-community/Qwen-7B\n",
+        "    id=lmstudio-community/Qwen-7B  params=7B  arch=Dense  size=5.0GB  maxCtx=131072\n",
+        "    suggested task class: `fast` (n_ctx=32000, compactor=none)\n",
+        collides,
+        "    draft: `darkmux profile draft qwen-7b-fast --model lmstudio-community/Qwen-7B --task-class fast`\n",
+        "\n",
+        "✓ big-moe-35b-a3b\n",
+        "    id=big-moe-35b-a3b  params=35B-A3B  arch=Moe  size=20.0GB  maxCtx=32000\n",
+        // The model's own 32000 cap binds on every host: the heuristics'
+        // RAM-sized context (262144 on a 128 GB Mac, 64000 on a CI runner)
+        // would otherwise make this line machine-dependent.
+        "    suggested task class: `long` (n_ctx=32000, compactor=qwen3-4b-instruct-2507 @ 32000)\n",
+        "    draft: `darkmux profile draft big-moe-35b-a3b-long --model big-moe-35b-a3b --task-class long`\n",
+        "\n",
+        "⚠ mystery-model\n",
+        "    id=mystery-model  params=?  arch=Unknown  size=0.0GB  maxCtx=0\n",
+        "    suggested task class: `fast` (n_ctx=32000, compactor=none)\n",
+        "    ⚠ NOT marked trainedForToolUse — agentic dispatch may be unreliable\n",
+        "    draft: `darkmux profile draft mystery-model-fast --model mystery-model --task-class fast`\n",
+        "\n",
+    ]
+    .concat();
+    assert_eq!(stdout, expected);
+}
+
 #[test]
 fn profile_list_errors_when_config_missing() {
     let mut cmd = darkmux_cmd();

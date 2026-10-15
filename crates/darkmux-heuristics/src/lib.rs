@@ -25,7 +25,7 @@
 //! in the array is matching priority (most-specific first, generic last).
 
 use darkmux_hardware::HardwareSpec;
-use darkmux_profiles::lms::ModelMeta;
+use darkmux_profiles::engine::ModelMeta;
 use serde::{Deserialize, Serialize};
 
 pub mod m_series_128;

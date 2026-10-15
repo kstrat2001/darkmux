@@ -21,10 +21,31 @@ mod lmstudio;
 
 pub use lmstudio::LmStudio;
 
-use crate::lms::ModelMeta;
 use anyhow::Result;
 use darkmux_gestalt::ModelHost;
 use darkmux_types::LoadedModel;
+
+/// One row from `lms ls --json`: every model the LMStudio catalog knows
+/// about (downloaded), regardless of whether it's currently loaded. Used by
+/// `darkmux scan` to discover models the user could add to their profile
+/// registry.
+///
+/// `publisher` is read from `lms ls --json` (e.g. "Qwen", "google",
+/// "lmstudio-community").
+#[derive(Debug, Clone)]
+pub struct ModelMeta {
+    pub model_key: String,
+    pub display_name: String,
+    pub publisher: String,
+    pub size_bytes: u64,
+    pub params_string: Option<String>,
+    pub architecture: Option<String>,
+    pub max_context_length: Option<u32>,
+    pub trained_for_tool_use: bool,
+    /// Type per LMStudio: "llm", "embedding", etc. We typically filter to
+    /// `"llm"` since profiles are for chat/agentic dispatch.
+    pub model_type: String,
+}
 
 /// A model server darkmux can ask questions of.
 pub trait Engine {
