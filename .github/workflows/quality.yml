@@ -97,7 +97,7 @@ on:
     # `crates/` were never covered because an unsharded run there could not
     # finish (see `mutants-full`'s own comment for the measured numbers and
     # the #2499 fix). As of that fix this cron now drives a SHARDED sweep of
-    # the whole workspace (`mutants-full`'s 21-shard matrix + the small-crate
+    # the whole workspace (`mutants-full`'s 23-shard matrix + the small-crate
     # job `mutants-full-small`, 13,636 mutants total, 2026-09-15 census) —
     # not just the root package. The PR job (`mutants-in-diff`, #2499's
     # earlier half) mutates `--workspace` too, but scoped to the diff, whose
@@ -1245,18 +1245,23 @@ jobs:
     #   - `max-parallel: 10` (see COST below): a Free account runs 20 jobs at
     #     once across ALL runner types, so 22 Linux jobs at once would starve
     #     PR CI just as the macOS ones did.
-    #   - MEASURED on Linux (quality run 38771514681, dispatched and then
-    #     canceled about 22 minutes into mutation): every root and crew shard
-    #     passed its baseline, in 55-102s build + 46-68s test, so no baseline
-    #     comes near 300 (nextest alone brings it under the old 120 here).
-    #     The five small crates ran to completion in 26 minutes. The tree has
-    #     outgrown the census below: a crew shard now lists 976 mutants after
-    #     its 170 macOS-only exclusions, a root shard 841. Mutation ran at
-    #     about 8 to 16s per mutant per shard, which projects the worst crew
-    #     shard at about 260 of its 300 minutes and root at about 210.
-    #     Shard count and `timeout-minutes` stay as they are on that
-    #     projection; the first complete Linux night is the number to re-size
-    #     from, since early mutants need not be representative.
+    #   - MEASURED on Linux (quality runs 38771514681 and 38775812456, each
+    #     dispatched and canceled 13 to 22 minutes into mutation): every
+    #     shard passed its baseline, the slowest in 62s build + 85s test (a
+    #     lab shard), so none comes near 300; nextest alone brings them under
+    #     the old 120 here. Profiles and the five small crates ran to
+    #     completion. The tree has outgrown the census below (per scope,
+    #     after macOS-only exclusions): crew 5,855 (170 excluded), root
+    #     3,364, lab 2,800, serve 2,737, flow 2,043, types 2,036, doctor 989,
+    #     profiles 642. Early mutation ran at about 3 to 16s per mutant per
+    #     shard, one lab shard at about 32s. At those rates a six-way crew
+    #     shard (976) projected to about 260 of its 300 minutes and a two-way
+    #     serve shard (1,369) to about 290, so crew is now 7 shards and serve
+    #     3 (about 836 and 913 each). Everything else stays as it was; the
+    #     first complete Linux night is the number to re-size from, since
+    #     early mutants need not be representative (the 32s lab shard and the
+    #     2,036-mutant solo types shard are the ones to watch). The census
+    #     and shard table below are the 2026-09-15 record.
     #
     # (#2499) SHARDED nightly sweep across the whole workspace (root package +
     # every crate under `crates/`) — the job used to be root-package-only
@@ -1348,8 +1353,8 @@ jobs:
     # the account's TOTAL concurrent jobs (20 on a Free account, macOS
     # included; Pro allows 40), so `max-parallel: 10` plus
     # `mutants-full-small` leaves 9 slots, one PR's full CI (ci.yml's 3 macOS
-    # and 5 Linux jobs plus `mutants-in-diff-extra`). 21 shards at 10 at a
-    # time is 3 waves.
+    # and 5 Linux jobs plus `mutants-in-diff-extra`). 23 shards (since #3242)
+    # at 10 at a time is 3 waves.
     # This repo is PUBLIC (verified via `gh repo view --json
     # isPrivate,visibility` before writing this, not assumed — GitHub does
     # not meter Actions minutes for GitHub-hosted runners on public repos,
@@ -1409,30 +1414,32 @@ jobs:
       fail-fast: false
       # (#3242) Leaves room for PR CI in the account's concurrent-job limit;
       # see COST above.
-      max-parallel: 11
+      max-parallel: 10
       matrix:
         include:
+          - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
+          - { scope: root, package: "", shard: "1/4", shard_label: "1-4" }
+          - { scope: root, package: "", shard: "2/4", shard_label: "2-4" }
+          - { scope: root, package: "", shard: "3/4", shard_label: "3-4" }
+          - { scope: crew, package: "darkmux-crew", shard: "0/7", shard_label: "0-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "1/7", shard_label: "1-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "2/7", shard_label: "2-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "3/7", shard_label: "3-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "4/7", shard_label: "4-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "5/7", shard_label: "5-7" }
+          - { scope: crew, package: "darkmux-crew", shard: "6/7", shard_label: "6-7" }
           - { scope: lab, package: "darkmux-lab", shard: "0/4", shard_label: "0-4" }
           - { scope: lab, package: "darkmux-lab", shard: "1/4", shard_label: "1-4" }
           - { scope: lab, package: "darkmux-lab", shard: "2/4", shard_label: "2-4" }
           - { scope: lab, package: "darkmux-lab", shard: "3/4", shard_label: "3-4" }
-          - { scope: serve, package: "darkmux-serve", shard: "0/2", shard_label: "0-2" }
-          - { scope: serve, package: "darkmux-serve", shard: "1/2", shard_label: "1-2" }
+          - { scope: serve, package: "darkmux-serve", shard: "0/3", shard_label: "0-3" }
+          - { scope: serve, package: "darkmux-serve", shard: "1/3", shard_label: "1-3" }
+          - { scope: serve, package: "darkmux-serve", shard: "2/3", shard_label: "2-3" }
           - { scope: flow, package: "darkmux-flow", shard: "0/2", shard_label: "0-2" }
           - { scope: flow, package: "darkmux-flow", shard: "1/2", shard_label: "1-2" }
           - { scope: doctor, package: "darkmux-doctor", shard: "", shard_label: "solo" }
           - { scope: types, package: "darkmux-types", shard: "", shard_label: "solo" }
           - { scope: profiles, package: "darkmux-profiles", shard: "", shard_label: "solo" }
-          - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
-          - { scope: root, package: "", shard: "1/4", shard_label: "1-4" }
-          - { scope: root, package: "", shard: "2/4", shard_label: "2-4" }
-          - { scope: root, package: "", shard: "3/4", shard_label: "3-4" }
-          - { scope: crew, package: "darkmux-crew", shard: "0/6", shard_label: "0-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "1/6", shard_label: "1-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "2/6", shard_label: "2-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "3/6", shard_label: "3-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "4/6", shard_label: "4-6" }
-          - { scope: crew, package: "darkmux-crew", shard: "5/6", shard_label: "5-6" }
     steps:
       - uses: actions/checkout@v4
 
@@ -1553,7 +1560,7 @@ jobs:
         if: always()
         with:
           # (v4 requires run-unique artifact names, unlike v3 — scope+shard
-          # makes every one of the 21 matrix jobs distinct.)
+          # makes every matrix job distinct.)
           name: mutants-full-${{ matrix.scope }}-${{ matrix.shard_label }}
           path: |
             mutants-out/**
