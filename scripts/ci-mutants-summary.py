@@ -1743,9 +1743,11 @@ def main(
 
 
 # ---------------------------------------------------------------------------
-# Platform split and shard plan for the PR-diff root mutation jobs.
+# Platform split and shard plan for the mutation jobs.
 #
-# The PR-diff mutation jobs run on Linux runners. Some of this repo's code is
+# Every mutation job runs on Linux runners: the PR-diff jobs since 2026-10-07,
+# the nightly sweep since #3242 (which uses `--plan` for the split alone, over
+# a whole package instead of a diff). Some of this repo's code is
 # compiled only on macOS (`#[cfg(target_os = "macos")]` items, a module whose
 # file opens with `#![cfg(...)]`). cargo-mutants does not evaluate platform
 # `cfg` attributes (27.1.0 skips only `cfg(test)`, `#[test]`-like attributes
@@ -2369,11 +2371,12 @@ def plan_main(args: list[str]) -> int:
     ]
     if not_built:
         lines += [
-            f"**{len(not_built)} of {planned} mutant(s) in this diff are in code the {platform} "
+            f"**{len(not_built)} of {planned} mutant(s) listed here are in code the {platform} "
             "build does not compile** (a platform `cfg` attribute is false here), so they were "
             "NOT tested. This is not a pass for them: cargo-mutants cannot see platform `cfg`, "
-            "and testing them here would only report each one as a false survivor. They are "
-            "tested where that code is built, or by the nightly sweep's own platform.",
+            "and testing them here would only report each one as a false survivor. No CI job "
+            "tests them today: every mutation job, the nightly sweep included, runs on Linux "
+            "(#3242).",
             "",
             "```",
             *sorted(not_built),
@@ -2381,7 +2384,7 @@ def plan_main(args: list[str]) -> int:
         ]
     else:
         lines.append(
-            f"None: every one of this diff's {planned} mutant(s) is in code the {platform} "
+            f"None: every one of the {planned} mutant(s) listed here is in code the {platform} "
             "build compiles."
         )
     if unreadable:

@@ -59,11 +59,19 @@ name: quality
 # (quality run 37522837813) the six root shards and coverage QUEUED 21 to 182
 # minutes while every Linux job started at once, and each shard then ran into
 # its 45-minute timeout. The PR-diff mutation jobs and coverage now run on
-# `ubuntu-latest`; ci.yml's macOS jobs are untouched, and the nightly sweep
-# stays on macOS for now (it does not run on PRs). Code compiled only on macOS
-# is not built on Linux; the plan job finds those mutants and reports them as
-# NOT TESTED ON THIS PLATFORM, by name and count, instead of letting them read
-# as survivors (see `mutants-in-diff-plan` and `ci-mutants-summary.py --plan`).
+# `ubuntu-latest`; ci.yml's macOS jobs are untouched. Code compiled only on
+# macOS is not built on Linux; the plan job finds those mutants and reports
+# them as NOT TESTED ON THIS PLATFORM, by name and count, instead of letting
+# them read as survivors (see `mutants-in-diff-plan` and
+# `ci-mutants-summary.py --plan`).
+#
+# (#3242) THE NIGHTLY SWEEP FOLLOWED (2026-10-16). `mutants-full` and
+# `mutants-full-small` had stayed on `macos-latest`, holding all five of the
+# account's macOS runners for 5 to 11 hours a night: on 2026-10-15 PR #3241's
+# macOS jobs and main's own CI queued over 90 minutes behind it. They now run
+# on `ubuntu-latest` with the PR-diff jobs' setup and the same platform split,
+# so NO mutation job runs on macOS any more and macOS-only code is mutated
+# nowhere (each plan section names those mutants). See `mutants-full`.
 
 on:
   pull_request:
@@ -1211,6 +1219,37 @@ jobs:
           if-no-files-found: ignore
 
   mutants-full:
+    # (#3242, 2026-10-16) What changed here, and why; the #2499 record follows.
+    #
+    #   - `--timeout 120` -> `--timeout 300`. cargo-mutants applies `--timeout`
+    #     to the unmutated baseline too, and every scheduled run since the
+    #     sweep was sharded (2026-09-16) aborted most shards there: on run
+    #     38567442256 (2026-10-14) 16 shards logged `TIMEOUT Unmutated
+    #     baseline in <59-192>s build + 120s test` and tested no mutant at
+    #     all. 300 is the PR-diff jobs' value, whose own measurement put a
+    #     crew-heavy baseline at 190.5s build + 221.2s test (see
+    #     `mutants-in-diff`). It bounds test time only, never build time.
+    #   - `ubuntu-latest`, not `macos-latest`, with the PR-diff jobs' Linux
+    #     setup unchanged: `--test-tool nextest` under the `mutants` profile
+    #     (whose per-test kill is sized one period past this 300), no debug
+    #     info and incremental builds, mutant trees on the larger of `/` and
+    #     `/mnt`, and a 4 GiB data cap per test process. See the
+    #     `mutants-in-diff` comment for why each one exists.
+    #   - The same platform split: each shard lists its scope's mutants,
+    #     excludes the ones in code Linux does not compile, and the scope's
+    #     first shard names them in its summary. That code was mutated only
+    #     here, on macOS, so it is now mutated NOWHERE: the PR-diff jobs
+    #     already accepted that loss on 2026-10-07 on the assumption this
+    #     sweep covered it. Mostly Apple Silicon host probes, sleep
+    #     assertions and the macOS gestalt probe.
+    #   - `max-parallel: 10` (see COST below): a Free account runs 20 jobs at
+    #     once across ALL runner types, so 22 Linux jobs at once would starve
+    #     PR CI just as the macOS ones did.
+    #   - Shard count and `timeout-minutes` are unchanged: the only
+    #     throughput this file records for a full sweep is the macOS 21.4s per
+    #     mutant below, and Linux has not run one yet. Re-measure from the
+    #     first complete Linux night before re-sizing.
+    #
     # (#2499) SHARDED nightly sweep across the whole workspace (root package +
     # every crate under `crates/`) — the job used to be root-package-only
     # despite its "full workspace" name (see the git history of this comment
@@ -1291,9 +1330,18 @@ jobs:
     #
     # COST: total mutate-testing compute is the SAME regardless of sharding
     # (sharding parallelizes wall-clock, it does not reduce total work) — SO
-    # roughly 13,636 mutants x 21.4s =~ 81 macOS-hours of mutate-testing per
-    # night, spread across these 21 shard-jobs plus `mutants-full-small`
-    # (22 jobs total).
+    # roughly 13,636 mutants x 21.4s =~ 81 runner-hours of mutate-testing per
+    # night at the macOS rate, spread across these 21 shard-jobs plus
+    # `mutants-full-small` (22 jobs total).
+    #
+    # (#3242) The macOS-runner paragraph that follows is the history of the
+    # starvation this issue fixed: the sweep held every macOS runner the
+    # account gets, 5 to 11 hours a night. On Linux the limit that binds is
+    # the account's TOTAL concurrent jobs (20 on a Free account, macOS
+    # included; Pro allows 40), so `max-parallel: 10` plus
+    # `mutants-full-small` leaves 9 slots, one PR's full CI (ci.yml's 3 macOS
+    # and 5 Linux jobs plus `mutants-in-diff-extra`). 21 shards at 10 at a
+    # time is 3 waves.
     # This repo is PUBLIC (verified via `gh repo view --json
     # isPrivate,visibility` before writing this, not assumed — GitHub does
     # not meter Actions minutes for GitHub-hosted runners on public repos,
@@ -1335,7 +1383,7 @@ jobs:
     # just the job. `tools/darkmux-mock-model` stays uncovered everywhere,
     # unchanged (dev/test infrastructure, not production code).
     name: mutation — full workspace sweep (nightly, sharded)
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
     # `workflow_dispatch`); without it, it runs this sweep, as before.
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '' && !inputs.coverage_only)
@@ -1351,6 +1399,9 @@ jobs:
       cancel-in-progress: false
     strategy:
       fail-fast: false
+      # (#3242) Leaves room for PR CI in the account's concurrent-job limit;
+      # see COST above.
+      max-parallel: 10
       matrix:
         include:
           - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
@@ -1383,7 +1434,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: mutants-full-${{ matrix.scope }}
+          # (#3242) One cache for every shard and `mutants-full-small`, as
+          # the PR-diff jobs share theirs: what they reuse is the registry
+          # and the installed tools. Builds happen in cargo-mutants' copied
+          # trees, never in this `target/`, so there is no target directory
+          # worth caching. One shard saves it; 21 saving one key would race.
+          shared-key: mutants-full
+          cache-targets: "false"
+          save-if: ${{ matrix.scope == 'root' && matrix.shard_label == '0-4' }}
 
       - name: Install cargo-mutants
         # Pinned for the reason spelled out in mutants-in-diff's install step:
@@ -1391,8 +1449,40 @@ jobs:
         # `outcomes.json` field names. Bump both sites together.
         run: cargo install cargo-mutants --locked --version 27.1.0
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          # The version ci.yml's test job pins.
+          tool: cargo-nextest@0.9.140
+
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Plan this shard's scope (platform split)
+        # (#3242) `mutants-in-diff-plan`'s platform split, over the whole
+        # scope rather than a diff: list the scope's mutants (seconds, builds
+        # nothing), find the ones in code this platform compiles out, and
+        # write them as exact `--exclude-re` patterns. Every shard of a scope
+        # computes the same list, so `--shard i/k` still partitions one list.
+        # Only the scope's first shard writes the summary section, so a
+        # six-shard crate names its not-built mutants once, not six times.
+        id: plan
+        run: |
+          SCOPE=()
+          if [ -n "${{ matrix.package }}" ]; then
+            SCOPE+=(-p "${{ matrix.package }}")
+          fi
+          mkdir -p plan
+          cargo mutants "${SCOPE[@]}" --list --json > plan/mutants.json
+          cargo mutants "${SCOPE[@]}" --list-files --json > plan/files.json
+          rustc --print cfg > plan/rustc-cfg.txt
+          python3 scripts/ci-mutants-summary.py --plan --scope "${{ matrix.scope }}" \
+            --mutants-json plan/mutants.json --files-json plan/files.json \
+            --rustc-cfg plan/rustc-cfg.txt --exclude-re-out plan/exclude-re.txt \
+            --summary-out plan/summary.md | tee plan/outputs.txt
+          case "${{ matrix.shard }}" in
+            "" | 0/*) cat plan/summary.md >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
 
       - name: Sweep this shard
         id: mutants
@@ -1407,8 +1497,23 @@ jobs:
           # #2499 widened it), everything else names its crate; the three
           # single-shard scopes (doctor/types/profiles) omit `--shard`
           # entirely rather than passing a meaningless `0/1`.
+          #
+          # (#3242) `--timeout 300`, nextest, the plan's exclusions and the
+          # build settings below: see this job's comment and the
+          # `mutants-in-diff` Mutate step, which this mirrors.
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan/exclude-re.txt)
+          echo "${#EXCLUDES[@]} mutant(s) excluded as not built on this platform"
+          export TMPDIR
+          TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)
+          export CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+          # Each test process capped at 4 GiB of data, so a mutant that
+          # allocates without bound is caught instead of taking the runner
+          # down (see the script).
+          export "$(bash scripts/ci-mutants-test-cap.sh)"
           set +e
-          ARGS=(-j 4 --timeout 120 --copy-vcs true --output mutants-out)
+          ARGS=(-j 4 --timeout 300 --copy-vcs true --test-tool nextest
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass
+            --output mutants-out "${EXCLUDES[@]}")
           if [ -n "${{ matrix.package }}" ]; then
             ARGS+=(-p "${{ matrix.package }}")
           fi
@@ -1419,6 +1524,7 @@ jobs:
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          df -h "$TMPDIR" || true
           exit 0
 
       - name: Summarize
@@ -1455,8 +1561,14 @@ jobs:
     # mutants is ~3.5h of mutate-testing before the five baselines are even
     # counted; 270 minutes (4.5h) below gives real margin under that and the
     # platform's 6-hour hard cap.
+    #
+    # (#3242) Linux, `--timeout 300`, nextest and the platform split, as
+    # `mutants-full` (see its comment). The build settings go to
+    # `$GITHUB_ENV` once rather than into each of the five sweep steps.
+    # These crates' baselines were the ones that fit 120s on macOS, so the
+    # longer timeout matters here only for a mutant that slows its tests.
     name: mutation — full workspace sweep (nightly, small crates)
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
     # `workflow_dispatch`); without it, it runs this sweep, as before.
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '' && !inputs.coverage_only)
@@ -1473,20 +1585,59 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: mutants-full-small
+          # `mutants-full`'s cache (see its comment); one of its shards saves.
+          shared-key: mutants-full
+          cache-targets: "false"
+          save-if: "false"
 
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked --version 27.1.0
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          # The version ci.yml's test job pins.
+          tool: cargo-nextest@0.9.140
+
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Plan each crate (platform split) and set the mutation build settings
+        # `mutants-full`'s plan step, once per crate; each sweep step below
+        # passes its crate's exclusions. The settings are the ones the
+        # `mutants-in-diff` Mutate step exports, written to `$GITHUB_ENV` so
+        # all five sweep steps get them.
+        run: |
+          for crate in darkmux-gestalt darkmux-fleet darkmux-heuristics darkmux-hardware darkmux-eureka; do
+            dir="plan-$crate"
+            mkdir -p "$dir"
+            cargo mutants -p "$crate" --list --json > "$dir/mutants.json"
+            cargo mutants -p "$crate" --list-files --json > "$dir/files.json"
+            rustc --print cfg > "$dir/rustc-cfg.txt"
+            python3 scripts/ci-mutants-summary.py --plan --scope "$crate" \
+              --mutants-json "$dir/mutants.json" --files-json "$dir/files.json" \
+              --rustc-cfg "$dir/rustc-cfg.txt" --exclude-re-out "$dir/exclude-re.txt" \
+              --summary-out "$dir/summary.md"
+            cat "$dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          done
+          {
+            echo "TMPDIR=$(bash scripts/ci-mutants-tmpdir.sh)"
+            echo "CARGO_INCREMENTAL=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
+            # Each test process capped at 4 GiB of data (see the script).
+            bash scripts/ci-mutants-test-cap.sh
+          } >> "$GITHUB_ENV"
 
       - name: Sweep darkmux-gestalt
         id: gestalt
         if: ${{ !cancelled() }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-darkmux-gestalt/exclude-re.txt)
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-gestalt --output mutants-out-gestalt
+          cargo mutants -j 4 --timeout 300 --copy-vcs true -p darkmux-gestalt --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out-gestalt "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -1505,8 +1656,11 @@ jobs:
         id: fleet
         if: ${{ !cancelled() }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-darkmux-fleet/exclude-re.txt)
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-fleet --output mutants-out-fleet
+          cargo mutants -j 4 --timeout 300 --copy-vcs true -p darkmux-fleet --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out-fleet "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -1525,8 +1679,11 @@ jobs:
         id: heuristics
         if: ${{ !cancelled() }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-darkmux-heuristics/exclude-re.txt)
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-heuristics --output mutants-out-heuristics
+          cargo mutants -j 4 --timeout 300 --copy-vcs true -p darkmux-heuristics --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out-heuristics "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -1545,8 +1702,11 @@ jobs:
         id: hardware
         if: ${{ !cancelled() }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-darkmux-hardware/exclude-re.txt)
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-hardware --output mutants-out-hardware
+          cargo mutants -j 4 --timeout 300 --copy-vcs true -p darkmux-hardware --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out-hardware "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
@@ -1565,8 +1725,11 @@ jobs:
         id: eureka
         if: ${{ !cancelled() }}
         run: |
+          mapfile -t EXCLUDES < <(sed 's/^/--exclude-re=/' plan-darkmux-eureka/exclude-re.txt)
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-eureka --output mutants-out-eureka
+          cargo mutants -j 4 --timeout 300 --copy-vcs true -p darkmux-eureka --test-tool nextest \
+            --cargo-test-arg="--config-file=$GITHUB_WORKSPACE/.config/nextest.toml" --cargo-test-arg=--profile=mutants --cargo-test-arg=--no-tests=pass \
+            --output mutants-out-eureka "${EXCLUDES[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
