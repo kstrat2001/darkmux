@@ -115,6 +115,14 @@ on:
           Empty runs the nightly sweep, as before.
         required: false
         default: ""
+      coverage_only:
+        # Coverage (and its CRAP ratchet) is too slow to gate every PR, so it
+        # runs post-merge. This runs it on demand against any branch, without
+        # the nightly mutation sweep a plain dispatch would also start.
+        description: Run only the coverage job (no mutation sweep).
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -1330,7 +1338,7 @@ jobs:
     runs-on: macos-latest
     # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
     # `workflow_dispatch`); without it, it runs this sweep, as before.
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '')
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '' && !inputs.coverage_only)
     timeout-minutes: 300
     concurrency:
       # Scoped to scope+shard, not the whole job: a re-run of the SAME shard
@@ -1451,7 +1459,7 @@ jobs:
     runs-on: macos-latest
     # A dispatch WITH `diff_base` replays the PR-diff jobs instead (see
     # `workflow_dispatch`); without it, it runs this sweep, as before.
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '')
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.diff_base == '' && !inputs.coverage_only)
     timeout-minutes: 270
     concurrency:
       group: mutants-full-small
