@@ -174,7 +174,7 @@ pub struct Context {
     pub loaded_models: Option<Vec<darkmux_types::LoadedModel>>,
     /// Downloaded-model catalog from `lms ls`, used for arch-max lookups.
     /// `None` if the call failed.
-    pub available_models: Option<Vec<darkmux_profiles::lms::ModelMeta>>,
+    pub available_models: Option<Vec<darkmux_profiles::engine::ModelMeta>>,
     /// System RAM in GB (unified memory total for Apple Silicon).
     pub total_ram_gb: u32,
 }
@@ -190,7 +190,7 @@ impl Context {
         // `skipped: no models loaded` under a FAILING `lms` — a reason the
         // code could not back, stated to the operator as fact.
         let loaded_models = engine::local().loaded().ok();
-        let available_models = darkmux_profiles::lms::list_available().ok();
+        let available_models = engine::local().catalog().ok();
         let total_ram_gb = darkmux_hardware::detect().total_ram_gb;
         Self {
             loaded_models,
@@ -651,9 +651,10 @@ mod tests {
         );
     }
 
-    /// (#316 stage 3.2) `Context::collect` carries LM Studio's listing as
-    /// reported: one resident from a fake `lms ps --json` is `Some([it])`,
-    /// and an `lms` that cannot run is `None` (not an empty listing, #2774
+    /// (#316 stage 3.2, 3.3) `Context::collect` carries LM Studio's
+    /// listings as reported: one resident from a fake `lms ps --json` and
+    /// one catalog entry from `lms ls --json` are each `Some([it])`, and an
+    /// `lms` that cannot run is `None` for both (not an empty listing, #2774
     /// round-9 C3). The only test in this crate that touches the
     /// environment, and it restores what it set; std only, so the crate
     /// gains no dev-dependency.
@@ -668,7 +669,7 @@ mod tests {
             r#"#!/bin/sh
 case "$1" in
   ps) echo '[{"identifier":"darkmux:m","modelKey":"m","status":"idle","sizeBytes":2000000000,"contextLength":4096}]' ;;
-  ls) echo '[]' ;;
+  ls) echo '[{"modelKey":"m","type":"llm","sizeBytes":2000000000,"maxContextLength":32768}]' ;;
   *) exit 1 ;;
 esac
 "#,
@@ -678,9 +679,9 @@ esac
         let prev = std::env::var_os("DARKMUX_LMS_BIN");
         // SAFETY: no other test in this crate reads or writes the environment.
         unsafe { std::env::set_var("DARKMUX_LMS_BIN", &fake) };
-        let listed = Context::collect().loaded_models;
+        let read = Context::collect();
         unsafe { std::env::set_var("DARKMUX_LMS_BIN", dir.join("no-such-lms")) };
-        let failed = Context::collect().loaded_models;
+        let unread = Context::collect();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
@@ -689,10 +690,17 @@ esac
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        let listed = listed.expect("a readable listing is Some");
+        let listed = read.loaded_models.expect("a readable listing is Some");
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert_eq!(listed[0].identifier, "darkmux:m");
         assert_eq!(listed[0].size, "2.00 GB");
+        let catalog = read.available_models.expect("a readable catalog is Some");
+        assert_eq!(catalog.len(), 1, "{catalog:?}");
+        assert_eq!(catalog[0].model_key, "m");
+        assert_eq!(catalog[0].max_context_length, Some(32768));
+        let failed = unread.loaded_models;
         assert!(failed.is_none(), "an unreadable listing is None, not empty: {failed:?}");
+        let failed = unread.available_models;
+        assert!(failed.is_none(), "an unreadable catalog is None, not empty: {failed:?}");
     }
 }

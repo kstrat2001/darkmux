@@ -31,7 +31,6 @@ use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
 use darkmux_profiles::engine;
-use darkmux_profiles::lms;
 use darkmux_profiles::profiles;
 use std::env;
 use std::io::{Read, Write};
@@ -6925,7 +6924,7 @@ fn check_ram_headroom_load_projection() -> Check {
     // we don't error if the catalog query fails — the projection just
     // reports "size unknown" for those entries and the operator sees the
     // partial picture rather than a missing check.
-    let catalog = lms::list_available().unwrap_or_default();
+    let catalog = engine::local().catalog().unwrap_or_default();
     let mut total_unloaded_gb = 0.0_f64;
     let mut pending: Vec<String> = Vec::new();
     for pm in &unloaded {
@@ -15066,7 +15065,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
 
         let check = check_lms_binary();
-        let spawned = lms::list_loaded();
+        let spawned = darkmux_profiles::lms::list_loaded();
 
         std::env::set_current_dir(prev_cwd).unwrap();
         unsafe {

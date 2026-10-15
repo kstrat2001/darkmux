@@ -1,9 +1,9 @@
 //! The LM Studio backend of the [`Engine`] facade: each method is one call
 //! to today's `crate::lms` function or [`LmsHost`], unchanged.
 
-use super::Engine;
+use super::{Engine, ModelMeta};
 use crate::gestalt_host::LmsHost;
-use crate::lms::{self, ModelMeta};
+use crate::lms;
 use anyhow::Result;
 use darkmux_gestalt::ModelHost;
 use darkmux_types::LoadedModel;

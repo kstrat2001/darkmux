@@ -233,10 +233,10 @@ pub fn worker_model_budget_bytes(total_ram_gb: u32) -> u64 {
 /// `darkmux:` namespace prefix; it is stripped for matching.
 pub fn choose_worker_model(
     loaded: &[String],
-    available: &[darkmux_profiles::lms::ModelMeta],
+    available: &[engine::ModelMeta],
     total_ram_gb: u32,
 ) -> Option<String> {
-    let llms: Vec<&darkmux_profiles::lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
+    let llms: Vec<&engine::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
     for id in loaded {
         let key = darkmux_gestalt::bare_model_key(id);
         if let Some(m) = llms.iter().find(|m| m.model_key == key) {
@@ -259,7 +259,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     if !text.contains(PLACEHOLDER_MODEL_ID) {
         return Ok(None);
     }
-    let available = match darkmux_profiles::lms::list_available() {
+    let available = match engine::local().catalog() {
         Ok(v) => v,
         Err(e) => {
             return Err(format!(
@@ -306,8 +306,8 @@ const UTILITY_MODEL_MIN_BYTES: u64 = 1_000_000_000;
 /// by a publisher prefix (`qwen/qwen3-4b-instruct-2507` vs
 /// `qwen3-4b-instruct-2507`, the shape that shipped in the example
 /// registry); else the smallest downloaded LLM that is a real model.
-pub fn choose_utility_model(current: &str, available: &[darkmux_profiles::lms::ModelMeta]) -> Option<String> {
-    let llms: Vec<&darkmux_profiles::lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
+pub fn choose_utility_model(current: &str, available: &[engine::ModelMeta]) -> Option<String> {
+    let llms: Vec<&engine::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
     if llms.iter().any(|m| m.model_key == current) {
         return Some(current.to_string());
     }
@@ -407,7 +407,7 @@ pub fn utility_window(headroom_bytes: u64, worker_bytes: u64, utility_bytes: u64
 pub fn plan_utility_binding(
     current: &str,
     window: Option<u32>,
-    available: &[darkmux_profiles::lms::ModelMeta],
+    available: &[engine::ModelMeta],
     headroom: Option<u64>,
     worker_bytes: u64,
     floor: u32,
@@ -533,7 +533,7 @@ fn set_ai_headroom_override(v: Option<Option<u64>>) {
 
 /// The worker models the registry names and the smallest window a managed
 /// worker declares: (largest worker size LM Studio lists, floor window).
-fn worker_facts(registry_json: &str, available: &[darkmux_profiles::lms::ModelMeta]) -> (u64, u32) {
+fn worker_facts(registry_json: &str, available: &[engine::ModelMeta]) -> (u64, u32) {
     let Ok(reg) = serde_json::from_str::<darkmux_types::ProfileRegistry>(registry_json) else {
         return (0, 1);
     };
@@ -602,7 +602,7 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
         return Ok(None);
     }
     // An unreachable lms was already reported by the worker fill.
-    let Ok(available) = darkmux_profiles::lms::list_available() else {
+    let Ok(available) = engine::local().catalog() else {
         return Ok(None);
     };
     let (worker_bytes, floor) = worker_facts(&text, &available);
@@ -1368,8 +1368,8 @@ mod tests {
 
     // ── #2038: init fills the placeholder model from what LM Studio has ──
 
-    fn meta(key: &str, size_gb: u64, kind: &str) -> darkmux_profiles::lms::ModelMeta {
-        darkmux_profiles::lms::ModelMeta {
+    fn meta(key: &str, size_gb: u64, kind: &str) -> engine::ModelMeta {
+        engine::ModelMeta {
             model_key: key.to_string(),
             display_name: key.to_string(),
             publisher: String::new(),
@@ -1469,8 +1469,8 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
 
     /// A 2 GB utility candidate whose own maximum window is above the shipped one.
-    fn util_meta() -> darkmux_profiles::lms::ModelMeta {
-        darkmux_profiles::lms::ModelMeta { max_context_length: Some(262_144), ..meta("qwen3-4b-instruct-2507", 2, "llm") }
+    fn util_meta() -> engine::ModelMeta {
+        engine::ModelMeta { max_context_length: Some(262_144), ..meta("qwen3-4b-instruct-2507", 2, "llm") }
     }
 
     #[test]

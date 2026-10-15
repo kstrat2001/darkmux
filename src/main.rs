@@ -711,10 +711,10 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
         None => std::collections::HashSet::new(),
     };
 
-    let available = lms::list_available()?;
-    let llms: Vec<&lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
+    let available = engine::local().catalog()?;
+    let llms: Vec<&engine::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
 
-    let uncovered: Vec<&lms::ModelMeta> = llms
+    let uncovered: Vec<&engine::ModelMeta> = llms
         .iter()
         .filter(|m| !covered.contains(&m.model_key))
         .copied()
@@ -1667,7 +1667,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             // supply --params (otherwise we'd silently bucket the unknown
             // model as Tiny, producing a 32K no-compactor profile regardless
             // of its real size — a documented footgun).
-            let available = lms::list_available().unwrap_or_default();
+            let available = engine::local().catalog().unwrap_or_default();
             let meta = match available.iter().find(|m| m.model_key == model).cloned() {
                 Some(found) => {
                     if params.is_some() || max_ctx.is_some() {
@@ -1691,7 +1691,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
                          Heuristics are tighter when the model is downloaded — re-run after \
                          download for the canonical draft."
                     );
-                    lms::ModelMeta {
+                    engine::ModelMeta {
                         model_key: model.clone(),
                         display_name: model.clone(),
                         publisher: "".into(),

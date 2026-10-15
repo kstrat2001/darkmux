@@ -282,27 +282,10 @@ fn is_ps_header(trimmed: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
 }
 
-/// One row from `lms ls --json` — every model the LMStudio catalog knows
-/// about (downloaded), regardless of whether it's currently loaded. Used by
-/// `darkmux scan` to discover models the user could add to their profile
-/// registry.
-///
-/// `publisher` is read from `lms ls --json` (e.g. "Qwen", "google",
-/// "lmstudio-community").
-#[derive(Debug, Clone)]
-pub struct ModelMeta {
-    pub model_key: String,
-    pub display_name: String,
-    pub publisher: String,
-    pub size_bytes: u64,
-    pub params_string: Option<String>,
-    pub architecture: Option<String>,
-    pub max_context_length: Option<u32>,
-    pub trained_for_tool_use: bool,
-    /// Type per LMStudio: "llm", "embedding", etc. We typically filter to
-    /// `"llm"` since profiles are for chat/agentic dispatch.
-    pub model_type: String,
-}
+/// (#316 stage 3.3) The catalog row type now lives with the engine facade;
+/// this path stays as a re-export until `lms` becomes private to the LM
+/// Studio backend (stage 3.7).
+pub use crate::engine::ModelMeta;
 
 /// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
 /// Errors when `lms` cannot be run, exits non-zero, or prints something that
