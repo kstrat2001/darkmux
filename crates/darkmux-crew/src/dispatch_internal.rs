@@ -14057,8 +14057,8 @@ fn ensure_model_resident_from(
     }
 }
 
-/// (#1139) Load `model_key` under `identifier` at `n_ctx` through the bounded
-/// [`LmsHost`] `ModelHost` port (#1276) instead of the raw, uncapped
+/// (#1139) Load `model_key` under `identifier` at `n_ctx` through the local
+/// engine's bounded `ModelHost` port (#1276; `LmsHost` today) instead of the raw, uncapped
 /// `lms::load_with_identifier` (`Command::status`, which blocks indefinitely on
 /// a RAM-starved / stuck load until the workflow's outer kill). The port
 /// enforces the resolved model-load deadline and classifies the failure into a
@@ -14068,8 +14068,12 @@ fn ensure_model_resident_from(
 /// `model_key` must already be BARE (`ensure_model_loaded_at_ctx` normalizes it
 /// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
 fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
-    use darkmux_gestalt::{Deadline, ModelHost};
-    let mut host = darkmux_profiles::gestalt_host::LmsHost::new();
+    use darkmux_gestalt::Deadline;
+    // (#316) As `concurrent_dispatch::lms_host_factory`: LM Studio always has
+    // a load lifecycle until stage 4.
+    let mut host = engine::local()
+        .host()
+        .expect("the local engine has a load lifecycle until stage 4 of #316");
     let deadline = Deadline::from_secs(darkmux_types::config_access::model_load_timeout_seconds());
     map_load_result(host.load(model_key, identifier, n_ctx, deadline), model_key, n_ctx)
 }
