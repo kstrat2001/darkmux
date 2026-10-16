@@ -1393,6 +1393,46 @@ fn a_resume_on_a_tool_less_hosted_role_is_refused_before_the_http_call() {
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
 
+/// (#316 stage 4.3) A profile that names no endpoint, on a machine whose
+/// `default_engine` is an `mlx_lm.server` endpoint: the dispatch goes to that
+/// server with the bare model id, LM Studio is never asked to load, and the
+/// operator is told the server may switch models.
+#[test]
+#[serial]
+fn an_endpointless_profile_runs_on_the_default_engine_and_says_it_may_switch() {
+    own_process!();
+    let mut rig = Rig::new();
+    fs::write(
+        &rig.profiles,
+        json!({
+            "profiles": {"local": {"models": [{"id": "mlx-community/Qwen3-30B-A3B-4bit", "n_ctx": 32768}]}},
+            "endpoints": {"mlx": {"url": "http://127.0.0.1:9/v1"}},
+            "default_profile": "local"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    rig.env().set("DARKMUX_DEFAULT_ENGINE", "mlx");
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, stderr) = run(&rig, rig.opts());
+    res.expect("the dispatch runs on the default engine");
+    let argv = rig.docker_run().unwrap();
+    for (flag, value) in [
+        ("--model", "mlx-community/Qwen3-30B-A3B-4bit"),
+        ("--chat-url", "http://host.docker.internal:9/v1/chat/completions"),
+    ] {
+        assert!(has_pair(&argv, flag, value), "`{flag} {value}` missing: {argv:?}");
+    }
+    assert!(!rig.lms_log().iter().any(|l| l.starts_with("load")), "LM Studio never loads: {:?}", rig.lms_log());
+    assert_eq!(
+        stderr.matches("`mlx` loads the model a request names; this dispatch sends `mlx-community/Qwen3-30B-A3B-4bit`").count(),
+        1,
+        "said once: {stderr}"
+    );
+    let sp = payload(&rig.record("dispatch.start")).clone();
+    assert_eq!(sp["endpoint"], "openai:127.0.0.1:9/mlx-community/Qwen3-30B-A3B-4bit", "recorded host-side");
+}
+
 #[test]
 #[serial]
 fn a_tool_granting_role_on_a_hosted_endpoint_runs_in_the_container_with_the_secret_on_stdin() {

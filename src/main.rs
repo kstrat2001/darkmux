@@ -1439,6 +1439,19 @@ fn peer_utility_line(id: &str) -> String {
     }
 }
 
+/// `machine status`'s line when this machine's engine could not say what
+/// it holds. (#316) An engine that does not report it is named as such; the
+/// JSON's wire shape for this is 4.5's (machine card and serve).
+fn residents_unknown_line(e: &anyhow::Error) -> String {
+    if engine::is_not_reported(e) {
+        return format!("this machine: {e}; residents UNKNOWN, not empty.");
+    }
+    format!(
+        "this machine: could not query LMStudio (`lms ps` failed here) — residents \
+         UNKNOWN, not empty. Check LMStudio + the `lms` CLI. ({e:#})"
+    )
+}
+
 fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
     if let Some(id) = id {
         return machine_status_remote(id, json);
@@ -1461,10 +1474,7 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
                     darkmux_types::config_access::machine_id(),
                 ))?;
             } else {
-                eprintln!(
-                    "this machine: could not query LMStudio (`lms ps` failed here) — residents \
-                     UNKNOWN, not empty. Check LMStudio + the `lms` CLI. ({e:#})"
-                );
+                eprintln!("{}", residents_unknown_line(&e));
             }
             return Ok(2);
         }

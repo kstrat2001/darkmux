@@ -20,9 +20,11 @@
 
 mod lmstudio;
 mod openai_compat;
+mod unresolved;
 
 pub use lmstudio::LmStudio;
 pub use openai_compat::{OpenAiCompatible, MODELS_PROBE_BOUND};
+use unresolved::Unresolved;
 
 use anyhow::Result;
 use darkmux_gestalt::ModelHost;
@@ -138,7 +140,7 @@ pub trait Engine {
     fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)>;
 }
 
-/// LM Studio, the engine a managed model runs on (`"managed": "lmstudio"`,
+/// LM Studio, the engine a managed model runs on (a managed endpoint,
 /// and a model that names no endpoint). Every step of a managed model's
 /// lifecycle asks it by name: loading, residency, eject of `darkmux:`
 /// instances, the local wave track. Those are LM Studio's whatever this
@@ -148,11 +150,36 @@ pub fn lmstudio() -> Box<dyn Engine> {
     Box::new(LmStudio)
 }
 
-/// The engine on this machine. Today that is always LM Studio, resolving its
-/// binary as before (`env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"`) at each
-/// call, so the fake-`lms` test seam is unchanged.
+/// The engine on this machine, as `default_engine` names it: LM Studio (the
+/// default, resolving its binary at each call as before), or the
+/// OpenAI-compatible server at an endpoint in `profiles.json`. The registry is
+/// read only when the setting names an endpoint, so the default path costs
+/// what it did. A value that names no usable engine is never read as LM
+/// Studio (contract 9): the engine returned answers every question with that
+/// refusal, which every entry point's preflight also gives.
 pub fn local() -> Box<dyn Engine> {
-    Box::new(LmStudio)
+    use darkmux_types::default_engine::{self, EngineChoice};
+    let (raw, source) = darkmux_types::config_access::default_engine_with_source();
+    if raw.trim().eq_ignore_ascii_case(default_engine::LMSTUDIO) {
+        return Box::new(LmStudio);
+    }
+    let registry = match crate::profiles::load_registry_quiet(None) {
+        Ok(l) => l.registry,
+        Err(e) => {
+            let load_error = format!("{e:#}");
+            let refusal = default_engine::resolve_without_registry(&raw, source, &load_error).err();
+            return Box::new(Unresolved { reason: refusal.map_or(load_error, |r| r.to_string()) });
+        }
+    };
+    match default_engine::resolve(&raw, source, &registry) {
+        Ok(EngineChoice::Lmstudio) => Box::new(LmStudio),
+        // `resolve` accepts only an unmanaged endpoint, which has a `url`.
+        Ok(EngineChoice::Endpoint(id)) => {
+            let url = registry.endpoints.get(&id).and_then(|e| e.url.clone()).unwrap_or_default();
+            Box::new(OpenAiCompatible::new(id, url))
+        }
+        Err(refusal) => Box::new(Unresolved { reason: refusal.to_string() }),
+    }
 }
 
 /// Whether an unload error is the typed not-resident outcome (#3083). It reads
@@ -221,44 +248,102 @@ pub(crate) fn assert_declaration_holds(engine: &dyn Engine, unload_probe: &str) 
 }
 
 
-/// (#316) A load lifecycle is LM Studio's, asked for by name: no production
-/// source in the workspace asks [`local`] for one, because once the local
-/// engine can be a server with no lifecycle, `local().host()` is `None` where
-/// a managed model needs to load. A view of the machine asks `local()`; a
-/// managed model's load asks [`lmstudio`].
 #[cfg(test)]
-#[test]
-fn no_production_code_asks_the_local_engine_for_a_load_lifecycle() {
-    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
+mod local_engine_tests {
+    use super::*;
+
+    /// (#316) A load lifecycle is LM Studio's, asked for by name: no production
+    /// source in the workspace asks [`local`] for one, because once the local
+    /// engine can be a server with no lifecycle, `local().host()` is `None` where
+    /// a managed model needs to load. A view of the machine asks `local()`; a
+    /// managed model's load asks [`lmstudio`].
+    #[test]
+    fn no_production_code_asks_the_local_engine_for_a_load_lifecycle() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
             }
         }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        sources(&root.join("src"), &mut files);
+        for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+            sources(&krate.path().join("src"), &mut files);
+        }
+        assert!(files.len() > 100, "the scan found the workspace sources: {}", files.len());
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|f| !f.to_string_lossy().contains("test"))
+            .filter(|f| {
+                let code: String = std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .flat_map(str::split_whitespace)
+                    .collect();
+                code.contains(&["engine::local()", ".host()"].concat())
+            })
+            .map(|f| f.display().to_string())
+            .collect();
+        assert!(offenders.is_empty(), "ask engine::lmstudio() for a managed model's load lifecycle: {offenders:?}");
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
-    sources(&root.join("src"), &mut files);
-    for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
-        sources(&krate.path().join("src"), &mut files);
+
+    /// (#316) `local()` follows `default_engine`: LM Studio by default, the
+    /// endpoint's server when it names one, and never LM Studio for a value that
+    /// names no usable engine. The loader puts every model that names no
+    /// endpoint on that server, and leaves a pinned managed model on LM Studio.
+    #[test]
+    #[serial_test::serial]
+    fn the_local_engine_and_endpointless_models_follow_default_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            r#"{"profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}, {"id": "k", "n_ctx": 1, "endpoint": "lms"}]}},
+                "endpoints": {"mlx": {"url": "http://127.0.0.1:9/v1"}, "lms": {"managed": "lmstudio"}}}"#,
+        )
+        .unwrap();
+        let reg = reg.to_string_lossy().into_owned();
+        let with = |value: Option<&str>, profiles: &str| {
+            unsafe {
+                std::env::set_var("DARKMUX_PROFILES", profiles);
+                match value {
+                    Some(v) => std::env::set_var("DARKMUX_DEFAULT_ENGINE", v),
+                    None => std::env::remove_var("DARKMUX_DEFAULT_ENGINE"),
+                }
+            }
+            let engine = local();
+            let models = crate::profiles::load_registry_quiet(None).map(|l| l.registry.profiles["p"].models.clone());
+            (engine.capabilities().loading, engine.loaded().map_err(|e| e.to_string()).err(), models)
+        };
+        let default = with(None, &reg);
+        let mlx = with(Some("mlx"), &reg);
+        let bogus = with(Some("mxl"), &reg);
+        let no_registry = with(Some("mlx"), "/nonexistent/profiles.json");
+        unsafe {
+            std::env::remove_var("DARKMUX_PROFILES");
+            std::env::remove_var("DARKMUX_DEFAULT_ENGINE");
+        }
+
+        assert_eq!(default.0, Loading::Explicit, "unset is LM Studio");
+        assert!(default.2.as_ref().unwrap()[0].is_managed(), "and an endpointless model stays managed");
+
+        assert_eq!(mlx.0, Loading::Unknown);
+        assert_eq!(mlx.1.as_deref(), Some("mlx does not report which models it has loaded"));
+        let models = mlx.2.unwrap();
+        assert_eq!(models[0].endpoint.as_ref().and_then(|e| e.named_id()), Some("mlx"), "endpointless goes to mlx");
+        assert!(models[1].is_managed(), "a model pinned to a managed endpoint stays on LM Studio");
+
+        for (case, err) in [("bogus", bogus.1), ("no registry", no_registry.1)] {
+            let err = err.unwrap_or_else(|| panic!("{case}: never read as LM Studio"));
+            assert!(err.starts_with("the default engine cannot be used: env var DARKMUX_DEFAULT_ENGINE: "), "{case}: {err}");
+        }
+        assert_eq!(bogus.0, Loading::Unknown, "a bad value is not LM Studio");
+        assert!(bogus.2.unwrap()[0].is_managed(), "a bad value moves no model; preflight refuses it");
     }
-    assert!(files.len() > 100, "the scan found the workspace sources: {}", files.len());
-    let offenders: Vec<String> = files
-        .iter()
-        .filter(|f| !f.to_string_lossy().contains("test"))
-        .filter(|f| {
-            let code: String = std::fs::read_to_string(f)
-                .unwrap()
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .flat_map(str::split_whitespace)
-                .collect();
-            code.contains(&["engine::local()", ".host()"].concat())
-        })
-        .map(|f| f.display().to_string())
-        .collect();
-    assert!(offenders.is_empty(), "ask engine::lmstudio() for a managed model's load lifecycle: {offenders:?}");
 }

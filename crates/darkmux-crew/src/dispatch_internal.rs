@@ -5960,6 +5960,13 @@ type SplitRoute = (Option<(crate::types::Role, String, crate::target::Target)>, 
 
 /// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
 fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
+    // (#316) Every dispatch is split here once, so a model on an engine that
+    // loads on request is announced once.
+    if let Some(DispatchRoute::Unmanaged { target, .. }) = &route {
+        if let Some(notice) = engine_switch_notice(&target.model) {
+            eprintln!("{notice}");
+        }
+    }
     match route {
         Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => (Some((*role, system_prompt, *target)), None),
         Some(DispatchRoute::Managed(target)) => (None, Some(*target)),
@@ -13881,6 +13888,30 @@ pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource)
         "darkmux dispatch: loading `{model_key}` at n_ctx={n_ctx} ({}) before dispatch. (#1135)",
         source.describe()
     )
+}
+
+/// (#316, ENGINES.md open question 5) A model sent to this machine's default
+/// engine when that engine loads whatever a request names (`mlx_lm.server`
+/// holds one model and switches to the one asked for): the operator is told
+/// once per dispatch that this dispatch may replace the model the engine
+/// holds. Decided from the engine's declared capabilities, never its name.
+fn engine_switch_notice(model: &darkmux_types::ProfileModel) -> Option<String> {
+    let endpoint_id = model.endpoint.as_ref()?.named_id()?;
+    let default_engine = darkmux_types::config_access::default_engine();
+    if default_engine.trim() != endpoint_id {
+        return None;
+    }
+    switch_notice_for(endpoint_id, engine::local().capabilities().loading, &model.id)
+}
+
+/// The decision and wording of [`engine_switch_notice`], pure.
+fn switch_notice_for(engine_id: &str, loading: engine::Loading, model_id: &str) -> Option<String> {
+    (loading == engine::Loading::Unknown).then(|| {
+        format!(
+            "darkmux dispatch: `{engine_id}` loads the model a request names; this dispatch sends `{model_id}`, \
+             which may replace the model it holds. (#316)"
+        )
+    })
 }
 
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the

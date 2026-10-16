@@ -7092,6 +7092,48 @@
         assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
     }
 
+    /// (#316, open question 5) On an engine that loads whatever a request
+    /// names, the dispatch says it may replace the model the engine holds; on
+    /// one darkmux loads explicitly, nothing is said.
+    #[test]
+    fn a_dispatch_to_an_engine_that_loads_on_request_says_it_may_switch() {
+        use darkmux_profiles::engine::Loading;
+        assert_eq!(
+            super::switch_notice_for("mlx", Loading::Unknown, "mlx-community/Qwen3-30B").as_deref(),
+            Some(
+                "darkmux dispatch: `mlx` loads the model a request names; this dispatch sends \
+                 `mlx-community/Qwen3-30B`, which may replace the model it holds. (#316)"
+            )
+        );
+        assert_eq!(super::switch_notice_for("lms", Loading::Explicit, "m"), None);
+    }
+
+    /// (#316) Only a model on the default engine is told: another endpoint,
+    /// or a model with none, says nothing.
+    #[test]
+    #[serial]
+    fn only_a_model_on_the_default_engine_gets_the_switch_notice() {
+        // `hosted_for_test` names its endpoint `azure`.
+        let model = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": "http://127.0.0.1:9/v1" }));
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(&reg, r#"{"profiles": {"p": {"models": [{"id": "m"}]}}, "endpoints": {"azure": {"url": "http://127.0.0.1:9/v1"}, "mlx": {"url": "http://127.0.0.1:8/v1"}}}"#).unwrap();
+        unsafe {
+            std::env::set_var("DARKMUX_PROFILES", &reg);
+            std::env::set_var("DARKMUX_DEFAULT_ENGINE", "azure");
+        }
+        let on_default = super::engine_switch_notice(&model);
+        unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "mlx") };
+        let elsewhere = super::engine_switch_notice(&model);
+        unsafe {
+            std::env::remove_var("DARKMUX_DEFAULT_ENGINE");
+            std::env::remove_var("DARKMUX_PROFILES");
+        }
+        assert!(on_default.is_some_and(|n| n.contains("`azure` loads the model a request names")));
+        assert_eq!(elsewhere, None, "a model on `azure` while the default engine is `mlx`");
+        assert_eq!(super::engine_switch_notice(&darkmux_types::ProfileModel::default()), None);
+    }
+
     /// (#3209) An unmanaged endpoint on this machine (`mlx_lm.server` on
     /// `127.0.0.1`) is dialed from inside the container, where loopback names
     /// the container: its chat URL gets the same `host.docker.internal`
