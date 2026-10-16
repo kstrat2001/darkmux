@@ -3221,6 +3221,16 @@ fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
     Ok(Some(match target.kind {
         darkmux_types::EndpointKind::Unmanaged => {
             let system_prompt = unmanaged_system_prompt(opts, &role)?;
+            // (#316) A brain that stays on this machine (the default engine
+            // on loopback) gets the operator's identity, as LM Studio does;
+            // an override is sent verbatim.
+            let system_prompt = if opts.system_prompt_override.is_none()
+                && identity_augmentation_allowed(brain_leaves_this_machine(&target))
+            {
+                crate::dispatch::augment_prompt_with_identity(&system_prompt)
+            } else {
+                system_prompt
+            };
             DispatchRoute::Unmanaged { role: Box::new(role), system_prompt, target: Box::new(target) }
         }
         darkmux_types::EndpointKind::Managed(_) => DispatchRoute::Managed(Box::new(target)),
@@ -3239,6 +3249,26 @@ fn try_resolve_unmanaged_target(
     })
 }
 
+/// (#316, operator decision 2026-10-17) Whether a resolved brain sends the
+/// conversation off this machine: the data boundary every identity and
+/// grounding decision reads. A managed model (LM Studio here) stays; so does
+/// an unmanaged endpoint that is this machine's default engine and is
+/// reached on loopback (`mlx_lm.server` on `127.0.0.1`), "local like LM
+/// Studio". Any other unmanaged endpoint leaves, including the default
+/// engine on another host.
+fn brain_leaves_this_machine(t: &crate::target::Target) -> bool {
+    match t.kind {
+        darkmux_types::EndpointKind::Managed(_) => false,
+        darkmux_types::EndpointKind::Unmanaged => {
+            let Some(ep) = t.model.endpoint.as_ref() else { return true };
+            let default_engine = darkmux_types::config_access::default_engine();
+            let is_default = ep.named_id().is_some_and(|id| id == default_engine.trim());
+            let on_loopback = ep.url.as_deref().is_some_and(|u| loopback_to_docker_host(u) != u);
+            !(is_default && on_loopback)
+        }
+    }
+}
+
 /// Data-boundary predicate: operator identity (`~/.darkmux/identity.md`)
 /// never leaves the machine — identity augmentation applies only when the
 /// dispatch's resolved brain is locally served (data-boundary decision,
@@ -3248,8 +3278,9 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
     !remote_brained
 }
 
-/// (#1698 Packet B2 gate) Would a dispatch with this (role, profile) resolve
-/// to a REMOTE endpoint? Answers the question a caller must ask BEFORE it
+/// (#1698 Packet B2 gate) Would a dispatch with this (role, profile) send the
+/// conversation off this machine ([`brain_leaves_this_machine`]: an unmanaged
+/// endpoint, other than the default engine on loopback, #316)? Answers the question a caller must ask BEFORE it
 /// assembles the payload — the identity gate above can decide late because
 /// it owns the augmentation, but a caller that composes its own message
 /// (the radio answering seat's grounding bundle) has to know the boundary
@@ -3266,7 +3297,7 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
 /// remote, withhold). Uncertainty never degrades to permissiveness — the
 /// cost of a false `true` is a thinner grounding bundle; the cost of a
 /// false `false` is private data on someone else's server.
-pub fn dispatch_resolves_unmanaged(
+pub fn dispatch_leaves_this_machine(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
@@ -3280,10 +3311,9 @@ pub fn dispatch_resolves_unmanaged(
     // (#2914) A work question: the utility model is set aside here too.
     match resolve_target(role, profile_name, config_path, false) {
         // (#2902 review C4) Exhaustive on the kind; see `try_resolve_unmanaged_target`.
-        Ok(Some(t)) => match t.kind {
-            darkmux_types::EndpointKind::Unmanaged => true,
-            darkmux_types::EndpointKind::Managed(_) => false,
-        },
+        // (#316) The one data-boundary predicate, so this cannot drift from
+        // what the dispatch itself decides.
+        Ok(Some(t)) => brain_leaves_this_machine(&t),
         // The registry did not load. The dispatch itself is about to hard-fail.
         Ok(None) => false,
         // No profile resolves, or a quarantined profile (#1282): the dispatch
@@ -3331,7 +3361,7 @@ impl LocalTarget {
 /// fallback), or a quarantined profile — in each case there is no local
 /// instance to check. Resolves through `resolve_target`,
 /// the SAME resolution the dispatch itself routes on (as
-/// [`dispatch_resolves_unmanaged`] does), and mints the identifier the way
+/// [`dispatch_leaves_this_machine`] does), and mints the identifier the way
 /// the wire does (`Target::wire_model`), so the instance checked is the
 /// instance sent to.
 pub fn dispatch_local_target(
@@ -6176,7 +6206,7 @@ fn prepare_container_run(
     let workdir_split_gitdirs = warn_split_gitdirs(opts);
     let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
     let (role, system_prompt, allowed_tools) =
-        container_role(opts, brain.agentic_pm.is_some(), &workdir_split_gitdirs)?;
+        container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
     let workspace_plan = plan_workspace(opts, unix_micros)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;

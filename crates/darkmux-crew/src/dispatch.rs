@@ -785,16 +785,17 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
 }
 
 /// (#1698 Packet B2 gate) True when a dispatch with this (role, profile)
-/// would resolve to a remote endpoint — the data-boundary question a caller
+/// would send the conversation off this machine (an unmanaged endpoint, other
+/// than the default engine on loopback, #316) — the data-boundary question a caller
 /// that COMPOSES its own payload must answer before assembling it. Fails
 /// closed (unresolvable ⇒ `true`). See
-/// `dispatch_internal::dispatch_resolves_unmanaged`'s own doc.
-pub fn dispatch_resolves_unmanaged(
+/// `dispatch_internal::dispatch_leaves_this_machine`'s own doc.
+pub fn dispatch_leaves_this_machine(
     role_id: &str,
     profile_name: Option<&str>,
     config_path: Option<&str>,
 ) -> bool {
-    crate::dispatch_internal::dispatch_resolves_unmanaged(role_id, profile_name, config_path)
+    crate::dispatch_internal::dispatch_leaves_this_machine(role_id, profile_name, config_path)
 }
 
 /// (#2917) The local LM Studio instance a dispatch would send to — see

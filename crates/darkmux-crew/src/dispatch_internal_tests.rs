@@ -7119,6 +7119,57 @@
         assert!(super::registry_polls_lmstudio(Some("/nonexistent/profiles.json")), "an unloadable registry polls");
     }
 
+    /// (#316, operator 2026-10-17) The data boundary: only the default engine
+    /// reached on loopback stays on this machine among unmanaged endpoints.
+    #[test]
+    #[serial]
+    fn only_the_default_engine_on_loopback_stays_on_this_machine() {
+        // `hosted_for_test` names its endpoint `azure`.
+        let leaves = |url: &str, default_engine: &str| {
+            let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": url }));
+            let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+            unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", default_engine) };
+            let out = super::brain_leaves_this_machine(&t);
+            unsafe { std::env::remove_var("DARKMUX_DEFAULT_ENGINE") };
+            out
+        };
+        assert!(!leaves("http://127.0.0.1:8080/v1", "azure"), "the default engine on loopback stays");
+        assert!(!leaves("http://localhost:8080/v1", "azure"), "localhost too");
+        assert!(leaves("http://studio.tailnet:8080/v1", "azure"), "the default engine on another host leaves");
+        assert!(leaves("http://127.0.0.1:8080/v1", "lmstudio"), "a loopback endpoint that is not the default engine leaves");
+        let managed = crate::target::target_for("p".into(), Default::default(), darkmux_types::ProfileModel::default()).unwrap();
+        assert!(!super::brain_leaves_this_machine(&managed), "LM Studio stays");
+    }
+
+    /// (#316) The predicate radio and fleet ask agrees: a profile on the
+    /// loopback default engine stays on this machine; on a remote default
+    /// engine it leaves.
+    #[test]
+    #[serial]
+    fn radio_and_fleet_see_the_loopback_default_engine_as_this_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = |url: &str| {
+            let p = dir.path().join("profiles.json");
+            std::fs::write(
+                &p,
+                serde_json::json!({
+                    "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                    "endpoints": {"mlx": {"url": url}},
+                    "default_profile": "p"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "mlx") };
+        let loopback = super::dispatch_leaves_this_machine("coder", None, Some(&reg("http://127.0.0.1:8080/v1")));
+        let remote = super::dispatch_leaves_this_machine("coder", None, Some(&reg("http://studio.tailnet:8080/v1")));
+        unsafe { std::env::remove_var("DARKMUX_DEFAULT_ENGINE") };
+        assert!(!loopback, "the loopback default engine is this machine");
+        assert!(remote, "a default engine on another host is not");
+    }
+
     /// (#316, open question 5) On an engine that loads whatever a request
     /// names, the dispatch says it may replace the model the engine holds; on
     /// one darkmux loads explicitly, nothing is said.
