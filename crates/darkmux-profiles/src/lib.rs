@@ -37,8 +37,9 @@ pub mod profiles;
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
 /// loader) adds that pass. Every endpoint is checked, not only the ones this
 /// run would call: bad config is bad config (#2947). A registry that cannot
-/// be loaded adds nothing here; the entry point reports that itself when it
-/// resolves a profile.
+/// be loaded adds nothing here but the `default_engine` check, run against an
+/// empty registry (only `lmstudio` passes); the entry point reports the load
+/// failure itself when it resolves a profile.
 pub fn preflight(
     scope: darkmux_types::config_enum::Scope,
 ) -> Result<(), darkmux_types::config_enum::PreflightRefusal> {
@@ -57,11 +58,18 @@ pub fn preflight_with(
     use darkmux_types::user_files::UserFileKind;
     let mut refusal = config_enum::preflight(scope).err().unwrap_or_else(|| PreflightRefusal::none(scope));
     if UserFileKind::Profiles.scopes().contains(&scope) {
-        if let Ok(loaded) = profiles::load_registry_quiet(profiles_file) {
-            refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
-            refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
-            refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
-            refusal.files.extend(profiles::user_file_problem(&loaded.path));
+        match profiles::load_registry_quiet(profiles_file) {
+            Ok(loaded) => {
+                refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
+                refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
+                refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
+                refusal.files.extend(profiles::user_file_problem(&loaded.path));
+            }
+            // With no registry no endpoint id can be checked, so only
+            // `lmstudio` passes: never read as LM Studio by default.
+            Err(_) => refusal
+                .invalid
+                .extend(darkmux_types::default_engine::invalid(&darkmux_types::ProfileRegistry::default())),
         }
     }
     refusal.into_result()
@@ -155,6 +163,7 @@ mod user_file_tests {
         let refused: Vec<_> = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun]
             .map(|scope| crate::preflight_with(scope, Some(&path)).map_err(|r| r.to_string()))
             .into();
+        let no_registry = crate::preflight_with(Scope::Dispatch, Some("/nonexistent/profiles.json"));
         unsafe { std::env::set_var(env, "LMStudio") };
         let lmstudio = crate::preflight_with(Scope::Dispatch, Some(&path));
         unsafe { std::env::remove_var(env) };
@@ -163,6 +172,8 @@ mod user_file_tests {
             assert!(msg.contains("env var DARKMUX_DEFAULT_ENGINE: `azur` is neither"), "{msg}");
         }
         assert_eq!(lmstudio, Ok(()));
+        let msg = no_registry.expect_err("no registry is not a pass").to_string();
+        assert!(msg.contains("`azur` is neither"), "{msg}");
     }
 
     #[test]

@@ -511,6 +511,10 @@ fn anchor_program_path(value: String, cwd: Option<&std::path::Path>) -> String {
 /// because whether it names a real engine depends on `profiles.json`:
 /// [`crate::default_engine::resolve`] decides that, and refuses a value it
 /// cannot use.
+pub fn default_engine() -> String {
+    default_engine_with_source().0
+}
+/// [`default_engine`] and the tier it came from.
 pub fn default_engine_with_source() -> (String, Source) {
     let (v, s) = pick_string_with_source(
         "DARKMUX_DEFAULT_ENGINE",
@@ -2537,7 +2541,7 @@ mod location_guard {
         ("REDIS_TELEMETRY_STREAM_SUFFIX", "a stream name's suffix"),
         ("LOCATION_ACCESSORS", "this table itself: accessor names and functions, no value"),
         ("machine_id", "this machine's public name, which every viewer reads"),
-        ("default_engine_with_source", "an engine's name: `lmstudio` or an endpoint id, which viewers read"),
+        ("default_engine", "an engine's name: `lmstudio` or an endpoint id, which viewers read"),
         ("fleet_mode", "an enum value"),
         ("declared_fleet_mode", "an enum value"),
         ("fleet_busy_policy", "an enum value (withheld where printed, as the execution surface)"),

@@ -423,6 +423,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // "invalid value for `fleet.mode`: invalid fleet.mode `hubb` — valid: …".
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
     check_answering_seat(key, value)?;
+    check_default_engine(key, value)?;
 
     let mut root = load_object_for_write(path)?;
     set_path(&mut root, key, parsed.clone());
@@ -477,6 +478,20 @@ fn check_answering_seat(key: &str, value: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// (#316) `default_engine` names `lmstudio` or an OpenAI-compatible endpoint
+/// in the profile registry; anything else is refused here, before it is
+/// written, as every dispatching entry point would refuse it after.
+fn check_default_engine(key: &str, value: &str) -> Result<()> {
+    use darkmux_types::default_engine;
+    if key != default_engine::KEY {
+        return Ok(());
+    }
+    let registry = darkmux_profiles::profiles::load_registry_quiet(None).map(|l| l.registry).unwrap_or_default();
+    default_engine::resolve(value, darkmux_types::config_access::Source::Config, &registry)
+        .map(|_| ())
+        .map_err(|e| anyhow!("invalid value for `{key}`: {}. valid: {}", e.problem, e.valid))
 }
 
 /// The hub's fleet default for the answering seat (#3022). Unlike the
@@ -992,6 +1007,19 @@ mod tests {
             }
             assert!(get_at(p, key).unwrap().contains("deep@studio"), "a refused write leaves the old value");
         }
+    }
+
+    /// (#316) `default_engine` is checked before it is written: `lmstudio`
+    /// in any case is taken, a value naming no engine is refused and the old
+    /// value stays.
+    #[test]
+    fn default_engine_takes_lmstudio_and_refuses_a_value_naming_no_engine() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "default_engine", "LMStudio").unwrap();
+        let err = set_at(p, "default_engine", "no-such-engine-xyz").unwrap_err().to_string();
+        assert!(err.starts_with("invalid value for `default_engine`: `no-such-engine-xyz` is neither"), "{err}");
+        assert!(get_at(p, "default_engine").unwrap().contains("LMStudio"), "a refused write leaves the old value");
     }
 
     #[test]
