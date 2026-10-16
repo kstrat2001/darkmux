@@ -137,6 +137,7 @@ pub const CONFIG_WITHHELD: &[(&str, Kind)] = &[
 pub const CONFIG_SHOWN: &[&str] = &[
     "schema_version",
     "machine_id",
+    "default_engine",
     "redis.enabled",
     "redis.db",
     "redis.stream",

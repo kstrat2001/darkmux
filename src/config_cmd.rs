@@ -100,6 +100,7 @@ enum Ty {
 const KEYS: &[(&str, Ty)] = &[
     ("machine_id", Ty::Str),
     ("lms_bin", Ty::Str),
+    ("default_engine", Ty::Str),
     ("lmstudio_url", Ty::Str),
     ("redis.enabled", Ty::Bool),
     ("redis.host", Ty::Str),

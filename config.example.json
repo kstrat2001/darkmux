@@ -1,8 +1,9 @@
 {
-  "schema_version": "2.3",
+  "schema_version": "2.4",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
+  "default_engine": "lmstudio",
   "redis": {
     "enabled": false,
     "host": "127.0.0.1",
