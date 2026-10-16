@@ -892,6 +892,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "ts-rs",
+ "ureq",
 ]
 
 [[package]]

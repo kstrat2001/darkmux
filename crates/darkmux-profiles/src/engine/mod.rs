@@ -10,16 +10,19 @@
 //! The facade sits above the gestalt [`ModelHost`] port rather than widening
 //! it: `ModelHost` is the planner's lifecycle port with planner-minimal facts,
 //! while these questions read the full [`LoadedModel`] and [`ModelMeta`]. A
-//! backend with no lifecycle (a Messages endpoint, stage 4) answers
-//! [`Engine::host`] with `None` instead of a port full of `Unsupported` stubs.
+//! backend with no lifecycle ([`OpenAiCompatible`], stage 4) answers
+//! [`Engine::host`] with `None` instead of a port full of `Unsupported` stubs,
+//! and a question it cannot answer with [`NotReported`], never an empty answer.
 //!
 //! The facade takes identifiers verbatim and has no ownership method: the
 //! `darkmux:` namespace (contract 4) stays the LM Studio backend's mechanism,
 //! in `crate::ownership`.
 
 mod lmstudio;
+mod openai_compat;
 
 pub use lmstudio::LmStudio;
+pub use openai_compat::{OpenAiCompatible, MODELS_PROBE_BOUND};
 
 use anyhow::Result;
 use darkmux_gestalt::ModelHost;
@@ -103,4 +106,29 @@ pub fn is_not_resident(err: &anyhow::Error) -> bool {
         err.downcast_ref::<darkmux_gestalt::HostError>(),
         Some(darkmux_gestalt::HostError::NotResident { .. })
     )
+}
+
+/// A question an engine cannot answer, such as which models a plain
+/// OpenAI-compatible server holds. Typed so a caller says so plainly instead of
+/// reading it as "none" (ENGINES.md section 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotReported {
+    /// The engine, as the operator named it (an endpoint id).
+    pub engine: String,
+    /// What it does not report, worded to follow "does not report".
+    pub question: &'static str,
+}
+
+impl std::fmt::Display for NotReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} does not report {}", self.engine, self.question)
+    }
+}
+
+impl std::error::Error for NotReported {}
+
+/// Whether an engine error is [`NotReported`]: the engine cannot answer, as
+/// opposed to failing to.
+pub fn is_not_reported(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotReported>().is_some()
 }
