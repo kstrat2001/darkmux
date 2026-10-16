@@ -1602,16 +1602,83 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     let gguf_reader = GgufFactsReader::from_ls_entries(&ls_rows);
     let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
 
+    let machine = gather_machine(&mut messages);
+    let mut ledger = compute_ledger(
+        LedgerInputs {
+            residents,
+            catalog,
+            arch,
+            pool: machine.pool,
+            // #1243: no budget field is wired into config.json on main yet;
+            // when `runtime.max_model_ram_gb` lands, resolve it here and the
+            // Budget limit arm activates.
+            budget_bytes: None,
+            swap_used_bytes: machine.swap_used_bytes,
+            compressor_bytes: machine.compressor_bytes,
+            margin_percent: machine.margin_percent,
+            workers: machine.workers,
+            residents_unknown: ps_rows.is_none(),
+            messages,
+        },
+        now_ms(),
+    );
+    ledger.gather_ms = started.elapsed().as_millis() as u64;
+    ledger
+}
+
+/// The ledger for an engine that cannot say what it holds (#316 stage 4): the
+/// machine's memory as [`gather_with_bin`] reads it, with the residents
+/// unknown rather than none (#3074's rule). `why` names the engine that could
+/// not answer; it is a `warn` message and the attribution note, which would
+/// otherwise blame `lms ps`. Counting such an engine's model in the budget is
+/// stage 5 (ENGINES.md open question 2). Never errors, like [`gather_with_bin`].
+pub fn gather_residents_unknown(why: &str) -> ModelLedger {
+    let started = std::time::Instant::now();
+    let mut messages = vec![LedgerMessage::warn(why)];
+    let machine = gather_machine(&mut messages);
+    let mut ledger = compute_ledger(
+        LedgerInputs {
+            residents: Vec::new(),
+            catalog: Vec::new(),
+            arch: BTreeMap::new(),
+            pool: machine.pool,
+            budget_bytes: None,
+            swap_used_bytes: machine.swap_used_bytes,
+            compressor_bytes: machine.compressor_bytes,
+            margin_percent: machine.margin_percent,
+            workers: machine.workers,
+            residents_unknown: true,
+            messages,
+        },
+        now_ms(),
+    );
+    ledger.attribution_note = format!("{why}; worker footprint not attributed");
+    ledger.gather_ms = started.elapsed().as_millis() as u64;
+    ledger
+}
+
+/// What the kernel and process table say about the machine's memory,
+/// whatever engine holds it.
+struct MachineProbes {
+    pool: Option<PoolSnapshot>,
+    swap_used_bytes: Option<u64>,
+    compressor_bytes: Option<u64>,
+    margin_percent: Option<u64>,
+    workers: Option<Vec<WorkerProc>>,
+}
+
+/// The machine half of a gather: every probe bounded, each failure a message.
+fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
     // Kernel counters — ONE vm_stat read feeds the pool decomposition
     // (#1821), the compressor row, AND (unchanged) the memorystatus
     // pressure tile below.
-    let vm_stat = bounded_stdout("vm_stat", &[], "vm_stat", SYS_PROBE_BOUND, &mut messages);
+    let vm_stat = bounded_stdout("vm_stat", &[], "vm_stat", SYS_PROBE_BOUND, messages);
     let (used_bytes, available_bytes, free_bytes, compressor_bytes) = match vm_stat.as_deref() {
         Some(out) => parse_pool_from_vm_stat(out),
         None => (None, None, None, None),
     };
     let capacity_bytes =
-        bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, &mut messages)
+        bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, messages)
             .and_then(|s| s.trim().parse::<u64>().ok());
     let pool = capacity_bytes
         .map(|capacity_bytes| PoolSnapshot { capacity_bytes, used_bytes, available_bytes, free_bytes });
@@ -1620,7 +1687,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         &["-n", "vm.swapusage"],
         "vm.swapusage",
         SYS_PROBE_BOUND,
-        &mut messages,
+        messages,
     )
     .and_then(|s| parse_swapusage_used_bytes(&s));
     let margin_percent = bounded_stdout(
@@ -1628,7 +1695,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         &["-n", "kern.memorystatus_level"],
         "memorystatus",
         SYS_PROBE_BOUND,
-        &mut messages,
+        messages,
     )
     .and_then(|s| s.trim().parse::<u64>().ok());
 
@@ -1638,31 +1705,11 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         &["-axo", "pid=,rss=,command="],
         "ps-workers",
         SYS_PROBE_BOUND,
-        &mut messages,
+        messages,
     )
     .map(|out| enrich_with_footprint(parse_worker_rss(&out), phys_footprint));
 
-    let mut ledger = compute_ledger(
-        LedgerInputs {
-            residents,
-            catalog,
-            arch,
-            pool,
-            // #1243: no budget field is wired into config.json on main yet;
-            // when `runtime.max_model_ram_gb` lands, resolve it here and the
-            // Budget limit arm activates.
-            budget_bytes: None,
-            swap_used_bytes,
-            compressor_bytes,
-            margin_percent,
-            workers,
-            residents_unknown: ps_rows.is_none(),
-            messages,
-        },
-        now_ms(),
-    );
-    ledger.gather_ms = started.elapsed().as_millis() as u64;
-    ledger
+    MachineProbes { pool, swap_used_bytes, compressor_bytes, margin_percent, workers }
 }
 
 /// Resolves architecture facts for every distinct resident model key,

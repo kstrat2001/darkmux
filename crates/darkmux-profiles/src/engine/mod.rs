@@ -10,16 +10,19 @@
 //! The facade sits above the gestalt [`ModelHost`] port rather than widening
 //! it: `ModelHost` is the planner's lifecycle port with planner-minimal facts,
 //! while these questions read the full [`LoadedModel`] and [`ModelMeta`]. A
-//! backend with no lifecycle (a Messages endpoint, stage 4) answers
-//! [`Engine::host`] with `None` instead of a port full of `Unsupported` stubs.
+//! backend with no lifecycle ([`OpenAiCompatible`], stage 4) answers
+//! [`Engine::host`] with `None` instead of a port full of `Unsupported` stubs,
+//! and a question it cannot answer with [`NotReported`], never an empty answer.
 //!
 //! The facade takes identifiers verbatim and has no ownership method: the
 //! `darkmux:` namespace (contract 4) stays the LM Studio backend's mechanism,
 //! in `crate::ownership`.
 
 mod lmstudio;
+mod openai_compat;
 
 pub use lmstudio::LmStudio;
+pub use openai_compat::{OpenAiCompatible, MODELS_PROBE_BOUND};
 
 use anyhow::Result;
 use darkmux_gestalt::ModelHost;
@@ -47,8 +50,55 @@ pub struct ModelMeta {
     pub model_type: String,
 }
 
+/// What an engine can do, declared once by the engine and read by the core,
+/// which picks its behavior from the declaration and never from which engine
+/// it is (ENGINES.md section 3.1). An engine declares only what it really
+/// does; a variant joins an enum when an engine that declares it is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    pub residency: Residency,
+    pub loading: Loading,
+    /// [`Engine::unload`] works; otherwise it is [`NotReported`].
+    pub unload: bool,
+    /// The engine marks an instance as darkmux's (LM Studio's `darkmux:`
+    /// identifier, contract 4); without one, question 3's own record applies.
+    pub ownership_mark: bool,
+    pub catalog: CatalogFacts,
+}
+
+/// Whether the engine says which models it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// [`Engine::loaded`] lists each resident with its context.
+    Reported,
+    /// [`Engine::loaded`] and [`Engine::resident_ids`] are [`NotReported`].
+    NotReported,
+}
+
+/// How a model comes to be loaded on the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loading {
+    /// darkmux loads a model at a context it chooses ([`Engine::host`]).
+    Explicit,
+    /// darkmux cannot load or predict what the engine holds; it sends the
+    /// profile's model and says so.
+    Unknown,
+}
+
+/// Which facts each [`Engine::catalog`] row carries; a fact not carried is
+/// unknown, never zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogFacts {
+    pub size: bool,
+    pub context_limit: bool,
+    pub tool_training: bool,
+}
+
 /// A model server darkmux can ask questions of.
 pub trait Engine {
+    /// What this engine can do. The core reads this, never the engine's type.
+    fn capabilities(&self) -> Capabilities;
+
     /// Every model the engine has resident. `Ok(vec![])` means the engine
     /// reported none; anything it could not interpret is an `Err`.
     fn loaded(&self) -> Result<Vec<LoadedModel>>;
@@ -104,3 +154,59 @@ pub fn is_not_resident(err: &anyhow::Error) -> bool {
         Some(darkmux_gestalt::HostError::NotResident { .. })
     )
 }
+
+/// A question an engine cannot answer, such as which models a plain
+/// OpenAI-compatible server holds. Typed so a caller says so plainly instead of
+/// reading it as "none" (ENGINES.md section 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotReported {
+    /// The engine, as the operator named it (an endpoint id).
+    pub engine: String,
+    /// What it does not report, worded to follow "does not report".
+    pub question: &'static str,
+}
+
+impl std::fmt::Display for NotReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} does not report {}", self.engine, self.question)
+    }
+}
+
+impl std::error::Error for NotReported {}
+
+/// Whether an engine error is [`NotReported`]: the engine cannot answer, as
+/// opposed to failing to.
+pub fn is_not_reported(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotReported>().is_some()
+}
+
+/// The conformance check every engine's tests run against a live-enough fake:
+/// what [`Engine::capabilities`] declares is what the methods do. A declared
+/// capability whose method says [`NotReported`], or an undeclared one whose
+/// method answers, fails here rather than in the core.
+#[cfg(test)]
+pub(crate) fn assert_declaration_holds(engine: &dyn Engine, unload_probe: &str) {
+    let caps = engine.capabilities();
+    let says_not_reported = |r: Result<()>| r.err().is_some_and(|e| is_not_reported(&e));
+
+    let residency_unreported = [
+        says_not_reported(engine.loaded().map(|_| ())),
+        says_not_reported(engine.resident_ids().map(|_| ())),
+    ];
+    assert_eq!(
+        residency_unreported,
+        [caps.residency == Residency::NotReported; 2],
+        "residency {:?} disagrees with loaded/resident_ids",
+        caps.residency
+    );
+    assert_eq!(engine.host().is_some(), caps.loading == Loading::Explicit, "loading {:?} disagrees with host()", caps.loading);
+    assert_eq!(!says_not_reported(engine.unload(unload_probe)), caps.unload, "unload {} disagrees with unload()", caps.unload);
+    if let Ok(rows) = engine.catalog() {
+        assert!(!rows.is_empty(), "the fake must list a model for the catalog facts to be checked");
+        for m in &rows {
+            assert_eq!(m.size_bytes != 0, caps.catalog.size, "{}: size", m.model_key);
+            assert_eq!(m.max_context_length.is_some(), caps.catalog.context_limit, "{}: context limit", m.model_key);
+        }
+    }
+}
+

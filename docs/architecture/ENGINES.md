@@ -41,17 +41,47 @@ The first three belong to an engine darkmux **manages**; the rest are **observat
 | Backend | Answers |
 |---|---|
 | LM Studio | all of them: today's behavior, wrapped, not rewritten |
-| plain OpenAI-compatible server (Splash, lithos, `mlx_lm.server`, vLLM) | request, `GET /v1/models`, usage |
+| plain OpenAI-compatible server (Splash, lithos, `mlx_lm.server`, vLLM) | request, usage, and `GET /v1/models` as the models it would answer to, never as what it holds (built in 4.1: `engine::OpenAiCompatible`) |
 | Messages (Claude) | request, caching, usage; no load, no inventory |
 
 **Required contract for every endpoint:** an OpenAI-style chat API (or Messages), `GET /v1/models`, and usage in each response. **Optional capabilities** are declared per backend; where one is absent, darkmux says so plainly instead of reading `loaded:false` or passing a doctor row vacuously. Endpoints in `profiles.json` become instances of a backend, so a profile means the same thing whatever serves it (contract 1).
+
+### 3.1 Capabilities: each engine declares them, the core derives its policy
+
+Engines differ by design, and that is the point of the facade, not a problem to flatten (operator, 2026-10-16: "these engines were always going to have their different policies … design the core to use all of them, and take advantage of special features in the more mature ones"). So no darkmux surface asks "is this LM Studio?". Each engine declares what it can do, along a few axes, and the core reads the declaration and picks its behavior. A mature engine declares more and gets more; a bare one still works, with the missing parts said plainly.
+
+| Axis | Values | Core behavior it drives |
+|---|---|---|
+| **Residency** | reported, with context (LM Studio `lms ps`) · served list is the resident list · not reported | headroom rows, the machine card's `loaded`, dispatch's resolution probe; "not reported" is said, never shown as empty |
+| **Loading** | explicit, at a chosen context (LM Studio) · on request, one model at a time (`mlx_lm.server`) · fixed at start · none (hosted) | the residency preflight: load at the profile's context · send the profile's model and disclose that the engine will switch to it · refuse a model the engine does not serve · skip |
+| **Unload** | an API · none | eject and cleanup, within question 3 (only what darkmux loaded) |
+| **Ownership mark** | a tag on the loaded instance (LM Studio's `darkmux:` identifier) · none | how question 3 knows what darkmux loaded: the tag, or darkmux's own record |
+| **Catalog facts** | per field: size, context limit, tool training | `init`'s sizing against the RAM budget; a missing fact is unknown, never 0 or "fits" |
+| **Stream extras** | prompt-processing progress (#3210), cached-token counts, a queue position | the scope's PROMPT percentage, cache reporting; read by a recognizer per engine, normalized into one neutral fact |
+| **Request extras** | prompt caching (Messages), a progress opt-in (llama.cpp) | sent only where the engine declares them |
+
+What each engine declares, and how sure it is:
+
+| Engine | Residency | Loading | Unload | Mark | Source |
+|---|---|---|---|---|---|
+| LM Studio | reported, with context and queue | explicit at a context; also loads a bare key on request at its 4096 default, which the `darkmux:` identifier on the wire avoids (#2240) | API | tag | today's code |
+| `mlx_lm.server` | not reported | on request, one at a time | none | none | its source at 0.32.1 (4.1); prefill progress measured on 0.31.3 (#3210) |
+| vLLM | served list is resident (unverified) | fixed at start (unverified) | none (unverified) | none | to check before its declaration is written |
+| Messages (Claude) | none: no residency concept | none | none | none | the API; prompt caching shipped (#3162, #3173) |
+
+**Built in 4.1:** `Engine::capabilities()` returns `engine::Capabilities` (residency, loading, unload, ownership mark, catalog facts). Its enums carry only the values a built engine declares (residency `Reported`/`NotReported`, loading `Explicit`/`Unknown`); "on request", "fixed" and the stream and request extras join with the engine that declares them. Like a graphics driver's caps, a declaration is only as good as its check: `engine::assert_declaration_holds` runs in each engine's tests against its fake and fails when a declared capability's method says `NotReported`, or an undeclared one answers. The ownership mark and tool-training facts have no method to check against and are declared, not checked.
+
+One known gap: 4.1's catalog rows carry size 0 for "unknown", because `ModelMeta.size_bytes` is not optional; it becomes optional before `init` sizes anything against it (4.4).
+
+`OpenAiCompatible` (4.1) starts as the most conservative declaration: residency not reported, no loading or unload darkmux drives, no mark. A finer declaration per engine (an `mlx_lm.server` that loads on request, a vLLM whose list is its residents) is a variant of it, chosen by what `init` detects or by the endpoint's config, and each one is verified against the engine before it is written down (section 9).
 
 ## 4. Open questions (operator decisions, not to be settled in code)
 
 1. **Does darkmux start and stop engines itself** (for example `mlx_lm.server` at the right model and context), or only adopt servers the operator started? **Decided (operator, 2026-10-16): only servers the operator started.** darkmux never starts or stops an engine process. Some engines run in the background on their own (LM Studio), so darkmux finds them already running and adopts them; for one that is not running, darkmux says so and names the command to start it, rather than starting it. Within an adopted engine that has a load lifecycle (LM Studio), darkmux still loads and unloads its own models as today.
 2. **One memory budget per machine across backends.** Today the budget knows only LM Studio's models. **Decided (operator, 2026-10-16): memory is budgeted per machine.** There is one budget for the machine's memory, whatever engine holds a model, so a model one engine serves counts against the headroom another engine loads into. Measured the same day: with Muse Glimmer 30B served by `mlx_lm.server`, `darkmux machine resources` folded its 33 GB into "other tenants" with no model row, and an LM Studio load would have been planned without it.
-3. **Contract 4 generalizes** from "`darkmux:<model>` in LM Studio" to "darkmux manages only what it started, on any backend". **Decided (operator, 2026-10-16): darkmux unloads only what it loaded, on every engine.** On LM Studio that stays the `darkmux:` name. An engine with a load and unload API but no way to tag a model is covered by a record darkmux keeps of each model it loaded there; it unloads only those, never a model the operator loaded. If the engine restarts and the record goes stale, a stale entry fails safe: darkmux reports it and unloads nothing it cannot match. An engine with no unload (`mlx_lm.server`, which serves the model it was started with) has nothing darkmux may unload, since stopping the server is ruled out by question 1.
+3. **Contract 4 generalizes** from "`darkmux:<model>` in LM Studio" to "darkmux manages only what it started, on any backend". **Decided (operator, 2026-10-16): darkmux unloads only what it loaded, on every engine.** On LM Studio that stays the `darkmux:` name. An engine with a load and unload API but no way to tag a model is covered by a record darkmux keeps of each model it loaded there; it unloads only those, never a model the operator loaded. If the engine restarts and the record goes stale, a stale entry fails safe: darkmux reports it and unloads nothing it cannot match. An engine with no unload API (`mlx_lm.server`) has nothing darkmux may unload, since stopping the server is ruled out by question 1. (Corrected in 4.1: `mlx_lm.server` does not only serve the model it was started with. It loads whichever model a request names and drops the one it held; see question 5 and section 3.1.)
 4. **Versioning.** Each stage below is behavior-preserving or additive and can ship in a minor. The doctrine line in `CLAUDE.md` is replaced when stage 3 lands, and the decision is recorded. **Recorded (stage 3.7):** stage 3 ships in a minor, since no wire, `--json`, config or profile shape changed; the `CLAUDE.md` line now reads "one engine facade, LM Studio its only backend today", and `docs/agents/LAYOUT.md` and `DESIGN.md` say the same.
+5. **Dispatch to an engine that switches models on request.** Found in 4.1, reading `mlx_lm/server.py` at mlx-lm 0.32.1: `mlx_lm.server` holds one model, loads whichever model a request names (`ModelProvider._load` drops the old one first), and its `GET /v1/models` lists every MLX model in the Hugging Face cache plus the one it was started with, never which one it holds. **Direction (operator, 2026-10-16): no single policy; each engine declares its capabilities and the core derives its behavior from them (section 3.1).** For this engine that means "loading: on request, one at a time": dispatch sends the model the profile names and says that the engine will switch to it. The exact wording and where it is said are 4.3's to propose.
 
 ## 5. Method: decomplicate before changing features
 
@@ -92,7 +122,7 @@ Off the path (left to the ratchet as files are touched, except cheap 0%-coverage
 | 1 | `run_dispatch`: boundary tests, mutation-proved, then split by responsibility | `run_dispatch` under complexity 20; every moved branch pinned; one live dispatch identical | done: #3233, #3234, #3235 (132 → 3) |
 | 2 | `dispatch_internal::dispatch` and the telemetry sampler, same method | both under 20; live dispatch identical | done: #3237, #3238 (`dispatch` 78 → 6, `run_telemetry_sampler` 37 → 3) |
 | 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged | done: #3241, #3244 to #3246, #3248 to #3250 (section 8.4); live coder dispatch on `deep` 2026-10-16 |
-| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent; a default engine per machine, which `init` detects and records | unmanaged endpoints stop being special cases; #3209 to #3211 fall out; a machine with no LM Studio (a Linux box serving `mlx_lm.server`) runs `init` and dispatch with no hand-edited config | designed: section 9 |
+| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent; a default engine per machine, which `init` detects and records | unmanaged endpoints stop being special cases; #3209 to #3211 fall out; a machine with no LM Studio (a Linux box serving `mlx_lm.server`) runs `init` and dispatch with no hand-edited config | in progress: 4.1 (the OpenAI-compatible engine type, not yet wired) |
 | 5 | one memory budget per machine across backends (open question 2, decided) | a model served by any local engine is a row in `machine resources` and counts in the headroom checks and load planning; nothing an engine holds reads as "other tenants" | |
 
 Numbering note: the titles of #3237 and #3238 say "stage 2" and "stage 3"; both are this table's stage 2. Stage 3 is the facade below.
@@ -184,7 +214,7 @@ One config key, **`default_engine`**: the engine `engine::local()` returns on th
    - **several answer:** suggest LM Studio, list the others with what each serves, and let the operator choose;
    - **none answer:** say so, naming every address probed and the command that starts each engine; write nothing.
 4. **Record:** a non-LM Studio choice is written as an endpoint in `profiles.json` (if it is not one already) and as `default_engine` in `config.json`, and named in `init`'s report like the files it already writes. `--dry-run` prints the same plan and writes nothing (`src/init.rs:34`). `init` does not prompt today; when several engines answer it asks, and with no terminal to ask on it takes LM Studio and says which others it saw.
-5. **Plan the models from what that engine can answer.** On LM Studio, unchanged: pick from the catalog, sized to the RAM budget. On a plain OpenAI-compatible engine, the only choice is among the models it already serves (`GET /v1/models`); `init` cannot pick a model to load or a context to load it at, and says so instead of guessing. darkmux does not start `mlx_lm.server` itself (open question 1, decided: it adopts only servers the operator started), so its model and context are whatever the operator started it with.
+5. **Plan the models from what that engine can answer.** On LM Studio, unchanged: pick from the catalog, sized to the RAM budget. On a plain OpenAI-compatible engine, the only choice is among the models it would answer to (`GET /v1/models`, which on `mlx_lm.server` is its whole Hugging Face cache, not what it holds); `init` cannot pick a context to load at, and says so instead of guessing. darkmux does not start `mlx_lm.server` itself (open question 1, decided: it adopts only servers the operator started). Which model a dispatch may name there is open question 5.
 
 `init` records the choice once, rather than dispatch re-detecting on every run: an engine that happens to be down one morning must not silently move the machine to another one. A down default engine is an error that names it, with the command to start it.
 
@@ -195,7 +225,7 @@ One config key, **`default_engine`**: the engine `engine::local()` returns on th
 | `engine::local()` | returns that endpoint's backend; `host()` is `None` (no load lifecycle), so residency and eject say "this engine has no load lifecycle" instead of calling `lms` |
 | `darkmux doctor` | a row for the setting and its source, a reachability row for that engine, and the LM Studio rows marked not applicable rather than failing or passing vacuously (section 3) |
 | dispatch | a profile on the local engine sends to that endpoint; the residency preflight is skipped plainly, as it is for `url` endpoints today |
-| machine card, serve | report the engine by name, and `loaded` from `GET /v1/models` where that is all the engine can say |
+| machine card, serve | report the engine by name, and say plainly that it does not report what it has loaded (`engine::NotReported`); `GET /v1/models` is not a residency list (open question 5) |
 
 ### 9.4 Not decided here
 
