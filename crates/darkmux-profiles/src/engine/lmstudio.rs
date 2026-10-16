@@ -1,7 +1,7 @@
 //! The LM Studio backend of the [`Engine`] facade: each method is one call
 //! to today's `crate::lms` function or [`LmsHost`], unchanged.
 
-use super::{Engine, ModelMeta};
+use super::{Capabilities, CatalogFacts, Engine, Loading, ModelMeta, Residency};
 use crate::model_ledger::ModelLedger;
 use crate::gestalt_host::LmsHost;
 use crate::lms;
@@ -15,6 +15,16 @@ use std::process::Command;
 pub struct LmStudio;
 
 impl Engine for LmStudio {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            residency: Residency::Reported,
+            loading: Loading::Explicit,
+            unload: true,
+            ownership_mark: true,
+            catalog: CatalogFacts { size: true, context_limit: true, tool_training: true },
+        }
+    }
+
     fn loaded(&self) -> Result<Vec<LoadedModel>> {
         lms::list_loaded()
     }
@@ -109,7 +119,7 @@ mod tests {
     const FAKE_LMS: &str = r#"#!/bin/sh
 case "$1" in
   ps) echo '[{"identifier":"darkmux:m","modelKey":"m","status":"idle","sizeBytes":1000000000,"contextLength":4096}]' ;;
-  ls) echo '[{"modelKey":"m","displayName":"M","publisher":"p","sizeBytes":1000000000,"type":"llm"}]' ;;
+  ls) echo '[{"modelKey":"m","displayName":"M","publisher":"p","sizeBytes":1000000000,"maxContextLength":32768,"trainedForToolUse":true,"type":"llm"}]' ;;
   unload) [ "$2" = "x" ] && exit 0; echo "Model Not Found: $2" >&2; exit 1 ;;
   --version) echo 'CLI commit: abc1234' ;;
   *) exit 1 ;;
@@ -143,6 +153,7 @@ esac
         let version = engine.version();
         let ledger: Vec<String> = engine.ledger().models.into_iter().map(|m| m.identifier).collect();
         let binary = engine.binary();
+        crate::engine::assert_declaration_holds(engine.as_ref(), "x");
 
         unsafe {
             match prev {

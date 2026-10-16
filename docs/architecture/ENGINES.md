@@ -69,6 +69,8 @@ What each engine declares, and how sure it is:
 | vLLM | served list is resident (unverified) | fixed at start (unverified) | none (unverified) | none | to check before its declaration is written |
 | Messages (Claude) | none: no residency concept | none | none | none | the API; prompt caching shipped (#3162, #3173) |
 
+**Built in 4.1:** `Engine::capabilities()` returns `engine::Capabilities` (residency, loading, unload, ownership mark, catalog facts). Its enums carry only the values a built engine declares (residency `Reported`/`NotReported`, loading `Explicit`/`Unknown`); "on request", "fixed" and the stream and request extras join with the engine that declares them. Like a graphics driver's caps, a declaration is only as good as its check: `engine::assert_declaration_holds` runs in each engine's tests against its fake and fails when a declared capability's method says `NotReported`, or an undeclared one answers. The ownership mark and tool-training facts have no method to check against and are declared, not checked.
+
 One known gap: 4.1's catalog rows carry size 0 for "unknown", because `ModelMeta.size_bytes` is not optional; it becomes optional before `init` sizes anything against it (4.4).
 
 `OpenAiCompatible` (4.1) starts as the most conservative declaration: residency not reported, no loading or unload darkmux drives, no mark. A finer declaration per engine (an `mlx_lm.server` that loads on request, a vLLM whose list is its residents) is a variant of it, chosen by what `init` detects or by the endpoint's config, and each one is verified against the engine before it is written down (section 9).

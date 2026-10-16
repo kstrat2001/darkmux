@@ -13,7 +13,7 @@
 //! drives ([`Engine::host`] is `None`) and nothing darkmux may unload (ENGINES.md
 //! open questions 1 and 3).
 
-use super::{Engine, ModelMeta, NotReported};
+use super::{Capabilities, CatalogFacts, Engine, Loading, ModelMeta, NotReported, Residency};
 use crate::model_ledger::ModelLedger;
 use anyhow::{Context, Result};
 use darkmux_gestalt::ModelHost;
@@ -89,6 +89,17 @@ fn parse_model_ids(body: &serde_json::Value) -> Result<Vec<String>> {
 }
 
 impl Engine for OpenAiCompatible {
+    /// The most conservative declaration: a list of ids and nothing else.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            residency: Residency::NotReported,
+            loading: Loading::Unknown,
+            unload: false,
+            ownership_mark: false,
+            catalog: CatalogFacts { size: false, context_limit: false, tool_training: false },
+        }
+    }
+
     fn loaded(&self) -> Result<Vec<LoadedModel>> {
         Err(self.not_reported("which models it has loaded"))
     }
@@ -236,6 +247,13 @@ mod tests {
         assert!(engine.host().is_none());
         assert!(engine.binary().is_none());
         assert!(engine.version().is_none());
+    }
+
+    #[test]
+    fn its_declaration_matches_what_it_does() {
+        let (base, server) = serve(ok_json(MLX_MODELS), 1);
+        crate::engine::assert_declaration_holds(&OpenAiCompatible::new("mlx", base), "m");
+        server.join().unwrap();
     }
 
     #[test]
