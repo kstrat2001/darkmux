@@ -1409,7 +1409,9 @@ fn a_tool_granting_role_on_a_hosted_endpoint_runs_in_the_container_with_the_secr
     assert!(argv[..rt].contains(&"-i".to_string()), "stdin is opened for the secret: {argv:?}");
     for (flag, value) in [
         ("--model", "gpt-remote"),
-        ("--chat-url", "http://127.0.0.1:9/v1/chat/completions"),
+        // (#3209) Dialed from inside the container, so a loopback endpoint
+        // reaches the host; the recorded endpoint below keeps 127.0.0.1.
+        ("--chat-url", "http://host.docker.internal:9/v1/chat/completions"),
         ("--context-window", "100000"),
         // ODDITY: the LM Studio base still rides along on a hosted brain.
         ("--base-url", "http://host.docker.internal:1234/v1"),
