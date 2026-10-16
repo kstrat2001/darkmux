@@ -37,9 +37,9 @@ pub mod profiles;
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
 /// loader) adds that pass. Every endpoint is checked, not only the ones this
 /// run would call: bad config is bad config (#2947). A registry that cannot
-/// be loaded adds nothing here but the `default_engine` check, run against an
-/// empty registry (only `lmstudio` passes); the entry point reports the load
-/// failure itself when it resolves a profile.
+/// be loaded adds nothing here but the `default_engine` check: only
+/// `lmstudio` passes, and any other value is refused naming the load error;
+/// the entry point reports the load failure itself when it resolves a profile.
 pub fn preflight(
     scope: darkmux_types::config_enum::Scope,
 ) -> Result<(), darkmux_types::config_enum::PreflightRefusal> {
@@ -66,10 +66,10 @@ pub fn preflight_with(
                 refusal.files.extend(profiles::user_file_problem(&loaded.path));
             }
             // With no registry no endpoint id can be checked, so only
-            // `lmstudio` passes: never read as LM Studio by default.
-            Err(_) => refusal
+            // `lmstudio` passes, and the refusal names the load error.
+            Err(e) => refusal
                 .invalid
-                .extend(darkmux_types::default_engine::invalid(&darkmux_types::ProfileRegistry::default())),
+                .extend(darkmux_types::default_engine::invalid_without_registry(&format!("{e:#}"))),
         }
     }
     refusal.into_result()
@@ -173,7 +173,7 @@ mod user_file_tests {
         }
         assert_eq!(lmstudio, Ok(()));
         let msg = no_registry.expect_err("no registry is not a pass").to_string();
-        assert!(msg.contains("`azur` is neither"), "{msg}");
+        assert!(msg.contains("`azur` names an endpoint, but the profile registry"), "{msg}");
     }
 
     #[test]

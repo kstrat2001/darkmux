@@ -488,9 +488,12 @@ fn check_default_engine(key: &str, value: &str) -> Result<()> {
     if key != default_engine::KEY {
         return Ok(());
     }
-    let registry = darkmux_profiles::profiles::load_registry_quiet(None).map(|l| l.registry).unwrap_or_default();
-    default_engine::resolve(value, darkmux_types::config_access::Source::Config, &registry)
-        .map(|_| ())
+    let source = darkmux_types::config_access::Source::Config;
+    match darkmux_profiles::profiles::load_registry_quiet(None) {
+        Ok(l) => default_engine::resolve(value, source, &l.registry),
+        Err(e) => default_engine::resolve_without_registry(value, source, &format!("{e:#}")),
+    }
+    .map(|_| ())
         .map_err(|e| anyhow!("invalid value for `{key}`: {}. valid: {}", e.problem, e.valid))
 }
 

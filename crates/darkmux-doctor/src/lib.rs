@@ -4013,13 +4013,16 @@ fn check_endpoints() -> Check {
 }
 
 /// (#316) `default_engine`: the engine this machine's local models run on.
-/// Checked against the profile registry, which defines its endpoint ids; a
-/// registry that cannot be loaded is checked as an empty one (the
-/// `profile registry` row names why it failed).
+/// Checked against the profile registry, which defines its endpoint ids; with
+/// no loadable registry only `lmstudio` passes and the load error is named.
 fn check_default_engine() -> Check {
-    let registry = profiles::load_registry(None).map(|l| l.registry).unwrap_or_default();
+    use darkmux_types::default_engine;
     let (raw, source) = darkmux_types::config_access::default_engine_with_source();
-    default_engine_status(darkmux_types::default_engine::resolve(&raw, source, &registry), source)
+    let resolved = match profiles::load_registry(None) {
+        Ok(l) => default_engine::resolve(&raw, source, &l.registry),
+        Err(e) => default_engine::resolve_without_registry(&raw, source, &format!("{e:#}")),
+    };
+    default_engine_status(resolved, source)
 }
 
 /// Pure decision for [`check_default_engine`].

@@ -86,6 +86,36 @@ pub fn invalid(reg: &ProfileRegistry) -> Vec<InvalidSetting> {
     current(reg).err().into_iter().collect()
 }
 
+/// [`resolve`] when the profile registry could not be loaded (`load_error`
+/// says why): `lmstudio` needs no registry; any other value cannot be checked
+/// and is refused naming the load error, never blamed for it.
+pub fn resolve_without_registry(
+    raw: &str,
+    source: Source,
+    load_error: &str,
+) -> Result<EngineChoice, InvalidSetting> {
+    if raw.trim().eq_ignore_ascii_case(LMSTUDIO) {
+        return Ok(EngineChoice::Lmstudio);
+    }
+    Err(InvalidSetting {
+        set_in: set_in(source),
+        problem: format!(
+            "`{}` names an endpoint, but the profile registry that defines it could not be loaded: {load_error}",
+            raw.trim()
+        ),
+        valid: valid_line(&ProfileRegistry::default()),
+    })
+}
+
+/// The preflight pass when the registry could not be loaded.
+pub fn invalid_without_registry(load_error: &str) -> Vec<InvalidSetting> {
+    let (raw, source) = crate::config_access::default_engine_with_source();
+    resolve_without_registry(&raw, source, load_error)
+        .err()
+        .into_iter()
+        .collect()
+}
+
 /// The command that changes the value where it was set.
 pub fn fix(set_in: &SetIn) -> String {
     match set_in {
@@ -212,6 +242,24 @@ mod tests {
         assert_eq!(
             resolve("mlx", Source::Config, &empty).unwrap_err().valid,
             "`lmstudio`, or the id of an OpenAI-compatible endpoint in profiles.json (none defined)"
+        );
+    }
+
+    /// A registry that cannot be loaded is named as the cause, never the
+    /// value: a typo in profiles.json must not read as a bad engine id.
+    #[test]
+    fn without_a_registry_only_lmstudio_passes_and_the_load_error_is_named() {
+        assert_eq!(
+            resolve_without_registry(" LMStudio ", Source::Config, "e"),
+            Ok(EngineChoice::Lmstudio)
+        );
+        let err =
+            resolve_without_registry("mlx", Source::Env, "expected `,` at line 3").unwrap_err();
+        assert_eq!(err.set_in, SetIn::Env(ENV));
+        assert_eq!(
+            err.problem,
+            "`mlx` names an endpoint, but the profile registry that defines it could not be loaded: \
+             expected `,` at line 3"
         );
     }
 
