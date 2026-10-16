@@ -20,7 +20,8 @@
 //!   failure can be classified into the `Eq` [`HostError`] vocabulary the
 //!   packet-3 executor matches on, instead of an opaque anyhow bail.
 
-use crate::lms::{lms_bin, pin_cwd};
+use crate::lms::lms_bin;
+use crate::process::pin_cwd;
 use darkmux_gestalt::{CatalogFact, Deadline, HostError, LoadReport, ModelHost, ResidentFact};
 use darkmux_gestalt::OwnedTarget;
 use std::process::{Command, Stdio};

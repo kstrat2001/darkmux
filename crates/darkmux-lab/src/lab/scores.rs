@@ -158,10 +158,10 @@ impl MachineFingerprint {
         // otherwise inherit a now-deleted directory and fail outright
         // rather than degrade to `None`. Neither `sw_vers` nor `lms` reads
         // or writes relative to cwd, so pin both via the one named helper
-        // (`darkmux_profiles::lms::pin_cwd` — see its doc comment for why
-        // `/`) rather than each repeating `.current_dir("/")` inline.
+        // (`darkmux_profiles::process::pin_cwd` — see its doc comment for
+        // why `/`) rather than each repeating `.current_dir("/")` inline.
         let mut sw_vers_cmd = std::process::Command::new("sw_vers");
-        darkmux_profiles::lms::pin_cwd(&mut sw_vers_cmd);
+        darkmux_profiles::process::pin_cwd(&mut sw_vers_cmd);
         let os_version = sw_vers_cmd
             .arg("-productVersion")
             .output()
@@ -169,23 +169,11 @@ impl MachineFingerprint {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty());
-        // `lms --version` emits one plain line (`CLI commit: efce996`);
-        // bare `lms version` emits a multi-line ANSI-art banner, which the
-        // first tool-bench live run stored verbatim as the fingerprint.
-        //
-        // (#1939) Resolved through the one `env > config.lms_bin > "lms"`
-        // precedence home, not a literal — an operator who set `lms_bin` to
-        // a non-default path otherwise gets an `engine_version` fingerprint
-        // that describes a DIFFERENT binary than the one that served the
-        // run (or a silently absent version if bare `lms` isn't on PATH).
-        let mut lms_version_cmd = std::process::Command::new(darkmux_types::config_access::lms_bin());
-        darkmux_profiles::lms::pin_cwd(&mut lms_version_cmd);
-        let engine_version = lms_version_cmd
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| clean_engine_version(&String::from_utf8_lossy(&o.stdout)));
+        // (#316 stage 3.6) The engine reports its own version line; the
+        // fingerprint keeps only the cleaned form.
+        let engine_version = darkmux_profiles::engine::local()
+            .version()
+            .and_then(|v| clean_engine_version(&v));
         Self::from_probes(
             machine_id,
             hw,
@@ -676,6 +664,30 @@ pub(crate) fn is_infra_failure(produced_no_usable_output: bool, m: Option<&Envel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#316 stage 3.6) The fingerprint's engine version is the local
+    /// engine's own version line, cleaned, and names the engine.
+    #[test]
+    #[serial_test::serial]
+    fn detect_records_the_local_engines_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("lms");
+        std::fs::write(&bin, "#!/bin/sh\n[ \"$1\" = --version ] || exit 1\necho 'CLI commit: abc1234'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let fp = MachineFingerprint::detect("m");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        assert_eq!(fp.engine_version.as_deref(), Some("CLI commit: abc1234"));
+        assert_eq!(fp.engine.as_deref(), Some("lmstudio"));
+    }
 
     #[test]
     fn clean_engine_version_accepts_a_plain_line_and_rejects_banners() {

@@ -8,14 +8,16 @@
 //! spawns through it. Three spawns bypass that chokepoint by construction —
 //! `darkmux-profiles::lms::load_with_identifier` (bespoke stdio-inheriting
 //! load loop), `darkmux-crew::dispatch_internal::probe_loaded_model_list`
-//! (a direct `lms ps --json` shell-out on the dispatch path), and
+//! (a direct `lms ps --json` shell-out on the dispatch path; since #316
+//! stage 3.6 the LM Studio backend's `resident_ids()`), and
 //! `darkmux-lab::lab::scores::MachineFingerprint::detect` (a lab-run
 //! hardware fingerprint) — and each carried its OWN copy of
 //! `cmd.current_dir("/")` with nothing protecting it. Proven: DELETING
 //! `load_with_identifier`'s pin line and running `cargo test -p
 //! darkmux-profiles` left all 213 tests green.
 //!
-//! #2534's fix names the pin — `darkmux_profiles::lms::pin_cwd` — and calls
+//! #2534's fix names the pin — `darkmux_profiles::process::pin_cwd` since #316
+//! stage 3.6, first `lms::pin_cwd` — and calls
 //! it from all four sites (the three bypasses plus `run_bounded` itself, so
 //! there is exactly ONE place the rule is written). This module is the test
 //! that keeps a FIFTH spawn from joining unnoticed.
@@ -51,7 +53,7 @@
 //!     unrelated `Command::new(&self.something)` elsewhere without
 //!     hardcoding `LmsHost`'s type.
 //!   - `crate::model_ledger::bounded_stdout` (`Command::new(bin)`, in this
-//!     crate's `model_ledger.rs`), reached live from `gather()` →
+//!     crate's `model_ledger.rs`), reached live from the LM Studio backend's `ledger()` →
 //!     `gather_with_bin` for the `lms` probe. The binary is bound to a
 //!     local BEFORE the spawn, so neither literal shape ever appears on the
 //!     spawn line.

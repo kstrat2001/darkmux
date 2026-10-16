@@ -2,13 +2,14 @@
 //! hardcoded `"lms"` literal — every spawn resolves the name through
 //! `darkmux_types::config_access::lms_bin()` (directly, or via one of this
 //! workspace's thin wrappers around it: `darkmux_profiles::lms::lms_bin()`,
-//! `LmsHost::new()`'s `bin: lms_bin()`, `model_ledger::gather()`'s
-//! `crate::lms::lms_bin()`), which resolves
+//! `LmsHost::new()`'s `bin: lms_bin()`, the LM Studio backend's `ledger()`
+//! (`crate::lms::lms_bin()`)), which resolves
 //! `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` (#661 Slice 4).
 //!
 //! `crates/darkmux-lab/src/lab/scores.rs` (the bench fingerprint's
 //! `engine_version` probe) and `crates/darkmux-crew/src/dispatch_internal.rs`
-//! (`probe_loaded_model_list`, on the live dispatch path) each spawned
+//! (`probe_loaded_model_list`, on the live dispatch path; both now the LM
+//! Studio backend's `version()` and `resident_ids()`, #316) each spawned
 //! `Command::new("lms")` directly — silently ignoring an operator's
 //! `lms_bin` override, either producing a fingerprint/probe result from the
 //! WRONG binary or nothing at all if bare `lms` isn't on `PATH`. That is the
@@ -33,7 +34,7 @@
 //!     a local bound to some unrelated string. The escape template already
 //!     lives in this very crate (`model_ledger.rs`'s `bounded_stdout`,
 //!     `Command::new(bin)` — legitimate there because `bin` is bound to
-//!     `lms_bin()` a few lines up via `gather()`), which is exactly why a
+//!     `lms_bin()` by the LM Studio backend's `ledger()`), which is exactly why a
 //!     text scan cannot be trusted to rule this class out in general —
 //!     only to catch the ONE spelling of the mistake this codebase has
 //!     actually made twice.
@@ -202,19 +203,20 @@ fn the_scan_sees_real_files_and_the_1939_fix_sites() {
         roots.len()
     );
 
-    let scores_path = workspace_root().join("crates/darkmux-lab/src/lab/scores.rs");
-    let scores = std::fs::read_to_string(&scores_path).unwrap_or_else(|e| panic!("reading {}: {e}", scores_path.display()));
-    assert!(
-        scores.contains("config_access::lms_bin()"),
-        "scores.rs no longer resolves its engine-version probe through the accessor — did #1939 regress?"
-    );
-
-    let dispatch_path = workspace_root().join("crates/darkmux-crew/src/dispatch_internal.rs");
-    let dispatch = std::fs::read_to_string(&dispatch_path).unwrap_or_else(|e| panic!("reading {}: {e}", dispatch_path.display()));
-    assert!(
-        dispatch.contains("config_access::lms_bin()"),
-        "dispatch_internal.rs's probe_loaded_model_list no longer resolves through the accessor — did #1939 regress?"
-    );
+    // (#316 stage 3.6) Both #1939 fix sites moved verbatim into the LM
+    // Studio backend: the lab fingerprint's engine-version probe is
+    // `version()`, dispatch's `probe_loaded_model_list` is `resident_ids()`.
+    let backend_path = workspace_root().join("crates/darkmux-profiles/src/engine/lmstudio.rs");
+    let backend = std::fs::read_to_string(&backend_path).unwrap_or_else(|e| panic!("reading {}: {e}", backend_path.display()));
+    for method in ["fn version(", "fn resident_ids("] {
+        let start = backend.find(method).unwrap_or_else(|| panic!("lmstudio.rs has no `{method}`"));
+        let body = &backend[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("config_access::lms_bin()"),
+            "the LM Studio backend's `{method}` no longer resolves through the accessor — did #1939 regress?"
+        );
+    }
 }
 
 /// Third control: this module's own doc comment quotes the antipattern

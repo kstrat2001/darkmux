@@ -12929,7 +12929,7 @@ fn resolve_dispatch_internal(
         skip_lmstudio_residency,
         allow_utility_model,
         &ensure_model_loaded_at_ctx,
-        &probe_loaded_model_list,
+        &|| engine::local().resident_ids(),
     )
 }
 
@@ -14157,48 +14157,6 @@ fn map_load_result(
     }
 }
 
-fn probe_loaded_model_list() -> Result<Vec<String>> {
-    // (#1863, named+tested #2534) This spawn bypasses darkmux-profiles'
-    // `run_bounded` chokepoint entirely — it shells out to `lms` directly on
-    // the dispatch path — so it needs its own cwd pin. A daemon/dispatch
-    // process started from a git worktree that later gets deleted (routine
-    // in this project's own workflow) otherwise inherits a cwd that no
-    // longer exists, and spawning any child from it fails outright.
-    // `darkmux_profiles::lms::pin_cwd` is the one place this rule is
-    // written; see its doc comment for why `/`.
-    //
-    // (#1939 sibling) Resolved through `darkmux_types::config_access::lms_bin()`
-    // — the one `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` precedence
-    // home — rather than a literal, so an operator's override is honored on
-    // this dispatch-path probe the same as everywhere else.
-    let mut cmd = Command::new(darkmux_types::config_access::lms_bin());
-    darkmux_profiles::lms::pin_cwd(&mut cmd);
-    let output = cmd
-        .args(["ps", "--json"])
-        .output()
-        .context("running `lms ps --json` to enumerate loaded models")?;
-    if !output.status.success() {
-        bail!(
-            "`lms ps --json` failed (exit {})",
-            output.status.code().unwrap_or(-1)
-        );
-    }
-    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("parsing `lms ps --json` output")?;
-    let mut ids = Vec::new();
-    if let Some(arr) = body.as_array() {
-        for entry in arr {
-            // Both forms a profile id could match against.
-            if let Some(key) = entry["modelKey"].as_str() {
-                ids.push(key.to_string());
-            }
-            if let Some(ident) = entry["identifier"].as_str() {
-                ids.push(ident.to_string());
-            }
-        }
-    }
-    Ok(ids)
-}
 
 // `first_user_symlink_in` and `is_macos_firmlink` moved to
 // `darkmux_types::workdir` as part of Wave-E.2 (#255). Runners + both runtime

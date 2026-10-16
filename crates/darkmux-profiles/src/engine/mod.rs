@@ -65,6 +65,22 @@ pub trait Engine {
     /// The engine's load lifecycle as the planner's port, or `None` when the
     /// engine has none (darkmux cannot load or evict models there).
     fn host(&self) -> Option<Box<dyn ModelHost>>;
+
+    /// The identifiers and model keys of every resident instance, both forms
+    /// a profile id could match. Dispatch's resolution probe; unlike
+    /// [`Engine::loaded`] it is one unbounded spawn with no text fallback,
+    /// moved as it was (ENGINES.md section 8.2).
+    fn resident_ids(&self) -> Result<Vec<String>>;
+
+    /// The engine's own version line, unparsed, or `None` when it could not
+    /// say. A lab fingerprint field; never an error.
+    fn version(&self) -> Option<String>;
+
+    /// The residency ledger (what is loaded, what it costs, what is free):
+    /// the machine page's `/machine/resources`, `darkmux machine resources`
+    /// and the doctor's unpriceable check. Never errors: every probe degrades
+    /// to a warning in the ledger.
+    fn ledger(&self) -> crate::model_ledger::ModelLedger;
 }
 
 /// The engine on this machine. Today that is always LM Studio, resolving its

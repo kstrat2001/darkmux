@@ -1060,6 +1060,32 @@
         assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
     }
 
+    /// (#316 stage 3.6) GET /machine/resources is the local engine's ledger:
+    /// the resident `lms ps` reports is its row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_resources_carries_the_engines_residents() {
+        let tmp = TempDir::new().unwrap();
+        let bin = fake_lms_with_one_resident(tmp.path());
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let response = build_router_local(PathBuf::new())
+            .oneshot(Request::builder().uri("/machine/resources").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        let ids: Vec<&str> = json["models"].as_array().unwrap().iter().filter_map(|m| m["identifier"].as_str()).collect();
+        assert_eq!(ids, vec!["darkmux:m"], "{json}");
+    }
+
     /// (#2107, #1833, #2108) GET /machine/resources carries a `load` block —
     /// the daemon-side continuous host sampler's `now`/`window` — once the
     /// ring holds samples. Injects fabricated samples straight into the
