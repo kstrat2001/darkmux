@@ -111,11 +111,11 @@ mod role_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_review;
-// #463 workspace split (PR2) — profiles/ownership/lms extracted to the
+// #463 workspace split (PR2) — profiles/ownership extracted to the
 // darkmux-profiles crate. These re-exports keep crate::{profiles,
-// ownership,lms}::* paths resolving. (2.0, #1405: the
-// `runtime` module — the legacy openclaw config-file patcher — was removed.)
-pub use darkmux_profiles::lms;
+// ownership}::* paths resolving. (2.0, #1405: the `runtime` module — the
+// legacy openclaw config-file patcher — was removed. #316 stage 3.7: `lms`
+// is private to the engine facade's LM Studio backend.)
 pub use darkmux_profiles::profiles;
 pub use darkmux_profiles::ownership;
 // #463 workspace split — types extracted to the darkmux-types crate. The

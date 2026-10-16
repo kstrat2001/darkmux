@@ -19,7 +19,7 @@
 pub mod engine;
 pub mod envelope;
 pub mod gestalt_host;
-pub mod lms;
+mod lms;
 pub mod model_ledger;
 pub mod ownership;
 pub mod process;

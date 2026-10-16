@@ -14059,7 +14059,7 @@ fn ensure_model_resident_from(
 
 /// (#1139) Load `model_key` under `identifier` at `n_ctx` through the local
 /// engine's bounded `ModelHost` port (#1276; `LmsHost` today) instead of the raw, uncapped
-/// `lms::load_with_identifier` (`Command::status`, which blocks indefinitely on
+/// `lms::load_with_identifier` (since removed; `Command::status`, which blocked indefinitely on
 /// a RAM-starved / stuck load until the workflow's outer kill). The port
 /// enforces the resolved model-load deadline and classifies the failure into a
 /// TYPED error, so a RAM-exhausted load becomes a clear, operator-actionable

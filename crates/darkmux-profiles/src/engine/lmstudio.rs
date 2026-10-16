@@ -94,6 +94,10 @@ impl Engine for LmStudio {
     fn ledger(&self) -> ModelLedger {
         crate::model_ledger::gather_with_bin(&lms::lms_bin())
     }
+
+    fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)> {
+        Some(darkmux_types::config_access::lms_bin_with_source())
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +142,7 @@ esac
         let ids = engine.resident_ids();
         let version = engine.version();
         let ledger: Vec<String> = engine.ledger().models.into_iter().map(|m| m.identifier).collect();
+        let binary = engine.binary();
 
         unsafe {
             match prev {
@@ -156,5 +161,10 @@ esac
         assert_eq!(ids.unwrap(), vec!["m".to_string(), "darkmux:m".to_string()], "model key, then identifier");
         assert_eq!(version.as_deref(), Some("CLI commit: abc1234\n"), "the version line, unparsed");
         assert_eq!(ledger, vec!["darkmux:m".to_string()], "the ledger reads the same `lms ps`");
+        assert_eq!(
+            binary,
+            Some((bin.to_string_lossy().into_owned(), darkmux_types::config_access::Source::Env)),
+            "the binary the engine is reached through, and that the env named it"
+        );
     }
 }

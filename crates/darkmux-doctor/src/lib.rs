@@ -6383,7 +6383,11 @@ fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
     // `config.lms_bin` at all, so an operator whose config named an
     // out-of-PATH `lms` (e.g. `~/.lmstudio/bin/lms`) got a false FAIL here
     // even though the daemon itself reached LMStudio fine.
-    let (bin, source) = darkmux_types::config_access::lms_bin_with_source();
+    // (#316 stage 3.7) Asked of the engine facade, which resolves it the same
+    // way; every engine is reached through a binary until stage 4.
+    let (bin, source) = darkmux_profiles::engine::local()
+        .binary()
+        .expect("the local engine is reached through a binary until stage 4 of #316");
     let via = match source {
         darkmux_types::config_access::Source::Env => " (via DARKMUX_LMS_BIN)",
         darkmux_types::config_access::Source::Config => " (via config.lms_bin)",
@@ -15065,7 +15069,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
 
         let check = check_lms_binary();
-        let spawned = darkmux_profiles::lms::list_loaded();
+        let spawned = darkmux_profiles::engine::local().loaded();
 
         std::env::set_current_dir(prev_cwd).unwrap();
         unsafe {
