@@ -646,6 +646,7 @@
                     crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
                     Some(full_window_pacer()),
                     local_stop,
+                    true,
                 )
             });
         });
@@ -7090,6 +7091,32 @@
         (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t));
         let argv = build_docker_run_argv(&config);
         assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
+    }
+
+    /// (#316 re-review) The sampler's LM Studio poll follows the registry the
+    /// dispatch runs on (`--profiles-file`), not the default one: a managed
+    /// model there is polled even when the default registry has none.
+    #[test]
+    #[serial]
+    fn the_lm_studio_poll_follows_the_dispatchs_own_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let unmanaged = write(
+            "default.json",
+            r#"{"profiles": {"p": {"models": [{"id": "m", "endpoint": "mlx"}]}}, "endpoints": {"mlx": {"url": "http://127.0.0.1:9/v1"}}}"#,
+        );
+        let managed = write("explicit.json", r#"{"profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}}}"#);
+        unsafe { std::env::set_var("DARKMUX_PROFILES", &unmanaged) };
+        let default_search = super::registry_polls_lmstudio(None);
+        let explicit = super::registry_polls_lmstudio(Some(&managed));
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        assert!(!default_search, "the default registry has nothing on LM Studio");
+        assert!(explicit, "the dispatch's own registry does");
+        assert!(super::registry_polls_lmstudio(Some("/nonexistent/profiles.json")), "an unloadable registry polls");
     }
 
     /// (#316, open question 5) On an engine that loads whatever a request
@@ -16475,6 +16502,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
                 None, // (#2902 step 5) no endpoint budget
                 DispatchStop::new("test-container".into()),
+                true,
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");

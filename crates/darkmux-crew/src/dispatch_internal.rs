@@ -7796,6 +7796,7 @@ fn spawn_observers(
         // endpoint budget (the pre-start half ran before `dispatch start`).
         pacer_for(limits_pm, opts.config_path.as_deref())?,
         local_stop.clone(),
+        registry_polls_lmstudio(opts.config_path.as_deref()),
     );
     Ok((
         ObserverGuards { _sampler_stop_guard, _watchdog_abandon_guard, _tailer_stop_guard },
@@ -9643,6 +9644,7 @@ fn spawn_guarded_sampler(
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     budget_pacer: Option<crate::budget::BudgetPacer>,
     local_stop: DispatchStop,
+    polls_lmstudio: bool,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -9662,9 +9664,17 @@ fn spawn_guarded_sampler(
             thermal_config,
             budget_pacer,
             local_stop,
+            polls_lmstudio,
         )
     });
     (guard, handle)
+}
+
+/// (#316) Whether the registry this dispatch runs on (`config_path`, else the
+/// default search) has anything on LM Studio, so its sampler polls it. A
+/// registry that cannot be loaded polls, as before.
+fn registry_polls_lmstudio(config_path: Option<&str>) -> bool {
+    darkmux_profiles::profiles::load_registry_quiet(config_path).map_or(true, |l| l.registry.needs_lmstudio())
 }
 
 /// The per-tier extras a governor's `dispatch.rest` carries beyond its
@@ -9707,6 +9717,9 @@ fn run_telemetry_sampler(
     budget_pacer: Option<crate::budget::BudgetPacer>,
     // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
     local_stop: DispatchStop,
+    // (#316) Whether this dispatch's profile registry has anything on LM
+    // Studio ([`registry_polls_lmstudio`]); `false` polls it not at all.
+    polls_lmstudio: bool,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     let records = SamplerRecords { role_id, session, execution, model, phase_id, record_context };
     let mut sampler = DispatchSampler::start(
@@ -9716,6 +9729,7 @@ fn run_telemetry_sampler(
         thermal_config,
         budget_pacer,
         local_stop,
+        polls_lmstudio,
     );
     while !stop_flag.load(Ordering::SeqCst) {
         sampler.tick(&records);
@@ -9905,6 +9919,7 @@ impl DispatchSampler {
         thermal_config: crate::thermal_governor::ThermalGovernorConfig,
         budget_pacer: Option<crate::budget::BudgetPacer>,
         local_stop: DispatchStop,
+        polls_lmstudio: bool,
     ) -> Self {
         let started = Instant::now();
         let probe = crate::host_probe::HostProbe::new();
@@ -9965,8 +9980,6 @@ impl DispatchSampler {
         // (#2914) One utility seat, under every id this dispatch declared for
         // it: the compactor's resolved wire id and the binding (normally the same
         // model; a pinned compactor that differs still shares the seat).
-        let polls_lmstudio =
-            darkmux_profiles::profiles::load_registry_quiet(None).map_or(true, |l| l.registry.needs_lmstudio());
         let lms_tracker = polls_lmstudio
             .then(|| LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect()));
         Self {
