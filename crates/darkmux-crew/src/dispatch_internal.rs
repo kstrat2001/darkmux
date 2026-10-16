@@ -2762,11 +2762,16 @@ pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmu
 /// argv: its chat URL (`--chat-url`) and, when declared and non-default, its
 /// dialect (`--dialect`). `(None, None)` for a managed dispatch, whose
 /// container dials `--base-url`.
+///
+/// (#3209) The chat URL is dialed from inside the container, so a host that
+/// means this machine gets the same rewrite as the LM Studio base URL
+/// ([`loopback_to_docker_host`]). It is a transport detail: the endpoint's
+/// recorded address stays the one the operator wrote.
 pub(crate) fn agentic_brain_flags(
     agentic: Option<&crate::target::Target>,
 ) -> (Option<String>, Option<darkmux_types::Dialect>) {
     match agentic {
-        Some(t) => (Some(t.chat_url.clone()), container_dialect_flag(t)),
+        Some(t) => (Some(loopback_to_docker_host(&t.chat_url)), container_dialect_flag(t)),
         None => (None, None),
     }
 }

@@ -7092,6 +7092,22 @@
         assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
     }
 
+    /// (#3209) An unmanaged endpoint on this machine (`mlx_lm.server` on
+    /// `127.0.0.1`) is dialed from inside the container, where loopback names
+    /// the container: its chat URL gets the same `host.docker.internal`
+    /// rewrite the LM Studio base URL gets. Any other host is left alone.
+    #[test]
+    fn a_loopback_endpoint_reaches_the_host_from_the_container() {
+        let url_for = |endpoint: &str| {
+            let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": endpoint }));
+            let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+            super::agentic_brain_flags(Some(&t)).0.unwrap()
+        };
+        assert_eq!(url_for("http://127.0.0.1:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");
+        assert_eq!(url_for("http://localhost:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");
+        assert_eq!(url_for("https://h.example/v1"), "https://h.example/v1/chat/completions");
+    }
+
     /// (#2902 review C3) `mission launch` sizes the coder brief through the
     /// role branch: with a role, the SELECTED model's window; with none,
     /// the profile default's.
