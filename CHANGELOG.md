@@ -21,10 +21,19 @@ darkmux release.
   in `profiles.json`, set with `darkmux config set default_engine <value>` or
   `DARKMUX_DEFAULT_ENGINE`. A value naming no usable engine is refused by `config
   set` and by every dispatch, mission launch and lab run, with the closest valid
-  value, and
-  `darkmux doctor` has a `default engine` row. This release reads the setting but
+  value, and `darkmux doctor` has a `default engine` row. This release reads the setting but
   does not act on it yet: local models still run on LM Studio. Config schema 2.4;
   an older darkmux refuses the key, so upgrade every machine before writing it.
+
+### Fixed
+
+- **A role with tools can reach an endpoint on this machine** (#3209). An
+  unmanaged endpoint at `http://127.0.0.1:<port>/v1` or `localhost` (an
+  `mlx_lm.server`, llama.cpp or Ollama) was dialed from inside the dispatch
+  container, where loopback names the container itself, so only tool-less roles
+  (which run host-side) could reach it. Its chat URL now gets the same
+  `host.docker.internal` rewrite the LM Studio address gets; what is recorded
+  stays the address you wrote.
 
 ## [5.2.0] - 2026-10-12
 
