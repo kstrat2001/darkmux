@@ -259,7 +259,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     if !text.contains(PLACEHOLDER_MODEL_ID) {
         return Ok(None);
     }
-    let available = match engine::local().catalog() {
+    let available = match engine::lmstudio().catalog() {
         Ok(v) => v,
         Err(e) => {
             return Err(format!(
@@ -269,7 +269,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
             ))
         }
     };
-    let loaded: Vec<String> = engine::local().loaded()
+    let loaded: Vec<String> = engine::lmstudio().loaded()
         .map(|v| v.into_iter().map(|m| m.model).collect())
         .unwrap_or_default();
     let ram_gb = darkmux_hardware::detect().total_ram_gb;
@@ -602,7 +602,7 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
         return Ok(None);
     }
     // An unreachable lms was already reported by the worker fill.
-    let Ok(available) = engine::local().catalog() else {
+    let Ok(available) = engine::lmstudio().catalog() else {
         return Ok(None);
     };
     let (worker_bytes, floor) = worker_facts(&text, &available);

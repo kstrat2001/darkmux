@@ -307,19 +307,20 @@ pub struct QueuedJob<T> {
 
 /// The canonical production [`ModelHost`] factory for [`run_bounded`]'s
 /// `host_factory` parameter: the local engine's load lifecycle
-/// (`engine::local().host()`, an `LmsHost` today) per call. A plain `fn`, not a
+/// (`engine::lmstudio().host()`, an `LmsHost`) per call. A plain `fn`, not a
 /// closure, so callers pass it directly as `&concurrent_dispatch::
 /// lms_host_factory` with no allocation. Tests exercising `run_bounded`'s
 /// wave-partitioning logic in isolation (synthetic `Facts`/placements, no
 /// real LMStudio intended) pass a `darkmux_gestalt::mock::MockHost`-backed
 /// factory instead — see [`ensure_wave_loaded`]'s doc.
 pub fn lms_host_factory() -> Box<dyn ModelHost> {
-    // (#316) LM Studio, the only backend until stage 4, always has a load
-    // lifecycle. Stage 4 adds engines without one, and their seats must not
-    // reach the local wave track (ENGINES.md section 9.3).
-    darkmux_profiles::engine::local()
+    // (#316) The local wave track loads managed seats, which are LM Studio's
+    // whatever the machine's default engine is, and LM Studio always has a
+    // load lifecycle. An engine without one never reaches this track
+    // (ENGINES.md section 9.3).
+    darkmux_profiles::engine::lmstudio()
         .host()
-        .expect("the local engine has a load lifecycle until stage 4 of #316")
+        .expect("LM Studio has a load lifecycle")
 }
 
 /// Run `jobs` to completion on independent, genuinely interleaved tracks

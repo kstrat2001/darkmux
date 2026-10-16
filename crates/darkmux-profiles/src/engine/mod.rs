@@ -138,6 +138,16 @@ pub trait Engine {
     fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)>;
 }
 
+/// LM Studio, the engine a managed model runs on (`"managed": "lmstudio"`,
+/// and a model that names no endpoint). Every step of a managed model's
+/// lifecycle asks it by name: loading, residency, eject of `darkmux:`
+/// instances, the local wave track. Those are LM Studio's whatever this
+/// machine's default engine is; a view of this machine's engine asks
+/// [`local`] instead. Resolves its binary at each call, as [`local`] does.
+pub fn lmstudio() -> Box<dyn Engine> {
+    Box::new(LmStudio)
+}
+
 /// The engine on this machine. Today that is always LM Studio, resolving its
 /// binary as before (`env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"`) at each
 /// call, so the fake-`lms` test seam is unchanged.
@@ -210,3 +220,45 @@ pub(crate) fn assert_declaration_holds(engine: &dyn Engine, unload_probe: &str) 
     }
 }
 
+
+/// (#316) A load lifecycle is LM Studio's, asked for by name: no production
+/// source in the workspace asks [`local`] for one, because once the local
+/// engine can be a server with no lifecycle, `local().host()` is `None` where
+/// a managed model needs to load. A view of the machine asks `local()`; a
+/// managed model's load asks [`lmstudio`].
+#[cfg(test)]
+#[test]
+fn no_production_code_asks_the_local_engine_for_a_load_lifecycle() {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+        sources(&krate.path().join("src"), &mut files);
+    }
+    assert!(files.len() > 100, "the scan found the workspace sources: {}", files.len());
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|f| !f.to_string_lossy().contains("test"))
+        .filter(|f| {
+            let code: String = std::fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(str::split_whitespace)
+                .collect();
+            code.contains(&["engine::local()", ".host()"].concat())
+        })
+        .map(|f| f.display().to_string())
+        .collect();
+    assert!(offenders.is_empty(), "ask engine::lmstudio() for a managed model's load lifecycle: {offenders:?}");
+}

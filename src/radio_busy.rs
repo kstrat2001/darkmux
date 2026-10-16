@@ -381,7 +381,7 @@ pub fn router_wait_notice(facts: Option<&UtilityFacts>, waited: Duration, ceilin
 /// registry is read the way every other reader reads it (lenient,
 /// crash-orphans swept) and only verified leases count.
 pub fn busy_report_live(target: &LocalTarget) -> Option<BusyReport> {
-    let loaded = engine::local().loaded().unwrap_or_default();
+    let loaded = engine::lmstudio().loaded().unwrap_or_default();
     let leases = darkmux_types::residency_lease::live_loaded_models_by_process(std::process::id());
     busy_report(target, &loaded, &leases, &live_runs_from_local_records)
 }
@@ -400,7 +400,7 @@ pub fn answering_seat_busy(overrides: &AnswererOverrides) -> Option<BusyReport> 
 /// resolves.
 pub fn utility_facts_live() -> Option<UtilityFacts> {
     let target = crate::crew::dispatch::utility_local_target(None)?;
-    let loaded = engine::local().loaded().ok();
+    let loaded = engine::lmstudio().loaded().ok();
     let reading = read_instance(&target, loaded.as_deref());
     let leases = darkmux_types::residency_lease::live_loaded_models_by_process(std::process::id());
     let foreign_holder = lease_holder(&target, &leases);

@@ -412,7 +412,7 @@ impl EnvelopeWarnings {
 /// The loaded models against the profile's declared ones. A failed `lms ps`
 /// is its own warning, so a run whose profile tag went unverified says so.
 fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
-    match engine::local().loaded() {
+    match engine::lmstudio().loaded() {
         Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \

@@ -140,7 +140,7 @@ esac
         // SAFETY: #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
 
-        let engine = crate::engine::local();
+        let engine = crate::engine::lmstudio();
         let loaded = engine
             .loaded()
             .map(|l| l.into_iter().map(|m| m.identifier).collect::<Vec<_>>());
@@ -193,7 +193,7 @@ esac
             std::env::remove_var("DARKMUX_LMS_BIN");
             std::env::set_var("DARKMUX_HOME", home.path());
         }
-        let binary = crate::engine::local().binary();
+        let binary = crate::engine::lmstudio().binary();
         unsafe {
             for (k, v) in [("DARKMUX_LMS_BIN", prev_bin), ("DARKMUX_HOME", prev_home)] {
                 match v {
