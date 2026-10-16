@@ -1038,6 +1038,21 @@ EOF
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let moe = darkmux_profiles::engine::ModelMeta {
+        model_key: "big-moe-35b-a3b".into(),
+        display_name: String::new(),
+        publisher: String::new(),
+        size_bytes: 21474836480,
+        params_string: Some("35B-A3B".into()),
+        architecture: Some("qwen3moe".into()),
+        max_context_length: Some(32000),
+        trained_for_tool_use: true,
+        model_type: "llm".into(),
+    };
+    let moe_compactor = darkmux_heuristics::suggest_profile(&moe, darkmux_heuristics::TaskClass::Long)
+        .compactor
+        .map(|c| format!("{} @ {}", c.model_id, c.n_ctx))
+        .unwrap_or_else(|| "none".into());
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let collides = "    ⚠ derived name `qwen-7b-fast` collides with another uncovered model — \
                     customize the name when drafting (publisher prefix gets stripped)\n";
@@ -1060,8 +1075,11 @@ EOF
         "    id=big-moe-35b-a3b  params=35B-A3B  arch=Moe  size=20.0GB  maxCtx=32000\n",
         // The model's own 32000 cap binds on every host: the heuristics'
         // RAM-sized context (262144 on a 128 GB Mac, 64000 on a CI runner)
-        // would otherwise make this line machine-dependent.
-        "    suggested task class: `long` (n_ctx=32000, compactor=qwen3-4b-instruct-2507 @ 32000)\n",
+        // would otherwise make this line machine-dependent. The compactor
+        // pairing is the host's heuristics provider's call (a 128 GB Apple
+        // Silicon Mac pairs one, a Linux runner does not), so it is asked of
+        // that provider rather than written in.
+        &format!("    suggested task class: `long` (n_ctx=32000, compactor={moe_compactor})\n"),
         "    draft: `darkmux profile draft big-moe-35b-a3b-long --model big-moe-35b-a3b --task-class long`\n",
         "\n",
         "⚠ mystery-model\n",
