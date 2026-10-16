@@ -1423,7 +1423,7 @@ fn an_endpointless_profile_runs_on_the_default_engine_and_says_it_may_switch() {
     ] {
         assert!(has_pair(&argv, flag, value), "`{flag} {value}` missing: {argv:?}");
     }
-    assert!(!rig.lms_log().iter().any(|l| l.starts_with("load")), "LM Studio never loads: {:?}", rig.lms_log());
+    assert!(rig.lms_log().is_empty(), "LM Studio is never asked anything: {:?}", rig.lms_log());
     assert_eq!(
         stderr.matches("`mlx` loads the model a request names; this dispatch sends `mlx-community/Qwen3-30B-A3B-4bit`").count(),
         1,

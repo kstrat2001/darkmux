@@ -28,7 +28,10 @@ darkmux release.
   loads whatever a request names (`mlx_lm.server`), each dispatch says it may
   replace the model the server holds. `darkmux doctor`'s `default engine` row
   checks that the server answers, and its LM Studio rows read "not checked" when
-  nothing needs LM Studio. `darkmux init` still plans for LM Studio, and `machine
+  nothing needs LM Studio (whether or not `default_engine` is set), and nothing
+  polls LM Studio during a dispatch then. A model on the default engine is treated
+  as any unmanaged endpoint is for the data boundary: `identity.md` is not added
+  to its prompt, as for a hosted model. `darkmux init` still plans for LM Studio, and `machine
   status --json` and `darkmux serve` still report this as LM Studio unreachable;
   both follow. Config schema 2.4;
   an older darkmux refuses the key, so upgrade every machine before writing it.

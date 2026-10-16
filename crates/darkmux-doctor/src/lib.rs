@@ -6440,7 +6440,9 @@ fn lmstudio_unneeded_check(name: &str) -> Check {
 /// (#3207) Whether the profile registry loads and declares nothing that needs
 /// LM Studio. A registry that does not load says nothing either way (`false`).
 fn lmstudio_unneeded() -> bool {
-    darkmux_profiles::profiles::load_registry(None).is_ok_and(|l| !l.registry.needs_lmstudio())
+    // Quiet: the `profile registry` row already announces a quarantine, and
+    // this runs for several rows (#316).
+    darkmux_profiles::profiles::load_registry_quiet(None).is_ok_and(|l| !l.registry.needs_lmstudio())
 }
 
 fn check_lms_binary() -> Check {

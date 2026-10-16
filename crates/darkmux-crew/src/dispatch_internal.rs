@@ -9876,7 +9876,10 @@ struct DispatchSampler {
     // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
     // all moved into `LmsTelemetryTracker` — see its doc for why the state
     // machine lives behind an injected-effect seam instead of inline here.
-    lms_tracker: LmsTelemetryTracker,
+    // (#316) `None` when nothing in the profile registry runs on LM Studio
+    // (every model on the default engine or another unmanaged endpoint):
+    // LM Studio is not polled at all, as on a machine without it.
+    lms_tracker: Option<LmsTelemetryTracker>,
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -9962,7 +9965,10 @@ impl DispatchSampler {
         // (#2914) One utility seat, under every id this dispatch declared for
         // it: the compactor's resolved wire id and the binding (normally the same
         // model; a pinned compactor that differs still shares the seat).
-        let lms_tracker = LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect());
+        let polls_lmstudio =
+            darkmux_profiles::profiles::load_registry_quiet(None).map_or(true, |l| l.registry.needs_lmstudio());
+        let lms_tracker = polls_lmstudio
+            .then(|| LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect()));
         Self {
             started,
             raw: Vec::new(),
@@ -9991,9 +9997,11 @@ impl DispatchSampler {
         // tagging, and the skip-on-failed-probe behavior all live in
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
-        self.lms_tracker.tick(&|| engine::lmstudio().loaded(), &|payload| {
-            records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
-        });
+        if let Some(tracker) = self.lms_tracker.as_mut() {
+            tracker.tick(&|| engine::lmstudio().loaded(), &|payload| {
+                records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
+            });
+        }
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
         // per-cluster frequency, power and thermal state the same probe
