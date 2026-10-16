@@ -422,8 +422,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // top context), so the operator always sees the specific hint —
     // "invalid value for `fleet.mode`: invalid fleet.mode `hubb` — valid: …".
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
-    check_answering_seat(key, value)?;
-    check_default_engine(key, value)?;
+    check_value(key, value)?;
 
     let mut root = load_object_for_write(path)?;
     set_path(&mut root, key, parsed.clone());
@@ -465,6 +464,13 @@ fn names_the_answering_seat(key: &str) -> bool {
 
 /// The address check for the answering-seat keys ([`names_the_answering_seat`]);
 /// any other key passes.
+/// The value checks beyond the field's type: a key that names a profile
+/// address or an engine is checked before it is written.
+fn check_value(key: &str, value: &str) -> Result<()> {
+    check_answering_seat(key, value)?;
+    check_default_engine(key, value)
+}
+
 fn check_answering_seat(key: &str, value: &str) -> Result<()> {
     if !names_the_answering_seat(key) {
         return Ok(());
