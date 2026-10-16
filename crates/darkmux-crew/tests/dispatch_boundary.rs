@@ -1369,6 +1369,43 @@ fn a_tool_less_role_on_a_hosted_endpoint_runs_one_http_call_and_no_container() {
     assert_eq!((c["exit_code"].as_i64(), c["total_tokens"].as_u64()), (Some(0), Some(5)));
 }
 
+/// (#316, operator 2026-10-17) A tool-less role on the default engine reached
+/// on loopback sends one HTTP call whose system prompt carries the operator's
+/// identity, as LM Studio's would: the conversation stays on this machine.
+/// The same server named as a non-default endpoint gets none.
+#[test]
+#[serial]
+fn a_tool_less_role_on_the_loopback_default_engine_carries_identity() {
+    own_process!();
+    use httpmock::prelude::*;
+    let mut rig = Rig::new();
+    fs::write(rig.state.join("identity.md"), "PIN-IDENTITY-MARKER").unwrap();
+    let server = MockServer::start();
+    let with_identity = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions").body_contains("PIN-IDENTITY-MARKER");
+        then.status(200).header("content-type", "application/json").json_body(json!({
+            "choices": [{"message": {"role": "assistant", "content": "local ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }));
+    });
+    fs::write(
+        &rig.profiles,
+        json!({
+            "profiles": {"local": {"models": [{"id": "m", "n_ctx": 32768}]}},
+            "endpoints": {"mlx": {"url": server.url("/v1")}},
+            "default_profile": "local"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    rig.env().set("DARKMUX_DEFAULT_ENGINE", "mlx");
+    let mut o = rig.opts();
+    o.role_id = "pr-reviewer".into();
+    let (res, _) = run(&rig, o);
+    res.expect("the single-shot on the default engine");
+    with_identity.assert_hits(1);
+}
+
 #[test]
 #[serial]
 fn a_resume_on_a_tool_less_hosted_role_is_refused_before_the_http_call() {
@@ -1413,6 +1450,7 @@ fn an_endpointless_profile_runs_on_the_default_engine_and_says_it_may_switch() {
     )
     .unwrap();
     rig.env().set("DARKMUX_DEFAULT_ENGINE", "mlx");
+    fs::write(rig.state.join("identity.md"), "PIN-IDENTITY-MARKER").unwrap();
     rig.container(ONE_TURN, ENVELOPE, "", 0);
     let (res, stderr) = run(&rig, rig.opts());
     res.expect("the dispatch runs on the default engine");
@@ -1429,6 +1467,9 @@ fn an_endpointless_profile_runs_on_the_default_engine_and_says_it_may_switch() {
         1,
         "said once: {stderr}"
     );
+    // (#316, operator 2026-10-17) The default engine on loopback is local
+    // like LM Studio: the operator's identity goes with the prompt.
+    assert!(arg_after(&argv, "--system").unwrap().contains("PIN-IDENTITY-MARKER"), "identity stays on this machine");
     let sp = payload(&rig.record("dispatch.start")).clone();
     assert_eq!(sp["endpoint"], "openai:127.0.0.1:9/mlx-community/Qwen3-30B-A3B-4bit", "recorded host-side");
 }

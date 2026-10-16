@@ -1852,7 +1852,7 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 
 /// The grounding scope this dispatch is allowed: [`GroundingScope::RemoteSafe`]
 /// when the answering seat resolves to a hosted endpoint on this machine.
-/// Fails closed via `crew::dispatch::dispatch_resolves_unmanaged`, and for a
+/// Fails closed via `crew::dispatch::dispatch_leaves_this_machine`, and for a
 /// malformed address. A fleet peer is one of the operator's own machines,
 /// not a hosted endpoint: the scope is [`GroundingScope::Full`], and the peer
 /// itself enforces it: the job carries `managed_only`, and a peer whose
@@ -1861,7 +1861,7 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
     match resolved_answering_seat(overrides) {
         Ok(AnsweringSeat::Here { explicit }) => {
-            if crate::crew::dispatch::dispatch_resolves_unmanaged("radio-host", explicit.as_deref(), None) {
+            if crate::crew::dispatch::dispatch_leaves_this_machine("radio-host", explicit.as_deref(), None) {
                 GroundingScope::RemoteSafe
             } else {
                 GroundingScope::Full
@@ -1975,7 +1975,7 @@ fn local_fallback_seat(binding: Option<&str>, overrides: &AnswererOverrides) -> 
     let names_here = |m: &str| matches!(routing_decision(Some(m), here.as_deref()), RoutingDecision::Local { .. });
     usable_local_seat(
         local_fallback_profile(binding, default_profile.as_deref(), names_here),
-        |p| crate::crew::dispatch::dispatch_resolves_unmanaged(crate::crew::loader::RADIO_HOST_ROLE_ID, Some(p), None),
+        |p| crate::crew::dispatch::dispatch_leaves_this_machine(crate::crew::loader::RADIO_HOST_ROLE_ID, Some(p), None),
         |p| {
             let local = AnswererOverrides { profile_name: Some(p.to_string()), humor: overrides.humor };
             crate::radio_busy::answering_seat_busy(&local).is_some()

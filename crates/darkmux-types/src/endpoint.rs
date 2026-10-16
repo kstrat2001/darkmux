@@ -859,6 +859,57 @@ pub fn url_host(url: &str) -> Option<String> {
     is_hostport(hostport).then(|| hostport.to_string())
 }
 
+/// Whether `host` (no port; an IPv6 literal in brackets) names this machine:
+/// `localhost` (any case), all of `127.0.0.0/8`, the unspecified `0.0.0.0`
+/// and `[::]`, and IPv6 loopback in any spelling.
+pub fn host_means_this_machine(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>().is_ok_and(|a| a.is_loopback() || a.is_unspecified());
+    }
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|a| a.is_loopback() || a.is_unspecified())
+}
+
+/// (#316) Whether a request to `url` is answered on this machine, judged by
+/// the host the transport actually dials ([`url_host`], #3079: the authority
+/// ends at the first `/`, `?` or `#`). A URL whose host cannot be read is not.
+/// Neither is one any client might read differently: a backslash (a WHATWG
+/// parser, the runtime's `url` crate, reads it as `/`; curl does not), or any
+/// character that is not printable ASCII. Fails closed.
+pub fn url_names_this_machine(url: &str) -> bool {
+    if url.chars().any(|c| c == '\\' || !c.is_ascii_graphic()) {
+        return false;
+    }
+    let Some(hostport) = url_host(url) else { return false };
+    let host = if hostport.starts_with('[') {
+        hostport.split_inclusive(']').next().unwrap_or(&hostport)
+    } else {
+        hostport.rsplit_once(':').map_or(hostport.as_str(), |(h, _)| h)
+    };
+    host_means_this_machine(host)
+}
+
+/// (#316, operator decision 2026-10-17) THE data-boundary predicate: whether
+/// a brain of `kind` at `endpoint` sends the conversation off this machine.
+/// A managed model (LM Studio here) stays; so does an unmanaged endpoint
+/// that is this machine's `default_engine` and is reached on loopback, "local
+/// like LM Studio". Any other unmanaged endpoint leaves, including the
+/// default engine on another host, and so does an unmanaged brain with no
+/// endpoint to read (fails closed).
+pub fn brain_leaves_this_machine(kind: EndpointKind, endpoint: Option<&ModelEndpoint>, default_engine: &str) -> bool {
+    match kind {
+        EndpointKind::Managed(_) => false,
+        EndpointKind::Unmanaged => {
+            let Some(ep) = endpoint else { return true };
+            let is_default = ep.named_id().is_some_and(|id| id == default_engine.trim());
+            let on_loopback = ep.url.as_deref().is_some_and(url_names_this_machine);
+            !(is_default && on_loopback)
+        }
+    }
+}
+
 /// A valid host (a bracketed IPv6 literal, or `[A-Za-z0-9._-]+`) plus an
 /// optional numeric port.
 fn is_hostport(s: &str) -> bool {
@@ -1212,6 +1263,46 @@ mod tests {
     /// so an `@` in the path is path, and userinfo holding a delimiter is a
     /// malformed authority that fails closed (labeled "remote"), not a host
     /// found past the delimiter.
+    #[test]
+    fn a_url_names_this_machine_only_by_the_host_the_transport_dials() {
+        for url in ["http://127.0.0.1:8080/v1", "http://localhost:8080/v1", "http://LOCALHOST/v1", "http://[::1]:8080/v1", "http://127.9.9.9/v1"] {
+            assert!(url_names_this_machine(url), "{url}");
+        }
+        // (#316 review) The authority ends at `?` and `#` as well as `/`: these
+        // dial example.invalid, whatever follows the `@`.
+        for url in [
+            "http://example.invalid?@127.0.0.1:9/v1",
+            "http://example.invalid#@127.0.0.1:9/v1",
+            "http://127.0.0.1@evil.example/v1",
+            "http://localhost.evil.example/v1",
+            "http://evil.example/127.0.0.1/v1",
+            // (#316 re-review) The runtime's `url` crate reads `\` as `/`.
+            "http://example.invalid\\@127.0.0.1:9/v1",
+            "http://mlx.evil.example\\@localhost:8080/v1",
+            "http://127.0.0.1:8080/v1 ",
+            "not a url",
+        ] {
+            assert!(!url_names_this_machine(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn only_lm_studio_and_the_loopback_default_engine_stay_on_this_machine() {
+        let ep = |id: &str, url: &str| ModelEndpoint {
+            url: Some(url.into()),
+            source: EndpointSource::Named(id.into()),
+            ..Default::default()
+        };
+        let leaves = |e: &ModelEndpoint, default_engine| brain_leaves_this_machine(EndpointKind::Unmanaged, Some(e), default_engine);
+        assert!(!brain_leaves_this_machine(EndpointKind::Managed(ManagedBackend::Lmstudio), None, "lmstudio"));
+        assert!(!leaves(&ep("mlx", "http://127.0.0.1:8080/v1"), "mlx"));
+        assert!(!leaves(&ep("mlx", "http://127.0.0.1:8080/v1"), " mlx "), "default_engine is trimmed, as it resolves");
+        assert!(leaves(&ep("mlx", "http://studio.tailnet:8080/v1"), "mlx"), "the default engine on another host");
+        assert!(leaves(&ep("mlx", "http://example.invalid?@127.0.0.1:9/v1"), "mlx"), "a URL that dials elsewhere");
+        assert!(leaves(&ep("mlx", "http://127.0.0.1:8080/v1"), "lmstudio"), "loopback, not the default engine");
+        assert!(brain_leaves_this_machine(EndpointKind::Unmanaged, None, "mlx"), "nothing to read fails closed");
+    }
+
     #[test]
     fn url_host_ends_the_authority_at_the_first_delimiter_like_the_transport() {
         assert_eq!(url_host("http://127.0.0.1:1234/gw/models@latest/v1").as_deref(), Some("127.0.0.1:1234"));

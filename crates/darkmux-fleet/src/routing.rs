@@ -248,15 +248,17 @@ pub fn dispatch_routed_single_shot(
 
 /// The data boundary for a dispatch that stays on this machine, enforced the
 /// way a receiver enforces it: the profile the dispatch resolves here
-/// (`dispatch_resolves_unmanaged`, which fails closed) must not be a hosted
-/// endpoint under `managed_only`. Refused with the typed boundary refusal a
+/// (`dispatch_leaves_this_machine`, which fails closed) must not leave
+/// the machine under `managed_only` (a hosted endpoint; the default engine on
+/// loopback stays, #316). A receiver's own check (`submission::check_boundary`)
+/// still refuses its default engine. Refused with the typed boundary refusal a
 /// peer's refusal carries, so a caller that re-asks with hosted-safe data on
 /// [`RefusalCode::Boundary`] does the same for a seat here.
 fn enforce_local_boundary(opts: &DispatchOpts, boundary: Option<Boundary>) -> Result<()> {
     let refusal = match boundary {
         None => return Ok(()),
         Some(Boundary::ManagedOnly) => {
-            if !dispatch::dispatch_resolves_unmanaged(&opts.role_id, opts.profile_name.as_deref(), None) {
+            if !dispatch::dispatch_leaves_this_machine(&opts.role_id, opts.profile_name.as_deref(), None) {
                 return Ok(());
             }
             crate::Refusal::BoundaryUnmanaged { profile: opts.profile_name.clone().unwrap_or_else(|| "(default)".into()) }

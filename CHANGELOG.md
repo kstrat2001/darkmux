@@ -29,9 +29,18 @@ darkmux release.
   replace the model the server holds. `darkmux doctor`'s `default engine` row
   checks that the server answers, and its LM Studio rows read "not checked" when
   nothing needs LM Studio (whether or not `default_engine` is set), and nothing
-  polls LM Studio during a dispatch then. A model on the default engine is treated
-  as any unmanaged endpoint is for the data boundary: `identity.md` is not added
-  to its prompt, as for a hosted model. `darkmux init` still plans for LM Studio, and `machine
+  polls LM Studio during a dispatch then. A model on the default engine reached on
+  loopback (`127.0.0.1`, `localhost`) stays on this machine for the data boundary,
+  as LM Studio does: `identity.md` is added to its prompt, radio's answering seat
+  on this machine gets its full grounding, and this machine's own `managed_only`
+  check accepts it. The default engine on another host is treated as any hosted
+  endpoint, and so is any URL whose host is not loopback as the transport reads it.
+  A fleet peer receiving a `managed_only` job still refuses its own default
+  engine; a radio question asked of it is re-asked with hosted-safe grounding.
+
+- **A utility model on a hosted endpoint no longer receives `identity.md`**
+  (#3207 sent it to every utility job). It goes only to a utility model on LM
+  Studio or on the loopback default engine. `darkmux init` still plans for LM Studio, and `machine
   status --json` and `darkmux serve` still report this as LM Studio unreachable;
   both follow. Config schema 2.4;
   an older darkmux refuses the key, so upgrade every machine before writing it.

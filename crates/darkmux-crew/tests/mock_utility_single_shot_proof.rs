@@ -438,6 +438,52 @@ fn recording_fake_lms(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (fake, log)
 }
 
+/// (#316) A utility binding on this machine's default engine reached on
+/// loopback stays on this machine, like LM Studio: its prompt carries the
+/// operator's identity.
+#[test]
+#[serial_test::serial]
+fn a_utility_job_on_the_loopback_default_engine_carries_identity() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions").body_contains("PIN-UTIL-IDENTITY");
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mlx-1", "object": "chat.completion", "created": 0, "model": "mlx-util",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "routed" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+        }));
+    });
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = registry_dir.path().join("profiles.json");
+    let body = serde_json::json!({
+        "default_profile": "work",
+        "profiles": { "work": { "models": [ { "id": "mock-worker", "n_ctx": 8192 } ] } },
+        "endpoints": { "mlx-local": { "url": format!("{}/v1", server.base_url()) } },
+        "internal": { "utility": { "id": "mlx-util", "n_ctx": 32768 } }
+    });
+    std::fs::write(&profiles_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+    let state = isolated_state();
+    std::fs::write(state.join("identity.md"), "PIN-UTIL-IDENTITY").unwrap();
+    let prev = std::env::var("DARKMUX_DEFAULT_ENGINE").ok();
+    unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "mlx-local") };
+    let reply = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "review this",
+        timeout_seconds: 30,
+        max_tokens: 128,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: None,
+    });
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_DEFAULT_ENGINE", v),
+            None => std::env::remove_var("DARKMUX_DEFAULT_ENGINE"),
+        }
+    }
+    assert_eq!(reply.expect("the utility call reaches the default engine").content, "routed");
+    mock.assert();
+}
+
 /// (#3207) A utility binding naming an UNMANAGED endpoint sends the job
 /// there: the bare binding id on the wire, the endpoint's dialect
 /// (`max_tokens`, no `max_completion_tokens`) and its auth header, and the
@@ -456,7 +502,10 @@ fn a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms
             .json_body_partial(r#"{ "model": "mlx-util", "max_tokens": 128 }"#)
             // The managed arm's low-variance setting, in the dialect that sends one.
             .body_contains("\"temperature\":0.2")
-            .body_contains("# Radio Router");
+            .body_contains("# Radio Router")
+            // (#316 review) The data boundary: this endpoint is not the
+            // loopback default engine, so the operator's identity stays here.
+            .matches(|req| !String::from_utf8_lossy(req.body.as_deref().unwrap_or_default()).contains("PIN-UTIL-IDENTITY"));
         then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
             "id": "mlx-1",
             "object": "chat.completion",
@@ -483,6 +532,7 @@ fn a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms
     });
     std::fs::write(&profiles_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
     let state = isolated_state();
+    std::fs::write(state.join("identity.md"), "PIN-UTIL-IDENTITY").unwrap();
     let flows_dir = state.join("flows");
     let bin_dir = tempfile::tempdir().unwrap();
     let (fake_lms, lms_log) = recording_fake_lms(bin_dir.path());
