@@ -310,7 +310,7 @@ fn every_lms_spawn_in_the_swept_crates_pins_its_cwd() {
         findings.is_empty(),
         "found {} `lms` spawn(s) with no cwd pin in the same function (#2534 — #1863 pinned \
          every spawn's cwd but only the `run_bounded` chokepoint had a test; these bypass it):\n{}\n\n\
-         Fix: call `darkmux_profiles::lms::pin_cwd(&mut cmd)` right after constructing the \
+         Fix: call `darkmux_profiles::process::pin_cwd(&mut cmd)` right after constructing the \
          `Command`, or route the call through `run_bounded` if it's a darkmux-profiles-internal \
          spawn that can accept that runner's stdio/deadline shape.",
         findings.len(),
@@ -324,8 +324,10 @@ fn every_lms_spawn_in_the_swept_crates_pins_its_cwd() {
 /// testing anything, worse than no probe. Assert the scan actually SEES
 /// the sites #2534 was filed against (at least 7 matches: 5 in `lms.rs`,
 /// 1 in `dispatch_internal.rs`, 1 in `scores.rs`, per the grep behind this
-/// fix). #1939 later rewrote the `dispatch_internal.rs` and `scores.rs`
-/// sites to resolve through the fully-qualified
+/// fix; since #316 stage 3.6 those last two are the LM Studio backend's
+/// `resident_ids` and `version`, both in `engine/lmstudio.rs`). #1939 later
+/// rewrote the `dispatch_internal.rs` and `scores.rs` sites to resolve
+/// through the fully-qualified
 /// `darkmux_types::config_access::lms_bin()` rather than the crate-local
 /// `lms_bin()` wrapper — a third literal shape was added to
 /// `LMS_SPAWN_PATTERNS` above to keep seeing them; the expected total stays

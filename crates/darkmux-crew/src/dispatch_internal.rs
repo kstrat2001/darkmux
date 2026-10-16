@@ -12947,8 +12947,8 @@ fn resolve_dispatch_internal(
 /// `darkmux:<mock-id>` on the wire for every mock-server dispatch), each
 /// left the whole crate green. The two injected effects are precisely the
 /// ones that would otherwise shell out to a real `lms`
-/// (`ensure_model_loaded_at_ctx` → `lms load`, `probe_loaded_model_list` →
-/// `lms ps`), so a unit test can drive BOTH arms of that guard and assert
+/// (`ensure_model_loaded_at_ctx` → `lms load`, `engine::local().resident_ids()`
+/// → `lms ps`), so a unit test can drive BOTH arms of that guard and assert
 /// the returned wire id without touching the operator's LMStudio.
 fn resolve_dispatch_model_with_hosts(
     role: &crate::types::Role,

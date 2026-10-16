@@ -1067,6 +1067,9 @@
     async fn machine_resources_carries_the_engines_residents() {
         let tmp = TempDir::new().unwrap();
         let bin = fake_lms_with_one_resident(tmp.path());
+        // The handler caches a ledger process-wide for 2 s; a sibling test in
+        // the same process (plain `cargo test`) would otherwise answer this one.
+        *MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
         let prev = std::env::var_os("DARKMUX_LMS_BIN");
         // SAFETY: #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
