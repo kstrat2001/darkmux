@@ -107,7 +107,7 @@ use darkmux_gestalt::{
     Facts, FootprintEstimator, HostError, ModelHost, Placement, Plan, Reason, ResourceProbe,
     WaveMode, WaveSchedule,
 };
-use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
+use darkmux_profiles::gestalt_host::{resolved_load_deadline, MacProbe};
 use darkmux_types::residency_lease;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -306,14 +306,20 @@ pub struct QueuedJob<T> {
 }
 
 /// The canonical production [`ModelHost`] factory for [`run_bounded`]'s
-/// `host_factory` parameter — a real `LmsHost` per call. A plain `fn`, not a
+/// `host_factory` parameter: the local engine's load lifecycle
+/// (`engine::local().host()`, an `LmsHost` today) per call. A plain `fn`, not a
 /// closure, so callers pass it directly as `&concurrent_dispatch::
 /// lms_host_factory` with no allocation. Tests exercising `run_bounded`'s
 /// wave-partitioning logic in isolation (synthetic `Facts`/placements, no
 /// real LMStudio intended) pass a `darkmux_gestalt::mock::MockHost`-backed
 /// factory instead — see [`ensure_wave_loaded`]'s doc.
 pub fn lms_host_factory() -> Box<dyn ModelHost> {
-    Box::new(LmsHost::new())
+    // (#316) LM Studio, the only backend until stage 4, always has a load
+    // lifecycle. Stage 4 adds engines without one, and their seats must not
+    // reach the local wave track (ENGINES.md section 9.3).
+    darkmux_profiles::engine::local()
+        .host()
+        .expect("the local engine has a load lifecycle until stage 4 of #316")
 }
 
 /// Run `jobs` to completion on independent, genuinely interleaved tracks
@@ -1199,6 +1205,38 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    /// (#316 stage 3.5) The production factory hands the wave track the
+    /// local engine's real host: its `list_resident` reaches `lms ps`, not a
+    /// double.
+    #[test]
+    #[serial_test::serial]
+    fn lms_host_factory_lists_residents_through_the_local_engine() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("lms");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\n\
+             echo '[{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}]'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+
+        let listed = lms_host_factory().list_resident();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let ids: Vec<String> = listed.expect("the fake `lms ps` answers").into_iter().map(|r| r.identifier).collect();
+        assert_eq!(ids, vec!["darkmux:m".to_string()]);
+    }
 
     /// Conformance (#2666 CONSIDER 2): the bare
     /// `residency_lease::live_leased_models` free function excludes only
