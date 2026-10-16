@@ -875,7 +875,13 @@ pub fn host_means_this_machine(host: &str) -> bool {
 /// (#316) Whether a request to `url` is answered on this machine, judged by
 /// the host the transport actually dials ([`url_host`], #3079: the authority
 /// ends at the first `/`, `?` or `#`). A URL whose host cannot be read is not.
+/// Neither is one any client might read differently: a backslash (a WHATWG
+/// parser, the runtime's `url` crate, reads it as `/`; curl does not), or any
+/// character that is not printable ASCII. Fails closed.
 pub fn url_names_this_machine(url: &str) -> bool {
+    if url.chars().any(|c| c == '\\' || !c.is_ascii_graphic()) {
+        return false;
+    }
     let Some(hostport) = url_host(url) else { return false };
     let host = if hostport.starts_with('[') {
         hostport.split_inclusive(']').next().unwrap_or(&hostport)
@@ -1270,6 +1276,10 @@ mod tests {
             "http://127.0.0.1@evil.example/v1",
             "http://localhost.evil.example/v1",
             "http://evil.example/127.0.0.1/v1",
+            // (#316 re-review) The runtime's `url` crate reads `\` as `/`.
+            "http://example.invalid\\@127.0.0.1:9/v1",
+            "http://mlx.evil.example\\@localhost:8080/v1",
+            "http://127.0.0.1:8080/v1 ",
             "not a url",
         ] {
             assert!(!url_names_this_machine(url), "{url}");
