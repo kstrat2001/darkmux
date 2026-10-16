@@ -92,7 +92,7 @@ fn partition_by_ownership(loaded: &[darkmux_types::LoadedModel]) -> (Vec<&darkmu
 /// The one remaining `Err` is a failure to LIST — with no listing there is
 /// no set to act on, and continuing would mean guessing.
 pub fn eject_all_managed(dry_run: bool) -> anyhow::Result<EjectSummary> {
-    let engine = crate::engine::local();
+    let engine = crate::engine::lmstudio();
     let loaded = engine.loaded()?;
     eject_managed_inner(
         &loaded,

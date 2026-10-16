@@ -9451,7 +9451,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
 /// forwarding each observation into the one flow stream as a
 /// `category=telemetry` record.
 ///
-/// **lms (`source=lms`)**: `darkmux_profiles::engine::local().loaded()` is the
+/// **lms (`source=lms`)**: `darkmux_profiles::engine::lmstudio().loaded()` is the
 /// lms-ps source. Each tick diffs the current loaded set against the
 /// previous tick's via `telemetry_sampler::lms_diff`; only CHANGES emit
 /// (`{event:"load"|"unload", model, gb?}`).
@@ -9984,7 +9984,7 @@ impl DispatchSampler {
         // tagging, and the skip-on-failed-probe behavior all live in
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
-        self.lms_tracker.tick(&|| engine::local().loaded(), &|payload| {
+        self.lms_tracker.tick(&|| engine::lmstudio().loaded(), &|payload| {
             records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
         });
 
@@ -12934,7 +12934,7 @@ fn resolve_dispatch_internal(
         skip_lmstudio_residency,
         allow_utility_model,
         &ensure_model_loaded_at_ctx,
-        &|| engine::local().resident_ids(),
+        &|| engine::lmstudio().resident_ids(),
     )
 }
 
@@ -12952,7 +12952,7 @@ fn resolve_dispatch_internal(
 /// `darkmux:<mock-id>` on the wire for every mock-server dispatch), each
 /// left the whole crate green. The two injected effects are precisely the
 /// ones that would otherwise shell out to a real `lms`
-/// (`ensure_model_loaded_at_ctx` → `lms load`, `engine::local().resident_ids()`
+/// (`ensure_model_loaded_at_ctx` → `lms load`, `engine::lmstudio().resident_ids()`
 /// → `lms ps`), so a unit test can drive BOTH arms of that guard and assert
 /// the returned wire id without touching the operator's LMStudio.
 fn resolve_dispatch_model_with_hosts(
@@ -13886,7 +13886,7 @@ pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource)
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the
 /// load messages (#2914 review, C5).
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
-    let engine = engine::local();
+    let engine = engine::lmstudio();
     ensure_model_resident_from(
         pm,
         source,
@@ -14074,11 +14074,11 @@ fn ensure_model_resident_from(
 /// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
 fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
     use darkmux_gestalt::Deadline;
-    // (#316) As `concurrent_dispatch::lms_host_factory`: LM Studio always has
-    // a load lifecycle until stage 4.
-    let mut host = engine::local()
+    // (#316) As `concurrent_dispatch::lms_host_factory`: a managed model
+    // loads on LM Studio, which always has a load lifecycle.
+    let mut host = engine::lmstudio()
         .host()
-        .expect("the local engine has a load lifecycle until stage 4 of #316");
+        .expect("LM Studio has a load lifecycle");
     let deadline = Deadline::from_secs(darkmux_types::config_access::model_load_timeout_seconds());
     map_load_result(host.load(model_key, identifier, n_ctx, deadline), model_key, n_ctx)
 }

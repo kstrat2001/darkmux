@@ -1021,7 +1021,7 @@ fn check_utility_model_binding() -> Check {
     let n_ctx = registry.as_ref().and_then(|r| r.utility_model_n_ctx());
     // Only query LMStudio when there's a binding to check.
     let loaded = if registry_util.is_some() {
-        engine::local().loaded().ok()
+        engine::lmstudio().loaded().ok()
     } else {
         None
     };
@@ -1434,7 +1434,7 @@ fn check_unreachable_darkmux_residents() -> Check {
     if !registry.needs_lmstudio() {
         return lmstudio_unneeded_check("unreachable residents");
     }
-    let loaded = match engine::local().loaded() {
+    let loaded = match engine::lmstudio().loaded() {
         Ok(l) => l,
         Err(_) => {
             return Check {
@@ -6438,7 +6438,7 @@ fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
     // even though the daemon itself reached LMStudio fine.
     // (#316 stage 3.7) Asked of the engine facade, which resolves it the same
     // way; every engine is reached through a binary until stage 4.
-    let (bin, source) = darkmux_profiles::engine::local()
+    let (bin, source) = darkmux_profiles::engine::lmstudio()
         .binary()
         .expect("the local engine is reached through a binary until stage 4 of #316");
     let via = match source {
@@ -6536,7 +6536,7 @@ fn check_profile_loaded_match() -> Check {
             };
         }
     };
-    let loaded = match engine::local().loaded() {
+    let loaded = match engine::lmstudio().loaded() {
         Ok(l) => l,
         Err(_) => {
             return Check {
@@ -6946,7 +6946,7 @@ fn check_ram_headroom_load_projection() -> Check {
         Ok(r) => r,
         Err(_) => return skip("the profile registry did not load (see the `profile registry` row)"),
     };
-    let loaded = match engine::local().loaded() {
+    let loaded = match engine::lmstudio().loaded() {
         Ok(l) => l,
         Err(_) => return skip("could not query lms"),
     };
@@ -6981,7 +6981,7 @@ fn check_ram_headroom_load_projection() -> Check {
     // we don't error if the catalog query fails — the projection just
     // reports "size unknown" for those entries and the operator sees the
     // partial picture rather than a missing check.
-    let catalog = engine::local().catalog().unwrap_or_default();
+    let catalog = engine::lmstudio().catalog().unwrap_or_default();
     let mut total_unloaded_gb = 0.0_f64;
     let mut pending: Vec<String> = Vec::new();
     for pm in &unloaded {
