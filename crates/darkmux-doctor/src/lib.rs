@@ -191,6 +191,7 @@ pub fn run() -> DoctorReport {
         checks_power::check_power_posture(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
+        check_default_engine(),
         check_env_masks_config(),
         check_binary_split_brain(),
         check_audit_integrity(),
@@ -4007,6 +4008,58 @@ fn check_endpoints() -> Check {
             status: Status::Warn,
             message: format!("can't list endpoints (profile registry load failed: {e:#})"),
             hint: None,
+        },
+    }
+}
+
+/// (#316) `default_engine`: the engine this machine's local models run on.
+/// Checked against the profile registry, which defines its endpoint ids; with
+/// no loadable registry only `lmstudio` passes and the load error is named.
+fn check_default_engine() -> Check {
+    use darkmux_types::default_engine;
+    let (raw, source) = darkmux_types::config_access::default_engine_with_source();
+    let resolved = match profiles::load_registry(None) {
+        Ok(l) => default_engine::resolve(&raw, source, &l.registry),
+        Err(e) => default_engine::resolve_without_registry(&raw, source, &format!("{e:#}")),
+    };
+    default_engine_status(resolved, source)
+}
+
+/// Pure decision for [`check_default_engine`].
+fn default_engine_status(
+    resolved: Result<darkmux_types::default_engine::EngineChoice, darkmux_types::config_enum::InvalidSetting>,
+    source: darkmux_types::config_access::Source,
+) -> Check {
+    use darkmux_types::config_access::Source;
+    use darkmux_types::default_engine::{self, EngineChoice};
+    let name = "default engine".to_string();
+    let via = match source {
+        Source::BuiltIn => " (built-in)".to_string(),
+        Source::Config => format!(" (via config.{})", default_engine::KEY),
+        Source::Env => format!(" (via {})", default_engine::ENV),
+    };
+    match resolved {
+        Ok(EngineChoice::Lmstudio) => {
+            Check { name, status: Status::Pass, message: format!("{}{via}", default_engine::LMSTUDIO), hint: None }
+        }
+        Ok(EngineChoice::Endpoint(id)) => Check {
+            name,
+            status: Status::Warn,
+            message: format!("endpoint `{id}`{via}, but this darkmux still runs local models on LM Studio"),
+            hint: Some(format!(
+                "This release reads `{}` without acting on it yet. A profile reaches `{id}` today by naming it as \
+                 its endpoint.",
+                default_engine::KEY
+            )),
+        },
+        Err(invalid) => Check {
+            name,
+            status: Status::Fail,
+            message: invalid.to_string(),
+            hint: Some(format!(
+                "Every dispatch, mission launch and lab run refuses to start until this is fixed: {}. (#316)",
+                default_engine::fix(&invalid.set_in)
+            )),
         },
     }
 }
@@ -11725,6 +11778,32 @@ mod tests {
         assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);
     }
 
+    /// (#316) `default_engine`: LM Studio passes with its tier; an endpoint
+    /// warns that this release does not act on it yet; a value naming no
+    /// usable engine fails with the fix for the tier that set it.
+    #[test]
+    fn the_default_engine_row_passes_warns_or_fails_with_the_fix() {
+        use darkmux_types::config_access::Source;
+        use darkmux_types::default_engine::resolve;
+        let reg = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1"}}}"#,
+        );
+        let row = |raw: &str, source| default_engine_status(resolve(raw, source, &reg), source);
+        let c = row("lmstudio", Source::BuiltIn);
+        assert_eq!((c.status, c.message.as_str(), c.hint), (Status::Pass, "lmstudio (built-in)", None));
+        let c = row("mlx", Source::Config);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.message,
+            "endpoint `mlx` (via config.default_engine), but this darkmux still runs local models on LM Studio"
+        );
+        let c = row("mxl", Source::Env);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.starts_with("env var DARKMUX_DEFAULT_ENGINE: `mxl` is neither"), "{}", c.message);
+        assert!(c.message.contains("the closest is `mlx`"), "{}", c.message);
+        assert!(c.hint.unwrap_or_default().contains("unset DARKMUX_DEFAULT_ENGINE"));
+    }
+
     /// (#3173 review) The hint names the registry file `check_endpoints`
     /// actually loaded, so the edit can be made where it is read.
     #[test]
@@ -12048,8 +12127,10 @@ mod tests {
         // (5.0) 69: `machine_uid_check` joined beside the machine_id row.
         //
         // (#3074) 66: `check_inactivity_timeout` joined beside the step-command row.
+        //
+        // (#316) 67: `check_default_engine` joined beside the endpoints row.
         let expected =
-            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

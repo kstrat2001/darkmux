@@ -1079,6 +1079,7 @@ mod tests {
             ("ClientAddrSource", "where a client on this machine found the daemon's address (`config_access`), runtime-only provenance, never a setting"),
             ("FixedKind", "a session kind whose wire fields have a fixed count (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
+            ("EngineChoice", "what `default_engine` resolved to; its values are an open set checked against profiles.json (`default_engine`), not a token list"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("DeclaredFleetMode", "`FleetMode` as a card, presence beat or record states it, with `Unknown` for a newer value; never a setting"),
             ("EndpointSource", "runtime-only provenance, never serialized"),

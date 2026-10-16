@@ -411,7 +411,12 @@ use std::path::Path;
 //           Also ADDED `redis.telemetry_maxlen` (the retention cap of the
 //           hub's machine-telemetry stream; unreleased, so folded into 2.3).
 //           An older binary refuses a config carrying it as an unknown key.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
+//   2.4 (#316, darkmux 5.3): ADDED `default_engine`, the machine's local
+//           engine (`lmstudio` or an endpoint id), resolved by
+//           `config_access::default_engine_with_source` and checked against
+//           `profiles.json` by `default_engine::resolve`. Absent = `lmstudio`,
+//           today's behavior. An older binary refuses it as an unknown key.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.4";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -780,6 +785,12 @@ pub struct DarkmuxConfig {
     pub lms_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lmstudio_url: Option<String>,
+    /// (#316) The engine `engine::local()` answers with on this machine:
+    /// `lmstudio`, or the id of an OpenAI-compatible endpoint in
+    /// `profiles.json`. Absent = `lmstudio`. Checked against the profile
+    /// registry by `crate::default_engine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_engine: Option<String>,
 
     // ── Sections ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2182,6 +2193,7 @@ impl DarkmuxConfig {
             machine_id: Some("my-machine".to_string()),
             lms_bin: Some("lms".to_string()),
             lmstudio_url: Some("http://localhost:1234".to_string()),
+            default_engine: Some(crate::default_engine::LMSTUDIO.to_string()),
             dirs: None,
             redis: Some(RedisConfig {
                 enabled: Some(false),

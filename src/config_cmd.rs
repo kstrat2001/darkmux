@@ -100,6 +100,7 @@ enum Ty {
 const KEYS: &[(&str, Ty)] = &[
     ("machine_id", Ty::Str),
     ("lms_bin", Ty::Str),
+    ("default_engine", Ty::Str),
     ("lmstudio_url", Ty::Str),
     ("redis.enabled", Ty::Bool),
     ("redis.host", Ty::Str),
@@ -421,7 +422,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // top context), so the operator always sees the specific hint —
     // "invalid value for `fleet.mode`: invalid fleet.mode `hubb` — valid: …".
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
-    check_answering_seat(key, value)?;
+    check_value(key, value)?;
 
     let mut root = load_object_for_write(path)?;
     set_path(&mut root, key, parsed.clone());
@@ -463,6 +464,13 @@ fn names_the_answering_seat(key: &str) -> bool {
 
 /// The address check for the answering-seat keys ([`names_the_answering_seat`]);
 /// any other key passes.
+/// The value checks beyond the field's type: a key that names a profile
+/// address or an engine is checked before it is written.
+fn check_value(key: &str, value: &str) -> Result<()> {
+    check_answering_seat(key, value)?;
+    check_default_engine(key, value)
+}
+
 fn check_answering_seat(key: &str, value: &str) -> Result<()> {
     if !names_the_answering_seat(key) {
         return Ok(());
@@ -476,6 +484,23 @@ fn check_answering_seat(key: &str, value: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// (#316) `default_engine` names `lmstudio` or an OpenAI-compatible endpoint
+/// in the profile registry; anything else is refused here, before it is
+/// written, as every dispatching entry point would refuse it after.
+fn check_default_engine(key: &str, value: &str) -> Result<()> {
+    use darkmux_types::default_engine;
+    if key != default_engine::KEY {
+        return Ok(());
+    }
+    let source = darkmux_types::config_access::Source::Config;
+    match darkmux_profiles::profiles::load_registry_quiet(None) {
+        Ok(l) => default_engine::resolve(value, source, &l.registry),
+        Err(e) => default_engine::resolve_without_registry(value, source, &format!("{e:#}")),
+    }
+    .map(|_| ())
+        .map_err(|e| anyhow!("invalid value for `{key}`: {}. valid: {}", e.problem, e.valid))
 }
 
 /// The hub's fleet default for the answering seat (#3022). Unlike the
@@ -991,6 +1016,42 @@ mod tests {
             }
             assert!(get_at(p, key).unwrap().contains("deep@studio"), "a refused write leaves the old value");
         }
+    }
+
+    /// (#316) `default_engine` is checked before it is written: `lmstudio`
+    /// in any case is taken, a value naming no engine is refused and the old
+    /// value stays.
+    ///
+    /// The registry is pinned through `DARKMUX_PROFILES`, so the outcome never
+    /// depends on the machine's own profiles.json.
+    #[test]
+    #[serial_test::serial]
+    fn default_engine_takes_lmstudio_and_refuses_a_value_naming_no_engine() {
+        let f = tmp();
+        let p = f.path();
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            r#"{"profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                "endpoints": {"mlx": {"url": "http://127.0.0.1:8080/v1"}}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("DARKMUX_PROFILES", &reg) };
+        let lmstudio = set_at(p, "default_engine", "LMStudio");
+        let unknown = set_at(p, "default_engine", "mxl").map_err(|e| e.to_string());
+        let endpoint = set_at(p, "default_engine", "mlx");
+        unsafe { std::env::set_var("DARKMUX_PROFILES", dir.path().join("absent.json")) };
+        let no_registry = set_at(p, "default_engine", "mlx").map_err(|e| e.to_string());
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        lmstudio.unwrap();
+        let err = unknown.unwrap_err();
+        assert!(err.starts_with("invalid value for `default_engine`: `mxl` is neither"), "{err}");
+        assert!(err.contains("the closest is `mlx`"), "{err}");
+        endpoint.unwrap();
+        let err = no_registry.unwrap_err();
+        assert!(err.contains("`mlx` names an endpoint, but the profile registry"), "{err}");
+        assert!(get_at(p, "default_engine").unwrap().contains("mlx"), "a refused write leaves the old value");
     }
 
     #[test]

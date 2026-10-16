@@ -32,12 +32,14 @@ pub mod profiles;
 /// unregistered `policy`, `config_enum::bad_endpoint_budget_policies`, and
 /// `limits` that cannot be used as written,
 /// `config_enum::invalid_endpoint_limits`) and every key its schema does not
-/// know (`darkmux_types::user_files`). `profiles.json` is a file
+/// know (`darkmux_types::user_files`), and `default_engine`, whose values
+/// are endpoint ids (`darkmux_types::default_engine`). `profiles.json` is a file
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
 /// loader) adds that pass. Every endpoint is checked, not only the ones this
 /// run would call: bad config is bad config (#2947). A registry that cannot
-/// be loaded adds nothing here; the entry point reports that itself when it
-/// resolves a profile.
+/// be loaded adds nothing here but the `default_engine` check: only
+/// `lmstudio` passes, and any other value is refused naming the load error;
+/// the entry point reports the load failure itself when it resolves a profile.
 pub fn preflight(
     scope: darkmux_types::config_enum::Scope,
 ) -> Result<(), darkmux_types::config_enum::PreflightRefusal> {
@@ -56,10 +58,18 @@ pub fn preflight_with(
     use darkmux_types::user_files::UserFileKind;
     let mut refusal = config_enum::preflight(scope).err().unwrap_or_else(|| PreflightRefusal::none(scope));
     if UserFileKind::Profiles.scopes().contains(&scope) {
-        if let Ok(loaded) = profiles::load_registry_quiet(profiles_file) {
-            refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
-            refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
-            refusal.files.extend(profiles::user_file_problem(&loaded.path));
+        match profiles::load_registry_quiet(profiles_file) {
+            Ok(loaded) => {
+                refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
+                refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
+                refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
+                refusal.files.extend(profiles::user_file_problem(&loaded.path));
+            }
+            // With no registry no endpoint id can be checked, so only
+            // `lmstudio` passes, and the refusal names the load error.
+            Err(e) => refusal
+                .invalid
+                .extend(darkmux_types::default_engine::invalid_without_registry(&format!("{e:#}"))),
         }
     }
     refusal.into_result()
@@ -139,6 +149,31 @@ mod user_file_tests {
                         "endpoints": {"api": {"url": "https://api.example/v1"}}}"#;
         let (_d, path) = write(named);
         assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&path)), Ok(()));
+    }
+
+    /// (#316) `default_engine` names an endpoint in this registry or
+    /// `lmstudio`; anything else is refused by every dispatching preflight,
+    /// never read as LM Studio.
+    #[test]
+    #[serial_test::serial]
+    fn a_default_engine_naming_no_usable_engine_is_refused() {
+        let (_d, path) = write(CLEAN);
+        let env = darkmux_types::default_engine::ENV;
+        unsafe { std::env::set_var(env, "azur") };
+        let refused: Vec<_> = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun]
+            .map(|scope| crate::preflight_with(scope, Some(&path)).map_err(|r| r.to_string()))
+            .into();
+        let no_registry = crate::preflight_with(Scope::Dispatch, Some("/nonexistent/profiles.json"));
+        unsafe { std::env::set_var(env, "LMStudio") };
+        let lmstudio = crate::preflight_with(Scope::Dispatch, Some(&path));
+        unsafe { std::env::remove_var(env) };
+        for r in refused {
+            let msg = r.unwrap_err();
+            assert!(msg.contains("env var DARKMUX_DEFAULT_ENGINE: `azur` is neither"), "{msg}");
+        }
+        assert_eq!(lmstudio, Ok(()));
+        let msg = no_registry.expect_err("no registry is not a pass").to_string();
+        assert!(msg.contains("`azur` names an endpoint, but the profile registry"), "{msg}");
     }
 
     #[test]
