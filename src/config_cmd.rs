@@ -1021,14 +1021,37 @@ mod tests {
     /// (#316) `default_engine` is checked before it is written: `lmstudio`
     /// in any case is taken, a value naming no engine is refused and the old
     /// value stays.
+    ///
+    /// The registry is pinned through `DARKMUX_PROFILES`, so the outcome never
+    /// depends on the machine's own profiles.json.
     #[test]
+    #[serial_test::serial]
     fn default_engine_takes_lmstudio_and_refuses_a_value_naming_no_engine() {
         let f = tmp();
         let p = f.path();
-        set_at(p, "default_engine", "LMStudio").unwrap();
-        let err = set_at(p, "default_engine", "no-such-engine-xyz").unwrap_err().to_string();
-        assert!(err.starts_with("invalid value for `default_engine`: `no-such-engine-xyz` is neither"), "{err}");
-        assert!(get_at(p, "default_engine").unwrap().contains("LMStudio"), "a refused write leaves the old value");
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            r#"{"profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                "endpoints": {"mlx": {"url": "http://127.0.0.1:8080/v1"}}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("DARKMUX_PROFILES", &reg) };
+        let lmstudio = set_at(p, "default_engine", "LMStudio");
+        let unknown = set_at(p, "default_engine", "mxl").map_err(|e| e.to_string());
+        let endpoint = set_at(p, "default_engine", "mlx");
+        unsafe { std::env::set_var("DARKMUX_PROFILES", dir.path().join("absent.json")) };
+        let no_registry = set_at(p, "default_engine", "mlx").map_err(|e| e.to_string());
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        lmstudio.unwrap();
+        let err = unknown.unwrap_err();
+        assert!(err.starts_with("invalid value for `default_engine`: `mxl` is neither"), "{err}");
+        assert!(err.contains("the closest is `mlx`"), "{err}");
+        endpoint.unwrap();
+        let err = no_registry.unwrap_err();
+        assert!(err.contains("`mlx` names an endpoint, but the profile registry"), "{err}");
+        assert!(get_at(p, "default_engine").unwrap().contains("mlx"), "a refused write leaves the old value");
     }
 
     #[test]
