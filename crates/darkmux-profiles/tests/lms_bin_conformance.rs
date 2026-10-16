@@ -1,7 +1,7 @@
 //! (#1939) Conformance: the model-host binary is never spawned by a
 //! hardcoded `"lms"` literal — every spawn resolves the name through
 //! `darkmux_types::config_access::lms_bin()` (directly, or via one of this
-//! workspace's thin wrappers around it: `darkmux_profiles::lms::lms_bin()`,
+//! workspace's thin wrappers around it: the crate-private `lms::lms_bin()`,
 //! `LmsHost::new()`'s `bin: lms_bin()`, the LM Studio backend's `ledger()`
 //! (`crate::lms::lms_bin()`)), which resolves
 //! `env(DARKMUX_LMS_BIN) > config.lms_bin > "lms"` (#661 Slice 4).

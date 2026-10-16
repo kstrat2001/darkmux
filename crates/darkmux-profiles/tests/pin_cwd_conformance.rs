@@ -14,7 +14,8 @@
 //! hardware fingerprint) — and each carried its OWN copy of
 //! `cmd.current_dir("/")` with nothing protecting it. Proven: DELETING
 //! `load_with_identifier`'s pin line and running `cargo test -p
-//! darkmux-profiles` left all 213 tests green.
+//! darkmux-profiles` left all 213 tests green. (`load_with_identifier` had
+//! no callers left and was removed in #316 stage 3.7.)
 //!
 //! #2534's fix names the pin — `darkmux_profiles::process::pin_cwd` since #316
 //! stage 3.6, first `lms::pin_cwd` — and calls
@@ -322,7 +323,7 @@ fn every_lms_spawn_in_the_swept_crates_pins_its_cwd() {
 /// or whose sweep roots resolved to an empty/wrong directory, would report
 /// the assertion above as vacuously green — a probe that passes without
 /// testing anything, worse than no probe. Assert the scan actually SEES
-/// the sites #2534 was filed against (at least 7 matches: 5 in `lms.rs`,
+/// the sites #2534 was filed against (at least 6 matches: 4 in `lms.rs`,
 /// 1 in `dispatch_internal.rs`, 1 in `scores.rs`, per the grep behind this
 /// fix; since #316 stage 3.6 those last two are the LM Studio backend's
 /// `resident_ids` and `version`, both in `engine/lmstudio.rs`). #1939 later
@@ -330,15 +331,16 @@ fn every_lms_spawn_in_the_swept_crates_pins_its_cwd() {
 /// through the fully-qualified
 /// `darkmux_types::config_access::lms_bin()` rather than the crate-local
 /// `lms_bin()` wrapper — a third literal shape was added to
-/// `LMS_SPAWN_PATTERNS` above to keep seeing them; the expected total stays
-/// 7, only the matched literal text for two of the sites changed.
+/// `LMS_SPAWN_PATTERNS` above to keep seeing them; only the matched literal
+/// text for two of the sites changed. The total was 7 until #316 stage 3.7
+/// removed the dead `load_with_identifier`, one of `lms.rs`'s five.
 #[test]
 fn the_scan_actually_finds_the_known_sites() {
     let total: usize = sweep_roots().iter().map(|r| all_lms_spawn_matches(r).len()).sum();
     assert!(
-        total >= 7,
+        total >= 6,
         "the conformance scan found only {total} `lms` spawn(s) across the swept crates — \
-         expected at least 7 (the known #2534 sites). Either the sweep roots are wrong, the \
+         expected at least 6 (the known #2534 sites). Either the sweep roots are wrong, the \
          `LMS_SPAWN_PATTERNS` no longer match this codebase's spawn style, or a site was \
          deleted — in every case, `every_lms_spawn_in_the_swept_crates_pins_its_cwd` above is \
          not actually testing what it claims to.",
@@ -355,12 +357,12 @@ fn the_window_extractor_does_not_leak_into_a_neighboring_function() {
     let lines: Vec<&str> = src.lines().collect();
 
     // `unload` (no `lms`-spawn pattern issue here, but it precedes
-    // `load_with_identifier` and must not see INTO it) is a real anchor:
-    // its body must not contain `load_with_identifier`'s signature.
+    // `verify_unload_outcome` and must not see INTO it) is a real anchor:
+    // its body must not contain `verify_unload_outcome`'s signature.
     let unload_idx = find_fn_decl(&lines, "unload");
     let unload_window = same_function_window(&lines, unload_idx);
     assert!(
-        !unload_window.contains("fn load_with_identifier"),
+        !unload_window.contains("fn verify_unload_outcome"),
         "the window extractor read past `unload`'s own body into its neighbor — \
          `same_function_window` is over-reaching, so every other assertion in this \
          module is unearned"

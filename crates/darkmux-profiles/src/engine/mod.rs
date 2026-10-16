@@ -81,6 +81,11 @@ pub trait Engine {
     /// and the doctor's unpriceable check. Never errors: every probe degrades
     /// to a warning in the ledger.
     fn ledger(&self) -> crate::model_ledger::ModelLedger;
+
+    /// The local binary darkmux reaches the engine through, and where that
+    /// name came from (env, config or built-in), or `None` when the engine
+    /// is not reached through a local binary. The doctor's binary check.
+    fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)>;
 }
 
 /// The engine on this machine. Today that is always LM Studio, resolving its

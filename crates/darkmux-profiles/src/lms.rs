@@ -1,7 +1,8 @@
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode, DEFAULT_LIST_BOUND};
 use crate::gestalt_host::resolved_load_deadline;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use darkmux_gestalt::Deadline;
+use crate::engine::ModelMeta;
 use darkmux_types::LoadedModel;
 use std::process::Command;
 
@@ -33,11 +34,6 @@ pub(crate) fn lms_bin() -> String {
     // env(DARKMUX_LMS_BIN) > config.lms_bin > "lms" (#661 Slice 4).
     darkmux_types::config_access::lms_bin()
 }
-
-/// (#316 stage 3.6) The cwd pin is a process helper, not an LM Studio one:
-/// it now lives in `crate::process`, and this path stays a re-export until
-/// `lms` becomes private to the LM Studio backend (stage 3.7).
-pub use crate::process::pin_cwd;
 
 /// Every model LMStudio currently has resident, via `lms ps --json` with a
 /// `lms ps` text fallback.
@@ -262,11 +258,6 @@ fn is_ps_header(trimmed: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
 }
 
-/// (#316 stage 3.3) The catalog row type now lives with the engine facade;
-/// this path stays as a re-export until `lms` becomes private to the LM
-/// Studio backend (stage 3.7).
-pub use crate::engine::ModelMeta;
-
 /// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
 /// Errors when `lms` cannot be run, exits non-zero, or prints something that
 /// is not a JSON list: a failed listing is not an empty catalog (#3143).
@@ -343,15 +334,10 @@ pub fn unload(identifier: &str) -> Result<()> {
     verify_unload_outcome(out.status.success(), &out.stderr, identifier)
 }
 
-/// (#316 stage 3.4) The not-resident check now lives with the engine facade;
-/// this path stays as a re-export until `lms` becomes private to the LM
-/// Studio backend (stage 3.7).
-pub use crate::engine::is_not_resident;
-
 /// Classify `lms unload` through the ONE shared classifier the gestalt host
 /// uses (#3083: two classifiers had diverged on "Model Not Found"). The typed
 /// [`darkmux_gestalt::HostError`] rides the `anyhow` error, so a caller that
-/// treats an already-gone instance as benign asks [`is_not_resident`].
+/// treats an already-gone instance as benign asks [`crate::engine::is_not_resident`].
 pub(crate) fn verify_unload_outcome(success: bool, stderr: &str, identifier: &str) -> Result<()> {
     let exit_detail = format!("of {identifier} failed: {}", stderr.trim());
     match crate::gestalt_host::lms_host::classify_unload_outcome(success, stderr, identifier, &exit_detail) {
@@ -360,81 +346,10 @@ pub(crate) fn verify_unload_outcome(success: bool, stderr: &str, identifier: &st
     }
 }
 
-/// Load a model into LMStudio under an explicit identifier. The caller is
-/// responsible for deciding whether the identifier should be darkmux-namespaced
-/// (see `ownership::namespaced_identifier`) or pass-through for an operator-set
-/// custom name.
-pub fn load_with_identifier(
-    model_id: &str,
-    n_ctx: u32,
-    identifier: &str,
-    quiet: bool,
-) -> Result<()> {
-    let mut cmd = Command::new(lms_bin());
-    cmd.args([
-        "load",
-        model_id,
-        "--context-length",
-        &n_ctx.to_string(),
-        "--identifier",
-        identifier,
-    ]);
-    // (#1863, named+tested #2534) This spawn bypasses `run_bounded`'s
-    // chokepoint fix (see that function's comment) by construction — it
-    // needs bespoke stdio handling for the load spinner — so it needs its
-    // own cwd pin.
-    pin_cwd(&mut cmd);
-    if quiet {
-        // (#1135) `quiet` must actually SUPPRESS. `Command` inherits the
-        // parent's stdio by default, so merely *not* setting it left the
-        // `lms load` progress spinner leaking to stdout — which corrupts a
-        // `--json` dispatch envelope when the load runs mid-dispatch. Null
-        // stdout; keep stderr inherited so a load failure is still visible.
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::inherit());
-    } else {
-        // inherit stdio so the user sees the loading spinner
-        cmd.stdout(std::process::Stdio::inherit());
-        cmd.stderr(std::process::Stdio::inherit());
-    }
-    // Bounded like everything else in this file, but NOT via `run_bounded`:
-    // that runner pipes/nulls stdio, and this call deliberately inherits it
-    // (the operator watches the load spinner; #1135 nulls stdout in quiet
-    // mode to protect `--json` envelopes). Same spawn + poll + kill shape,
-    // stdio left exactly as configured above.
-    let deadline = resolved_load_deadline();
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("running `lms load {model_id}`"))?;
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() >= deadline.0 => {
-                let _ = child.kill();
-                let _ = child.wait(); // reap — the kill must not leave a zombie
-                bail!(
-                    "lms load {model_id} timed out after {}s                      (DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS to tune)",
-                    deadline.0.as_secs()
-                );
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("waiting on `lms load {model_id}`: {e}");
-            }
-        }
-    };
-    if !status.success() {
-        bail!("lms load {model_id} failed: exit {}", status.code().unwrap_or(-1));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::is_not_resident;
     use serde_json::json;
 
     #[test]

@@ -3,10 +3,10 @@
 //! Sibling to (not a replacement for) `crate::lms`. This adapter differs
 //! from those wrappers in exactly the ways the gestalt ports require:
 //!
-//! - **Enforced deadline on EVERY call (#1276).** The current
-//!   `lms::load_with_identifier` blocks indefinitely via `Command::status()`
-//!   — a wrong model id hangs the dispatch until the workflow's outer kill.
-//!   Here every `lms` child — load, unload, and the read-only ps/ls — is
+//! - **Enforced deadline on EVERY call (#1276).** The old
+//!   `lms::load_with_identifier` (removed in #316 stage 3.7) blocked
+//!   indefinitely via `Command::status()`: a wrong model id hung the dispatch
+//!   until the workflow's outer kill. Here every `lms` child — load, unload, and the read-only ps/ls — is
 //!   spawned, polled with `try_wait`, and hard-killed at expiry, returning a
 //!   typed [`HostError::Timeout`] naming the phase. Mutating calls run under
 //!   the caller's [`Deadline`]; the list calls (whose port signatures carry
@@ -143,7 +143,7 @@ impl ModelHost for LmsHost {
     }
 
     /// `lms load <key> --context-length <ctx> --identifier <id> -y` under the
-    /// enforced deadline. Flags match `crate::lms::load_with_identifier` plus
+    /// enforced deadline. Flags match the old `lms::load_with_identifier` plus
     /// `-y`: inside a dispatch the load must never wait on an interactive
     /// confirmation (#1276 — "never let `lms load` decide to download or wait
     /// interactively"); the deadline backstops whatever `-y` doesn't cover.

@@ -1,12 +1,12 @@
 # One interface over many engines: design and refactor plan
 
-**Status:** stages 0 to 2 done; stage 3 in progress (section 8); stage 4's default engine designed (section 9) · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198 (sections 2 to 6), d1a971568 (section 8)
+**Status:** stages 0 to 3 done (section 8); stage 4's default engine designed (section 9) · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198 (sections 2 to 6), d1a971568 (section 8)
 
 Every concrete claim cites the code it comes from (`path:line`) or the measurement it was taken from. Nothing here ships today; where this doc says "today", it describes the current binary.
 
 ## 1. Why
 
-darkmux runs local models through LM Studio and only LM Studio (`CLAUDE.md`, "What darkmux is": "a `ModelBackend` abstraction is #316, deliberately not built"). Not every machine or user runs LM Studio: a Linux machine serves `mlx_lm.server`, a Mac may prefer Splash or lithos, and the hosted seats speak Claude's Messages dialect. Those already run as `url` endpoints (`endpoints.<id>.url` in `profiles.json`), but each one is a special case beside the LM Studio path, and the features built on LM Studio go dark on them.
+darkmux ran local models through LM Studio and only LM Studio (`CLAUDE.md`, "What darkmux is", until stage 3.7: "a `ModelBackend` abstraction is #316, deliberately not built"). Stage 3 put a facade in front of it; LM Studio is still its only backend. Not every machine or user runs LM Studio: a Linux machine serves `mlx_lm.server`, a Mac may prefer Splash or lithos, and the hosted seats speak Claude's Messages dialect. Those already run as `url` endpoints (`endpoints.<id>.url` in `profiles.json`), but each one is a special case beside the LM Studio path, and the features built on LM Studio go dark on them.
 
 The goal is a real mux: one interface the rest of darkmux calls, with LM Studio as one backend among several.
 
@@ -52,7 +52,7 @@ The first three belong to an engine darkmux **manages**; the rest are **observat
 1. **Does darkmux start and stop engines itself** (for example `mlx_lm.server` at the right model and context), or only adopt servers the operator started?
 2. **One memory budget per machine across backends.** Today the budget knows only LM Studio's models.
 3. **Contract 4 generalizes** from "`darkmux:<model>` in LM Studio" to "darkmux manages only what it started, on any backend".
-4. **Versioning.** Each stage below is behavior-preserving or additive and can ship in a minor. The doctrine line in `CLAUDE.md` is replaced when stage 3 lands, and the decision is recorded.
+4. **Versioning.** Each stage below is behavior-preserving or additive and can ship in a minor. The doctrine line in `CLAUDE.md` is replaced when stage 3 lands, and the decision is recorded. **Recorded (stage 3.7):** stage 3 ships in a minor, since no wire, `--json`, config or profile shape changed; the `CLAUDE.md` line now reads "one engine facade, LM Studio its only backend today", and `docs/agents/LAYOUT.md` and `DESIGN.md` say the same.
 
 ## 5. Method: decomplicate before changing features
 
@@ -92,7 +92,7 @@ Off the path (left to the ratchet as files are touched, except cheap 0%-coverage
 | 0 | CRAP ratchet in CI; tests for the 0%-coverage path functions | ratchet live; `cmd_model_eject`, `cmd_profile` and the two doctor checks pinned | done: #3232 |
 | 1 | `run_dispatch`: boundary tests, mutation-proved, then split by responsibility | `run_dispatch` under complexity 20; every moved branch pinned; one live dispatch identical | done: #3233, #3234, #3235 (132 → 3) |
 | 2 | `dispatch_internal::dispatch` and the telemetry sampler, same method | both under 20; live dispatch identical | done: #3237, #3238 (`dispatch` 78 → 6, `run_telemetry_sampler` 37 → 3) |
-| 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged | planned: section 8 |
+| 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged | done: #3241, #3244 to #3246, #3248 to #3250 (section 8.4); live coder dispatch on `deep` 2026-10-16 |
 | 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent; a default engine per machine, which `init` detects and records | unmanaged endpoints stop being special cases; #3209 to #3211 fall out; a machine with no LM Studio (a Linux box serving `mlx_lm.server`) runs `init` and dispatch with no hand-edited config | designed: section 9 |
 | 5 | one memory budget per machine across backends | (open question 2) | |
 | 6 | managed servers for engines without a manager | (open question 1) | |
@@ -148,7 +148,7 @@ Each PR is behavior-preserving, moves one question, and is verified by the exist
 | **3.4** (done: #3246) | unload, `is_not_resident` (its old path stays a re-export until 3.7), and `eject_all_managed`'s list | `eject_each` and residency closure tests; `cmd_model_eject` (stage 0); pinned first: the eject's post-unload re-check and dispatch's wrong-context reload (both found by mutation) |
 | **3.5** (done: #3248) | load: `LmsHost::new()` → `engine.host()`; `None` is an `expect` until stage 4, so `run_bounded`'s factory type is unchanged | the gestalt and concurrent-dispatch suites (their doubles are untouched), the dispatch boundary's load tests; pinned first: the wave track's production factory (found by mutation) |
 | **3.6** (done: #3249) | the bespoke spawns into the backend verbatim (`resident_ids`, `ledger`, `version`); `pin_cwd` to `darkmux_profiles::process` (its old path a re-export until 3.7) | `pin_cwd_conformance.rs` and `lms_bin_conformance.rs`, their path lists updated in the same PR; pinned first: dispatch's #408 cross-check, `machine resources`, `/machine/resources`, doctor's resident pricing and the lab fingerprint's engine version (all five found by mutation) |
-| 3.7 | `lms` becomes private to the backend, so the done-when is a compile error rather than a grep; drop `main.rs`'s re-export and the dead `load_with_identifier`; doctor's `check_lms_binary` asks `binary()`; replace the `CLAUDE.md` doctrine line (open question 4) | the full suite with `full-ci`; one live dispatch, with the operator's go-ahead |
+| **3.7** (done: #3250) | `lms` becomes private to the backend, so a call to the `lms` module from another crate is a compile error (`LmsHost`, `gather_with_bin` and `config_access::lms_bin()` stay public, so a bypass through them is still review's to catch); drop `main.rs`'s re-export and the dead `load_with_identifier`; doctor's `check_lms_binary` asks `binary()`; replace the `CLAUDE.md` doctrine line (open question 4) | the full suite with `full-ci`; one live dispatch, with the operator's go-ahead |
 
 **First PR (3.1):** add `darkmux-profiles/src/engine/{mod.rs,lmstudio.rs}` with `loaded()`, `catalog()`, `unload()`, `host()` delegating one-to-one to `lms::*` and `LmsHost`, and route `darkmux-doctor`'s seven `list_loaded` calls through it. It proves the shape on the best-pinned consumer, and the doctor tests stay byte-identical.
 
@@ -180,7 +180,7 @@ One config key, **`default_engine`**: the engine `engine::local()` returns on th
 `init` detects which engines are **answering**, not which OS it runs on. "Linux, so MLX" is a guess: a Linux machine may run vLLM, a Mac may run `mlx_lm.server`, and an installed server may simply not be running. A probe is cheap and settles it.
 
 1. **LM Studio:** `lms` resolves (`config_access::lms_bin()`) and `lms ps` answers.
-2. **An OpenAI-compatible server:** `GET /v1/models` answers at each endpoint already in `profiles.json`, at the address passed as `darkmux init --engine-url <url>`, and at the well-known local defaults (`mlx_lm.server`'s default port, 8080 as of this writing; confirm against the installed version before relying on it).
+2. **An OpenAI-compatible server:** `GET /v1/models` answers at each endpoint already in `profiles.json`, at the address passed as `darkmux init --engine-url <url>`, and at the well-known local defaults (`mlx_lm.server`'s default port, 8080, confirmed on mlx-lm 0.32.1).
 3. **Decide:**
    - **exactly one answers:** suggest it;
    - **several answer:** suggest LM Studio, list the others with what each serves, and let the operator choose;
