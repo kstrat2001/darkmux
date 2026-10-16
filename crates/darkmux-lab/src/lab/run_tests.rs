@@ -759,3 +759,25 @@ fn the_batch_summary_counts_completed_and_errored_runs() {
     assert_eq!(batch_summary(&[o(None), o(Some("boom")), o(None)]), "3 run(s): 2 completed, 1 errored");
     assert_eq!(batch_summary(&[o(None)]), "1 run(s): 1 completed, 0 errored");
 }
+
+/// (#316) A profile with nothing on LM Studio is not checked against it: no
+/// "`lms ps` failed" warning on a machine whose models all run elsewhere,
+/// even with no `lms` at all.
+#[test]
+#[serial_test::serial]
+fn a_profile_with_nothing_on_lm_studio_is_not_checked_against_it() {
+    let pm = darkmux_types::ProfileModel::hosted_for_test("m", Some(1), serde_json::json!({ "url": "http://127.0.0.1:9/v1" }));
+    let profile = darkmux_types::Profile { models: vec![pm], ..Default::default() };
+    let prev = std::env::var_os("DARKMUX_LMS_BIN");
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/lms") };
+    let unmanaged = envelope_check(&profile, "p");
+    let managed = envelope_check(&darkmux_types::Profile { models: vec![darkmux_types::ProfileModel { id: "m".into(), ..Default::default() }], ..Default::default() }, "p");
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    assert_eq!(unmanaged, Vec::<String>::new());
+    assert!(managed.iter().any(|w| w.contains("could not verify")), "a managed profile still is: {managed:?}");
+}

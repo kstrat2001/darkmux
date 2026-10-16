@@ -830,6 +830,27 @@ impl ProfileRegistry {
         self.endpoints = endpoints;
     }
 
+    /// (#316) The machine's default engine is the endpoint `id`
+    /// (`default_engine`): every profile model that names no endpoint, and a
+    /// utility binding that names none, is on that endpoint, exactly as if it
+    /// named `id`. Run by the loader after [`Self::materialize_endpoints`], so
+    /// every consumer reads one answer (contract 1). Nothing writes a loaded
+    /// registry back to `profiles.json`, so the file keeps what the operator
+    /// wrote.
+    pub fn apply_default_engine(&mut self, id: &str) {
+        let endpoint = self.endpoint_named(id);
+        for model in self.profiles.values_mut().flat_map(|p| p.models.iter_mut()) {
+            if model.endpoint.is_none() {
+                model.endpoint = Some(endpoint.clone());
+            }
+        }
+        if let Some(utility) = self.internal.as_mut().and_then(|i| i.utility.as_mut()) {
+            if utility.endpoint.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                utility.endpoint = Some(id.to_string());
+            }
+        }
+    }
+
     /// (#2902) THE id lookup: `endpoints.<id>` as a named endpoint carrying
     /// the definition's fields, or an unresolved reference when the map does
     /// not define it (or its entry was quarantined). Shared by
@@ -1270,6 +1291,31 @@ mod tests {
         let mut back: ProfileRegistry = serde_json::from_value(out).unwrap();
         back.materialize_endpoints();
         assert_eq!(back.profiles["p"].models[0].endpoint, m.endpoint);
+    }
+
+    /// (#316) With the default engine on an endpoint, a model or utility
+    /// binding that names no endpoint is on it; one that names its own keeps it.
+    #[test]
+    fn the_default_engine_takes_every_model_and_binding_that_names_no_endpoint() {
+        let mut r: ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "profiles": {"p": {"models": [
+                {"id": "local", "n_ctx": 1},
+                {"id": "pinned", "n_ctx": 1, "endpoint": "lms"},
+            ]}},
+            "endpoints": {"mlx": {"url": "http://127.0.0.1:8080/v1"}, "lms": {"managed": "lmstudio"}},
+            "internal": {"utility": {"id": "u", "n_ctx": 1}},
+        }))
+        .unwrap();
+        r.materialize_endpoints();
+        r.apply_default_engine("mlx");
+        let models = &r.profiles["p"].models;
+        assert_eq!(models[0].endpoint_kind(), Ok(EndpointKind::Unmanaged));
+        assert_eq!(models[0].endpoint.as_ref().and_then(|e| e.named_id()), Some("mlx"));
+        assert_eq!(models[1].endpoint_kind(), Ok(EndpointKind::Managed(ManagedBackend::Lmstudio)));
+        assert!(r.utility_is_unmanaged());
+        assert!(r.needs_lmstudio(), "the pinned managed model still needs LM Studio");
+        r.profiles.get_mut("p").unwrap().models.pop();
+        assert!(!r.needs_lmstudio(), "with it gone, nothing does");
     }
 
     #[test]

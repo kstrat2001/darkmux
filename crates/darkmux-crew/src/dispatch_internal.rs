@@ -5960,6 +5960,13 @@ type SplitRoute = (Option<(crate::types::Role, String, crate::target::Target)>, 
 
 /// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
 fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
+    // (#316) Every dispatch is split here once, so a model on an engine that
+    // loads on request is announced once.
+    if let Some(DispatchRoute::Unmanaged { target, .. }) = &route {
+        if let Some(notice) = engine_switch_notice(&target.model) {
+            eprintln!("{notice}");
+        }
+    }
     match route {
         Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => (Some((*role, system_prompt, *target)), None),
         Some(DispatchRoute::Managed(target)) => (None, Some(*target)),
@@ -7789,6 +7796,7 @@ fn spawn_observers(
         // endpoint budget (the pre-start half ran before `dispatch start`).
         pacer_for(limits_pm, opts.config_path.as_deref())?,
         local_stop.clone(),
+        registry_polls_lmstudio(opts.config_path.as_deref()),
     );
     Ok((
         ObserverGuards { _sampler_stop_guard, _watchdog_abandon_guard, _tailer_stop_guard },
@@ -9636,6 +9644,7 @@ fn spawn_guarded_sampler(
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     budget_pacer: Option<crate::budget::BudgetPacer>,
     local_stop: DispatchStop,
+    polls_lmstudio: bool,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -9655,9 +9664,17 @@ fn spawn_guarded_sampler(
             thermal_config,
             budget_pacer,
             local_stop,
+            polls_lmstudio,
         )
     });
     (guard, handle)
+}
+
+/// (#316) Whether the registry this dispatch runs on (`config_path`, else the
+/// default search) has anything on LM Studio, so its sampler polls it. A
+/// registry that cannot be loaded polls, as before.
+fn registry_polls_lmstudio(config_path: Option<&str>) -> bool {
+    darkmux_profiles::profiles::load_registry_quiet(config_path).map_or(true, |l| l.registry.needs_lmstudio())
 }
 
 /// The per-tier extras a governor's `dispatch.rest` carries beyond its
@@ -9700,6 +9717,9 @@ fn run_telemetry_sampler(
     budget_pacer: Option<crate::budget::BudgetPacer>,
     // (#2925) Where a phase- or mission-scoped stop lands: this dispatch only.
     local_stop: DispatchStop,
+    // (#316) Whether this dispatch's profile registry has anything on LM
+    // Studio ([`registry_polls_lmstudio`]); `false` polls it not at all.
+    polls_lmstudio: bool,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     let records = SamplerRecords { role_id, session, execution, model, phase_id, record_context };
     let mut sampler = DispatchSampler::start(
@@ -9709,6 +9729,7 @@ fn run_telemetry_sampler(
         thermal_config,
         budget_pacer,
         local_stop,
+        polls_lmstudio,
     );
     while !stop_flag.load(Ordering::SeqCst) {
         sampler.tick(&records);
@@ -9869,7 +9890,10 @@ struct DispatchSampler {
     // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
     // all moved into `LmsTelemetryTracker` — see its doc for why the state
     // machine lives behind an injected-effect seam instead of inline here.
-    lms_tracker: LmsTelemetryTracker,
+    // (#316) `None` when nothing in the profile registry runs on LM Studio
+    // (every model on the default engine or another unmanaged endpoint):
+    // LM Studio is not polled at all, as on a machine without it.
+    lms_tracker: Option<LmsTelemetryTracker>,
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -9895,6 +9919,7 @@ impl DispatchSampler {
         thermal_config: crate::thermal_governor::ThermalGovernorConfig,
         budget_pacer: Option<crate::budget::BudgetPacer>,
         local_stop: DispatchStop,
+        polls_lmstudio: bool,
     ) -> Self {
         let started = Instant::now();
         let probe = crate::host_probe::HostProbe::new();
@@ -9955,7 +9980,8 @@ impl DispatchSampler {
         // (#2914) One utility seat, under every id this dispatch declared for
         // it: the compactor's resolved wire id and the binding (normally the same
         // model; a pinned compactor that differs still shares the seat).
-        let lms_tracker = LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect());
+        let lms_tracker = polls_lmstudio
+            .then(|| LmsTelemetryTracker::new(records.model.clone(), utility_ids.into_iter().flatten().collect()));
         Self {
             started,
             raw: Vec::new(),
@@ -9984,9 +10010,11 @@ impl DispatchSampler {
         // tagging, and the skip-on-failed-probe behavior all live in
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
-        self.lms_tracker.tick(&|| engine::lmstudio().loaded(), &|payload| {
-            records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
-        });
+        if let Some(tracker) = self.lms_tracker.as_mut() {
+            tracker.tick(&|| engine::lmstudio().loaded(), &|payload| {
+                records.emit(darkmux_flow::FlowSource::Lms, darkmux_flow::Payload::TelemetryLms(payload))
+            });
+        }
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
         // per-cluster frequency, power and thermal state the same probe
@@ -13881,6 +13909,30 @@ pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource)
         "darkmux dispatch: loading `{model_key}` at n_ctx={n_ctx} ({}) before dispatch. (#1135)",
         source.describe()
     )
+}
+
+/// (#316, ENGINES.md open question 5) A model sent to this machine's default
+/// engine when that engine loads whatever a request names (`mlx_lm.server`
+/// holds one model and switches to the one asked for): the operator is told
+/// once per dispatch that this dispatch may replace the model the engine
+/// holds. Decided from the engine's declared capabilities, never its name.
+fn engine_switch_notice(model: &darkmux_types::ProfileModel) -> Option<String> {
+    let endpoint_id = model.endpoint.as_ref()?.named_id()?;
+    let default_engine = darkmux_types::config_access::default_engine();
+    if default_engine.trim() != endpoint_id {
+        return None;
+    }
+    switch_notice_for(endpoint_id, engine::local().capabilities().loading, &model.id)
+}
+
+/// The decision and wording of [`engine_switch_notice`], pure.
+fn switch_notice_for(engine_id: &str, loading: engine::Loading, model_id: &str) -> Option<String> {
+    (loading == engine::Loading::Unknown).then(|| {
+        format!(
+            "darkmux dispatch: `{engine_id}` loads the model a request names; this dispatch sends `{model_id}`, \
+             which may replace the model it holds. (#316)"
+        )
+    })
 }
 
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the

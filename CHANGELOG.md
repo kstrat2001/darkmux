@@ -21,8 +21,19 @@ darkmux release.
   in `profiles.json`, set with `darkmux config set default_engine <value>` or
   `DARKMUX_DEFAULT_ENGINE`. A value naming no usable engine is refused by `config
   set` and by every dispatch, mission launch and lab run, with the closest valid
-  value, and `darkmux doctor` has a `default engine` row. This release reads the setting but
-  does not act on it yet: local models still run on LM Studio. Config schema 2.4;
+  value, and `darkmux doctor` has a `default engine` row. With it naming an endpoint, every
+  profile model that names no endpoint (and an endpointless utility binding) runs
+  on that server: darkmux sends the bare model id, loads and ejects nothing there,
+  and a model pinned to a managed endpoint stays on LM Studio. On a server that
+  loads whatever a request names (`mlx_lm.server`), each dispatch says it may
+  replace the model the server holds. `darkmux doctor`'s `default engine` row
+  checks that the server answers, and its LM Studio rows read "not checked" when
+  nothing needs LM Studio (whether or not `default_engine` is set), and nothing
+  polls LM Studio during a dispatch then. A model on the default engine is treated
+  as any unmanaged endpoint is for the data boundary: `identity.md` is not added
+  to its prompt, as for a hosted model. `darkmux init` still plans for LM Studio, and `machine
+  status --json` and `darkmux serve` still report this as LM Studio unreachable;
+  both follow. Config schema 2.4;
   an older darkmux refuses the key, so upgrade every machine before writing it.
 
 ### Fixed

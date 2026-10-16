@@ -124,6 +124,14 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
     let mut registry = parse_registry_lenient(&raw)
         .with_context(|| format!("parsing JSON at {}", path.display()))?;
     validate_registry(&mut registry, &path)?;
+    // (#316) A model that names no endpoint is on this machine's default
+    // engine. A value naming no usable engine changes nothing here: every
+    // entry point's preflight refuses it.
+    if let Ok(darkmux_types::default_engine::EngineChoice::Endpoint(id)) =
+        darkmux_types::default_engine::current(&registry)
+    {
+        registry.apply_default_engine(&id);
+    }
     if announce && !registry.quarantined.is_empty() {
         // One warning line per load (matching the loud-but-brief style of
         // this crate's other operator warnings); full per-entry detail lives

@@ -156,7 +156,7 @@ pub fn run() -> DoctorReport {
         check_runtime_image_freshness(),
         check_runtime_binary_cache(),
         check_ram_headroom(),
-        check_ram_headroom_load_projection(),
+        check_load_projection(),
         check_power_state(),
         check_platform_and_provider(),
         check_crew_role_prompt_coverage(),
@@ -4022,13 +4022,22 @@ fn check_default_engine() -> Check {
         Ok(l) => default_engine::resolve(&raw, source, &l.registry),
         Err(e) => default_engine::resolve_without_registry(&raw, source, &format!("{e:#}")),
     };
-    default_engine_status(resolved, source)
+    // (#316) An endpoint engine is asked once whether it answers: the
+    // bounded `GET /v1/models` its catalog is.
+    let answers = match &resolved {
+        Ok(default_engine::EngineChoice::Endpoint(_)) => {
+            Some(engine::local().catalog().map(|c| c.len()).map_err(|e| format!("{e:#}")))
+        }
+        _ => None,
+    };
+    default_engine_status(resolved, source, answers)
 }
 
 /// Pure decision for [`check_default_engine`].
 fn default_engine_status(
     resolved: Result<darkmux_types::default_engine::EngineChoice, darkmux_types::config_enum::InvalidSetting>,
     source: darkmux_types::config_access::Source,
+    answers: Option<Result<usize, String>>,
 ) -> Check {
     use darkmux_types::config_access::Source;
     use darkmux_types::default_engine::{self, EngineChoice};
@@ -4042,15 +4051,26 @@ fn default_engine_status(
         Ok(EngineChoice::Lmstudio) => {
             Check { name, status: Status::Pass, message: format!("{}{via}", default_engine::LMSTUDIO), hint: None }
         }
-        Ok(EngineChoice::Endpoint(id)) => Check {
-            name,
-            status: Status::Warn,
-            message: format!("endpoint `{id}`{via}, but this darkmux still runs local models on LM Studio"),
-            hint: Some(format!(
-                "This release reads `{}` without acting on it yet. A profile reaches `{id}` today by naming it as \
-                 its endpoint.",
-                default_engine::KEY
-            )),
+        Ok(EngineChoice::Endpoint(id)) => match answers {
+            Some(Ok(n)) => Check {
+                name,
+                status: Status::Pass,
+                message: format!(
+                    "endpoint `{id}`{via}: answers, and would serve {n} model(s); it does not report which it holds"
+                ),
+                hint: None,
+            },
+            Some(Err(e)) => Check {
+                name,
+                status: Status::Fail,
+                message: format!("endpoint `{id}`{via} does not answer: {}", first_line(&e)),
+                hint: Some(format!(
+                    "Start the server `{id}` names (darkmux adopts a running engine and never starts one), or set \
+                     `{}` to an engine that is running. Every model that names no endpoint is sent there.",
+                    default_engine::KEY
+                )),
+            },
+            None => not_applicable(&name, "the default engine was not asked"),
         },
         Err(invalid) => Check {
             name,
@@ -6420,7 +6440,9 @@ fn lmstudio_unneeded_check(name: &str) -> Check {
 /// (#3207) Whether the profile registry loads and declares nothing that needs
 /// LM Studio. A registry that does not load says nothing either way (`false`).
 fn lmstudio_unneeded() -> bool {
-    darkmux_profiles::profiles::load_registry(None).is_ok_and(|l| !l.registry.needs_lmstudio())
+    // Quiet: the `profile registry` row already announces a quarantine, and
+    // this runs for several rows (#316).
+    darkmux_profiles::profiles::load_registry_quiet(None).is_ok_and(|l| !l.registry.needs_lmstudio())
 }
 
 fn check_lms_binary() -> Check {
@@ -6489,7 +6511,12 @@ fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
 }
 
 fn check_models_loaded() -> Check {
-    match engine::local().loaded() {
+    models_loaded_status(engine::local().loaded())
+}
+
+/// Pure decision for [`check_models_loaded`].
+fn models_loaded_status(loaded: anyhow::Result<Vec<darkmux_types::LoadedModel>>) -> Check {
+    match loaded {
         Ok(models) if !models.is_empty() => Check {
             name: "models loaded".into(),
             status: Status::Pass,
@@ -6515,16 +6542,24 @@ fn check_models_loaded() -> Check {
                     .into(),
             ),
         },
+        // (#316) The engine cannot say (a server with no residency report):
+        // not a failure, and never "nothing loaded".
+        Err(e) if engine::is_not_reported(&e) => not_applicable("models loaded", &e.to_string()),
         Err(e) => Check {
             name: "models loaded".into(),
             status: Status::Warn,
-            message: format!("could not query lms: {}", first_line(&e.to_string())),
+            message: format!("could not query the engine: {}", first_line(&e.to_string())),
             hint: Some("ensure LMStudio is running and reachable".into()),
         },
     }
 }
 
 fn check_profile_loaded_match() -> Check {
+    // (#316) Nothing here runs on LM Studio (every model is on the default
+    // engine or another unmanaged endpoint): not checked, as `lms binary`.
+    if lmstudio_unneeded() {
+        return lmstudio_unneeded_check("profile match");
+    }
     let registry = match profiles::load_registry(None) {
         Ok(r) => r,
         Err(_) => {
@@ -6933,6 +6968,15 @@ fn classify_ram_headroom(
 /// already fully resident). See issue #70 thread A for the operator-facing
 /// motivation — pre-#68 doctor under-reported drift after a swap-load
 /// sequence; post-#68 we can call it out before the operator hits it.
+/// (#316) [`check_ram_headroom_load_projection`] when something here loads
+/// on LM Studio; as `lms binary`, not checked when nothing does.
+fn check_load_projection() -> Check {
+    if lmstudio_unneeded() {
+        return lmstudio_unneeded_check("RAM headroom (load projection)");
+    }
+    check_ram_headroom_load_projection()
+}
+
 fn check_ram_headroom_load_projection() -> Check {
     const NAME: &str = "RAM headroom (load projection)";
     let skip = |reason: &str| Check {
@@ -11778,26 +11822,46 @@ mod tests {
         assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);
     }
 
-    /// (#316) `default_engine`: LM Studio passes with its tier; an endpoint
-    /// warns that this release does not act on it yet; a value naming no
-    /// usable engine fails with the fix for the tier that set it.
+    /// (#316) An engine that does not report what it holds is not a failure
+    /// and never "nothing loaded"; any other error still warns.
     #[test]
-    fn the_default_engine_row_passes_warns_or_fails_with_the_fix() {
+    fn models_loaded_is_not_applicable_on_an_engine_that_does_not_report_it() {
+        let unreported: anyhow::Error =
+            darkmux_profiles::engine::NotReported { engine: "mlx".into(), question: "which models it has loaded" }.into();
+        let c = models_loaded_status(Err(unreported));
+        assert_eq!(
+            (c.status, c.message.as_str()),
+            (Status::Pass, "(not applicable: mlx does not report which models it has loaded)")
+        );
+        let c = models_loaded_status(Err(anyhow::anyhow!("lms: connection refused")));
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+    }
+
+    /// (#316) `default_engine`: LM Studio passes with its tier; an endpoint
+    /// passes when it answers and fails, naming it, when it does not; a value
+    /// naming no usable engine fails with the fix for the tier that set it.
+    #[test]
+    fn the_default_engine_row_passes_or_fails_with_the_fix() {
         use darkmux_types::config_access::Source;
         use darkmux_types::default_engine::resolve;
         let reg = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1"}}}"#,
         );
-        let row = |raw: &str, source| default_engine_status(resolve(raw, source, &reg), source);
-        let c = row("lmstudio", Source::BuiltIn);
+        let row = |raw: &str, source, answers| default_engine_status(resolve(raw, source, &reg), source, answers);
+        let c = row("lmstudio", Source::BuiltIn, None);
         assert_eq!((c.status, c.message.as_str(), c.hint), (Status::Pass, "lmstudio (built-in)", None));
-        let c = row("mlx", Source::Config);
-        assert_eq!(c.status, Status::Warn);
+        let c = row("mlx", Source::Config, Some(Ok(3)));
+        assert_eq!(c.status, Status::Pass);
         assert_eq!(
             c.message,
-            "endpoint `mlx` (via config.default_engine), but this darkmux still runs local models on LM Studio"
+            "endpoint `mlx` (via config.default_engine): answers, and would serve 3 model(s); it does not report \
+             which it holds"
         );
-        let c = row("mxl", Source::Env);
+        let c = row("mlx", Source::Config, Some(Err("mlx: GET http://127.0.0.1:8080/v1/models: refused".into())));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.starts_with("endpoint `mlx` (via config.default_engine) does not answer: mlx: GET"), "{}", c.message);
+        assert!(c.hint.unwrap_or_default().contains("never starts one"));
+        let c = row("mxl", Source::Env, None);
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.starts_with("env var DARKMUX_DEFAULT_ENGINE: `mxl` is neither"), "{}", c.message);
         assert!(c.message.contains("the closest is `mlx`"), "{}", c.message);
