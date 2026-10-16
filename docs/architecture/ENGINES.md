@@ -1,6 +1,6 @@
 # One interface over many engines: design and refactor plan
 
-**Status:** stages 0 to 2 done; stage 3 planned (section 8) · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198 (sections 2 to 6), d1a971568 (section 8)
+**Status:** stages 0 to 2 done; stage 3 in progress (section 8); stage 4's default engine designed (section 9) · **Tracks:** #316 (engine abstraction), #3198 and #3136 (CRAP) · **Measured at:** `main` 3126be198 (sections 2 to 6), d1a971568 (section 8)
 
 Every concrete claim cites the code it comes from (`path:line`) or the measurement it was taken from. Nothing here ships today; where this doc says "today", it describes the current binary.
 
@@ -93,7 +93,7 @@ Off the path (left to the ratchet as files are touched, except cheap 0%-coverage
 | 1 | `run_dispatch`: boundary tests, mutation-proved, then split by responsibility | `run_dispatch` under complexity 20; every moved branch pinned; one live dispatch identical | done: #3233, #3234, #3235 (132 → 3) |
 | 2 | `dispatch_internal::dispatch` and the telemetry sampler, same method | both under 20; live dispatch identical | done: #3237, #3238 (`dispatch` 78 → 6, `run_telemetry_sampler` 37 → 3) |
 | 3 | the facade with LM Studio as its only backend; no behavior change | no `lms::` call outside the LM Studio backend; existing tests and a live run unchanged | planned: section 8 |
-| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent | unmanaged endpoints stop being special cases; #3209 to #3211 fall out | |
+| 4 | plain OpenAI-compatible and Messages backends; capabilities reported or plainly absent; a default engine per machine, which `init` detects and records | unmanaged endpoints stop being special cases; #3209 to #3211 fall out; a machine with no LM Studio (a Linux box serving `mlx_lm.server`) runs `init` and dispatch with no hand-edited config | designed: section 9 |
 | 5 | one memory budget per machine across backends | (open question 2) | |
 | 6 | managed servers for engines without a manager | (open question 1) | |
 
@@ -160,3 +160,48 @@ Each PR is behavior-preserving, moves one question, and is verified by the exist
 | 2. one memory budget | untouched: the ledger reads through the facade, and the budget still knows only LM Studio |
 | 3. contract 4 generalizes | **touched, kept neutral.** The facade takes identifiers verbatim and has no ownership method; `ownership::namespaced_identifier` and `is_darkmux_owned` stay the LM Studio backend's mechanism, and `ModelHost::unload` keeps its `OwnedTarget` claim check. The two free-unload paths (dispatch reload, eject) keep their string identifiers |
 | 4. versioning | **cannot be avoided:** 3.7 replaces the "LMStudio, and only LMStudio" doctrine line and records the decision. No wire, `--json`, config or profile shape changes (contracts 1, 5, 7): `LoadedModel` and `ModelMeta` keep their fields, and `lms_bin` stays the one config key |
+
+## 9. Stage 4 design: the default engine, and how `init` picks it
+
+Today every machine's engine is LM Studio by construction: `engine::local()` returns `LmStudio` unconditionally (`crates/darkmux-profiles/src/engine/mod.rs`), and `init` plans the worker and utility models from `engine::local().catalog()` (`src/init.rs:262`, `:605`). With no `lms`, `init` stops at "install LM Studio" (`src/init.rs:267`). A Linux machine serving `mlx_lm.server` therefore has no way to say "this is my engine" except a hand-written `url` endpoint, and the LM Studio-shaped parts of `init` and dispatch stay dark.
+
+### 9.1 The setting
+
+One config key, **`default_engine`**: the engine `engine::local()` returns on this machine.
+
+- **Values.** `lmstudio`, or the id of an endpoint in `profiles.json` (`endpoints.<id>`) whose server darkmux should treat as this machine's engine. `lmstudio` reuses the existing value spelling of `ManagedBackend` (`crates/darkmux-types/src/endpoint.rs:59`), so one name means one engine everywhere.
+- **Unset means `lmstudio`.** Every existing install keeps today's behavior without a config change (contract 5: additive).
+- **Resolved in the one place:** `env(DARKMUX_DEFAULT_ENGINE) > config.json > lmstudio`, through `darkmux_types::config_access`, with its source shown by `darkmux doctor` like every other setting.
+- **Refused, never defaulted, when wrong** (contract 9): a value that is neither `lmstudio` nor a known endpoint id is refused at preflight by every entry point that would consume it, naming the file, the value and the closest valid one, and `darkmux doctor` fails it. It is registered in `darkmux-types/src/config_enum.rs` with the registry's open-set handling for endpoint ids.
+- **Changed through** `darkmux config set default_engine <value>`, never by darkmux on its own (operator sovereignty).
+
+### 9.2 What `init` does
+
+`init` detects which engines are **answering**, not which OS it runs on. "Linux, so MLX" is a guess: a Linux machine may run vLLM, a Mac may run `mlx_lm.server`, and an installed server may simply not be running. A probe is cheap and settles it.
+
+1. **LM Studio:** `lms` resolves (`config_access::lms_bin()`) and `lms ps` answers.
+2. **An OpenAI-compatible server:** `GET /v1/models` answers at each endpoint already in `profiles.json`, at the address passed as `darkmux init --engine-url <url>`, and at the well-known local defaults (`mlx_lm.server`'s default port, 8080 as of this writing; confirm against the installed version before relying on it).
+3. **Decide:**
+   - **exactly one answers:** suggest it;
+   - **several answer:** suggest LM Studio, list the others with what each serves, and let the operator choose;
+   - **none answer:** say so, naming every address probed and the command that starts each engine; write nothing.
+4. **Record:** a non-LM Studio choice is written as an endpoint in `profiles.json` (if it is not one already) and as `default_engine` in `config.json`, and named in `init`'s report like the files it already writes. `--dry-run` prints the same plan and writes nothing (`src/init.rs:34`). `init` does not prompt today; when several engines answer it asks, and with no terminal to ask on it takes LM Studio and says which others it saw.
+5. **Plan the models from what that engine can answer.** On LM Studio, unchanged: pick from the catalog, sized to the RAM budget. On a plain OpenAI-compatible engine, the only choice is among the models it already serves (`GET /v1/models`); `init` cannot pick a model to load or a context to load it at, and says so instead of guessing. Whether darkmux starts `mlx_lm.server` itself at a chosen model and context is open question 1 (stage 6).
+
+`init` records the choice once, rather than dispatch re-detecting on every run: an engine that happens to be down one morning must not silently move the machine to another one. A down default engine is an error that names it, with the command to start it.
+
+### 9.3 What else reads it
+
+| Surface | With `default_engine` set to a non-LM Studio engine |
+|---|---|
+| `engine::local()` | returns that endpoint's backend; `host()` is `None` (no load lifecycle), so residency and eject say "this engine has no load lifecycle" instead of calling `lms` |
+| `darkmux doctor` | a row for the setting and its source, a reachability row for that engine, and the LM Studio rows marked not applicable rather than failing or passing vacuously (section 3) |
+| dispatch | a profile on the local engine sends to that endpoint; the residency preflight is skipped plainly, as it is for `url` endpoints today |
+| machine card, serve | report the engine by name, and `loaded` from `GET /v1/models` where that is all the engine can say |
+
+### 9.4 Not decided here
+
+- **Several local engines at once** (LM Studio and `mlx_lm.server` both serving on one machine, profiles on each). `default_engine` names one; profiles that name an endpoint explicitly already route to it. A per-profile engine choice beyond that waits for a need.
+- **One memory budget across them** is open question 2.
+- **Starting the engine** is open question 1.
+
