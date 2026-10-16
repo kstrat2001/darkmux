@@ -248,3 +248,16 @@ fn projection_skips_when_free_memory_cannot_be_read() {
     let _f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("darkmux:big", "big")]));
     assert_eq!(skipped(&check_ram_headroom_load_projection()), "could not read vm_stat (non-macOS?)");
 }
+
+// ─── check_unpriceable_residents ────────────────────────────────────
+
+/// (#316 stage 3.6) The row reads the local engine's ledger: a resident with
+/// no catalog size and no readable weights is named as unpriceable.
+#[serial_test::serial]
+#[test]
+fn unpriceable_residents_names_a_resident_the_ledger_cannot_price() {
+    let _f = Fakes::new(None).loaded(&ps(&[("darkmux:zz-unpriceable", "zz-unpriceable")]));
+    let c = check_unpriceable_residents();
+    assert_eq!((c.name.as_str(), c.status), ("resident pricing", Status::Warn));
+    assert!(c.message.contains("1 resident model(s) genuinely unpriceable") && c.message.contains("zz-unpriceable"), "{}", c.message);
+}

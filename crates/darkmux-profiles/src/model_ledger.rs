@@ -1212,7 +1212,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     ModelLedger {
         schema_version: LEDGER_SCHEMA_VERSION.to_string(),
         generated_at_ms,
-        gather_ms: 0, // stamped by gather()
+        gather_ms: 0, // stamped by gather_with_bin()
         limit_bytes,
         limit_source,
         pool,
@@ -1560,18 +1560,14 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
 
 // ── gather (the I/O edge; every probe bounded) ──────────────────────────
 
-/// Assemble the live ledger: `lms ps/ls --json` + per-model arch facts +
-/// kernel counters, all through bounded child runs (#1276 mechanics), then
-/// the pure [`compute_ledger`] — and stamp the gather's own cost (#1286
-/// observer constraint 3). Never errors: every probe degrades to a warning
-/// in the payload.
-pub fn gather() -> ModelLedger {
-    gather_with_bin(&crate::lms::lms_bin())
-}
-
-/// [`gather`] with an explicit `lms` binary — the test seam (tests point at
-/// a nonexistent binary / a stub and never touch the operator's real
-/// LMStudio; with no ls entries the arch reader touches no files either).
+/// Assemble the live ledger from the `lms` at `lms_bin`: `lms ps/ls --json`,
+/// per-model arch facts and kernel counters, all through bounded child runs
+/// (#1276 mechanics), then the pure [`compute_ledger`] — and stamp the
+/// gather's own cost (#1286 observer constraint 3). Never errors: every probe
+/// degrades to a warning in the payload. Production reaches it through
+/// `engine::local().ledger()` (#316 stage 3.6); tests point `lms_bin` at a
+/// nonexistent binary / a stub and never touch the operator's real LMStudio
+/// (with no ls entries the arch reader touches no files either).
 pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     let started = std::time::Instant::now();
     let mut messages = Vec::new();

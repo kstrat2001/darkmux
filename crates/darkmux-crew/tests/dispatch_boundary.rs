@@ -1038,6 +1038,24 @@ fn a_model_resident_at_the_wrong_context_is_unloaded_then_loaded_at_its_own() {
 
 #[test]
 #[serial]
+fn a_dispatch_warns_when_the_engine_lists_residents_other_than_the_selected_model() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[]);
+    // The load "succeeds" but `lms ps` then lists only another model: the
+    // #408 cross-check reads the engine's resident ids and says so.
+    rig.fake("lms-ps-after-load.json", lms_ps(&[("darkmux:other", "other", 4096)]));
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, stderr) = run(&rig, rig.opts());
+    res.unwrap();
+    assert!(
+        stderr.contains("selects `model-a`, but LMStudio has loaded [other, darkmux:other]"),
+        "{stderr}"
+    );
+}
+
+#[test]
+#[serial]
 fn operator_identity_is_appended_to_a_local_system_prompt() {
     own_process!();
     let rig = Rig::new();

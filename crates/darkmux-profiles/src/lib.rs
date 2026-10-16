@@ -22,6 +22,7 @@ pub mod gestalt_host;
 pub mod lms;
 pub mod model_ledger;
 pub mod ownership;
+pub mod process;
 pub mod profiles;
 
 /// (#2902 step 5) THE preflight for an entry point that starts work: every

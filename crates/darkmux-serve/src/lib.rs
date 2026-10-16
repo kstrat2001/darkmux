@@ -2912,7 +2912,7 @@ async fn machine_resources_handler(
     if let Some(ledger) = machine_resources_cached_fresh() {
         return Ok(axum::Json(machine_resources_body(ledger)));
     }
-    let ledger = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather)
+    let ledger = tokio::task::spawn_blocking(|| darkmux_profiles::engine::local().ledger())
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: memory-ledger gather panicked\n"))?;
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {

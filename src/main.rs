@@ -1365,7 +1365,7 @@ fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
         print!("{}", fleet_cli::peer_resources_view(id, value, json)?);
         return Ok(0);
     }
-    let ledger = darkmux_profiles::model_ledger::gather();
+    let ledger = darkmux_profiles::engine::local().ledger();
     if json {
         cli_json::emit(&ledger)?;
     } else {

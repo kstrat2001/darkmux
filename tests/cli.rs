@@ -15101,6 +15101,20 @@ fn machine_eject_fails_when_lms_cannot_say_what_is_loaded() {
     assert!(stderr.contains("cannot tell whether any models are loaded"), "{stderr}");
 }
 
+/// `machine resources` reads the local engine's ledger: every resident
+/// `lms ps` reports is a row, and the JSON carries it.
+#[test]
+fn machine_resources_lists_each_resident_the_engine_reports() {
+    let tmp = TempDir::new().unwrap();
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192), ("user-model", 4096)]);
+    let (code, stdout, stderr) = run_with_lms(&lms, &["machine", "resources", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let mut ids: Vec<&str> = v["models"].as_array().unwrap().iter().map(|m| m["identifier"].as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["darkmux:a", "user-model"]);
+}
+
 /// A fake `lms` whose `ls --json` lists one 7B model with a 32K window.
 fn fake_lms_catalog(tmp: &TempDir) -> std::path::PathBuf {
     let fake = tmp.path().join("fake-lms");

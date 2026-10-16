@@ -1345,13 +1345,13 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
 /// or a weights format neither reader understands. The MLX-build remedy
 /// below still applies whenever one exists.
 ///
-/// Calls the SAME `model_ledger::gather()` the machine page's `/machine/
+/// Reads the SAME `engine::local().ledger()` the machine page's `/machine/
 /// resources` endpoint uses, rather than re-deriving "unpriceable" from
 /// `lms ps`/`lms ls` directly — the ledger's own compute is the one source
 /// of truth for what counts as unpriceable (arch AND size fallback both
 /// failed), so this check can never drift from what the page shows.
 fn check_unpriceable_residents() -> Check {
-    let ledger = darkmux_profiles::model_ledger::gather();
+    let ledger = darkmux_profiles::engine::local().ledger();
     unpriceable_residents_status(&ledger.models)
 }
 
