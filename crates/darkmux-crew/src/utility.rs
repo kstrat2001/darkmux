@@ -143,7 +143,17 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     } else {
         role_prompt
     };
-    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
+    // (#316) The data boundary: the operator's identity only for a utility
+    // model that stays on this machine (LM Studio, the default engine on
+    // loopback, or the mock harness's base), never a hosted endpoint.
+    let leaves = job.base_url_override.is_none()
+        && darkmux_types::endpoint::brain_leaves_this_machine(
+            target.kind,
+            Some(&target.endpoint),
+            &darkmux_types::config_access::default_engine(),
+        );
+    let system_prompt =
+        if leaves { system_prompt } else { crate::dispatch::augment_prompt_with_identity(&system_prompt) };
 
     // Where the job goes, decided once (#3207): the mock harness's base, an
     // unmanaged endpoint the binding names, or the managed LM Studio.

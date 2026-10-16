@@ -456,7 +456,10 @@ fn a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms
             .json_body_partial(r#"{ "model": "mlx-util", "max_tokens": 128 }"#)
             // The managed arm's low-variance setting, in the dialect that sends one.
             .body_contains("\"temperature\":0.2")
-            .body_contains("# Radio Router");
+            .body_contains("# Radio Router")
+            // (#316 review) The data boundary: this endpoint is not the
+            // loopback default engine, so the operator's identity stays here.
+            .matches(|req| !String::from_utf8_lossy(req.body.as_deref().unwrap_or_default()).contains("PIN-UTIL-IDENTITY"));
         then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
             "id": "mlx-1",
             "object": "chat.completion",
@@ -483,6 +486,7 @@ fn a_utility_job_on_an_unmanaged_endpoint_runs_there_with_the_bare_id_and_no_lms
     });
     std::fs::write(&profiles_path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
     let state = isolated_state();
+    std::fs::write(state.join("identity.md"), "PIN-UTIL-IDENTITY").unwrap();
     let flows_dir = state.join("flows");
     let bin_dir = tempfile::tempdir().unwrap();
     let (fake_lms, lms_log) = recording_fake_lms(bin_dir.path());

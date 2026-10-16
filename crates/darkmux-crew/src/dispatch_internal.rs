@@ -2814,18 +2814,10 @@ fn loopback_to_docker_host(url: &str) -> String {
     format!("{scheme}://{userinfo}host.docker.internal{port}{path}")
 }
 
-/// See [`loopback_to_docker_host`] for the set.
+/// See [`loopback_to_docker_host`] for the set: the one rule in
+/// `darkmux_types::endpoint`, shared with the data boundary (#316).
 fn host_means_this_machine(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        return v6
-            .parse::<std::net::Ipv6Addr>()
-            .is_ok_and(|a| a.is_loopback() || a.is_unspecified());
-    }
-    host.parse::<std::net::Ipv4Addr>()
-        .is_ok_and(|a| a.is_loopback() || a.is_unspecified())
+    darkmux_types::endpoint::host_means_this_machine(host)
 }
 
 
@@ -3249,24 +3241,14 @@ fn try_resolve_unmanaged_target(
     })
 }
 
-/// (#316, operator decision 2026-10-17) Whether a resolved brain sends the
-/// conversation off this machine: the data boundary every identity and
-/// grounding decision reads. A managed model (LM Studio here) stays; so does
-/// an unmanaged endpoint that is this machine's default engine and is
-/// reached on loopback (`mlx_lm.server` on `127.0.0.1`), "local like LM
-/// Studio". Any other unmanaged endpoint leaves, including the default
-/// engine on another host.
+/// (#316) [`darkmux_types::endpoint::brain_leaves_this_machine`] for a
+/// resolved dispatch target, against this machine's live `default_engine`.
 fn brain_leaves_this_machine(t: &crate::target::Target) -> bool {
-    match t.kind {
-        darkmux_types::EndpointKind::Managed(_) => false,
-        darkmux_types::EndpointKind::Unmanaged => {
-            let Some(ep) = t.model.endpoint.as_ref() else { return true };
-            let default_engine = darkmux_types::config_access::default_engine();
-            let is_default = ep.named_id().is_some_and(|id| id == default_engine.trim());
-            let on_loopback = ep.url.as_deref().is_some_and(|u| loopback_to_docker_host(u) != u);
-            !(is_default && on_loopback)
-        }
-    }
+    darkmux_types::endpoint::brain_leaves_this_machine(
+        t.kind,
+        t.model.endpoint.as_ref(),
+        &darkmux_types::config_access::default_engine(),
+    )
 }
 
 /// Data-boundary predicate: operator identity (`~/.darkmux/identity.md`)
@@ -6388,7 +6370,7 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Resul
 /// system prompt, and the runtime tool catalog its palette allows.
 fn container_role(
     opts: &DispatchOpts,
-    agentic: bool,
+    leaves_this_machine: bool,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
 ) -> Result<(crate::types::Role, String, Option<Vec<String>>)> {
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
@@ -6396,7 +6378,7 @@ fn container_role(
         .into_iter()
         .find(|r| r.id == opts.role_id)
         .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
-    let system_prompt = container_system_prompt(&role, opts, agentic, workdir_split_gitdirs)?;
+    let system_prompt = container_system_prompt(&role, opts, leaves_this_machine, workdir_split_gitdirs)?;
     warn_unknown_role_vocab(&role, &opts.role_id);
     // Compute the runtime tool catalog from the role's tool_palette
     // (allow minus deny). When the palette is empty, returns None and
@@ -6416,7 +6398,7 @@ fn container_role(
 fn container_system_prompt(
     role: &crate::types::Role,
     opts: &DispatchOpts,
-    agentic: bool,
+    leaves_this_machine: bool,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
 ) -> Result<String> {
     // (#1550 cluster item 3) See the hosted-dispatch call site's comment —
@@ -6448,12 +6430,11 @@ fn container_system_prompt(
     // (#147) Operator-identity augmentation (~/.darkmux/identity.md), no-op
     // when the file is absent. Data-boundary rule: operator identity never
     // leaves the machine — local dispatches only (data-boundary decision,
-    // #1405 review). A dispatch whose resolved brain is a remote endpoint is
-    // skipped here (the agentic-remote container path, where `agentic_pm` is
-    // set) and never augmented on the single-shot `dispatch_unmanaged` path
-    // (whose system prompt comes from `try_resolve_unmanaged_target`,
-    // which builds it without identity).
-    let system_prompt = if identity_augmentation_allowed(agentic) {
+    // #1405 review). `leaves_this_machine` is [`brain_leaves_this_machine`]
+    // for this container's brain (#316): LM Studio and the default engine on
+    // loopback get the identity, any other endpoint does not. The single-shot
+    // unmanaged path applies the same predicate in `route_dispatch`.
+    let system_prompt = if identity_augmentation_allowed(leaves_this_machine) {
         crate::dispatch::augment_prompt_with_identity(&system_prompt)
     } else {
         system_prompt

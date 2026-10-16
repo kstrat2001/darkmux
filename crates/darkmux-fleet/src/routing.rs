@@ -250,7 +250,8 @@ pub fn dispatch_routed_single_shot(
 /// way a receiver enforces it: the profile the dispatch resolves here
 /// (`dispatch_leaves_this_machine`, which fails closed) must not leave
 /// the machine under `managed_only` (a hosted endpoint; the default engine on
-/// loopback stays, #316). Refused with the typed boundary refusal a
+/// loopback stays, #316). A receiver's own check (`submission::check_boundary`)
+/// still refuses its default engine. Refused with the typed boundary refusal a
 /// peer's refusal carries, so a caller that re-asks with hosted-safe data on
 /// [`RefusalCode::Boundary`] does the same for a seat here.
 fn enforce_local_boundary(opts: &DispatchOpts, boundary: Option<Boundary>) -> Result<()> {
