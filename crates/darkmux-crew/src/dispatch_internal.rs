@@ -9446,7 +9446,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
 /// forwarding each observation into the one flow stream as a
 /// `category=telemetry` record.
 ///
-/// **lms (`source=lms`)**: `darkmux_profiles::lms::list_loaded()` is the
+/// **lms (`source=lms`)**: `darkmux_profiles::engine::local().loaded()` is the
 /// lms-ps source. Each tick diffs the current loaded set against the
 /// previous tick's via `telemetry_sampler::lms_diff`; only CHANGES emit
 /// (`{event:"load"|"unload", model, gb?}`).

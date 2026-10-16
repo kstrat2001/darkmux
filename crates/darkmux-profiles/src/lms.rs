@@ -258,7 +258,6 @@ fn is_ps_header(trimmed: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
 }
 
-
 /// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
 /// Errors when `lms` cannot be run, exits non-zero, or prints something that
 /// is not a JSON list: a failed listing is not an empty catalog (#3143).
@@ -335,7 +334,6 @@ pub fn unload(identifier: &str) -> Result<()> {
     verify_unload_outcome(out.status.success(), &out.stderr, identifier)
 }
 
-
 /// Classify `lms unload` through the ONE shared classifier the gestalt host
 /// uses (#3083: two classifiers had diverged on "Model Not Found"). The typed
 /// [`darkmux_gestalt::HostError`] rides the `anyhow` error, so a caller that
@@ -347,7 +345,6 @@ pub(crate) fn verify_unload_outcome(success: bool, stderr: &str, identifier: &st
         None => Ok(()),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

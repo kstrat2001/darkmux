@@ -7,7 +7,7 @@
 //! observability viewer renders:
 //!
 //! - `source="lms"` → model load/unload deltas, derived from
-//!   `darkmux_profiles::lms::list_loaded()` (the lms-ps source). Wire
+//!   `darkmux_profiles::engine::local().loaded()` (the lms-ps source). Wire
 //!   payload shapes the served demo viewer consumes:
 //!   `{event:"load", model:<id>, gb:<N>}` (load) /
 //!   `{event:"unload", model:<id>}` (unload — no `gb`).

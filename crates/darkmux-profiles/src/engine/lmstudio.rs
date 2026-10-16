@@ -167,4 +167,30 @@ esac
             "the binary the engine is reached through, and that the env named it"
         );
     }
+
+    /// With no env and no config, the binary is the built-in `lms`, and the
+    /// facade says so: doctor's row must not blame an env var or a config
+    /// key nobody set (review of #3250).
+    #[test]
+    #[serial_test::serial]
+    fn binary_reports_the_built_in_lms_when_nothing_names_one() {
+        let home = tempfile::tempdir().unwrap();
+        let prev_bin = std::env::var_os("DARKMUX_LMS_BIN");
+        let prev_home = std::env::var_os("DARKMUX_HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe {
+            std::env::remove_var("DARKMUX_LMS_BIN");
+            std::env::set_var("DARKMUX_HOME", home.path());
+        }
+        let binary = crate::engine::local().binary();
+        unsafe {
+            for (k, v) in [("DARKMUX_LMS_BIN", prev_bin), ("DARKMUX_HOME", prev_home)] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(binary, Some(("lms".to_string(), darkmux_types::config_access::Source::BuiltIn)));
+    }
 }
