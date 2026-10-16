@@ -1560,8 +1560,8 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
 
 // ── gather (the I/O edge; every probe bounded) ──────────────────────────
 
-/// Assemble the live ledger from the `lms` at `lms_bin`: `lms ps/ls --json`
-/// + per-model arch facts + kernel counters, all through bounded child runs
+/// Assemble the live ledger from the `lms` at `lms_bin`: `lms ps/ls --json`,
+/// per-model arch facts and kernel counters, all through bounded child runs
 /// (#1276 mechanics), then the pure [`compute_ledger`] — and stamp the
 /// gather's own cost (#1286 observer constraint 3). Never errors: every probe
 /// degrades to a warning in the payload. Production reaches it through
