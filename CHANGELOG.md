@@ -94,6 +94,14 @@ darkmux release.
 
 ### Fixed
 
+- **A daemon started without LM Studio's directory on its PATH finds `lms`** (#3266).
+  LM Studio adds its PATH line to `~/.zshrc`, which a launchd job or a `zsh -lc` login
+  shell never reads, so such a daemon read LM Studio as unreachable: the machine page
+  said "no models loaded" while darkmux held two. A bare `lms` (the built-in, or the
+  `"lms_bin": "lms"` that `init` writes) that is not on PATH now resolves to LM Studio's
+  own install, `~/.lmstudio/bin/lms`, when it exists; a path set in `lms_bin` is used as
+  given. `doctor`'s lms row names the path it found.
+
 - **A tool-less dispatch on an unmanaged endpoint shows its turn live** (#3211). The
   host-side path (`runtime=direct`, a `pr-reviewer` seat or any tool-less role on an
   endpoint darkmux does not manage) wrote no heartbeats and no turn record, so the fleet
