@@ -25,9 +25,9 @@ darkmux release.
   (`/sys/class/power_supply`, its state from the same rules a Mac's uses) now come from
   the platform strategy off Apple Silicon macOS, where they read "not measured" before.
   Apple Silicon macOS keeps its IOKit, IOReport and mach readers unchanged. Linux is
-  checked on a real Linux machine, not in CI: `scripts/linux-check.sh` (whole-workspace
-  clippy with `-D warnings`, the platform, hardware and types tests, a release build and
-  `darkmux doctor`) runs there before a release.
+  checked on a real Linux machine: `scripts/linux-check.sh` (whole-workspace clippy with
+  `-D warnings`, the platform, hardware and types tests and a release build) runs as a CI
+  job on a self-hosted Omarchy runner, skipped for pull requests from forks.
 
 - **A Linux machine has a place in the fleet** (#3275). Its identity comes from
   `/etc/machine-id`, else D-Bus's copy at `/var/lib/dbus/machine-id` (new on a reinstall, so a dual-boot laptop is two machines; #3212),

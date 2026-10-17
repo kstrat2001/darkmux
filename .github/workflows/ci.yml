@@ -455,6 +455,26 @@ jobs:
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust-relevant changes; fleet e2e skipped (reports green)."
 
+  linux-omarchy:
+    name: Linux check (self-hosted Omarchy)
+    runs-on: [self-hosted, Linux, omarchy]
+    timeout-minutes: 30
+    # CI's other jobs run on macOS, so nothing else compiles the Linux-only
+    # code (`cfg(target_os = "linux")` leaves, the darkmux-platform Linux
+    # strategy). This runs scripts/linux-check.sh on Kain's Omarchy laptop.
+    # SECURITY (public repo + self-hosted runner): never run a fork's code on
+    # that machine. Pull requests from forks skip this job; pushes to main and
+    # same-repo branches are written by the owner or the agents' bot.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Linux check (clippy, OS tests, release build)
+        env:
+          LINUX_CHECK_SKIP_DOCTOR: '1'
+        run: bash scripts/linux-check.sh
+
   runtime-test-lint:
     name: runtime crate — test + lint (macos-latest)
     runs-on: macos-latest

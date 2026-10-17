@@ -26,7 +26,11 @@ step "release build"
 cargo build --release --bin darkmux
 ./target/release/darkmux --version
 
-step "doctor (read-only; review the Linux rows by eye)"
-./target/release/darkmux doctor || echo "doctor exited $? (read the rows above)"
+# CI (the self-hosted Omarchy job) skips doctor: it reads the runner user's
+# ~/.darkmux, not a configured install.
+if [ "${LINUX_CHECK_SKIP_DOCTOR:-}" != "1" ]; then
+  step "doctor (read-only; review the Linux rows by eye)"
+  ./target/release/darkmux doctor || echo "doctor exited $? (read the rows above)"
+fi
 
 printf '\nlinux-check: PASS (clippy, OS tests, release build). Doctor output is for review.\n'
