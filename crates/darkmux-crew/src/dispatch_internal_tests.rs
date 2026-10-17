@@ -3773,7 +3773,10 @@
             None,
             single_shot_cap(opts.max_completion_tokens, None),
             // (#3211) The body as sent: a chat-completions call streams.
-            &crate::direct_stream::stream_body(&single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None)),
+            &crate::direct_stream::stream_body(
+                &single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None),
+                crate::direct_stream::Shape::Chat,
+            ),
         );
         let mut sources = Vec::new();
         for entry in std::fs::read_dir(flows_dir.path()).unwrap().flatten() {
@@ -19825,12 +19828,49 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(refusal(400, r#"{"error":{"message":"streaming is not supported"}}"#));
     }
 
+    /// (#3270 review F1) A Messages error event inside a stream (HTTP 200)
+    /// is classified as its unstreamed HTTP twin: overloaded as shed (529),
+    /// rate limit as rate-limited (429), api_error as a server error that
+    /// may have spent (500).
+    #[test]
+    fn a_messages_error_event_in_a_stream_is_classified_as_its_http_twin() {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\n";
+        let ev = |t: &str, m: &str| format!("{start}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{t}\",\"message\":\"{m}\"}}}}\n\n").into_bytes();
+        let kind = |r: &std::result::Result<serde_json::Value, HostedCallError>| match r {
+            Ok(_) => "ok".to_string(),
+            Err(HostedCallError::RateLimited(_)) => "rate_limited".into(),
+            Err(HostedCallError::ServerShed(_)) => "shed".into(),
+            Err(HostedCallError::Other(e)) => format!(
+                "other:{:?}:spent={}",
+                e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind),
+                call_may_have_spent(e)
+            ),
+        };
+        let twin = |status: u16, t: &str, m: &str| {
+            finish_reply(false, true, Some(status), format!(r#"{{"type":"error","error":{{"type":"{t}","message":"{m}"}}}}"#).into_bytes())
+        };
+        for (status, t) in [(529, "overloaded_error"), (500, "api_error"), (429, "rate_limit_error")] {
+            assert_eq!(kind(&finish_reply(true, true, Some(200), ev(t, "x"))), kind(&twin(status, t, "x")), "{t}");
+        }
+    }
+
+    /// (#3270 review F2) A server error inside a stream that happens to say
+    /// "stream" is not the endpoint refusing to stream: no unstreamed resend.
+    #[test]
+    fn a_midstream_error_naming_stream_is_not_a_stream_refusal() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal error while processing the stream\"}}\n\n";
+        match finish_reply(true, true, Some(200), body.as_bytes().to_vec()) {
+            Err(HostedCallError::Other(e)) => assert!(!refused_stream_request(&e), "{e:#}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// (#3211 review F2) A stream cut off mid-way fails as an unanswered call:
     /// charged as one the endpoint may have processed, never read as a reply.
     #[test]
     fn a_cut_off_stream_is_an_unanswered_call() {
         let cut = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_vec();
-        match streamed_reply_as_chat(true, cut.clone()) {
+        match streamed_reply_as_chat(true, crate::direct_stream::Shape::Chat, cut.clone()) {
             Err(HostedCallError::Other(e)) => {
                 assert!(call_may_have_spent(&e), "{e:#}");
                 let kind = e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind);
@@ -19838,7 +19878,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             }
             other => panic!("expected an unanswered failure, got {other:?}"),
         }
-        assert_eq!(streamed_reply_as_chat(false, cut.clone()).ok(), Some(cut), "an unstreamed call reads its body as before");
+        assert_eq!(streamed_reply_as_chat(false, crate::direct_stream::Shape::Chat, cut.clone()).ok(), Some(cut), "an unstreamed call reads its body as before");
     }
 
     /// (#3211 review F6) A streamed reply is written as it arrives (`-N`), so
@@ -19926,20 +19966,40 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(complete["total_tokens"], 10, "the reassembled reply's counts reach the terminal record");
     }
 
-    /// (#3211) A Messages dialect call is not streamed (its events are
-    /// another shape), but still writes the opener and its `dispatch.turn`,
-    /// with no model time (nothing was streamed).
+    /// (#316 4.6) A Messages dialect dispatch streams like a chat-completions
+    /// one: the request asks to stream (no `stream_options`), the scope gets
+    /// a generating heartbeat, and the turn has its usage and model time.
     #[test]
     #[serial]
-    fn a_messages_direct_dispatch_writes_its_turn_without_streaming() {
-        let reply = r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#;
-        let (result, records, request) = run_direct_dispatch(reply, serde_json::json!({ "dialect": "messages" }));
-        result.expect("the Messages dispatch succeeds");
-        assert!(!request.contains("\"stream\""), "{request}");
-        let seq = actions(&records);
-        assert!(seq.contains(&"dispatch.turn.heartbeat".to_string()), "{seq:?}");
+    fn a_messages_direct_dispatch_streams_and_writes_its_turn_evidence() {
+        const SSE: &str = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+            event: message_stop\n\
+            data: {\"type\":\"message_stop\"}\n\n";
+        let (result, records, request) = run_direct_dispatch(SSE, serde_json::json!({ "dialect": "messages" }));
+        assert_eq!(result.expect("the streamed Messages dispatch succeeds").stdout, "ok");
+        assert!(request.contains("\"stream\":true") && !request.contains("stream_options"), "{request}");
+        let beats: Vec<&serde_json::Value> = records.iter().filter(|r| r["action"] == "dispatch.turn.heartbeat").collect();
+        assert!(beats.iter().any(|b| b["payload"]["generated_chars"].as_u64() > Some(0)), "{beats:?}");
         let turn = records.iter().find(|r| r["action"] == "dispatch.turn").expect("a turn record");
-        assert!(turn["payload"].get("generation_ms").is_none(), "{turn}");
+        assert_eq!(turn["payload"]["finish_reason"], "stop");
+        assert_eq!(turn["payload"]["usage"]["total_tokens"], 7);
+        assert!(turn["payload"]["generation_ms"].is_u64(), "{turn}");
+    }
+
+    /// (#316 4.6) A Messages endpoint that ignores `stream` and answers with
+    /// the whole message is read as before.
+    #[test]
+    #[serial]
+    fn a_messages_endpoint_that_ignores_stream_is_read_whole() {
+        let reply = r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#;
+        let (result, records, _) = run_direct_dispatch(reply, serde_json::json!({ "dialect": "messages" }));
+        assert_eq!(result.expect("the Messages dispatch succeeds").stdout, "ok");
+        assert!(records.iter().any(|r| r["action"] == "dispatch.turn"));
     }
 
     // ── (#2869) host reads of the model-writable out-dir ──────────────

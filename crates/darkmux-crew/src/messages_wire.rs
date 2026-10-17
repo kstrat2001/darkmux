@@ -173,6 +173,40 @@ mod tests {
 
     /// The whole host path against a local server: the version header goes
     /// out on a Messages URL, and the reply comes back in the chat shape.
+    /// (#316 4.6) A streamed Messages call through the real curl path: the
+    /// body asks to stream, progress is reported as events arrive, and the
+    /// reply reads as the unstreamed one.
+    #[test]
+    fn a_streamed_messages_call_reports_progress_and_reads_the_reply() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"verdict\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages").json_body_partial(r#"{"stream": true}"#);
+            then.status(200).header("content-type", "text/event-stream").body(sse);
+        });
+        let req = crate::direct_stream::stream_body(
+            &body("claude-sonnet-5-5", &crate::single_shot::chat_messages("PERSONA", "judge"), 64),
+            crate::direct_stream::Shape::Messages,
+        );
+        let mut seen = 0u64;
+        let mut on = |p: &crate::direct_stream::SseProgress| seen = seen.max(p.content_chars);
+        let reply = crate::dispatch_internal::remote_chat_completion(&server.url("/v1/messages"), None, &req, 30, Some(&mut on)).unwrap();
+        mock.assert();
+        let r = crate::single_shot::extract_reply(&reply);
+        assert_eq!(r.content, "verdict");
+        assert_eq!(r.counts.total, Some(11));
+        assert_eq!(seen, 7, "the text delta was reported as it arrived");
+    }
+
     #[test]
     fn a_hosted_call_to_a_messages_url_sends_the_version_and_reads_the_reply() {
         let server = httpmock::MockServer::start();
