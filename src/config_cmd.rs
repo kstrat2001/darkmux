@@ -164,6 +164,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (5.0) Informational stderr lines on an interactive terminal; see
     // `darkmux_types::diagnostics`.
     ("runtime.verbose", Ty::Bool),
+    // (#3275) A string: a bare uid stays `"1000"`, the field is a string.
+    ("runtime.container_user", Ty::Str),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
@@ -890,6 +892,19 @@ mod tests {
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(cfg.redis.unwrap().port, Some(6380));
         assert_eq!(cfg.runtime.unwrap().turn_delay_ms, Some(3000));
+    }
+
+    /// (#3276 review F1) `runtime.container_user` is settable, and kept a
+    /// string (a bare uid is not coerced to a number: the field is a string).
+    #[test]
+    fn container_user_is_settable_as_a_string() {
+        let f = tmp();
+        let p = f.path();
+        for v in ["1000:1000", "1000", "image"] {
+            set_at(p, "runtime.container_user", v).unwrap();
+            let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            assert_eq!(cfg.runtime.unwrap().container_user.as_deref(), Some(v));
+        }
     }
 
     /// (#2094) `runtime.turn_delay_ms` rejects a non-integer value the same

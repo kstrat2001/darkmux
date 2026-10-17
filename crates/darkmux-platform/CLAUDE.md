@@ -21,7 +21,7 @@ Claude Code loads this file when it works in this directory. The root `CLAUDE.md
 
 ## The ratchet (`os-gates.allow`, `src/os_gates.rs`)
 
-Outside this crate, a line naming the OS (`target_os`, `consts::OS`) is allowed only where one already was when this crate arrived. The test fails if a file gains one (the fix is a `Platform` method) and if a file loses one until its count is lowered, so the list records the migration and only shrinks. `runtime/` is outside the workspace and outside the ratchet: it only ever runs in the Linux container.
+Outside this crate, a line naming the OS (`target_os`, `consts::OS`) is allowed only where one already was when this crate arrived. It reads text, so a comment naming one counts too. The test fails if a file gains one (the fix is a `Platform` method) and if a file loses one until its count is lowered, so the list records the migration and only shrinks. `runtime/` is outside the workspace and outside the ratchet: it only ever runs in the Linux container.
 
 ## Migration order
 

@@ -40,7 +40,7 @@ pub trait Platform: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerUser {
     /// The image's own user (the runtime image's `USER`). Right where the
-    /// engine maps ownership across the mounts (Docker Desktop).
+    /// engine maps ownership across the mounts (Docker Desktop on macOS).
     Image,
     /// A numeric user, and group when given: the host user, where bind mounts
     /// keep the host's ownership (Docker Engine on Linux).

@@ -763,6 +763,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",

@@ -21,6 +21,10 @@ impl Platform for LinuxPlatform {
     /// the container runs as that user. The runtime image's own user (uid
     /// 1000) only matches by chance. With no readable `/proc` (this module
     /// compiled for another OS, in tests) the answer is the image's user.
+    ///
+    /// Assumes rootful Docker Engine. Under rootless Docker, rootless Podman
+    /// or Docker Desktop for Linux, the container's uid 0 is the host user, so
+    /// `runtime.container_user = "0:0"` is the setting there (#3276 review).
     fn container_user(&self) -> ContainerUser {
         host_ids()
             .map(|(uid, gid)| ContainerUser::Host {

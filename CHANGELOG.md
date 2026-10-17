@@ -26,8 +26,13 @@ darkmux release.
   Engine keeps the host's ownership on the bind mounts; under Docker Desktop the image's
   own user). `runtime.container_user` (`DARKMUX_CONTAINER_USER`: `image`, `<uid>` or
   `<uid>:<gid>`) overrides the platform's answer, and a value that doesn't parse refuses
-  the dispatch. Config schema 2.5 (additive). On macOS nothing changes: no new
-  `docker run` flags unless the override is set.
+  the dispatch; `darkmux config set runtime.container_user` sets it, and `darkmux doctor`
+  shows the resolved user and fails a value that doesn't parse. Config schema 2.5
+  (additive). On macOS nothing changes: no new `docker run` flags unless the override is
+  set. On Linux, the container reaches a model server through the Docker bridge, so the
+  server must listen beyond `127.0.0.1` (LM Studio's and `mlx_lm.server`'s default bind is
+  loopback). The host-user answer assumes rootful Docker Engine; rootless Docker or Podman,
+  and Docker Desktop for Linux, need `runtime.container_user` set to `0:0`.
 
 - **A reply that opens with raw channel markup says its engine did not parse the
   model's format** (#3264). Muse Glimmer addresses each message to a channel (`to=self`

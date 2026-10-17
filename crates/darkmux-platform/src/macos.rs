@@ -14,7 +14,7 @@ impl Platform for MacPlatform {
         ContainerHostAccess::Builtin
     }
 
-    /// Docker Desktop maps ownership across the mounts, so the image's own
+    /// Docker Desktop on macOS maps ownership across the mounts, so the image's own
     /// user can use them.
     fn container_user(&self) -> ContainerUser {
         ContainerUser::Image

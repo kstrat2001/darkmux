@@ -688,7 +688,7 @@ darkmux was built on macOS, and its host facts came from macOS tools: `sysctl`, 
 
 **Migration order follows what blocks Linux use.** Container host access and the container user are first, because every role with tools runs in the container. Next is the memory snapshot: `MacProbe` is the only `ResourceProbe`, so off macOS the residency planner, the machine lens and the scheduler read empty pools, and five crates each read total RAM their own way. Then machine uid (presence and fleet), the host probe (viewer telemetry), secrets (the Keychain) and service management (launchd or systemd).
 
-Known gaps: the ratchet reads text, so an OS check assembled another way (a `cfg` alias, a build script) passes it. `runtime/` is outside the workspace and outside the ratchet; it only ever runs in the Linux container. A Linux container still cannot reach a model server bound only to `127.0.0.1` through the host gateway: that is the server's bind address, which darkmux does not own.
+Known gaps: the ratchet reads text, so an OS check assembled another way (a `cfg` alias, a build script) passes it. `runtime/` is outside the workspace and outside the ratchet; it only ever runs in the Linux container. A Linux container still cannot reach a model server bound only to `127.0.0.1` through the host gateway: that is the server's bind address, which darkmux does not own. The Linux container-user answer assumes rootful Docker Engine; rootless Docker, rootless Podman and Docker Desktop for Linux map the host user to the container's uid 0, so they need `runtime.container_user = "0:0"`.
 
 ## Seat classes: every step says what it consumes
 

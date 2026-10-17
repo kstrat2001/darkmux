@@ -19,6 +19,7 @@ use anyhow::Result;
 // (#2112) Battery / Low Power Mode / thermal-state / thermal-emergency
 // doctor check — see the module doc for why it shares `power_posture`'s
 // probe with the mission pre-flight rather than re-reading `pmset` itself.
+mod checks_container;
 mod checks_power;
 // (#2093) The flow-record hook sink's rows — see the module doc.
 mod checks_hooks;
@@ -189,6 +190,7 @@ pub fn run() -> DoctorReport {
         check_host_probe(),
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
+        checks_container::check_container_user(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_default_engine(),
@@ -12193,8 +12195,11 @@ mod tests {
         // (#3074) 66: `check_inactivity_timeout` joined beside the step-command row.
         //
         // (#316) 67: `check_default_engine` joined beside the endpoints row.
+        //
+        // (#3275) 68: `checks_container::check_container_user` joined beside the
+        // power-posture row.
         let expected =
-            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
