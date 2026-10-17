@@ -265,7 +265,7 @@ brightnessctl -d apple-panel-bl set 50%</code></pre>
       <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, battery and cluster MHz read on Linux. Power is next; GPU and thermal state read "not reported". The residency planner sees no memory pools (it only manages LM Studio models).</li>
       <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process usage in <code>fdinfo</code>, so the lens shows "—".</li>
       <li><strong>A model on an unmanaged endpoint</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it manages.</li>
-      <li><strong>A role with no tools on an unmanaged endpoint</strong> writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
+      <li><strong>Prompt processing shows no progress</strong> on an unmanaged endpoint: the fleet card reads PROMPT until the first token (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
       <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, and warns on rows whose probes are macOS-only.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
