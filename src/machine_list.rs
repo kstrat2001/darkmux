@@ -108,7 +108,14 @@ fn cells(m: &FleetMachine) -> [String; 4] {
                 s.ram_free_for_ai_bytes.map(human_gb).unwrap_or_else(dash),
                 s.os.clone(),
                 s.darkmux_version.clone(),
-                if models.is_empty() { dash() } else { models },
+                // (#316) An empty list is "-" only when it is the engine's answer.
+                if !models.is_empty() {
+                    models
+                } else if s.lms_unreachable {
+                    "unknown".to_string()
+                } else {
+                    dash()
+                },
             ]
         }
         other => {
@@ -348,7 +355,11 @@ fn grounding_lines(view: &FleetView, m: &FleetMachine) -> Vec<String> {
     let mut lines = vec![format!("- {name}{here}: liveness {}; {}", liveness_words(m.liveness), card_words(&m.card))];
     if let CardOutcome::Available { card, .. } = &m.card {
         let loaded: Vec<String> = card.specs.loaded_models.iter().map(|x| x.identifier.clone()).collect();
-        lines.push(format!("  loaded models: {}", capped_list(&loaded)));
+        // (#316) A list that is not known is never "none".
+        match crate::card_status::residents_unknown(&card.specs) {
+            Some(why) => lines.push(format!("  loaded models: not known ({why})")),
+            None => lines.push(format!("  loaded models: {}", capped_list(&loaded))),
+        }
         lines.push(format!("  {}", grounding_profiles_line(card, &m.accepts)));
     }
     if let Some(phrase) = accepts_phrase(&m.accepts, Voice::Grounding) {
@@ -416,10 +427,22 @@ fn loaded_now_lines(view: &FleetView) -> Vec<String> {
         }
     }
     let mut lines = vec!["loaded now (model → machines that have it loaded):".to_string()];
-    if by_model.is_empty() {
+    // (#316) A machine whose list is not known is named as such, so "none"
+    // is never said about it.
+    let unknown: Vec<String> = view
+        .machines
+        .iter()
+        .filter_map(|m| match &m.card {
+            CardOutcome::Available { card, .. } => crate::card_status::residents_unknown(&card.specs)
+                .map(|why| format!("- not known on {}: {why}", view.row_name(m))),
+            _ => None,
+        })
+        .collect();
+    if by_model.is_empty() && unknown.is_empty() {
         lines.push("- none".to_string());
     }
     lines.extend(by_model.iter().map(|(model, hosts)| format!("- {model} → {}", hosts.join(", "))));
+    lines.extend(unknown);
     lines
 }
 
@@ -933,6 +956,28 @@ pub(crate) mod tests {
         m.entry = None;
         let out = render_grounding(&view(vec![m]));
         assert!(out.contains("profile-07 (managed: qwen/other-model), and 9 more"), "{out}");
+    }
+
+    /// (#316 stage 4.5 review) A machine whose engine does not report what it
+    /// holds, or whose LM Studio could not be asked, is never said to have
+    /// nothing loaded: radio's grounding says "not known" and why, and the
+    /// table's last cell is "unknown", not "-".
+    #[test]
+    fn a_machine_whose_residents_are_not_known_is_never_said_to_have_none() {
+        let mut c = card("5.0.0");
+        c.specs.loaded_models.clear();
+        c.specs.lms_unreachable = true;
+        c.specs.engine = Some(darkmux_serve::wire::MachineEngine { name: "local-8080".into(), reports_residency: false, usable: true });
+        let m = machine("mlxbox", Liveness::Live, read(c.clone()));
+        let out = render_grounding(&view(vec![m.clone()]));
+        assert!(out.contains("loaded models: not known (`local-8080` does not report which models it has loaded)"), "{out}");
+        assert!(out.contains("- not known on mlxbox: `local-8080` does not report"), "{out}");
+        assert!(!out.contains("- none"), "{out}");
+        assert_eq!(cells(&m)[3], "unknown");
+
+        c.specs.engine = None;
+        let old = machine("old", Liveness::Live, read(c));
+        assert!(render_grounding(&view(vec![old])).contains("not known (LM Studio could not be asked)"));
     }
 
     #[test]

@@ -596,6 +596,7 @@ MachineCard
 MachineEngine
   name: string
   reports_residency: boolean
+  usable: boolean
 MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow

@@ -78,9 +78,9 @@ pub(crate) struct ProfileList<'a> {
 /// `machine status --json`, for this machine or a roster peer.
 ///
 /// When `lms_unreachable` is true the residents are UNKNOWN, not zero: both
-/// lists are empty and the exit code is 2. (#316) When `engine.reports_residency`
-/// is false the engine does not say what it holds: both lists are empty for
-/// that reason, never because nothing is loaded, and the exit code is 0.
+/// lists are empty and the exit code is 2. (#316) `engine` says why: when its
+/// `reports_residency` is false (and it is `usable`) the engine does not say
+/// what it holds, which is not a failure, and the exit code is 0.
 /// `engine` is `null` for a peer older than 4.5 (whose engine is LM Studio).
 /// `matching_profiles` and `registry` are present only for a local read,
 /// which is the only one that reads this host's registry.

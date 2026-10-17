@@ -106,6 +106,12 @@ pub trait Engine {
     /// the machine surfaces call this machine's engine (#316 stage 4.5).
     fn name(&self) -> String;
 
+    /// Whether this is an engine at all: `false` only for a `default_engine`
+    /// value that names no usable engine, which every question refuses.
+    fn usable(&self) -> bool {
+        true
+    }
+
     /// Every model the engine has resident. `Ok(vec![])` means the engine
     /// reported none; anything it could not interpret is an `Err`.
     fn loaded(&self) -> Result<Vec<LoadedModel>>;

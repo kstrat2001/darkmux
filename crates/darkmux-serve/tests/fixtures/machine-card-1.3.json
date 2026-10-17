@@ -23,7 +23,8 @@
     "lms_unreachable": false,
     "engine": {
       "name": "lmstudio",
-      "reports_residency": true
+      "reports_residency": true,
+      "usable": true
     },
     "utility_model": null,
     "hub_configured": false,

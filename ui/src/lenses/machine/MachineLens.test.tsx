@@ -1116,3 +1116,14 @@ describe("MachineLens — the live block is the SAME shared component the sheet 
     expect(drawerSrc).toMatch(/useMachineStatsContent/);
   });
 });
+
+describe("(#316 stage 4.5) this machine on an engine that does not report residency", () => {
+  it("says why the model list is empty instead of no models loaded", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, lms_unreachable: true, engine: { name: "local-8080", reports_residency: false, usable: true } },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(container.textContent).toContain("local-8080 does not report which models it has loaded."));
+    expect(container.textContent).not.toContain("no models loaded.");
+  });
+});

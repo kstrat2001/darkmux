@@ -8,7 +8,7 @@
  * peer's own `detail` sentence: an outcome line is a fixed phrase per variant.
  */
 
-import { engineOf, engineSuffix, reportsResidency } from "../../lib/machineEngine";
+import { engineOf, engineSuffix, residentsKnown } from "../../lib/machineEngine";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { Liveness } from "../../types/generated/Liveness";
@@ -137,7 +137,7 @@ export function rowSpecs(row: FleetMachine): MachineSpecsResponse | null {
  * registers none reads none. */
 export function rowUtility(row: FleetMachine): UtilityReading {
   const specs = rowSpecs(row);
-  return utilityReading(specs !== null, specs?.utility_model, reportsResidency(specs));
+  return utilityReading(specs !== null, specs?.utility_model, residentsKnown(specs));
 }
 
 /** Whether the row's own card declares `fleet.mode hub`. A machine whose card

@@ -1037,21 +1037,26 @@
                     ("DARKMUX_DEFAULT_ENGINE", Some(std::ffi::OsStr::new(engine))),
                     ("DARKMUX_LMS_BIN", Some(bin.as_os_str())),
                 ],
-                || (local_engine_residents(), gather_specs()),
+                || {
+                    let r = local_engine_residents();
+                    ((r.engine, r.models, r.unknown.is_some()), gather_specs())
+                },
             )
         };
 
         let ((engine, models, unreachable), specs) = on("mlx");
-        assert_eq!(engine, wire::MachineEngine { name: "mlx".into(), reports_residency: false });
-        assert!(models.is_empty() && !unreachable, "not reported is not unreachable");
-        assert_eq!((specs.engine, specs.lms_unreachable), (Some(engine), false));
+        assert_eq!(engine, wire::MachineEngine { name: "mlx".into(), reports_residency: false, usable: true });
+        // Unknown on the wire (`lms_unreachable`), so a reader older than
+        // `engine` never reads it as an empty machine; `engine` says why.
+        assert!(models.is_empty() && unreachable, "not reported is unknown, never empty");
+        assert_eq!((specs.engine, specs.lms_unreachable), (Some(engine), true));
 
         let ((engine, models, unreachable), _) = on("lmstudio");
-        assert_eq!(engine, wire::MachineEngine { name: "lmstudio".into(), reports_residency: true });
+        assert_eq!(engine, wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true });
         assert_eq!((models.len(), unreachable), (1, false));
 
         let ((engine, _, unreachable), _) = on("nope");
-        assert_eq!((engine.name.as_str(), engine.reports_residency, unreachable), ("nope", false, true));
+        assert_eq!((engine.name.as_str(), engine.usable, unreachable), ("nope", false, true));
     }
 
     // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───

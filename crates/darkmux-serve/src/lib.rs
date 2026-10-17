@@ -2814,35 +2814,55 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
     let result = tokio::task::spawn_blocking(local_engine_residents).await;
-    let (engine, models, unreachable) = result.unwrap_or_else(|_| (unknown_engine(), Vec::new(), true));
+    let r = result.unwrap_or_else(|_| EngineResidents::panicked());
     axum::Json(wire::MachineStatusResponse {
-        models,
-        lms_unreachable: unreachable,
-        engine,
+        lms_unreachable: r.unknown.is_some(),
+        models: r.models,
+        engine: r.engine,
         generated_at_ms: current_millis(),
     })
 }
 
-/// (#316) This machine's engine, what it holds, and whether it could not be
-/// asked: the ONE read behind `/machine/status`, `/machine/specs` (and so the
-/// card) and `darkmux machine status`. An engine that does not report what
-/// it holds is not unreachable: its list is empty and the engine says why.
-pub fn local_engine_residents() -> (wire::MachineEngine, Vec<darkmux_types::LoadedModel>, bool) {
+/// (#316) This machine's engine and what it holds.
+pub struct EngineResidents {
+    pub engine: wire::MachineEngine,
+    pub models: Vec<darkmux_types::LoadedModel>,
+    /// Why the resident list is not known (`models` is then empty for that
+    /// reason): the engine does not report it, cannot be used, or could not
+    /// be asked. `None` when `models` is the engine's answer.
+    pub unknown: Option<String>,
+}
+
+impl EngineResidents {
+    /// The read panicked: nothing is known about the engine.
+    fn panicked() -> Self {
+        EngineResidents {
+            engine: wire::MachineEngine {
+                name: darkmux_types::config_access::default_engine(),
+                reports_residency: false,
+                usable: true,
+            },
+            models: Vec::new(),
+            unknown: Some("the engine read failed".to_string()),
+        }
+    }
+}
+
+/// (#316) The ONE read behind `/machine/status`, `/machine/specs` (and so the
+/// card) and `darkmux machine status`: which engine, what it holds, and when
+/// that is not known, why. The wire's `lms_unreachable` is `unknown.is_some()`
+/// and `engine` names the reason, so no reader decides it again.
+pub fn local_engine_residents() -> EngineResidents {
     let engine = engine::local();
     let view = wire::MachineEngine {
         name: engine.name(),
         reports_residency: matches!(engine.capabilities().residency, engine::Residency::Reported),
+        usable: engine.usable(),
     };
     match engine.loaded() {
-        Ok(m) => (view, m, false),
-        Err(e) if engine::is_not_reported(&e) => (view, Vec::new(), false),
-        Err(_) => (view, Vec::new(), true),
+        Ok(models) => EngineResidents { engine: view, models, unknown: None },
+        Err(e) => EngineResidents { engine: view, models: Vec::new(), unknown: Some(format!("{e:#}")) },
     }
-}
-
-/// The engine named when its read panicked: nothing is known about it.
-fn unknown_engine() -> wire::MachineEngine {
-    wire::MachineEngine { name: darkmux_types::config_access::default_engine(), reports_residency: false }
 }
 
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
@@ -2976,7 +2996,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
         cpu_brand: None,
         loaded_models: Vec::new(),
         lms_unreachable: true,
-        engine: Some(unknown_engine()),
+        engine: Some(EngineResidents::panicked().engine),
         utility_model: None,
         hub_configured: false,
         generated_at_ms: current_millis(),
@@ -2987,7 +3007,8 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 /// ONE gather. Blocking (it shells out); each probe is independent, so one
 /// failure never cascades.
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let (engine, loaded_models, lms_unreachable) = local_engine_residents();
+    let residents = local_engine_residents();
+    let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = read_ram_total_bytes();
     let ram_free = read_ram_free_for_ai_bytes();
     let cpu_brand = read_cpu_brand();

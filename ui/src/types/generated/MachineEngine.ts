@@ -15,4 +15,9 @@ name: string,
  * never because nothing is loaded (an OpenAI-compatible server lists
  * what it would answer to, not what it holds).
  */
-reports_residency: boolean, };
+reports_residency: boolean, 
+/**
+ * `false` when `default_engine` names no usable engine (`darkmux doctor`
+ * names why); every question to it is refused.
+ */
+usable: boolean, };

@@ -19,7 +19,8 @@ machine_id: string | null,
  */
 machine_uid: string | null, os: string, ram_total_bytes: number | null, ram_free_for_ai_bytes: number | null, cpu_brand: string | null, loaded_models: Array<LoadedModel>, 
 /**
- * As on `/machine/status`: the engine was asked and could not answer.
+ * As on `/machine/status`: the resident list is not known (`engine`
+ * says why).
  */
 lms_unreachable: boolean, 
 /**

@@ -48,6 +48,10 @@ impl Engine for Unresolved {
         self.name.clone()
     }
 
+    fn usable(&self) -> bool {
+        false
+    }
+
     fn loaded(&self) -> Result<Vec<LoadedModel>> {
         self.refused()
     }

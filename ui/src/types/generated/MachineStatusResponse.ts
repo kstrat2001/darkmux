@@ -7,10 +7,12 @@ import type { MachineEngine } from "./MachineEngine";
  */
 export type MachineStatusResponse = { models: Array<LoadedModel>, 
 /**
- * The engine was asked and could not answer: for LM Studio, the `lms`
- * binary could not be invoked; for another engine, its setting cannot
- * be used. An engine that does not report residency is not unreachable
- * (`engine.reports_residency`).
+ * The resident list is not known, so `models` is empty for that reason,
+ * never because nothing is loaded. `engine` says why: it does not
+ * report residency (`reports_residency: false`), its setting cannot be
+ * used (`usable: false`), or it could not be asked (LM Studio: the `lms`
+ * binary could not be invoked). A reader older than `engine` reads every
+ * case as "unknown", which is true of each.
  */
 lms_unreachable: boolean, 
 /**

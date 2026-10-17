@@ -18,14 +18,20 @@ darkmux release.
 
 - **The machine surfaces name the engine** (#316). `/machine/specs`, `/machine/status`,
   the machine card (schema 1.3) and `darkmux machine status --json` carry `engine`: its
-  name (`lmstudio` or the endpoint id) and whether it reports which models it holds.
-  On an engine that does not (an OpenAI-compatible server such as `mlx_lm.server`), the
-  machine page says so instead of "no models loaded", the utility model reads "residency
-  not reported" instead of "not loaded", the ledger note is information rather than a
-  warning, and `machine status` exits 0 naming the engine instead of reporting it
-  unreachable. The fleet card and the machine page's header add the engine's name when it
-  is not LM Studio; Machine info has an `engine` row for every machine. A machine page whose
-  LM Studio could not be asked also says its residents are unknown, not "no models loaded".
+  name (`lmstudio` or the endpoint id), whether it reports which models it holds, and
+  whether it is usable. `lms_unreachable` now means the resident list is not known for any
+  reason (an engine that does not report it, a setting that names no usable engine, or an
+  LM Studio that could not be asked), so an older reader shows such a machine as unknown,
+  never empty; `engine` says which. On an engine that does not report (an
+  OpenAI-compatible server such as `mlx_lm.server`), the machine page says so instead of
+  "no models loaded", the utility model reads "residency not reported" (in the viewer and
+  in `machine list`) instead of "not loaded", the ledger note is information rather than a
+  warning, radio's grounding says the machine's loaded models are not known instead of
+  "none", and `machine status` exits 0 naming the engine. The fleet card and the machine
+  page's header add the engine's name when it is not LM Studio; Machine info has an
+  `engine` row. A machine whose LM Studio could not be asked is also shown as unknown,
+  not empty, on the machine page, in `machine list` and in radio's grounding.
+
 - **`darkmux init` finds the engine that answers** (#316). It asks LM Studio
   (`lms ps`) and any OpenAI-compatible server (`GET /v1/models`) at an endpoint
   `profiles.json` names on this machine and at `mlx_lm.server`'s default
