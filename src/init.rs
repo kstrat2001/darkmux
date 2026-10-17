@@ -331,6 +331,16 @@ fn fill_models(registry_path: &Path, engine: &ModelsEngine, report: &mut InitRep
 /// dispatch time; this is the one `init` knows how to fill.
 pub const PLACEHOLDER_MODEL_ID: &str = "<your-worker-model-id>";
 
+/// (#316 re-review) Whether a worker slot still names the placeholder: a
+/// profile model whose `id` is it. The example's `_comment` mentions the
+/// placeholder too, so a substring test reads a registry whose slots the
+/// operator filled by hand as unfilled. A registry that does not parse has
+/// no slot `init` can fill.
+pub fn has_placeholder_slot(registry_json: &str) -> bool {
+    darkmux_profiles::profiles::parse_registry_lenient(registry_json)
+        .is_ok_and(|r| r.profiles.values().flat_map(|p| p.models.iter()).any(|m| m.id == PLACEHOLDER_MODEL_ID))
+}
+
 /// (#2038) Replace every placeholder worker id in the registry text with
 /// `model_id`. Text-level on purpose: the registry is the operator's file,
 /// and a parse-and-reserialize would reorder keys and drop their formatting.
@@ -379,7 +389,7 @@ pub fn choose_worker_model(
 /// operator words.
 fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Option<String>, String> {
     let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
-    if !text.contains(PLACEHOLDER_MODEL_ID) {
+    if !has_placeholder_slot(&text) {
         return Ok(None);
     }
     let available = match engine::lmstudio().catalog() {
@@ -456,7 +466,7 @@ fn fill_models_on_server(
     let models = match models {
         Ok(m) => m,
         Err(reason) => {
-            if text.contains(PLACEHOLDER_MODEL_ID) {
+            if has_placeholder_slot(&text) {
                 report.worker_model_unfilled_reason = Some(reason.clone());
             }
             return;
@@ -476,7 +486,7 @@ fn fill_models_on_server(
 
 /// `text` with the worker placeholder filled from the server's one model.
 fn fill_server_worker(text: String, name: &str, models: &[String], report: &mut InitReport) -> String {
-    if !text.contains(PLACEHOLDER_MODEL_ID) {
+    if !has_placeholder_slot(&text) {
         return text;
     }
     match choose_server_worker(name, models) {

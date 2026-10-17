@@ -14526,7 +14526,7 @@ fn init_lists_a_skill_that_is_not_darkmux_s_as_skipped_and_leaves_it_alone() {
 
     let mut cmd = darkmux_cmd();
     cmd.env("HOME", &home).env("DARKMUX_HOME", &dm).env("DARKMUX_LMS_BIN", &lms).env("DARKMUX_SKILLS_DIR", &source);
-    cmd.env("DARKMUX_TEST_INIT_SERVERS", "");
+    cmd.env("DARKMUX_TEST_INIT_SERVERS", "").env_remove("DARKMUX_DEFAULT_ENGINE").env_remove("DARKMUX_PROFILES");
     let out = stdout_of(&cmd.arg("init").output().unwrap());
 
     assert!(out.contains("  skipped (1): my-skill\n"), "{out}");

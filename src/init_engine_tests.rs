@@ -276,3 +276,40 @@ fn may_detect_only_while_no_engine_or_model_was_chosen() {
     let tuned = fresh.replace(crate::init::PLACEHOLDER_MODEL_ID, "qwen/qwen3-coder-30b");
     assert!(!may_detect(&tuned, "lmstudio", "config.json"), "a tuned registry is never moved");
 }
+
+/// (#316 re-review A) The example's `_comment` names the placeholder; a
+/// registry whose slots the operator filled by hand has no placeholder slot,
+/// so nothing chose-nothing about it.
+#[test]
+fn a_hand_filled_example_is_not_detected_on_despite_its_comment() {
+    let example = include_str!("../profiles.example.json");
+    let filled = example.replace("\"id\": \"<your-worker-model-id>\"", "\"id\": \"operator/tuned-model\"");
+    assert!(filled.contains(crate::init::PLACEHOLDER_MODEL_ID), "the comment still names it");
+    assert!(may_detect(example, "lmstudio", "config.json"));
+    assert!(!may_detect(&filled, "lmstudio", "config.json"));
+}
+
+/// (#316 re-review B, C) The remedies name commands that work: `init` alone
+/// does not re-detect once a model is set, and `--engine-url` takes no
+/// `lmstudio`, so the way back is `config set`.
+#[test]
+fn the_remedies_name_commands_that_work() {
+    let none = Outcome::NoneAnswering { probed: vec![MLX_DEFAULT_URL.into()] }.lines(true).join("\n");
+    assert!(none.contains("darkmux init --engine-url <url>") && !none.contains("then re-run `darkmux init`:"), "{none}");
+    let kept = Outcome::Kept { engine: "local-8080".into(), from: "config.json" }.lines(true).join("\n");
+    assert!(kept.contains("`darkmux config set default_engine lmstudio` goes back to LM Studio"), "{kept}");
+    let lms = Outcome::Kept { engine: "lmstudio".into(), from: "config.json" }.lines(true).join("\n");
+    assert!(!lms.contains("goes back"), "{lms}");
+}
+
+#[test]
+fn same_file_resolves_links_and_falls_back_to_the_spelling() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("profiles.json");
+    std::fs::write(&real, "{}").unwrap();
+    let link = dir.path().join("link.json");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(same_file(&link, &real));
+    assert!(!same_file(&dir.path().join("other.json"), &real));
+    assert!(same_file(&dir.path().join("missing.json"), &dir.path().join("missing.json")));
+}

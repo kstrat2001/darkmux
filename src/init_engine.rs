@@ -96,9 +96,7 @@ impl Outcome {
     /// or when recording failed: the lines then say what would be written.
     pub fn lines(&self, written: bool) -> Vec<String> {
         match self {
-            Outcome::Kept { engine, from } => vec![format!(
-                "default engine: `{engine}` (from {from}; `darkmux init --engine-url <url>` records another)"
-            )],
+            Outcome::Kept { engine, from } => vec![kept_line(engine, from)],
             Outcome::Chosen { found, endpoint, added, others, how } => {
                 let mut lines = vec![chosen_line(found, endpoint.as_deref(), *added, *how, written)];
                 if !others.is_empty() {
@@ -154,12 +152,21 @@ fn chosen_line(found: &Found, endpoint: Option<&str>, added: bool, how: How, wri
     }
 }
 
+fn kept_line(engine: &str, from: &str) -> String {
+    let back = if engine.trim().eq_ignore_ascii_case(LMSTUDIO) {
+        String::new()
+    } else {
+        format!("; `darkmux config set {} {LMSTUDIO}` goes back to LM Studio", default_engine_setting::KEY)
+    };
+    format!("default engine: `{engine}` (from {from}; `darkmux init --engine-url <url>` records a server{back})")
+}
+
 fn none_answering_lines(probed: &[String]) -> Vec<String> {
     vec![
         format!("default engine: none answering, nothing recorded. Probed: {}.", probed.join(", ")),
-        "  start one, then re-run `darkmux init`: LM Studio (open the app, or `lms server start`), or \
-         `mlx_lm.server --model <model>` (serves on 127.0.0.1:8080); another OpenAI-compatible server is named \
-         with `--engine-url <url>`."
+        "  the config keeps `lmstudio`: start LM Studio (open the app, or `lms server start`) and it is used. \
+         For another engine, start it and record it with `darkmux init --engine-url <url>` (`mlx_lm.server \
+         --model <model>` serves on http://127.0.0.1:8080)."
             .to_string(),
     ]
 }
@@ -457,7 +464,7 @@ pub fn configured(config_path: &Path) -> (String, &'static str) {
 pub fn may_detect(registry_json: &str, engine: &str, from: &str) -> bool {
     from != FROM_ENV
         && engine.trim().eq_ignore_ascii_case(LMSTUDIO)
-        && registry_json.contains(crate::init::PLACEHOLDER_MODEL_ID)
+        && crate::init::has_placeholder_slot(registry_json)
 }
 
 /// Why a chosen server cannot be recorded, checked before anything is
@@ -473,7 +480,7 @@ pub fn record_blocker(new_registry: &str, id: &str, registry_path: &Path) -> Opt
         }
     }
     if let Ok(p) = std::env::var("DARKMUX_PROFILES") {
-        if !p.trim().is_empty() && Path::new(p.trim()) != registry_path {
+        if !p.trim().is_empty() && !same_file(Path::new(p.trim()), registry_path) {
             return Some(format!(
                 "DARKMUX_PROFILES points dispatch at {}, not at {}, the registry init writes; unset it, or add \
                  the endpoint there by hand.",
@@ -492,6 +499,16 @@ pub fn record_blocker(new_registry: &str, id: &str, registry_path: &Path) -> Opt
     default_engine_setting::resolve(id, darkmux_types::config_access::Source::Config, &reg)
         .err()
         .map(|e| format!("`{id}` would not resolve: {}", e.problem))
+}
+
+/// Whether two paths name one file: compared resolved (symlinks such as
+/// macOS `/tmp` -> `/private/tmp`), falling back to the spelling when a path
+/// does not resolve (the registry may not exist yet on a dry run).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// The URL of the registry endpoint `id`, when it is one.
