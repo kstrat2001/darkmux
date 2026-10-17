@@ -96,7 +96,9 @@ curl -s http://127.0.0.1:8080/v1/models</code></pre>
     <pre><code>"internal": {
   "utility": { "id": "mlx-community/Qwen3-1.7B-4bit", "endpoint": "mlx-local", "n_ctx": 8192 }
 }</code></pre>
-    <p>If you have no LM Studio, remove the profiles <code>init</code> wrote for it (<code>fast</code>, <code>balanced</code>, <code>deep</code>) so <code>darkmux doctor</code> passes <code>lms binary</code>. A role with no tools now runs on the host against the endpoint, with no Docker and no LM Studio:</p>
+    <p>If you have no LM Studio, remove the profiles <code>init</code> wrote for it (<code>fast</code>, <code>balanced</code>, <code>deep</code>) so <code>darkmux doctor</code> passes <code>lms binary</code>, and make the server this machine's engine, so darkmux stops asking LM Studio what is loaded:</p>
+    <pre><code>darkmux config set default_engine mlx-local</code></pre>
+    <p>A role with no tools now runs on the host against the endpoint, with no Docker and no LM Studio:</p>
     <pre><code>darkmux dispatch pr-reviewer --profile mlx-small "In two sentences: what is one risk of merging a change that adds a new required config field?"</code></pre>
   </div>
 </section>
@@ -264,8 +266,7 @@ brightnessctl -d apple-panel-bl set 50%</code></pre>
       <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process usage in <code>fdinfo</code>, so the lens shows "—".</li>
       <li><strong>A model on an unmanaged endpoint</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it manages.</li>
       <li><strong>A role with no tools on an unmanaged endpoint</strong> writes no live state, so the fleet card reads PROMPT for the whole call (<a href="https://github.com/kstrat2001/darkmux/issues/3211">#3211</a>). Prompt-processing progress isn't shown yet (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
-      <li><strong>A <code>127.0.0.1</code> endpoint from inside the container</strong> dials the container itself: darkmux rewrites a loopback LM Studio address, not an unmanaged endpoint's URL. Use <code>host.docker.internal</code> (<a href="https://github.com/kstrat2001/darkmux/issues/3209">#3209</a>).</li>
-      <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, warns on <code>models loaded</code> with no LM Studio, and warns on rows whose probes are macOS-only.</li>
+      <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, and warns on rows whose probes are macOS-only.</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>
