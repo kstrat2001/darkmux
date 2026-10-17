@@ -345,3 +345,204 @@ fn the_machine_id_falls_back_to_the_dbus_copy() {
     // (#3277 re-review) The real list reads systemd's id first.
     assert_eq!(crate::linux::MACHINE_ID_PATHS, ["/etc/machine-id", "/var/lib/dbus/machine-id"]);
 }
+
+// ── host readings for the machine lens (observation only) ──
+
+#[test]
+fn per_cpu_ticks_come_from_proc_stat_in_cpu_order() {
+    let stat = "cpu  10 1 5 100 2 1 1 0 0 0\ncpu0 4 1 2 50 1 0 0 0 0 0\ncpu1 6 0 3 50 1 1 1 0 0 0\nintr 123\n";
+    let ticks = crate::linux::cpu_ticks_from_stat(stat).unwrap();
+    assert_eq!(ticks.len(), 2, "the aggregate `cpu` line is not a core");
+    // system folds in irq + softirq; idle folds in iowait.
+    assert_eq!(
+        ticks[0],
+        CpuTicks {
+            user: 4,
+            nice: 1,
+            system: 2,
+            idle: 51
+        }
+    );
+    assert_eq!(
+        ticks[1],
+        CpuTicks {
+            user: 6,
+            nice: 0,
+            system: 5,
+            idle: 51
+        }
+    );
+    assert_eq!(crate::linux::cpu_ticks_from_stat("intr 1\n"), None);
+}
+
+/// Tiers, the shape macOS's `hw.perflevelN` reports, read from `cpufreq`
+/// policies (`(online cpus, capacity, kHz)`).
+fn tiers(policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>, online: usize) -> Vec<(String, usize, Option<u32>)> {
+    let online: Vec<usize> = (0..online).collect();
+    crate::linux::tiers_from_policies(policies, &online).into_iter().map(|(c, mhz)| (c.name, c.logical_cpus, mhz)).collect()
+}
+
+/// Each tier's tick positions, for `online` CPU numbers.
+fn positions(policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>, online: &[usize]) -> Vec<(String, Vec<usize>)> {
+    crate::linux::tiers_from_policies(policies, online).into_iter().map(|(c, _)| (c.name, c.tick_positions)).collect()
+}
+
+/// An M1 or M2: E cores first, then P cores, fastest tier first.
+#[test]
+fn asahi_tiers_are_fastest_first_with_their_mhz() {
+    let t = tiers(vec![(vec![0, 1, 2, 3], Some(571), Some(600_000)), (vec![4, 5, 6, 7], Some(1024), Some(1_968_000))], 8);
+    assert_eq!(t, vec![("Performance".into(), 4, Some(1968)), ("Efficiency".into(), 4, Some(600))]);
+}
+
+/// (#3279 review F2) An M1 Pro's two P-clusters are one Performance tier, so
+/// each tier's busy percent and MHz come from its own CPUs.
+#[test]
+fn equal_capacity_clusters_are_one_tier() {
+    let t = tiers(
+        vec![
+            (vec![0, 1], Some(512), Some(600_000)),
+            (vec![2, 3, 4, 5], Some(1024), Some(3_000_000)),
+            (vec![6, 7, 8, 9], Some(1024), Some(2_000_000)),
+        ],
+        10,
+    );
+    assert_eq!(t, vec![("Performance".into(), 8, Some(2500)), ("Efficiency".into(), 2, Some(600))]);
+}
+
+/// (#3279 review F3) x86's one policy per CPU, with no `cpu_capacity`, is
+/// one "CPU" tier, not one cluster per CPU.
+#[test]
+fn one_policy_per_cpu_with_no_capacity_is_one_cpu_tier() {
+    let t = tiers((0..4).map(|c| (vec![c], None, Some(2_000_000 + c as u64 * 1000))).collect(), 4);
+    assert_eq!(t, vec![("CPU".into(), 4, Some(2001))]);
+}
+
+/// (#3279 re-review F1) An M1 Ultra numbers die 0's E and P cores, then
+/// die 1's: each tier names its own CPUs' positions, not a block.
+#[test]
+fn a_tier_split_across_dies_names_its_own_cpus() {
+    let p = |cpus: std::ops::Range<usize>, cap| (cpus.collect::<Vec<_>>(), Some(cap), None);
+    let online: Vec<usize> = (0..20).collect();
+    let t = positions(vec![p(0..2, 512), p(2..6, 1024), p(6..10, 1024), p(10..12, 512), p(12..16, 1024), p(16..20, 1024)], &online);
+    let perf: Vec<usize> = (2..10).chain(12..20).collect();
+    assert_eq!(t, vec![("Performance".into(), perf), ("Efficiency".into(), vec![0, 1, 10, 11])]);
+}
+
+/// An offline CPU has no `/proc/stat` line, so positions skip it: with cpu1
+/// offline, cpu2 is at position 1.
+#[test]
+fn positions_follow_the_online_cpus() {
+    let t = positions(vec![(vec![0, 2], Some(512), None), (vec![3, 4], Some(1024), None)], &[0, 2, 3, 4]);
+    assert_eq!(t, vec![("Performance".into(), vec![2, 3]), ("Efficiency".into(), vec![0, 1])]);
+    // A tier whose CPUs are all offline is dropped.
+    let gone = positions(vec![(vec![0], Some(512), None), (vec![5], Some(1024), None)], &[0]);
+    assert_eq!(gone, vec![("Efficiency".into(), vec![0])]);
+}
+
+/// `/proc/stat`'s CPU numbers; the aggregate `cpu` line is not one.
+#[test]
+fn online_cpus_come_from_proc_stat() {
+    let stat = "cpu  10 1 5 100\ncpu0 4 1 2 50\ncpu2 6 0 3 50\nintr 1\n";
+    assert_eq!(crate::linux::online_cpus_from_stat(stat), vec![0, 2]);
+}
+
+/// (#3279 review F1) No `cpufreq` (a VM, a container): one "CPU" tier of
+/// every online CPU, its MHz unknown; nothing when no CPU was read.
+#[test]
+fn no_cpufreq_is_one_tier_of_the_online_cpus() {
+    assert_eq!(tiers(vec![], 4), vec![("CPU".into(), 4, None)]);
+    assert!(tiers(vec![], 0).is_empty());
+}
+
+#[test]
+fn a_linux_memory_snapshot_comes_from_meminfo() {
+    let meminfo = "MemTotal: 7715696 kB\nMemFree: 2171000 kB\nMemAvailable: 5071000 kB\nSwapTotal: 7714800 kB\nSwapFree: 6849000 kB\n";
+    let m = crate::linux::memory_from_meminfo(meminfo).unwrap();
+    assert_eq!(
+        m.capacity_bytes,
+        7715696 * 1024,
+        "capacity is usable MemTotal, never rounded"
+    );
+    assert_eq!(m.free_bytes, Some(2171000 * 1024));
+    assert_eq!(m.available_bytes, Some(5071000 * 1024));
+    assert_eq!(m.swap_used_bytes, Some((7714800 - 6849000) * 1024));
+    assert_eq!(
+        m.used_pct(),
+        Some(34),
+        "(total - available) / total, rounded"
+    );
+    assert!(
+        crate::linux::memory_from_meminfo("MemFree: 1 kB\n").is_none(),
+        "no capacity, no snapshot"
+    );
+}
+
+#[test]
+fn this_linux_machine_reads_its_cpus_and_memory() {
+    if std::env::consts::OS == "linux" {
+        let ticks = LinuxPlatform.cpu_ticks().expect("/proc/stat");
+        let clusters = LinuxPlatform.cpu_clusters();
+        // The tiers cover every CPU exactly once.
+        let mut positions: Vec<usize> = clusters.iter().flat_map(|c| c.tick_positions.clone()).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, (0..ticks.len()).collect::<Vec<_>>());
+        assert!(LinuxPlatform
+            .memory_snapshot()
+            .unwrap()
+            .used_pct()
+            .is_some());
+    }
+}
+
+/// macOS reads these through darkmux-crew's mach probe until that moves
+/// here; its strategy answers nothing, so nothing changes on a Mac.
+#[test]
+fn macos_and_other_leave_host_readings_to_their_existing_paths() {
+    assert!(MacPlatform.cpu_clusters().is_empty() && MacPlatform.cpu_ticks().is_none());
+    assert!(MacPlatform.memory_snapshot().is_none());
+    assert!(OtherPlatform.cpu_ticks().is_none() && OtherPlatform.memory_snapshot().is_none());
+}
+
+/// A battery from `/sys/class/power_supply`: the Battery supply's charge,
+/// status and current, and whether any Mains supply is online.
+#[test]
+fn a_linux_battery_comes_from_power_supply() {
+    let full_on_ac = crate::linux::battery_from_supply(
+        &[("type", "Battery"), ("present", "1"), ("capacity", "100"), ("status", "Full"), ("current_now", "0"), ("time_to_empty_now", "0")],
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        full_on_ac,
+        BatteryReading { charge_pct: 100, on_ac: true, charging: false, fully_charged: Some(true), current_ma: Some(0), minutes_to_empty: None }
+    );
+    let discharging = crate::linux::battery_from_supply(
+        &[("type", "Battery"), ("capacity", "62"), ("status", "Discharging"), ("current_now", "-1250000"), ("time_to_empty_now", "5400")],
+        false,
+    )
+    .unwrap();
+    assert_eq!(discharging.current_ma, Some(-1250));
+    assert_eq!(discharging.minutes_to_empty, Some(90));
+    assert!(!discharging.on_ac && !discharging.charging && discharging.fully_charged == Some(false));
+    let held = crate::linux::battery_from_supply(&[("type", "Battery"), ("capacity", "80"), ("status", "Not charging")], true).unwrap();
+    assert!(held.on_ac && !held.charging && held.fully_charged == Some(false));
+    assert!(crate::linux::battery_from_supply(&[("type", "Battery"), ("present", "0"), ("capacity", "50")], true).is_none(), "an absent pack is no battery");
+    assert!(crate::linux::battery_from_supply(&[("type", "Battery"), ("status", "Full")], true).is_none(), "no charge, no reading");
+}
+
+#[test]
+fn this_linux_machine_reads_its_battery_if_it_has_one() {
+    if std::env::consts::OS == "linux" && std::path::Path::new("/sys/class/power_supply/macsmc-battery").exists() {
+        let b = LinuxPlatform.battery().expect("the M2's battery");
+        assert!(b.charge_pct <= 100);
+    }
+    assert!(MacPlatform.battery().is_none() && OtherPlatform.battery().is_none());
+}
+
+#[test]
+fn this_linux_machine_reports_a_frequency_per_cluster() {
+    if std::env::consts::OS == "linux" {
+        assert_eq!(LinuxPlatform.cpu_cluster_mhz().len(), LinuxPlatform.cpu_clusters().len());
+    }
+    assert!(MacPlatform.cpu_cluster_mhz().is_empty() && OtherPlatform.cpu_cluster_mhz().is_empty());
+}

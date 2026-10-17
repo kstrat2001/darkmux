@@ -613,14 +613,28 @@ mod imp {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use imp::{health, sample};
 
-/// Every non-Apple-Silicon target reports no battery. The arithmetic above
-/// (`charge_pct_from`, `minutes_to_empty_from`, `capacity_pct`,
-/// `parse_time_at_soc`) stays compiled and unit-tested on every host, so
-/// the LOGIC is covered on any CI machine even though the readings are not
-/// — the same split `host_probe`'s module doc describes.
+/// Not Apple Silicon macOS: the charge facts come from the platform strategy
+/// (`darkmux_platform`: `/sys/class/power_supply` on Linux; no battery
+/// elsewhere), and the state from the same [`charge_state_from`] rules a Mac
+/// uses. The arithmetic above (`charge_pct_from`, `minutes_to_empty_from`,
+/// `capacity_pct`, `parse_time_at_soc`) stays compiled and unit-tested on
+/// every host — the same split `host_probe`'s module doc describes.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn sample() -> Option<BatterySample> {
-    None
+    darkmux_platform::current().battery().map(sample_from_reading)
+}
+
+/// A platform battery reading as the lens's sample. Unused in a macOS build
+/// (its IOKit probe builds samples directly), hence the allow.
+#[allow(dead_code)]
+fn sample_from_reading(r: darkmux_platform::BatteryReading) -> BatterySample {
+    BatterySample {
+        charge_pct: r.charge_pct,
+        on_ac: r.on_ac,
+        charging: r.charging,
+        state: charge_state_from(r.on_ac, r.charging, r.fully_charged, r.current_ma),
+        minutes_to_empty: r.minutes_to_empty,
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -631,6 +645,26 @@ pub fn health() -> Option<BatteryHealth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3275) A platform reading becomes the lens's sample, its state
+    /// from the same rules as a Mac's: full on AC is Full, held on AC with no
+    /// current is Held, off AC is Discharging.
+    #[test]
+    fn a_platform_battery_reading_takes_the_macs_charge_state_rules() {
+        let r = |on_ac, charging, fully_charged, current_ma| darkmux_platform::BatteryReading {
+            charge_pct: 80,
+            on_ac,
+            charging,
+            fully_charged,
+            current_ma,
+            minutes_to_empty: None,
+        };
+        assert_eq!(sample_from_reading(r(true, false, Some(true), Some(0))).state, ChargeState::Full);
+        assert_eq!(sample_from_reading(r(true, false, Some(false), Some(0))).state, ChargeState::Held);
+        assert_eq!(sample_from_reading(r(true, true, Some(false), Some(900))).state, ChargeState::Charging);
+        assert_eq!(sample_from_reading(r(false, false, Some(false), Some(-900))).state, ChargeState::Discharging);
+        assert_eq!(sample_from_reading(r(true, false, Some(false), Some(0))).charge_pct, 80);
+    }
 
     #[test]
     fn charge_state_table() {

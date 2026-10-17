@@ -57,6 +57,34 @@ impl Platform for LinuxPlatform {
     fn ram_installed_bytes(&self) -> Option<u64> {
         installed_ram_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
+
+    /// `cpufreq` policies grouped into tiers by `cpu_capacity` (see
+    /// [`tiers_from_policies`]); one "CPU" tier of every online CPU where
+    /// there is no `cpufreq` (most VMs and containers).
+    fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
+        tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(info, _)| info).collect()
+    }
+
+    /// `/proc/stat`'s per-CPU lines.
+    fn cpu_ticks(&self) -> Option<Vec<crate::CpuTicks>> {
+        cpu_ticks_from_stat(&read_to_string("/proc/stat")?)
+    }
+
+    /// `/proc/meminfo`.
+    fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
+        memory_from_meminfo(&read_to_string("/proc/meminfo")?)
+    }
+
+    /// `/sys/class/power_supply`: the Battery supply, and whether a Mains
+    /// supply is online.
+    fn battery(&self) -> Option<crate::BatteryReading> {
+        read_battery()
+    }
+
+    /// Each tier's mean `scaling_cur_freq`, aligned with [`Self::cpu_clusters`].
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
+    }
 }
 
 /// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.
@@ -179,3 +207,237 @@ pub(crate) fn ids_from_status(status: &str) -> Option<(u32, u32)> {
     };
     Some((effective("Uid:")?, effective("Gid:")?))
 }
+
+/// Per-CPU ticks from `/proc/stat` (`cpuN user nice system idle iowait irq
+/// softirq ...`, in USER_HZ). `system` folds in irq and softirq and `idle`
+/// folds in iowait, so busy = user + nice + system the way mach counts it.
+/// The aggregate `cpu` line is skipped. `None` with no per-CPU line.
+pub(crate) fn cpu_ticks_from_stat(stat: &str) -> Option<Vec<crate::CpuTicks>> {
+    let ticks: Vec<crate::CpuTicks> = stat
+        .lines()
+        .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+        .filter_map(|l| {
+            let f: Vec<u64> = l
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            let at = |i: usize| f.get(i).copied().unwrap_or(0);
+            (f.len() >= 4).then(|| crate::CpuTicks {
+                user: at(0),
+                nice: at(1),
+                system: at(2) + at(5) + at(6),
+                idle: at(3) + at(4),
+            })
+        })
+        .collect();
+    (!ticks.is_empty()).then_some(ticks)
+}
+
+/// Each `cpufreq` policy's CPUs and their `cpu_capacity`.
+#[cfg(target_os = "linux")]
+fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
+    let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+        return Vec::new();
+    };
+    let mut policies: Vec<(Vec<usize>, Option<u64>)> = dir
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
+        .filter_map(|e| {
+            // `affected_cpus` lists the policy's ONLINE CPUs: `/proc/stat` has a
+            // line for each online CPU only, so an offline one must not count.
+            let cpus: Vec<usize> = std::fs::read_to_string(e.path().join("affected_cpus"))
+                .ok()?
+                .split_whitespace()
+                .filter_map(|c| c.parse().ok())
+                .collect();
+            let first = *cpus.first()?;
+            let capacity =
+                std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{first}/cpu_capacity"))
+                    .ok()
+                    .and_then(|c| c.trim().parse().ok());
+            Some((cpus, capacity))
+        })
+        .collect();
+    policies.sort_by_key(|(cpus, _)| cpus.first().copied());
+    policies
+}
+
+
+/// Tiers from `(online cpus, capacity, current kHz)` policies, the shape
+/// macOS's `hw.perflevelN` reports: policies of equal capacity are one tier
+/// (two P-clusters on an M1 Pro, or the one-policy-per-CPU of x86's
+/// `intel_pstate`), its MHz the mean of its policies'. Fastest first; with
+/// more than one capacity the highest is "Performance" and the rest
+/// "Efficiency", one capacity is "CPU". Each tier names its CPUs' positions
+/// in `online` (the CPU numbers `/proc/stat` lists, ascending), so a tier
+/// whose CPUs are not one block (an M1 Ultra's two dies) still reads its own.
+/// With no policies at all (no `cpufreq`), one "CPU" tier of every online
+/// CPU, its MHz unknown.
+pub(crate) fn tiers_from_policies(
+    policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>,
+    online: &[usize],
+) -> Vec<(crate::CpuClusterInfo, Option<u32>)> {
+    let info = |name: &str, tick_positions: Vec<usize>| crate::CpuClusterInfo {
+        name: name.to_string(),
+        logical_cpus: tick_positions.len(),
+        tick_positions,
+    };
+    if policies.is_empty() {
+        return if online.is_empty() { Vec::new() } else { vec![(info("CPU", (0..online.len()).collect()), None)] };
+    }
+    // capacity -> (cpus, kHz readings)
+    let mut tiers: Vec<(Option<u64>, Vec<usize>, Vec<u64>)> = Vec::new();
+    for (cpus, capacity, khz) in policies {
+        let i = tiers.iter().position(|t| t.0 == capacity).unwrap_or_else(|| {
+            tiers.push((capacity, Vec::new(), Vec::new()));
+            tiers.len() - 1
+        });
+        tiers[i].1.extend(cpus);
+        tiers[i].2.extend(khz);
+    }
+    tiers.retain(|t| !t.1.is_empty());
+    tiers.sort_by_key(|t| std::cmp::Reverse(t.0));
+    let top = tiers.first().and_then(|t| t.0);
+    let mixed = tiers.len() > 1;
+    tiers
+        .into_iter()
+        .map(|(capacity, mut cpus, khz)| {
+            let name = match (mixed, capacity.is_some() && capacity == top) {
+                (false, _) => "CPU",
+                (true, true) => "Performance",
+                (true, false) => "Efficiency",
+            };
+            cpus.sort_unstable();
+            let positions = cpus.iter().filter_map(|c| online.iter().position(|o| o == c)).collect();
+            let mhz = (!khz.is_empty()).then(|| (khz.iter().sum::<u64>() / khz.len() as u64 / 1000) as u32);
+            (info(name, positions), mhz)
+        })
+        // A tier whose CPUs all left `/proc/stat` (a hotplug race) reads
+        // nothing; drop it, as macOS drops an empty perf level.
+        .filter(|(i, _)| i.logical_cpus > 0)
+        .collect()
+}
+
+/// The CPU numbers `/proc/stat` lists (the online ones), in its order.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn online_cpus_from_stat(stat: &str) -> Vec<usize> {
+    stat.lines()
+        .filter_map(|l| {
+            // `cpuN ...`; the aggregate `cpu  ...` line has no number.
+            let rest = l.strip_prefix("cpu").filter(|r| r.as_bytes().first().is_some_and(u8::is_ascii_digit))?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// This machine's online CPU numbers; empty when unreadable.
+#[cfg(target_os = "linux")]
+fn online_cpus() -> Vec<usize> {
+    read_to_string("/proc/stat").map_or_else(Vec::new, |s| online_cpus_from_stat(&s))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn online_cpus() -> Vec<usize> {
+    Vec::new()
+}
+
+
+/// A memory snapshot from `/proc/meminfo`; `None` without `MemTotal`.
+pub(crate) fn memory_from_meminfo(meminfo: &str) -> Option<crate::MemorySnapshot> {
+    let kib = |key: &str| -> Option<u64> {
+        meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix(key))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|k| k * 1024)
+    };
+    Some(crate::MemorySnapshot {
+        capacity_bytes: kib("MemTotal:")?,
+        free_bytes: kib("MemFree:"),
+        available_bytes: kib("MemAvailable:"),
+        swap_used_bytes: kib("SwapTotal:")
+            .zip(kib("SwapFree:"))
+            .map(|(t, f)| t.saturating_sub(f)),
+    })
+}
+
+/// The first present Battery supply, and whether any Mains supply is online.
+#[cfg(target_os = "linux")]
+fn read_battery() -> Option<crate::BatteryReading> {
+    let supplies: Vec<Vec<(String, String)>> = std::fs::read_dir("/sys/class/power_supply")
+        .ok()?
+        .flatten()
+        .map(|e| {
+            ["type", "present", "online", "capacity", "status", "current_now", "time_to_empty_now"]
+                .iter()
+                .filter_map(|k| {
+                    let v = std::fs::read_to_string(e.path().join(k)).ok()?;
+                    Some((k.to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .collect();
+    let field = |s: &Vec<(String, String)>, k: &str| s.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    let on_ac = supplies
+        .iter()
+        .any(|s| field(s, "type").as_deref() == Some("Mains") && field(s, "online").as_deref() == Some("1"));
+    supplies.iter().find_map(|s| {
+        let pairs: Vec<(&str, &str)> = s.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        battery_from_supply(&pairs, on_ac)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_battery() -> Option<crate::BatteryReading> {
+    None
+}
+
+/// One power supply's sysfs fields to a battery reading: `None` unless it is
+/// a present Battery with a charge. `status` is `Charging`, `Discharging`,
+/// `Full` or `Not charging` (on AC, held below full); `current_now` is in
+/// microamps; `time_to_empty_now` in seconds, 0 meaning no estimate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn battery_from_supply(fields: &[(&str, &str)], on_ac: bool) -> Option<crate::BatteryReading> {
+    let get = |k: &str| fields.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+    if get("type") != Some("Battery") || get("present") == Some("0") {
+        return None;
+    }
+    let charge_pct = get("capacity")?.parse::<u8>().ok()?.min(100);
+    let status = get("status");
+    Some(crate::BatteryReading {
+        charge_pct,
+        on_ac,
+        charging: status == Some("Charging"),
+        fully_charged: status.map(|s| s == "Full"),
+        current_ma: get("current_now").and_then(|v| v.parse::<i64>().ok()).map(|ua| ua / 1000),
+        minutes_to_empty: get("time_to_empty_now")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|s| *s > 0)
+            .map(|s| s / 60),
+    })
+}
+
+/// [`read_policies`] plus each policy's current frequency (kHz).
+#[cfg(target_os = "linux")]
+fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
+    read_policies()
+        .into_iter()
+        .map(|(cpus, capacity)| {
+            let khz = cpus.first().and_then(|c| {
+                let path = format!("/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq");
+                std::fs::read_to_string(path).ok()?.trim().parse().ok()
+            });
+            (cpus, capacity, khz)
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
+    Vec::new()
+}
+

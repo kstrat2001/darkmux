@@ -29,4 +29,24 @@ impl Platform for OtherPlatform {
     fn ram_installed_bytes(&self) -> Option<u64> {
         None
     }
+
+    fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
+        Vec::new()
+    }
+
+    fn cpu_ticks(&self) -> Option<Vec<crate::CpuTicks>> {
+        None
+    }
+
+    fn memory_snapshot(&self) -> Option<crate::MemorySnapshot> {
+        None
+    }
+
+    fn battery(&self) -> Option<crate::BatteryReading> {
+        None
+    }
+
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        Vec::new()
+    }
 }

@@ -537,7 +537,8 @@ pub fn reduce_host_extras(raw: &[HostExtraAt], configured_interval_ms: Option<u6
 /// two samples explicitly.)
 pub struct HostProbe {
     levels: Vec<mach_cpu::PerfLevel>,
-    ranges: Vec<std::ops::Range<usize>>,
+    /// Each level's tick positions ([`mach_cpu::level_positions`]).
+    positions: Vec<Vec<usize>>,
     prev_ticks: Option<Vec<mach_cpu::CoreTicks>>,
     prev_at: Option<std::time::Instant>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -559,7 +560,7 @@ impl HostProbe {
     /// each subsequent sample is ~5-10 ms.
     pub fn new() -> Self {
         let levels = mach_cpu::perf_levels();
-        let ranges = mach_cpu::core_ranges(&levels);
+        let positions = mach_cpu::level_positions(&levels);
         // Not `mut`: only the aarch64 branch below ever assigns
         // `sources.ioreport`/`sources.freq_tables` — on every other target
         // this binding is read-only, and a `mut` here would be a dead-code
@@ -606,7 +607,7 @@ impl HostProbe {
         }
         Self {
             levels,
-            ranges,
+            positions,
             prev_ticks: None,
             prev_at: None,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -636,11 +637,11 @@ impl HostProbe {
                 let per_level = self
                     .levels
                     .iter()
-                    .zip(&self.ranges)
+                    .zip(&self.positions)
                     .map(|(l, r)| CpuCluster {
                         name: l.name.clone(),
                         cores: l.logical_cpus,
-                        pct: mach_cpu::range_busy_pct(prev, cur, r),
+                        pct: mach_cpu::positions_busy_pct(prev, cur, r),
                         mhz: None,
                     })
                     .collect::<Vec<_>>();
@@ -690,6 +691,7 @@ impl HostProbe {
             (clusters, gpu_mhz, power)
         };
         let _ = interval_ms; // unused on non-Apple-Silicon builds
+        let clusters = platform::with_cluster_mhz(clusters);
 
         let gpu = platform::gpu_read();
         self.prev_at = Some(t0);
@@ -838,12 +840,27 @@ mod platform {
         });
         util.map(|u| (u, mem))
     }
+
+    /// IOReport already attached each cluster's MHz above.
+    pub fn with_cluster_mhz(clusters: Vec<super::CpuCluster>) -> Vec<super::CpuCluster> {
+        clusters
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod platform {
     pub fn gpu_read() -> Option<(u64, Option<u64>)> {
         None
+    }
+
+    /// Each cluster's current MHz from the platform strategy (`cpufreq` on
+    /// Linux), aligned with the clusters it reported; a cluster with no
+    /// reading keeps `None`.
+    pub fn with_cluster_mhz(mut clusters: Vec<super::CpuCluster>) -> Vec<super::CpuCluster> {
+        for (c, mhz) in clusters.iter_mut().zip(darkmux_platform::current().cpu_cluster_mhz()) {
+            c.mhz = c.mhz.or(mhz);
+        }
+        clusters
     }
 }
 
