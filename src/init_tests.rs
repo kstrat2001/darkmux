@@ -1095,8 +1095,12 @@ fn a_fresh_init_records_the_only_answering_server_and_plans_its_one_model() {
     assert_eq!(r.worker_model_filled.as_deref(), Some("mlx-community/Qwen3-4B-4bit"));
     assert!(!env.read_registry().contains(PLACEHOLDER_MODEL_ID));
     assert_eq!(r.models_engine.as_deref(), Some(id.as_str()));
-    let utility = r.utility_model_unfilled_reason.unwrap_or_default();
+    // (#316 finding B) The shipped utility the server does not list is
+    // unbound, on disk, not kept for the server to fetch.
+    let utility = r.utility_model_unregistered_reason.unwrap_or_default();
     assert!(utility.contains("does not list") && utility.contains(shipped_utility()), "{utility}");
+    assert_eq!(r.utility_model_unfilled_reason, None);
+    assert!(reg.internal.as_ref().and_then(|i| i.utility.as_ref()).is_none(), "the utility binding was kept");
     assert!(!env.lms_calls().contains("ls"), "LM Studio's catalog is not this engine's: {}", env.lms_calls());
 }
 
@@ -1250,4 +1254,24 @@ fn a_tuned_registry_without_a_config_is_not_moved() {
 
     assert_eq!(r.engine, Some(Outcome::Kept { engine: "lmstudio".into(), from: "config.json" }));
     assert_eq!(env.read_registry(), mine);
+}
+
+/// (#316 finding B) With the worker already set, unbinding the shipped
+/// utility is the only change, and it still reaches the file.
+#[test]
+#[serial_test::serial]
+fn an_unlisted_utility_is_unbound_on_disk_when_nothing_else_changes() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.lms_missing();
+    env.write_registry(&EXAMPLE_PROFILES_JSON.replace(PLACEHOLDER_MODEL_ID, "m/one"));
+    let (base, server) = serve_models(&["m/one"], 1);
+
+    let r = init(&InitOptions { engine_url: Some(base), ..opts() }).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(r.worker_model_filled, None, "the worker was already set");
+    assert!(r.utility_model_unregistered_reason.is_some(), "{r:?}");
+    let reg = load(&env);
+    assert!(reg.internal.as_ref().and_then(|i| i.utility.as_ref()).is_none(), "the utility binding was kept on disk");
 }

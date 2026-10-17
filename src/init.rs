@@ -472,15 +472,17 @@ fn fill_models_on_server(
             return;
         }
     };
+    let read = text.clone();
     let text = fill_server_worker(text, name, models, report);
     let text = fill_server_utility(text, name, models, report);
-    if report.worker_model_filled.is_none() && report.utility_model_filled.is_none() {
+    if text == read {
         return;
     }
     if let Err(e) = fs::write(registry_path, &text) {
         report.worker_model_unfilled_reason = Some(format!("writing {}: {e}", registry_path.display()));
         report.worker_model_filled = None;
         report.utility_model_filled = None;
+        report.utility_model_unregistered_reason = None;
     }
 }
 
@@ -520,13 +522,20 @@ fn fill_server_utility(text: String, name: &str, models: &[String], report: &mut
             None => text,
         },
         Some(_) => text,
-        None => {
-            report.utility_model_unfilled_reason = Some(format!(
-                "`{name}` does not list the registry's utility model `{current}`. Set `internal.utility` in \
-                 profiles.json to a small instruct model it serves."
-            ));
-            text
-        }
+        // (#316) Unbound, not kept: a server asked for a model it does not
+        // list may fetch it (mlx_lm.server downloads it from Hugging Face) on
+        // the first compaction or radio-routing call.
+        None => match remove_utility_binding(&text) {
+            Some(t) => {
+                report.utility_model_unregistered_reason = Some(format!(
+                    "`{name}` does not list the registry's utility model `{current}`, so no utility model is \
+                     bound (compaction is off). Set `internal.utility` in profiles.json to a small instruct \
+                     model it serves."
+                ));
+                t
+            }
+            None => text,
+        },
     }
 }
 
@@ -1211,6 +1220,21 @@ fn darkmux_agents_md_section() -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // (#316 finding B) A server that does not list the shipped utility model
+    // must not keep it bound: mlx_lm.server fetches an unknown model id from
+    // Hugging Face on the first compaction or radio-routing call.
+    #[test]
+    fn a_server_that_does_not_list_the_shipped_utility_unbinds_it() {
+        let mut report = InitReport::default();
+        let models = vec!["mlx-community/Muse-Glimmer-30B-8bit".to_string()];
+        let text = fill_server_utility(EXAMPLE_PROFILES_JSON.to_string(), "local-8080", &models, &mut report);
+        assert!(utility_value_span(&text).is_none(), "the binding was kept:\n{text}");
+        serde_json::from_str::<serde_json::Value>(&text).expect("still valid JSON");
+        let reason = report.utility_model_unregistered_reason.expect("a reason");
+        assert!(reason.contains("local-8080") && reason.contains("internal.utility"), "{reason}");
+        assert_eq!(report.utility_model_unfilled_reason, None);
+    }
 
     #[test]
     fn example_config_matches_with_defaults() {
