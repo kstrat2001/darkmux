@@ -929,6 +929,10 @@ mod tests {
     #[test]
     fn the_start_time_of_pid_1_is_readable_from_an_unprivileged_process() {
         let a = process_start_stamp(1).expect("pid 1's start time must be readable across users");
+        // macOS stamps a wall-clock time. Linux stamps clock ticks since boot
+        // (`/proc/<pid>/stat` field 22), and pid 1 starts at tick 0; the lease
+        // only compares stamps for equality, so 0 is a valid stamp there.
+        #[cfg(target_os = "macos")]
         assert!(a > 0);
         assert_eq!(process_start_stamp(1), Some(a), "stable across reads");
     }
