@@ -14325,6 +14325,9 @@ fn init_in(home: &std::path::Path, darkmux_home: &std::path::Path, lms: &std::pa
     let path = format!("{}:{}", ram.display(), std::env::var("PATH").unwrap_or_default());
     let mut cmd = darkmux_cmd();
     cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home).env("DARKMUX_LMS_BIN", lms).env("PATH", path);
+    // (#316) `init` probes OpenAI-compatible servers on this machine; none
+    // answers here, so a server the host runs on 8080 cannot change a result.
+    cmd.env("DARKMUX_TEST_INIT_SERVERS", "").env_remove("DARKMUX_DEFAULT_ENGINE").env_remove("DARKMUX_PROFILES");
     cmd.arg("init").args(args).output().unwrap()
 }
 
@@ -14523,6 +14526,7 @@ fn init_lists_a_skill_that_is_not_darkmux_s_as_skipped_and_leaves_it_alone() {
 
     let mut cmd = darkmux_cmd();
     cmd.env("HOME", &home).env("DARKMUX_HOME", &dm).env("DARKMUX_LMS_BIN", &lms).env("DARKMUX_SKILLS_DIR", &source);
+    cmd.env("DARKMUX_TEST_INIT_SERVERS", "").env_remove("DARKMUX_DEFAULT_ENGINE").env_remove("DARKMUX_PROFILES");
     let out = stdout_of(&cmd.arg("init").output().unwrap());
 
     assert!(out.contains("  skipped (1): my-skill\n"), "{out}");

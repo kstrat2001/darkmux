@@ -391,7 +391,7 @@ fn describe_key_at(path: &Path, key: &str) -> Result<String> {
 
 /// Set `key` to `value` in the config.json at `path`, returning the operator
 /// confirmation line. Pure-ish (file IO only) so tests drive it with a temp path.
-fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
+pub(crate) fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     if let Some((_, item)) = SECRET_KEYS.iter().find(|(k, _)| *k == key) {
         bail!(
             "`{key}` is a secret and never lives in config.json — store it in the macOS Keychain:\n  \

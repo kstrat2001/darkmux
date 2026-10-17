@@ -218,6 +218,13 @@ One config key, **`default_engine`**: the engine `engine::local()` returns on th
 
 `init` records the choice once, rather than dispatch re-detecting on every run: an engine that happens to be down one morning must not silently move the machine to another one. A down default engine is an error that names it, with the command to start it.
 
+**As built (stage 4.4, `src/init_engine.rs`).** Three points the plan above left open:
+
+- **Once means: until an engine or a model was chosen.** `init` detects only while nothing chose yet: `DARKMUX_DEFAULT_ENGINE` is unset, the config names `lmstudio` (its default) and the registry still holds the worker placeholder (`init_engine::may_detect`). A re-run over a tuned registry, a recorded engine or the variable keeps that engine and probes no other server, even with no `config.json`; `darkmux init --engine-url <url>` is how the operator records another (it probes that address alone, and is chosen without asking when it answers).
+- **A refusal records nothing.** Before writing, `init` checks that `DARKMUX_DEFAULT_ENGINE` is unset (it would override the config), that `DARKMUX_PROFILES` does not point dispatch at another registry, and that the setting resolves against the registry it would write; a refusal writes neither file, says why, and plans the models on the engine already configured. A config write that still fails puts `profiles.json` back.
+- **Only endpoints on this machine are probed.** A registry endpoint is a candidate when it is unmanaged, not the Messages dialect, and its URL names this machine (`url_names_this_machine`, the data boundary's test). A hosted API or a LAN peer is never this machine's engine, and init sends it nothing; `--engine-url` names any address explicitly.
+- **What a new endpoint is called and speaks.** `local-<port>` (`local-engine` without a port, `-2` and on when taken), dialect `chat-completions-max-tokens`, the cap field `mlx_lm.server` reads.
+
 ### 9.3 What else reads it
 
 | Surface | With `default_engine` set to a non-LM Studio engine |

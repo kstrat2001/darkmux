@@ -16,6 +16,20 @@ darkmux release.
 
 ### Added
 
+- **`darkmux init` finds the engine that answers** (#316). It asks LM Studio
+  (`lms ps`) and any OpenAI-compatible server (`GET /v1/models`) at an endpoint
+  `profiles.json` names on this machine and at `mlx_lm.server`'s default
+  address, 127.0.0.1:8080. One answering is recorded; several are asked about on a
+  terminal (LM Studio first, and without a terminal LM Studio is taken and the
+  others named); none answering records nothing and names every address probed. A
+  server is recorded as an endpoint (`local-<port>`) and as `default_engine`, and
+  the worker model is filled from the one model it lists (with several, `init`
+  names them and leaves the choice to you). It detects only while nothing chose an
+  engine yet (no `DARKMUX_DEFAULT_ENGINE`, the config at `lmstudio`, the registry
+  still holding the worker placeholder); otherwise it keeps the engine it finds,
+  and `darkmux init --engine-url <url>` records another. A choice it cannot record
+  writes nothing and says why. `--dry-run` probes and prints the plan and writes
+  nothing.
 - **`default_engine`, the machine's local engine** (#316). `lmstudio` (the
   default, and what `init` now writes) or the id of an OpenAI-compatible endpoint
   in `profiles.json`, set with `darkmux config set default_engine <value>` or

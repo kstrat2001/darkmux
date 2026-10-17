@@ -607,6 +607,7 @@ mod tests {
     const JSON_WRITER_ALLOWLIST: &[(&str, usize, &str)] = &[
         ("src/config_cmd.rs", 2, "writes config.json"),
         ("src/init.rs", 2, "writes config.json"),
+        ("src/init_engine.rs", 1, "quotes the endpoint id and URL inside init's text-level profiles.json edit"),
         ("src/fleet_cli.rs", 2, "writes the roster's config file"),
         ("src/fleet_defaults.rs", 1, "writes the last-known copy of the hub's fleet defaults"),
         ("src/acp_panel.rs", 1, "writes the launch spec file"),

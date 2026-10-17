@@ -18,6 +18,7 @@
 //! discipline; only the darkmux-owned skills ever refresh, and only when
 //! provably safe to.
 
+use crate::init_engine::{self, Outcome};
 use crate::skills;
 use anyhow::{Context, Result, anyhow};
 use darkmux_profiles::engine;
@@ -32,6 +33,9 @@ pub struct InitOptions {
     pub with_agents_md: Option<PathBuf>,
     pub force: bool,
     pub dry_run: bool,
+    /// (#316) `--engine-url`: the OpenAI-compatible server to record as this
+    /// machine's engine, probed alone and chosen when it answers.
+    pub engine_url: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +59,14 @@ pub struct InitReport {
     /// (#3020) Why `init` removed the shipped `internal.utility` binding
     /// instead of registering a utility model, when it did.
     pub utility_model_unregistered_reason: Option<String>,
+    /// (#316) The engine the models were planned from, when it is not LM
+    /// Studio: the endpoint id (or URL) of an OpenAI-compatible server.
+    pub models_engine: Option<String>,
+    /// (#316, ENGINES.md 9.2) Which engine `init` found answering, and what
+    /// it recorded as `default_engine`.
+    pub engine: Option<Outcome>,
+    /// (#316) Why the chosen engine could not be recorded, when it could not.
+    pub engine_unrecorded: Option<String>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -115,21 +127,27 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         report.profile_registry_created = true;
     }
 
-    // 1b) (#2038) Fill the placeholder worker model from what LM Studio has.
+    // 1b) Bootstrap the config file (#661). Same never-overwrite discipline as
+    //     the profile registry — the operator's config edits outrank a re-run.
+    let (config_path, config_created) = bootstrap_config(opts.dry_run)?;
+    report.config_already_present = !config_created;
+    report.config_path = Some(config_path.clone());
+    report.config_created = config_created;
+
+    // 1c) (#316, ENGINES.md 9.2) Which engine answers on this machine, recorded
+    //     as `default_engine` while none was chosen yet (`may_detect`), or
+    //     when the operator names one with `--engine-url`.
+    settle_engine(opts, &registry_path, &config_path, &mut report)?;
+
+    // 1d) (#2038) Fill the placeholder worker model from what the engine has.
     //     Runs on a fresh registry AND on a re-run against one that still holds
     //     the placeholder (the operator downloaded a model after the first
     //     init). A registry without the placeholder is never touched, so an
     //     operator's own edits outrank this every time.
     if !opts.dry_run && registry_path.exists() {
-        fill_models(&registry_path, &mut report);
+        let engine = models_engine(&report, &registry_path, &config_path);
+        fill_models(&registry_path, &engine, &mut report);
     }
-
-    // 2) Bootstrap the config file (#661). Same never-overwrite discipline as
-    //    the profile registry — the operator's config edits outrank a re-run.
-    let (config_path, config_created) = bootstrap_config(opts.dry_run)?;
-    report.config_already_present = !config_created;
-    report.config_path = Some(config_path);
-    report.config_created = config_created;
 
     // 3) Skills install. `refresh_darkmux: true` (#1426) makes a re-run after a
     //    binary upgrade refresh an installed darkmux-* skill (idempotent
@@ -178,9 +196,114 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     Ok(report)
 }
 
-/// Steps 1b and 1c: fill the worker placeholder and verify the utility
-/// binding against what LM Studio has, recording each outcome on `report`.
-fn fill_models(registry_path: &Path, report: &mut InitReport) {
+/// (#316) Step 1c: detect the answering engines and record the choice.
+/// An engine already chosen is kept unless the operator passed
+/// `--engine-url` ([`init_engine::may_detect`]).
+fn settle_engine(opts: &InitOptions, registry_path: &Path, config_path: &Path, report: &mut InitReport) -> Result<()> {
+    let explicit = opts
+        .engine_url
+        .as_deref()
+        .map(init_engine::engine_url)
+        .transpose()
+        .map_err(|e| anyhow!("--engine-url: {e}"))?;
+    let text = fs::read_to_string(registry_path).unwrap_or_else(|_| EXAMPLE_PROFILES_JSON.to_string());
+    let (engine, from) = init_engine::configured(config_path);
+    if explicit.is_none() && !init_engine::may_detect(&text, &engine, from) {
+        report.engine = Some(Outcome::Kept { engine, from });
+        return Ok(());
+    }
+    let (answering, probed, error) = init_engine::detect(&init_engine::LiveProbe, &text, explicit.as_deref());
+    let mut terminal = init_engine::TerminalAsk;
+    let ask: Option<&mut dyn init_engine::Ask> = if opts.dry_run { None } else { Some(&mut terminal) };
+    let mut outcome = init_engine::decide(answering, probed, explicit.as_deref(), error, ask);
+    if let Err(reason) = record_engine(&mut outcome, &text, registry_path, config_path, opts.dry_run) {
+        report.engine_unrecorded = Some(reason);
+    }
+    report.engine = Some(outcome);
+    Ok(())
+}
+
+/// Write a chosen server: its endpoint into the registry (when new), then
+/// `default_engine` into the config, through `config set`'s own checks.
+/// Everything that could refuse is checked first ([`init_engine::record_blocker`]),
+/// and a config write that still fails puts the registry back, so a refusal
+/// never leaves half a record.
+fn record_engine(
+    outcome: &mut Outcome,
+    text: &str,
+    registry_path: &Path,
+    config_path: &Path,
+    dry_run: bool,
+) -> std::result::Result<(), String> {
+    let new_text = init_engine::plan_record(outcome, text)?;
+    let Outcome::Chosen { endpoint: Some(id), .. } = &*outcome else {
+        return Ok(());
+    };
+    if let Some(blocker) = init_engine::record_blocker(new_text.as_deref().unwrap_or(text), id, registry_path) {
+        return Err(blocker);
+    }
+    if dry_run {
+        return Ok(());
+    }
+    let previous = fs::read_to_string(registry_path).ok();
+    if let Some(t) = new_text.as_deref() {
+        fs::write(registry_path, t).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    }
+    let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
+    if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
+        let restored = match &previous {
+            Some(p) => fs::write(registry_path, p).is_ok(),
+            None => fs::remove_file(registry_path).is_ok(),
+        };
+        let note = if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" };
+        return Err(format!("{e:#} ({note})"));
+    }
+    set.map(|_| ()).map_err(|e| format!("{e:#}"))
+}
+
+/// The engine whose models `init` plans from.
+#[derive(Debug)]
+enum ModelsEngine {
+    Lmstudio,
+    /// An OpenAI-compatible server, named as messages name it, and the ids it
+    /// lists (or why it did not answer).
+    Server { name: String, models: std::result::Result<Vec<String>, String> },
+}
+
+/// The engine chosen this run, else the one the config names.
+fn models_engine(report: &InitReport, registry_path: &Path, config_path: &Path) -> ModelsEngine {
+    // An engine found but not recorded is not the one dispatch will use.
+    let recorded = report.engine.as_ref().filter(|_| report.engine_unrecorded.is_none());
+    match recorded {
+        Some(o) if o.server().is_some() => {
+            let (name, models) = o.server().expect("checked");
+            return ModelsEngine::Server { name, models: Ok(models.to_vec()) };
+        }
+        Some(Outcome::Chosen { .. }) => return ModelsEngine::Lmstudio,
+        _ => {}
+    }
+    let (name, _) = init_engine::configured(config_path);
+    if name.trim().eq_ignore_ascii_case(darkmux_types::default_engine::LMSTUDIO) {
+        return ModelsEngine::Lmstudio;
+    }
+    let text = fs::read_to_string(registry_path).unwrap_or_default();
+    let models = match init_engine::endpoint_url(&text, &name) {
+        Some(url) => init_engine::Probe::served(&init_engine::LiveProbe, &url).map_err(|e| {
+            format!("the default engine `{name}` did not answer `GET /models` at {url} ({e:#}). Start it, then re-run `darkmux init`.")
+        }),
+        None => Err(format!("the default engine `{name}` is not an endpoint in {}.", registry_path.display())),
+    };
+    ModelsEngine::Server { name, models }
+}
+
+/// Steps 1d and 1e: fill the worker placeholder and verify the utility
+/// binding against what the engine has, recording each outcome on `report`.
+fn fill_models(registry_path: &Path, engine: &ModelsEngine, report: &mut InitReport) {
+    if let ModelsEngine::Server { name, models } = engine {
+        report.models_engine = Some(name.clone());
+        fill_models_on_server(registry_path, name, models, report);
+        return;
+    }
     match fill_worker_model(registry_path) {
         Ok(Some(id)) => report.worker_model_filled = Some(id),
         Ok(None) => {}
@@ -207,6 +330,16 @@ fn fill_models(registry_path: &Path, report: &mut InitReport) {
 /// `dispatch_internal::is_placeholder_model_id` catches any `<...>` id at
 /// dispatch time; this is the one `init` knows how to fill.
 pub const PLACEHOLDER_MODEL_ID: &str = "<your-worker-model-id>";
+
+/// (#316 re-review) Whether a worker slot still names the placeholder: a
+/// profile model whose `id` is it. The example's `_comment` mentions the
+/// placeholder too, so a substring test reads a registry whose slots the
+/// operator filled by hand as unfilled. A registry that does not parse has
+/// no slot `init` can fill.
+pub fn has_placeholder_slot(registry_json: &str) -> bool {
+    darkmux_profiles::profiles::parse_registry_lenient(registry_json)
+        .is_ok_and(|r| r.profiles.values().flat_map(|p| p.models.iter()).any(|m| m.id == PLACEHOLDER_MODEL_ID))
+}
 
 /// (#2038) Replace every placeholder worker id in the registry text with
 /// `model_id`. Text-level on purpose: the registry is the operator's file,
@@ -256,7 +389,7 @@ pub fn choose_worker_model(
 /// operator words.
 fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Option<String>, String> {
     let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
-    if !text.contains(PLACEHOLDER_MODEL_ID) {
+    if !has_placeholder_slot(&text) {
         return Ok(None);
     }
     let available = match engine::lmstudio().catalog() {
@@ -279,6 +412,122 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
     fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
     Ok(Some(id))
+}
+
+/// (#316, ENGINES.md 9.2 step 5) The worker model on an OpenAI-compatible
+/// server: the one model it lists, when it lists one. It reports no sizes and
+/// loads whichever listed model a request names, so with several `init`
+/// cannot pick one, nor a context to load it at, and says so.
+pub fn choose_server_worker(name: &str, models: &[String]) -> std::result::Result<String, String> {
+    match models {
+        [only] => Ok(only.clone()),
+        [] => Err(format!("`{name}` lists no models. Start it with the model you want, then re-run `darkmux init`.")),
+        _ => Err(format!(
+            "`{name}` lists {} models and loads whichever one a request names; it reports neither their sizes nor \
+             what it holds, so init cannot pick one or a context to load it at. Put the one you want in place of \
+             `{PLACEHOLDER_MODEL_ID}` in profiles.json: {}.",
+            models.len(),
+            init_engine::name_models(models)
+        )),
+    }
+}
+
+/// The utility model on a server: the shipped id when it lists that, or the
+/// same model under a publisher-prefixed key. Sizes are unknown there, so
+/// there is no smallest-real-model fallback.
+pub fn choose_server_utility(current: &str, models: &[String]) -> Option<String> {
+    let metas: Vec<engine::ModelMeta> = models
+        .iter()
+        .map(|id| engine::ModelMeta {
+            model_key: id.clone(),
+            display_name: id.clone(),
+            publisher: String::new(),
+            size_bytes: 0,
+            params_string: None,
+            architecture: None,
+            max_context_length: None,
+            trained_for_tool_use: false,
+            model_type: "llm".to_string(),
+        })
+        .collect();
+    choose_utility_model(current, &metas)
+}
+
+/// The IO half of [`choose_server_worker`] and [`choose_server_utility`].
+fn fill_models_on_server(
+    registry_path: &Path,
+    name: &str,
+    models: &std::result::Result<Vec<String>, String>,
+    report: &mut InitReport,
+) {
+    let Ok(text) = fs::read_to_string(registry_path) else {
+        return;
+    };
+    let models = match models {
+        Ok(m) => m,
+        Err(reason) => {
+            if has_placeholder_slot(&text) {
+                report.worker_model_unfilled_reason = Some(reason.clone());
+            }
+            return;
+        }
+    };
+    let text = fill_server_worker(text, name, models, report);
+    let text = fill_server_utility(text, name, models, report);
+    if report.worker_model_filled.is_none() && report.utility_model_filled.is_none() {
+        return;
+    }
+    if let Err(e) = fs::write(registry_path, &text) {
+        report.worker_model_unfilled_reason = Some(format!("writing {}: {e}", registry_path.display()));
+        report.worker_model_filled = None;
+        report.utility_model_filled = None;
+    }
+}
+
+/// `text` with the worker placeholder filled from the server's one model.
+fn fill_server_worker(text: String, name: &str, models: &[String], report: &mut InitReport) -> String {
+    if !has_placeholder_slot(&text) {
+        return text;
+    }
+    match choose_server_worker(name, models) {
+        Ok(id) => {
+            let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
+            report.worker_model_filled = Some(id);
+            filled
+        }
+        Err(reason) => {
+            report.worker_model_unfilled_reason = Some(reason);
+            text
+        }
+    }
+}
+
+/// `text` with the shipped utility binding checked against what the server
+/// lists. A hand-set binding, or one naming its own endpoint, is left alone.
+fn fill_server_utility(text: String, name: &str, models: &[String], report: &mut InitReport) -> String {
+    let Some((current, _)) = shipped_utility_binding(&text) else {
+        return text;
+    };
+    if utility_on_unmanaged_endpoint(&text) {
+        return text;
+    }
+    match choose_server_utility(&current, models) {
+        Some(id) if id != current => match set_utility_binding(&text, &id, None) {
+            Some(t) => {
+                report.utility_model_filled = Some(id);
+                t
+            }
+            None => text,
+        },
+        Some(_) => text,
+        None => {
+            report.utility_model_unfilled_reason = Some(format!(
+                "`{name}` does not list the registry's utility model `{current}`. Set `internal.utility` in \
+                 profiles.json to a small instruct model it serves."
+            ));
+            text
+        }
+    }
 }
 
 /// Why no worker model was chosen from an answered catalog.

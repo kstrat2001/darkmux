@@ -486,6 +486,12 @@ pub(crate) enum Cmd {
         /// Show what would be installed without writing.
         #[arg(long, short = 'n')]
         dry_run: bool,
+        /// Record the OpenAI-compatible server at this URL (its `/v1` root;
+        /// `/v1` is added to a bare host) as this machine's engine, when it
+        /// answers `GET /v1/models`. Without it, `init` records the engine it
+        /// finds answering in a config it creates, and keeps an existing one.
+        #[arg(long, value_name = "URL")]
+        engine_url: Option<String>,
     },
 }
 

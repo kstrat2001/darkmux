@@ -60,6 +60,7 @@ pub use darkmux_hardware as hardware;
 // crate::heuristics::* resolving for recommendations/doctor.
 pub use darkmux_heuristics as heuristics;
 mod init;
+mod init_engine;
 // #515 — lab harness extracted (lab + workloads + providers). Re-exports keep
 // crate::{lab,workloads,providers}::* resolving for main.
 pub use darkmux_lab::lab;
@@ -243,7 +244,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             with_agents_md,
             force,
             dry_run,
-        } => cmd_init(with_hook, with_claude_md, with_agents_md, force, dry_run),
+            engine_url,
+        } => cmd_init(init::InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, engine_url }),
         Cmd::Serve {
             port,
             bind,
@@ -1729,7 +1731,8 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
 /// binding as written or removed it, and the window it sized (#2053, #3020).
 fn print_init_utility_model(report: &init::InitReport, p: &std::path::Path) {
     if let Some(id) = report.utility_model_filled.as_deref() {
-        println!("utility model: `{id}` (the registry named one LM Studio does not have; this is the closest downloaded match, edit {} to change)", p.display());
+        let (engine, kind) = report.models_engine.as_deref().map_or(("LM Studio".to_string(), "downloaded "), |n| (format!("`{n}`"), "listed "));
+        println!("utility model: `{id}` (the registry named one {engine} does not have; this is the closest {kind}match, edit {} to change)", p.display());
     } else if let Some(reason) = report.utility_model_unfilled_reason.as_deref() {
         println!("utility model: not verified. {reason}");
     } else if let Some(reason) = report.utility_model_unregistered_reason.as_deref() {
@@ -1741,29 +1744,33 @@ fn print_init_utility_model(report: &init::InitReport, p: &std::path::Path) {
     }
 }
 
-fn cmd_init(
-    with_hook: bool,
-    with_claude_md: Option<std::path::PathBuf>,
-    with_agents_md: Option<std::path::PathBuf>,
-    force: bool,
-    dry_run: bool,
-) -> Result<i32> {
-    let report = init::init(&init::InitOptions {
-        with_hook,
-        with_claude_md,
-        with_agents_md,
-        force,
-        dry_run,
-    })?;
+/// (#316) `cmd_init`'s engine lines, printed first: the models below were
+/// planned from that engine.
+fn print_init_engine(report: &init::InitReport, dry_run: bool) {
+    if let Some(engine) = report.engine.as_ref() {
+        for line in engine.lines(!dry_run && report.engine_unrecorded.is_none()) {
+            println!("{line}");
+        }
+    }
+    if let Some(reason) = report.engine_unrecorded.as_deref() {
+        println!("  not recorded: {reason}");
+    }
+}
+
+fn cmd_init(opts: init::InitOptions) -> Result<i32> {
+    let dry_run = opts.dry_run;
+    let report = init::init(&opts)?;
+    print_init_engine(&report, dry_run);
     if let Some(p) = report.profile_registry_path.as_ref() {
         if report.profile_registry_already_present {
             println!("profile registry: already present at {}", p.display());
         } else if report.profile_registry_created {
             println!("profile registry: created at {}", p.display());
         }
-        // (#2038) The worker model: filled from LM Studio, or say why not.
+        // (#2038) The worker model: filled from the engine, or say why not.
+        let has_it = report.models_engine.as_deref().map_or("LM Studio has it".to_string(), |n| format!("`{n}` lists it"));
         if let Some(id) = report.worker_model_filled.as_deref() {
-            println!("worker model: `{id}` (LM Studio has it; every worker profile now names it, edit {} to change)", p.display());
+            println!("worker model: `{id}` ({has_it}; every worker profile now names it, edit {} to change)", p.display());
         } else if let Some(reason) = report.worker_model_unfilled_reason.as_deref() {
             println!("worker model: not set. {reason}");
         }
