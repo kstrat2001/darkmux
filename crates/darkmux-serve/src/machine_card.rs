@@ -1065,7 +1065,7 @@ pub(crate) mod tests {
                     queued: Some(0),
                 }],
                 lms_unreachable: false,
-                engine: Some(crate::wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true }),
+                engine: Some(crate::wire::MachineEngine { name: darkmux_types::default_engine::LMSTUDIO.into(), reports_residency: true, usable: true }),
                 utility_model: None,
                 hub_configured: false,
                 generated_at_ms: 1_000,
