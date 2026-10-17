@@ -537,7 +537,8 @@ pub fn reduce_host_extras(raw: &[HostExtraAt], configured_interval_ms: Option<u6
 /// two samples explicitly.)
 pub struct HostProbe {
     levels: Vec<mach_cpu::PerfLevel>,
-    ranges: Vec<std::ops::Range<usize>>,
+    /// Each level's tick positions ([`mach_cpu::level_positions`]).
+    positions: Vec<Vec<usize>>,
     prev_ticks: Option<Vec<mach_cpu::CoreTicks>>,
     prev_at: Option<std::time::Instant>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -559,7 +560,7 @@ impl HostProbe {
     /// each subsequent sample is ~5-10 ms.
     pub fn new() -> Self {
         let levels = mach_cpu::perf_levels();
-        let ranges = mach_cpu::core_ranges(&levels);
+        let positions = mach_cpu::level_positions(&levels);
         // Not `mut`: only the aarch64 branch below ever assigns
         // `sources.ioreport`/`sources.freq_tables` — on every other target
         // this binding is read-only, and a `mut` here would be a dead-code
@@ -606,7 +607,7 @@ impl HostProbe {
         }
         Self {
             levels,
-            ranges,
+            positions,
             prev_ticks: None,
             prev_at: None,
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -636,11 +637,11 @@ impl HostProbe {
                 let per_level = self
                     .levels
                     .iter()
-                    .zip(&self.ranges)
+                    .zip(&self.positions)
                     .map(|(l, r)| CpuCluster {
                         name: l.name.clone(),
                         cores: l.logical_cpus,
-                        pct: mach_cpu::range_busy_pct(prev, cur, r),
+                        pct: mach_cpu::positions_busy_pct(prev, cur, r),
                         mhz: None,
                     })
                     .collect::<Vec<_>>();

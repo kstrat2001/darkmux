@@ -50,10 +50,9 @@ pub trait Platform: Send + Sync {
     /// actually use is a separate, smaller fact.
     fn ram_installed_bytes(&self) -> Option<u64>;
 
-    /// The CPU's tiers (the shape macOS's `hw.perflevelN` reports), for the
-    /// machine lens, ordered so the LAST holds the lowest CPU numbers: the
-    /// lens's `core_ranges` maps each tier to its CPUs by that rule. Empty
-    /// when the platform can't say.
+    /// The CPU's tiers (the shape macOS's `hw.perflevelN` reports), fastest
+    /// first, for the machine lens; each names its CPUs' positions in
+    /// [`Self::cpu_ticks`]. Empty when the platform can't say.
     fn cpu_clusters(&self) -> Vec<CpuClusterInfo>;
 
     /// Cumulative busy/idle ticks per logical CPU, in CPU-number order; the
@@ -98,6 +97,11 @@ pub struct BatteryReading {
 pub struct CpuClusterInfo {
     pub name: String,
     pub logical_cpus: usize,
+    /// Where this cluster's CPUs sit in [`Platform::cpu_ticks`]'s list
+    /// (positions, not CPU numbers), so a reader sums its own CPUs on any
+    /// layout. An M1 Ultra numbers die 0's E and P cores, then die 1's, so
+    /// a tier is not one contiguous block.
+    pub tick_positions: Vec<usize>,
 }
 
 /// One logical CPU's cumulative ticks.

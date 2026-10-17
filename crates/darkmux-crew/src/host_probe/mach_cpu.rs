@@ -20,6 +20,10 @@ pub struct PerfLevel {
     pub index: usize,
     pub name: String,
     pub logical_cpus: usize,
+    /// (#3275) Where this level's CPUs sit in [`per_core_ticks`]'s list, when
+    /// the platform names them (Linux: a tier's CPUs need not be one block).
+    /// `None` on macOS, where [`core_ranges`]'s block rule holds.
+    pub tick_positions: Option<Vec<usize>>,
 }
 
 /// One core's four mach tick counters (`PROCESSOR_CPU_LOAD_INFO`).
@@ -56,6 +60,39 @@ pub fn core_ranges(levels: &[PerfLevel]) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
+/// (#3275) Each level's tick positions: the ones the platform named, else
+/// its [`core_ranges`] block. Aligned with `levels`. Pure.
+pub fn level_positions(levels: &[PerfLevel]) -> Vec<Vec<usize>> {
+    let ranges = core_ranges(levels);
+    levels
+        .iter()
+        .zip(ranges)
+        .map(|(l, r)| l.tick_positions.clone().unwrap_or_else(|| r.collect()))
+        .collect()
+}
+
+/// Busy percent over the cores at `positions`, from two tick snapshots: the
+/// same arithmetic as [`range_busy_pct`], for a set that need not be one
+/// block. `None` for an empty set or a position past either snapshot.
+pub fn positions_busy_pct(prev: &[CoreTicks], cur: &[CoreTicks], positions: &[usize]) -> Option<u64> {
+    if positions.is_empty() || positions.iter().any(|&i| i >= prev.len() || i >= cur.len()) {
+        return None;
+    }
+    let (mut busy, mut total) = (0u64, 0u64);
+    for &i in positions {
+        let du = cur[i].user.wrapping_sub(prev[i].user) as u64;
+        let ds = cur[i].system.wrapping_sub(prev[i].system) as u64;
+        let dn = cur[i].nice.wrapping_sub(prev[i].nice) as u64;
+        let di = cur[i].idle.wrapping_sub(prev[i].idle) as u64;
+        busy += du + ds + dn;
+        total += du + ds + dn + di;
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(((busy as f64 / total as f64) * 100.0).clamp(0.0, 100.0).round() as u64)
+}
+
 /// Busy percent over one core-index range, from two tick snapshots.
 ///
 /// `busy = user + system + nice`, `total = busy + idle`, both measured as
@@ -73,22 +110,7 @@ pub fn range_busy_pct(
     cur: &[CoreTicks],
     range: &std::ops::Range<usize>,
 ) -> Option<u64> {
-    if range.end > prev.len() || range.end > cur.len() || range.is_empty() {
-        return None;
-    }
-    let (mut busy, mut total) = (0u64, 0u64);
-    for i in range.clone() {
-        let du = cur[i].user.wrapping_sub(prev[i].user) as u64;
-        let ds = cur[i].system.wrapping_sub(prev[i].system) as u64;
-        let dn = cur[i].nice.wrapping_sub(prev[i].nice) as u64;
-        let di = cur[i].idle.wrapping_sub(prev[i].idle) as u64;
-        busy += du + ds + dn;
-        total += du + ds + dn + di;
-    }
-    if total == 0 {
-        return None;
-    }
-    Some(((busy as f64 / total as f64) * 100.0).clamp(0.0, 100.0).round() as u64)
+    positions_busy_pct(prev, cur, &range.clone().collect::<Vec<_>>())
 }
 
 /// Memory-pressure percent from raw `vm_statistics64` page counts.
@@ -212,7 +234,7 @@ mod imp {
                 let logical = sysctl_u32(&format!("hw.perflevel{i}.logicalcpu"))? as usize;
                 let name = sysctl_string(&format!("hw.perflevel{i}.name"))
                     .unwrap_or_else(|| format!("level{i}"));
-                (logical > 0).then_some(PerfLevel { index: i, name, logical_cpus: logical })
+                (logical > 0).then_some(PerfLevel { index: i, name, logical_cpus: logical, tick_positions: None })
             })
             .collect()
     }
@@ -310,7 +332,7 @@ pub fn perf_levels() -> Vec<PerfLevel> {
         .cpu_clusters()
         .into_iter()
         .enumerate()
-        .map(|(index, c)| PerfLevel { index, name: c.name, logical_cpus: c.logical_cpus })
+        .map(|(index, c)| PerfLevel { index, name: c.name, logical_cpus: c.logical_cpus, tick_positions: Some(c.tick_positions) })
         .collect()
 }
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -335,7 +357,7 @@ mod tests {
     use super::*;
 
     fn lvl(index: usize, name: &str, n: usize) -> PerfLevel {
-        PerfLevel { index, name: name.to_string(), logical_cpus: n }
+        PerfLevel { index, name: name.to_string(), logical_cpus: n, tick_positions: None }
     }
 
     #[test]
@@ -367,6 +389,24 @@ mod tests {
 
     fn ticks(user: u32, system: u32, idle: u32, nice: u32) -> CoreTicks {
         CoreTicks { user, system, idle, nice }
+    }
+
+    #[test]
+    fn positions_busy_pct_reads_a_set_that_is_not_one_block() {
+        // (#3275) cpu0 and cpu2 fully busy, cpu1 idle: positions [0, 2] are 100%.
+        let prev = vec![CoreTicks::default(); 3];
+        let busy = CoreTicks { user: 10, ..CoreTicks::default() };
+        let idle = CoreTicks { idle: 10, ..CoreTicks::default() };
+        let cur = vec![busy, idle, busy];
+        assert_eq!(positions_busy_pct(&prev, &cur, &[0, 2]), Some(100));
+        assert_eq!(positions_busy_pct(&prev, &cur, &[1]), Some(0));
+        assert_eq!(positions_busy_pct(&prev, &cur, &[3]), None, "past the snapshot");
+        // A named set wins over the block rule; a level without one keeps it.
+        let levels = vec![
+            PerfLevel { index: 0, name: "Performance".into(), logical_cpus: 2, tick_positions: Some(vec![0, 2]) },
+            lvl(1, "Efficiency", 1),
+        ];
+        assert_eq!(level_positions(&levels), vec![vec![0, 2], vec![0]]);
     }
 
     #[test]

@@ -18,8 +18,9 @@ darkmux release.
 
 - **The machine lens reads a Linux machine** (#3275). CPU load per core and per tier
   (`/proc/stat`; `cpufreq` policies of equal capacity are one tier, as macOS's perf levels
-  are, and a machine with no `cpufreq`, such as a VM, is one "CPU" tier), each tier's MHz
-  (the mean of its policies'; offline CPUs are not counted), memory (`/proc/meminfo`: the memory
+  are, each reading its own CPUs even when they are not one block, as on an M1 Ultra's two
+  dies; a machine with no `cpufreq`, such as a VM, is one "CPU" tier), each tier's MHz (the
+  mean of its policies'; offline CPUs are not counted), memory (`/proc/meminfo`: the memory
   ledger's pool, swap and margin rows, with no compressor row invented) and the battery
   (`/sys/class/power_supply`, its state from the same rules a Mac's uses) now come from
   the platform strategy off Apple Silicon macOS, where they read "not measured" before.

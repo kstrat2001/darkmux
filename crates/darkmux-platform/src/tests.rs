@@ -378,7 +378,13 @@ fn per_cpu_ticks_come_from_proc_stat_in_cpu_order() {
 /// Tiers, the shape macOS's `hw.perflevelN` reports, read from `cpufreq`
 /// policies (`(online cpus, capacity, kHz)`).
 fn tiers(policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>, online: usize) -> Vec<(String, usize, Option<u32>)> {
-    crate::linux::tiers_from_policies(policies, online).into_iter().map(|(c, mhz)| (c.name, c.logical_cpus, mhz)).collect()
+    let online: Vec<usize> = (0..online).collect();
+    crate::linux::tiers_from_policies(policies, &online).into_iter().map(|(c, mhz)| (c.name, c.logical_cpus, mhz)).collect()
+}
+
+/// Each tier's tick positions, for `online` CPU numbers.
+fn positions(policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>, online: &[usize]) -> Vec<(String, Vec<usize>)> {
+    crate::linux::tiers_from_policies(policies, online).into_iter().map(|(c, _)| (c.name, c.tick_positions)).collect()
 }
 
 /// An M1 or M2: E cores first, then P cores, fastest tier first.
@@ -411,12 +417,30 @@ fn one_policy_per_cpu_with_no_capacity_is_one_cpu_tier() {
     assert_eq!(t, vec![("CPU".into(), 4, Some(2001))]);
 }
 
-/// An Intel hybrid numbers its P cores first: the tier holding the lowest
-/// CPUs comes last, the order the machine lens's `core_ranges` maps.
+/// (#3279 re-review F1) An M1 Ultra numbers die 0's E and P cores, then
+/// die 1's: each tier names its own CPUs' positions, not a block.
 #[test]
-fn tiers_are_ordered_so_the_lowest_cpus_come_last() {
-    let t = tiers(vec![(vec![0, 1, 2, 3], Some(1024), None), (vec![4, 5, 6, 7, 8, 9], Some(400), None)], 10);
-    assert_eq!(t, vec![("Efficiency".into(), 6, None), ("Performance".into(), 4, None)]);
+fn a_tier_split_across_dies_names_its_own_cpus() {
+    let p = |cpus: std::ops::Range<usize>, cap| (cpus.collect::<Vec<_>>(), Some(cap), None);
+    let online: Vec<usize> = (0..20).collect();
+    let t = positions(vec![p(0..2, 512), p(2..6, 1024), p(6..10, 1024), p(10..12, 512), p(12..16, 1024), p(16..20, 1024)], &online);
+    let perf: Vec<usize> = (2..10).chain(12..20).collect();
+    assert_eq!(t, vec![("Performance".into(), perf), ("Efficiency".into(), vec![0, 1, 10, 11])]);
+}
+
+/// An offline CPU has no `/proc/stat` line, so positions skip it: with cpu1
+/// offline, cpu2 is at position 1.
+#[test]
+fn positions_follow_the_online_cpus() {
+    let t = positions(vec![(vec![0, 2], Some(512), None), (vec![3, 4], Some(1024), None)], &[0, 2, 3, 4]);
+    assert_eq!(t, vec![("Performance".into(), vec![2, 3]), ("Efficiency".into(), vec![0, 1])]);
+}
+
+/// `/proc/stat`'s CPU numbers; the aggregate `cpu` line is not one.
+#[test]
+fn online_cpus_come_from_proc_stat() {
+    let stat = "cpu  10 1 5 100\ncpu0 4 1 2 50\ncpu2 6 0 3 50\nintr 1\n";
+    assert_eq!(crate::linux::online_cpus_from_stat(stat), vec![0, 2]);
 }
 
 /// (#3279 review F1) No `cpufreq` (a VM, a container): one "CPU" tier of
