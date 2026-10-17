@@ -8486,12 +8486,18 @@ fn warn_on_channel_markup(reply: &str, model: &str) {
     }
 }
 
+/// The header the runtime's text-mode summary puts above the reply.
+const FINAL_ASSISTANT_HEADER: &str = "--- final assistant message ---\n";
+
 /// (#3264) The model's reply in a container run's stdout: the envelope's
-/// `final_assistant` for a `--json` dispatch, the stdout itself otherwise
-/// (the runtime prints the reply as its text-mode output).
+/// `final_assistant` for a `--json` dispatch; in text mode, what follows the
+/// summary's reply header (empty when the run failed and printed none).
 fn container_reply(json: bool, stdout: &str) -> String {
     if !json {
-        return stdout.to_string();
+        return stdout
+            .split_once(FINAL_ASSISTANT_HEADER)
+            .map(|(_, reply)| reply.to_string())
+            .unwrap_or_default();
     }
     serde_json::from_str::<darkmux_trajectory::RuntimeEnvelope>(stdout.trim())
         .ok()
