@@ -5869,7 +5869,7 @@ mod tests {
         let row = |payload: serde_json::Value, clocks: PeerClocks| {
             let r = serde_json::json!({
                 "ts": start_ts, "action": "run.start", "handle": "pr-merge", "mission_id": "panel-1",
-                "session_id": run_session, "machine_id": "darkbook", "machine_uid": mine, "payload": payload,
+                "session_id": run_session, "machine_id": "a-peer-name-no-host-has", "machine_uid": mine, "payload": payload,
             });
             let mut idx = HashMap::new();
             let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
