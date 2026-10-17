@@ -24,9 +24,10 @@ darkmux release.
   ledger's pool, swap and margin rows, with no compressor row invented) and the battery
   (`/sys/class/power_supply`, its state from the same rules a Mac's uses) now come from
   the platform strategy off Apple Silicon macOS, where they read "not measured" before.
-  Apple Silicon macOS keeps its IOKit, IOReport and mach readers unchanged. CI gains a
-  Linux job: whole-workspace clippy with `-D warnings`, which compiles every target for
-  Linux, plus the platform, hardware and types tests.
+  Apple Silicon macOS keeps its IOKit, IOReport and mach readers unchanged. Linux is
+  checked on a real Linux machine, not in CI: `scripts/linux-check.sh` (whole-workspace
+  clippy with `-D warnings`, the platform, hardware and types tests, a release build and
+  `darkmux doctor`) runs there before a release.
 
 - **A Linux machine has a place in the fleet** (#3275). Its identity comes from
   `/etc/machine-id`, else D-Bus's copy at `/var/lib/dbus/machine-id` (new on a reinstall, so a dual-boot laptop is two machines; #3212),
