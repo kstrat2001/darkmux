@@ -646,7 +646,7 @@ pub fn health() -> Option<BatteryHealth> {
 mod tests {
     use super::*;
 
-    /// (omarchy) A platform reading becomes the lens's sample, its state
+    /// (#3275) A platform reading becomes the lens's sample, its state
     /// from the same rules as a Mac's: full on AC is Full, held on AC with no
     /// current is Held, off AC is Discharging.
     #[test]

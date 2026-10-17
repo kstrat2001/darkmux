@@ -455,6 +455,63 @@ jobs:
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust-relevant changes; fleet e2e skipped (reports green)."
 
+  linux-build-lint:
+    name: Linux build + lint + platform tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # (#3275) darkmux runs on Linux too (Omarchy under Asahi). The macOS job
+    # above never compiles a Linux-only branch, so a `cfg(target_os =
+    # "linux")` leaf, the `darkmux-platform` Linux strategy or a dead-code
+    # warning only one OS sees can break Linux with every check green. This
+    # job compiles every workspace target for Linux (clippy, `-D warnings`)
+    # and runs the crates whose answers differ by OS. The rest of the suite
+    # stays on macOS until its tests that read the real host (doctor, the
+    # residency lease, tailscale) are made OS-neutral.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # `every` + one brace list: see the build-test-lint filter.
+          predicate-quantifier: 'every'
+          filters: |
+            rust:
+              - '{Cargo.toml,Cargo.lock,src/**,crates/**,tests/**,templates/**,.github/workflows/ci.yml}'
+              - '!**/CLAUDE.md'
+
+      - name: Install Rust stable toolchain
+        if: steps.filter.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.rust == 'true'
+        with:
+          key: linux-build-lint
+
+      - name: Install cargo-nextest
+        if: steps.filter.outputs.rust == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Clippy (whole workspace, all targets, no warnings allowed)
+        if: steps.filter.outputs.rust == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Platform tests (the crates whose answers differ by OS)
+        if: steps.filter.outputs.rust == 'true'
+        run: cargo nextest run --profile ci -p darkmux-platform -p darkmux-hardware -p darkmux-types
+
+      - name: No Rust-relevant changes — Linux job skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust-relevant changes; Linux job skipped (reports green)."
+
   runtime-test-lint:
     name: runtime crate — test + lint (macos-latest)
     runs-on: macos-latest

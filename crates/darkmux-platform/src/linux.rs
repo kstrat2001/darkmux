@@ -270,7 +270,7 @@ fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
 pub(crate) fn clusters_from_policies(
     mut policies: Vec<(Vec<usize>, Option<u64>)>,
 ) -> Vec<crate::CpuClusterInfo> {
-    policies.sort_by(|a, b| b.1.cmp(&a.1));
+    policies.sort_by_key(|p| std::cmp::Reverse(p.1));
     let top = policies.first().and_then(|p| p.1);
     let mixed = policies.iter().any(|p| p.1 != top);
     policies
@@ -344,6 +344,7 @@ fn read_battery() -> Option<crate::BatteryReading> {
 /// a present Battery with a charge. `status` is `Charging`, `Discharging`,
 /// `Full` or `Not charging` (on AC, held below full); `current_now` is in
 /// microamps; `time_to_empty_now` in seconds, 0 meaning no estimate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn battery_from_supply(fields: &[(&str, &str)], on_ac: bool) -> Option<crate::BatteryReading> {
     let get = |k: &str| fields.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
     if get("type") != Some("Battery") || get("present") == Some("0") {
@@ -387,6 +388,6 @@ fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
 /// Each cluster's MHz, ordered exactly as [`clusters_from_policies`] orders
 /// the clusters (by capacity, highest first, stably).
 pub(crate) fn cluster_mhz_from_policies(mut policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>) -> Vec<Option<u32>> {
-    policies.sort_by(|a, b| b.1.cmp(&a.1));
+    policies.sort_by_key(|p| std::cmp::Reverse(p.1));
     policies.into_iter().map(|(_, _, khz)| khz.map(|k| (k / 1000) as u32)).collect()
 }

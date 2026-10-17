@@ -1676,7 +1676,7 @@ struct MemoryRows {
     margin_percent: Option<u64>,
 }
 
-/// (omarchy) The memory rows from a platform snapshot: used = capacity -
+/// (#3275) The memory rows from a platform snapshot: used = capacity -
 /// available, margin = available / capacity (the share free, as macOS's
 /// `kern.memorystatus_level` tile reads), no compressor reading invented.
 fn memory_rows_from_snapshot(s: &darkmux_platform::MemorySnapshot) -> MemoryRows {
@@ -1745,7 +1745,7 @@ struct MachineProbes {
 
 /// The machine half of a gather: every probe bounded, each failure a message.
 fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
-    // (omarchy) Where the platform reports memory (Linux: /proc/meminfo), it
+    // (#3275) Where the platform reports memory (Linux: /proc/meminfo), it
     // fills the pool, swap and margin rows. macOS answers nothing there, so a
     // Mac keeps the kernel-counter path, unchanged (`macos_memory_rows`).
     let MemoryRows { pool, swap_used_bytes, compressor_bytes, margin_percent } =
@@ -2225,7 +2225,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
 mod tests {
     use super::*;
 
-    /// (omarchy) Where the platform reports memory (Linux), the ledger's pool,
+    /// (#3275) Where the platform reports memory (Linux), the ledger's pool,
     /// swap and margin come from it: used = capacity - available, margin =
     /// available / capacity. No compressor reading is invented.
     #[test]
