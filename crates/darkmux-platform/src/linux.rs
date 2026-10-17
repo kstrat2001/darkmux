@@ -34,7 +34,7 @@ impl Platform for LinuxPlatform {
             .unwrap_or(ContainerUser::Image)
     }
 
-    /// The install's `/etc/machine-id`. A dual-boot Mac's macOS side has a
+    /// The install's machine-id (`/etc/machine-id`, else D-Bus's copy). A dual-boot Mac's macOS side has a
     /// different identity (its `IOPlatformUUID`): one install, one uid.
     fn machine_uid(&self) -> Option<String> {
         machine_uid_from_disk()
@@ -114,7 +114,7 @@ pub(crate) fn model_name_from_cpuinfo(cpuinfo: &str) -> Option<String> {
     })
 }
 
-/// `/etc/machine-id`: systemd's id for this install, stable across reboots
+/// The machine-id (`/etc/machine-id`, else `/var/lib/dbus/machine-id`): the id for this install, stable across reboots
 /// and hostname changes, new on a reinstall. Readable by any user.
 pub(crate) fn machine_uid_from_disk() -> Option<String> {
     read_machine_id()
@@ -128,7 +128,7 @@ fn read_machine_id() -> Option<String> {
 /// systemd's machine-id, then D-Bus's copy, which distributions without
 /// systemd keep (machine-id(5)).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const MACHINE_ID_PATHS: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+pub(crate) const MACHINE_ID_PATHS: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
 
 /// The first of `paths` holding a valid machine-id.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

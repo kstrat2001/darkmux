@@ -228,7 +228,7 @@ fn read_linux_meminfo_gb() -> Option<u32> {
 /// operator-set display label), from the platform strategy
 /// (`darkmux_platform::Platform::machine_uid`): the `IOPlatformUUID` on macOS
 /// (survives renames and OS reinstalls; only a logic-board swap resets it),
-/// `/etc/machine-id` on Linux (new on a reinstall). `None` where the platform
+/// the machine-id on Linux (`/etc/machine-id`, else D-Bus's copy; new on a reinstall). `None` where the platform
 /// has none to read: callers treat that as *unknown identity* and never fall
 /// back to a name string.
 ///

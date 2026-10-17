@@ -2439,7 +2439,7 @@ pub struct FlowRecord {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_id: Option<String>,
     /// Stable hardware identity of the machine that emitted this record
-    /// (`IOPlatformUUID` on macOS, `/etc/machine-id` on Linux; #640, #3275) —
+    /// (`IOPlatformUUID` on macOS, the machine-id on Linux; #640, #3275) —
     /// the canonical machine identity, distinct from the mutable `machine_id`
     /// label above. Auto-populated at write time from
     /// `darkmux_hardware::machine_uid()`. `None` where the platform has none, or on records

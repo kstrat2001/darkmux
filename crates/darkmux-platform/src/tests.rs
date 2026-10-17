@@ -342,4 +342,6 @@ fn the_machine_id_falls_back_to_the_dbus_copy() {
     assert_eq!(crate::linux::first_machine_id(&[&etc, &dbus]).as_deref(), Some(id), "etc invalid");
     std::fs::write(&etc, "fedcba9876543210fedcba9876543210\n").unwrap();
     assert_eq!(crate::linux::first_machine_id(&[&etc, &dbus]).as_deref(), Some("fedcba9876543210fedcba9876543210"), "etc first");
+    // (#3277 re-review) The real list reads systemd's id first.
+    assert_eq!(crate::linux::MACHINE_ID_PATHS, ["/etc/machine-id", "/var/lib/dbus/machine-id"]);
 }

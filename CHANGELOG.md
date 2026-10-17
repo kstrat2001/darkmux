@@ -17,7 +17,7 @@ darkmux release.
 ### Added
 
 - **A Linux machine has a place in the fleet** (#3275). Its identity comes from
-  `/etc/machine-id` (or D-Bus's copy at `/var/lib/dbus/machine-id`) (new on a reinstall, so a dual-boot laptop is two machines; #3212),
+  `/etc/machine-id`, else D-Bus's copy at `/var/lib/dbus/machine-id` (new on a reinstall, so a dual-boot laptop is two machines; #3212),
   so it beats presence and its records carry a `machine_uid`; the fleet card names its CPU
   (`/proc/cpuinfo` or the device tree) and its installed memory (`MemTotal` rounded up to a
   whole GiB; display only, and lower than the size sold where firmware reserves more than a
