@@ -4073,6 +4073,17 @@ pub(crate) fn classify_hosted_response(
 /// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs`'s tests reuse
 /// this classification directly rather than re-deriving the error-shape
 /// corpus (401/429/503/array-shaped/malformed/contentless).
+/// The HTTP status a Messages `error.type` is sent with when it is not inside
+/// a stream: `overloaded_error` 529, `rate_limit_error` 429, `api_error` 500.
+fn messages_error_status(err: &serde_json::Value) -> Option<u64> {
+    match err.get("type")?.as_str()? {
+        "overloaded_error" => Some(529),
+        "rate_limit_error" => Some(429),
+        "api_error" => Some(500),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_hosted_response(
     stdout: &[u8],
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
@@ -4094,7 +4105,10 @@ pub(crate) fn parse_hosted_response(
             .and_then(|f| f.get("error"))
     });
     if let Some(err) = err_obj {
-        let code = err.get("code").and_then(|c| c.as_u64());
+        // (#3270) A Messages error names its class in `error.type`, with no
+        // `code`; it reaches this body reading inside a stream (HTTP 200), so
+        // it is read as the HTTP status its unstreamed twin carries.
+        let code = err.get("code").and_then(|c| c.as_u64()).or_else(|| messages_error_status(err));
         let status = err.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let msg = err
             .get("message")
@@ -4109,7 +4123,7 @@ pub(crate) fn parse_hosted_response(
         if code == Some(429) || status == "RESOURCE_EXHAUSTED" {
             return Err(HostedCallError::RateLimited(msg.to_string()));
         }
-        if code == Some(503) || status == "UNAVAILABLE" || (msg.contains("high demand") && msg.contains("try again")) {
+        if matches!(code, Some(503 | 529)) || status == "UNAVAILABLE" || (msg.contains("high demand") && msg.contains("try again")) {
             return Err(HostedCallError::ServerShed(msg.to_string()));
         }
         let kind = if code.is_some_and(|c| c >= 500) { HostedFailure::ServerError } else { HostedFailure::Rejected };

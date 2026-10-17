@@ -19828,6 +19828,43 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(refusal(400, r#"{"error":{"message":"streaming is not supported"}}"#));
     }
 
+    /// (#3270 review F1) A Messages error event inside a stream (HTTP 200)
+    /// is classified as its unstreamed HTTP twin: overloaded as shed (529),
+    /// rate limit as rate-limited (429), api_error as a server error that
+    /// may have spent (500).
+    #[test]
+    fn a_messages_error_event_in_a_stream_is_classified_as_its_http_twin() {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\n";
+        let ev = |t: &str, m: &str| format!("{start}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{t}\",\"message\":\"{m}\"}}}}\n\n").into_bytes();
+        let kind = |r: &std::result::Result<serde_json::Value, HostedCallError>| match r {
+            Ok(_) => "ok".to_string(),
+            Err(HostedCallError::RateLimited(_)) => "rate_limited".into(),
+            Err(HostedCallError::ServerShed(_)) => "shed".into(),
+            Err(HostedCallError::Other(e)) => format!(
+                "other:{:?}:spent={}",
+                e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind),
+                call_may_have_spent(e)
+            ),
+        };
+        let twin = |status: u16, t: &str, m: &str| {
+            finish_reply(false, true, Some(status), format!(r#"{{"type":"error","error":{{"type":"{t}","message":"{m}"}}}}"#).into_bytes())
+        };
+        for (status, t) in [(529, "overloaded_error"), (500, "api_error"), (429, "rate_limit_error")] {
+            assert_eq!(kind(&finish_reply(true, true, Some(200), ev(t, "x"))), kind(&twin(status, t, "x")), "{t}");
+        }
+    }
+
+    /// (#3270 review F2) A server error inside a stream that happens to say
+    /// "stream" is not the endpoint refusing to stream: no unstreamed resend.
+    #[test]
+    fn a_midstream_error_naming_stream_is_not_a_stream_refusal() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal error while processing the stream\"}}\n\n";
+        match finish_reply(true, true, Some(200), body.as_bytes().to_vec()) {
+            Err(HostedCallError::Other(e)) => assert!(!refused_stream_request(&e), "{e:#}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// (#3211 review F2) A stream cut off mid-way fails as an unanswered call:
     /// charged as one the endpoint may have processed, never read as a reply.
     #[test]
