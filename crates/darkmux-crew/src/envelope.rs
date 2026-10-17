@@ -1242,8 +1242,9 @@ mod tests {
         assert_eq!(persisted.mission_id, "m6");
         assert_eq!(persisted.status, MissionOutcomeStatus::Degraded);
         // finalize appends its own records-emitted warning when the records
-        // carry no machine_uid, which is the case on every host but a Mac
-        // (`darkmux_hardware::machine_uid` reads the macOS IOPlatformUUID).
+        // carry no machine_uid, which is the case on a host whose platform has
+        // none (`darkmux_hardware::machine_uid`: macOS's IOPlatformUUID, Linux's
+        // machine-id).
         let mut expected = vec!["remote probe token budget exhausted".to_string()];
         if darkmux_hardware::machine_uid().is_none() {
             expected.push(

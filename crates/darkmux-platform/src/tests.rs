@@ -328,3 +328,18 @@ fn this_linux_machine_reports_installed_ram() {
         assert_eq!(ram % GIB, 0, "a whole GiB");
     }
 }
+
+/// (#3277 review) Without systemd's `/etc/machine-id`, D-Bus's copy is read;
+/// an invalid first file is skipped, not taken.
+#[test]
+fn the_machine_id_falls_back_to_the_dbus_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (etc, dbus) = (dir.path().join("etc-machine-id"), dir.path().join("dbus-machine-id"));
+    let id = "0123456789abcdef0123456789abcdef";
+    std::fs::write(&dbus, format!("{id}\n")).unwrap();
+    assert_eq!(crate::linux::first_machine_id(&[&etc, &dbus]).as_deref(), Some(id), "etc missing");
+    std::fs::write(&etc, "uninitialized\n").unwrap();
+    assert_eq!(crate::linux::first_machine_id(&[&etc, &dbus]).as_deref(), Some(id), "etc invalid");
+    std::fs::write(&etc, "fedcba9876543210fedcba9876543210\n").unwrap();
+    assert_eq!(crate::linux::first_machine_id(&[&etc, &dbus]).as_deref(), Some("fedcba9876543210fedcba9876543210"), "etc first");
+}

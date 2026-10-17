@@ -885,6 +885,9 @@ dependencies = [
 [[package]]
 name = "darkmux-platform"
 version = "5.2.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "darkmux-profiles"

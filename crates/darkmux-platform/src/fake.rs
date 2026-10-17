@@ -8,6 +8,19 @@ pub struct FakePlatform {
     pub machine_uid: Option<String>,
 }
 
+/// Every answer at its "nothing to report" value, so a test sets only the
+/// answers it is about (`FakePlatform { machine_uid: .., ..Default::default() }`)
+/// and a new question does not break every literal.
+impl Default for FakePlatform {
+    fn default() -> Self {
+        FakePlatform {
+            container_host_access: ContainerHostAccess::Builtin,
+            container_user: ContainerUser::Image,
+            machine_uid: None,
+        }
+    }
+}
+
 impl Platform for FakePlatform {
     fn id(&self) -> &'static str {
         "fake"

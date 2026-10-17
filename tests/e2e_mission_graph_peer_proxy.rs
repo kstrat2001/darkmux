@@ -117,9 +117,10 @@ fn register_peer(reader: &FleetNode, peer: &FleetNode) {
 /// Publish a live presence beat for `peer` directly onto the harness's
 /// shared Redis. Written directly rather than waited-for from `peer`'s
 /// own emitter thread (`darkmux_flow::presence::spawn_emitter_thread`)
-/// because that thread self-disables on any non-macOS host (no
-/// `IOPlatformUUID`-derived `machine_uid`, #640) — this e2e binary runs
-/// on the `fleet-e2e` job's ubuntu-latest runner. The emitter thread
+/// because every daemon this harness starts shares one host, so their
+/// emitters would beat under the host's one `machine_uid` (#3275: the
+/// runner's `/etc/machine-id`), and on a host with none they do not beat at
+/// all (#640). This e2e binary runs on the `fleet-e2e` job's ubuntu-latest runner. The emitter thread
 /// itself is exercised elsewhere; what THIS test needs is only "presence
 /// says peer is live", which is exactly what a real beat on the real
 /// shared Redis proves regardless of who wrote it.

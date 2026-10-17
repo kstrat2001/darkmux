@@ -50,8 +50,10 @@ impl Platform for LinuxPlatform {
     }
 
     /// `MemTotal` rounded up to a whole GiB: the kernel reports what it can
-    /// use, after firmware and its own reservations (7.36 GiB on an 8 GB M2),
-    /// and that share is always under a GiB.
+    /// use, after firmware and its own reservations (7.36 GiB on an 8 GB M2).
+    /// Display only. Close to the size as sold where the reserved share is
+    /// under a GiB; lower where firmware sets aside more (an integrated GPU's
+    /// carve-out, a large crashkernel).
     fn ram_installed_bytes(&self) -> Option<u64> {
         installed_ram_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
@@ -120,7 +122,18 @@ pub(crate) fn machine_uid_from_disk() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn read_machine_id() -> Option<String> {
-    parse_machine_id(&std::fs::read_to_string("/etc/machine-id").ok()?)
+    first_machine_id(&MACHINE_ID_PATHS)
+}
+
+/// systemd's machine-id, then D-Bus's copy, which distributions without
+/// systemd keep (machine-id(5)).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MACHINE_ID_PATHS: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+
+/// The first of `paths` holding a valid machine-id.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn first_machine_id<P: AsRef<std::path::Path>>(paths: &[P]) -> Option<String> {
+    paths.iter().find_map(|p| parse_machine_id(&std::fs::read_to_string(p).ok()?))
 }
 
 #[cfg(not(target_os = "linux"))]
