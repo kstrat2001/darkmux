@@ -19821,6 +19821,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(!refusal(400, r#"{"error":{"message":"maximum context length exceeded"}}"#));
         assert!(!refusal(401, r#"{"error":{"message":"bad key"}}"#));
         assert!(!refusal(500, r#"{"error":{"message":"stream broke"}}"#), "a 5xx is not a refusal");
+        assert!(!refusal(400, r#"{"error":{"message":"Provider returned error: upstream request failed validation"}}"#), "upstream is not stream");
+        assert!(refusal(400, r#"{"error":{"message":"streaming is not supported"}}"#));
     }
 
     /// (#3211 review F2) A stream cut off mid-way fails as an unanswered call:
@@ -19829,7 +19831,11 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     fn a_cut_off_stream_is_an_unanswered_call() {
         let cut = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_vec();
         match streamed_reply_as_chat(true, cut.clone()) {
-            Err(HostedCallError::Other(e)) => assert!(call_may_have_spent(&e), "{e:#}"),
+            Err(HostedCallError::Other(e)) => {
+                assert!(call_may_have_spent(&e), "{e:#}");
+                let kind = e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind);
+                assert!(matches!(kind, Some(HostedFailure::Unanswered)), "the answer never came whole: {kind:?}");
+            }
             other => panic!("expected an unanswered failure, got {other:?}"),
         }
         assert_eq!(streamed_reply_as_chat(false, cut.clone()).ok(), Some(cut), "an unstreamed call reads its body as before");

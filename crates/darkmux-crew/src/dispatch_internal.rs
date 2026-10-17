@@ -3814,7 +3814,12 @@ fn streamed_reply_as_chat(streams: bool, response: Vec<u8>) -> std::result::Resu
 /// unstreamed.
 fn refused_stream_request(err: &anyhow::Error) -> bool {
     let kind = err.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|e| e.kind);
-    matches!(kind, Some(HostedFailure::Rejected)) && format!("{err:#}").to_ascii_lowercase().contains("stream")
+    let text = format!("{err:#}").to_ascii_lowercase();
+    // A whole word, never a substring: "upstream" is not about streaming.
+    let names_streaming = text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| matches!(w, "stream" | "stream_options" | "streaming"));
+    matches!(kind, Some(HostedFailure::Rejected)) && names_streaming
 }
 
 /// How often a streaming reply's file is read while curl writes it: well

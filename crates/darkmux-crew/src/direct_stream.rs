@@ -43,10 +43,11 @@ pub(crate) fn stream_body(body: &Value) -> Value {
 /// One event's delta text: (answer, reasoning). Reasoning arrives as
 /// `reasoning_content` (LM Studio, vLLM, DeepSeek) or `reasoning` (some
 /// OpenAI-compatible servers); a server that sends both sends one text
-/// twice, so the first present is read, never their sum.
+/// twice, so the first non-empty one is read, never their sum (an empty
+/// placeholder in one field never hides the other's text).
 fn delta_text(event: &Value) -> (&str, &str) {
     let delta = event.pointer("/choices/0/delta");
-    let text = |key: &str| delta.and_then(|d| d.get(key)).and_then(Value::as_str);
+    let text = |key: &str| delta.and_then(|d| d.get(key)).and_then(Value::as_str).filter(|s| !s.is_empty());
     (text("content").unwrap_or(""), text("reasoning_content").or_else(|| text("reasoning")).unwrap_or(""))
 }
 
@@ -93,13 +94,13 @@ pub(crate) struct SseTail {
 }
 
 impl SseTail {
-    /// Read `bytes`, the response's next piece; `true` when it completed at
-    /// least one event.
     /// A tail for an attempt sent at `started`.
     pub(crate) fn sent_at(started: std::time::Instant) -> Self {
         SseTail { progress: SseProgress { started: Some(started), ..SseProgress::default() }, ..SseTail::default() }
     }
 
+    /// Read `bytes`, the response's next piece; `true` when it completed at
+    /// least one event.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
         self.pending.extend_from_slice(bytes);
         let Some(end) = self.pending.iter().rposition(|b| *b == b'\n') else {

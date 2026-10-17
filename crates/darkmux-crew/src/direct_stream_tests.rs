@@ -109,6 +109,13 @@ fn reasoning_under_both_names_is_counted_once() {
     let mut tail = SseTail::default();
     tail.feed(both.as_bytes());
     assert_eq!(tail.progress.generated_chars, 3);
+    // An empty placeholder under one name never hides the other's text.
+    let placeholder = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\",\"reasoning\":\"xy\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let reply: Value = serde_json::from_slice(&ok(placeholder)).unwrap();
+    assert_eq!(reply["choices"][0]["message"]["reasoning_content"], "xy");
+    let mut tail = SseTail::default();
+    tail.feed(placeholder.as_bytes());
+    assert_eq!(tail.progress.generated_chars, 2);
     // Sent under `reasoning` alone, it is still read.
     let only = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"xy\"},\"finish_reason\":\"stop\"}]}\n\n";
     let reply: Value = serde_json::from_slice(&ok(only)).unwrap();
@@ -123,10 +130,15 @@ fn the_model_time_starts_at_the_streaming_attempts_send() {
     let emitted = RefCell::new(Vec::new());
     let mut ev = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::from_secs(2), |p| emitted.borrow_mut().push(p));
     let sent = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    let earlier = sent - std::time::Duration::from_secs(60);
     let (reply, body) = ev.send(
         serde_json::json!({ "model": "m" }),
         |_, progress| {
-            progress.expect("a streamed call")(&SseProgress { started: Some(sent), chunks: 1, ..SseProgress::default() });
+            let on = progress.expect("a streamed call");
+            // An earlier attempt streamed too (then was retried): the last
+            // attempt's send is the model time's start.
+            on(&SseProgress { started: Some(earlier), chunks: 1, ..SseProgress::default() });
+            on(&SseProgress { started: Some(sent), chunks: 1, ..SseProgress::default() });
             Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }))
         },
         |_| false,
