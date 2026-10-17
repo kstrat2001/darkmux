@@ -110,7 +110,11 @@ darkmux release.
   secret handling and retries unchanged) and writes the opening heartbeat with the request's
   size, a heartbeat every 2 s while text arrives, and one `dispatch.turn` with its usage and
   model time, so the scope reads PROMPT, GEN and finished like a container turn. A Messages
-  dialect call is not streamed yet; it writes the opener and its `dispatch.turn`.
+  dialect call (a Claude seat) streams the same way (#316): `"stream": true` with no
+  `stream_options`, its typed events (`content_block_delta`, `message_delta`,
+  `message_stop`) read back into the unstreamed message, so its usage and cache counts are
+  unchanged. A Messages stream that ends with no `message_stop` and no stop reason fails as
+  unanswered, never as a partial reply.
 
 - **A role with tools can reach an endpoint on this machine** (#3209). An
   unmanaged endpoint at `http://127.0.0.1:<port>/v1` or `localhost` (an

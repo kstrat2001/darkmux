@@ -2,7 +2,7 @@ use super::*;
 
 /// `body` reassembled, when it is a finished SSE stream.
 fn ok(body: &str) -> Vec<u8> {
-    assemble(body.as_bytes()).expect("an SSE body").expect("a finished stream")
+    assemble(body.as_bytes(), Shape::Chat).expect("an SSE body").expect("a finished stream")
 }
 
 /// The shape `mlx_lm.server` and LM Studio stream: content deltas, a finish
@@ -30,8 +30,8 @@ fn a_streamed_reply_is_put_back_together_as_the_unstreamed_one() {
 
 #[test]
 fn a_body_that_is_not_sse_is_left_for_the_ordinary_reading() {
-    assert_eq!(assemble(br#"{"error":{"message":"bad key"}}"#), None);
-    assert_eq!(assemble(br#"{"choices":[{"message":{"content":"x"}}]}"#), None);
+    assert_eq!(assemble(br#"{"error":{"message":"bad key"}}"#, Shape::Chat), None);
+    assert_eq!(assemble(br#"{"choices":[{"message":{"content":"x"}}]}"#, Shape::Chat), None);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn the_tail_counts_whole_events_across_split_reads() {
 
 #[test]
 fn a_streamed_body_asks_for_the_usage_block() {
-    let body = stream_body(&serde_json::json!({ "model": "m", "stream": false }));
+    let body = stream_body(&serde_json::json!({ "model": "m", "stream": false }), Shape::Chat);
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert_eq!(body["model"], "m");
@@ -93,10 +93,10 @@ fn a_stream_opening_with_a_comment_or_an_event_line_is_read_as_sse() {
 #[test]
 fn a_stream_cut_off_mid_way_is_not_a_reply() {
     let cut = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
-    assert!(matches!(assemble(cut.as_bytes()), Some(Err(_))));
-    assert!(assemble(format!("{cut}data: [DONE]\n\n").as_bytes()).unwrap().is_ok());
+    assert!(matches!(assemble(cut.as_bytes(), Shape::Chat), Some(Err(_))));
+    assert!(assemble(format!("{cut}data: [DONE]\n\n").as_bytes(), Shape::Chat).unwrap().is_ok());
     let finish = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"length\"}]}\n\n";
-    assert!(assemble(finish.as_bytes()).unwrap().is_ok());
+    assert!(assemble(finish.as_bytes(), Shape::Chat).unwrap().is_ok());
 }
 
 /// (#3211 review F5) A server sending the reasoning under both names sends
@@ -170,4 +170,94 @@ fn a_refused_stream_request_is_sent_again_unstreamed() {
     assert_eq!(sent.borrow().len(), 2);
     assert!(body.get("stream").is_none(), "the body sent last: {body}");
     assert!(!ev.streams);
+}
+
+/// (#316 4.6) The Messages stream: a thinking block, a ping, two text
+/// deltas, the stop reason and output count on `message_delta`, then
+/// `message_stop`. The input and cache counts arrive on `message_start`.
+const MSSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: ping\n\
+data: {\"type\":\"ping\"}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+/// A Messages SSE body, reassembled and read the way `finish_reply` reads it.
+fn messages_reply(body: &str) -> Result<Value, crate::dispatch_internal::HostedCallError> {
+    let bytes = assemble(body.as_bytes(), Shape::Messages).expect("an SSE body").expect("a finished stream");
+    crate::dispatch_internal::parse_hosted_response(&crate::messages_wire::reply_bytes_as_chat(true, bytes))
+}
+
+#[test]
+fn a_streamed_messages_reply_is_put_back_together_as_the_unstreamed_one() {
+    let parsed = messages_reply(MSSE).expect("classifies as Ok");
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    assert_eq!(parsed["model"], "claude-sonnet-5-5");
+    let out = crate::single_shot::extract_reply(&parsed);
+    assert_eq!(out.content, "Hello", "the thinking block is not the answer");
+    let c = out.counts;
+    assert_eq!((c.prompt, c.completion, c.total, c.cached), (Some(42), Some(5), Some(47), Some(30)));
+}
+
+#[test]
+fn the_tail_counts_messages_text_and_thinking_deltas() {
+    let mut tail = SseTail::new(Shape::Messages);
+    assert!(tail.feed(MSSE.as_bytes()));
+    assert_eq!((tail.progress.content_chars, tail.progress.generated_chars), (5, 8));
+}
+
+#[test]
+fn a_messages_stream_cut_off_mid_way_is_not_a_reply() {
+    let cut = &MSSE[..MSSE.find("event: message_delta").unwrap()];
+    assert!(matches!(assemble(cut.as_bytes(), Shape::Messages), Some(Err(_))));
+    // The stop reason alone says it finished, before `message_stop` arrives.
+    let stopped = &MSSE[..MSSE.find("event: message_stop").unwrap()];
+    assert!(assemble(stopped.as_bytes(), Shape::Messages).unwrap().is_ok());
+}
+
+#[test]
+fn a_messages_error_event_reaches_the_error_classification() {
+    let body = format!(
+        "{}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}}\n\n",
+        &MSSE[..MSSE.find("event: content_block_start").unwrap()]
+    );
+    assert!(messages_reply(&body).is_err());
+}
+
+#[test]
+fn a_streamed_messages_body_asks_to_stream_with_no_chat_options() {
+    let body = stream_body(&serde_json::json!({ "model": "m" }), Shape::Messages);
+    assert_eq!(body["stream"], true);
+    assert!(body.get("stream_options").is_none(), "Messages has no stream_options: {body}");
+}
+
+#[test]
+fn a_messages_turn_streams() {
+    let mut ev = TurnEvidence::open(darkmux_types::Dialect::Messages, 10, std::time::Duration::from_secs(2), |_| {});
+    let (_, body) = ev.send(
+        serde_json::json!({ "model": "m" }),
+        |_, progress| {
+            assert!(progress.is_some(), "a Messages call is sent with the progress callback");
+            Ok(serde_json::json!({}))
+        },
+        |_| false,
+    );
+    assert_eq!(body["stream"], true);
+    assert!(ev.streams);
 }

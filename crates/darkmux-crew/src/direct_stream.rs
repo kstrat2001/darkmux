@@ -8,12 +8,36 @@
 //! `"stream": true` to a chat-completions body, and the caller reads the
 //! response file while curl writes it ([`SseTail`]); when curl is done the
 //! SSE body is put back together into the reply a non-streamed call returns
-//! ([`assemble`]), so every reader of the reply is untouched. A Messages
-//! dialect call is not streamed here (its events are another shape); it
-//! still writes the turn's opening heartbeat and its `dispatch.turn`.
+//! ([`assemble`]), so every reader of the reply is untouched. (#316 4.6) A
+//! Messages dialect call streams too: its events are another [`Shape`]
+//! (`content_block_delta`, `message_delta`, `message_stop`), put back
+//! together as the unstreamed Messages reply, which the Messages reader
+//! then translates as before.
 
 use darkmux_flow::payload::{DispatchHeartbeatPayload, DispatchTurnPayload, TurnUsage};
 use serde_json::Value;
+
+/// The event shape a stream arrives in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// Chat completions: `choices[0].delta`, `finish_reason`, `[DONE]`.
+    #[default]
+    Chat,
+    /// Messages: typed events, `content_block_delta`, `message_delta`,
+    /// `message_stop`.
+    Messages,
+}
+
+impl Shape {
+    pub(crate) fn of(dialect: darkmux_types::Dialect) -> Self {
+        Shape::messages_if(dialect == darkmux_types::Dialect::Messages)
+    }
+
+    /// Messages when the call speaks it (`messages_wire::speaks_messages`).
+    pub(crate) fn messages_if(messages: bool) -> Self {
+        if messages { Shape::Messages } else { Shape::Chat }
+    }
+}
 
 /// What has streamed so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -29,13 +53,16 @@ pub(crate) struct SseProgress {
     pub chunks: u64,
 }
 
-/// A chat-completions body asked to stream, with the usage block on its last
-/// event (`stream_options.include_usage`), so the reply's counts survive.
-pub(crate) fn stream_body(body: &Value) -> Value {
+/// A body asked to stream. A chat-completions one also asks for the usage
+/// block on its last event (`stream_options.include_usage`), so the reply's
+/// counts survive; a Messages stream carries its usage unasked.
+pub(crate) fn stream_body(body: &Value, shape: Shape) -> Value {
     let mut b = body.clone();
     if let Some(obj) = b.as_object_mut() {
         obj.insert("stream".into(), true.into());
-        obj.insert("stream_options".into(), serde_json::json!({ "include_usage": true }));
+        if shape == Shape::Chat {
+            obj.insert("stream_options".into(), serde_json::json!({ "include_usage": true }));
+        }
     }
     b
 }
@@ -45,15 +72,23 @@ pub(crate) fn stream_body(body: &Value) -> Value {
 /// OpenAI-compatible servers); a server that sends both sends one text
 /// twice, so the first non-empty one is read, never their sum (an empty
 /// placeholder in one field never hides the other's text).
-fn delta_text(event: &Value) -> (&str, &str) {
+///
+/// A Messages event's text is a `content_block_delta`: `text_delta` is the
+/// answer, `thinking_delta` the reasoning.
+fn delta_text(event: &Value, shape: Shape) -> (&str, &str) {
+    if shape == Shape::Messages {
+        let delta = event.get("delta").filter(|_| event["type"] == "content_block_delta");
+        let text = |key: &str| delta.and_then(|d| d.get(key)).and_then(Value::as_str).unwrap_or("");
+        return (text("text"), text("thinking"));
+    }
     let delta = event.pointer("/choices/0/delta");
     let text = |key: &str| delta.and_then(|d| d.get(key)).and_then(Value::as_str).filter(|s| !s.is_empty());
     (text("content").unwrap_or(""), text("reasoning_content").or_else(|| text("reasoning")).unwrap_or(""))
 }
 
 /// The characters one event's delta adds: (answer, everything generated).
-fn delta_chars(event: &Value) -> (u64, u64) {
-    let (content, reasoning) = delta_text(event);
+fn delta_chars(event: &Value, shape: Shape) -> (u64, u64) {
+    let (content, reasoning) = delta_text(event, shape);
     let content = content.chars().count() as u64;
     (content, content + reasoning.chars().count() as u64)
 }
@@ -68,8 +103,14 @@ fn is_sse(text: &str) -> bool {
 }
 
 /// Whether the stream said it was done: the `[DONE]` marker, or a choice's
-/// `finish_reason`. A stream without either was cut off.
-fn finished(text: &str) -> bool {
+/// `finish_reason`; for Messages, `message_stop`, or a `message_delta`
+/// carrying the stop reason. A stream without either was cut off.
+fn finished(text: &str, shape: Shape) -> bool {
+    if shape == Shape::Messages {
+        return data_lines(text).filter_map(|d| serde_json::from_str::<Value>(d).ok()).any(|e| {
+            e["type"] == "message_stop" || (e["type"] == "message_delta" && e.pointer("/delta/stop_reason").is_some_and(|r| !r.is_null()))
+        });
+    }
     text.lines().filter_map(|l| l.strip_prefix("data:")).any(|d| d.trim() == "[DONE]")
         || data_lines(text)
             .filter_map(|d| serde_json::from_str::<Value>(d).ok())
@@ -90,13 +131,18 @@ fn data_lines(text: &str) -> impl Iterator<Item = &str> {
 #[derive(Debug, Default)]
 pub(crate) struct SseTail {
     pending: Vec<u8>,
+    shape: Shape,
     pub progress: SseProgress,
 }
 
 impl SseTail {
+    pub(crate) fn new(shape: Shape) -> Self {
+        SseTail { shape, ..SseTail::default() }
+    }
+
     /// A tail for an attempt sent at `started`.
-    pub(crate) fn sent_at(started: std::time::Instant) -> Self {
-        SseTail { progress: SseProgress { started: Some(started), ..SseProgress::default() }, ..SseTail::default() }
+    pub(crate) fn sent_at(started: std::time::Instant, shape: Shape) -> Self {
+        SseTail { progress: SseProgress { started: Some(started), ..SseProgress::default() }, ..SseTail::new(shape) }
     }
 
     /// Read `bytes`, the response's next piece; `true` when it completed at
@@ -110,7 +156,7 @@ impl SseTail {
         let before = self.progress.chunks;
         for data in data_lines(&String::from_utf8_lossy(&complete)) {
             let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
-            let (content, generated) = delta_chars(&event);
+            let (content, generated) = delta_chars(&event, self.shape);
             self.progress.content_chars += content;
             self.progress.generated_chars += generated;
             self.progress.chunks += 1;
@@ -119,15 +165,18 @@ impl SseTail {
     }
 }
 
-/// An SSE chat-completions response put back together as the reply a
-/// non-streamed call returns: `choices[0].message` (content, and reasoning
+/// An SSE response put back together as the reply a non-streamed call
+/// returns. Chat completions: `choices[0].message` (content, and reasoning
 /// when any streamed), its `finish_reason`, the `usage` block and `model`.
+/// Messages: the message from `message_start` with its text (thinking is
+/// not part of the answer, as on an unstreamed reply), the stop reason, and the usage of `message_start` updated by
+/// `message_delta`.
 /// `None` when `body` is not an SSE response (an error body, or a server
 /// that ignored `stream`): the caller reads it as it is. An error event in
 /// the stream is returned as that error object, so the classification that
 /// reads every reply finds it. `Some(Err)` when the stream was cut off
 /// before it finished: a partial reply is never read as a whole one.
-pub(crate) fn assemble(body: &[u8]) -> Option<Result<Vec<u8>, String>> {
+pub(crate) fn assemble(body: &[u8], shape: Shape) -> Option<Result<Vec<u8>, String>> {
     let text = String::from_utf8_lossy(body);
     if !is_sse(&text) {
         return None;
@@ -135,10 +184,55 @@ pub(crate) fn assemble(body: &[u8]) -> Option<Result<Vec<u8>, String>> {
     if let Some(err) = data_lines(&text).filter_map(|d| serde_json::from_str::<Value>(d).ok()).find(|e| e.get("error").is_some()) {
         return Some(Ok(err.to_string().into_bytes()));
     }
-    if !finished(&text) {
-        return Some(Err("the streamed reply ended with no [DONE] and no finish_reason".to_string()));
+    if !finished(&text, shape) {
+        return Some(Err(match shape {
+            Shape::Chat => "the streamed reply ended with no [DONE] and no finish_reason",
+            Shape::Messages => "the streamed reply ended with no message_stop and no stop_reason",
+        }
+        .to_string()));
     }
-    Some(Ok(reassemble(&text)))
+    Some(Ok(match shape {
+        Shape::Chat => reassemble(&text),
+        Shape::Messages => reassemble_messages(&text),
+    }))
+}
+
+/// The events of a finished Messages stream as one Messages reply.
+fn reassemble_messages(text: &str) -> Vec<u8> {
+    let mut text_out = String::new();
+    let mut reply = serde_json::json!({ "type": "message", "role": "assistant" });
+    let mut usage = serde_json::Map::new();
+    for data in data_lines(text) {
+        let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+        text_out.push_str(delta_text(&event, Shape::Messages).0);
+        let counts = match event["type"].as_str() {
+            Some("message_start") => {
+                for key in ["id", "model"] {
+                    if let Some(v) = event.pointer(&format!("/message/{key}")).filter(|v| !v.is_null()) {
+                        reply[key] = v.clone();
+                    }
+                }
+                event.pointer("/message/usage")
+            }
+            Some("message_delta") => {
+                if let Some(r) = event.pointer("/delta/stop_reason").filter(|r| !r.is_null()) {
+                    reply["stop_reason"] = r.clone();
+                }
+                event.get("usage")
+            }
+            _ => None,
+        };
+        // A later count replaces an earlier one (`message_delta`'s output
+        // tokens are the final total, not an increment).
+        for (k, v) in counts.and_then(Value::as_object).into_iter().flatten().filter(|(_, v)| !v.is_null()) {
+            usage.insert(k.clone(), v.clone());
+        }
+    }
+    reply["content"] = serde_json::json!([{ "type": "text", "text": text_out }]);
+    if !usage.is_empty() {
+        reply["usage"] = Value::Object(usage);
+    }
+    reply.to_string().into_bytes()
 }
 
 /// The events of a finished stream as one reply.
@@ -148,7 +242,7 @@ fn reassemble(text: &str) -> Vec<u8> {
     let (mut finish, mut usage, mut model) = (Value::Null, Value::Null, Value::Null);
     for data in data_lines(text) {
         let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
-        let (c, r) = delta_text(&event);
+        let (c, r) = delta_text(&event, Shape::Chat);
         content.push_str(c);
         reasoning.push_str(r);
         if let Some(f) = event.pointer("/choices/0/finish_reason").filter(|f| !f.is_null()) {
@@ -264,11 +358,12 @@ pub(crate) fn turn(reply: &Value, counts: &darkmux_trajectory::UsageCounts, gene
 /// A direct dispatch's turn records, written through `emit` (the caller's
 /// record builder): the opener at [`TurnEvidence::open`], coalesced
 /// heartbeats while a streamed reply arrives, and the turn's record at
-/// [`TurnEvidence::ended`]. `streams` is whether the call streams: a
-/// chat-completions dialect does, a Messages one does not (yet).
+/// [`TurnEvidence::ended`]. `streams` is whether the call streams: every
+/// dialect does, until an endpoint refuses the streamed request.
 pub(crate) struct TurnEvidence<F: Fn(darkmux_flow::Payload)> {
     emit: F,
     gate: HeartbeatGate,
+    shape: Shape,
     pub streams: bool,
     /// When the attempt that streamed was sent (its model time's start).
     started: Option<std::time::Instant>,
@@ -280,7 +375,8 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
         TurnEvidence {
             emit,
             gate: HeartbeatGate::new(interval),
-            streams: dialect != darkmux_types::Dialect::Messages,
+            shape: Shape::of(dialect),
+            streams: true,
             started: None,
         }
     }
@@ -300,7 +396,7 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
         if !self.streams {
             return (send(&plain, None), plain);
         }
-        let streamed = stream_body(&plain);
+        let streamed = stream_body(&plain, self.shape);
         let reply = self.with_progress(|on| send(&streamed, Some(on)));
         match reply {
             Err(e) if refused_streaming(&e) => {

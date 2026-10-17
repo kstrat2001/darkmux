@@ -3759,13 +3759,14 @@ pub(crate) fn remote_chat_completion(
 fn follow_streamed_reply(
     child: &mut std::process::Child,
     body_path: &std::path::Path,
+    shape: crate::direct_stream::Shape,
     on: Option<&mut (dyn FnMut(&crate::direct_stream::SseProgress) + '_)>,
 ) {
     use std::io::Read;
     let Some(on) = on else {
         return;
     };
-    let mut tail = crate::direct_stream::SseTail::sent_at(Instant::now());
+    let mut tail = crate::direct_stream::SseTail::sent_at(Instant::now(), shape);
     let mut file = std::fs::File::open(body_path).ok();
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -3797,11 +3798,15 @@ fn curl_args(timeout_seconds: u32, cfg_path: &std::path::Path, streams: bool) ->
 /// other reply as it came. A stream cut off before it finished is a call
 /// whose answer never came whole (`Unanswered`): failed, and charged as one
 /// the endpoint may have processed, never read as a complete reply.
-fn streamed_reply_as_chat(streams: bool, response: Vec<u8>) -> std::result::Result<Vec<u8>, HostedCallError> {
+fn streamed_reply_as_chat(
+    streams: bool,
+    shape: crate::direct_stream::Shape,
+    response: Vec<u8>,
+) -> std::result::Result<Vec<u8>, HostedCallError> {
     if !streams {
         return Ok(response);
     }
-    match crate::direct_stream::assemble(&response) {
+    match crate::direct_stream::assemble(&response, shape) {
         None => Ok(response),
         Some(Ok(reply)) => Ok(reply),
         Some(Err(why)) => Err(HostedCallError::Other(failure(HostedFailure::Unanswered, why))),
@@ -3932,7 +3937,7 @@ fn remote_chat_attempt(
         // delivery to the launcher in a real invocation shape).
         let child_pid = child.id();
         darkmux_types::child_registry::register(child_pid);
-        follow_streamed_reply(&mut child, &body_path, progress.as_deref_mut());
+        follow_streamed_reply(&mut child, &body_path, crate::direct_stream::Shape::messages_if(messages), progress.as_deref_mut());
         let wait_result = child.wait_with_output().map_err(|e| {
             failure(HostedFailure::Unanswered, format!("running curl for hosted dispatch: {e}"))
         });
@@ -3989,7 +3994,7 @@ fn finish_reply(
     status: Option<u16>,
     response: Vec<u8>,
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
-    let response = streamed_reply_as_chat(streams, response)?;
+    let response = streamed_reply_as_chat(streams, crate::direct_stream::Shape::messages_if(messages), response)?;
     let response = crate::messages_wire::reply_bytes_as_chat(messages, response);
     classify_hosted_response(status, &response)
 }
