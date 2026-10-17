@@ -58,9 +58,11 @@ impl Platform for LinuxPlatform {
         installed_ram_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
 
-    /// `cpufreq` policies grouped into clusters by `cpu_capacity`.
+    /// `cpufreq` policies grouped into tiers by `cpu_capacity` (see
+    /// [`tiers_from_policies`]); one "CPU" tier of every online CPU where
+    /// there is no `cpufreq` (most VMs and containers).
     fn cpu_clusters(&self) -> Vec<crate::CpuClusterInfo> {
-        clusters_from_policies(read_policies())
+        tiers_from_policies(read_policies_with_freq(), online_cpus()).into_iter().map(|(info, _)| info).collect()
     }
 
     /// `/proc/stat`'s per-CPU lines.
@@ -79,9 +81,9 @@ impl Platform for LinuxPlatform {
         read_battery()
     }
 
-    /// Each policy's `scaling_cur_freq`, in cluster order.
+    /// Each tier's mean `scaling_cur_freq`, aligned with [`Self::cpu_clusters`].
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
-        cluster_mhz_from_policies(read_policies_with_freq())
+        tiers_from_policies(read_policies_with_freq(), online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
 }
 
@@ -242,7 +244,9 @@ fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
         .filter_map(|e| {
-            let cpus: Vec<usize> = std::fs::read_to_string(e.path().join("related_cpus"))
+            // `affected_cpus` lists the policy's ONLINE CPUs: `/proc/stat` has a
+            // line for each online CPU only, so an offline one must not count.
+            let cpus: Vec<usize> = std::fs::read_to_string(e.path().join("affected_cpus"))
                 .ok()?
                 .split_whitespace()
                 .filter_map(|c| c.parse().ok())
@@ -259,32 +263,63 @@ fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
     policies
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_policies() -> Vec<(Vec<usize>, Option<u64>)> {
-    Vec::new()
-}
 
-/// Clusters from `(cpus, capacity)` policies, fastest first. With more than
-/// one capacity the highest is "Performance" and the rest "Efficiency"; one
-/// kind is "CPU".
-pub(crate) fn clusters_from_policies(
-    mut policies: Vec<(Vec<usize>, Option<u64>)>,
-) -> Vec<crate::CpuClusterInfo> {
-    policies.sort_by_key(|p| std::cmp::Reverse(p.1));
-    let top = policies.first().and_then(|p| p.1);
-    let mixed = policies.iter().any(|p| p.1 != top);
-    policies
+/// Tiers from `(online cpus, capacity, current kHz)` policies, the shape
+/// macOS's `hw.perflevelN` reports: policies of equal capacity are one tier
+/// (two P-clusters on an M1 Pro, or the one-policy-per-CPU of x86's
+/// `intel_pstate`), its MHz the mean of its policies'. With more than one
+/// capacity the highest is "Performance" and the rest "Efficiency"; one is
+/// "CPU". The tiers are ordered by their lowest CPU, highest first, so the
+/// machine lens's `core_ranges` (which gives the LAST tier the lowest CPU
+/// numbers) maps each tier to its own CPUs on any layout whose tiers are
+/// contiguous: Asahi's E cores first, an Intel hybrid's P cores first.
+/// With no policies at all (no `cpufreq`), one "CPU" tier of `online`
+/// CPUs, its MHz unknown.
+pub(crate) fn tiers_from_policies(
+    policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>,
+    online: usize,
+) -> Vec<(crate::CpuClusterInfo, Option<u32>)> {
+    let cpu = |n| crate::CpuClusterInfo { name: "CPU".to_string(), logical_cpus: n };
+    if policies.is_empty() {
+        return if online > 0 { vec![(cpu(online), None)] } else { Vec::new() };
+    }
+    // capacity -> (cpus, kHz readings)
+    let mut tiers: Vec<(Option<u64>, Vec<usize>, Vec<u64>)> = Vec::new();
+    for (cpus, capacity, khz) in policies {
+        let i = tiers.iter().position(|t| t.0 == capacity).unwrap_or_else(|| {
+            tiers.push((capacity, Vec::new(), Vec::new()));
+            tiers.len() - 1
+        });
+        tiers[i].1.extend(cpus);
+        tiers[i].2.extend(khz);
+    }
+    tiers.retain(|t| !t.1.is_empty());
+    tiers.sort_by_key(|t| std::cmp::Reverse(t.1.iter().min().copied()));
+    let top = tiers.iter().map(|t| t.0).max().flatten();
+    let mixed = tiers.len() > 1;
+    tiers
         .into_iter()
-        .map(|(cpus, capacity)| crate::CpuClusterInfo {
-            name: match (mixed, capacity == top) {
+        .map(|(capacity, cpus, khz)| {
+            let name = match (mixed, capacity.is_some() && capacity == top) {
                 (false, _) => "CPU",
                 (true, true) => "Performance",
                 (true, false) => "Efficiency",
-            }
-            .to_string(),
-            logical_cpus: cpus.len(),
+            };
+            let mhz = (!khz.is_empty()).then(|| (khz.iter().sum::<u64>() / khz.len() as u64 / 1000) as u32);
+            (crate::CpuClusterInfo { name: name.to_string(), logical_cpus: cpus.len() }, mhz)
         })
         .collect()
+}
+
+/// How many CPUs `/proc/stat` lists (the online ones); 0 when unreadable.
+#[cfg(target_os = "linux")]
+fn online_cpus() -> usize {
+    read_to_string("/proc/stat").and_then(|s| cpu_ticks_from_stat(&s)).map_or(0, |t| t.len())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn online_cpus() -> usize {
+    0
 }
 
 /// A memory snapshot from `/proc/meminfo`; `None` without `MemTotal`.
@@ -385,9 +420,3 @@ fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
     Vec::new()
 }
 
-/// Each cluster's MHz, ordered exactly as [`clusters_from_policies`] orders
-/// the clusters (by capacity, highest first, stably).
-pub(crate) fn cluster_mhz_from_policies(mut policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>) -> Vec<Option<u32>> {
-    policies.sort_by_key(|p| std::cmp::Reverse(p.1));
-    policies.into_iter().map(|(_, _, khz)| khz.map(|k| (k / 1000) as u32)).collect()
-}

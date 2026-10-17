@@ -375,38 +375,56 @@ fn per_cpu_ticks_come_from_proc_stat_in_cpu_order() {
     assert_eq!(crate::linux::cpu_ticks_from_stat("intr 1\n"), None);
 }
 
-/// Clusters are listed fastest first, the order macOS's `hw.perflevelN`
-/// uses: Asahi's P cores have capacity 1024, its E cores less.
+/// Tiers, the shape macOS's `hw.perflevelN` reports, read from `cpufreq`
+/// policies (`(online cpus, capacity, kHz)`).
+fn tiers(policies: Vec<(Vec<usize>, Option<u64>, Option<u64>)>, online: usize) -> Vec<(String, usize, Option<u32>)> {
+    crate::linux::tiers_from_policies(policies, online).into_iter().map(|(c, mhz)| (c.name, c.logical_cpus, mhz)).collect()
+}
+
+/// An M1 or M2: E cores first, then P cores, fastest tier first.
 #[test]
-fn cpu_clusters_come_from_cpufreq_policies_fastest_first() {
-    let policies = vec![
-        (vec![0, 1, 2, 3], Some(571)),
-        (vec![4, 5, 6, 7], Some(1024)),
-    ];
-    let clusters = crate::linux::clusters_from_policies(policies);
-    assert_eq!(
-        clusters,
+fn asahi_tiers_are_fastest_first_with_their_mhz() {
+    let t = tiers(vec![(vec![0, 1, 2, 3], Some(571), Some(600_000)), (vec![4, 5, 6, 7], Some(1024), Some(1_968_000))], 8);
+    assert_eq!(t, vec![("Performance".into(), 4, Some(1968)), ("Efficiency".into(), 4, Some(600))]);
+}
+
+/// (#3279 review F2) An M1 Pro's two P-clusters are one Performance tier, so
+/// each tier's busy percent and MHz come from its own CPUs.
+#[test]
+fn equal_capacity_clusters_are_one_tier() {
+    let t = tiers(
         vec![
-            CpuClusterInfo {
-                name: "Performance".into(),
-                logical_cpus: 4
-            },
-            CpuClusterInfo {
-                name: "Efficiency".into(),
-                logical_cpus: 4
-            },
-        ]
+            (vec![0, 1], Some(512), Some(600_000)),
+            (vec![2, 3, 4, 5], Some(1024), Some(3_000_000)),
+            (vec![6, 7, 8, 9], Some(1024), Some(2_000_000)),
+        ],
+        10,
     );
-    // One cluster (a homogeneous CPU) is just "CPU".
-    let single = crate::linux::clusters_from_policies(vec![(vec![0, 1], Some(1024))]);
-    assert_eq!(
-        single,
-        vec![CpuClusterInfo {
-            name: "CPU".into(),
-            logical_cpus: 2
-        }]
-    );
-    assert!(crate::linux::clusters_from_policies(vec![]).is_empty());
+    assert_eq!(t, vec![("Performance".into(), 8, Some(2500)), ("Efficiency".into(), 2, Some(600))]);
+}
+
+/// (#3279 review F3) x86's one policy per CPU, with no `cpu_capacity`, is
+/// one "CPU" tier, not one cluster per CPU.
+#[test]
+fn one_policy_per_cpu_with_no_capacity_is_one_cpu_tier() {
+    let t = tiers((0..4).map(|c| (vec![c], None, Some(2_000_000 + c as u64 * 1000))).collect(), 4);
+    assert_eq!(t, vec![("CPU".into(), 4, Some(2001))]);
+}
+
+/// An Intel hybrid numbers its P cores first: the tier holding the lowest
+/// CPUs comes last, the order the machine lens's `core_ranges` maps.
+#[test]
+fn tiers_are_ordered_so_the_lowest_cpus_come_last() {
+    let t = tiers(vec![(vec![0, 1, 2, 3], Some(1024), None), (vec![4, 5, 6, 7, 8, 9], Some(400), None)], 10);
+    assert_eq!(t, vec![("Efficiency".into(), 6, None), ("Performance".into(), 4, None)]);
+}
+
+/// (#3279 review F1) No `cpufreq` (a VM, a container): one "CPU" tier of
+/// every online CPU, its MHz unknown; nothing when no CPU was read.
+#[test]
+fn no_cpufreq_is_one_tier_of_the_online_cpus() {
+    assert_eq!(tiers(vec![], 4), vec![("CPU".into(), 4, None)]);
+    assert!(tiers(vec![], 0).is_empty());
 }
 
 #[test]
@@ -492,18 +510,6 @@ fn this_linux_machine_reads_its_battery_if_it_has_one() {
         assert!(b.charge_pct <= 100);
     }
     assert!(MacPlatform.battery().is_none() && OtherPlatform.battery().is_none());
-}
-
-/// Each cluster's current frequency, in the same fastest-first order as
-/// `cpu_clusters`, from the policy's `scaling_cur_freq` (kHz).
-#[test]
-fn cluster_mhz_follows_the_cluster_order() {
-    let policies = vec![
-        (vec![0, 1, 2, 3], Some(571), Some(600_000)),
-        (vec![4, 5, 6, 7], Some(1024), Some(1_968_000)),
-    ];
-    assert_eq!(crate::linux::cluster_mhz_from_policies(policies), vec![Some(1968), Some(600)]);
-    assert_eq!(crate::linux::cluster_mhz_from_policies(vec![(vec![0], Some(1024), None)]), vec![None]);
 }
 
 #[test]

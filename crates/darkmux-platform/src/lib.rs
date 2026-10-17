@@ -50,8 +50,10 @@ pub trait Platform: Send + Sync {
     /// actually use is a separate, smaller fact.
     fn ram_installed_bytes(&self) -> Option<u64>;
 
-    /// The CPU's clusters, fastest first (the order macOS's `hw.perflevelN`
-    /// uses), for the machine lens. Empty when the platform can't say.
+    /// The CPU's tiers (the shape macOS's `hw.perflevelN` reports), for the
+    /// machine lens, ordered so the LAST holds the lowest CPU numbers: the
+    /// lens's `core_ranges` maps each tier to its CPUs by that rule. Empty
+    /// when the platform can't say.
     fn cpu_clusters(&self) -> Vec<CpuClusterInfo>;
 
     /// Cumulative busy/idle ticks per logical CPU, in CPU-number order; the
