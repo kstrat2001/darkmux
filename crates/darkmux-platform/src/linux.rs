@@ -313,6 +313,9 @@ pub(crate) fn tiers_from_policies(
             let mhz = (!khz.is_empty()).then(|| (khz.iter().sum::<u64>() / khz.len() as u64 / 1000) as u32);
             (info(name, positions), mhz)
         })
+        // A tier whose CPUs all left `/proc/stat` (a hotplug race) reads
+        // nothing; drop it, as macOS drops an empty perf level.
+        .filter(|(i, _)| i.logical_cpus > 0)
         .collect()
 }
 

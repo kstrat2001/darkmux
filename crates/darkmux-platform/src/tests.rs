@@ -434,6 +434,9 @@ fn a_tier_split_across_dies_names_its_own_cpus() {
 fn positions_follow_the_online_cpus() {
     let t = positions(vec![(vec![0, 2], Some(512), None), (vec![3, 4], Some(1024), None)], &[0, 2, 3, 4]);
     assert_eq!(t, vec![("Performance".into(), vec![2, 3]), ("Efficiency".into(), vec![0, 1])]);
+    // A tier whose CPUs are all offline is dropped.
+    let gone = positions(vec![(vec![0], Some(512), None), (vec![5], Some(1024), None)], &[0]);
+    assert_eq!(gone, vec![("Efficiency".into(), vec![0])]);
 }
 
 /// `/proc/stat`'s CPU numbers; the aggregate `cpu` line is not one.
@@ -479,10 +482,10 @@ fn this_linux_machine_reads_its_cpus_and_memory() {
     if std::env::consts::OS == "linux" {
         let ticks = LinuxPlatform.cpu_ticks().expect("/proc/stat");
         let clusters = LinuxPlatform.cpu_clusters();
-        assert_eq!(
-            clusters.iter().map(|c| c.logical_cpus).sum::<usize>(),
-            ticks.len()
-        );
+        // The tiers cover every CPU exactly once.
+        let mut positions: Vec<usize> = clusters.iter().flat_map(|c| c.tick_positions.clone()).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, (0..ticks.len()).collect::<Vec<_>>());
         assert!(LinuxPlatform
             .memory_snapshot()
             .unwrap()
