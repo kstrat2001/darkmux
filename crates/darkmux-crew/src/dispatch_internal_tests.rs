@@ -3772,7 +3772,8 @@
         let unreported = crate::budget::conservative_hosted_spend(
             None,
             single_shot_cap(opts.max_completion_tokens, None),
-            &single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None),
+            // (#3211) The body as sent: a chat-completions call streams.
+            &crate::direct_stream::stream_body(&single_shot_body(target.dialect, "gpt-remote", "system prompt", &opts.message, opts.max_completion_tokens, None)),
         );
         let mut sources = Vec::new();
         for entry in std::fs::read_dir(flows_dir.path()).unwrap().flatten() {
@@ -19806,6 +19807,139 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let complete = records.iter().find(|r| r["action"] == "dispatch.complete").unwrap();
         assert_eq!(complete["payload"]["total_tokens"], 9);
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
+    }
+
+    /// (#3211 review F3) Only a 4xx about streaming itself is sent again
+    /// unstreamed: an older API version rejecting `stream_options`.
+    #[test]
+    fn only_a_refusal_of_the_stream_request_is_retried_unstreamed() {
+        let refusal = |status: u16, body: &str| match classify_hosted_response(Some(status), body.as_bytes()) {
+            Err(HostedCallError::Other(e)) => refused_stream_request(&e),
+            other => panic!("expected a terminal error, got {other:?}"),
+        };
+        assert!(refusal(400, r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#));
+        assert!(!refusal(400, r#"{"error":{"message":"maximum context length exceeded"}}"#));
+        assert!(!refusal(401, r#"{"error":{"message":"bad key"}}"#));
+        assert!(!refusal(500, r#"{"error":{"message":"stream broke"}}"#), "a 5xx is not a refusal");
+        assert!(!refusal(400, r#"{"error":{"message":"Provider returned error: upstream request failed validation"}}"#), "upstream is not stream");
+        assert!(refusal(400, r#"{"error":{"message":"streaming is not supported"}}"#));
+    }
+
+    /// (#3211 review F2) A stream cut off mid-way fails as an unanswered call:
+    /// charged as one the endpoint may have processed, never read as a reply.
+    #[test]
+    fn a_cut_off_stream_is_an_unanswered_call() {
+        let cut = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_vec();
+        match streamed_reply_as_chat(true, cut.clone()) {
+            Err(HostedCallError::Other(e)) => {
+                assert!(call_may_have_spent(&e), "{e:#}");
+                let kind = e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind);
+                assert!(matches!(kind, Some(HostedFailure::Unanswered)), "the answer never came whole: {kind:?}");
+            }
+            other => panic!("expected an unanswered failure, got {other:?}"),
+        }
+        assert_eq!(streamed_reply_as_chat(false, cut.clone()).ok(), Some(cut), "an unstreamed call reads its body as before");
+    }
+
+    /// (#3211 review F6) A streamed reply is written as it arrives (`-N`), so
+    /// heartbeats are not held back by curl's output buffer.
+    #[test]
+    fn a_streamed_call_asks_curl_not_to_buffer() {
+        let cfg = std::path::Path::new("/tmp/x.curl");
+        assert!(curl_args(30, cfg, true).iter().any(|a| a == "-N"));
+        assert!(!curl_args(30, cfg, false).iter().any(|a| a == "-N"));
+    }
+
+    /// (#3211) Run `dispatch_unmanaged` against a one-shot mock answering
+    /// `reply`, at an endpoint described by `endpoint` (its `url` is set
+    /// here). Returns the result, the session's flow records and the request
+    /// the mock received.
+    fn run_direct_dispatch(
+        reply: &'static str,
+        mut endpoint: serde_json::Value,
+    ) -> (Result<DispatchResult>, Vec<serde_json::Value>, String) {
+        let (base_url, rx) = one_shot_http_mock(reply);
+        endpoint["url"] = base_url.into();
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev: Vec<_> = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR"].iter().map(|k| (*k, std::env::var_os(k))).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let session_id = format!("direct-turn-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::test_session(&session_id);
+        opts.phase_id = None;
+        opts.json = false;
+        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), endpoint);
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target);
+        for (k, v) in prev {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
+        (result, drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session_id)), request)
+    }
+
+    fn actions(records: &[serde_json::Value]) -> Vec<String> {
+        records.iter().filter_map(|r| r["action"].as_str().map(str::to_string)).collect()
+    }
+
+    /// (#3211) A tool-less dispatch on a chat-completions endpoint streams,
+    /// and writes the live evidence a container turn writes: the opener with
+    /// the request's size (PROMPT), a heartbeat with generated text (GEN),
+    /// and one `dispatch.turn` with its usage and model time, between the
+    /// bookends. Its reply is read as before.
+    #[test]
+    #[serial]
+    fn a_direct_dispatch_streams_and_writes_its_turn_evidence() {
+        const SSE: &str = "data: {\"model\":\"served\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+            data: {\"model\":\"served\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n\
+            data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+            data: [DONE]\n\n";
+        let (result, records, request) = run_direct_dispatch(SSE, serde_json::json!({}));
+        let result = result.expect("the streamed dispatch succeeds");
+        assert_eq!(result.stdout, "Hello");
+        assert!(request.contains("\"stream\":true") && request.contains("\"include_usage\":true"), "{request}");
+
+        let seq = actions(&records);
+        let pos = |a: &str| seq.iter().position(|x| x == a).unwrap_or_else(|| panic!("no {a} in {seq:?}"));
+        let beats: Vec<&serde_json::Value> = records.iter().filter(|r| r["action"] == "dispatch.turn.heartbeat").collect();
+        assert!(beats.len() >= 2, "an opener and a generating heartbeat: {seq:?}");
+        let prompt_chars = ("system prompt".chars().count() + dispatch_preflight_probe_opts().message.chars().count()) as u64;
+        assert_eq!(beats[0]["payload"]["prompt_chars"], prompt_chars);
+        assert_eq!(beats[0]["payload"]["generated_chars"], 0);
+        assert!(beats[1..].iter().any(|b| b["payload"]["generated_chars"].as_u64() > Some(0)), "{beats:?}");
+        let turn = &records[pos("dispatch.turn")]["payload"];
+        assert_eq!((turn["finish_reason"].as_str(), turn["usage"]["total_tokens"].as_u64()), (Some("stop"), Some(10)));
+        assert!(turn["generation_ms"].is_u64(), "a streamed turn has its model time: {turn}");
+        assert!(pos("dispatch.start") < pos("dispatch.turn.heartbeat"));
+        assert!(pos("dispatch.turn") < pos("dispatch.complete"));
+        let complete = &records[pos("dispatch.complete")]["payload"];
+        assert_eq!(complete["total_tokens"], 10, "the reassembled reply's counts reach the terminal record");
+    }
+
+    /// (#3211) A Messages dialect call is not streamed (its events are
+    /// another shape), but still writes the opener and its `dispatch.turn`,
+    /// with no model time (nothing was streamed).
+    #[test]
+    #[serial]
+    fn a_messages_direct_dispatch_writes_its_turn_without_streaming() {
+        let reply = r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#;
+        let (result, records, request) = run_direct_dispatch(reply, serde_json::json!({ "dialect": "messages" }));
+        result.expect("the Messages dispatch succeeds");
+        assert!(!request.contains("\"stream\""), "{request}");
+        let seq = actions(&records);
+        assert!(seq.contains(&"dispatch.turn.heartbeat".to_string()), "{seq:?}");
+        let turn = records.iter().find(|r| r["action"] == "dispatch.turn").expect("a turn record");
+        assert!(turn["payload"].get("generation_ms").is_none(), "{turn}");
     }
 
     // ── (#2869) host reads of the model-writable out-dir ──────────────

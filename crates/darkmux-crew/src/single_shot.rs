@@ -274,7 +274,7 @@ pub fn single_shot_chat(req: &SingleShotRequest) -> Result<SingleShotReply> {
         req.temperature,
         req.max_tokens,
     );
-    let resp = remote_chat_completion(&url, None, &body, req.timeout_seconds)?;
+    let resp = remote_chat_completion(&url, None, &body, req.timeout_seconds, None)?;
     Ok(extract_reply(&resp))
 }
 
@@ -328,7 +328,7 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
     let url = req.endpoint.chat_url()?;
     let auth = remote_auth_header(req.endpoint)?;
     let body = req.body()?;
-    let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds)?;
+    let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds, None)?;
     let reply = extract_reply(&resp);
     Ok(reply)
 }

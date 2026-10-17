@@ -77,6 +77,16 @@ darkmux release.
 
 ### Fixed
 
+- **A tool-less dispatch on an unmanaged endpoint shows its turn live** (#3211). The
+  host-side path (`runtime=direct`, a `pr-reviewer` seat or any tool-less role on an
+  endpoint darkmux does not manage) wrote no heartbeats and no turn record, so the fleet
+  card's scope read PROMPT for the whole call. A chat-completions call now streams
+  (`"stream": true` with `stream_options.include_usage`, through the same curl call, its
+  secret handling and retries unchanged) and writes the opening heartbeat with the request's
+  size, a heartbeat every 2 s while text arrives, and one `dispatch.turn` with its usage and
+  model time, so the scope reads PROMPT, GEN and finished like a container turn. A Messages
+  dialect call is not streamed yet; it writes the opener and its `dispatch.turn`.
+
 - **A role with tools can reach an endpoint on this machine** (#3209). An
   unmanaged endpoint at `http://127.0.0.1:<port>/v1` or `localhost` (an
   `mlx_lm.server`, llama.cpp or Ollama) was dialed from inside the dispatch

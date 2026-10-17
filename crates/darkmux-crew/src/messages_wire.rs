@@ -188,7 +188,7 @@ mod tests {
             }));
         });
         let req = body("claude-sonnet-5-5", &crate::single_shot::chat_messages("PERSONA", "judge"), 64);
-        let reply = crate::dispatch_internal::remote_chat_completion(&server.url("/v1/messages"), None, &req, 30).unwrap();
+        let reply = crate::dispatch_internal::remote_chat_completion(&server.url("/v1/messages"), None, &req, 30, None).unwrap();
         mock.assert();
         let r = crate::single_shot::extract_reply(&reply);
         assert_eq!(r.content, "verdict");
@@ -207,7 +207,7 @@ mod tests {
             when.method(httpmock::Method::POST).path("/v1/chat/completions");
             then.status(200).json_body(json!({"choices": [{"message": {"content": "ok"}}]}));
         });
-        let reply = crate::dispatch_internal::remote_chat_completion(&server.url("/v1/chat/completions"), None, &json!({}), 30).unwrap();
+        let reply = crate::dispatch_internal::remote_chat_completion(&server.url("/v1/chat/completions"), None, &json!({}), 30, None).unwrap();
         assert_eq!(crate::single_shot::extract_reply(&reply).content, "ok");
         with_version.assert_hits(0);
         plain.assert();
