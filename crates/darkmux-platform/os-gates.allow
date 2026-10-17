@@ -13,6 +13,7 @@ crates/darkmux-crew/src/host_probe/power_posture.rs 5
 crates/darkmux-crew/src/host_probe/thermal.rs 3
 crates/darkmux-crew/src/sleep_assertion.rs 8
 crates/darkmux-crew/src/telemetry_sampler.rs 1
+crates/darkmux-crew/tests/dispatch_boundary.rs 1
 crates/darkmux-doctor/src/checks_power.rs 3
 crates/darkmux-doctor/src/lib.rs 2
 crates/darkmux-flow/src/lib.rs 7

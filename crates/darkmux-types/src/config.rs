@@ -416,7 +416,7 @@ use std::path::Path;
 //           `config_access::default_engine_with_source` and checked against
 //           `profiles.json` by `default_engine::resolve`. Absent = `lmstudio`,
 //           today's behavior. An older binary refuses it as an unknown key.
-//   2.5 (omarchy): additive `runtime.container_user` (`image`, `<uid>` or
+//   2.5 (#3275): additive `runtime.container_user` (`image`, `<uid>` or
 //           `<uid>:<gid>`; `DARKMUX_CONTAINER_USER`), overriding the
 //           platform's answer for which user the dispatch container runs
 //           as. An older binary refuses a config carrying it.
@@ -1112,7 +1112,7 @@ pub struct RuntimeBehaviorConfig {
     /// honoring an operator's configured rest there would only add real
     /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
-    /// (omarchy, 2.4) Which user the dispatch container runs as: `image`
+    /// (#3275, 2.5) Which user the dispatch container runs as: `image`
     /// (the runtime image's own user), `<uid>` or `<uid>:<gid>`. Unset, the
     /// platform decides (`darkmux_platform::Platform::container_user`): the
     /// image's user under Docker Desktop, the host user on Linux, where bind

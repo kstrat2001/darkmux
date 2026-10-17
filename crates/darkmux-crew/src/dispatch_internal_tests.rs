@@ -5469,7 +5469,7 @@
         assert!(!remote.contains("darkmux-cache"), "{remote}");
     }
 
-    /// (omarchy) Docker Engine on Linux does not define `host.docker.internal`
+    /// (#3275) Docker Engine on Linux does not define `host.docker.internal`
     /// (Docker Desktop does), so a container dialing the rewritten loopback URL
     /// cannot resolve its host. When the platform answers `HostGateway` the
     /// mapping is a docker-run OPTION, before the `--` fence; `Builtin` (what
@@ -5491,7 +5491,7 @@
         assert!(at < fence, "must be a docker-run option, not a runtime arg: {argv:?}");
     }
 
-    /// (omarchy) A host user runs the container as that user, with a HOME it
+    /// (#3275) A host user runs the container as that user, with a HOME it
     /// can write (the image's home belongs to its own uid); the image's user
     /// leaves the argv exactly as it was. Both are docker-run OPTIONS.
     #[test]
@@ -5511,7 +5511,7 @@
         assert!(user < fence && home < fence, "docker-run options, not runtime args: {argv:?}");
     }
 
-    /// (omarchy) An operator override wins over the platform's answer; with
+    /// (#3275) An operator override wins over the platform's answer; with
     /// none, the platform decides; a value that doesn't parse refuses,
     /// naming the setting, rather than falling back to anything.
     #[test]

@@ -1595,7 +1595,7 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
     (v.unwrap(), s)
 }
 
-/// (omarchy) The operator's override for which user the dispatch container
+/// (#3275) The operator's override for which user the dispatch container
 /// runs as, unparsed: `env(DARKMUX_CONTAINER_USER) > config.runtime.
 /// container_user > none`. There is no built-in default here: with no
 /// override, the platform answers (`darkmux_platform::Platform::
@@ -3632,7 +3632,7 @@ mod tests {
         }
     }
 
-    // ── container_user (omarchy): env > config > none. No default here:
+    // ── container_user (#3275): env > config > none. No default here:
     //    with no override the platform answers (`darkmux_platform`) ──
     #[serial_test::serial]
     #[test]
