@@ -56,6 +56,7 @@ FlowMissionsResponse.generated_at_ms: number
 FlowMissionsResponse.meta: CoverageMeta
 MachineStatusResponse.models: Array<LoadedModel>
 MachineStatusResponse.lms_unreachable: boolean
+MachineStatusResponse.engine: MachineEngine
 MachineStatusResponse.generated_at_ms: number
 MachineSpecsResponse.darkmux_version: string
 MachineSpecsResponse.flow_schema_version: string
@@ -67,6 +68,7 @@ MachineSpecsResponse.ram_free_for_ai_bytes: number | null
 MachineSpecsResponse.cpu_brand: string | null
 MachineSpecsResponse.loaded_models: Array<LoadedModel>
 MachineSpecsResponse.lms_unreachable: boolean
+MachineSpecsResponse.engine: MachineEngine | null
 MachineSpecsResponse.utility_model: UtilityModel | null
 MachineSpecsResponse.hub_configured: boolean
 MachineSpecsResponse.generated_at_ms: number

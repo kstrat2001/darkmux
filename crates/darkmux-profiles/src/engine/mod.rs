@@ -101,6 +101,11 @@ pub trait Engine {
     /// What this engine can do. The core reads this, never the engine's type.
     fn capabilities(&self) -> Capabilities;
 
+    /// The engine's name as `default_engine` spells it: `lmstudio`, or the
+    /// endpoint id; for a value that names no usable engine, that value. What
+    /// the machine surfaces call this machine's engine (#316 stage 4.5).
+    fn name(&self) -> String;
+
     /// Every model the engine has resident. `Ok(vec![])` means the engine
     /// reported none; anything it could not interpret is an `Err`.
     fn loaded(&self) -> Result<Vec<LoadedModel>>;
@@ -168,7 +173,7 @@ pub fn local() -> Box<dyn Engine> {
         Err(e) => {
             let load_error = format!("{e:#}");
             let refusal = default_engine::resolve_without_registry(&raw, source, &load_error).err();
-            return Box::new(Unresolved { reason: refusal.map_or(load_error, |r| r.to_string()) });
+            return Box::new(Unresolved { name: raw.trim().to_string(), reason: refusal.map_or(load_error, |r| r.to_string()) });
         }
     };
     match default_engine::resolve(&raw, source, &registry) {
@@ -178,7 +183,7 @@ pub fn local() -> Box<dyn Engine> {
             let url = registry.endpoints.get(&id).and_then(|e| e.url.clone()).unwrap_or_default();
             Box::new(OpenAiCompatible::new(id, url))
         }
-        Err(refusal) => Box::new(Unresolved { reason: refusal.to_string() }),
+        Err(refusal) => Box::new(Unresolved { name: raw.trim().to_string(), reason: refusal.to_string() }),
     }
 }
 

@@ -2813,16 +2813,36 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// The engine's `loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
-    let result = tokio::task::spawn_blocking(|| engine::local().loaded()).await;
-    let (models, unreachable) = match result {
-        Ok(Ok(m)) => (m, false),
-        _ => (Vec::new(), true),
-    };
+    let result = tokio::task::spawn_blocking(local_engine_residents).await;
+    let (engine, models, unreachable) = result.unwrap_or_else(|_| (unknown_engine(), Vec::new(), true));
     axum::Json(wire::MachineStatusResponse {
         models,
         lms_unreachable: unreachable,
+        engine,
         generated_at_ms: current_millis(),
     })
+}
+
+/// (#316) This machine's engine, what it holds, and whether it could not be
+/// asked: the ONE read behind `/machine/status`, `/machine/specs` (and so the
+/// card) and `darkmux machine status`. An engine that does not report what
+/// it holds is not unreachable: its list is empty and the engine says why.
+pub fn local_engine_residents() -> (wire::MachineEngine, Vec<darkmux_types::LoadedModel>, bool) {
+    let engine = engine::local();
+    let view = wire::MachineEngine {
+        name: engine.name(),
+        reports_residency: matches!(engine.capabilities().residency, engine::Residency::Reported),
+    };
+    match engine.loaded() {
+        Ok(m) => (view, m, false),
+        Err(e) if engine::is_not_reported(&e) => (view, Vec::new(), false),
+        Err(_) => (view, Vec::new(), true),
+    }
+}
+
+/// The engine named when its read panicked: nothing is known about it.
+fn unknown_engine() -> wire::MachineEngine {
+    wire::MachineEngine { name: darkmux_types::config_access::default_engine(), reports_residency: false }
 }
 
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
@@ -2956,6 +2976,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
         cpu_brand: None,
         loaded_models: Vec::new(),
         lms_unreachable: true,
+        engine: Some(unknown_engine()),
         utility_model: None,
         hub_configured: false,
         generated_at_ms: current_millis(),
@@ -2966,10 +2987,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 /// ONE gather. Blocking (it shells out); each probe is independent, so one
 /// failure never cascades.
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let (loaded_models, lms_unreachable) = match engine::local().loaded() {
-        Ok(m) => (m, false),
-        Err(_) => (Vec::new(), true),
-    };
+    let (engine, loaded_models, lms_unreachable) = local_engine_residents();
     let ram_total = read_ram_total_bytes();
     let ram_free = read_ram_free_for_ai_bytes();
     let cpu_brand = read_cpu_brand();
@@ -3019,6 +3037,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
         cpu_brand,
         loaded_models,
         lms_unreachable,
+        engine: Some(engine),
         utility_model,
         hub_configured,
         generated_at_ms: current_millis(),

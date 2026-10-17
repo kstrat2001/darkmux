@@ -100,14 +100,34 @@ pub struct LiveIngestHealth {
 
 // ─── /machine/* ────────────────────────────────────────────────────────────
 
+/// (#316) The engine this machine's local models run on (`default_engine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct MachineEngine {
+    /// `lmstudio`, or the id of the endpoint `default_engine` names (for a
+    /// value that names no usable engine, that value).
+    pub name: String,
+    /// Whether the engine reports which models it holds. When `false` the
+    /// resident list beside this is empty because the engine was not asked,
+    /// never because nothing is loaded (an OpenAI-compatible server lists
+    /// what it would answer to, not what it holds).
+    pub reports_residency: bool,
+}
+
 /// `GET /machine/status`: the resident models.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineStatusResponse {
     pub models: Vec<LoadedModel>,
-    /// The `lms` binary could not be invoked.
+    /// The engine was asked and could not answer: for LM Studio, the `lms`
+    /// binary could not be invoked; for another engine, its setting cannot
+    /// be used. An engine that does not report residency is not unreachable
+    /// (`engine.reports_residency`).
     pub lms_unreachable: bool,
+    /// (#316) This machine's engine.
+    pub engine: MachineEngine,
     #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
 }
@@ -145,7 +165,12 @@ pub struct MachineSpecsResponse {
     pub ram_free_for_ai_bytes: Option<u64>,
     pub cpu_brand: Option<String>,
     pub loaded_models: Vec<LoadedModel>,
+    /// As on `/machine/status`: the engine was asked and could not answer.
     pub lms_unreachable: bool,
+    /// (#316) This machine's engine; `null` from a darkmux before 4.5, whose
+    /// engine was always LM Studio.
+    #[serde(default)]
+    pub engine: Option<MachineEngine>,
     pub utility_model: Option<UtilityModel>,
     /// Whether this machine has a fleet hub (Redis) configured. A fact, never
     /// the URL: the hub's host is not something a card shows anyone (#3072).

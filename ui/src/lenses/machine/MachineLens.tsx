@@ -1,4 +1,5 @@
 import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
+import { residentsUnknownNote } from "../../lib/machineEngine";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -516,6 +517,7 @@ export function MachineLens({
           residencyRows={residencyRows}
           residencyChanged={residencyChanged}
           nowMs={nowMs}
+          residentsUnknown={residentsUnknownNote(specs)}
         />
       </div>
 

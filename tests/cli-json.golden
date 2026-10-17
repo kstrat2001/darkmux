@@ -593,6 +593,9 @@ MachineCard
   generated_at_ms: uint64
   gather_ms: uint64
   cache_ttl_ms: uint64
+MachineEngine
+  name: string
+  reports_residency: boolean
 MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow
@@ -623,12 +626,14 @@ MachineSpecsResponse
   cpu_brand: string | null
   loaded_models: LoadedModel[]
   lms_unreachable: boolean
+  engine: MachineEngine | null
   utility_model: UtilityModel | null
   hub_configured: boolean
   generated_at_ms: uint64
 MachineStatusOutput
   machine_id: string | null
   lms_unreachable: boolean
+  engine: MachineEngine | null
   managed: LoadedModel[]
   user_state: LoadedModel[]
   matching_profiles?: string[] | null

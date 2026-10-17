@@ -8,6 +8,7 @@
  * peer's own `detail` sentence: an outcome line is a fixed phrase per variant.
  */
 
+import { engineOf, engineSuffix, reportsResidency } from "../../lib/machineEngine";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { Liveness } from "../../types/generated/Liveness";
@@ -115,13 +116,14 @@ export function rowStanding(row: FleetMachine): Standing {
   return livenessStanding(row.liveness);
 }
 
-/** A machine's hardware line from its specs: chip and RAM. Empty when the
- * specs name no chip. */
+/** A machine's hardware line from its specs: chip and RAM, and (#316) the
+ * engine its local models run on when that is not LM Studio, the default
+ * (Machine info names it either way). Empty when the specs name no chip. */
 export function specsLine(specs: MachineSpecsResponse): string {
   const chip = specs.cpu_brand ?? "";
   if (!chip) return "";
   const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
-  return chip + gb;
+  return `${chip}${gb}${engineSuffix(engineOf(specs))}`;
 }
 
 /** The card's own specs, when the view read a card. */
@@ -135,7 +137,7 @@ export function rowSpecs(row: FleetMachine): MachineSpecsResponse | null {
  * registers none reads none. */
 export function rowUtility(row: FleetMachine): UtilityReading {
   const specs = rowSpecs(row);
-  return utilityReading(specs !== null, specs?.utility_model);
+  return utilityReading(specs !== null, specs?.utility_model, reportsResidency(specs));
 }
 
 /** Whether the row's own card declares `fleet.mode hub`. A machine whose card

@@ -2094,6 +2094,54 @@ fn machine_status_remote_degraded_peer_is_not_healthy_empty() {
     );
 }
 
+/// (#316 stage 4.5) A peer whose engine does not report what it holds is
+/// said to be so, exit 0: not unreachable (exit 2) and not an empty machine.
+#[test]
+fn machine_status_remote_engine_that_does_not_report_residency_says_so() {
+    let body = r#"{"models":[],"lms_unreachable":false,"engine":{"name":"local-8080","reports_residency":false},"generated_at_ms":1}"#;
+    let tmp = TempDir::new().unwrap();
+    for json in [false, true] {
+        let addr = canned_http_peer("200 OK", body, 1);
+        let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+        let mut cmd = darkmux_cmd();
+        cmd.env("DARKMUX_FLEET_FILE", &fleet_file).args(["machine", "status", "peer1"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {}", String::from_utf8_lossy(&out.stderr));
+        if json {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["engine"]["reports_residency"], false, "{v}");
+            assert_eq!(v["lms_unreachable"], false, "{v}");
+        } else {
+            assert!(stdout.contains("`local-8080` does not report which models it has loaded"), "{stdout}");
+            assert!(!stdout.contains("exclusively darkmux's"), "not the empty-machine view: {stdout}");
+        }
+    }
+}
+
+/// (#316 stage 4.5) This machine on an engine that does not report what it
+/// holds: exit 0, the engine named, not `lms_unreachable`.
+#[test]
+fn machine_status_local_engine_that_does_not_report_residency_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_PROFILES", &registry)
+        .env("DARKMUX_DEFAULT_ENGINE", "mlx")
+        .args(["machine", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["engine"], serde_json::json!({ "name": "mlx", "reports_residency": false }), "{v}");
+    assert_eq!(v["lms_unreachable"], false, "{v}");
+    assert_eq!(v["managed"], serde_json::json!([]), "{v}");
+}
+
 /// (#1426) A healthy peer read renders its residents partitioned by
 /// ownership; `--json` carries the `machine_id` provenance key.
 #[test]

@@ -20,6 +20,7 @@ const SPECS: MachineSpecsResponse = {
   cpu_brand: "Apple M1 Max",
   loaded_models: [],
   lms_unreachable: false,
+  engine: null,
   utility_model: null,
   hub_configured: false,
   generated_at_ms: 0,
