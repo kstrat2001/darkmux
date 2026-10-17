@@ -1731,8 +1731,8 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
 /// binding as written or removed it, and the window it sized (#2053, #3020).
 fn print_init_utility_model(report: &init::InitReport, p: &std::path::Path) {
     if let Some(id) = report.utility_model_filled.as_deref() {
-        let engine = report.models_engine.as_deref().map_or("LM Studio".to_string(), |n| format!("`{n}`"));
-        println!("utility model: `{id}` (the registry named one {engine} does not have; this is the closest match, edit {} to change)", p.display());
+        let (engine, kind) = report.models_engine.as_deref().map_or(("LM Studio".to_string(), "downloaded "), |n| (format!("`{n}`"), "listed "));
+        println!("utility model: `{id}` (the registry named one {engine} does not have; this is the closest {kind}match, edit {} to change)", p.display());
     } else if let Some(reason) = report.utility_model_unfilled_reason.as_deref() {
         println!("utility model: not verified. {reason}");
     } else if let Some(reason) = report.utility_model_unregistered_reason.as_deref() {
@@ -1748,7 +1748,7 @@ fn print_init_utility_model(report: &init::InitReport, p: &std::path::Path) {
 /// planned from that engine.
 fn print_init_engine(report: &init::InitReport, dry_run: bool) {
     if let Some(engine) = report.engine.as_ref() {
-        for line in engine.lines(dry_run) {
+        for line in engine.lines(!dry_run && report.engine_unrecorded.is_none()) {
             println!("{line}");
         }
     }

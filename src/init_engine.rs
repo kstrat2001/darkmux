@@ -62,14 +62,26 @@ pub fn name_models(models: &[String]) -> String {
     if more == 0 { shown.join(", ") } else { format!("{} and {more} more", shown.join(", ")) }
 }
 
+/// How the recorded engine was picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// It was the only one answering (or the one `--engine-url` named).
+    Only,
+    /// The operator chose it on the terminal.
+    Asked,
+    /// Several answered and no choice was made: LM Studio, listed first.
+    Default,
+}
+
 /// What `init` decided about the engine, and what it wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The existing config names the engine; `init` kept it.
-    Kept { engine: String },
+    /// The engine was already chosen (`from` config.json or the
+    /// `DARKMUX_DEFAULT_ENGINE` variable); `init` kept it.
+    Kept { engine: String, from: &'static str },
     /// `found` is this machine's engine. `endpoint` is the id `default_engine`
     /// names (added to `profiles.json` when `added`); `others` also answered.
-    Chosen { found: Found, endpoint: Option<String>, added: bool, others: Vec<Found>, asked: bool },
+    Chosen { found: Found, endpoint: Option<String>, added: bool, others: Vec<Found>, how: How },
     /// Nothing answered at any of `probed`.
     NoneAnswering { probed: Vec<String> },
     /// `--engine-url` was given and did not answer.
@@ -80,16 +92,15 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// `init`'s report lines for the engine; `dry_run` says what would be
-    /// written instead.
-    pub fn lines(&self, dry_run: bool) -> Vec<String> {
-        let would = if dry_run { "would set" } else { "set" };
+    /// `init`'s report lines for the engine. `written` is false on a dry run,
+    /// or when recording failed: the lines then say what would be written.
+    pub fn lines(&self, written: bool) -> Vec<String> {
         match self {
-            Outcome::Kept { engine } => vec![format!(
-                "default engine: `{engine}` (from config.json; `darkmux init --engine-url <url>` records another)"
+            Outcome::Kept { engine, from } => vec![format!(
+                "default engine: `{engine}` (from {from}; `darkmux init --engine-url <url>` records another)"
             )],
-            Outcome::Chosen { found, endpoint, added, others, asked } => {
-                let mut lines = vec![chosen_line(found, endpoint.as_deref(), *added, *asked, would)];
+            Outcome::Chosen { found, endpoint, added, others, how } => {
+                let mut lines = vec![chosen_line(found, endpoint.as_deref(), *added, *how, written)];
                 if !others.is_empty() {
                     lines.push(format!(
                         "  also answering: {}. `darkmux init --engine-url <url>` records one of these instead.",
@@ -105,8 +116,9 @@ impl Outcome {
             )],
             Outcome::Undecided { answering } => vec![format!(
                 "default engine: not set. More than one engine answers and there was no choice to record: {}. \
-                 Re-run `darkmux init --engine-url <url>` with the one this machine should use.",
-                answering.iter().map(Found::describe).collect::<Vec<_>>().join("; ")
+                 {}Re-run `darkmux init --engine-url <url>` with the one this machine should use.",
+                answering.iter().map(Found::describe).collect::<Vec<_>>().join("; "),
+                if written { "" } else { "A run on a terminal asks which. " }
             )],
         }
     }
@@ -123,13 +135,18 @@ impl Outcome {
     }
 }
 
-fn chosen_line(found: &Found, endpoint: Option<&str>, added: bool, asked: bool, would: &str) -> String {
-    let how = if asked { "chosen" } else { "the one answering" };
+fn chosen_line(found: &Found, endpoint: Option<&str>, added: bool, how: How, written: bool) -> String {
+    let how = match how {
+        How::Only => "the one answering",
+        How::Asked => "chosen",
+        How::Default => "listed first; no choice was made",
+    };
+    let (set, add) = if written { ("set", "added") } else { ("would set", "would be added") };
     match (found, endpoint) {
         (Found::Server { url, .. }, Some(id)) => {
-            let added = if added { format!(", endpoint `{id}` added to profiles.json") } else { String::new() };
+            let added = if added { format!(", endpoint `{id}` {add} to profiles.json") } else { String::new() };
             format!(
-                "default engine: `{id}` at {url} ({how}; {would} `default_engine` in config.json{added}). It loads \
+                "default engine: `{id}` at {url} ({how}; {set} `default_engine` in config.json{added}). It loads \
                  whichever model a request names and does not report what it holds."
             )
         }
@@ -168,8 +185,7 @@ impl Probe for LiveProbe {
     }
 
     fn served(&self, url: &str) -> Result<Vec<String>> {
-        #[cfg(test)]
-        if let Some(servers) = TEST_SERVERS.lock().unwrap().as_ref() {
+        if let Some(servers) = test_servers() {
             anyhow::ensure!(servers.iter().any(|s| same_url(s, url)), "not a test server: {url}");
         }
         let catalog = engine::OpenAiCompatible::new(url, url).catalog()?;
@@ -177,23 +193,24 @@ impl Probe for LiveProbe {
     }
 
     fn well_known(&self) -> Vec<String> {
-        #[cfg(test)]
-        if let Some(v) = TEST_SERVERS.lock().unwrap().clone() {
+        if let Some(v) = test_servers() {
             return v;
         }
         vec![MLX_DEFAULT_URL.to_string()]
     }
 }
 
-#[cfg(test)]
-static TEST_SERVERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+/// The TEST hook `DARKMUX_TEST_INIT_SERVERS`: when set (even empty), the
+/// comma-separated servers `LiveProbe` may reach. They are its well-known
+/// addresses, and any other URL (a registry endpoint on 8080, say) does not
+/// answer, so no test, in process or driving the binary, reaches a server
+/// this machine happens to run. Not an operator knob, like the other
+/// `DARKMUX_TEST_*` hooks.
+pub const TEST_SERVERS_HOOK: &str = "DARKMUX_TEST_INIT_SERVERS";
 
-/// Pin the servers `LiveProbe` may reach: they are its well-known addresses,
-/// and any other URL (a registry endpoint on 8080, say) does not answer. So
-/// no test reaches a server this machine happens to run.
-#[cfg(test)]
-pub fn set_test_servers(v: Option<Vec<String>>) {
-    *TEST_SERVERS.lock().unwrap() = v;
+fn test_servers() -> Option<Vec<String>> {
+    let v = std::env::var(TEST_SERVERS_HOOK).ok()?;
+    Some(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
 }
 
 /// Picks one of several answering engines (LM Studio first, when it is one).
@@ -318,25 +335,32 @@ pub fn decide(
     last_error: Option<String>,
     ask: Option<&mut dyn Ask>,
 ) -> Outcome {
-    let chosen = |mut all: Vec<Found>, i: usize, asked: bool| {
-        let found = all.remove(i);
-        Outcome::Chosen { found, endpoint: None, added: false, others: all, asked }
-    };
     if let Some(url) = explicit {
-        return match answering.is_empty() {
-            true => Outcome::NotAnswering { url: url.to_string(), error: last_error.unwrap_or_default() },
-            false => chosen(answering, 0, false),
-        };
+        if answering.is_empty() {
+            return Outcome::NotAnswering { url: url.to_string(), error: last_error.unwrap_or_default() };
+        }
+        return chosen(answering, 0, How::Only);
     }
     match answering.len() {
         0 => Outcome::NoneAnswering { probed },
-        1 => chosen(answering, 0, false),
-        _ => match ask.and_then(|a| a.choose(&answering)) {
-            Some(i) if i < answering.len() => chosen(answering, i, true),
-            _ if answering[0] == Found::Lmstudio => chosen(answering, 0, false),
-            _ => Outcome::Undecided { answering },
-        },
+        1 => chosen(answering, 0, How::Only),
+        _ => pick_among(answering, ask),
     }
+}
+
+/// Several answering: the operator's pick, else LM Studio (listed first),
+/// else nothing.
+fn pick_among(answering: Vec<Found>, ask: Option<&mut dyn Ask>) -> Outcome {
+    match ask.and_then(|a| a.choose(&answering)) {
+        Some(i) if i < answering.len() => chosen(answering, i, How::Asked),
+        _ if answering[0] == Found::Lmstudio => chosen(answering, 0, How::Default),
+        _ => Outcome::Undecided { answering },
+    }
+}
+
+fn chosen(mut all: Vec<Found>, i: usize, how: How) -> Outcome {
+    let found = all.remove(i);
+    Outcome::Chosen { found, endpoint: None, added: false, others: all, how }
 }
 
 /// The endpoint id `init` gives a server it adds: `local-<port>`, or
@@ -404,20 +428,70 @@ fn endpoints_open_brace(text: &str) -> Option<usize> {
     None
 }
 
-/// The engine the existing config names: `DARKMUX_DEFAULT_ENGINE`, else
+/// Where [`configured`] read the engine from when the variable set it.
+pub const FROM_ENV: &str = default_engine_setting::ENV;
+
+/// The engine already chosen, and where from: `DARKMUX_DEFAULT_ENGINE`, else
 /// config.json's `default_engine`, else `lmstudio`. Read from the file, since
 /// `init` may run before any config tier is loaded.
-pub fn configured(config_path: &Path) -> String {
+pub fn configured(config_path: &Path) -> (String, &'static str) {
     if let Ok(v) = std::env::var(default_engine_setting::ENV) {
         if !v.trim().is_empty() {
-            return v;
+            return (v, FROM_ENV);
         }
     }
-    std::fs::read_to_string(config_path)
+    let engine = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| v.get(default_engine_setting::KEY)?.as_str().map(str::to_string))
-        .unwrap_or_else(|| LMSTUDIO.to_string())
+        .unwrap_or_else(|| LMSTUDIO.to_string());
+    (engine, "config.json")
+}
+
+/// (#316) Whether `init` may detect and record an engine without being told
+/// to: nothing chose one yet. The variable has not; the config names LM
+/// Studio (its default); and the registry still holds the worker placeholder,
+/// so no model was ever planned on any engine. A tuned registry, or an
+/// engine already recorded, is never moved by an engine that happens to be
+/// down one morning.
+pub fn may_detect(registry_json: &str, engine: &str, from: &str) -> bool {
+    from != FROM_ENV
+        && engine.trim().eq_ignore_ascii_case(LMSTUDIO)
+        && registry_json.contains(crate::init::PLACEHOLDER_MODEL_ID)
+}
+
+/// Why a chosen server cannot be recorded, checked before anything is
+/// written: the variable overrides config.json, `DARKMUX_PROFILES` points
+/// dispatch at another registry, or the setting would not resolve against
+/// the registry `init` would write.
+pub fn record_blocker(new_registry: &str, id: &str, registry_path: &Path) -> Option<String> {
+    if let Ok(v) = std::env::var(default_engine_setting::ENV).map(|v| v.trim().to_string()) {
+        if !v.is_empty() {
+            return Some(format!(
+                "{FROM_ENV}=`{v}` is set and overrides config.json; unset it, then re-run `darkmux init`."
+            ));
+        }
+    }
+    if let Ok(p) = std::env::var("DARKMUX_PROFILES") {
+        if !p.trim().is_empty() && Path::new(p.trim()) != registry_path {
+            return Some(format!(
+                "DARKMUX_PROFILES points dispatch at {}, not at {}, the registry init writes; unset it, or add \
+                 the endpoint there by hand.",
+                p.trim(),
+                registry_path.display()
+            ));
+        }
+    }
+    let reg = match darkmux_profiles::profiles::parse_registry_lenient(new_registry) {
+        Ok(mut r) => {
+            r.materialize_endpoints();
+            r
+        }
+        Err(e) => return Some(format!("the registry would not load ({e:#})")),
+    };
+    default_engine_setting::resolve(id, darkmux_types::config_access::Source::Config, &reg)
+        .err()
+        .map(|e| format!("`{id}` would not resolve: {}", e.problem))
 }
 
 /// The URL of the registry endpoint `id`, when it is one.

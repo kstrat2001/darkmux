@@ -66,7 +66,7 @@ fn one_answering_engine_is_chosen_without_asking() {
     let out = run(&probe, NO_ENDPOINTS, None, Some(&mut ask));
     assert_eq!(
         out,
-        Outcome::Chosen { found: server(MLX_DEFAULT_URL, &["m"]), endpoint: None, added: false, others: vec![], asked: false }
+        Outcome::Chosen { found: server(MLX_DEFAULT_URL, &["m"]), endpoint: None, added: false, others: vec![], how: How::Only }
     );
     assert!(ask.1.is_empty(), "one engine is never asked about");
 }
@@ -77,8 +77,8 @@ fn several_answering_ask_with_lm_studio_first_and_take_the_answer() {
     let mut ask = Answer(Some(1), Vec::new());
     let out = run(&probe, NO_ENDPOINTS, None, Some(&mut ask));
     assert_eq!(ask.1, vec![vec![Found::Lmstudio, server(MLX_DEFAULT_URL, &["m"])]]);
-    let Outcome::Chosen { found, others, asked, .. } = out else { panic!("{out:?}") };
-    assert_eq!((found, others, asked), (server(MLX_DEFAULT_URL, &["m"]), vec![Found::Lmstudio], true));
+    let Outcome::Chosen { found, others, how, .. } = out else { panic!("{out:?}") };
+    assert_eq!((found, others, how), (server(MLX_DEFAULT_URL, &["m"]), vec![Found::Lmstudio], How::Asked));
 }
 
 #[test]
@@ -86,10 +86,12 @@ fn several_answering_with_no_one_to_ask_take_lm_studio_and_name_the_others() {
     let probe = FakeProbe::new(true).serving(MLX_DEFAULT_URL, &["m"]);
     let mut nobody = Answer(None, Vec::new());
     let out = run(&probe, NO_ENDPOINTS, None, Some(&mut nobody));
-    let Outcome::Chosen { found, others, asked, .. } = &out else { panic!("{out:?}") };
-    assert_eq!((found, others, *asked), (&Found::Lmstudio, &vec![server(MLX_DEFAULT_URL, &["m"])], false));
-    let lines = out.lines(false).join("\n");
+    let Outcome::Chosen { found, others, how, .. } = &out else { panic!("{out:?}") };
+    assert_eq!((found, others, *how), (&Found::Lmstudio, &vec![server(MLX_DEFAULT_URL, &["m"])], How::Default));
+    let lines = out.lines(true).join("\n");
     assert!(lines.contains("also answering:") && lines.contains(MLX_DEFAULT_URL), "{lines}");
+    // (#316 review) Not "the one answering" when others answered too.
+    assert!(lines.contains("no choice was made") && !lines.contains("the one answering"), "{lines}");
 }
 
 #[test]
@@ -110,7 +112,7 @@ fn none_answering_names_every_address_probed() {
     assert_eq!(probed.len(), 3, "{probed:?}");
     assert!(probed[0].starts_with("LM Studio (`"), "{probed:?}");
     assert_eq!(&probed[1..], &["http://localhost:8000/v1".to_string(), MLX_DEFAULT_URL.to_string()]);
-    let lines = out.lines(false).join("\n");
+    let lines = out.lines(true).join("\n");
     assert!(lines.contains("http://localhost:8000/v1") && lines.contains("mlx_lm.server --model"), "{lines}");
 }
 
@@ -144,7 +146,7 @@ fn an_explicit_url_is_the_only_address_probed_and_is_chosen_without_asking() {
     let out = run(&probe, NO_ENDPOINTS, Some("http://10.0.0.5:8080/v1"), Some(&mut ask));
     assert_eq!(*probe.asked.borrow(), vec!["http://10.0.0.5:8080/v1".to_string()]);
     assert!(ask.1.is_empty());
-    assert!(matches!(out, Outcome::Chosen { found: Found::Server { .. }, asked: false, .. }), "{out:?}");
+    assert!(matches!(out, Outcome::Chosen { found: Found::Server { .. }, how: How::Only, .. }), "{out:?}");
 }
 
 #[test]
@@ -224,7 +226,7 @@ fn plan_record_adds_a_new_server_and_reuses_a_registry_one() {
         endpoint: None,
         added: false,
         others: vec![],
-        asked: false,
+        how: How::Only,
     };
     let text = plan_record(&mut fresh, NO_ENDPOINTS).unwrap().expect("a new endpoint is written");
     assert!(text.contains("\"local-8080\""), "{text}");
@@ -235,7 +237,7 @@ fn plan_record_adds_a_new_server_and_reuses_a_registry_one() {
         endpoint: None,
         added: false,
         others: vec![],
-        asked: false,
+        how: How::Only,
     };
     assert_eq!(plan_record(&mut known, NO_ENDPOINTS).unwrap(), None);
     assert!(matches!(&known, Outcome::Chosen { endpoint: Some(id), added: false, .. } if id == "mlx"));
@@ -246,4 +248,31 @@ fn name_models_caps_the_list() {
     let many: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
     assert_eq!(name_models(&many[..2]), "`m0`, `m1`");
     assert!(name_models(&many).ends_with("`m7` and 2 more"), "{}", name_models(&many));
+}
+
+#[test]
+fn the_undecided_dry_run_says_a_terminal_run_would_ask() {
+    let out = Outcome::Undecided { answering: vec![server(MLX_DEFAULT_URL, &["m"]), server("http://127.0.0.1:9/v1", &["n"])] };
+    assert!(out.lines(false).join("\n").contains("A run on a terminal asks which."));
+    assert!(!out.lines(true).join("\n").contains("asks which"));
+}
+
+#[test]
+fn the_kept_line_names_where_the_engine_came_from() {
+    let out = Outcome::Kept { engine: "lmstudio".into(), from: FROM_ENV };
+    assert!(out.lines(true)[0].contains("from DARKMUX_DEFAULT_ENGINE"), "{:?}", out.lines(true));
+}
+
+/// (#316 review finding 3) Only a machine where nothing chose an engine yet
+/// is detected on: the variable unset, the config at its `lmstudio`
+/// default, and the registry still holding the worker placeholder.
+#[test]
+fn may_detect_only_while_no_engine_or_model_was_chosen() {
+    let fresh = format!("{{ \"profiles\": {{ \"p\": {{ \"models\": [{{ \"id\": \"{}\" }}] }} }} }}", crate::init::PLACEHOLDER_MODEL_ID);
+    assert!(may_detect(&fresh, "lmstudio", "config.json"));
+    assert!(may_detect(&fresh, " LMStudio ", "config.json"));
+    assert!(!may_detect(&fresh, "lmstudio", FROM_ENV), "the variable chose it");
+    assert!(!may_detect(&fresh, "mlx", "config.json"), "an engine was recorded");
+    let tuned = fresh.replace(crate::init::PLACEHOLDER_MODEL_ID, "qwen/qwen3-coder-30b");
+    assert!(!may_detect(&tuned, "lmstudio", "config.json"), "a tuned registry is never moved");
 }

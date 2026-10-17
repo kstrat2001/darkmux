@@ -24,10 +24,12 @@ darkmux release.
   others named); none answering records nothing and names every address probed. A
   server is recorded as an endpoint (`local-<port>`) and as `default_engine`, and
   the worker model is filled from the one model it lists (with several, `init`
-  names them and leaves the choice to you). The choice is made once, in the config
-  `init` creates; a re-run keeps the engine the config names, and
-  `darkmux init --engine-url <url>` records another. `--dry-run` probes and prints
-  the plan and writes nothing.
+  names them and leaves the choice to you). It detects only while nothing chose an
+  engine yet (no `DARKMUX_DEFAULT_ENGINE`, the config at `lmstudio`, the registry
+  still holding the worker placeholder); otherwise it keeps the engine it finds,
+  and `darkmux init --engine-url <url>` records another. A choice it cannot record
+  writes nothing and says why. `--dry-run` probes and prints the plan and writes
+  nothing.
 - **`default_engine`, the machine's local engine** (#316). `lmstudio` (the
   default, and what `init` now writes) or the id of an OpenAI-compatible endpoint
   in `profiles.json`, set with `darkmux config set default_engine <value>` or

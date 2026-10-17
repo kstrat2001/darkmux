@@ -98,7 +98,7 @@ impl InitEnv {
         env.headroom(Some(1 << 50));
         // (#316) No server answers unless a test serves one, so a server this
         // machine runs (on 8080, or at a registry endpoint) cannot answer a test.
-        crate::init_engine::set_test_servers(Some(Vec::new()));
+        env.set(crate::init_engine::TEST_SERVERS_HOOK, OsString::new());
         // A skills override would change which source `init` installs from;
         // the target is what matters here, and it is under HOME.
         env.unset("DARKMUX_SKILLS_DIR");
@@ -180,7 +180,6 @@ impl InitEnv {
 impl Drop for InitEnv {
     fn drop(&mut self) {
         set_ai_headroom_override(None);
-        crate::init_engine::set_test_servers(None);
         for (var, value) in self.prev.drain(..).rev() {
             // SAFETY: as in `set`.
             unsafe {
@@ -335,7 +334,9 @@ fn a_dry_run_over_an_existing_install_reports_it_present_and_touches_nothing() {
     assert!(r.profile_registry_already_present && !r.profile_registry_created);
     assert!(r.config_already_present && !r.config_created);
     assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON, "placeholder left for a real run");
-    assert_eq!(env.lms_calls(), "");
+    // (#316) No engine was chosen yet (the placeholder is still there), so
+    // the plan probes `lms ps`; it never reads the catalog.
+    assert_eq!(env.lms_calls(), "ps --json\n");
 }
 
 #[test]
@@ -461,8 +462,8 @@ fn a_registry_the_operator_already_filled_is_never_rewritten_or_asked_about() {
     assert_eq!(r.worker_model_filled, None);
     assert_eq!(r.worker_model_unfilled_reason, None);
     assert_eq!(env.read_registry(), mine);
-    // (#316) One `ps`: the engine probe. No placeholder, so no loaded-model lookup.
-    assert_eq!(env.lms_calls().matches("ps").count(), 1, "{}", env.lms_calls());
+    // (#316) No placeholder, so no engine probe (`may_detect`) and no loaded-model lookup.
+    assert!(!env.lms_calls().contains("ps"), "no placeholder, so no loaded-model lookup: {}", env.lms_calls());
 }
 
 #[test]
@@ -1053,7 +1054,9 @@ fn serve_models(ids: &[&str], requests: usize) -> (String, std::thread::JoinHand
             stream.write_all(response.as_bytes()).unwrap();
         }
     });
-    crate::init_engine::set_test_servers(Some(vec![base.clone()]));
+    // SAFETY: every caller holds #[serial_test::serial] in its own process;
+    // `InitEnv` set this variable first, so its drop restores it.
+    unsafe { std::env::set_var(crate::init_engine::TEST_SERVERS_HOOK, &base) };
     (base, handle)
 }
 
@@ -1125,7 +1128,8 @@ fn nothing_answering_records_no_engine_and_names_what_was_probed() {
     let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_url = format!("http://{}/v1", dead.local_addr().unwrap());
     drop(dead);
-    crate::init_engine::set_test_servers(Some(vec![dead_url.clone()]));
+    // SAFETY: as in `serve_models`.
+    unsafe { std::env::set_var(crate::init_engine::TEST_SERVERS_HOOK, &dead_url) };
 
     let r = init(&opts()).unwrap();
 
@@ -1148,7 +1152,7 @@ fn a_rerun_keeps_the_configured_engine_unless_the_operator_names_one() {
 
     let (base, server) = serve_models(&["m/one"], 1);
     let kept = init(&opts()).unwrap();
-    assert_eq!(kept.engine, Some(Outcome::Kept { engine: "lmstudio".to_string() }));
+    assert_eq!(kept.engine, Some(Outcome::Kept { engine: "lmstudio".to_string(), from: "config.json" }));
     assert_eq!(config_engine(&env).as_deref(), Some("lmstudio"));
 
     let named = init(&InitOptions { engine_url: Some(base.trim_end_matches("/v1").to_string()), ..opts() }).unwrap();
@@ -1171,7 +1175,79 @@ fn a_dry_run_names_the_server_it_would_record_and_writes_nothing() {
     server.join().unwrap();
 
     let engine = r.engine.expect("an engine outcome");
-    let line = engine.lines(true).join("\n");
+    let line = engine.lines(false).join("\n");
     assert!(line.contains(&format!("`local-{}`", port_of(&base))) && line.contains("would set"), "{line}");
     assert!(!env.registry().exists() && !env.config().exists());
+}
+
+/// (#316 review finding 1) `DARKMUX_DEFAULT_ENGINE` chose the engine, so a
+/// fresh init keeps it: no server is recorded and no model planned on one.
+#[test]
+#[serial_test::serial]
+fn the_variable_keeps_its_engine_and_refuses_an_engine_url() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    env.set("DARKMUX_DEFAULT_ENGINE", "lmstudio".into());
+    let (base, server) = serve_models(&["m/one"], 1);
+
+    let r = init(&opts()).unwrap();
+    assert_eq!(r.engine, Some(Outcome::Kept { engine: "lmstudio".into(), from: "DARKMUX_DEFAULT_ENGINE" }));
+    assert_eq!(r.worker_model_filled.as_deref(), Some("tiny-llm"), "planned on LM Studio");
+
+    let named = init(&InitOptions { engine_url: Some(base.clone()), ..opts() }).unwrap();
+    server.join().unwrap();
+    let why = named.engine_unrecorded.unwrap_or_default();
+    assert!(why.contains("DARKMUX_DEFAULT_ENGINE"), "{why}");
+    assert_eq!(config_engine(&env).as_deref(), Some("lmstudio"));
+    assert!(!env.read_registry().contains("local-"), "no half record");
+}
+
+/// (#316 review finding 2) A server that cannot be recorded is not planned
+/// on either: here `DARKMUX_PROFILES` points dispatch at another registry,
+/// so nothing is written and the worker comes from the configured engine.
+#[test]
+#[serial_test::serial]
+fn a_server_that_cannot_be_recorded_writes_nothing_and_plans_nothing_on_it() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    let elsewhere = env.home.path().join("other.json");
+    env.set("DARKMUX_PROFILES", elsewhere.clone().into_os_string());
+    let (base, server) = serve_models(&["m/one"], 1);
+
+    let r = init(&InitOptions { engine_url: Some(base), ..opts() }).unwrap();
+    server.join().unwrap();
+
+    let why = r.engine_unrecorded.clone().unwrap_or_default();
+    // Refused before any write, naming the variable (not found later by
+    // `config set`'s own check, which would leave the registry to put back).
+    assert!(why.starts_with("DARKMUX_PROFILES points dispatch at"), "{why}");
+    assert!(r.engine.as_ref().unwrap().lines(false)[0].contains("would set"), "{:?}", r.engine);
+    assert_eq!(config_engine(&env).as_deref(), Some("lmstudio"));
+    assert!(!env.read_registry().contains("local-"), "no endpoint written");
+    assert_eq!(r.models_engine, None);
+    assert_eq!(r.worker_model_filled.as_deref(), Some("tiny-llm"));
+}
+
+/// (#316 review finding 3) A tuned registry with no config.json (deleted, or
+/// from before config.json existed) is not moved to whatever answers.
+#[test]
+#[serial_test::serial]
+fn a_tuned_registry_without_a_config_is_not_moved() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.lms_missing();
+    let mine = example_without_placeholder();
+    env.write_registry(&mine);
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", dead.local_addr().unwrap());
+    drop(dead);
+    // SAFETY: as in `serve_models`.
+    unsafe { std::env::set_var(crate::init_engine::TEST_SERVERS_HOOK, &url) };
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.engine, Some(Outcome::Kept { engine: "lmstudio".into(), from: "config.json" }));
+    assert_eq!(env.read_registry(), mine);
 }

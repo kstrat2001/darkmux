@@ -135,9 +135,9 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.config_created = config_created;
 
     // 1c) (#316, ENGINES.md 9.2) Which engine answers on this machine, recorded
-    //     as `default_engine` in a config this run created, or when the
-    //     operator names one with `--engine-url`.
-    settle_engine(opts, &registry_path, &config_path, config_created, &mut report)?;
+    //     as `default_engine` while none was chosen yet (`may_detect`), or
+    //     when the operator names one with `--engine-url`.
+    settle_engine(opts, &registry_path, &config_path, &mut report)?;
 
     // 1d) (#2038) Fill the placeholder worker model from what the engine has.
     //     Runs on a fresh registry AND on a re-run against one that still holds
@@ -197,26 +197,21 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 }
 
 /// (#316) Step 1c: detect the answering engines and record the choice.
-/// A config `init` did not create keeps the engine it names unless the
-/// operator passed `--engine-url`.
-fn settle_engine(
-    opts: &InitOptions,
-    registry_path: &Path,
-    config_path: &Path,
-    config_created: bool,
-    report: &mut InitReport,
-) -> Result<()> {
+/// An engine already chosen is kept unless the operator passed
+/// `--engine-url` ([`init_engine::may_detect`]).
+fn settle_engine(opts: &InitOptions, registry_path: &Path, config_path: &Path, report: &mut InitReport) -> Result<()> {
     let explicit = opts
         .engine_url
         .as_deref()
         .map(init_engine::engine_url)
         .transpose()
         .map_err(|e| anyhow!("--engine-url: {e}"))?;
-    if !config_created && explicit.is_none() {
-        report.engine = Some(Outcome::Kept { engine: init_engine::configured(config_path) });
+    let text = fs::read_to_string(registry_path).unwrap_or_else(|_| EXAMPLE_PROFILES_JSON.to_string());
+    let (engine, from) = init_engine::configured(config_path);
+    if explicit.is_none() && !init_engine::may_detect(&text, &engine, from) {
+        report.engine = Some(Outcome::Kept { engine, from });
         return Ok(());
     }
-    let text = fs::read_to_string(registry_path).unwrap_or_else(|_| EXAMPLE_PROFILES_JSON.to_string());
     let (answering, probed, error) = init_engine::detect(&init_engine::LiveProbe, &text, explicit.as_deref());
     let mut terminal = init_engine::TerminalAsk;
     let ask: Option<&mut dyn init_engine::Ask> = if opts.dry_run { None } else { Some(&mut terminal) };
@@ -230,6 +225,9 @@ fn settle_engine(
 
 /// Write a chosen server: its endpoint into the registry (when new), then
 /// `default_engine` into the config, through `config set`'s own checks.
+/// Everything that could refuse is checked first ([`init_engine::record_blocker`]),
+/// and a config write that still fails puts the registry back, so a refusal
+/// never leaves half a record.
 fn record_engine(
     outcome: &mut Outcome,
     text: &str,
@@ -241,15 +239,26 @@ fn record_engine(
     let Outcome::Chosen { endpoint: Some(id), .. } = &*outcome else {
         return Ok(());
     };
+    if let Some(blocker) = init_engine::record_blocker(new_text.as_deref().unwrap_or(text), id, registry_path) {
+        return Err(blocker);
+    }
     if dry_run {
         return Ok(());
     }
-    if let Some(t) = new_text {
+    let previous = fs::read_to_string(registry_path).ok();
+    if let Some(t) = new_text.as_deref() {
         fs::write(registry_path, t).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
     }
-    crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id)
-        .map(|_| ())
-        .map_err(|e| format!("{e:#}"))
+    let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
+    if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
+        let restored = match &previous {
+            Some(p) => fs::write(registry_path, p).is_ok(),
+            None => fs::remove_file(registry_path).is_ok(),
+        };
+        let note = if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" };
+        return Err(format!("{e:#} ({note})"));
+    }
+    set.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
 
 /// The engine whose models `init` plans from.
@@ -263,7 +272,9 @@ enum ModelsEngine {
 
 /// The engine chosen this run, else the one the config names.
 fn models_engine(report: &InitReport, registry_path: &Path, config_path: &Path) -> ModelsEngine {
-    match &report.engine {
+    // An engine found but not recorded is not the one dispatch will use.
+    let recorded = report.engine.as_ref().filter(|_| report.engine_unrecorded.is_none());
+    match recorded {
         Some(o) if o.server().is_some() => {
             let (name, models) = o.server().expect("checked");
             return ModelsEngine::Server { name, models: Ok(models.to_vec()) };
@@ -271,7 +282,7 @@ fn models_engine(report: &InitReport, registry_path: &Path, config_path: &Path) 
         Some(Outcome::Chosen { .. }) => return ModelsEngine::Lmstudio,
         _ => {}
     }
-    let name = init_engine::configured(config_path);
+    let (name, _) = init_engine::configured(config_path);
     if name.trim().eq_ignore_ascii_case(darkmux_types::default_engine::LMSTUDIO) {
         return ModelsEngine::Lmstudio;
     }
