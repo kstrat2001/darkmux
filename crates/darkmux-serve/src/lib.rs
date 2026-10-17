@@ -2834,12 +2834,14 @@ pub struct EngineResidents {
 }
 
 impl EngineResidents {
-    /// The read panicked: nothing is known about the engine.
+    /// The read panicked: the engine was asked and gave no answer. It is not
+    /// said to be one that does not report (`reports_residency: true`), so
+    /// every reader says it could not be asked, never that it is fine.
     fn panicked() -> Self {
         EngineResidents {
             engine: wire::MachineEngine {
                 name: darkmux_types::config_access::default_engine(),
-                reports_residency: false,
+                reports_residency: true,
                 usable: true,
             },
             models: Vec::new(),

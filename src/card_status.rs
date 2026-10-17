@@ -169,6 +169,7 @@ pub(crate) fn residents_unknown(specs: &darkmux_serve::wire::MachineSpecsRespons
     Some(match &specs.engine {
         Some(e) if !e.usable => format!("its default engine `{}` cannot be used", e.name),
         Some(e) if !e.reports_residency => format!("`{}` does not report which models it has loaded", e.name),
+        Some(e) if e.name != darkmux_types::default_engine::LMSTUDIO => format!("`{}` could not be asked", e.name),
         _ => "LM Studio could not be asked".to_string(),
     })
 }
@@ -243,5 +244,31 @@ mod tests {
         let idle = status_lines(&by("peer, beating, idle").row);
         assert_eq!(idle[0], "  status: idle");
         assert_eq!(idle[1], "  utility model: qwen3-4b, resident; job: not shown here");
+    }
+
+    /// (#316 stage 4.5) A card whose resident list is not known: the utility
+    /// line never says "not resident", and the reason names the engine's case.
+    #[test]
+    fn a_card_whose_residents_are_not_known_says_so_and_why() {
+        use darkmux_serve::wire::MachineEngine;
+        let raw = include_str!("../tests/fixtures/card-status-rows.json");
+        let cases: Vec<Case> = serde_json::from_str(raw).unwrap();
+        let mut row = cases.into_iter().find(|c| c.name == "peer, beating, idle").unwrap().row;
+        let CardOutcome::Available { card, .. } = &mut row.card else { panic!("the fixture row has a card") };
+        card.specs.lms_unreachable = true;
+        if let Some(u) = card.specs.utility_model.as_mut() {
+            u.loaded = false;
+        }
+        let engine = |name: &str, reports_residency, usable| Some(MachineEngine { name: name.into(), reports_residency, usable });
+        card.specs.engine = engine("local-8080", false, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("`local-8080` does not report which models it has loaded"));
+        card.specs.engine = engine("nope", false, false);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("its default engine `nope` cannot be used"));
+        card.specs.engine = engine("lmstudio", true, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("LM Studio could not be asked"));
+        card.specs.engine = engine("local-8080", true, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("`local-8080` could not be asked"));
+        let lines = status_lines(&row);
+        assert_eq!(lines[1], "  utility model: qwen3-4b, residency not reported; job: not shown here");
     }
 }

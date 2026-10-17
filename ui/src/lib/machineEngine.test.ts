@@ -21,6 +21,10 @@ describe("machineEngine (#316 stage 4.5)", () => {
     expect(residentsUnknownNote({ engine: null, lms_unreachable: true })).toMatch(/LM Studio could not be asked/);
     expect(residentsUnknownNote({ engine: lms, lms_unreachable: false })).toBeNull();
     expect(residentsUnknownNote(null)).toBeNull();
+    // A failed read of another engine is that engine, never "does not report".
+    expect(residentsUnknownNote({ engine: { ...mlx, reports_residency: true }, lms_unreachable: true })).toBe(
+      "local-8080 could not be asked; what it holds is unknown.",
+    );
     expect(residentsKnown({ engine: mlx, lms_unreachable: true })).toBe(false);
     expect(residentsKnown(undefined)).toBe(true);
     expect(engineRow({ engine: lms })).toBe("LM Studio");

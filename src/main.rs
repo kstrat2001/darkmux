@@ -1429,10 +1429,12 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
 /// or an older one that does not state the field, is "not reported", never
 /// "none bound" and never "resident".
 fn peer_utility_line(id: &str) -> String {
-    let specs = fleet_cli::fetch_peer_json(id, "/machine/specs").ok();
-    let known = !specs.as_ref().and_then(|s| s.get("lms_unreachable")?.as_bool()).unwrap_or(false);
-    match specs.and_then(|s| s.get("utility_model").cloned()) {
-        Some(v) => card_status::utility_line(serde_json::from_value::<darkmux_serve::wire::UtilityModel>(v).ok().as_ref(), known),
+    let stated = fleet_cli::fetch_peer_json(id, "/machine/specs").ok().and_then(|specs| specs.get("utility_model").cloned());
+    // Printed only after the peer's `/machine/status` answered with a known
+    // resident list (the unknown cases return before it), so the residency
+    // here is a reading.
+    match stated {
+        Some(v) => card_status::utility_line(serde_json::from_value::<darkmux_serve::wire::UtilityModel>(v).ok().as_ref(), true),
         None => format!("utility model: not reported by `{id}`; job: not shown here"),
     }
 }

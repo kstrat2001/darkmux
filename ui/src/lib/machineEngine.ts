@@ -43,6 +43,7 @@ export function residentsUnknownNote(specs: ResidentSpecs | null): string | null
   const engine = engineOf(specs as ResidentSpecs);
   if (!engine.usable) return `the default engine \`${engine.name}\` cannot be used; \`darkmux doctor\` names why.`;
   if (!engine.reports_residency) return `${engineLabel(engine)} does not report which models it has loaded.`;
+  if (engine.name !== LMSTUDIO) return `${engine.name} could not be asked; what it holds is unknown.`;
   return "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
 }
 
