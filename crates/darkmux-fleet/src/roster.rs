@@ -80,7 +80,8 @@ pub struct MachineEntry {
     pub added_unix_ms: u64,
 
     /// Stable per-machine hardware identity (#2768) —
-    /// `darkmux_hardware::machine_uid()`'s `IOPlatformUUID`, resolved at
+    /// `darkmux_hardware::machine_uid()` (the `IOPlatformUUID` on macOS,
+    /// the machine-id on Linux), resolved at
     /// `machine add` time. This is the FLEET ROSTER's own copy of the same
     /// identity flow records carry as `machine_uid` (schema 1.11,
     /// `crates/darkmux-flow/src/schema.rs`) — the field that lets the

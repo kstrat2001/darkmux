@@ -5,6 +5,20 @@ use crate::{ContainerHostAccess, ContainerUser, Platform};
 pub struct FakePlatform {
     pub container_host_access: ContainerHostAccess,
     pub container_user: ContainerUser,
+    pub machine_uid: Option<String>,
+}
+
+/// Every answer at its "nothing to report" value, so a test sets only the
+/// answers it is about (`FakePlatform { machine_uid: .., ..Default::default() }`)
+/// and a new question does not break every literal.
+impl Default for FakePlatform {
+    fn default() -> Self {
+        FakePlatform {
+            container_host_access: ContainerHostAccess::Builtin,
+            container_user: ContainerUser::Image,
+            machine_uid: None,
+        }
+    }
 }
 
 impl Platform for FakePlatform {
@@ -18,5 +32,18 @@ impl Platform for FakePlatform {
 
     fn container_user(&self) -> ContainerUser {
         self.container_user
+    }
+
+    fn machine_uid(&self) -> Option<String> {
+        self.machine_uid.clone()
+    }
+
+    /// Fakes report no CPU; a test needing one asserts the strategies directly.
+    fn cpu_brand(&self) -> Option<String> {
+        None
+    }
+
+    fn ram_installed_bytes(&self) -> Option<u64> {
+        None
     }
 }

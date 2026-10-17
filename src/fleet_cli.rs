@@ -1115,8 +1115,8 @@ mod tests {
 
     /// (#2924) Self is recognized by NAME — the entry's id equals this
     /// machine's machine_id — at a peer-usable address. Asserted against
-    /// `darkmux_hardware::machine_uid()`'s own live answer (None off macOS is
-    /// correct there too); on macOS it must actually resolve, so the equality
+    /// `darkmux_hardware::machine_uid()`'s own live answer (None where the
+    /// platform has none is correct there too); on macOS it must actually resolve, so the equality
     /// cannot pass vacuously on None == None.
     #[serial_test::serial]
     #[test]

@@ -16,6 +16,15 @@ darkmux release.
 
 ### Added
 
+- **A Linux machine has a place in the fleet** (#3275). Its identity comes from
+  `/etc/machine-id`, else D-Bus's copy at `/var/lib/dbus/machine-id` (new on a reinstall, so a dual-boot laptop is two machines; #3212),
+  so it beats presence and its records carry a `machine_uid`; the fleet card names its CPU
+  (`/proc/cpuinfo` or the device tree) and its installed memory (`MemTotal` rounded up to a
+  whole GiB; display only, and lower than the size sold where firmware reserves more than a
+  GiB). These come from the platform strategy, where the macOS
+  answers moved unchanged (`ioreg`'s `IOPlatformUUID`, `sysctl`'s CPU brand and
+  `hw.memsize`); `/machine/specs` and the presence beat now read one cached source for each.
+
 - **Roles with tools run in Docker on Linux** (#3275). A new crate, `darkmux-platform`,
   answers each question whose answer differs by OS (a `Platform` strategy per OS, chosen
   in one place), so shared code never checks which OS it is on; a test keeps new OS

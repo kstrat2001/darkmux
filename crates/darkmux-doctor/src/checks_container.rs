@@ -56,11 +56,11 @@ const NAME: &str = "container user";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_platform::{ContainerHostAccess, FakePlatform};
+    use darkmux_platform::FakePlatform;
     use darkmux_types::config_access::Source;
 
     fn platform(user: ContainerUser) -> FakePlatform {
-        FakePlatform { container_host_access: ContainerHostAccess::Builtin, container_user: user }
+        FakePlatform { container_user: user, ..FakePlatform::default() }
     }
 
     #[test]

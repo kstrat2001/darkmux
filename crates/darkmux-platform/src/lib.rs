@@ -34,6 +34,21 @@ pub trait Platform: Send + Sync {
     /// Which user a dispatch container runs as, so it can read and write the
     /// host directories bind-mounted into it.
     fn container_user(&self) -> ContainerUser;
+
+    /// This install's stable identity (#640: the identity, distinct from the
+    /// operator's display name). `None` when the platform has none to read:
+    /// callers treat that as unknown identity and never fall back to a name.
+    fn machine_uid(&self) -> Option<String>;
+
+    /// The CPU's marketing name (`"Apple M2"`, `"Apple M5 Max"`), for the
+    /// fleet card's hardware line. `None` when the platform can't say:
+    /// callers show "not reported", never a placeholder.
+    fn cpu_brand(&self) -> Option<String>;
+
+    /// The machine's installed memory, in bytes, as it is sold, for DISPLAY
+    /// (the fleet card's `· 8 GB`). Never a planning budget: what darkmux can
+    /// actually use is a separate, smaller fact.
+    fn ram_installed_bytes(&self) -> Option<u64>;
 }
 
 /// Which user a dispatch container runs as.

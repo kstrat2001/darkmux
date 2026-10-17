@@ -285,7 +285,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
             eprintln!(
                 "{}",
                 darkmux_types::style::warn(
-                    "presence: no stable machine UID (IOPlatformUUID unavailable); \
+                    "presence: no stable machine UID (no IOPlatformUUID on macOS, no machine-id on Linux); \
                      presence disabled — this machine can't be identified, and it \
                      won't masquerade under a name (#640)"
                 )
