@@ -21000,3 +21000,13 @@ fn the_sampler_nap_ends_at_the_stop_flag() {
     assert!(t0.elapsed() < super::TELEMETRY_SAMPLE_INTERVAL, "returned before the full interval: {:?}", t0.elapsed());
     raiser.join().unwrap();
 }
+
+#[test]
+fn container_reply_is_the_envelopes_final_assistant_or_the_text_output() {
+    // (#3264) The text a channel-markup check reads from a container run.
+    let envelope = r#"{"result":"stop","final_assistant":"to=self<|message|>x","trajectory_path":null}"#;
+    assert_eq!(container_reply(true, envelope), "to=self<|message|>x");
+    assert_eq!(container_reply(false, "to=self<|message|>x\n"), "to=self<|message|>x\n");
+    assert_eq!(container_reply(true, "not an envelope"), "");
+    assert_eq!(container_reply(true, r#"{"result":"error","final_assistant":null}"#), "");
+}

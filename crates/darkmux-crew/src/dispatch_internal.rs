@@ -4443,6 +4443,7 @@ fn dispatch_unmanaged(
     // counts. The usage record, the budget settle, the completion record and
     // the envelope all take their numbers from `counts`.
     let reply = crate::single_shot::extract_reply(&resp);
+    warn_on_channel_markup(&reply.content, &pm.id);
     let counts = reply.counts.clone();
     evidence.ended(&resp, &counts);
 
@@ -4818,6 +4819,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             return Err(e);
         }
     };
+    warn_on_channel_markup(&reply.content, &model_id);
 
     // (#2902 step 1a) The one usage record for this one model call. The
     // endpoint is the LMStudio base `single_shot_chat` just called (the
@@ -8120,6 +8122,7 @@ fn close_container_run(
     // reduction lands here — after the tailer has finished and its
     // observations are final.
     let bounds = resolved_runtime_bounds(run.brain.agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?;
+    warn_on_channel_markup(&container_reply(opts.json, &stdout), model);
     let stdout = runtime_stdout_for_caller(opts.json, stdout, |stdout| {
         enrich_envelope_with_summary(
             stdout,
@@ -8473,6 +8476,27 @@ pub(crate) struct DegeneracyWarning {
 /// process's stderr, styled as a warning.
 fn stderr_warning_sink(line: &str) {
     eprintln!("{}", darkmux_types::style::warn(line));
+}
+
+/// (#3264) Say so when a reply opens with the model's raw channel markup:
+/// the engine did not parse the model's format. The reply is not changed.
+fn warn_on_channel_markup(reply: &str, model: &str) {
+    if let Some(leak) = crate::channel_markup::leaked(reply) {
+        stderr_warning_sink(&crate::channel_markup::warning(&leak, model));
+    }
+}
+
+/// (#3264) The model's reply in a container run's stdout: the envelope's
+/// `final_assistant` for a `--json` dispatch, the stdout itself otherwise
+/// (the runtime prints the reply as its text-mode output).
+fn container_reply(json: bool, stdout: &str) -> String {
+    if !json {
+        return stdout.to_string();
+    }
+    serde_json::from_str::<darkmux_trajectory::RuntimeEnvelope>(stdout.trim())
+        .ok()
+        .and_then(|e| e.final_assistant)
+        .unwrap_or_default()
 }
 
 /// (#2947) The warning a checkpoint calls for: its judge `would_conclude`

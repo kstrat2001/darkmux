@@ -45,6 +45,7 @@ mod test_guard_conformance;
 /// out goes through — `mods.gate`'s `test_command`, `procedural.shell`.
 pub mod bounded_command;
 pub mod brief_refs;
+pub mod channel_markup;
 pub mod concurrent_dispatch;
 /// (#2869) No-follow, regular-file-only reads out of a directory a
 /// container can write (the out-dir, the workspace).

@@ -16,6 +16,23 @@ darkmux release.
 
 ### Added
 
+- **A reply that opens with raw channel markup says its engine did not parse the
+  model's format** (#3264). Muse Glimmer addresses each message to a channel (`to=self`
+  for reasoning, `to=user` for the answer) and gpt-oss's Harmony does the same with
+  `<|channel|>`. An engine with a parser for the format returns the answer in `content`
+  and the reasoning in `reasoning_content`; one without passes the markup through. The
+  #316 live gate hit this with Muse-Glimmer-30B on `mlx_lm.server` 0.32.1, on both the
+  direct and the container path. A dispatch whose reply opens with that markup now
+  prints one warning naming the model, the marker and engines that parse the format
+  (llama.cpp's `llama-server` b10353 or later, or vLLM with its `muse_glimmer` reasoning
+  parser; for Harmony, `llama-server` or vLLM). The reply is left as the model wrote it:
+  darkmux leaves parsing to the engine rather than keeping a parser per model family.
+  The research behind that choice, recorded on #3264: llama.cpp b10353+, vLLM and the
+  vllm-mlx and mlx-optiq add-ons parse Muse Glimmer, upstream `mlx_lm.server` does not;
+  the model card's only Mac setup is `brew install llama.cpp`; Grok Build reads only
+  `reasoning_content` and relies on the engine, while OpenClaw also strips Harmony
+  markers client-side after gpt-oss leaked them on LM Studio's MLX runtime.
+
 - **The machine surfaces name the engine** (#316). `/machine/specs`, `/machine/status`,
   the machine card (schema 1.3) and `darkmux machine status --json` carry `engine`: its
   name (`lmstudio` or the endpoint id), whether it reports which models it holds, and
