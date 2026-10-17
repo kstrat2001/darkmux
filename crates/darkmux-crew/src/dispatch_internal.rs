@@ -3574,7 +3574,7 @@ pub fn probe_unmanaged_endpoint(
         reasoning_effort: None,
     });
     let t0 = SystemTime::now();
-    let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, timeout_seconds)?;
+    let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, timeout_seconds, None)?;
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
     let counts = darkmux_trajectory::UsageCounts::of_reply(&resp);
     let served_model = resp.get("model").and_then(|m| m.as_str()).map(str::to_string);
@@ -3726,6 +3726,9 @@ pub(crate) fn remote_chat_completion(
     auth_header: Option<&(String, String)>,
     body: &serde_json::Value,
     timeout_seconds: u32,
+    // (#3211) For a body that asks to stream: called as the reply arrives,
+    // with what has streamed so far. `None` for a call that does not stream.
+    mut progress: Option<&mut dyn FnMut(&crate::direct_stream::SseProgress)>,
 ) -> Result<serde_json::Value> {
     let attempts = RATE_LIMIT_BACKOFF_SECONDS.len() + 1;
     let mut last: Option<HostedCallError> = None;
@@ -3740,7 +3743,7 @@ pub(crate) fn remote_chat_completion(
             );
             std::thread::sleep(std::time::Duration::from_secs(delay));
         }
-        match remote_chat_attempt(url, auth_header, body, timeout_seconds) {
+        match remote_chat_attempt(url, auth_header, body, timeout_seconds, progress.as_deref_mut()) {
             Ok(v) => return Ok(v),
             Err(e @ (HostedCallError::RateLimited(_) | HostedCallError::ServerShed(_))) => last = Some(e),
             Err(HostedCallError::Other(e)) => return Err(e),
@@ -3748,6 +3751,60 @@ pub(crate) fn remote_chat_completion(
     }
     Err(exhausted_hosted_error(last, attempts))
 }
+
+/// (#3211) Read a streaming reply's file while curl writes it, reporting
+/// each time a read completes an event, until curl exits; the exit itself
+/// is collected by the caller. A file that cannot be read reports nothing,
+/// and the reply is still read whole once curl is done.
+fn follow_streamed_reply(
+    child: &mut std::process::Child,
+    body_path: &std::path::Path,
+    on: Option<&mut (dyn FnMut(&crate::direct_stream::SseProgress) + '_)>,
+) {
+    use std::io::Read;
+    let Some(on) = on else {
+        return;
+    };
+    let mut tail = crate::direct_stream::SseTail::default();
+    let mut file = std::fs::File::open(body_path).ok();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let exited = !matches!(child.try_wait(), Ok(None));
+        while let Some(n) = file.as_mut().and_then(|f| f.read(&mut buf).ok()).filter(|n| *n > 0) {
+            if tail.feed(&buf[..n]) {
+                on(&tail.progress);
+            }
+        }
+        if exited {
+            return;
+        }
+        std::thread::sleep(STREAM_POLL);
+    }
+}
+
+/// The hosted call's curl arguments; (#3211) a streamed reply is written to
+/// its file as it arrives (`-N`).
+fn curl_args(timeout_seconds: u32, cfg_path: &std::path::Path, streams: bool) -> Vec<String> {
+    let mut args = vec!["-sS".to_string(), "-m".to_string(), timeout_seconds.to_string()];
+    if streams {
+        args.push("-N".to_string());
+    }
+    args.extend(["-K".to_string(), cfg_path.to_string_lossy().into_owned()]);
+    args
+}
+
+/// (#3211) A streamed reply, put back together as the unstreamed one; any
+/// other reply as it came.
+fn streamed_reply_as_chat(streams: bool, response: Vec<u8>) -> Vec<u8> {
+    if !streams {
+        return response;
+    }
+    crate::direct_stream::assemble(&response).unwrap_or(response)
+}
+
+/// How often a streaming reply's file is read while curl writes it: well
+/// under the 2 s heartbeat coalescing, so the first event shows promptly.
+const STREAM_POLL: Duration = Duration::from_millis(100);
 
 /// The error for a hosted call whose retries ran out on 429s or shed load,
 /// each with its own text and class (a 503 is not "rate-limited (429)").
@@ -3771,6 +3828,7 @@ fn remote_chat_attempt(
     auth_header: Option<&(String, String)>,
     body: &serde_json::Value,
     timeout_seconds: u32,
+    mut progress: Option<&mut (dyn FnMut(&crate::direct_stream::SseProgress) + '_)>,
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
     use std::io::Write;
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -3800,7 +3858,8 @@ fn remote_chat_attempt(
     // write the secret-bearing body, run curl — then ALWAYS remove the file,
     // even if the create/write/curl fails partway (a partial secret file must
     // never linger).
-    let run = || -> Result<std::process::Output> {
+    let streams = progress.is_some();
+    let mut run = || -> Result<std::process::Output> {
         #[cfg(unix)]
         let mut f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -3832,14 +3891,8 @@ fn remote_chat_attempt(
         #[cfg(not(unix))]
         std::fs::File::create(&body_path)
             .map_err(|e| failure(HostedFailure::NotSent, format!("creating the response file: {e}")))?;
-        let child = Command::new("curl")
-            .args([
-                "-sS",
-                "-m",
-                &timeout_seconds.to_string(),
-                "-K",
-                &cfg_path.to_string_lossy(),
-            ])
+        let mut child = Command::new("curl")
+            .args(curl_args(timeout_seconds, &cfg_path, streams))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -3859,6 +3912,7 @@ fn remote_chat_attempt(
         // delivery to the launcher in a real invocation shape).
         let child_pid = child.id();
         darkmux_types::child_registry::register(child_pid);
+        follow_streamed_reply(&mut child, &body_path, progress.as_deref_mut());
         let wait_result = child.wait_with_output().map_err(|e| {
             failure(HostedFailure::Unanswered, format!("running curl for hosted dispatch: {e}"))
         });
@@ -3902,6 +3956,8 @@ fn remote_chat_attempt(
         )));
     }
     let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
+    // (#3211) A streamed reply, put back together as the unstreamed one.
+    let response = streamed_reply_as_chat(streams, response);
     let response = crate::messages_wire::reply_bytes_as_chat(messages, response);
     classify_hosted_response(status, &response)
 }
@@ -4292,17 +4348,28 @@ fn dispatch_unmanaged(
         ),
     );
 
-    let req_body = single_shot_body(
+    // (#3211) The turn's live evidence, as a container turn has it: the
+    // opener now (PROMPT), coalesced heartbeats while a streamed reply
+    // arrives (GEN), and the turn's record when it is in.
+    let mut evidence = crate::direct_stream::TurnEvidence::open(
+        target.dialect,
+        (system_prompt.chars().count() + opts.message.chars().count()) as u64,
+        HEARTBEAT_MIN_INTERVAL,
+        |payload| {
+            let _ = darkmux_flow::record(build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, payload));
+        },
+    );
+    let req_body = evidence.body(single_shot_body(
         target.dialect,
         &pm.id,
         system_prompt,
         &opts.message,
         opts.max_completion_tokens,
         ep.reasoning_effort.as_deref(),
-    );
+    ));
 
     let t0 = SystemTime::now();
-    let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds);
+    let resp = evidence.call(|progress| remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds, progress));
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
 
     let resp = match resp {
@@ -4341,6 +4408,7 @@ fn dispatch_unmanaged(
     // the envelope all take their numbers from `counts`.
     let reply = crate::single_shot::extract_reply(&resp);
     let counts = reply.counts.clone();
+    evidence.ended(&resp, &counts, wall_ms);
 
     // (#2902 step 1a) The one usage record for this one model call — before
     // the terminal, so a reader of the stream sees the call's cost no later

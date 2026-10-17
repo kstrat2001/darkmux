@@ -1361,7 +1361,13 @@ fn a_tool_less_role_on_a_hosted_endpoint_runs_one_http_call_and_no_container() {
     let label = format!("openai:127.0.0.1:{}/gpt-remote", server.port());
     assert_eq!(env["final_assistant"], "hosted ok");
     assert_eq!(env["metrics"]["endpoint"], label.as_str());
-    assert_eq!(rig.actions()[1..], ["dispatch.start", "telemetry.tokens", "dispatch.complete"]);
+    // (#3211) The turn's live evidence: its opener, and its record. This mock
+    // answers unstreamed (a server that ignores `stream`), so no chunk
+    // heartbeat comes between them, and the reply is read as before.
+    assert_eq!(
+        rig.actions()[1..],
+        ["dispatch.start", "dispatch.turn.heartbeat", "dispatch.turn", "telemetry.tokens", "dispatch.complete"]
+    );
     let s = rig.record("dispatch.start");
     assert_eq!((s["handle"].as_str(), s["model"].as_str()), (Some("pr-reviewer"), Some("gpt-remote")));
     assert_eq!(payload(&s)["endpoint"], label.as_str());

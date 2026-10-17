@@ -66,6 +66,7 @@ pub mod dispatch;
 pub mod dispatch_as_crew_of_one;
 pub mod dispatch_envelope;
 pub mod dispatch_internal;
+pub(crate) mod direct_stream;
 // (#2628) Gives a STANDALONE raw dispatch (never itself a `StepKind`, never
 // one placement among concurrent wave siblings) the same Exclusive-
 // reconcile + #1487 residency-lease protection `ensure_wave_loaded` gives
