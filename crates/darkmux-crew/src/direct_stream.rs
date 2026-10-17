@@ -245,7 +245,7 @@ pub(crate) fn turn(reply: &Value, counts: &darkmux_trajectory::UsageCounts, gene
         turn_seq: TURN,
         finish_reason: finish.chars().take(64).collect(),
         tool_calls_count: 0,
-        usage: reported.iter().any(Option::is_some).then(|| TurnUsage {
+        usage: reported.iter().any(Option::is_some).then_some(TurnUsage {
             prompt_tokens: counts.prompt,
             completion_tokens: counts.completion,
             total_tokens: counts.total,
