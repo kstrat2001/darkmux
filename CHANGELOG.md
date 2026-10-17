@@ -94,6 +94,13 @@ darkmux release.
 
 ### Fixed
 
+- **`init` on an OpenAI-compatible server no longer keeps a utility model the server
+  does not list** (#316). It kept the shipped `internal.utility` binding and only said so,
+  and `mlx_lm.server` fetches a model it does not hold from Hugging Face, so the first
+  compaction or radio-routing call could start a multi-gigabyte download. The binding is
+  now removed, and `init` says compaction is off until `internal.utility` names a model
+  the server serves.
+
 - **A daemon started without LM Studio's directory on its PATH finds `lms`** (#3266).
   LM Studio adds its PATH line to `~/.zshrc`, which a launchd job or a `zsh -lc` login
   shell never reads, so such a daemon read LM Studio as unreachable: the machine page
