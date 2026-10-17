@@ -34,6 +34,7 @@ const RESIDENCY_WORD: Record<Exclude<UtilityResidency, UtilityResidency.None>, s
   [UtilityResidency.Resident]: "resident",
   [UtilityResidency.NotLoaded]: "not loaded",
   [UtilityResidency.Unknown]: "residency unknown",
+  [UtilityResidency.NotReported]: "residency not reported",
 };
 
 /** The robot's drawn state (`data-dot`): solid, faded, dashed. */
@@ -41,6 +42,7 @@ const DOT: Record<Exclude<UtilityResidency, UtilityResidency.None>, string> = {
   [UtilityResidency.Resident]: "filled",
   [UtilityResidency.NotLoaded]: "hollow",
   [UtilityResidency.Unknown]: "unknown",
+  [UtilityResidency.NotReported]: "unknown",
 };
 
 export function UtilityGlyph({

@@ -61,7 +61,13 @@ use std::time::Duration;
 /// `specs.redis_url_redacted` is `specs.hub_configured`: whether a hub is
 /// configured, never where it is (#3072). 1.0 and
 /// 1.1 are unreleased, so no shipped reader meets a 1.2 card.
-pub const CARD_SCHEMA_VERSION: &str = "1.2";
+///
+/// 1.3 (#316): `specs.engine`, the machine's engine by name, whether it
+/// reports what it holds, and whether it is usable. Absent on a 1.2 card,
+/// whose engine is LM Studio. `specs.lms_unreachable` now means the resident
+/// list is not known for any of those reasons, so a 1.2 reader shows an
+/// engine that does not report residency as unknown, never as empty.
+pub const CARD_SCHEMA_VERSION: &str = "1.3";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
@@ -1059,6 +1065,7 @@ pub(crate) mod tests {
                     queued: Some(0),
                 }],
                 lms_unreachable: false,
+                engine: Some(crate::wire::MachineEngine { name: darkmux_types::default_engine::LMSTUDIO.into(), reports_residency: true, usable: true }),
                 utility_model: None,
                 hub_configured: false,
                 generated_at_ms: 1_000,

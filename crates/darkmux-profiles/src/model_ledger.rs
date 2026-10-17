@@ -1633,8 +1633,19 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
 /// otherwise blame `lms ps`. Counting such an engine's model in the budget is
 /// stage 5 (ENGINES.md open question 2). Never errors, like [`gather_with_bin`].
 pub fn gather_residents_unknown(why: &str) -> ModelLedger {
+    gather_residents_unknown_as(LedgerMessage::warn(why), why)
+}
+
+/// (#316) The ledger of an engine that does not report what it holds: the
+/// same unknown residents, said as information, not a warning. Nothing is
+/// wrong; the engine was never asked (it has no such question).
+pub fn gather_residents_not_reported(why: &str) -> ModelLedger {
+    gather_residents_unknown_as(LedgerMessage::info(why), why)
+}
+
+fn gather_residents_unknown_as(message: LedgerMessage, why: &str) -> ModelLedger {
     let started = std::time::Instant::now();
-    let mut messages = vec![LedgerMessage::warn(why)];
+    let mut messages = vec![message];
     let machine = gather_machine(&mut messages);
     let mut ledger = compute_ledger(
         LedgerInputs {

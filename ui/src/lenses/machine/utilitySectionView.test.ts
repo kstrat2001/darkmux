@@ -97,3 +97,11 @@ describe("(#2915) the machine page's Utility section", () => {
     expect(none[2]).toMatchObject({ calls: "0 calls", tokens: "0 tokens" });
   });
 });
+
+describe("(#316 stage 4.5) the Utility section on a machine whose residents are not known", () => {
+  test("says the residency is not reported, never not loaded", () => {
+    const unknown = { ...specs({ loaded: false }), lms_unreachable: true, engine: { name: "local-8080", reports_residency: false, usable: true } };
+    const v = utilitySectionView({ data: [], uid: U, nowMs: 60_000, specs: unknown, isLocal: true, residentRow: null });
+    expect(v.factsLine).toMatch(/· residency not reported$/);
+  });
+});

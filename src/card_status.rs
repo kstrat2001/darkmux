@@ -141,15 +141,37 @@ pub(crate) fn card_status(m: &FleetMachine) -> StatusReading {
 /// The utility model line: its name, whether it is resident, and its job.
 /// A utility job is a flow record, which neither the machine card nor a
 /// one-shot CLI read carries, so the job is said to be unshown, never guessed.
-pub(crate) fn utility_line(utility: Option<&UtilityModel>) -> String {
+/// `residents_known`: (#316) the machine's resident list is the engine's
+/// answer (`!specs.lms_unreachable`); when it is not, `loaded: false` is not
+/// a reading.
+pub(crate) fn utility_line(utility: Option<&UtilityModel>, residents_known: bool) -> String {
     match utility {
         Some(u) => format!(
             "utility model: {}, {}; job: not shown here",
             u.id,
-            if u.loaded { "resident" } else { "not resident" }
+            match (u.loaded, residents_known) {
+                (true, _) => "resident",
+                (false, true) => "not resident",
+                (false, false) => "residency not reported",
+            }
         ),
         None => "utility model: none bound; job: not shown here".to_string(),
     }
+}
+
+/// (#316) Why a card's loaded-model list is not known, or `None` when the
+/// list is its engine's answer. `lms_unreachable` is the fact; `engine`
+/// names the reason (a card older than 4.5 states none: LM Studio).
+pub(crate) fn residents_unknown(specs: &darkmux_serve::wire::MachineSpecsResponse) -> Option<String> {
+    if !specs.lms_unreachable {
+        return None;
+    }
+    Some(match &specs.engine {
+        Some(e) if !e.usable => format!("its default engine `{}` cannot be used", e.name),
+        Some(e) if !e.reports_residency => format!("`{}` does not report which models it has loaded", e.name),
+        Some(e) if e.name != darkmux_types::default_engine::LMSTUDIO => format!("`{}` could not be asked", e.name),
+        _ => "LM Studio could not be asked".to_string(),
+    })
 }
 
 /// The lines `machine list` prints under a machine's row: its status word, the
@@ -161,7 +183,7 @@ pub(crate) fn status_lines(m: &FleetMachine) -> Vec<String> {
     lines.extend(reading.status.second_line().map(|line| format!("  {line}")));
     lines.extend(reading.reason.map(|why| format!("  why: {why}")));
     if let CardOutcome::Available { card, .. } = &m.card {
-        lines.push(format!("  {}", utility_line(card.specs.utility_model.as_ref())));
+        lines.push(format!("  {}", utility_line(card.specs.utility_model.as_ref(), !card.specs.lms_unreachable)));
     }
     lines
 }
@@ -203,9 +225,11 @@ mod tests {
     #[test]
     fn the_utility_line_says_resident_or_not_and_never_guesses_the_job() {
         let u = |loaded| UtilityModel { id: "qwen3-4b".into(), loaded, n_ctx: None };
-        assert_eq!(utility_line(Some(&u(true))), "utility model: qwen3-4b, resident; job: not shown here");
-        assert_eq!(utility_line(Some(&u(false))), "utility model: qwen3-4b, not resident; job: not shown here");
-        assert_eq!(utility_line(None), "utility model: none bound; job: not shown here");
+        assert_eq!(utility_line(Some(&u(true)), true), "utility model: qwen3-4b, resident; job: not shown here");
+        assert_eq!(utility_line(Some(&u(false)), true), "utility model: qwen3-4b, not resident; job: not shown here");
+        assert_eq!(utility_line(None, true), "utility model: none bound; job: not shown here");
+        // (#316) Residents not known: `loaded: false` is not a reading.
+        assert_eq!(utility_line(Some(&u(false)), false), "utility model: qwen3-4b, residency not reported; job: not shown here");
     }
 
     #[test]
@@ -220,5 +244,31 @@ mod tests {
         let idle = status_lines(&by("peer, beating, idle").row);
         assert_eq!(idle[0], "  status: idle");
         assert_eq!(idle[1], "  utility model: qwen3-4b, resident; job: not shown here");
+    }
+
+    /// (#316 stage 4.5) A card whose resident list is not known: the utility
+    /// line never says "not resident", and the reason names the engine's case.
+    #[test]
+    fn a_card_whose_residents_are_not_known_says_so_and_why() {
+        use darkmux_serve::wire::MachineEngine;
+        let raw = include_str!("../tests/fixtures/card-status-rows.json");
+        let cases: Vec<Case> = serde_json::from_str(raw).unwrap();
+        let mut row = cases.into_iter().find(|c| c.name == "peer, beating, idle").unwrap().row;
+        let CardOutcome::Available { card, .. } = &mut row.card else { panic!("the fixture row has a card") };
+        card.specs.lms_unreachable = true;
+        if let Some(u) = card.specs.utility_model.as_mut() {
+            u.loaded = false;
+        }
+        let engine = |name: &str, reports_residency, usable| Some(MachineEngine { name: name.into(), reports_residency, usable });
+        card.specs.engine = engine("local-8080", false, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("`local-8080` does not report which models it has loaded"));
+        card.specs.engine = engine("nope", false, false);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("its default engine `nope` cannot be used"));
+        card.specs.engine = engine("lmstudio", true, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("LM Studio could not be asked"));
+        card.specs.engine = engine("local-8080", true, true);
+        assert_eq!(residents_unknown(&card.specs).as_deref(), Some("`local-8080` could not be asked"));
+        let lines = status_lines(&row);
+        assert_eq!(lines[1], "  utility model: qwen3-4b, residency not reported; job: not shown here");
     }
 }

@@ -1138,3 +1138,17 @@ describe("MachineHealthRegion — the snapshot age reads in human units", () => 
     expect(container.querySelector(".mm-stalebanner")?.textContent).toMatch(/\u2014 snapshot just now$/);
   });
 });
+
+describe("MachineHealthRegion: residents that are not known (#316 stage 4.5)", () => {
+  it("says why an empty list is not 'no models loaded' when the engine does not report it", () => {
+    const empty = { ...BASE, models: [] };
+    const { container } = renderRegion(empty, { residentsUnknown: "local-8080 does not report which models it has loaded." });
+    expect(container.textContent).toContain("local-8080 does not report which models it has loaded.");
+    expect(container.textContent).not.toContain("no models loaded.");
+  });
+
+  it("still says 'no models loaded' when the engine reported none", () => {
+    const { container } = renderRegion({ ...BASE, models: [] });
+    expect(container.textContent).toContain("no models loaded.");
+  });
+});

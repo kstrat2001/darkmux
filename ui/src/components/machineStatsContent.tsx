@@ -35,6 +35,7 @@
  * renders its OWN top-level element would force an extra wrapper div into
  * both call sites for no reason.
  */
+import { engineRow } from "../lib/machineEngine";
 import { InfoGlyph } from "./InfoGlyph";
 import { PowerGlyph } from "./PowerGlyph";
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
@@ -1024,6 +1025,8 @@ export function useMachineStatsContent({
     hostSpecs?.cpu_brand ?? "",
     fmtGbBytes(ramTotal),
     hostSpecs?.os ?? "",
+    // (#316) The engine the machine's local models run on.
+    engineRow(hostSpecs),
   ];
   const hasIdentity = identityValues.some((v) => v !== "");
   const identityBlock = (
@@ -1032,6 +1035,7 @@ export function useMachineStatsContent({
       <Kv label="silicon" value={identityValues[1]} />
       <Kv label="shared memory" value={identityValues[2]} />
       <Kv label="OS" value={identityValues[3]} />
+      <Kv label="engine" value={identityValues[4]} />
     </>
   );
 

@@ -571,10 +571,13 @@ function ModelRows({
   rows,
   nowMs,
   machineState,
+  residentsUnknown,
 }: {
   rows: ResidencyRowView[];
   nowMs: number;
   machineState: string | null | undefined;
+  /** (#316) Why an empty list is not "no models loaded", or `null`. */
+  residentsUnknown?: string | null;
 }) {
   const groups = groupResidencyRows(rows);
   // Shared scale (`perModelScale`'s own doc) — the largest figure across
@@ -583,7 +586,7 @@ function ModelRows({
   // track doesn't visibly rescale out from under it).
   const scale = perModelScale(rows.map((r) => r.model));
   if (groups.length === 0) {
-    return <div className="none">no models loaded.</div>;
+    return <div className="none">{residentsUnknown ?? "no models loaded."}</div>;
   }
   return (
     <>
@@ -612,6 +615,10 @@ export interface HealthRegionProps {
   residencyRows?: ResidencyRowView[];
   residencyChanged?: boolean;
   nowMs?: number;
+  /** (#316) Why this machine's resident list is not known (its engine does
+   *  not report it, or could not be asked), from `residentsUnknownNote`;
+   *  `null` when an empty list means nothing is loaded. */
+  residentsUnknown?: string | null;
   /** (#2108, operator finding) Test-only override for the mobile/desktop
    * ledger-summary split below — production omits this and measures
    * `window.innerWidth` via `useIsMobile` (see that hook's own doc; the
@@ -628,6 +635,7 @@ export function MachineHealthRegion({
   residencyRows = [],
   residencyChanged = false,
   nowMs = Date.now(),
+  residentsUnknown,
   isMobileOverride,
 }: HealthRegionProps) {
   const measuredIsMobile = useIsMobile();
@@ -880,7 +888,7 @@ export function MachineHealthRegion({
       {showMachineShrinkHint && <div className="mm-hint">↳ {machineShrinkHint}</div>}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} machineState={b.machine.state} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} machineState={b.machine.state} residentsUnknown={residentsUnknown} />
       </div>
 
       {/* #1821: `messages` replaces `warnings` — each entry carries a

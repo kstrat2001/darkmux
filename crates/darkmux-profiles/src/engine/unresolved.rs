@@ -15,6 +15,8 @@ use darkmux_types::LoadedModel;
 /// `reason` is the operator line: where the value was set, what is wrong
 /// with it and the valid values.
 pub(crate) struct Unresolved {
+    /// The setting's value, as written.
+    pub(crate) name: String,
     pub(crate) reason: String,
 }
 
@@ -40,6 +42,14 @@ impl Engine for Unresolved {
                 tool_training: false,
             },
         }
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn usable(&self) -> bool {
+        false
     }
 
     fn loaded(&self) -> Result<Vec<LoadedModel>> {

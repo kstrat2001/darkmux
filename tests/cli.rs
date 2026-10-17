@@ -1997,7 +1997,7 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["is_this_machine"], true);
     assert_eq!(row["liveness"], "live");
     assert_eq!(row["card"]["state"], "available", "{row}");
-    assert_eq!(row["card"]["card"]["card_schema_version"], "1.2");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.3");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 
@@ -2092,6 +2092,95 @@ fn machine_status_remote_degraded_peer_is_not_healthy_empty() {
         !stdout.contains("exclusively darkmux's"),
         "must NOT render the healthy-empty view: {stdout}"
     );
+}
+
+/// (#316 stage 4.5) A peer whose engine does not report what it holds is
+/// said to be so, exit 0: not unreachable (exit 2) and not an empty machine.
+#[test]
+fn machine_status_remote_engine_that_does_not_report_residency_says_so() {
+    let body = r#"{"models":[],"lms_unreachable":true,"engine":{"name":"local-8080","reports_residency":false,"usable":true},"generated_at_ms":1}"#;
+    let tmp = TempDir::new().unwrap();
+    for json in [false, true] {
+        let addr = canned_http_peer("200 OK", body, 1);
+        let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+        let mut cmd = darkmux_cmd();
+        cmd.env("DARKMUX_FLEET_FILE", &fleet_file).args(["machine", "status", "peer1"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {}", String::from_utf8_lossy(&out.stderr));
+        if json {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["engine"]["reports_residency"], false, "{v}");
+            assert_eq!(v["lms_unreachable"], true, "unknown, never empty: {v}");
+        } else {
+            assert!(stdout.contains("`local-8080` does not report which models it has loaded"), "{stdout}");
+            assert!(!stdout.contains("exclusively darkmux's"), "not the empty-machine view: {stdout}");
+        }
+    }
+}
+
+/// (#316 review) A peer whose `engine` does not parse is refused, never read
+/// as an LM Studio with nothing loaded.
+#[test]
+fn machine_status_remote_unreadable_engine_is_refused() {
+    let body = r#"{"models":[],"lms_unreachable":false,"engine":{"name":7},"generated_at_ms":1}"#;
+    let addr = canned_http_peer("200 OK", body, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = darkmux_cmd().env("DARKMUX_FLEET_FILE", &fleet_file).args(["machine", "status", "peer1"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("an engine this darkmux does not read"), "{stderr}");
+}
+
+/// (#316 review F1, F2) A residency that is not known for any reason but
+/// "the engine does not report it" is a failure, exit 2: a setting that names
+/// no usable engine here, and a peer whose engine read failed.
+#[test]
+fn machine_status_unknown_residents_that_are_not_by_design_exit_2() {
+    let tmp = TempDir::new().unwrap();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_PROFILES", &registry)
+        .env("DARKMUX_DEFAULT_ENGINE", "nope")
+        .args(["machine", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((v["engine"]["usable"].clone(), v["lms_unreachable"].clone()), (serde_json::json!(false), serde_json::json!(true)), "{v}");
+
+    // The daemon's answer when its engine read failed.
+    let body = r#"{"models":[],"lms_unreachable":true,"engine":{"name":"lmstudio","reports_residency":true,"usable":true},"generated_at_ms":1}"#;
+    let addr = canned_http_peer("200 OK", body, 1);
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = darkmux_cmd().env("DARKMUX_FLEET_FILE", &fleet_file).args(["machine", "status", "peer1"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("UNKNOWN"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// (#316 stage 4.5) This machine on an engine that does not report what it
+/// holds: exit 0, the engine named, not `lms_unreachable`.
+#[test]
+fn machine_status_local_engine_that_does_not_report_residency_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_PROFILES", &registry)
+        .env("DARKMUX_DEFAULT_ENGINE", "mlx")
+        .args(["machine", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["engine"], serde_json::json!({ "name": "mlx", "reports_residency": false, "usable": true }), "{v}");
+    assert_eq!(v["lms_unreachable"], true, "unknown, never empty: {v}");
+    assert_eq!(v["managed"], serde_json::json!([]), "{v}");
 }
 
 /// (#1426) A healthy peer read renders its residents partitioned by

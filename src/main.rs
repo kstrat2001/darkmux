@@ -1409,19 +1409,14 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
             fleet_cli::peer_reports(&value)
         ),
     };
-    if lms_unreachable {
-        if json {
-            cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string())))?;
-        } else {
-            eprintln!(
-                "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
-                 failed there): residents UNKNOWN, not empty. Check LMStudio + the \
-                 `lms` CLI on `{id}`."
-            );
-        }
-        return Ok(2);
+    let engine = peer_engine(id, &value)?;
+    if let Some(e) = engine.as_ref().filter(|e| e.usable && !e.reports_residency) {
+        return residents_not_reported(e, json, Some(id));
     }
-    let code = render_residents(&models, None, None, json, Some(id))?;
+    if lms_unreachable {
+        return peer_residents_unknown(id, engine, json);
+    }
+    let code = render_residents(&models, None, None, json, Some(id), engine.as_ref())?;
     if !json {
         println!();
         println!("{}", peer_utility_line(id));
@@ -1435,23 +1430,97 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
 /// "none bound" and never "resident".
 fn peer_utility_line(id: &str) -> String {
     let stated = fleet_cli::fetch_peer_json(id, "/machine/specs").ok().and_then(|specs| specs.get("utility_model").cloned());
+    // Printed only after the peer's `/machine/status` answered with a known
+    // resident list (the unknown cases return before it), so the residency
+    // here is a reading.
     match stated {
-        Some(v) => card_status::utility_line(serde_json::from_value::<darkmux_serve::wire::UtilityModel>(v).ok().as_ref()),
+        Some(v) => card_status::utility_line(serde_json::from_value::<darkmux_serve::wire::UtilityModel>(v).ok().as_ref(), true),
         None => format!("utility model: not reported by `{id}`; job: not shown here"),
     }
 }
 
-/// `machine status`'s line when this machine's engine could not say what
-/// it holds. (#316) An engine that does not report it is named as such; the
-/// JSON's wire shape for this is 4.5's (machine card and serve).
-fn residents_unknown_line(e: &anyhow::Error) -> String {
-    if engine::is_not_reported(e) {
-        return format!("this machine: {e}; residents UNKNOWN, not empty.");
+/// A peer whose resident list is not known: the unknown shape (`--json`) or
+/// the line naming why, exit 2.
+fn peer_residents_unknown(id: &str, engine: Option<darkmux_serve::wire::MachineEngine>, json: bool) -> Result<i32> {
+    if json {
+        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string()), engine))?;
+    } else {
+        eprintln!("{}", peer_unreachable_line(id, engine.as_ref()));
     }
-    format!(
-        "this machine: could not query LMStudio (`lms ps` failed here) — residents \
-         UNKNOWN, not empty. Check LMStudio + the `lms` CLI. ({e:#})"
-    )
+    Ok(2)
+}
+
+/// (#316) The peer's engine from its `/machine/status`; `None` from a peer
+/// older than 4.5 (LM Studio). Present but unreadable is refused like the
+/// resident list, never read as LM Studio.
+fn peer_engine(id: &str, value: &serde_json::Value) -> Result<Option<darkmux_serve::wire::MachineEngine>> {
+    let Some(e) = value.get("engine").filter(|e| !e.is_null()) else {
+        return Ok(None);
+    };
+    serde_json::from_value(e.clone())
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("machine `{id}` answered with an engine this darkmux does not read ({err})"))
+}
+
+/// A peer whose engine could not be asked: LM Studio's `lms`, or (#316) a
+/// default engine whose setting cannot be used there.
+fn peer_unreachable_line(id: &str, engine: Option<&darkmux_serve::wire::MachineEngine>) -> String {
+    match engine.filter(|e| !e.usable) {
+        Some(e) => format!(
+            "machine `{id}`: its default engine `{}` cannot be used there: residents UNKNOWN, not empty. \
+             `darkmux doctor` on `{id}` names why.",
+            e.name
+        ),
+        None => format!(
+            "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
+             failed there): residents UNKNOWN, not empty. Check LMStudio + the \
+             `lms` CLI on `{id}`."
+        ),
+    }
+}
+
+/// `machine status`'s line when this machine's engine could not be asked;
+/// `why` is the engine's own error.
+fn residents_unknown_line(engine: &darkmux_serve::wire::MachineEngine, why: &str) -> String {
+    if engine.usable {
+        return format!(
+            "this machine: could not query LMStudio (`lms ps` failed here) — residents \
+             UNKNOWN, not empty. Check LMStudio + the `lms` CLI. ({why})"
+        );
+    }
+    format!("this machine: {why}; residents UNKNOWN, not empty.")
+}
+
+/// `machine status` when this machine's resident list is not known: the
+/// unknown shape (`--json`) or the line naming why, exit 2.
+fn local_residents_unknown(engine: darkmux_serve::wire::MachineEngine, why: &str, json: bool) -> Result<i32> {
+    if json {
+        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(
+            darkmux_types::config_access::machine_id(),
+            Some(engine),
+        ))?;
+    } else {
+        eprintln!("{}", residents_unknown_line(&engine, why));
+    }
+    Ok(2)
+}
+
+/// (#316) `machine status` on an engine that does not report what it holds:
+/// said plainly, exit 0 (it is not a failure). The JSON is the unknown shape
+/// (`lms_unreachable: true`, empty lists) with the engine saying why.
+fn residents_not_reported(engine: &darkmux_serve::wire::MachineEngine, json: bool, remote_id: Option<&str>) -> Result<i32> {
+    if json {
+        let machine_id = remote_id.map(str::to_string).or_else(darkmux_types::config_access::machine_id);
+        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(machine_id, Some(engine.clone())))?;
+        return Ok(0);
+    }
+    let who = remote_id.map_or("this machine".to_string(), |id| format!("machine `{id}`"));
+    println!(
+        "{who}: its engine `{}` does not report which models it has loaded; residents not reported. \
+         It loads whichever model a request names.",
+        engine.name
+    );
+    Ok(0)
 }
 
 fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
@@ -1468,19 +1537,13 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
     // condition from a PEER gets a parseable object and rc 2. One host's
     // answer to "can you see LMStudio" should not depend on which side of
     // the fleet is asking. Same shape, same exit code, both branches.
-    let loaded = match engine::local().loaded() {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            if json {
-                cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(
-                    darkmux_types::config_access::machine_id(),
-                ))?;
-            } else {
-                eprintln!("{}", residents_unknown_line(&e));
-            }
-            return Ok(2);
-        }
-    };
+    let darkmux_serve::EngineResidents { engine: engine_view, models: loaded, unknown } = darkmux_serve::local_engine_residents();
+    if engine_view.usable && !engine_view.reports_residency {
+        return residents_not_reported(&engine_view, json, None);
+    }
+    if let Some(why) = unknown {
+        return local_residents_unknown(engine_view, &why, json);
+    }
     // Which registered profile(s) does the loaded set match? (The retired
     // top-level `status` verb's one unique dimension.)
     let (matches, registry_path): (Option<Vec<String>>, Option<String>) =
@@ -1507,10 +1570,10 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
             }
             Err(_) => (None, None),
         };
-    let code = render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None)?;
+    let code = render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None, Some(&engine_view))?;
     if !json {
         println!();
-        println!("{}", card_status::utility_line(darkmux_serve::local_utility_model(&loaded).as_ref()));
+        println!("{}", card_status::utility_line(darkmux_serve::local_utility_model(&loaded).as_ref(), true));
     }
     Ok(code)
 }
@@ -1524,6 +1587,7 @@ fn render_residents(
     registry_path: Option<&str>,
     json: bool,
     remote_id: Option<&str>,
+    engine: Option<&darkmux_serve::wire::MachineEngine>,
 ) -> Result<i32> {
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
@@ -1533,6 +1597,7 @@ fn render_residents(
         cli_json::emit(&cli_json::MachineStatusOutput {
             machine_id: remote_id.map(str::to_string).or_else(darkmux_types::config_access::machine_id),
             lms_unreachable: false,
+            engine: engine.cloned(),
             managed,
             user_state: user,
             matching_profiles: matches,

@@ -100,6 +100,10 @@ impl Engine for OpenAiCompatible {
         }
     }
 
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
     fn loaded(&self) -> Result<Vec<LoadedModel>> {
         Err(self.not_reported("which models it has loaded"))
     }
@@ -146,7 +150,7 @@ impl Engine for OpenAiCompatible {
     }
 
     fn ledger(&self) -> ModelLedger {
-        crate::model_ledger::gather_residents_unknown(&format!(
+        crate::model_ledger::gather_residents_not_reported(&format!(
             "{} does not report which models it has loaded",
             self.name
         ))
@@ -288,10 +292,13 @@ mod tests {
     fn ledger_says_residents_are_unknown_and_why() {
         let ledger = OpenAiCompatible::new("mlx", "http://127.0.0.1:9/v1").ledger();
         assert!(ledger.models.is_empty());
+        // (#316 stage 4.5) Said as information: nothing is wrong, so the
+        // machine page shows no WARN for it.
         assert!(
             ledger.messages.iter().any(|m| m
                 .text
-                .starts_with("mlx does not report which models it has loaded")),
+                .starts_with("mlx does not report which models it has loaded")
+                && m.severity == crate::model_ledger::Severity::Info),
             "{:?}",
             ledger.messages
         );

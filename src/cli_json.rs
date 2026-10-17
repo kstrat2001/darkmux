@@ -78,13 +78,17 @@ pub(crate) struct ProfileList<'a> {
 /// `machine status --json`, for this machine or a roster peer.
 ///
 /// When `lms_unreachable` is true the residents are UNKNOWN, not zero: both
-/// lists are empty and the exit code is 2. `matching_profiles` and `registry`
-/// are present only for a local read, which is the only one that reads this
-/// host's registry.
+/// lists are empty and the exit code is 2. (#316) `engine` says why: when its
+/// `reports_residency` is false (and it is `usable`) the engine does not say
+/// what it holds, which is not a failure, and the exit code is 0.
+/// `engine` is `null` for a peer older than 4.5 (whose engine is LM Studio).
+/// `matching_profiles` and `registry` are present only for a local read,
+/// which is the only one that reads this host's registry.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct MachineStatusOutput<'a> {
     pub machine_id: Option<String>,
     pub lms_unreachable: bool,
+    pub engine: Option<darkmux_serve::wire::MachineEngine>,
     pub managed: Vec<&'a LoadedModel>,
     pub user_state: Vec<&'a LoadedModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,11 +98,12 @@ pub(crate) struct MachineStatusOutput<'a> {
 }
 
 impl MachineStatusOutput<'_> {
-    /// The answer when LMStudio could not be queried.
-    pub(crate) fn lms_unreachable(machine_id: Option<String>) -> Self {
+    /// The answer when the engine could not be queried.
+    pub(crate) fn lms_unreachable(machine_id: Option<String>, engine: Option<darkmux_serve::wire::MachineEngine>) -> Self {
         MachineStatusOutput {
             machine_id,
             lms_unreachable: true,
+            engine,
             managed: Vec::new(),
             user_state: Vec::new(),
             matching_profiles: None,
@@ -782,10 +787,11 @@ mod tests {
     #[test]
     fn machine_status_answers_with_the_same_keys_whether_or_not_lms_answered() {
         let keys = |v: &serde_json::Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
-        let unreachable = serde_json::to_value(MachineStatusOutput::lms_unreachable(Some("studio".into()))).unwrap();
+        let unreachable = serde_json::to_value(MachineStatusOutput::lms_unreachable(Some("studio".into()), None)).unwrap();
         let answered = serde_json::to_value(MachineStatusOutput {
             machine_id: Some("studio".into()),
             lms_unreachable: false,
+            engine: None,
             managed: Vec::new(),
             user_state: Vec::new(),
             matching_profiles: None,

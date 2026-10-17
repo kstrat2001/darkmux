@@ -100,14 +100,44 @@ pub struct LiveIngestHealth {
 
 // ─── /machine/* ────────────────────────────────────────────────────────────
 
+/// (#316) The engine this machine's local models run on (`default_engine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct MachineEngine {
+    /// `lmstudio`, or the id of the endpoint `default_engine` names (for a
+    /// value that names no usable engine, that value).
+    pub name: String,
+    /// Whether the engine reports which models it holds. When `false` the
+    /// resident list beside this is empty because the engine was not asked,
+    /// never because nothing is loaded (an OpenAI-compatible server lists
+    /// what it would answer to, not what it holds).
+    pub reports_residency: bool,
+    /// `false` when `default_engine` names no usable engine (`darkmux doctor`
+    /// names why); every question to it is refused.
+    #[serde(default = "engine_usable_default")]
+    pub usable: bool,
+}
+
+fn engine_usable_default() -> bool {
+    true
+}
+
 /// `GET /machine/status`: the resident models.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineStatusResponse {
     pub models: Vec<LoadedModel>,
-    /// The `lms` binary could not be invoked.
+    /// The resident list is not known, so `models` is empty for that reason,
+    /// never because nothing is loaded. `engine` says why: it does not
+    /// report residency (`reports_residency: false`), its setting cannot be
+    /// used (`usable: false`), or it could not be asked (LM Studio: the `lms`
+    /// binary could not be invoked). A reader older than `engine` reads every
+    /// case as "unknown", which is true of each.
     pub lms_unreachable: bool,
+    /// (#316) This machine's engine.
+    pub engine: MachineEngine,
     #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
 }
@@ -145,7 +175,13 @@ pub struct MachineSpecsResponse {
     pub ram_free_for_ai_bytes: Option<u64>,
     pub cpu_brand: Option<String>,
     pub loaded_models: Vec<LoadedModel>,
+    /// As on `/machine/status`: the resident list is not known (`engine`
+    /// says why).
     pub lms_unreachable: bool,
+    /// (#316) This machine's engine; `null` from a darkmux before 4.5, whose
+    /// engine was always LM Studio.
+    #[serde(default)]
+    pub engine: Option<MachineEngine>,
     pub utility_model: Option<UtilityModel>,
     /// Whether this machine has a fleet hub (Redis) configured. A fact, never
     /// the URL: the hub's host is not something a card shows anyone (#3072).

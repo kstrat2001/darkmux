@@ -14,6 +14,7 @@
  * reads 0), so nothing appears or disappears as jobs start and end.
  */
 
+import { residentsKnown } from "../../lib/machineEngine";
 import { fmtC, memBytes } from "../../lib/format";
 import { sameUid, uidOf } from "../../lib/machineIdentity";
 import { UtilityResidency, utilityJobWord, utilityReading, utilityStrip, utilityUsageByJob, type UtilityStrip } from "../../lib/utilityJobs";
@@ -64,7 +65,7 @@ export function utilitySectionView(args: {
   const held = noSignal || unseen;
   const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
-  const reading = args.isLocal ? utilityReading(args.specs != null, args.specs?.utility_model) : utilityReading(false, null);
+  const reading = args.isLocal ? utilityReading(args.specs != null, args.specs?.utility_model, residentsKnown(args.specs)) : utilityReading(false, null);
   const strip = utilityStrip(args.data, args.uid, args.nowMs, reading);
   const win = binding?.n_ctx != null ? `window ${binding.n_ctx.toLocaleString("en-US")}` : "window —";
   const residency = !identityKnown
@@ -108,6 +109,8 @@ function residencyLine(residency: UtilityResidency, bytes: number | null): strin
       return `resident${bytes != null ? ` · ${memBytes(bytes)}` : ""}`;
     case UtilityResidency.NotLoaded:
       return "not loaded";
+    case UtilityResidency.NotReported:
+      return "residency not reported";
     case UtilityResidency.Unknown:
     case UtilityResidency.None:
       return "no utility model registered";

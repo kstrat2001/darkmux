@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import { UtilityResidency } from "../../lib/utilityJobs";
-import { machineIsHub, rowUtility, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { machineIsHub, rowUtility, specsLine, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -20,6 +20,7 @@ const SPECS: MachineSpecsResponse = {
   cpu_brand: "Apple M1 Max",
   loaded_models: [],
   lms_unreachable: false,
+  engine: null,
   utility_model: null,
   hub_configured: false,
   generated_at_ms: 0,
@@ -292,5 +293,17 @@ describe("rowUtility: the card's own statement of its utility model", () => {
   it("is the same whichever machine serves the page", () => {
     const m = withModel({ id: "m", loaded: true, n_ctx: null });
     expect(rowUtility({ ...m, is_this_machine: true })).toEqual(rowUtility({ ...m, is_this_machine: false }));
+  });
+});
+
+describe("(#316 stage 4.5) a card whose engine does not report residency", () => {
+  const specs: MachineSpecsResponse = { ...SPECS, lms_unreachable: true, engine: { name: "local-8080", reports_residency: false, usable: true }, utility_model: { id: "u4b", loaded: false, n_ctx: null } };
+  it("names the engine on the hardware line, and only a non-LM Studio one", () => {
+    expect(specsLine(specs)).toBe("Apple M1 Max · 32 GB · local-8080");
+    expect(specsLine(SPECS)).toBe("Apple M1 Max · 32 GB");
+  });
+  it("reads its utility model as not reported, never not loaded", () => {
+    const card = { specs } as unknown as MachineCard;
+    expect(rowUtility(row({ card: { state: "available", card, source: "listener" } })).residency).toBe(UtilityResidency.NotReported);
   });
 });

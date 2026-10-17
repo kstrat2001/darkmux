@@ -994,6 +994,71 @@
         assert!(failed.loaded_models.is_empty());
     }
 
+    /// Run `f` with each `(var, value)` set (`None` removes it), restoring after.
+    fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
+        let prev: Vec<_> = vars.iter().map(|(k, _)| (k.to_string(), std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            // SAFETY: callers are #[serial]; restored below.
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let out = f();
+        for (k, v) in prev {
+            // SAFETY: as above.
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        out
+    }
+
+    /// (#316 stage 4.5) The machine surfaces name this machine's engine, and
+    /// an engine that does not report what it holds reads as that, never as
+    /// unreachable (which painted an mlx machine broken) and never as an
+    /// empty machine. A setting naming no usable engine is unreachable.
+    #[test]
+    #[serial_test::serial]
+    fn the_machine_surfaces_name_the_engine_and_read_an_unreported_one_as_unreported() {
+        let tmp = TempDir::new().unwrap();
+        let registry = tmp.path().join("profiles.json");
+        fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
+        let bin = fake_lms_with_one_resident(tmp.path());
+        let on = |engine: &str| {
+            with_env(
+                &[
+                    ("DARKMUX_PROFILES", Some(registry.as_os_str())),
+                    ("DARKMUX_DEFAULT_ENGINE", Some(std::ffi::OsStr::new(engine))),
+                    ("DARKMUX_LMS_BIN", Some(bin.as_os_str())),
+                ],
+                || {
+                    let r = local_engine_residents();
+                    ((r.engine, r.models, r.unknown.is_some()), gather_specs())
+                },
+            )
+        };
+
+        let ((engine, models, unreachable), specs) = on("mlx");
+        assert_eq!(engine, wire::MachineEngine { name: "mlx".into(), reports_residency: false, usable: true });
+        // Unknown on the wire (`lms_unreachable`), so a reader older than
+        // `engine` never reads it as an empty machine; `engine` says why.
+        assert!(models.is_empty() && unreachable, "not reported is unknown, never empty");
+        assert_eq!((specs.engine, specs.lms_unreachable), (Some(engine), true));
+
+        let ((engine, models, unreachable), _) = on("lmstudio");
+        assert_eq!(engine, wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true });
+        assert_eq!((models.len(), unreachable), (1, false));
+
+        let ((engine, _, unreachable), _) = on("nope");
+        assert_eq!((engine.name.as_str(), engine.usable, unreachable), ("nope", false, true));
+    }
+
     // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
 
     /// GET /machine/resources returns the memory ledger with the fields the

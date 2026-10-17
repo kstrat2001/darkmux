@@ -356,6 +356,7 @@ describe("MachineDrawer (#2107)", () => {
           cpu_brand: "M5 Max",
           loaded_models: [],
           lms_unreachable: false,
+          engine: null,
           utility_model: null,
           hub_configured: false,
           generated_at_ms: NOW,
@@ -1760,6 +1761,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           cpu_brand: "Apple M5 Max",
           loaded_models: [],
           lms_unreachable: false,
+          engine: null,
           utility_model: null,
           hub_configured: false,
           generated_at_ms: NOW,
@@ -1817,6 +1819,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           cpu_brand: "Apple M5 Max",
           loaded_models: [],
           lms_unreachable: false,
+          engine: null,
           utility_model: null,
           hub_configured: false,
           generated_at_ms: NOW,
@@ -2019,6 +2022,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
       { identifier: "user:phi-4", model: "phi-4", status: "loaded", size: "9 GB", context: 16384 },
     ],
     lms_unreachable: false,
+    engine: null,
     utility_model: { id: "qwen3-4b-instruct-2507", loaded: true, n_ctx: null },
     hub_configured: false,
     generated_at_ms: NOW,
@@ -2174,5 +2178,41 @@ describe("MachineDrawer: a relayed dispatch describes the machine that ran it (5
     openDesktop();
     await waitFor(() => expect(screen.getByRole("dialog").textContent).toContain("M5 Max"));
     expect(screen.getByRole("dialog").textContent).toContain("MacBook-Pro");
+  });
+});
+
+describe("(#316 stage 4.5) Machine info names the engine", () => {
+  it("has an engine row saying what the engine does not report", () => {
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid="self-uid"
+        liveMachines={new Map()}
+        specs={{
+          darkmux_version: "5.2.0",
+          flow_schema_version: "2.2.0",
+          machine_id: "MacBook-Pro",
+          machine_uid: null,
+          os: "macOS",
+          ram_total_bytes: 137438953472,
+          ram_free_for_ai_bytes: null,
+          cpu_brand: "M5 Max",
+          loaded_models: [],
+          lms_unreachable: true,
+          engine: { name: "local-8080", reports_residency: false, usable: true },
+          utility_model: null,
+          hub_configured: false,
+          generated_at_ms: NOW,
+        }}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(screen.getByText("engine")).toBeInTheDocument();
+    expect(screen.getByText("local-8080 · does not report what it holds")).toBeInTheDocument();
   });
 });

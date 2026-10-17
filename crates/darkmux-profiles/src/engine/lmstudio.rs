@@ -25,6 +25,10 @@ impl Engine for LmStudio {
         }
     }
 
+    fn name(&self) -> String {
+        darkmux_types::default_engine::LMSTUDIO.to_string()
+    }
+
     fn loaded(&self) -> Result<Vec<LoadedModel>> {
         lms::list_loaded()
     }

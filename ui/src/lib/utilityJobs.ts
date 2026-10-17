@@ -324,6 +324,10 @@ function machineUtilityRecords(data: readonly NormRecord[], uid: string): NormRe
 export enum UtilityResidency {
   Resident = "resident",
   NotLoaded = "not_loaded",
+  /** (#316) The machine's resident list is not known (its engine does not
+   *  report it, cannot be used, or could not be asked), so whether the
+   *  utility model is loaded there is not known either. */
+  NotReported = "not_reported",
   Unknown = "unknown",
   None = "none",
 }
@@ -336,10 +340,18 @@ export interface UtilityReading {
 }
 
 /** The reading for a card. `model` is the card's `specs.utility_model`
- *  (`undefined`: the card states nothing). `read`: a card was read at all. */
-export function utilityReading(read: boolean, model: { id: string; loaded: boolean } | null | undefined): UtilityReading {
+ *  (`undefined`: the card states nothing). `read`: a card was read at all.
+ *  `residentsKnown`: (#316) the card's resident list is its engine's answer
+ *  (`!specs.lms_unreachable`); when it is not, `loaded: false` is not a
+ *  reading and the residency is `NotReported`. */
+export function utilityReading(
+  read: boolean,
+  model: { id: string; loaded: boolean } | null | undefined,
+  residentsKnown = true,
+): UtilityReading {
   if (!read || model === undefined) return { residency: UtilityResidency.Unknown, id: null };
   if (model === null) return { residency: UtilityResidency.None, id: null };
+  if (!model.loaded && !residentsKnown) return { residency: UtilityResidency.NotReported, id: model.id };
   return { residency: model.loaded ? UtilityResidency.Resident : UtilityResidency.NotLoaded, id: model.id };
 }
 

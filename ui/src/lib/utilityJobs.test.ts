@@ -11,6 +11,7 @@ import {
   utilityJobVisual,
   utilityUsageByJob,
   utilityReading,
+  UtilityResidency,
 } from "./utilityJobs";
 
 const M = "mach-a";
@@ -244,5 +245,13 @@ describe("utilityStrip: another machine's records never close this machine's job
     const own = start(1, UTILITY_JOB.compaction, { session_id: SID });
     const ownTurn = norm({ ts: at(5), action: ACTION.DispatchTurn, machine_uid: M, session_id: SID });
     expect(utilityStrip([own, ownTurn], M, ms(6), utilityReading(false, null)).job).toBeNull();
+  });
+});
+
+describe("utilityReading on an engine that does not report residency (#316 stage 4.5)", () => {
+  it("is NotReported, never NotLoaded, when the engine cannot say", () => {
+    expect(utilityReading(true, { id: "u4b", loaded: false }, false).residency).toBe(UtilityResidency.NotReported);
+    expect(utilityReading(true, { id: "u4b", loaded: false }).residency).toBe(UtilityResidency.NotLoaded);
+    expect(utilityReading(true, null, false).residency).toBe(UtilityResidency.None);
   });
 });

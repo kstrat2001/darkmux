@@ -2813,16 +2813,58 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// The engine's `loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
-    let result = tokio::task::spawn_blocking(|| engine::local().loaded()).await;
-    let (models, unreachable) = match result {
-        Ok(Ok(m)) => (m, false),
-        _ => (Vec::new(), true),
-    };
+    let result = tokio::task::spawn_blocking(local_engine_residents).await;
+    let r = result.unwrap_or_else(|_| EngineResidents::panicked());
     axum::Json(wire::MachineStatusResponse {
-        models,
-        lms_unreachable: unreachable,
+        lms_unreachable: r.unknown.is_some(),
+        models: r.models,
+        engine: r.engine,
         generated_at_ms: current_millis(),
     })
+}
+
+/// (#316) This machine's engine and what it holds.
+pub struct EngineResidents {
+    pub engine: wire::MachineEngine,
+    pub models: Vec<darkmux_types::LoadedModel>,
+    /// Why the resident list is not known (`models` is then empty for that
+    /// reason): the engine does not report it, cannot be used, or could not
+    /// be asked. `None` when `models` is the engine's answer.
+    pub unknown: Option<String>,
+}
+
+impl EngineResidents {
+    /// The read panicked: the engine was asked and gave no answer. It is not
+    /// said to be one that does not report (`reports_residency: true`), so
+    /// every reader says it could not be asked, never that it is fine.
+    fn panicked() -> Self {
+        EngineResidents {
+            engine: wire::MachineEngine {
+                name: darkmux_types::config_access::default_engine(),
+                reports_residency: true,
+                usable: true,
+            },
+            models: Vec::new(),
+            unknown: Some("the engine read failed".to_string()),
+        }
+    }
+}
+
+/// (#316) The ONE read behind `/machine/status`, `/machine/specs` (and so the
+/// card) and `darkmux machine status`: which engine, what it holds, and when
+/// that is not known, why. The wire's `lms_unreachable` is `unknown.is_some()`
+/// and `engine` names the reason, so no reader decides it again.
+pub fn local_engine_residents() -> EngineResidents {
+    let engine = engine::local();
+    let view = wire::MachineEngine {
+        name: engine.name(),
+        reports_residency: matches!(engine.capabilities().residency, engine::Residency::Reported),
+        usable: engine.usable(),
+    };
+    match engine.loaded() {
+        Ok(models) => EngineResidents { engine: view, models, unknown: None },
+        Err(e) => EngineResidents { engine: view, models: Vec::new(), unknown: Some(format!("{e:#}")) },
+    }
 }
 
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
@@ -2956,6 +2998,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
         cpu_brand: None,
         loaded_models: Vec::new(),
         lms_unreachable: true,
+        engine: Some(EngineResidents::panicked().engine),
         utility_model: None,
         hub_configured: false,
         generated_at_ms: current_millis(),
@@ -2966,10 +3009,8 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 /// ONE gather. Blocking (it shells out); each probe is independent, so one
 /// failure never cascades.
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let (loaded_models, lms_unreachable) = match engine::local().loaded() {
-        Ok(m) => (m, false),
-        Err(_) => (Vec::new(), true),
-    };
+    let residents = local_engine_residents();
+    let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = read_ram_total_bytes();
     let ram_free = read_ram_free_for_ai_bytes();
     let cpu_brand = read_cpu_brand();
@@ -3019,6 +3060,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
         cpu_brand,
         loaded_models,
         lms_unreachable,
+        engine: Some(engine),
         utility_model,
         hub_configured,
         generated_at_ms: current_millis(),
