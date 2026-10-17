@@ -19809,6 +19809,41 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }
 
+    /// (#3211 review F3) Only a 4xx about streaming itself is sent again
+    /// unstreamed: an older API version rejecting `stream_options`.
+    #[test]
+    fn only_a_refusal_of_the_stream_request_is_retried_unstreamed() {
+        let refusal = |status: u16, body: &str| match classify_hosted_response(Some(status), body.as_bytes()) {
+            Err(HostedCallError::Other(e)) => refused_stream_request(&e),
+            other => panic!("expected a terminal error, got {other:?}"),
+        };
+        assert!(refusal(400, r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#));
+        assert!(!refusal(400, r#"{"error":{"message":"maximum context length exceeded"}}"#));
+        assert!(!refusal(401, r#"{"error":{"message":"bad key"}}"#));
+        assert!(!refusal(500, r#"{"error":{"message":"stream broke"}}"#), "a 5xx is not a refusal");
+    }
+
+    /// (#3211 review F2) A stream cut off mid-way fails as an unanswered call:
+    /// charged as one the endpoint may have processed, never read as a reply.
+    #[test]
+    fn a_cut_off_stream_is_an_unanswered_call() {
+        let cut = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_vec();
+        match streamed_reply_as_chat(true, cut.clone()) {
+            Err(HostedCallError::Other(e)) => assert!(call_may_have_spent(&e), "{e:#}"),
+            other => panic!("expected an unanswered failure, got {other:?}"),
+        }
+        assert_eq!(streamed_reply_as_chat(false, cut.clone()).ok(), Some(cut), "an unstreamed call reads its body as before");
+    }
+
+    /// (#3211 review F6) A streamed reply is written as it arrives (`-N`), so
+    /// heartbeats are not held back by curl's output buffer.
+    #[test]
+    fn a_streamed_call_asks_curl_not_to_buffer() {
+        let cfg = std::path::Path::new("/tmp/x.curl");
+        assert!(curl_args(30, cfg, true).iter().any(|a| a == "-N"));
+        assert!(!curl_args(30, cfg, false).iter().any(|a| a == "-N"));
+    }
+
     /// (#3211) Run `dispatch_unmanaged` against a one-shot mock answering
     /// `reply`, at an endpoint described by `endpoint` (its `url` is set
     /// here). Returns the result, the session's flow records and the request

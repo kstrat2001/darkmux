@@ -3765,7 +3765,7 @@ fn follow_streamed_reply(
     let Some(on) = on else {
         return;
     };
-    let mut tail = crate::direct_stream::SseTail::default();
+    let mut tail = crate::direct_stream::SseTail::sent_at(Instant::now());
     let mut file = std::fs::File::open(body_path).ok();
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -3794,12 +3794,27 @@ fn curl_args(timeout_seconds: u32, cfg_path: &std::path::Path, streams: bool) ->
 }
 
 /// (#3211) A streamed reply, put back together as the unstreamed one; any
-/// other reply as it came.
-fn streamed_reply_as_chat(streams: bool, response: Vec<u8>) -> Vec<u8> {
+/// other reply as it came. A stream cut off before it finished is a call
+/// whose answer never came whole (`Unanswered`): failed, and charged as one
+/// the endpoint may have processed, never read as a complete reply.
+fn streamed_reply_as_chat(streams: bool, response: Vec<u8>) -> std::result::Result<Vec<u8>, HostedCallError> {
     if !streams {
-        return response;
+        return Ok(response);
     }
-    crate::direct_stream::assemble(&response).unwrap_or(response)
+    match crate::direct_stream::assemble(&response) {
+        None => Ok(response),
+        Some(Ok(reply)) => Ok(reply),
+        Some(Err(why)) => Err(HostedCallError::Other(failure(HostedFailure::Unanswered, why))),
+    }
+}
+
+/// (#3211) An endpoint refusing the streamed request itself: a 4xx naming
+/// `stream` (an older API version rejecting `stream_options`, a server with
+/// no streaming). Never charged (a 4xx was not processed), and asked again
+/// unstreamed.
+fn refused_stream_request(err: &anyhow::Error) -> bool {
+    let kind = err.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|e| e.kind);
+    matches!(kind, Some(HostedFailure::Rejected)) && format!("{err:#}").to_ascii_lowercase().contains("stream")
 }
 
 /// How often a streaming reply's file is read while curl writes it: well
@@ -3957,7 +3972,19 @@ fn remote_chat_attempt(
     }
     let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
     // (#3211) A streamed reply, put back together as the unstreamed one.
-    let response = streamed_reply_as_chat(streams, response);
+    finish_reply(streams, messages, status, response)
+}
+
+/// A finished call's reply, classified: (#3211) a streamed one put back
+/// together first, then a Messages one read as chat, then the HTTP status
+/// and the body decide ([`classify_hosted_response`]).
+fn finish_reply(
+    streams: bool,
+    messages: bool,
+    status: Option<u16>,
+    response: Vec<u8>,
+) -> std::result::Result<serde_json::Value, HostedCallError> {
+    let response = streamed_reply_as_chat(streams, response)?;
     let response = crate::messages_wire::reply_bytes_as_chat(messages, response);
     classify_hosted_response(status, &response)
 }
@@ -4359,17 +4386,21 @@ fn dispatch_unmanaged(
             let _ = darkmux_flow::record(build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, payload));
         },
     );
-    let req_body = evidence.body(single_shot_body(
+    let plain_body = single_shot_body(
         target.dialect,
         &pm.id,
         system_prompt,
         &opts.message,
         opts.max_completion_tokens,
         ep.reasoning_effort.as_deref(),
-    ));
+    );
 
     let t0 = SystemTime::now();
-    let resp = evidence.call(|progress| remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds, progress));
+    let (resp, req_body) = evidence.send(
+        plain_body,
+        |body, progress| remote_chat_completion(&url, auth.as_ref(), body, opts.timeout_seconds, progress),
+        refused_stream_request,
+    );
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
 
     let resp = match resp {
@@ -4408,7 +4439,7 @@ fn dispatch_unmanaged(
     // the envelope all take their numbers from `counts`.
     let reply = crate::single_shot::extract_reply(&resp);
     let counts = reply.counts.clone();
-    evidence.ended(&resp, &counts, wall_ms);
+    evidence.ended(&resp, &counts);
 
     // (#2902 step 1a) The one usage record for this one model call — before
     // the terminal, so a reader of the stream sees the call's cost no later
