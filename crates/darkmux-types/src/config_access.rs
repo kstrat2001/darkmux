@@ -490,9 +490,33 @@ pub fn lms_bin() -> String {
 /// Anchoring once, in the one accessor both read, makes them agree. A bare
 /// name (`lms`) stays a `PATH` lookup.
 pub fn lms_bin_with_source() -> (String, Source) {
-    let (v, s) = pick_string_with_source("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms"));
+    let (v, s) = pick_string_with_source("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some(LMS));
+    // (#3266) The bare name asks for a lookup, whichever tier set it (`init`
+    // writes `"lms_bin": "lms"` visibly), so the lookup's fallback applies to
+    // it; a path is used as given.
+    let v = v.filter(|v| v != LMS).unwrap_or_else(|| default_lms_bin(std::env::var_os("PATH").as_deref(), dirs::home_dir().as_deref()));
     let cwd = std::env::current_dir().ok();
-    (anchor_program_path(v.unwrap(), cwd.as_deref()), s)
+    (anchor_program_path(v, cwd.as_deref()), s)
+}
+
+/// The bare name `lms` is looked up (see [`default_lms_bin`]).
+const LMS: &str = "lms";
+
+/// (#3266) The bare `lms`, looked up: the bare name when it is on `path_var`, else
+/// LM Studio's own install (`~/.lmstudio/bin/lms`, where `lms bootstrap`
+/// puts it) when that exists, else the bare name so the failure names the
+/// tool. LM Studio adds its `PATH` line to `~/.zshrc`, which a daemon started
+/// by launchd or a `zsh -lc` login shell never reads; such a process read LM
+/// Studio as unreachable while a shell found it (the same split #2916 fixed
+/// for `tailscale`).
+fn default_lms_bin(path_var: Option<&std::ffi::OsStr>, home: Option<&std::path::Path>) -> String {
+    let on_path = path_var.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(LMS).is_file()));
+    if !on_path {
+        if let Some(installed) = home.map(|h| h.join(".lmstudio/bin/lms")).filter(|p| p.is_file()) {
+            return installed.to_string_lossy().into_owned();
+        }
+    }
+    LMS.to_string()
 }
 
 /// Joins a relative, path-bearing program value onto `cwd`; an absolute
@@ -3025,6 +3049,62 @@ mod tests {
         // No readable cwd (deleted worktree): nothing to anchor to, so the
         // value passes through rather than being invented.
         assert_eq!(anchor_program_path("./bin/lms".into(), None), "./bin/lms");
+    }
+
+    // ── (#3266) the built-in `lms` falls back to LM Studio's own install
+    //    location when no `lms` is on PATH: a daemon started by launchd (or a
+    //    `zsh -lc` login shell, which never reads the ~/.zshrc LM Studio adds
+    //    its PATH line to) otherwise read LM Studio as unreachable.
+    #[test]
+    fn the_default_lms_falls_back_to_lm_studios_install_when_not_on_path() {
+        let home = tempfile::tempdir().unwrap();
+        let on_path = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let installed = home.path().join(".lmstudio/bin/lms");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "").unwrap();
+        std::fs::write(on_path.path().join("lms"), "").unwrap();
+        let path = |d: &std::path::Path| std::ffi::OsString::from(d.as_os_str());
+
+        // Not on PATH, installed: the install's absolute path.
+        assert_eq!(default_lms_bin(Some(&path(empty.path())), Some(home.path())), installed.to_string_lossy());
+        assert_eq!(default_lms_bin(None, Some(home.path())), installed.to_string_lossy());
+        // On PATH: the bare name, as before.
+        assert_eq!(default_lms_bin(Some(&path(on_path.path())), Some(home.path())), "lms");
+        // Neither: the bare name, so the failure names the tool.
+        assert_eq!(default_lms_bin(Some(&path(empty.path())), Some(empty.path())), "lms");
+        assert_eq!(default_lms_bin(None, None), "lms");
+    }
+
+    // (#3266) `init` writes `"lms_bin": "lms"`, so the bare name from a
+    // configured tier still gets the fallback; a path is used as given.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_lms_from_any_tier_is_looked_up_and_a_path_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let installed = home.path().join(".lmstudio/bin/lms");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "").unwrap();
+        let saved: Vec<_> = ["DARKMUX_LMS_BIN", "PATH", "HOME"].iter().map(|k| (*k, std::env::var_os(k))).collect();
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("DARKMUX_LMS_BIN", "lms");
+        }
+        let bare = lms_bin_with_source();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/opt/lms") };
+        let given = lms_bin_with_source();
+        for (k, v) in saved {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(bare, (installed.to_string_lossy().into_owned(), Source::Env));
+        assert_eq!(given, ("/opt/lms".to_string(), Source::Env));
     }
 
     // (#2498) `pick_string` and `pick_string_with_source` are two
