@@ -5209,6 +5209,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5448,6 +5450,8 @@
             base_url_override: base_url,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         }
     }
 
@@ -5463,6 +5467,66 @@
         cfg.cache_dir = crate::dispatch_internal::shared_cache_dir_for(Some("laptop"));
         let remote = build_docker_run_argv(&cfg).join(" ");
         assert!(!remote.contains("darkmux-cache"), "{remote}");
+    }
+
+    /// (#3275) Docker Engine on Linux does not define `host.docker.internal`
+    /// (Docker Desktop does), so a container dialing the rewritten loopback URL
+    /// cannot resolve its host. When the platform answers `HostGateway` the
+    /// mapping is a docker-run OPTION, before the `--` fence; `Builtin` (what
+    /// macOS answers) leaves the argv exactly as it was.
+    #[test]
+    fn host_gateway_mapping_follows_the_platforms_answer() {
+        use darkmux_platform::{ContainerHostAccess, ContainerUser, FakePlatform, Platform};
+        let fake = |access| FakePlatform { container_host_access: access, container_user: ContainerUser::Image };
+        let flag = "--add-host=host.docker.internal:host-gateway".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+
+        cfg.container_host_access = fake(ContainerHostAccess::Builtin).container_host_access();
+        assert!(!build_docker_run_argv(&cfg).contains(&flag), "Builtin adds nothing");
+
+        cfg.container_host_access = fake(ContainerHostAccess::HostGateway).container_host_access();
+        let argv = build_docker_run_argv(&cfg);
+        let at = argv.iter().position(|a| *a == flag).expect("HostGateway adds the mapping");
+        let fence = argv.iter().position(|a| a == "--").expect("-- fence");
+        assert!(at < fence, "must be a docker-run option, not a runtime arg: {argv:?}");
+    }
+
+    /// (#3275) A host user runs the container as that user, with a HOME it
+    /// can write (the image's home belongs to its own uid); the image's user
+    /// leaves the argv exactly as it was. Both are docker-run OPTIONS.
+    #[test]
+    fn container_user_follows_the_resolved_answer() {
+        use darkmux_platform::ContainerUser;
+        let mut cfg = argv_config_with_base_url(None);
+        let image = build_docker_run_argv(&cfg);
+        assert!(!image.iter().any(|a| a.starts_with("--user")), "Image adds no --user: {image:?}");
+        assert!(!image.iter().any(|a| a == "HOME=/tmp"), "Image keeps the image's HOME");
+
+        cfg.container_user = ContainerUser::Host { uid: 1001, gid: Some(1002) };
+        let argv = build_docker_run_argv(&cfg);
+        let fence = argv.iter().position(|a| a == "--").expect("-- fence");
+        let user = argv.iter().position(|a| a == "--user=1001:1002").expect("--user for a host user");
+        let home = argv.iter().position(|a| a == "HOME=/tmp").expect("a writable HOME");
+        assert_eq!(argv[home - 1], "-e");
+        assert!(user < fence && home < fence, "docker-run options, not runtime args: {argv:?}");
+    }
+
+    /// (#3275) An operator override wins over the platform's answer; with
+    /// none, the platform decides; a value that doesn't parse refuses,
+    /// naming the setting, rather than falling back to anything.
+    #[test]
+    fn an_override_wins_over_the_platform_and_a_bad_one_refuses() {
+        use crate::dispatch_internal::resolve_container_user;
+        use darkmux_platform::{ContainerHostAccess, ContainerUser, FakePlatform};
+        let linux_like = FakePlatform {
+            container_host_access: ContainerHostAccess::HostGateway,
+            container_user: ContainerUser::Host { uid: 1001, gid: Some(1001) },
+        };
+        assert_eq!(resolve_container_user(None, &linux_like).unwrap(), ContainerUser::Host { uid: 1001, gid: Some(1001) });
+        assert_eq!(resolve_container_user(Some("image"), &linux_like).unwrap(), ContainerUser::Image);
+        assert_eq!(resolve_container_user(Some("1000"), &linux_like).unwrap(), ContainerUser::Host { uid: 1000, gid: None });
+        let err = resolve_container_user(Some("root"), &linux_like).unwrap_err().to_string();
+        assert!(err.contains("runtime.container_user") && err.contains("DARKMUX_CONTAINER_USER"), "{err}");
     }
 
     /// The value following `--base-url` in `argv`, if the flag is present.
@@ -5680,6 +5744,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5806,6 +5872,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5866,6 +5934,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         }
     }
 
@@ -7569,6 +7639,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);
@@ -14320,6 +14392,8 @@
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
+            container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
+            container_user: darkmux_platform::ContainerUser::Image,
         };
         let argv = build_docker_run_argv(&config);
         let flag = argv

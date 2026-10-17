@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt", "crates/darkmux-trajectory"]
+members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-platform", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt", "crates/darkmux-trajectory"]
 # runtime/ is a separate crate with its own Cargo.lock; it stays out of the
 # workspace per #463 ("stays as-is"). plugins/darkmux-bundler-rust is a
 # genuinely standalone Cargo project (its own [workspace] table, zero
@@ -79,6 +79,7 @@ darkmux-flow = { path = "crates/darkmux-flow" }
 darkmux-profiles = { path = "crates/darkmux-profiles" }
 darkmux-crew = { path = "crates/darkmux-crew" }
 darkmux-hardware = { path = "crates/darkmux-hardware" }
+darkmux-platform = { path = "crates/darkmux-platform" }
 darkmux-heuristics = { path = "crates/darkmux-heuristics" }
 darkmux-eureka = { path = "crates/darkmux-eureka" }
 darkmux-fleet = { path = "crates/darkmux-fleet" }

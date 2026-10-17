@@ -2457,6 +2457,47 @@ pub struct DockerRunConfig {
     /// exists before setting this — the runtime fails loudly (exit 2)
     /// rather than silently starting fresh on a missing/corrupt one.
     pub resume_checkpoint: bool,
+    /// (#3275) How the container reaches this machine as
+    /// `host.docker.internal`, the name [`loopback_to_docker_host`] rewrites
+    /// to: the platform's answer (`darkmux_platform`). `HostGateway` adds
+    /// `--add-host=host.docker.internal:host-gateway`; `Builtin` adds nothing.
+    pub container_host_access: darkmux_platform::ContainerHostAccess,
+    /// (#3275) Which user the container runs as, from
+    /// [`resolve_container_user`]: the operator's override, else the
+    /// platform's answer. `Host` adds `--user=<uid>[:<gid>]` and
+    /// `-e HOME=/tmp` (the image's home belongs to the image's own uid);
+    /// `Image` adds nothing.
+    pub container_user: darkmux_platform::ContainerUser,
+}
+
+/// (#3275) Which user the dispatch container runs as: the operator's
+/// override (`runtime.container_user` / `DARKMUX_CONTAINER_USER`) when set,
+/// else `platform`'s answer. An override that doesn't parse refuses the
+/// dispatch, naming the setting, rather than falling back.
+pub(crate) fn resolve_container_user(
+    override_value: Option<&str>,
+    platform: &dyn darkmux_platform::Platform,
+) -> Result<darkmux_platform::ContainerUser> {
+    match override_value {
+        None => Ok(platform.container_user()),
+        Some(v) => darkmux_platform::ContainerUser::parse(v).map_err(|why| {
+            anyhow!("runtime.container_user (or DARKMUX_CONTAINER_USER): {why}")
+        }),
+    }
+}
+
+/// (#3275) The `docker run` flags the platform's answers call for:
+/// `host.docker.internal` mapped when the platform says to, and the resolved
+/// user (with a `HOME` it owns). Both fields' docs say when each applies.
+fn platform_docker_args(config: &DockerRunConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway {
+        args.push("--add-host=host.docker.internal:host-gateway".to_string());
+    }
+    if let Some(user) = config.container_user.docker_user() {
+        args.extend([format!("--user={user}"), "-e".to_string(), "HOME=/tmp".to_string()]);
+    }
+    args
 }
 
 impl DockerRunConfig {
@@ -2605,6 +2646,8 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         args.push("-e".to_string());
         args.push(format!("DARKMUX_MAX_PAUSE_MS={max_pause_ms}"));
     }
+
+    args.extend(platform_docker_args(config));
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -7588,6 +7631,11 @@ fn container_run_config(
         // checkpoint into `host_out` when `opts.resume_from` is `Some` —
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
+        container_host_access: darkmux_platform::current().container_host_access(),
+        container_user: resolve_container_user(
+            darkmux_types::config_access::container_user_override().as_deref(),
+            darkmux_platform::current(),
+        )?,
         remote_chat_url: agentic_brain.0,
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing

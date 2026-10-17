@@ -704,6 +704,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-serve",
  "darkmux-trajectory",
@@ -733,6 +734,7 @@ dependencies = [
  "darkmux-flow",
  "darkmux-gestalt",
  "darkmux-hardware",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-trajectory",
  "darkmux-types",
@@ -761,6 +763,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
@@ -877,6 +880,10 @@ dependencies = [
  "tempfile",
  "ts-rs",
 ]
+
+[[package]]
+name = "darkmux-platform"
+version = "5.2.0"
 
 [[package]]
 name = "darkmux-profiles"

@@ -164,6 +164,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (5.0) Informational stderr lines on an interactive terminal; see
     // `darkmux_types::diagnostics`.
     ("runtime.verbose", Ty::Bool),
+    // (#3275) A string: a bare uid stays `"1000"`, the field is a string.
+    ("runtime.container_user", Ty::Str),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
@@ -468,7 +470,18 @@ fn names_the_answering_seat(key: &str) -> bool {
 /// address or an engine is checked before it is written.
 fn check_value(key: &str, value: &str) -> Result<()> {
     check_answering_seat(key, value)?;
-    check_default_engine(key, value)
+    check_default_engine(key, value)?;
+    check_container_user(key, value)
+}
+
+/// (#3275) `runtime.container_user` is `image`, `<uid>` or `<uid>:<gid>`;
+/// anything else is refused here, before it is written, as every dispatch
+/// would refuse it after.
+fn check_container_user(key: &str, value: &str) -> Result<()> {
+    if key != "runtime.container_user" {
+        return Ok(());
+    }
+    darkmux_platform::ContainerUser::parse(value).map(|_| ()).map_err(|why| anyhow!("invalid value for `{key}`: {why}"))
 }
 
 fn check_answering_seat(key: &str, value: &str) -> Result<()> {
@@ -890,6 +903,29 @@ mod tests {
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(cfg.redis.unwrap().port, Some(6380));
         assert_eq!(cfg.runtime.unwrap().turn_delay_ms, Some(3000));
+    }
+
+    /// (#3276 re-review F2) A value every dispatch would refuse is refused
+    /// before it is written, as `default_engine`'s is.
+    #[test]
+    fn container_user_refuses_a_value_that_does_not_parse() {
+        let f = tmp();
+        let err = set_at(f.path(), "runtime.container_user", "garbage").unwrap_err().to_string();
+        assert!(err.contains("runtime.container_user") && err.contains("`garbage`"), "{err}");
+        assert!(!std::fs::read_to_string(f.path()).unwrap_or_default().contains("garbage"), "nothing written");
+    }
+
+    /// (#3276 review F1) `runtime.container_user` is settable, and kept a
+    /// string (a bare uid is not coerced to a number: the field is a string).
+    #[test]
+    fn container_user_is_settable_as_a_string() {
+        let f = tmp();
+        let p = f.path();
+        for v in ["1000:1000", "1000", "image"] {
+            set_at(p, "runtime.container_user", v).unwrap();
+            let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            assert_eq!(cfg.runtime.unwrap().container_user.as_deref(), Some(v));
+        }
     }
 
     /// (#2094) `runtime.turn_delay_ms` rejects a non-integer value the same

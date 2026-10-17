@@ -14,6 +14,7 @@ darkmux-types = { path = "../darkmux-types" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 darkmux-crew = { path = "../darkmux-crew" }
+darkmux-platform = { path = "../darkmux-platform" }
 darkmux-eureka = { path = "../darkmux-eureka" }
 darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-heuristics = { path = "../darkmux-heuristics" }

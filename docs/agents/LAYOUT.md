@@ -65,6 +65,7 @@ crates/
   darkmux-doctor/             `darkmux doctor` checks
   darkmux-eureka/             Rules engine (RULES_SCHEMA_VERSION)
   darkmux-hardware/ darkmux-heuristics/  Apple-Silicon tier detection + heuristics providers
+  darkmux-platform/           Platform strategies: one `Platform` impl per host OS (macos/, linux/, other/, fake/); the only crate that names an OS (`os-gates.allow` ratchet)
 runtime/                      Internal-runtime crate (built into the darkmux-runtime Docker image; NOT a workspace member)
   src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring
   src/compaction.rs           Narrative + structured-slot compaction; JSON repair; escalation

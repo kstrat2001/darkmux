@@ -1,0 +1,29 @@
+# OS gates (`target_os`, `consts::OS`) that predate darkmux-platform, per file.
+# The ratchet test (src/os_gates.rs) fails if a file gains one, or a new file has
+# one: put the platform difference behind a `Platform` method instead. It also
+# fails if a count drops, so moving a gate into the platform crate lowers its
+# line here in the same commit. This list only shrinks.
+crates/darkmux-crew/src/contained_file.rs 6
+crates/darkmux-crew/src/host_probe/battery.rs 4
+crates/darkmux-crew/src/host_probe/iokit.rs 1
+crates/darkmux-crew/src/host_probe/ioreport.rs 2
+crates/darkmux-crew/src/host_probe/mach_cpu.rs 5
+crates/darkmux-crew/src/host_probe/mod.rs 18
+crates/darkmux-crew/src/host_probe/power_posture.rs 5
+crates/darkmux-crew/src/host_probe/thermal.rs 3
+crates/darkmux-crew/src/sleep_assertion.rs 8
+crates/darkmux-crew/src/telemetry_sampler.rs 1
+crates/darkmux-crew/tests/dispatch_boundary.rs 1
+crates/darkmux-doctor/src/checks_power.rs 3
+crates/darkmux-doctor/src/lib.rs 2
+crates/darkmux-flow/src/lib.rs 7
+crates/darkmux-hardware/src/lib.rs 4
+crates/darkmux-lab/src/lab/cow_clone.rs 1
+crates/darkmux-lab/src/lab/sandbox_hash.rs 1
+crates/darkmux-profiles/src/gestalt_host/mac_probe.rs 9
+crates/darkmux-profiles/src/model_ledger.rs 4
+crates/darkmux-serve/src/lib.rs 7
+crates/darkmux-types/src/residency_lease.rs 5
+crates/darkmux-types/src/workdir.rs 2
+src/fleet_cli.rs 1
+src/init.rs 1

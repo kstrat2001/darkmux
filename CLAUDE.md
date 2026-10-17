@@ -73,6 +73,7 @@ Full text: `docs/agents/DOCTRINE.md`.
 
 - **Don't add dependencies casually.** The dep set is deliberately small (`anyhow`, `clap`, `serde`, `serde_json`, `dirs`). A 10-line inline module beats a crate for small one-off needs.
 - **Trait providers, not feature flags.** New workload kinds go through the `WorkloadProvider` trait in `crates/darkmux-lab/src/workloads/types.rs`, registered in `register_builtins()` in `crates/darkmux-lab/src/providers/mod.rs`. Don't bolt new behavior into the lab orchestrator.
+- **OS differences live in `darkmux-platform`.** Business logic asks `darkmux_platform::current()` a question (a `Platform` method returning data) and never names an OS. A new `target_os` / `consts::OS` outside that crate fails the `os-gates.allow` ratchet. Rules: `crates/darkmux-platform/CLAUDE.md`.
 - **Manifests are JSON.** Workload manifests, profile registries, run manifests — all JSON. The repo briefly used YAML; that switch is done. Don't reintroduce YAML.
 - **Tests over prints.** Mutating-state tests (cwd, env vars) need `#[serial_test::serial]` to avoid races. Integration tests in `tests/cli.rs` use `assert_cmd` to spawn the binary.
 
@@ -96,6 +97,7 @@ Full text: `docs/agents/DOCTRINE.md`.
 | StepKind tiering | `crates/darkmux-crew/src/step_kinds/CLAUDE.md` |
 | Versioning: rules schema | `crates/darkmux-eureka/CLAUDE.md` |
 | Fleet networking | `crates/darkmux-fleet/CLAUDE.md` |
+| Platform strategies (per-OS behavior) | `crates/darkmux-platform/CLAUDE.md` |
 | Model-facing prompt construction | `templates/builtin/CLAUDE.md` (and `runtime/CLAUDE.md`) |
 | Verifying a viewer change | `ui/CLAUDE.md` |
 
