@@ -218,6 +218,12 @@ One config key, **`default_engine`**: the engine `engine::local()` returns on th
 
 `init` records the choice once, rather than dispatch re-detecting on every run: an engine that happens to be down one morning must not silently move the machine to another one. A down default engine is an error that names it, with the command to start it.
 
+**As built (stage 4.4, `src/init_engine.rs`).** Three points the plan above left open:
+
+- **Once means the config `init` creates.** A re-run against an existing `config.json` keeps the engine it names and probes no other server; `darkmux init --engine-url <url>` is how the operator records another (it probes that address alone, and is chosen without asking when it answers).
+- **Only endpoints on this machine are probed.** A registry endpoint is a candidate when it is unmanaged, not the Messages dialect, and its URL names this machine (`url_names_this_machine`, the data boundary's test). A hosted API or a LAN peer is never this machine's engine, and init sends it nothing; `--engine-url` names any address explicitly.
+- **What a new endpoint is called and speaks.** `local-<port>` (`local-engine` without a port, `-2` and on when taken), dialect `chat-completions-max-tokens`, the cap field `mlx_lm.server` reads.
+
 ### 9.3 What else reads it
 
 | Surface | With `default_engine` set to a non-LM Studio engine |
