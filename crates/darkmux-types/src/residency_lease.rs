@@ -929,7 +929,10 @@ mod tests {
     #[test]
     fn the_start_time_of_pid_1_is_readable_from_an_unprivileged_process() {
         let a = process_start_stamp(1).expect("pid 1's start time must be readable across users");
-        assert!(a > 0);
+        // pid 1's stamp may be 0 (ticks since boot, where boot is tick 0); the
+        // lease only compares stamps for equality. A process started after
+        // boot, this one, stamps above 0 everywhere.
+        assert!(process_start_stamp(std::process::id()).expect("own start time") > 0);
         assert_eq!(process_start_stamp(1), Some(a), "stable across reads");
     }
 

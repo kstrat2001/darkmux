@@ -682,7 +682,7 @@ darkmux was built on macOS, and its host facts came from macOS tools: `sysctl`, 
 
 **macOS behavior does not change.** A Mac answer is the code darkmux already runs there, moved behind the trait and not rewritten, so the existing suite and the macOS CI lane hold it. `OtherPlatform` answers what darkmux did before the crate existed, so an OS with no strategy of its own changes nothing.
 
-**Every strategy compiles everywhere.** Each module is ordinary Rust on every OS, so each one's answers are unit-tested on Linux CI and on a Mac alike. An OS-only call inside a strategy (a sysctl, a `/proc` read) is `cfg`-gated at that leaf, with its parsing compiled everywhere, the shape `gestalt_host::mac_probe` already uses. Tests that need a specific answer use `FakePlatform`, whose every answer the test sets.
+**Every strategy compiles everywhere.** Each module is ordinary Rust on every OS, so each one's answers are unit-tested on Linux and on a Mac alike. An OS-only call inside a strategy (a sysctl, a `/proc` read) is `cfg`-gated at that leaf, with its parsing compiled everywhere, the shape `gestalt_host::mac_probe` already uses. Tests that need a specific answer use `FakePlatform`, whose every answer the test sets.
 
 **The rule is held by a ratchet, not by this paragraph.** Outside the crate, a line naming the OS (`target_os`, `consts::OS`) is allowed only where one already was when platform strategies arrived: `crates/darkmux-platform/os-gates.allow` lists those per file (100 lines in 23 files at the start). `os_differences_stay_in_the_platform_crate` fails when a file gains one, naming the fix, and when a file loses one until its count is lowered, so the list records the migration and only shrinks.
 
