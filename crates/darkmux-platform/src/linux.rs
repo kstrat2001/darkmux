@@ -47,6 +47,8 @@ fn host_ids() -> Option<(u32, u32)> {
 
 /// The effective uid and gid from `/proc/<pid>/status` (`Uid:` and `Gid:`
 /// list real, effective, saved and filesystem ids; the second is effective).
+/// Compiled everywhere and tested everywhere; only Linux calls it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn ids_from_status(status: &str) -> Option<(u32, u32)> {
     let effective = |key: &str| {
         status

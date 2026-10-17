@@ -81,7 +81,6 @@ mod tests {
         assert!(host.message.contains("1000:1000"), "{}", host.message);
     }
 
-    #[test]
     /// (#3276 re-review F1) The row names the tier the value came from: an
     /// env value is never credited to the config key.
     #[test]
