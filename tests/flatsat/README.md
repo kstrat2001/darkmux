@@ -71,9 +71,9 @@ available (flow-record attribution stays static while the peer is frozen)
 and documents the gap inline. Real fix shape: a non-macOS `machine_uid`
 fallback (e.g. `/etc/machine-id`) so presence has something to key on off
 a Mac — named as a follow-up, not fixed here (out of this packet's scope).
-(omarchy branch: `darkmux_platform::Platform::machine_uid` now answers
+(#3275: `darkmux_platform::Platform::machine_uid` now answers
 `/etc/machine-id` on Linux, so a container with one gets a presence
-heartbeat; this scenario's `test.fixme` can be revisited once that lands.)
+heartbeat; this scenario's `test.fixme` can be revisited.)
 
 Every scenario asserts render-sanity (main `#stage` region visible with
 non-trivial height, no horizontal document scroll at phone width, zero

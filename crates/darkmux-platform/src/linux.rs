@@ -130,6 +130,7 @@ fn read_machine_id() -> Option<String> {
 
 /// A machine id is 32 lowercase hex characters (`machine-id(5)`); anything
 /// else (empty, `uninitialized` during first boot) is no identity.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_machine_id(contents: &str) -> Option<String> {
     let id = contents.trim();
     let valid = id.len() == 32
