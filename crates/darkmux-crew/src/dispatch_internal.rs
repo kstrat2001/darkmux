@@ -4073,17 +4073,6 @@ pub(crate) fn classify_hosted_response(
 /// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs`'s tests reuse
 /// this classification directly rather than re-deriving the error-shape
 /// corpus (401/429/503/array-shaped/malformed/contentless).
-/// The HTTP status a Messages `error.type` is sent with when it is not inside
-/// a stream: `overloaded_error` 529, `rate_limit_error` 429, `api_error` 500.
-fn messages_error_status(err: &serde_json::Value) -> Option<u64> {
-    match err.get("type")?.as_str()? {
-        "overloaded_error" => Some(529),
-        "rate_limit_error" => Some(429),
-        "api_error" => Some(500),
-        _ => None,
-    }
-}
-
 pub(crate) fn parse_hosted_response(
     stdout: &[u8],
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
@@ -4144,6 +4133,17 @@ pub(crate) fn parse_hosted_response(
         )));
     }
     Ok(resp)
+}
+
+/// The HTTP status a Messages `error.type` is sent with when it is not inside
+/// a stream: `overloaded_error` 529, `rate_limit_error` 429, `api_error` 500.
+fn messages_error_status(err: &serde_json::Value) -> Option<u64> {
+    match err.get("type")?.as_str()? {
+        "overloaded_error" => Some(529),
+        "rate_limit_error" => Some(429),
+        "api_error" => Some(500),
+        _ => None,
+    }
 }
 
 /// (#2902 step 1a) Emit one single-shot call's usage record through the
