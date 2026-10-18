@@ -23,6 +23,7 @@ pub mod test_redis;
 mod bookend;
 mod hub_link;
 mod hub_route;
+pub use hub_route::is_prompt_phase_heartbeat;
 mod integrity;
 mod schema;
 mod status;
@@ -1637,8 +1638,8 @@ impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
         // (#2101, #3210) Heartbeats stay local except a turn's prompt-phase
-        // ones (its opener and the engine's prefill reports before anything
-        // is generated): at a 2 s cadence every beat flushed other machines'
+        // ones (its opener and the engine's prefill reports before the
+        // reply's first chunk): at a 2 s cadence every beat flushed other machines'
         // work out of the capped stream, and only the prefill's say how far
         // a peer has read its prompt. (#3074, contract 3) A lab run's records
         // stay local. One rule, shared with the outage backfill: `hub_route`.

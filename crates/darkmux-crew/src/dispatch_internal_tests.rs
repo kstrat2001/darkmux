@@ -12518,6 +12518,47 @@
         assert_eq!(heartbeats_in(&isolated.path().join("flows")).len(), beats_after_first, "a repeated count wrote a durable heartbeat");
     }
 
+    /// (#3210, PR #3293 review) What the tailer writes after a turn's prefill
+    /// never rides the hub, even while the runtime counts nothing generated
+    /// (a reasoning field it did not read): an opener, the final report, then
+    /// 30 chunks at `generated_chars: 0` carrying the turn's count, each with
+    /// the 2 s window open. Only the opener and the report are prompt-phase.
+    #[test]
+    #[serial]
+    fn tailer_chunks_after_the_prefill_are_never_prompt_phase() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":2516,"total":2516}"#);
+        state.poll_and_emit();
+        for i in 1..=30u64 {
+            state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+            append(&format!(r#"{{"type":"model.partial","seq":3,"partial_index":{i},"cumulative_chars":0,"generated_chars":0,"ts":{}}}"#, 1_758_700_009_000u64 + i * 2000));
+            state.poll_and_emit();
+        }
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 32, "every chunk wrote a durable beat: {}", beats.len());
+        let prompt_phase: Vec<&serde_json::Value> = beats
+            .iter()
+            .filter(|b| darkmux_flow::is_prompt_phase_heartbeat(&serde_json::from_value(b["payload"].clone()).unwrap()))
+            .collect();
+        assert_eq!(prompt_phase.len(), 2, "only the opener and the report travel, not {} of 32", prompt_phase.len());
+        assert!(prompt_phase[0]["payload"].get("prompt_chars").is_some());
+        assert_eq!(prompt_phase[1]["payload"]["prompt_processed"], 2516);
+    }
+
     /// (#3210) Coalescing keeps the LATEST progress, not the first: reports
     /// held back by the 2 s window ride on the turn's next heartbeat, and a
     /// new stream (a new turn, or a continuation of the same one) starts

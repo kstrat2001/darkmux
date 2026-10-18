@@ -8,8 +8,10 @@
 //! `dispatch.turn.heartbeat` stays off the hub (#2101: at a 2 s cadence the
 //! heartbeats flushed other machines' work out of the capped stream). One
 //! kind of heartbeat is the exception, decided by its payload
-//! ([`is_prompt_phase_heartbeat`], #3210): a heartbeat from a turn's prefill,
-//! which is the only record that says how far a machine has read its prompt.
+//! ([`is_prompt_phase_heartbeat`], #3210): a turn's opener, or a prefill
+//! report written before the reply's first chunk, the only records that say
+//! how far a machine has read its prompt. A beat that read a chunk never
+//! travels.
 //! Without it another machine's card cannot show the prompt bar. And a lab
 //! run's records never reach the hub, whatever their action (#3074,
 //! contract 3).
@@ -18,23 +20,30 @@ use crate::payload::DispatchHeartbeatPayload;
 use crate::{FlowAction, FlowRecord, HubStream, Payload};
 
 /// (#3210) Whether a heartbeat was written while the turn was still reading
-/// its prompt, which is the only kind of heartbeat that rides the hub. Nothing
-/// generated yet (`generated_chars` is 0), and either:
+/// its prompt, which is the only kind of heartbeat that rides the hub. The
+/// rule is structural: the beat read no chunk of the reply (no
+/// `partial_index`), nothing was generated (`generated_chars` is 0), and it
+/// is either:
 ///
 /// - the turn's opener, the one heartbeat that carries `prompt_chars` (the
-///   request's size; one per turn, written before the request is sent), or
+///   request's size; one per stream, written before the request is sent), or
 /// - an engine's prefill progress report (`prompt_processed` of
-///   `prompt_total`).
+///   `prompt_total`) written before the first chunk.
 ///
-/// A beat written after generation starts also carries the turn's latest
-/// progress count, so "carries a count" alone would send every 2 s beat of a
-/// turn to the hub; the zero-generated condition is what keeps those local.
-/// A beat that does not say how much was generated (`generated_chars` null,
-/// an older runtime) stays local.
-pub(crate) fn is_prompt_phase_heartbeat(p: &DispatchHeartbeatPayload) -> bool {
+/// A beat that read a chunk never travels, whatever its `generated_chars`
+/// says: every beat after the prefill carries the turn's final count, and a
+/// count of 0 generated is not proof the reply has not started (#3293
+/// review: a reasoning field or tool-call arguments a reader did not count
+/// left it at 0, and every 2 s beat matched). Every writer marks a beat that
+/// read a chunk with `partial_index`: the tailer's chunk and writing-tick
+/// beats (`dispatch_internal.rs` `Chunk::of_partial` / `of_writing`), and
+/// the direct path's `chunk_beat` once a chunk was read. The opener and the
+/// tailer's progress beat (`Chunk::of_progress`) carry none. A beat that does
+/// not say how much was generated (`generated_chars` null) stays local.
+pub fn is_prompt_phase_heartbeat(p: &DispatchHeartbeatPayload) -> bool {
     let opener = p.prompt_chars.is_some();
     let progress = p.prompt_processed.is_some() && p.prompt_total.is_some();
-    p.generated_chars == Some(0) && (opener || progress)
+    p.partial_index.is_none() && p.generated_chars == Some(0) && (opener || progress)
 }
 
 /// The hub stream a record rides, `None` when it stays local. The one rule;
@@ -122,6 +131,11 @@ mod tests {
         let mut unsaid = progress_before_generation();
         unsaid["generated_chars"] = serde_json::Value::Null;
         assert!(!is_prompt_phase_heartbeat(&typed(unsaid)), "a beat that does not say what was generated");
+        assert!(
+            !is_prompt_phase_heartbeat(&typed(json!({"turn_seq": 2, "partial_index": 1, "cumulative_chars": 0, "sampled_at_ms": 5,
+                "generated_chars": 0, "prompt_processed": 2516, "prompt_total": 2516}))),
+            "a beat that read a chunk, whatever it says was generated (#3293 review: reasoning the runtime did not count)"
+        );
         let mut half = progress_before_generation();
         half.as_object_mut().unwrap().remove("prompt_total");
         assert!(!is_prompt_phase_heartbeat(&typed(half)), "a count with no total");

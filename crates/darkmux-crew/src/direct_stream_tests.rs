@@ -335,3 +335,22 @@ fn a_heartbeat_carries_the_prefill_progress_fact() {
 fn a_stream_with_prefill_progress_reassembles_to_the_same_reply() {
     assert_eq!(ok(&format!("{MLX_PREFILL}{SSE}")), ok(SSE));
 }
+
+/// (#3210, PR #3293 review) A tool-call-first reply on mlx: the deltas carry
+/// only tool-call arguments, which `delta_chars` does not count, so every
+/// beat after the prefill says `generated_chars: 0` and carries the turn's
+/// count. None of them is a prompt-phase heartbeat: a beat that read a chunk
+/// never rides the hub. The beat before any chunk, and the opener, still do.
+#[test]
+fn a_tool_call_first_reply_sends_no_prompt_phase_beat_after_the_prefill() {
+    let mut tail = SseTail::new(Shape::Chat);
+    tail.feed(MLX_PREFILL.as_bytes());
+    assert!(darkmux_flow::is_prompt_phase_heartbeat(&chunk_beat(&tail.progress)), "the prefill report travels");
+    assert!(darkmux_flow::is_prompt_phase_heartbeat(&opener(9000)), "the opener travels");
+    let tool_args = "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n";
+    tail.feed(tool_args.as_bytes());
+    let beat = chunk_beat(&tail.progress);
+    assert_eq!((beat.generated_chars, beat.prompt_processed, beat.partial_index), (Some(0), Some(1024), Some(2)), "{beat:?}");
+    assert!(!darkmux_flow::is_prompt_phase_heartbeat(&beat), "a beat that read a chunk stays local: {beat:?}");
+}

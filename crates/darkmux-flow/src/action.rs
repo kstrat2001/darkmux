@@ -224,10 +224,10 @@ macro_rules! flow_actions {
             /// it stays local (#2101: a 2 s cadence, most of a long mission's
             /// records). Which heartbeats do travel is decided by the payload,
             /// and only by `hub_route::hub_stream_for` (#3210): a turn's opener
-            /// (`prompt_chars`, nothing generated) and an engine's prefill
-            /// reports (`prompt_processed`/`prompt_total`) while
-            /// `generated_chars` is 0 ride the work stream; every other beat
-            /// stays local. Route a record through that function, never through
+            /// (`prompt_chars`) and an engine's prefill reports
+            /// (`prompt_processed`/`prompt_total`) written before the reply's
+            /// first chunk ride the work stream; a beat that read a chunk
+            /// (`partial_index`), and every other beat, stays local. Route a record through that function, never through
             /// this one alone.
             pub fn hub_stream(&self) -> Option<HubStream> {
                 match self {

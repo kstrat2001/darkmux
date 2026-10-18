@@ -499,6 +499,7 @@ mod tests {
                     role: None,
                     content: content.map(str::to_string),
                     reasoning_content: reasoning.map(str::to_string),
+                    reasoning: None,
                     tool_calls: tool.then(|| {
                         vec![ToolCallDelta {
                             index: Some(0),
@@ -542,6 +543,7 @@ mod tests {
                     role: None,
                     content: None,
                     reasoning_content: None,
+                    reasoning: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index: Some(0),
                         id: None,

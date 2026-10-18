@@ -694,6 +694,24 @@ pub struct Delta {
     /// can emit a `model.reasoning` trajectory event from it.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// (#3210 review) The same reasoning text under the name `mlx_lm.server`
+    /// (and some other OpenAI-compatible servers) streams it: `reasoning`.
+    /// Read through [`Delta::reasoning_text`], never directly.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+impl Delta {
+    /// This delta's reasoning text: `reasoning_content`, else `reasoning`,
+    /// the first non-empty one. A server that sends both sends one text
+    /// twice, so they are never summed (the host's direct path reads them
+    /// the same way, `direct_stream.rs` `delta_text`).
+    pub fn reasoning_text(&self) -> Option<&str> {
+        fn text(f: &Option<String>) -> Option<&str> {
+            f.as_deref().filter(|s| !s.is_empty())
+        }
+        text(&self.reasoning_content).or_else(|| text(&self.reasoning))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -784,7 +802,7 @@ impl ChunkAccumulator {
             if let Some(content) = &choice.delta.content {
                 self.content.push_str(content);
             }
-            if let Some(reasoning) = &choice.delta.reasoning_content {
+            if let Some(reasoning) = choice.delta.reasoning_text() {
                 self.reasoning_content.push_str(reasoning);
             }
             if let Some(tcs) = &choice.delta.tool_calls {
@@ -1785,6 +1803,7 @@ mod tests {
                     content: Some(content.to_string()),
                     tool_calls: None,
                     reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],
@@ -1804,6 +1823,7 @@ mod tests {
                     content: None,
                     tool_calls: None,
                     reasoning_content: Some(reasoning.to_string()),
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],
@@ -1847,6 +1867,7 @@ mod tests {
                         extra_content: None,
                     }]),
                     reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],
@@ -1897,6 +1918,28 @@ mod tests {
             pj.get("extra_content").is_none(),
             "no extra_content key when the endpoint doesn't use one"
         );
+    }
+
+    /// (#3210 review) `mlx_lm.server` streams reasoning in `delta.reasoning`
+    /// (0.32.1, server.py), not `reasoning_content`: read either, so a
+    /// reasoning phase counts as generated (the GEN/think rate, and the
+    /// heartbeats that say nothing was generated yet). A server sending both
+    /// sends one text twice; the first non-empty one is read, never the sum
+    /// (the host's direct path reads them the same way, `direct_stream.rs`
+    /// `delta_text`).
+    #[test]
+    fn accumulator_counts_mlx_reasoning_field() {
+        let chunk = |delta: &str| -> ChatChunk {
+            serde_json::from_str(&format!(r#"{{"id":"x","choices":[{{"index":0,"delta":{delta},"finish_reason":null}}]}}"#)).unwrap()
+        };
+        let mut acc = ChunkAccumulator::new();
+        acc.ingest(&chunk(r#"{"role":"assistant","reasoning":"abc"}"#));
+        assert_eq!(acc.reasoning_bytes(), 3, "mlx's `reasoning` counts");
+        acc.ingest(&chunk(r#"{"reasoning_content":"de","reasoning":"de"}"#));
+        assert_eq!(acc.reasoning_bytes(), 5, "both fields: one text, counted once");
+        acc.ingest(&chunk(r#"{"reasoning_content":"","reasoning":"f"}"#));
+        assert_eq!(acc.reasoning_bytes(), 6, "an empty placeholder never hides the other field");
+        assert_eq!(acc.take_reasoning_content().as_deref(), Some("abcdef"));
     }
 
     #[test]
@@ -2062,6 +2105,7 @@ mod tests {
                     content: Some("response".to_string()),
                     tool_calls: None,
                     reasoning_content: Some("thinking step".to_string()),
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],
