@@ -593,9 +593,12 @@ interface PrefillOpener {
    *  repeats a state, `freshMs`). */
   lastSampleAtMs: number;
 }
-function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
+function prefillOpener(beats: HeartbeatSample[], closed: ReadonlySet<unknown>): PrefillOpener | null {
   const last = beats[beats.length - 1];
-  if (last === undefined) return null;
+  // (#3298 review) A turn its `dispatch.turn` closed is read, whatever the
+  // timestamps say: a sub-second turn's opener inside the next marker's
+  // second read as a hung prefill after a long rest.
+  if (last === undefined || (last.turn !== undefined && closed.has(last.turn))) return null;
   const reports: HeartbeatSample[] = [];
   for (let i = beats.length - 1; i >= 0; i--) {
     const b = beats[i];
@@ -604,6 +607,19 @@ function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
     if (b.prompt !== undefined) reports.push(b);
   }
   return null;
+}
+
+/** (#3298 review) The turns a `dispatch.turn` record has closed, by
+ *  `turn_seq` (the turn record's own field, the one every heartbeat of the
+ *  turn carries). `records` is one execution's, so the numbers do not
+ *  collide across executions. */
+function closedTurns(records: NormRecord[]): Set<unknown> {
+  const out = new Set<unknown>();
+  for (const r of records) {
+    const turn = payloadOf(r, ACTION.DispatchTurn);
+    if (turn?.turn_seq !== undefined && turn.turn_seq !== null) out.add(turn.turn_seq);
+  }
+  return out;
 }
 
 /** (#3210) How many of its own steps an engine reporting prefill progress
@@ -953,7 +969,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
   // (#3145) The current turn's opener while nothing has been generated
   // since it: the prompt's size, and the start its prefill bound counts
   // from, for every PROMPT reading below.
-  const opener = prefillOpener(beats);
+  const opener = prefillOpener(beats, closedTurns(cut));
 
   let marker: StateMarker | null = null;
   // `dispatch.tool` is emitted when a tool COMPLETES. A turn that ends with
