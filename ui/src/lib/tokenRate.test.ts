@@ -1625,6 +1625,16 @@ describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
     expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 } });
   });
 
+  it("(live check) the time left follows a prefill that slows as its context grows", () => {
+    // Measured on the M2: ~9 s per 512-token step early, ~13 s late. Steps
+    // here grow 8, 10, 12, 14 s; the whole run's rate (2,048 in 44 s) says
+    // 55 s left, the last three steps' (1,536 in 36 s) about 60 s.
+    const slowing = [start, opener(), report(8, 512, 5_120), report(16, 1_024, 5_120), report(26, 1_536, 5_120), report(38, 2_048, 5_120), report(52, 2_560, 5_120)];
+    const left = deriveLiveState(slowing, T + 52_000).promptProgress?.secondsLeft ?? 0;
+    expect(left).toBeGreaterThanOrEqual(59);
+    expect(left).toBeLessThanOrEqual(61);
+  });
+
   it("the whole capture: the latest report, at 100% with nothing left to estimate", () => {
     const r = deriveLiveState([start, opener(), ...capture], T + 42_100);
     expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 2_516, total: 2_516, percent: 100 } });

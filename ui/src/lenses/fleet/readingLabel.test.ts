@@ -22,12 +22,13 @@ describe("readingLabel: the status line while an execution runs", () => {
   });
   it("(#3210) prompt processing with the engine's progress says how far, and how long is left", () => {
     const promptProgress = { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 };
-    // The phone form keeps the time left, which the long form ellipsized away.
-    expect(readingLabel(exec({ state: "prompt", promptLabel: "~36k", promptProgress }), "prompt")).toEqual({
-      kind: "byWidth",
-      full: "processing 40% · ~23s left",
-      word: "40% · ~23s left",
-    });
+    // (live check on a 1280px desktop) "processing 40% · ~23s l…" ellipsized
+    // the time left on a three-card row: with a time left, the line is the
+    // percentage and the time alone (the brain and its bar say "processing").
+    expect(readingLabel(exec({ state: "prompt", promptLabel: "~36k", promptProgress }), "prompt")).toEqual({ kind: "text", text: "40% · ~23s left" });
+    // Before there is a rate, the word keeps the line readable.
+    const first = { processed: 512, total: 2_516, percent: 20 };
+    expect(readingLabel(exec({ state: "prompt", promptProgress: first }), "prompt")).toEqual({ kind: "text", text: "processing 20%" });
     expect(readingTitle(exec({ state: "prompt", promptProgress }), "prompt")).toBe("uncached prompt processed: 1,024 of 2,516 tokens, about 23s left");
   });
   it("compacting counts its seconds", () => {
