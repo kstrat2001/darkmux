@@ -1630,6 +1630,20 @@ describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
     expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 2_516, total: 2_516, percent: 100 } });
   });
 
+  it("(re-review) a big prompt keeps its size-scaled bound as a floor: one slow step mid-prefill is not STALL", () => {
+    // 244,552 chars (the #3145 bound allows ~579 s). Two quick steps, then
+    // one 7.5x slower: a batched request or a throttled machine.
+    const big = 244_552;
+    const recs = [start, opener(big), report(8, 512, 9_000), report(16, 1_024, 9_000), report(76, 1_536, 9_000)];
+    for (let ms = 0; ms <= 76_000; ms += 500) {
+      const at = T + ms;
+      const seen = recs.filter((r) => r.tMs == null || r.tMs <= at);
+      expect(deriveLiveState(seen, at).state, `at ${ms / 1000}s`).not.toBe("stalled");
+    }
+    // Past the size-scaled bound, three of its own steps of silence is a hang.
+    expect(deriveLiveState(recs.slice(0, 4), T + 600_000).state).toBe("stalled");
+  });
+
   it("an advancing prefill whose steps are slower than the stall threshold never reads STALL", () => {
     // A slow machine: 40 s per step, past STALL_AFTER_MS between reports.
     const slow = [start, opener(), report(40, 512), report(80, 1_024)];
@@ -1672,12 +1686,15 @@ describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
     expect(deriveLiveState(records, T + 19_000)).toMatchObject({ state: "prompt", promptProgress: { processed: 1_024, secondsLeft: 21 } });
   });
 
-  it("prefillStallAfterMs applies only when no progress fact exists", () => {
-    // A 244,552-char opener allows 579 s of silence with no progress; once
-    // the engine reports progress, its own pace bounds the silence instead.
+  it("prefillStallAfterMs is a floor with progress, and the whole bound without it", () => {
+    // A 244,552-char opener allows ~579 s with no progress. With progress,
+    // a silence of three steps is a hang only once that floor has passed
+    // (re-review: a mid-prefill slowdown must not flicker STALL).
+    const bound = prefillStallAfterMs(244_552);
     const big = [start, opener(244_552), report(8, 512), report(16, 1_024)];
-    expect(prefillStallAfterMs(244_552)).toBeGreaterThan(76_000);
-    expect(deriveLiveState(big, T + 16_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+    expect(bound).toBeGreaterThan(76_000);
+    expect(deriveLiveState(big, T + 16_000 + STALL_AFTER_MS + 1).state).toBe("prompt");
+    expect(deriveLiveState(big, T + bound + 1)).toEqual({ state: "stalled" });
     expect(deriveLiveState([start, opener(244_552)], T + 16_000 + STALL_AFTER_MS + 1)).toEqual({ state: "prompt", promptChars: 244_552 });
   });
 

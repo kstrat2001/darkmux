@@ -31,10 +31,11 @@ darkmux release.
   2.3.0, additive; trajectory schema 1.1 adds the `model.prompt.progress` event). A report
   that advances counts as proof of work, so a long prefill on slow hardware no longer reads
   as STALL while it is moving; a report repeating the same count does not, and writes no
-  durable heartbeat. The silence after the last advance is bounded by three of the
-  engine's own steps between reports (never under 30 s); before there are two advances,
-  and for an engine that reports nothing, the size-based prefill bound applies. Engines
-  that report nothing read as before. llama.cpp and LM Studio are not recognized yet.
+  durable heartbeat. A reporting engine reads STALL only once the size-based prefill
+  bound has passed AND it has been silent since its last advance for three of its own
+  steps between reports (30 s before there are two advances), so a step that slows
+  mid-way is never STALL sooner than an engine that reports nothing. Engines that report
+  nothing read as before. llama.cpp and LM Studio are not recognized yet.
 
 - **The machine lens reads a Linux machine** (#3275). CPU load per core and per tier
   (`/proc/stat`; `cpufreq` policies of equal capacity are one tier, as macOS's perf levels

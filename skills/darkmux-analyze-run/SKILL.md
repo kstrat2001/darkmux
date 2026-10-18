@@ -92,7 +92,7 @@ The first line is a `trajectory.header` event carrying the file's `schema_versio
 { "type": "model.prompt.progress", "seq": <turn>, "processed": <int>, "total": <int>, "ts": <unix_ms> }
 ```
 
-The engine's own prefill progress, in prompt tokens, when it reports any (today `mlx_lm.server`, one per prefill step). Absent for an engine that reports nothing. Consecutive reports give the prefill rate.
+The engine's own prefill progress, in tokens of this request's uncached prompt (with a prompt cache hit, `total` is only the part not already cached), when it reports any (today `mlx_lm.server`, one per prefill step). Absent for an engine that reports nothing. Consecutive reports whose count advanced give the prefill rate; a repeated count is not progress.
 
 ### `model.partial` (N per streaming turn, one per SSE chunk)
 

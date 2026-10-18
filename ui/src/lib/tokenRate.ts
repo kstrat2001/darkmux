@@ -604,16 +604,19 @@ export function progressStallAfterMs(advanced: HeartbeatSample[]): number {
  *  `STALL_AFTER_MS` (the ordinary rule, so a live refresh still counts)
  *  AND past `prefillStallAfterMs` of its opener. (#3210) When the engine
  *  reports progress, the silence counts from its last ADVANCING report
- *  (repeats keep the heartbeat fresh but are not progress): with two or
- *  more advances its own pace bounds it (`progressStallAfterMs`); with
- *  fewer, the size-scaled bound from the opener still applies, and the
- *  silence must also pass `STALL_AFTER_MS`. */
+ *  (repeats keep the heartbeat fresh but are not progress). The size-scaled
+ *  bound from the opener stays a floor; past it, the silence must pass the
+ *  engine's own pace with two or more advances (`progressStallAfterMs`), or
+ *  `STALL_AFTER_MS` with fewer. */
 function prefillOverdue(opener: PrefillOpener, records: NormRecord[], nowMs: number): boolean {
   if (opener.reports.length === 0) return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
   const moved = advances(opener.reports);
   const silentMs = nowMs - (moved[moved.length - 1]?.atMs ?? opener.atMs);
-  if (moved.length >= 2) return silentMs > progressStallAfterMs(moved);
-  return silentMs > STALL_AFTER_MS && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+  // The size-scaled bound (#3145) stays a floor: a moving prefill whose step
+  // slows mid-way (another request batched in, a throttled machine) is never
+  // STALL before an engine that reports nothing would be.
+  const pastSizeBound = nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+  return pastSizeBound && silentMs > (moved.length >= 2 ? progressStallAfterMs(moved) : STALL_AFTER_MS);
 }
 
 /** (#3210) The prefill progress PROMPT shows: the latest report, and the
