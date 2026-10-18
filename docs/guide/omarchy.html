@@ -32,27 +32,27 @@
   <div class="wrap">
     <div class="label">11 <span class="dot">·</span> machine setup</div>
     <h1>Omarchy: darkmux on Linux</h1>
-    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a> (Arch Linux) on an Apple Silicon Mac running Asahi: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux doesn't give you for free. Linux support lives on the <a href="https://github.com/kstrat2001/darkmux/tree/omarchy"><code>omarchy</code></a> branch until it reaches a release; the last section says what doesn't work yet.</p>
+    <p class="lede">darkmux was built on macOS. This page is the path on <a href="https://omarchy.org">Omarchy</a> (Arch Linux) on an Apple Silicon Mac running Asahi: build from source, serve a model on the Apple GPU without LM Studio, and set up what Linux doesn't give you for free. Linux support ships in darkmux releases from v5.3.0, built from source (there is no Linux package yet, <a href="https://github.com/kstrat2001/darkmux/issues/3274">#3274</a>); the last section says what doesn't work yet.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>Build and install</h2>
-    <p>There is no Homebrew here, so darkmux builds from the <code>omarchy</code> branch, which carries the Linux platform fixes. Omarchy ships <code>mise</code> for the Rust toolchain:</p>
+    <p>There is no Homebrew here, so darkmux builds from a release tag. Omarchy ships <code>mise</code> for the Rust toolchain:</p>
     <pre><code>mise use -g rust@1.97.1
-cargo install --git https://github.com/kstrat2001/darkmux --branch omarchy --locked darkmux
+cargo install --git https://github.com/kstrat2001/darkmux --tag v5.3.0 --locked darkmux
 ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   <span class="comment"># ~/.cargo/bin is not on Omarchy's PATH</span>
 darkmux --version
 darkmux init</code></pre>
-    <p>Re-run the <code>cargo install</code> line to update. A <code>✱</code> after the commit in <code>--version</code> is harmless: cargo's checkout looks modified to the build's git probe. With no LM Studio, <code>init</code> can't fill in a worker model; the next section adds one.</p>
+    <p>To update, re-run the <code>cargo install</code> line with the newest tag from the <a href="https://github.com/kstrat2001/darkmux/releases">releases page</a>. A <code>✱</code> after the commit in <code>--version</code> is harmless: cargo's checkout looks modified to the build's git probe. With no LM Studio, <code>init</code> can't fill in a worker model; the next section adds one.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>A local model without LM Studio</h2>
-    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver and installs <code>mlx_lm.server</code>, an OpenAI-compatible chat server. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux sends requests, and the server owns what is loaded.</p>
+    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver and installs <code>mlx_lm.server</code>, an OpenAI-compatible chat server. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux sends requests, and the server owns what is loaded. While it reads a prompt, <code>mlx_lm.server</code> reports how far it has got, so the fleet card's scope shows a bar under the brain and the line says the percentage and the time left. With a prompt cache hit it counts only the part of the prompt the cache didn't hold.</p>
     <h3>Install omarchy-mlx</h3>
     <p>The Omarchy menu's entry (Install &gt; AI) refuses chips it hasn't been tested on; the project's own installer warns instead and carries on. Read the script before running it:</p>
     <pre><code>sudo pacman -S --needed lapack blas openblas
@@ -265,8 +265,7 @@ brightnessctl -d apple-panel-bl set 50%</code></pre>
       <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, battery and cluster MHz read on Linux. Power is next; GPU and thermal state read "not reported". The residency planner sees no memory pools (it only manages LM Studio models).</li>
       <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process usage in <code>fdinfo</code>, so the lens shows "—".</li>
       <li><strong>A model on an unmanaged endpoint</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it manages.</li>
-      <li><strong>Prompt processing shows no progress</strong> on an unmanaged endpoint: the fleet card reads PROMPT until the first token (<a href="https://github.com/kstrat2001/darkmux/issues/3210">#3210</a>).</li>
-      <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, and warns on rows whose probes are macOS-only.</li>
+      <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, and warns on rows whose probes are macOS-only, such as RAM headroom (<a href="https://github.com/kstrat2001/darkmux/issues/3281">#3281</a>).</li>
       <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
     </ul>
   </div>

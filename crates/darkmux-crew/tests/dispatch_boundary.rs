@@ -573,7 +573,12 @@ fn skip_preflight_skips_the_daemon_probe_but_not_the_image_check() {
     rig.labels(&[("darkmux-runtime:latest", "0.0.1")]);
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("a mismatched image is refused"));
-    assert!(err.starts_with("no runtime image for darkmux 5.2.0 is available: the local one was skipped and the pull failed."), "{err}");
+    // The version is this build's own, so a release bump never breaks it.
+    let expected = format!(
+        "no runtime image for darkmux {} is available: the local one was skipped and the pull failed.",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(err.starts_with(&expected), "{err}");
     assert!(err.contains("0.0.1"), "{err}");
     let verbs = rig.docker_verbs();
     assert!(!verbs.iter().any(|v| v.starts_with("version")), "{verbs:?}");

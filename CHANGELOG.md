@@ -14,6 +14,19 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-10-18
+
+darkmux runs on Linux. On Omarchy (Arch on Asahi, an Apple Silicon laptop) with
+`mlx_lm.server`, roles with tools run in Docker as the host user, the machine joins the
+fleet with its own identity, and the machine lens reads its CPU tiers, memory and battery.
+Stage 4 of the engine facade (#316) lands with it: `default_engine` names the machine's
+local engine, `darkmux init` finds the engine that answers, and the machine surfaces name
+it. PROMPT now shows how far the engine has read the prompt (a bar under the brain, and the
+time left), where the engine reports it (`mlx_lm.server` today). A fleet card that is still
+checking draws a radar sweep. Config schemas 2.4 and 2.5 add `default_engine` and
+`runtime.container_user`, and flow schema 2.3.0 adds the prompt-progress fields; an older
+darkmux refuses the new config keys, so upgrade every machine before setting them.
+
 ### Added
 
 - **PROMPT shows how far the engine has read the prompt** (#3210). When the engine reports
@@ -181,6 +194,16 @@ darkmux release.
   an older darkmux refuses the key, so upgrade every machine before writing it.
 
 ### Fixed
+
+- **This machine's own lab run shows live on its card** (#3294). On a daemon with a fleet
+  hub, the viewer's live stream read only the hub, which never carries a lab run's records
+  or the plain 2 s heartbeats, so a lab run (pepper-grinder) reached the card only through
+  the page's 20 s refresh and could hold "— think tok/s" for 20 s. The stream now also
+  sends this machine's records that stay off the hub, once each, and still ends when the
+  hub tail ends so the browser reconnects.
+
+- **The scope centers a number with its unit, and a tool icon with its caption, as a pair**
+  (#3292). "91" over "tok/s" and the wrench over "tool gen" sat low in the tube.
 
 - **A peer's card reads a short turn's rate, its tool gen, and a hung prefill's STALL**
   (matrix review before 5.3.0). The hub writers also relay a stream's first beat past the
@@ -3688,6 +3711,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.3.0
 [5.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.2.0
 [5.1.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.1
 [5.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.0
