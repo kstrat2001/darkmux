@@ -602,8 +602,9 @@ export interface CardFace {
    *  having no reading). */
   noSignal: boolean;
   /** The tube: a live execution's reading, the idle tube, the powered-off
-   *  screen of an offline machine, or no-signal static. */
-  tube: "reading" | "idle" | "off" | "nosignal";
+   *  screen of an offline machine, the radar sweep of a card still checking
+   *  (#3284), or no-signal static. */
+  tube: "reading" | "idle" | "off" | "seeking" | "nosignal";
   /** The running count is shown; otherwise "—" holds its line. */
   countShown: boolean;
   /** The utility strip may call a quiet strip "idle"; otherwise its words
@@ -651,6 +652,12 @@ function statusOf(f: { absent: boolean; active: boolean; notStreaming: boolean; 
  *  - A quiet utility strip's "idle": waits on the flow window, the only
  *    source of utility jobs.
  *  Until then the card says "checking…", in the same boxes. */
+/** (#3284) A card with no reading: still checking sweeps for its machine;
+ *  static is for a card whose sources answered and still show nothing. */
+function noReadingTube(status: CardStatus): "seeking" | "nosignal" {
+  return status === CardStatus.Checking ? "seeking" : "nosignal";
+}
+
 export function cardFace(
   card: { active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability; note: string | null },
   hasReading: boolean,
@@ -670,7 +677,7 @@ export function cardFace(
   const status = statusOf({ absent, active: card.active, notStreaming, idleKnown, cardRead: card.note === null });
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
-  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : "nosignal";
+  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : noReadingTube(status);
   return {
     status,
     active,

@@ -2266,7 +2266,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
     expect(card.className).not.toContain("absent");
     expect(card.className).not.toContain("active");
     expect(document.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
-    expect(cardScope(card)).toMatchObject({ state: "nosignal", size: "card" });
+    expect(cardScope(card)).toMatchObject({ state: "seeking", size: "card" });
     expect(cardScope(card).centerUnit ?? null).toBeNull();
     // The flow window HAS answered, and it is the only source of utility
     // jobs, so a quiet strip may say so.
@@ -2288,7 +2288,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
     await waitForFleetQueriesSettled(queryClient);
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(stat(document.querySelector(".mach")!)).toBe("checking…");
-    expect(cardScope(document.querySelector(".mach")!)).toMatchObject({ state: "nosignal" });
+    expect(cardScope(document.querySelector(".mach")!)).toMatchObject({ state: "seeking" });
 
     runs.open();
     await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
@@ -2330,7 +2330,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
       expect(card.textContent).toContain("MacBook-Pro");
       expect(stat(card)).toBe("checking…");
       expect(card.querySelector(".runs")!.textContent).toBe("—");
-      expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+      expect(cardScope(card)).toMatchObject({ state: "seeking" });
       // Only the flow window can contradict a quiet utility strip.
       expect(utilLabel(card)).toMatch(what === "the flow window" ? /checking…$/ : /idle$/);
 
@@ -2394,7 +2394,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
     const card = document.querySelector(".mach")!;
     expect(stat(card)).toBe("checking…");
     expect(card.className).not.toContain("absent");
-    expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+    expect(cardScope(card)).toMatchObject({ state: "seeking" });
 
     presence.open();
     await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("offline"));
@@ -2459,7 +2459,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
     expect(card.textContent).not.toContain("0 running");
     expect(card.querySelector(".runs")!.textContent).toBe("—");
     expect(card.className).not.toContain("absent");
-    expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+    expect(cardScope(card)).toMatchObject({ state: "seeking" });
 
     view.open();
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
@@ -2526,7 +2526,7 @@ describe("FleetLens: a card says checking… until its first data arrives (#2958
         expect(card.textContent).not.toContain("idle");
         expect(card.textContent).not.toContain("offline");
         expect(card.querySelector(".runs")!.textContent).toBe("—");
-        expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+        expect(cardScope(card)).toMatchObject({ state: "seeking" });
         expect(utilLabel(card)).toMatch(/checking…$/);
       }
       // The token panel's zeros are a negative claim off the same read: it

@@ -54,6 +54,9 @@ describe("scopeTargets: each state is a set of targets on ONE trace (#2890)", ()
 
   it("NO SIGNAL turns the ring off and the static on", () => {
     expect(scopeTargets("nosignal", 0, 0, GREEN)).toMatchObject({ ring: 0, fuzz: 1 });
+    // (#3284) Checking: a radar sweep looking for the machine, not static.
+    expect(scopeTargets("seeking", 0, 0, GREEN)).toMatchObject({ ring: 0, fuzz: 0, radar: 1 });
+    expect(scopeTargets("nosignal", 0, 0, GREEN).radar).toBe(0);
   });
 
   it("FINISHED is a calm dimmed ring, no motion layers", () => {
@@ -209,6 +212,7 @@ describe("stateTone: the color each scope state draws in", () => {
     expect(stateTone("finished")).toBe("none");
     expect(stateTone("idle")).toBe("none");
     expect(stateTone("nosignal")).toBe("nosignal");
+    expect(stateTone("seeking")).toBe("none");
   });
 });
 
