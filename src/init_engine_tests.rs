@@ -177,6 +177,52 @@ fn parse_choice_reads_a_number_in_range_or_the_default() {
     assert_eq!(parse_choice("mlx", 2), None);
 }
 
+/// (#3287) The terminal question: the options are listed numbered, the answer
+/// line is read and parsed (end of input reads as the empty answer, the
+/// first option); nobody to ask reads nothing and prints nothing, and an
+/// input that cannot be read is no choice.
+#[test]
+fn prompt_choice_lists_the_options_and_reads_one_answer() {
+    let options = [
+        Found::Lmstudio,
+        Found::Server { id: Some("mlx".into()), url: "http://127.0.0.1:8080/v1".into(), models: vec!["m".into()] },
+    ];
+    let mut out = Vec::new();
+    let mut input = std::io::Cursor::new("2\nleft over\n");
+    assert_eq!(prompt_choice(true, &options, &mut input, &mut out), Some(1));
+    let shown = String::from_utf8(out).unwrap();
+    assert!(shown.starts_with("darkmux init: more than one engine answers on this machine:\n"), "{shown}");
+    assert!(shown.contains("  1) LM Studio"), "{shown}");
+    assert!(shown.contains("  2) endpoint `mlx`, http://127.0.0.1:8080/v1"), "{shown}");
+    assert!(shown.ends_with("Which is this machine's engine? [1]: "), "{shown}");
+
+    let mut out = Vec::new();
+    assert_eq!(prompt_choice(true, &options, &mut std::io::Cursor::new("\n"), &mut out), Some(0), "empty is the first");
+    let mut out = Vec::new();
+    assert_eq!(prompt_choice(false, &options, &mut std::io::Cursor::new("2\n"), &mut out), None);
+    assert!(out.is_empty(), "nobody to ask is asked nothing");
+    let mut out = Vec::new();
+    assert_eq!(prompt_choice(true, &options, &mut std::io::Cursor::new(""), &mut out), Some(0), "end of input");
+    struct Broken;
+    impl std::io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+    }
+    let mut out = Vec::new();
+    assert_eq!(prompt_choice(true, &options, &mut std::io::BufReader::new(Broken), &mut out), None);
+}
+
+/// (#3287) An endpoint's URL, read from the registry it is defined in; an id
+/// that is no endpoint, or a registry that does not parse, has none.
+#[test]
+fn endpoint_url_reads_the_registry_endpoint_or_nothing() {
+    let reg = r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:8080/v1"}}}"#;
+    assert_eq!(endpoint_url(reg, "mlx").as_deref(), Some("http://127.0.0.1:8080/v1"));
+    assert_eq!(endpoint_url(reg, "other"), None);
+    assert_eq!(endpoint_url("not json", "mlx"), None);
+}
+
 #[test]
 fn new_endpoint_id_is_named_for_the_port_and_never_reuses_an_id() {
     assert_eq!(new_endpoint_id("http://127.0.0.1:8080/v1", &[]), "local-8080");

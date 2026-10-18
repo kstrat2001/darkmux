@@ -121,6 +121,80 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         );
     };
 
+    let system_prompt = utility_system_prompt(job, &target)?;
+
+    // Where the job goes, decided once (#3207): the mock harness's base, an
+    // unmanaged endpoint the binding names, or the managed LM Studio.
+    let route = utility_route(&target, job.base_url_override);
+    let wire_model = utility_wire_model(route, &target, job.role_id)?;
+    let call = || utility_call(route, job, &wire_model, &system_prompt);
+    // (#2915) The job is VISIBLE while it runs: one lean `utility.start`
+    // (no session) right before the call, so the viewer's fleet card shows
+    // the job from here until its usage record (or `utility.error`) lands.
+    // Emitted after residency on purpose: a job that failed to load never
+    // started, and must not leave a start with no end behind.
+    // (#2915 review) Its own job id, echoed by its end, and ms times.
+    let job_kind = crate::usage::utility_job(crate::usage::CallKind::SingleShot, Some(job.role_id));
+    let job_id = job_kind.map(crate::usage::mint_utility_job_id).unwrap_or_default();
+    let started_at_ms = crate::usage::unix_ms_now();
+    // (#2928) The job's two edges also go out on the live channel, at once:
+    // a sub-second routing job's durable start and end otherwise reach the
+    // viewer in the same delivery and it is never drawn open.
+    let mut live = job_kind.and_then(|_| darkmux_flow::live::LiveSender::for_local_daemon());
+    if let Some(kind) = job_kind {
+        record_utility_start(job, kind, &job_id, &wire_model, started_at_ms, live.as_mut());
+    }
+    let send_live_end = |live: &mut Option<darkmux_flow::live::LiveSender>, ended_at_ms: u64| {
+        if let (Some(tx), Some(kind)) = (live.as_mut(), job_kind) {
+            let fields = serde_json::json!({
+                "job": kind,
+                "job_id": job_id,
+                "ended_at_ms": ended_at_ms,
+                "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
+            });
+            tx.send(&live_utility_edge(&fields, "end", job.role_id, &wire_model, ended_at_ms));
+        }
+    };
+    let reply = match call() {
+        Ok(r) => r,
+        Err(e) => {
+            send_live_end(&mut live, crate::usage::unix_ms_now());
+            // (#2915) The end of a started job that has no usage record.
+            if let Some(kind) = job_kind {
+                record_utility_error(job.role_id, kind, &wire_model, &job_id, started_at_ms);
+            }
+            return Err(reword_residency_lost(e, &wire_model));
+        }
+    };
+
+    // The one record: the job's usage, attributed to the job's role, on the
+    // utility model, with no session.
+    // (#3207) The endpoint the call really went to: an unmanaged endpoint's
+    // route label and `endpoints` id (so its window budget counts the job),
+    // else the LM Studio base, as before.
+    let (endpoint_label, endpoint_id) = route.endpoint_facts(&wire_model);
+    let mut payload = reply.usage_payload(
+        crate::usage::CallKind::SingleShot,
+        Some(job.role_id),
+        &wire_model,
+        &endpoint_label,
+        endpoint_id,
+    );
+    if job_kind.is_some() {
+        let ended_at_ms = crate::usage::unix_ms_now();
+        send_live_end(&mut live, ended_at_ms);
+        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
+    }
+    let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, &ExecutionId::mint(), payload));
+
+    Ok(UtilityReply { content: reply.content })
+}
+
+/// The utility job's system prompt: its role's prompt, the specialist
+/// preamble when the role is one, and the operator's identity only when the
+/// model stays on this machine. Errors name an unknown role or a role with no
+/// readable prompt.
+fn utility_system_prompt(job: &UtilityJob<'_>, target: &crate::target::UtilityTarget) -> Result<String> {
     let roles = crate::loader::load_roles().context("loading roles for a utility job")?;
     let role = roles
         .iter()
@@ -154,95 +228,55 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         );
     let system_prompt =
         if leaves { system_prompt } else { crate::dispatch::augment_prompt_with_identity(&system_prompt) };
+    Ok(system_prompt)
+}
 
-    // Where the job goes, decided once (#3207): the mock harness's base, an
-    // unmanaged endpoint the binding names, or the managed LM Studio.
-    let route = utility_route(&target, job.base_url_override);
-    let wire_model = utility_wire_model(route, &target, job.role_id)?;
-    let call = || utility_call(route, job, &wire_model, &system_prompt);
-    // (#2915) The job is VISIBLE while it runs: one lean `utility.start`
-    // (no session) right before the call, so the viewer's fleet card shows
-    // the job from here until its usage record (or `utility.error`) lands.
-    // Emitted after residency on purpose: a job that failed to load never
-    // started, and must not leave a start with no end behind.
-    // (#2915 review) Its own job id, echoed by its end, and ms times.
-    let job_kind = crate::usage::utility_job(crate::usage::CallKind::SingleShot, Some(job.role_id));
-    let job_id = job_kind.map(crate::usage::mint_utility_job_id).unwrap_or_default();
-    let started_at_ms = crate::usage::unix_ms_now();
-    // (#2928) The job's two edges also go out on the live channel, at once:
-    // a sub-second routing job's durable start and end otherwise reach the
-    // viewer in the same delivery and it is never drawn open.
-    let mut live = job_kind.and_then(|_| darkmux_flow::live::LiveSender::for_local_daemon());
-    if let Some(kind) = job_kind {
-        let payload = crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds).saturating_mul(1_000), started_at_ms);
-        if let Some(tx) = live.as_mut() {
-            let fields = serde_json::to_value(&payload).unwrap_or_default();
-            tx.send(&live_utility_edge(&fields, "start", job.role_id, &wire_model, started_at_ms));
-        }
-        let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-            job.role_id,
-            &wire_model,
-            darkmux_flow::Payload::UtilityStart(payload),
-        ));
+/// (#2915) The job's `utility.start`, durable and (#2928) on the live channel.
+fn record_utility_start(
+    job: &UtilityJob<'_>,
+    kind: crate::usage::UtilityJobKind,
+    job_id: &str,
+    wire_model: &str,
+    started_at_ms: u64,
+    live: Option<&mut darkmux_flow::live::LiveSender>,
+) {
+    let timeout_ms = u64::from(job.timeout_seconds).saturating_mul(1_000);
+    let payload = crate::usage::utility_start_payload(kind, job_id, wire_model, None, timeout_ms, started_at_ms);
+    if let Some(tx) = live {
+        let fields = serde_json::to_value(&payload).unwrap_or_default();
+        tx.send(&live_utility_edge(&fields, "start", job.role_id, wire_model, started_at_ms));
     }
-    let send_live_end = |live: &mut Option<darkmux_flow::live::LiveSender>, ended_at_ms: u64| {
-        if let (Some(tx), Some(kind)) = (live.as_mut(), job_kind) {
-            let fields = serde_json::json!({
-                "job": kind,
-                "job_id": job_id,
-                "ended_at_ms": ended_at_ms,
-                "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
-            });
-            tx.send(&live_utility_edge(&fields, "end", job.role_id, &wire_model, ended_at_ms));
-        }
-    };
-    let reply = match call() {
-        Ok(r) => r,
-        Err(e) => {
-            send_live_end(&mut live, crate::usage::unix_ms_now());
-            // (#2915) The end of a started job that has no usage record.
-            if let Some(kind) = job_kind {
-                let payload = crate::usage::utility_error_payload(
-                    kind,
-                    &wire_model,
-                    &job_id,
-                    started_at_ms,
-                    crate::usage::unix_ms_now(),
-                );
-                let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-                    job.role_id,
-                    &wire_model,
-                    darkmux_flow::Payload::UtilityError(payload),
-                ));
-            }
-            return Err(match crate::dispatch_internal::residency_lost_detail(&wire_model, &format!("{e:#}")) {
-                Some(msg) => e.context(msg),
-                None => e,
-            });
-        }
-    };
+    let _ = darkmux_flow::record(crate::usage::utility_marker_record(
+        job.role_id,
+        wire_model,
+        darkmux_flow::Payload::UtilityStart(payload),
+    ));
+}
 
-    // The one record: the job's usage, attributed to the job's role, on the
-    // utility model, with no session.
-    // (#3207) The endpoint the call really went to: an unmanaged endpoint's
-    // route label and `endpoints` id (so its window budget counts the job),
-    // else the LM Studio base, as before.
-    let (endpoint_label, endpoint_id) = route.endpoint_facts(&wire_model);
-    let mut payload = reply.usage_payload(
-        crate::usage::CallKind::SingleShot,
-        Some(job.role_id),
-        &wire_model,
-        &endpoint_label,
-        endpoint_id,
-    );
-    if job_kind.is_some() {
-        let ended_at_ms = crate::usage::unix_ms_now();
-        send_live_end(&mut live, ended_at_ms);
-        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
+/// (#2915) The `utility.error` that ends a started job whose call failed.
+fn record_utility_error(
+    role_id: &str,
+    kind: crate::usage::UtilityJobKind,
+    wire_model: &str,
+    job_id: &str,
+    started_at_ms: u64,
+) {
+    let ended_at_ms = crate::usage::unix_ms_now();
+    let payload = crate::usage::utility_error_payload(kind, wire_model, job_id, started_at_ms, ended_at_ms);
+    let _ = darkmux_flow::record(crate::usage::utility_marker_record(
+        role_id,
+        wire_model,
+        darkmux_flow::Payload::UtilityError(payload),
+    ));
+}
+
+/// A failed call's error, re-worded when the utility model's instance went
+/// away (`residency_lost_detail`, as on the work path).
+fn reword_residency_lost(e: anyhow::Error, wire_model: &str) -> anyhow::Error {
+    match crate::dispatch_internal::residency_lost_detail(wire_model, &format!("{e:#}")) {
+        Some(msg) => e.context(msg),
+        None => e,
     }
-    let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, &ExecutionId::mint(), payload));
-
-    Ok(UtilityReply { content: reply.content })
 }
 
 /// (#3207) Where one utility job's call goes.

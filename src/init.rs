@@ -108,24 +108,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     let mut report = InitReport::default();
 
     // 1) Bootstrap the profile registry (the "fresh user has no config" case).
-    //    Never overwrites — even with --force — because the user's profile
-    //    edits matter more than re-running init.
-    let registry_path = user_profile_registry_path()?;
-    report.profile_registry_path = Some(registry_path.clone());
-    if registry_path.exists() {
-        report.profile_registry_already_present = true;
-    } else if !opts.dry_run {
-        if let Some(parent) = registry_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&registry_path, EXAMPLE_PROFILES_JSON)
-            .with_context(|| format!("writing {}", registry_path.display()))?;
-        report.profile_registry_created = true;
-    } else {
-        // dry-run: report what would happen without writing
-        report.profile_registry_created = true;
-    }
+    let registry_path = bootstrap_registry(opts.dry_run, &mut report)?;
 
     // 1b) Bootstrap the config file (#661). Same never-overwrite discipline as
     //     the profile registry — the operator's config edits outrank a re-run.
@@ -149,6 +132,37 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         fill_models(&registry_path, &engine, &mut report);
     }
 
+    // 3)-6) Skills, and the optional hook and doc merges.
+    install_integrations(opts, &mut report)?;
+
+    Ok(report)
+}
+
+/// Step 1: bootstrap the profile registry. Never overwrites — even with
+/// --force — because the user's profile edits matter more than re-running
+/// init. A dry run reports what it would create and writes nothing.
+fn bootstrap_registry(dry_run: bool, report: &mut InitReport) -> Result<PathBuf> {
+    let registry_path = user_profile_registry_path()?;
+    report.profile_registry_path = Some(registry_path.clone());
+    if registry_path.exists() {
+        report.profile_registry_already_present = true;
+    } else if !dry_run {
+        if let Some(parent) = registry_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&registry_path, EXAMPLE_PROFILES_JSON)
+            .with_context(|| format!("writing {}", registry_path.display()))?;
+        report.profile_registry_created = true;
+    } else {
+        // dry-run: report what would happen without writing
+        report.profile_registry_created = true;
+    }
+    Ok(registry_path)
+}
+
+/// Step 3: install the skills, recording what happened on `report`.
+fn install_skills_step(opts: &InitOptions, report: &mut InitReport) -> Result<()> {
     // 3) Skills install. `refresh_darkmux: true` (#1426) makes a re-run after a
     //    binary upgrade refresh an installed darkmux-* skill (idempotent
     //    refresh) — but only an unmodified one (#1927); a locally-edited copy
@@ -167,6 +181,13 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     report.skills_skipped = skills_report.skipped;
     report.skills_protected = skills_report.protected;
     report.skills_force_overwrote_modified = skills_report.force_overwrote_modified;
+    Ok(())
+}
+
+/// Steps 3-6: install the skills, then the optional SessionStart hook and
+/// CLAUDE.md / AGENTS.md merges, recording each on `report`.
+fn install_integrations(opts: &InitOptions, report: &mut InitReport) -> Result<()> {
+    install_skills_step(opts, report)?;
 
     // 4) SessionStart hook (optional)
     if opts.with_hook {
@@ -192,8 +213,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         report.agents_md_appended = appended;
         report.agents_md_already_present = !appended;
     }
-
-    Ok(report)
+    Ok(())
 }
 
 /// (#316) Step 1c: detect the answering engines and record the choice.
@@ -251,14 +271,19 @@ fn record_engine(
     }
     let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
     if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
-        let restored = match &previous {
-            Some(p) => fs::write(registry_path, p).is_ok(),
-            None => fs::remove_file(registry_path).is_ok(),
-        };
-        let note = if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" };
-        return Err(format!("{e:#} ({note})"));
+        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref())));
     }
     set.map(|_| ()).map_err(|e| format!("{e:#}"))
+}
+
+/// Put the registry back as it was before `record_engine` wrote it (removed,
+/// when there was none), and say whether that worked.
+fn put_back(registry_path: &Path, previous: Option<&str>) -> &'static str {
+    let restored = match previous {
+        Some(p) => fs::write(registry_path, p).is_ok(),
+        None => fs::remove_file(registry_path).is_ok(),
+    };
+    if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" }
 }
 
 /// The engine whose models `init` plans from.
@@ -514,28 +539,39 @@ fn fill_server_utility(text: String, name: &str, models: &[String], report: &mut
         return text;
     }
     match choose_server_utility(&current, models) {
-        Some(id) if id != current => match set_utility_binding(&text, &id, None) {
-            Some(t) => {
-                report.utility_model_filled = Some(id);
-                t
-            }
-            None => text,
-        },
+        Some(id) if id != current => rebind_server_utility(text, id, report),
         Some(_) => text,
         // (#316) Unbound, not kept: a server asked for a model it does not
         // list may fetch it (mlx_lm.server downloads it from Hugging Face) on
         // the first compaction or radio-routing call.
-        None => match remove_utility_binding(&text) {
-            Some(t) => {
-                report.utility_model_unregistered_reason = Some(format!(
-                    "`{name}` does not list the registry's utility model `{current}`, so no utility model is \
-                     bound (compaction is off). Set `internal.utility` in profiles.json to a small instruct \
-                     model it serves."
-                ));
-                t
-            }
-            None => text,
-        },
+        None => unbind_server_utility(text, name, &current, report),
+    }
+}
+
+/// `text` with the utility binding moved to `id`, the key the server lists it
+/// under.
+fn rebind_server_utility(text: String, id: String, report: &mut InitReport) -> String {
+    match set_utility_binding(&text, &id, None) {
+        Some(t) => {
+            report.utility_model_filled = Some(id);
+            t
+        }
+        None => text,
+    }
+}
+
+/// `text` with the utility binding removed, and the reason on `report`.
+fn unbind_server_utility(text: String, name: &str, current: &str, report: &mut InitReport) -> String {
+    match remove_utility_binding(&text) {
+        Some(t) => {
+            report.utility_model_unregistered_reason = Some(format!(
+                "`{name}` does not list the registry's utility model `{current}`, so no utility model is \
+                 bound (compaction is off). Set `internal.utility` in profiles.json to a small instruct \
+                 model it serves."
+            ));
+            t
+        }
+        None => text,
     }
 }
 
@@ -1234,6 +1270,62 @@ mod tests {
         let reason = report.utility_model_unregistered_reason.expect("a reason");
         assert!(reason.contains("local-8080") && reason.contains("internal.utility"), "{reason}");
         assert_eq!(report.utility_model_unfilled_reason, None);
+    }
+
+    /// (#3287) The other three answers a server gives about the shipped
+    /// utility: listed under a publisher-prefixed key, the binding moves to
+    /// it; listed under its own key, nothing changes; and a binding on an
+    /// unmanaged endpoint, or one the operator set, is never touched.
+    #[test]
+    fn a_server_utility_is_rebound_kept_or_left_alone() {
+        let shipped = {
+            let (a, b) = utility_value_span(EXAMPLE_PROFILES_JSON).unwrap();
+            EXAMPLE_PROFILES_JSON[a..b].to_string()
+        };
+        let bare = shipped.rsplit('/').next().unwrap();
+        let prefixed = format!("mlx-community/{bare}");
+
+        let mut report = InitReport::default();
+        let listed = std::slice::from_ref(&prefixed);
+        let text = fill_server_utility(EXAMPLE_PROFILES_JSON.to_string(), "mlx", listed, &mut report);
+        let (a, b) = utility_value_span(&text).expect("still bound");
+        assert_eq!(&text[a..b], prefixed, "moved to the key the server lists");
+        assert_eq!(report.utility_model_filled.as_deref(), Some(prefixed.as_str()));
+        assert_eq!(report.utility_model_unregistered_reason, None);
+
+        let mut report = InitReport::default();
+        let listed = std::slice::from_ref(&shipped);
+        let text = fill_server_utility(EXAMPLE_PROFILES_JSON.to_string(), "mlx", listed, &mut report);
+        assert_eq!(text, EXAMPLE_PROFILES_JSON, "listed as bound: unchanged");
+        assert_eq!((report.utility_model_filled, report.utility_model_unregistered_reason), (None, None));
+
+        let mut v: serde_json::Value = serde_json::from_str(EXAMPLE_PROFILES_JSON).unwrap();
+        v["endpoints"]["mlx-local"] = serde_json::json!({ "url": "http://127.0.0.1:8080/v1" });
+        v["internal"]["utility"]["endpoint"] = serde_json::json!("mlx-local");
+        let unmanaged = serde_json::to_string_pretty(&v).unwrap();
+        let hand_set = EXAMPLE_PROFILES_JSON.replace(&shipped, "operator/own-utility");
+        for text in [unmanaged, hand_set] {
+            let mut report = InitReport::default();
+            let out = fill_server_utility(text.clone(), "mlx", &["other/model".to_string()], &mut report);
+            assert_eq!(out, text, "left alone");
+            assert_eq!((report.utility_model_filled, report.utility_model_unregistered_reason), (None, None));
+        }
+    }
+
+    /// (#3287) `record_engine`'s undo: the registry is rewritten as it was,
+    /// or removed when there was none, and a failed undo says so.
+    #[test]
+    fn put_back_restores_or_removes_the_registry_and_says_whether_it_could() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        fs::write(&path, "changed").unwrap();
+        assert_eq!(put_back(&path, Some("before")), "profiles.json was put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert_eq!(put_back(&path, None), "profiles.json was put back");
+        assert!(!path.exists(), "no registry before, none after");
+        assert_eq!(put_back(&path, None), "profiles.json could NOT be put back");
+        let unwritable = dir.path().join("no-such-dir").join("profiles.json");
+        assert_eq!(put_back(&unwritable, Some("before")), "profiles.json could NOT be put back");
     }
 
     #[test]

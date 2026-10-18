@@ -215,6 +215,31 @@ fn a_streamed_messages_reply_is_put_back_together_as_the_unstreamed_one() {
     assert_eq!((c.prompt, c.completion, c.total, c.cached), (Some(42), Some(5), Some(47), Some(30)));
 }
 
+/// (#3287) A sparse Messages stream: a null id is no id, a null stop reason
+/// never erases a real one, a data line that is not JSON is skipped, and a
+/// stream that reported no usage puts no `usage` block on the reply.
+#[test]
+fn a_sparse_messages_stream_carries_only_the_values_it_sent() {
+    let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":null,\"model\":\"m\"}}\n\n\
+data: not json\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+    let bytes = assemble(body.as_bytes(), Shape::Messages).expect("an SSE body").expect("a finished stream");
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(reply["model"], "m");
+    assert!(reply.get("id").is_none(), "a null id is not copied: {reply}");
+    assert_eq!(reply["stop_reason"], "max_tokens", "a later null does not erase it: {reply}");
+    assert!(reply.get("usage").is_none(), "no counts, no usage block: {reply}");
+    assert_eq!(reply["content"][0]["text"], "Hi");
+}
+
 #[test]
 fn the_tail_counts_messages_text_and_thinking_deltas() {
     let mut tail = SseTail::new(Shape::Messages);
