@@ -602,8 +602,9 @@ export interface CardFace {
    *  having no reading). */
   noSignal: boolean;
   /** The tube: a live execution's reading, the idle tube, the powered-off
-   *  screen of an offline machine, or no-signal static. */
-  tube: "reading" | "idle" | "off" | "nosignal";
+   *  screen of an offline machine, the radar sweep of a card still checking
+   *  (#3284), or no-signal static. */
+  tube: "reading" | "idle" | "off" | "seeking" | "nosignal";
   /** The running count is shown; otherwise "—" holds its line. */
   countShown: boolean;
   /** The utility strip may call a quiet strip "idle"; otherwise its words
@@ -670,7 +671,9 @@ export function cardFace(
   const status = statusOf({ absent, active: card.active, notStreaming, idleKnown, cardRead: card.note === null });
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
-  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : "nosignal";
+  // (#3284) A card still checking sweeps for its machine; static is for a
+  // card whose sources answered and still show nothing.
+  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : status === CardStatus.Checking ? "seeking" : "nosignal";
   return {
     status,
     active,

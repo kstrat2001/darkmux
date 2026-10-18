@@ -21,9 +21,11 @@ import type { LiveState } from "./tokenRate";
 
 /** The scope's visible states. The five live ones are `LiveState`'s own;
  *  `nosignal` is a stall reading the page could not trust (connection lost),
+ *  `seeking` (#3284) is a machine the page is still checking for (a radar
+ *  sweep: looking, where static says lost),
  *  `finished` is a run that has ended (calm dimmed ring, the average in the
  *  center), and `idle` is no live execution (a mission between model steps). */
-export type ScopeState = LiveState | "nosignal" | "finished" | "idle";
+export type ScopeState = LiveState | "nosignal" | "seeking" | "finished" | "idle";
 
 /** One frame's worth of trace parameters.
  *  - `ring`: brightness of the main trace
@@ -32,6 +34,7 @@ export type ScopeState = LiveState | "nosignal" | "finished" | "idle";
  *  - `inward`: the PROMPT rings
  *  - `breath`: the REST breathing
  *  - `fuzz`: no-signal static
+ *  - `radar`: (#3284) the seeking sweep (a rotating beam and its trail)
  *  - `sx`/`sy`: horizontal and vertical scale (the CRT collapse and power-on)
  *  - `ember`: the STALL dot
  *  - `rscale`: ring radius scale
@@ -50,6 +53,7 @@ export interface ScopeParams {
   inward: number;
   breath: number;
   fuzz: number;
+  radar: number;
   sx: number;
   sy: number;
   ember: number;
@@ -73,6 +77,7 @@ export const SCOPE_SPEED = {
   inward: 5,
   breath: 4,
   fuzz: 6,
+  radar: 5,
   sx: 16,
   sy: 16,
   ember: 5,
@@ -86,10 +91,10 @@ export const SCOPE_SPEED = {
 
 /** The morphing keys, in a fixed array so the per-frame loop does not call
  *  `Object.keys` (which allocates). Color is handled separately. */
-const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo", "scribe", "iris", "drift"] as const;
+const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "radar", "sx", "sy", "ember", "rscale", "tempo", "scribe", "iris", "drift"] as const;
 
 function blankParams(): ScopeParams {
-  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, scribe: 0, iris: 0, drift: 0, r: 0, g: 0, b: 0 };
+  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, radar: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, scribe: 0, iris: 0, drift: 0, r: 0, g: 0, b: 0 };
 }
 
 /** The targets for `state`, `sinceSec` seconds after entering it, written
@@ -114,6 +119,7 @@ export function scopeTargets(
   out.inward = 0;
   out.breath = 0;
   out.fuzz = 0;
+  out.radar = 0;
   out.sx = 1;
   out.sy = 1;
   out.ember = 0;
@@ -154,6 +160,12 @@ export function scopeTargets(
     case "nosignal":
       out.ring = 0;
       out.fuzz = 1;
+      break;
+    case "seeking":
+      // (#3284, operator: "more like a search animation, maybe like old
+      // school radar seek") The sweep draws its own range rings.
+      out.ring = 0;
+      out.radar = 1;
       break;
     case "finished":
       // (#2890 operator review) The ended run's echo: the wave its AVERAGE
@@ -288,6 +300,7 @@ export function stateTone(state: ScopeState): ScopeTone {
   switch (state) {
     case "finished":
     case "idle":
+    case "seeking":
       return "none";
     default:
       return state;

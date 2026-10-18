@@ -326,10 +326,11 @@ function CardTube({
       </div>
     );
   }
-  if (face.tube === "nosignal") {
+  if (face.tube === "nosignal" || face.tube === "seeking") {
+    const state = face.tube;
     return (
       <div className="mach-scope" data-testid="fleet-token-scope">
-        <TokenScope tokensPerSec={0} state="nosignal" size="card" {...scopeCenter({ state: "nosignal", tokensPerSec: 0 })} />
+        <TokenScope tokensPerSec={0} state={state} size="card" {...scopeCenter({ state, tokensPerSec: 0 })} />
       </div>
     );
   }

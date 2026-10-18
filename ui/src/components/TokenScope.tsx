@@ -151,6 +151,8 @@ interface ScopeClocks {
   breathT: number;
   sweep: number;
   inwardT: number;
+  /** (#3284) The seeking radar beam's angle, radians. */
+  radarT: number;
   /** (#2890) The wave's WHOLE lobe count now, the one it is leaving, and how
    *  far the crossfade between them has run; stepped by `lib/scopeWave.ts`. */
   lobes: LobeBlend;
@@ -307,6 +309,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   c.breathT += dt * 1.1;
   c.sweep += dt * Math.PI * 1.6;
   c.inwardT = (c.inwardT + dt * 0.45) % 1;
+  c.radarT = (c.radarT + dt * RADAR_TURN_PER_SEC) % (Math.PI * 2);
 
   ctx.globalCompositeOperation = "lighter";
   // The rate sets a lobe count; the wave draws a WHOLE count and glides to a
@@ -498,6 +501,8 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
+  // SEEKING (#3284): an old radar scope looking for the machine.
+  if (p.radar > 0.02) drawRadar(ctx, cx, cy, R, p, c.radarT);
   // NO SIGNAL: static fading in.
   if (p.fuzz > 0.02) {
     const rr = Math.min(w, h) / 2;
@@ -512,6 +517,74 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       ctx.fillRect(x, y, 1.3, 1.3);
     }
   }
+}
+
+/** (#3284) One revolution of the seeking beam every 2.6 s. */
+const RADAR_TURN_PER_SEC = (Math.PI * 2) / 2.6;
+/** The trail's span behind the beam (radians) and how many wedges draw it. */
+const RADAR_TRAIL = Math.PI * 0.3;
+const RADAR_TRAIL_STEPS = 24;
+
+/** (#3284) SEEKING: two faint range rings and a crosshair, a beam from the
+ *  center turning clockwise, and a phosphor wedge fading behind it. The
+ *  frame's translucent clear adds the afterglow. The wedges are unblurred and
+ *  only the beam carries a glow (canvas blur is paid per stroke; see TOOLS). */
+function drawRadar(ctx: CanvasRenderingContext2D, cx: number, cy: number, R: number, p: ScopeParams, head: number) {
+  const { r: cr, g: cg, b: cb } = p;
+  const k = p.radar;
+  const rx = R * p.sx;
+  const ry = R * p.sy;
+  ctx.lineWidth = 1;
+  // Faint: the frame's translucent clear lets a still line build up, so these
+  // read about twice as bright as their alpha.
+  ctx.strokeStyle = rgba(cr, cg, cb, 0.07 * k);
+  for (const f of [0.5, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx * f, ry * f, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = rgba(cr, cg, cb, 0.04 * k);
+  ctx.beginPath();
+  ctx.moveTo(cx - rx, cy);
+  ctx.lineTo(cx + rx, cy);
+  ctx.moveTo(cx, cy - ry);
+  ctx.lineTo(cx, cy + ry);
+  ctx.stroke();
+  // One conic-gradient fill where the canvas has it (no seams between
+  // wedges); stacked wedges otherwise.
+  if (typeof ctx.createConicGradient === "function") {
+    const g = ctx.createConicGradient(head - RADAR_TRAIL, cx, cy);
+    const span = RADAR_TRAIL / (Math.PI * 2);
+    g.addColorStop(0, rgba(cr, cg, cb, 0));
+    g.addColorStop(span * 0.6, rgba(cr, cg, cb, 0.06 * k));
+    g.addColorStop(span, rgba(cr, cg, cb, 0.28 * k));
+    g.addColorStop(Math.min(1, span + 0.0001), rgba(cr, cg, cb, 0));
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.ellipse(cx, cy, rx, ry, 0, head - RADAR_TRAIL, head);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+  } else for (let i = 0; i < RADAR_TRAIL_STEPS; i++) {
+    const f = 1 - i / RADAR_TRAIL_STEPS;
+    const a1 = head - RADAR_TRAIL * (i / RADAR_TRAIL_STEPS);
+    const a0 = head - RADAR_TRAIL * ((i + 1) / RADAR_TRAIL_STEPS);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.ellipse(cx, cy, rx, ry, 0, a0, a1 + 0.004);
+    ctx.closePath();
+    ctx.fillStyle = rgba(cr, cg, cb, 0.2 * f * f * k);
+    ctx.fill();
+  }
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(head) * rx, cy + Math.sin(head) * ry);
+  ctx.strokeStyle = rgba(lift(cr, 0.4), lift(cg, 0.4), lift(cb, 0.4), 0.9 * k);
+  ctx.lineWidth = 1.6;
+  ctx.shadowColor = rgba(cr, cg, cb, 0.9);
+  ctx.shadowBlur = 8 * k;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
 }
 
 /** A plain whole number eases between values; anything else ("—") is shown
@@ -541,7 +614,7 @@ export function TokenScope({
   const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const morphRef = useRef<ScopeMorph>(createMorph());
-  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobes: { cur: 3, prev: 3, mix: 1 }, handMix: 0 });
+  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), radarT: Math.random() * 6, lobes: { cur: 3, prev: 3, mix: 1 }, handMix: 0 });
   // GEN's live rate, or a finished run's average for its echo (#2890).
   const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the
