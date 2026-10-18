@@ -4633,6 +4633,96 @@
             assert!(got.contains("sse-telemetry-sample"), "the telemetry stream is not in the live view: {got:?}");
         }
 
+        /// On the Redis path, this machine's viewers still get what the hub
+        /// never carries, from the local day file: a lab run's records
+        /// (contract 3) and the 2 s generation heartbeats the hub rule keeps
+        /// local (#2101, #3210). A lab dispatch has no live channel either, so
+        /// before this its card moved only on the viewer's 20 s reconcile, and
+        /// a snapshot taken on turn 1's stream-open chunk read "— think tok/s"
+        /// for the whole 20 s. A record the hub does carry (work, a
+        /// prompt-phase heartbeat, a relayed generation beat) is written to the
+        /// file too, and reaches the viewer once, from Redis.
+        #[tokio::test]
+        #[serial]
+        async fn the_redis_flow_stream_also_sends_what_stays_off_the_hub_from_the_local_file() {
+            use futures::StreamExt;
+            use std::io::Write;
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+            let tmp = TempDir::new().unwrap();
+            let day_file = tmp.path().join(format!("{today}.jsonl"));
+            fs::write(&day_file, "").unwrap();
+            let app = build_router_local(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let lab = "pepper-grinder-deep-1792325841-1.lab.adhoc.coder.pepper-grinder";
+            let work = "dispatch-coder-1792326044-38a8-0.adhoc.coder.thinkcap";
+            // The writers' real heartbeat shapes; `handle` marks each line.
+            let opener = r#"{"turn_seq":1,"cumulative_chars":0,"sampled_at_ms":1,"generated_chars":0,"prompt_chars":9000}"#;
+            let beat = r#"{"turn_seq":1,"partial_index":9,"cumulative_chars":0,"sampled_at_ms":2,"generated_chars":120}"#;
+            let relayed = r#"{"turn_seq":1,"partial_index":12,"cumulative_chars":0,"sampled_at_ms":3,"generated_chars":200,"hub_relay":true}"#;
+            let line = |action: &str, session: &str, marker: &str, payload: &str| {
+                format!(r#"{{"ts":"{today}T12:00:00Z","action":"{action}","session_id":"{session}","handle":"{marker}","payload":{payload}}}"#)
+            };
+            let hb = "dispatch.turn.heartbeat";
+            let on_hub = [
+                line("dispatch.turn", work, "work-turn", r#"{"turn_seq":1}"#),
+                line(hb, work, "work-opener", opener),
+                line(hb, work, "work-relayed", relayed),
+            ];
+            {
+                let mut f = fs::OpenOptions::new().append(true).open(&day_file).unwrap();
+                for l in [
+                    line(hb, lab, "lab-beat", beat),
+                    line(hb, lab, "lab-opener", opener),
+                    line("dispatch.turn", lab, "lab-turn", r#"{"turn_seq":1}"#),
+                    line(hb, work, "work-beat", beat),
+                ]
+                .iter()
+                .chain(on_hub.iter())
+                {
+                    writeln!(f, "{l}").unwrap();
+                }
+            }
+            for l in &on_hub {
+                xadd_flow_record(&redis.url, l);
+            }
+
+            let wanted = ["lab-beat", "lab-opener", "lab-turn", "work-beat", "work-turn", "work-opener", "work-relayed"];
+            let mut seen = String::new();
+            let _ = tokio::time::timeout(Duration::from_secs(4), async {
+                while let Some(Ok(chunk)) = body.next().await {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                    if wanted.iter().all(|m| seen.contains(&format!("\"{m}\""))) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            // Long enough for another file poll: a duplicate would land by now.
+            let _ = tokio::time::timeout(Duration::from_millis(700), async {
+                while let Some(Ok(chunk)) = body.next().await {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                }
+            })
+            .await;
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            for m in wanted {
+                assert_eq!(seen.matches(&format!("\"{m}\"")).count(), 1, "`{m}` reaches the viewer exactly once: {seen:?}");
+            }
+        }
+
         /// (#2101) The session replay (`/flow-dispatch/:id`) reads the
         /// telemetry stream: a peer's host sample on the hub lands in the run's
         /// record set, which is what its SYSTEM pane draws. Reading the work
@@ -8927,6 +9017,22 @@ mod flow_stream_ends_with_its_records {
             .await
             .expect("the response ends once its records do");
         assert_eq!(all.len(), 2, "every record is delivered before the end");
+    }
+
+    /// The same on the Redis path's other side: the local file tail of what
+    /// stays off the hub never ends either, so it must not hold the response
+    /// open once the hub tail has given up.
+    #[tokio::test]
+    async fn the_redis_path_ends_when_the_hub_tail_ends_though_the_local_tail_is_open() {
+        let hub = stream::iter(vec!["a".to_string(), "stream.error".to_string()]).boxed();
+        let local = stream::pending().boxed();
+        let all = tokio::time::timeout(std::time::Duration::from_secs(2), super::super::hub_then_local(hub, local).collect::<Vec<_>>())
+            .await
+            .expect("the lines end once the hub's do");
+        assert_eq!(all, ["a", "stream.error"]);
+        let local = stream::iter(vec!["beat".to_string()]).boxed();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), super::super::hub_then_local(stream::pending().boxed(), local).next()).await;
+        assert_eq!(first.ok().flatten().as_deref(), Some("beat"), "a local line arrives while the hub tail is open");
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ pub mod test_redis;
 mod bookend;
 mod hub_link;
 mod hub_route;
-pub use hub_route::{heartbeat_rides_hub, is_prompt_phase_heartbeat, HubRelayGate, HUB_GENERATION_BEAT_INTERVAL_MS};
+pub use hub_route::{heartbeat_rides_hub, is_prompt_phase_heartbeat, stays_off_hub, HubRelayGate, HUB_GENERATION_BEAT_INTERVAL_MS};
 mod integrity;
 mod schema;
 mod status;
