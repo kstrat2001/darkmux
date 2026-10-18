@@ -3097,7 +3097,8 @@ fn read_ram_free_for_ai_bytes() -> Option<u64> {
 /// stream comes from `XREAD BLOCK darkmux:flow $` (and the machine-telemetry
 /// stream beside it) — the **fleet-wide** tail of new records from every
 /// machine writing to the shared streams, plus what the hub never carries
-/// (every heartbeat, a lab run's records) tailed from this machine's own day
+/// (a lab run's records and the 2 s generation heartbeats; a prompt-phase or
+/// `hub_relay` beat comes from Redis) tailed from this machine's own day
 /// file. When Redis is unset OR unreachable at probe time, falls
 /// back to file-tailing `<flows_dir>/<date>.jsonl` (today's
 /// per-machine behavior). #270 PR-B.
@@ -3174,11 +3175,12 @@ async fn flow_stream_handler(
         // pre-date the RawRedisUrl wrapper and handle the raw string
         // safely), so the secret stays unlogged. (#661 Slice 5)
         let hub = redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned.clone());
-        // What the hub never carries (every heartbeat, a lab run's records)
-        // comes from this machine's own day file, as the file-tail path sends
-        // it: the live channel's durable fallback, and the only push a lab run
-        // has (it opts out of the live channel). The hub's own records come
-        // from the hub alone, so none arrives twice (`stays_off_hub`).
+        // What the hub never carries (a lab run's records, the 2 s generation
+        // heartbeats) comes from this machine's own day file, as the file-tail
+        // path sends it: the live channel's durable fallback, and the only
+        // push a lab run has (it opts out of the live channel). The hub's own
+        // records (work, prompt-phase and `hub_relay` beats) come from the hub
+        // alone, so none arrives twice (`stays_off_hub`).
         hub_then_local(Box::pin(hub), Box::pin(local_only_lines(&state.flows_dir, &date_owned).await))
     } else {
         if redis_url.is_some() {

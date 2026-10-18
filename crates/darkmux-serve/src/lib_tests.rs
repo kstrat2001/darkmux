@@ -4723,6 +4723,46 @@
             }
         }
 
+        /// (#3122, through the real route) When the hub tail gives up (Redis
+        /// gone: `MAX_CONSECUTIVE_XREAD_FAILURES` failures, 500 ms apart), the
+        /// response ends, so the browser reconnects onto the file tail. The
+        /// local-file fill on the Redis path never ends on its own and must
+        /// not hold the response open.
+        #[tokio::test]
+        #[serial]
+        async fn the_redis_flow_stream_ends_when_redis_goes_away() {
+            use futures::StreamExt;
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let mut redis = spawn_redis();
+            let today = today_utc_date();
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join(format!("{today}.jsonl")), "").unwrap();
+            let app = build_router_local(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            redis.child.kill().unwrap();
+            let _ = redis.child.wait();
+            let mut seen = String::new();
+            let ended = tokio::time::timeout(Duration::from_secs(15), async {
+                while let Some(chunk) = body.next().await {
+                    if let Ok(c) = chunk {
+                        seen.push_str(&String::from_utf8_lossy(&c));
+                    }
+                }
+            })
+            .await;
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+            assert!(ended.is_ok(), "the response stayed open after the hub tail gave up: {seen:?}");
+        }
+
         /// (#2101) The session replay (`/flow-dispatch/:id`) reads the
         /// telemetry stream: a peer's host sample on the hub lands in the run's
         /// record set, which is what its SYSTEM pane draws. Reading the work
