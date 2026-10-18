@@ -184,17 +184,15 @@ impl Backfill<'_> {
         let ts = v.get("ts")?.as_str()?;
         let uid = v.get("machine_uid").and_then(|u| u.as_str());
         let ours = uid.is_none() || uid == self.own_uid;
-        // Work records only: a heartbeat stays local and a telemetry sample is
-        // live state, so the next one supersedes any the hub missed (#2101).
-        let publishable = crate::reader::action_of(&v)
-            .as_ref()
-            .is_none_or(|a| a.hub_stream() == Some(crate::HubStream::Work));
-        // A lab run's records never reach the hub, live or re-sent (#3074).
-        let lab = crate::is_lab_session(v.get("session_id").and_then(|s| s.as_str()));
+        // Work records only, by the live write's own rule (`hub_route`): a
+        // heartbeat stays local unless it is a turn's prompt-phase one
+        // (#2101, #3210), a lab run's records never reach the hub (#3074),
+        // and a telemetry sample is live state, so the next one supersedes
+        // any the hub missed.
+        let publishable = crate::hub_route::hub_stream_of_value(&v) == Some(crate::HubStream::Work);
         let wanted = ts >= self.since
             && ours
             && publishable
-            && !lab
             && crate::flow_record_identity(&v) != self.skip_identity;
         wanted.then(|| (ts.to_string(), v.to_string()))
     }

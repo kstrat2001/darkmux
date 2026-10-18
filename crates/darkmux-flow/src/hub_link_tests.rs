@@ -514,8 +514,9 @@ fn backfill_skips_lab_session_records() {
     assert_eq!(handles, ["solo"]);
 }
 
-/// (#2101) Backfill re-sends the local day file's records, but never the
-/// heartbeats: they are local-only liveness detail and would flush the stream.
+/// (#2101) Backfill re-sends the local day file's records, but not the
+/// heartbeats (#3210: except a turn's prompt-phase ones; these carry no
+/// payload): they would flush the stream.
 #[test]
 fn backfill_skips_heartbeats_and_still_sends_the_rest() {
     let dir = TempDir::new().unwrap();
@@ -532,6 +533,42 @@ fn backfill_skips_heartbeats_and_still_sends_the_rest() {
     let handles: Vec<String> =
         lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
     assert_eq!(handles, ["tool", "turn"], "heartbeat skipped, the rest sent: {handles:?}");
+}
+
+/// (#3210) The backfill re-sends exactly the heartbeats the live write
+/// sends: a turn's opener and its prefill reports before anything is
+/// generated. A report after generation started, a plain beat, and a lab
+/// run's opener stay in the day file.
+#[test]
+fn backfill_resends_prompt_phase_heartbeats_only() {
+    use darkmux_types::session_id::{RunId, SessionId};
+    let dir = TempDir::new().unwrap();
+    let now = current_epoch_secs();
+    let today = dir.path().join(format!("{}.jsonl", day_utc_at(now)));
+    let solo = SessionId::adhoc(RunId::standalone("s-3210").unwrap(), "coder", "n").wire();
+    let lab = SessionId::adhoc(RunId::lab("l-3210").unwrap(), "coder", "n").wire();
+    let line = |handle: &str, session: &str, payload: serde_json::Value| {
+        serde_json::json!({"ts": ts_utc_at(now - 10), "action": "dispatch.turn.heartbeat", "handle": handle, "session_id": session, "payload": payload})
+            .to_string()
+    };
+    let opener = serde_json::json!({"turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_chars": 9000});
+    let early = serde_json::json!({"turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_processed": 512, "prompt_total": 2048});
+    let late = serde_json::json!({"turn_seq": 1, "partial_index": 3, "cumulative_chars": 9, "generated_chars": 12, "prompt_processed": 2048, "prompt_total": 2048});
+    let plain = serde_json::json!({"turn_seq": 1, "partial_index": 8, "cumulative_chars": 40, "generated_chars": 60});
+    let body = [
+        line("opener", &solo, opener.clone()),
+        line("early", &solo, early),
+        line("late", &solo, late),
+        line("plain", &solo, plain),
+        line("lab-opener", &lab, opener),
+    ]
+    .join("\n");
+    std::fs::write(&today, body).unwrap();
+    let since = ts_utc_at(now - 60);
+    let lines = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.lines();
+    let handles: Vec<String> =
+        lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
+    assert_eq!(handles, ["opener", "early"]);
 }
 
 /// (#3035) A link state or health value a newer darkmux wrote reads as

@@ -17,6 +17,9 @@ import { norm, type RawRecord } from "../../testing/records";
 import type { Run } from "../../types/generated/Run";
 import type { NormRecord } from "../../lib/ingest";
 import { liveSampleToRecord, type LiveOverlay } from "../../lib/liveChannel";
+import { ingest } from "../../lib/ingest";
+import { NO_PRESENCE } from "../../lib/lifecycle";
+import { readingLabel } from "./readingLabel";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
   return { tracked: true, receive_key: 0, ...overrides };
@@ -1424,5 +1427,72 @@ describe("shownExecution (#2881, #2886 F6)", () => {
   });
   it("shows nothing when nothing runs", () => {
     expect(shownExecution([], "b", "a")).toEqual({ selectedIdx: -1, defaultSid: null });
+  });
+});
+
+// (#3210) Another machine's prefill, as its records reach this viewer off the
+// fleet hub: a `/flow/:date` body with the peer's `dispatch.start`, its turn's
+// opener, and the engine's prefill reports, each stamped with the hub's id.
+// Before 5.3.0 the hub carried no heartbeat at all, so the peer's card had
+// nothing to read the bar from.
+describe("(#3210) a peer's prefill progress, through the hub", () => {
+  const PEER = "uid-studio";
+  const SID = "s-peer";
+  const T0 = Date.parse("2026-10-18T01:00:00.000Z");
+  const at = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const beat = (hubMs: number, sampledMs: number, payload: Record<string, unknown>) => ({
+    ts: at(sampledMs),
+    hub_id: `${hubMs}-0`,
+    level: "info",
+    category: "work",
+    tier: "local",
+    stage: "dispatch",
+    action: "dispatch.turn.heartbeat",
+    handle: "coder",
+    session_id: SID,
+    execution_id: "e-peer",
+    machine_id: "studio",
+    machine_uid: PEER,
+    payload: { turn_seq: 1, cumulative_chars: 0, sampled_at_ms: sampledMs, generated_chars: 0, ...payload },
+  });
+  const body = {
+    records: [
+      { ts: at(T0), hub_id: `${T0}-0`, action: "dispatch.start", handle: "coder", session_id: SID, execution_id: "e-peer", machine_id: "studio", machine_uid: PEER, payload: { prompt_chars: 90_000 } },
+      beat(T0 + 10, T0 + 5, { prompt_chars: 90_000 }),
+      // mlx reports every 512 tokens; the host writes at most one per 2 s.
+      beat(T0 + 2_010, T0 + 2_000, { prompt_processed: 512, prompt_total: 4096 }),
+      beat(T0 + 4_010, T0 + 4_000, { prompt_processed: 1024, prompt_total: 4096 }),
+      beat(T0 + 6_010, T0 + 6_000, { prompt_processed: 1536, prompt_total: 4096 }),
+    ],
+  };
+  const NOW = T0 + 6_500;
+
+  it("live: the peer's card reads PROMPT with the bar and the time left", () => {
+    const card = buildFleetCard(ingest(body), new Map(), null, new Set([SID]), false, PEER, NOW);
+    expect(card.executions).toHaveLength(1);
+    const exec = card.executions[0];
+    expect(exec.state).toBe("prompt");
+    expect(exec.promptProgress).toEqual({ processed: 1536, total: 4096, percent: 37, secondsLeft: 10 });
+    expect(readingLabel(exec, "prompt")).toEqual({ kind: "text", text: "37% · ~10s left" });
+  });
+
+  it("playback: the same records, scrubbed to mid-prefill, read the same", () => {
+    const card = buildFleetCard(ingest(body), new Map(), null, NO_PRESENCE, false, PEER, NOW);
+    expect(card.executions[0]?.promptProgress).toEqual({ processed: 1536, total: 4096, percent: 37, secondsLeft: 10 });
+    // Earlier in the prefill, only what had arrived by then counts.
+    const earlier = buildFleetCard(ingest(body), new Map(), null, NO_PRESENCE, false, PEER, T0 + 2_500);
+    expect(earlier.executions[0]?.promptProgress).toEqual({ processed: 512, total: 4096, percent: 12 });
+  });
+
+  it("without the hub's heartbeats (before 5.3.0) the card has no progress to show", () => {
+    const bookendOnly = { records: body.records.filter((r) => r.action !== "dispatch.turn.heartbeat") };
+    const card = buildFleetCard(ingest(bookendOnly), new Map(), null, new Set([SID]), false, PEER, NOW);
+    expect(card.executions[0]?.promptProgress).toBeUndefined();
+  });
+
+  it("the opener has to travel too: progress reports alone draw no bar", () => {
+    const noOpener = { records: body.records.filter((r) => !(r.payload as { prompt_chars?: number }).prompt_chars || r.action !== "dispatch.turn.heartbeat") };
+    const card = buildFleetCard(ingest(noOpener), new Map(), null, new Set([SID]), false, PEER, NOW);
+    expect(card.executions[0]?.promptProgress).toBeUndefined();
   });
 });

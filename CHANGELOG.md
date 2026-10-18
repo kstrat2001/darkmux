@@ -36,6 +36,12 @@ darkmux release.
   steps between reports (30 s before there are two advances), so a step that slows
   mid-way is never STALL sooner than an engine that reports nothing. Engines that report
   nothing read as before. llama.cpp and LM Studio are not recognized yet.
+  Another machine's card shows the bar and the time left too, live and in playback: a
+  turn's prompt-phase heartbeats (its opener, and the engine's reports while nothing has
+  been generated) now ride the fleet hub's work stream, re-sent after an outage by the
+  same rule. Every other heartbeat stays local, as since #2101, and a lab run's stay local
+  (contract 3). That is one record per turn plus about one per 512-token prefill step,
+  never more than one per 2 s.
 
 - **A fleet card still checking sweeps like a radar** (#3284). While a card waits for its
   first answers ("checking…"), its scope draws an old radar sweep: a turning beam with a
