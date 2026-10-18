@@ -51,6 +51,10 @@ pub(crate) struct SseProgress {
     pub generated_chars: u64,
     /// `data:` events read, the end marker excluded.
     pub chunks: u64,
+    /// (#3210) The latest prefill progress the engine reported, when it
+    /// reports any (`darkmux_trajectory::PromptProgressSample`, the parser
+    /// the runtime's reader shares).
+    pub prompt: Option<darkmux_trajectory::PromptProgressSample>,
 }
 
 /// A body asked to stream. A chat-completions one also asks for the usage
@@ -146,22 +150,27 @@ impl SseTail {
     }
 
     /// Read `bytes`, the response's next piece; `true` when it completed at
-    /// least one event.
+    /// least one event or (#3210) a new prefill progress report.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
         self.pending.extend_from_slice(bytes);
         let Some(end) = self.pending.iter().rposition(|b| *b == b'\n') else {
             return false;
         };
         let complete: Vec<u8> = self.pending.drain(..=end).collect();
-        let before = self.progress.chunks;
-        for data in data_lines(&String::from_utf8_lossy(&complete)) {
+        let before = (self.progress.chunks, self.progress.prompt);
+        let text = String::from_utf8_lossy(&complete);
+        // (#3210) The engine's prefill progress; the latest report wins.
+        if let Some(p) = text.lines().rev().find_map(darkmux_trajectory::PromptProgressSample::of_sse_line) {
+            self.progress.prompt = Some(p);
+        }
+        for data in data_lines(&text) {
             let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
             let (content, generated) = delta_chars(&event, self.shape);
             self.progress.content_chars += content;
             self.progress.generated_chars += generated;
             self.progress.chunks += 1;
         }
-        self.progress.chunks > before
+        (self.progress.chunks, self.progress.prompt) != before
     }
 }
 
@@ -312,18 +321,24 @@ pub(crate) fn opener(prompt_chars: u64) -> DispatchHeartbeatPayload {
         prompt_chars: Some(prompt_chars),
         phase: None,
         tool_name: None,
+        prompt_processed: None,
+        prompt_total: None,
         step_id: None,
         context: None,
     }
 }
 
-/// A heartbeat for what has streamed so far. The scope reads GEN from it.
+/// A heartbeat for what has streamed so far. The scope reads GEN from it,
+/// or (#3210) PROMPT's progress while only prefill reports have arrived (no
+/// chunk read, so no chunk index). Every beat carries the latest report.
 pub(crate) fn chunk_beat(p: &SseProgress) -> DispatchHeartbeatPayload {
     DispatchHeartbeatPayload {
-        partial_index: Some(p.chunks),
+        partial_index: (p.chunks > 0).then_some(p.chunks),
         cumulative_chars: p.content_chars,
         generated_chars: Some(p.generated_chars),
         prompt_chars: None,
+        prompt_processed: p.prompt.map(|s| s.processed),
+        prompt_total: p.prompt.map(|s| s.total),
         ..opener(0)
     }
 }

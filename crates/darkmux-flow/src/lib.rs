@@ -4032,6 +4032,9 @@ mod tests {
         //            additive (#3168): `cache_write_tokens` on the usage record.
         //            Also additive (#3125): `beats` on `dispatch.start` and
         //            `run.start`, the writer's promise to beat its session.
+        //   2.3.0 — (#3210) additive: `prompt_processed` / `prompt_total` on
+        //            `dispatch.turn.heartbeat`, the engine's prefill progress over
+        //            this request's uncached prompt.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -4043,7 +4046,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.2.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.3.0");
     }
 
     #[test]

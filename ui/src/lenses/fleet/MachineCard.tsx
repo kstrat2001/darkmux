@@ -264,6 +264,11 @@ function CountLine({
   );
 }
 
+/** (#3210) PROMPT's processed fraction for the scope's bar, when reported. */
+function promptFractionOf(r: { state: string | null; promptProgress?: { processed: number; total: number } }): number | undefined {
+  return r.state === "prompt" && r.promptProgress ? r.promptProgress.processed / r.promptProgress.total : undefined;
+}
+
 /** (#3284) The scope state for a tube with no reading to draw: the radar
  *  sweep while checking, static once the sources answered with nothing. */
 function noReadingTube(tube: CardFace["tube"]): "seeking" | "nosignal" | null {
@@ -314,6 +319,7 @@ function CardTube({
           toolName={selected.toolName}
           toolWriting={selected.writing === true}
           thinking={selected.state === "generating" && selected.thinking === true}
+          promptFraction={promptFractionOf(selected)}
           {...scopeCenter({
             state: scopeState,
             tokensPerSec: selected.tokensPerSec,

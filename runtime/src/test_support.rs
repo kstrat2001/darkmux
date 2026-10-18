@@ -288,7 +288,8 @@ impl Drop for GuardedMockServer {
 }
 
 /// (#2889) A raw SSE server that plays a SCRIPT: each entry waits its delay,
-/// then sends one `data:` payload. Built on a bare `TcpListener` rather than
+/// then sends one `data:` payload (or, for an entry that starts with `:`,
+/// that SSE comment line as it is: #3210's prefill progress). Built on a bare `TcpListener` rather than
 /// httpmock because the defect under test is a SILENCE inside one response
 /// (LM Studio names a tool call, then generates its arguments without sending
 /// anything), and httpmock can only delay a whole response.
@@ -326,7 +327,7 @@ pub(crate) fn sse_server_scripted(script: Vec<(std::time::Duration, String)>) ->
         let _ = sock.flush();
         for (delay, data) in script {
             std::thread::sleep(delay);
-            let payload = format!("data: {data}\n\n");
+            let payload = if data.starts_with(':') { format!("{data}\n\n") } else { format!("data: {data}\n\n") };
             if sock
                 .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
                 .is_err()

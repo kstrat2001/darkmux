@@ -20,12 +20,22 @@ describe("readingLabel: the status line while an execution runs", () => {
     expect(readingLabel(exec({ state: "prompt", promptLabel: "~36k" }), "prompt")).toEqual({ kind: "text", text: "processing ~36k" });
     expect(readingLabel(exec({ state: "prompt" }), "prompt")).toEqual({ kind: "text", text: "processing prompt" });
   });
+  it("(#3210) prompt processing with the engine's progress says how far, and how long is left", () => {
+    const promptProgress = { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 };
+    // The phone form keeps the time left, which the long form ellipsized away.
+    expect(readingLabel(exec({ state: "prompt", promptLabel: "~36k", promptProgress }), "prompt")).toEqual({
+      kind: "byWidth",
+      full: "processing 40% · ~23s left",
+      word: "40% · ~23s left",
+    });
+    expect(readingTitle(exec({ state: "prompt", promptProgress }), "prompt")).toBe("uncached prompt processed: 1,024 of 2,516 tokens, about 23s left");
+  });
   it("compacting counts its seconds", () => {
     expect(readingLabel(exec({ state: "prompt", compacting: true, compactingSeconds: 12 }), "prompt")).toEqual({ kind: "text", text: "compacting · 12s" });
   });
   it("a rest with a reason carries both forms of it, for the card to pick by width", () => {
     const label = readingLabel(exec({ state: "rest", restReason: "thermal · serious", restReasonWord: "thermal" }), "rest");
-    expect(label).toMatchObject({ kind: "rest", word: "thermal" });
+    expect(label).toMatchObject({ kind: "byWidth", word: "thermal" });
   });
   it("a rest without a reason counts down", () => {
     expect(readingLabel(exec({ state: "rest", restSecondsLeft: 12 }), "rest")).toEqual({ kind: "text", text: "rest 12s" });

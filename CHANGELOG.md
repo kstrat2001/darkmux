@@ -16,6 +16,27 @@ darkmux release.
 
 ### Added
 
+- **PROMPT shows how far the engine has read the prompt** (#3210). When the engine reports
+  prefill progress in its stream, the scope's brain moves up over a thin bar that fills as
+  the prompt is read (bordered, so it shows empty from the first report), the fleet card
+  reads "processing 40% · ~23s left" (on a phone, "40% · ~23s left") and the run page's
+  readout says the same under the lamps; the time left is estimated from the rate of the
+  reports that advanced, once there are two. Today that is `mlx_lm.server`, which writes
+  one `: keepalive <processed>/<total>` comment line per prefill step with nothing to opt
+  into. Its `total` is this request's uncached prompt: what its prompt cache did not
+  already hold, so with a cache hit the percentage is of the remainder, not the whole
+  prompt. Both stream readers (the runtime's and the host-side direct path) recognize that
+  shape through one shared parser and record it as a neutral fact on
+  `dispatch.turn.heartbeat`: `prompt_processed` and `prompt_total`, in tokens (flow schema
+  2.3.0, additive; trajectory schema 1.1 adds the `model.prompt.progress` event). A report
+  that advances counts as proof of work, so a long prefill on slow hardware no longer reads
+  as STALL while it is moving; a report repeating the same count does not, and writes no
+  durable heartbeat. A reporting engine reads STALL only once the size-based prefill
+  bound has passed AND it has been silent since its last advance for three of its own
+  steps between reports (30 s before there are two advances), so a step that slows
+  mid-way is never STALL sooner than an engine that reports nothing. Engines that report
+  nothing read as before. llama.cpp and LM Studio are not recognized yet.
+
 - **A fleet card still checking sweeps like a radar** (#3284). While a card waits for its
   first answers ("checking…"), its scope draws an old radar sweep: a turning beam with a
   fading phosphor trail over faint range rings. Static now means only a card whose sources

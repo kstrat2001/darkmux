@@ -78,7 +78,7 @@ fn the_wire_names_are_fixed() {
         "dispatch.intra_turn_stall.recovered", "dispatch.empty_tool_calls.recovered",
         "dispatch.per_turn_cap.salvaged", "dispatch.tool_call.discarded",
         "dispatch.tool.malformed_names", "dispatch.escalation.triggered",
-        "dispatch.feedback.injected", "trajectory.header",
+        "dispatch.feedback.injected", "trajectory.header", "model.prompt.progress",
     ];
     for name in names {
         let e = parse_line(&format!(r#"{{"type":"{name}"}}"#)).unwrap_or_else(|| panic!("{name} does not parse"));
@@ -469,4 +469,47 @@ fn an_enum_value_from_a_newer_runtime_reads_as_unknown_not_a_dropped_event() {
     // "invalid name" nor "not granted" is claimed for a cause nobody read.
     let fold = TrajectoryFold::from_lines(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
     assert_eq!((fold.tool_calls_invalid_name, fold.tool_calls_ungranted, fold.tool_calls_unclassified), (0, 0, 2));
+}
+
+/// (#3210) Prefill progress reads back with its counts, under its turn.
+#[test]
+fn a_prompt_progress_event_reads_back_with_its_turn_and_counts() {
+    let e = parse_line(r#"{"type":"model.prompt.progress","seq":4,"ts":9,"processed":1024,"total":2516}"#);
+    assert!(
+        matches!(&e, Some(TrajectoryEvent::PromptProgress(p)) if p.processed == 1024 && p.total == 2516),
+        "{e:?}"
+    );
+    let e = e.unwrap();
+    assert_eq!((e.seq(), e.ts()), (Some(4), Some(9)));
+}
+
+/// Every event's turn and clock, by type: the clock for every type but the
+/// header (and an unknown type), the turn for every type but the execution
+/// bookends, the compaction events and the pre-send bound.
+#[test]
+fn every_event_type_reports_its_turn_and_clock() {
+    let no_turn = [
+        "dispatch.start", "dispatch.complete", "compaction.start", "compaction.call", "compaction",
+        "compaction.skipped", "compaction.unproductive", "dispatch.pre_send_bound", "trajectory.header",
+    ];
+    let names = [
+        "dispatch.start", "dispatch.complete", "model.streaming.start", "model.partial",
+        "model.tool_call.writing", "model.prompt.progress", "model.streaming.end", "model.completed",
+        "model.reasoning", "tool.completed", "tool_call.promoted", "tool_call.promotion_suppressed",
+        "runtime.rest", "compaction.start", "compaction.call", "compaction", "compaction.skipped",
+        "compaction.unproductive", "dispatch.context", "dispatch.context.stale_tokens",
+        "dispatch.pre_send_bound", "dispatch.checkpoint", "dispatch.gate.observation", "dispatch.gate.abort",
+        "dispatch.cycle.suspected", "dispatch.reasoning_loop.suspected", "dispatch.reasoning_bound.not_applied",
+        "dispatch.tool.repeated_failure", "dispatch.intra_turn_stall.recovered",
+        "dispatch.empty_tool_calls.recovered", "dispatch.per_turn_cap.salvaged", "dispatch.tool_call.discarded",
+        "dispatch.tool.malformed_names", "dispatch.escalation.triggered", "dispatch.feedback.injected",
+        "trajectory.header",
+    ];
+    for name in names {
+        let e = parse_line(&format!(r#"{{"type":"{name}","seq":7,"ts":9}}"#)).unwrap_or_else(|| panic!("{name}"));
+        let header = name == "trajectory.header";
+        assert_eq!(e.ts(), (!header).then_some(9), "{name} clock");
+        assert_eq!(e.seq(), (!no_turn.contains(&name)).then_some(7), "{name} turn");
+    }
+    assert_eq!((TrajectoryEvent::Unknown.seq(), TrajectoryEvent::Unknown.ts()), (None, None));
 }

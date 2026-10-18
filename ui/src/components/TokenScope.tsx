@@ -71,6 +71,11 @@ export interface TokenScopeProps {
    *  omitted it is derived from the older props below (`stalled`,
    *  `resting`, `tone`), so an existing caller keeps working. */
   state?: ScopeState;
+  /** (#3210) PROMPT's processed fraction (0..1) of this request's uncached
+   *  prompt, when the engine reports it:
+   *  the brain moves up and a thin bar under it fills that far. Absent, or
+   *  outside PROMPT, the brain sits alone as before. */
+  promptFraction?: number;
   /** (#2890) While `state` is `"tools"`: the tool being run (the latest
    *  completed call's `tool_name`), drawn as an icon in the center. Unknown
    *  or absent reads as the gear. */
@@ -594,6 +599,22 @@ function parseWhole(label: string | null | undefined): number | null {
   return label != null && /^\d+$/.test(label) ? Number(label) : null;
 }
 
+/** (#3210) PROMPT's center: the brain, and under it, once the engine reports
+ *  progress, a thin bordered bar filled to the processed fraction. */
+function BrainCenter({ state, promptFraction }: { state: ScopeState; promptFraction: number | undefined }) {
+  const barPct = promptFraction !== undefined && Number.isFinite(promptFraction) ? Math.round(Math.max(0, Math.min(1, promptFraction)) * 100) : null;
+  return (
+    <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state} data-progress={barPct !== null ? "" : undefined}>
+      <BrainGlyph className="token-scope-ico" />
+      {barPct !== null ? (
+        <span className="token-scope-bar">
+          <span className="token-scope-bar__fill" style={{ width: `${barPct}%` }} />
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 export function TokenScope({
   tokensPerSec,
   state: stateProp,
@@ -609,6 +630,7 @@ export function TokenScope({
   centerCarried = false,
   className,
   tone = "generating",
+  promptFraction,
   restEndMs,
   clock = WALL_CLOCK,
 }: TokenScopeProps) {
@@ -821,11 +843,7 @@ export function TokenScope({
     );
   } else if (showBrain) {
     centerKey = "brain";
-    centerNode = (
-      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state}>
-        <BrainGlyph className="token-scope-ico" />
-      </div>
-    );
+    centerNode = <BrainCenter state={state} promptFraction={promptFraction} />;
   } else if (showNumber) {
     centerKey = `num:${state}`;
     centerNode = (

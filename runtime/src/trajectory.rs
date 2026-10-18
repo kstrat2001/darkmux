@@ -1375,6 +1375,20 @@ impl Trajectory {
         }));
     }
 
+    /// model.prompt.progress — (#3210) the engine reported how much of the
+    /// prompt it has processed, in tokens, before its first output
+    /// (`mlx_lm.server` writes one report per prefill step). One event per
+    /// report, as the engine paces them (seconds apart); the host coalesces
+    /// them into the turn's heartbeats.
+    pub fn append_prompt_progress(&mut self, seq: u32, processed: u64, total: u64) {
+        self.write_event(dt::TrajectoryEvent::PromptProgress(dt::PromptProgress {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            processed,
+            total,
+        }));
+    }
+
     /// model.streaming.end — fires when the SSE stream terminates
     /// (either via `data: [DONE]` or EOF), before the `model.completed`
     /// summary event for the same turn. Records totals collected during

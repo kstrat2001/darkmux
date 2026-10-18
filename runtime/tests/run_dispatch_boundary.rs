@@ -1195,7 +1195,7 @@ fn l_the_out_dir_records_dispatch_start_and_complete() {
     assert!(run.stderr.contains(&format!("darkmux-runtime: trajectory → {}\n", path.display())), "{run:?}");
 
     let t = trajectory_of(dir.path());
-    assert_eq!(t[0], json!({ "schema_version": "1.0", "type": "trajectory.header" }));
+    assert_eq!(t[0], json!({ "schema_version": "1.1", "type": "trajectory.header" }));
     let start = &t[1];
     assert_eq!(start["type"], "dispatch.start");
     assert_eq!(start["model"], "brain-model");

@@ -86,6 +86,14 @@ The first line is a `trajectory.header` event carrying the file's `schema_versio
 
 `system_chars` is the system-role messages' total char count for THIS request (changes only across compactions); `prompt_chars` is the accumulated conversation context size in chars. Independent signal from `usage.prompt_tokens` (which uses LMStudio's tokenizer).
 
+### `model.prompt.progress` (0..N per streaming turn, before the first partial)
+
+```
+{ "type": "model.prompt.progress", "seq": <turn>, "processed": <int>, "total": <int>, "ts": <unix_ms> }
+```
+
+The engine's own prefill progress, in tokens of this request's uncached prompt (with a prompt cache hit, `total` is only the part not already cached), when it reports any (today `mlx_lm.server`, one per prefill step). Absent for an engine that reports nothing. Consecutive reports whose count advanced give the prefill rate; a repeated count is not progress.
+
 ### `model.partial` (N per streaming turn, one per SSE chunk)
 
 ```

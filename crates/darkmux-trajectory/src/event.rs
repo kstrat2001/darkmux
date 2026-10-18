@@ -35,6 +35,8 @@ pub enum TrajectoryEvent {
     Partial(Partial),
     #[serde(rename = "model.tool_call.writing")]
     ToolCallWriting(ToolCallWriting),
+    #[serde(rename = "model.prompt.progress")]
+    PromptProgress(PromptProgress),
     #[serde(rename = "model.streaming.end")]
     StreamingEnd(StreamingEnd),
     #[serde(rename = "model.completed")]
@@ -292,6 +294,21 @@ impl Default for ToolCallWriting {
             tool_name: String::new(),
         }
     }
+}
+
+/// `model.prompt.progress` (#3210, trajectory 1.1): the engine reported how
+/// much of this request's uncached prompt it has processed, in tokens, before its first output
+/// ([`crate::PromptProgressSample`] recognizes the shapes). Not a chunk.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptProgress {
+    pub seq: u64,
+    pub ts: u64,
+    /// Tokens of the uncached prompt processed so far.
+    pub processed: u64,
+    /// Tokens the engine has to process: this request's prompt less what
+    /// its prompt cache held, not the whole prompt.
+    pub total: u64,
 }
 
 /// `model.streaming.end`: the stream terminated, before `model.completed`.
@@ -864,88 +881,132 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// An event's turn (`None` for the events outside any turn) and clock.
+type Stamp = (Option<u64>, u64);
+
 impl TrajectoryEvent {
     /// The turn an event belongs to, for the events that carry one.
     pub fn seq(&self) -> Option<u64> {
-        use TrajectoryEvent as E;
-        match self {
-            E::StreamingStart(e) => Some(e.seq),
-            E::Partial(e) => Some(e.seq),
-            E::ToolCallWriting(e) => Some(e.seq),
-            E::StreamingEnd(e) => Some(e.seq),
-            E::ModelCompleted(e) => Some(e.seq),
-            E::Reasoning(e) => Some(e.seq),
-            E::ToolCompleted(e) => Some(e.seq),
-            E::ToolCallPromoted(e) => Some(e.seq),
-            E::PromotionSuppressed(e) => Some(e.seq),
-            E::Rest(e) => Some(e.seq),
-            E::Context(e) => Some(e.seq),
-            E::StaleContextTokens(e) => Some(e.seq),
-            E::Checkpoint(e) => Some(e.seq),
-            E::GateObservation(e) => Some(e.seq),
-            E::GateAbort(e) => Some(e.seq),
-            E::CycleSuspected(e) => Some(e.seq),
-            E::ReasoningLoopSuspected(e) => Some(e.seq),
-            E::ReasoningBoundNotApplied(e) => Some(e.seq),
-            E::RepeatedToolFailure(e) => Some(e.seq),
-            E::IntraTurnStallRecovered(e) | E::EmptyToolCallsRecovered(e) => Some(e.seq),
-            E::PerTurnCapSalvaged(e) => Some(e.seq),
-            E::ToolCallDiscarded(e) => Some(e.seq),
-            E::MalformedToolNames(e) => Some(e.seq),
-            E::EscalationTriggered(e) => Some(e.seq),
-            E::FeedbackInjected(e) => Some(e.seq),
-            E::DispatchStart(_)
-            | E::DispatchComplete(_)
-            | E::CompactionStart(_)
-            | E::CompactionCall(_)
-            | E::Compaction(_)
-            | E::CompactionSkipped(_)
-            | E::CompactionUnproductive(_)
-            | E::PreSendBound(_)
-            | E::Header(_)
-                        | E::Unknown => None,
-        }
+        self.stamp().and_then(|(seq, _)| seq)
     }
 
     /// When the runtime wrote the event, in unix milliseconds. `None` for
     /// the events that carry no clock.
     pub fn ts(&self) -> Option<u64> {
+        self.stamp().map(|(_, ts)| ts)
+    }
+
+    /// Turn and clock, read family by family; `None` for the events that
+    /// carry no clock (the header, an unknown type).
+    fn stamp(&self) -> Option<Stamp> {
+        self.stream_stamp()
+            .or_else(|| self.turn_stamp())
+            .or_else(|| self.outside_turn_stamp())
+            .or_else(|| self.detector_stamp())
+            .or_else(|| self.recovery_stamp())
+    }
+
+    /// A model stream's own events.
+    fn stream_stamp(&self) -> Option<Stamp> {
         use TrajectoryEvent as E;
         match self {
-            E::DispatchStart(e) => Some(e.ts),
-            E::DispatchComplete(e) => Some(e.ts),
-            E::StreamingStart(e) => Some(e.ts),
-            E::Partial(e) => Some(e.ts),
-            E::ToolCallWriting(e) => Some(e.ts),
-            E::StreamingEnd(e) => Some(e.ts),
-            E::ModelCompleted(e) => Some(e.ts),
-            E::Reasoning(e) => Some(e.ts),
-            E::ToolCompleted(e) => Some(e.ts),
-            E::ToolCallPromoted(e) => Some(e.ts),
-            E::PromotionSuppressed(e) => Some(e.ts),
-            E::Rest(e) => Some(e.ts),
-            E::CompactionStart(e) => Some(e.ts),
-            E::CompactionCall(e) => Some(e.ts),
-            E::Compaction(e) => Some(e.ts),
-            E::CompactionSkipped(e) => Some(e.ts),
-            E::CompactionUnproductive(e) => Some(e.ts),
-            E::Context(e) => Some(e.ts),
-            E::StaleContextTokens(e) => Some(e.ts),
-            E::PreSendBound(e) => Some(e.ts),
-            E::Checkpoint(e) => Some(e.ts),
-            E::GateObservation(e) => Some(e.ts),
-            E::GateAbort(e) => Some(e.ts),
-            E::CycleSuspected(e) => Some(e.ts),
-            E::ReasoningLoopSuspected(e) => Some(e.ts),
-            E::ReasoningBoundNotApplied(e) => Some(e.ts),
-            E::RepeatedToolFailure(e) => Some(e.ts),
-            E::IntraTurnStallRecovered(e) | E::EmptyToolCallsRecovered(e) => Some(e.ts),
-            E::PerTurnCapSalvaged(e) => Some(e.ts),
-            E::ToolCallDiscarded(e) => Some(e.ts),
-            E::MalformedToolNames(e) => Some(e.ts),
-            E::EscalationTriggered(e) => Some(e.ts),
-            E::FeedbackInjected(e) => Some(e.ts),
-            E::Header(_) | E::Unknown => None,
+            E::StreamingStart(e) => Some((Some(e.seq), e.ts)),
+            E::Partial(e) => Some((Some(e.seq), e.ts)),
+            E::ToolCallWriting(e) => Some((Some(e.seq), e.ts)),
+            E::PromptProgress(e) => Some((Some(e.seq), e.ts)),
+            E::StreamingEnd(e) => Some((Some(e.seq), e.ts)),
+            E::ModelCompleted(e) => Some((Some(e.seq), e.ts)),
+            E::Reasoning(e) => Some((Some(e.seq), e.ts)),
+            _ => None,
+        }
+    }
+
+    /// A turn's tools, rest, context and checkpoint.
+    fn turn_stamp(&self) -> Option<Stamp> {
+        use TrajectoryEvent as E;
+        match self {
+            E::ToolCompleted(e) => Some((Some(e.seq), e.ts)),
+            E::ToolCallPromoted(e) => Some((Some(e.seq), e.ts)),
+            E::PromotionSuppressed(e) => Some((Some(e.seq), e.ts)),
+            E::Rest(e) => Some((Some(e.seq), e.ts)),
+            E::Context(e) => Some((Some(e.seq), e.ts)),
+            E::StaleContextTokens(e) => Some((Some(e.seq), e.ts)),
+            E::Checkpoint(e) => Some((Some(e.seq), e.ts)),
+            E::PreSendBound(e) => Some((None, e.ts)),
+            _ => None,
+        }
+    }
+
+    /// The events outside any turn: the execution's bookends and compaction.
+    fn outside_turn_stamp(&self) -> Option<Stamp> {
+        use TrajectoryEvent as E;
+        match self {
+            E::DispatchStart(e) => Some((None, e.ts)),
+            E::DispatchComplete(e) => Some((None, e.ts)),
+            E::CompactionStart(e) => Some((None, e.ts)),
+            E::CompactionCall(e) => Some((None, e.ts)),
+            E::Compaction(e) => Some((None, e.ts)),
+            E::CompactionSkipped(e) => Some((None, e.ts)),
+            E::CompactionUnproductive(e) => Some((None, e.ts)),
+            _ => None,
+        }
+    }
+
+    /// The detectors' findings.
+    fn detector_stamp(&self) -> Option<Stamp> {
+        use TrajectoryEvent as E;
+        match self {
+            E::GateObservation(e) => Some((Some(e.seq), e.ts)),
+            E::GateAbort(e) => Some((Some(e.seq), e.ts)),
+            E::CycleSuspected(e) => Some((Some(e.seq), e.ts)),
+            E::ReasoningLoopSuspected(e) => Some((Some(e.seq), e.ts)),
+            E::ReasoningBoundNotApplied(e) => Some((Some(e.seq), e.ts)),
+            E::RepeatedToolFailure(e) => Some((Some(e.seq), e.ts)),
+            _ => None,
+        }
+    }
+
+    /// The loop's recoveries and interventions. Exhaustive, so a new event
+    /// type must be placed in a family before it compiles.
+    fn recovery_stamp(&self) -> Option<Stamp> {
+        use TrajectoryEvent as E;
+        match self {
+            E::IntraTurnStallRecovered(e) | E::EmptyToolCallsRecovered(e) => Some((Some(e.seq), e.ts)),
+            E::PerTurnCapSalvaged(e) => Some((Some(e.seq), e.ts)),
+            E::ToolCallDiscarded(e) => Some((Some(e.seq), e.ts)),
+            E::MalformedToolNames(e) => Some((Some(e.seq), e.ts)),
+            E::EscalationTriggered(e) => Some((Some(e.seq), e.ts)),
+            E::FeedbackInjected(e) => Some((Some(e.seq), e.ts)),
+            E::DispatchStart(_)
+            | E::DispatchComplete(_)
+            | E::StreamingStart(_)
+            | E::Partial(_)
+            | E::ToolCallWriting(_)
+            | E::PromptProgress(_)
+            | E::StreamingEnd(_)
+            | E::ModelCompleted(_)
+            | E::Reasoning(_)
+            | E::ToolCompleted(_)
+            | E::ToolCallPromoted(_)
+            | E::PromotionSuppressed(_)
+            | E::Rest(_)
+            | E::Context(_)
+            | E::StaleContextTokens(_)
+            | E::Checkpoint(_)
+            | E::PreSendBound(_)
+            | E::CompactionStart(_)
+            | E::CompactionCall(_)
+            | E::Compaction(_)
+            | E::CompactionSkipped(_)
+            | E::CompactionUnproductive(_)
+            | E::GateObservation(_)
+            | E::GateAbort(_)
+            | E::CycleSuspected(_)
+            | E::ReasoningLoopSuspected(_)
+            | E::ReasoningBoundNotApplied(_)
+            | E::RepeatedToolFailure(_)
+            | E::Header(_)
+            | E::Unknown => None,
         }
     }
 }

@@ -509,9 +509,9 @@ impl LmStudioClient {
     pub fn chat_streaming(
         &self,
         req: &ChatRequest,
-    ) -> Result<ChunkStream<BufReader<Box<dyn std::io::Read + Send + Sync>>>> {
+    ) -> Result<Chunks<BufReader<Box<dyn std::io::Read + Send + Sync>>>> {
         let resp = self.send_streaming(req)?;
-        Ok(self.chunk_stream(BufReader::new(resp.into_reader())))
+        Ok(self.chunk_stream(BufReader::new(resp.into_reader())).chunks())
     }
 
     /// The one streaming POST both entry points share.
@@ -1053,10 +1053,12 @@ fn read_line_capped<R: BufRead>(
 }
 
 /// Iterator over SSE-encoded `ChatChunk`s from a streamed
-/// chat-completions response.
+/// chat-completions response, as [`StreamItem`]s ([`ChunkStream::chunks`]
+/// for the chunks alone).
 ///
 /// Parses the `data: <json>\n\n` framing line by line. Empty lines (SSE
-/// event separators) and comment lines (starting with `:`) are skipped.
+/// event separators) and comment lines (starting with `:`) are skipped,
+/// except (#3210) a comment that reports prefill progress, which is an item.
 /// Other SSE fields (`event:`, `id:`, `retry:`) are also skipped — the
 /// chat-completions stream only uses `data:`. Terminates on `data: [DONE]`
 /// or EOF.
@@ -1090,6 +1092,15 @@ impl std::fmt::Display for StreamWentSilent {
 
 impl std::error::Error for StreamWentSilent {}
 
+/// (#3210) One item of a reply stream: a chunk, or the engine's report of
+/// how much of this request's uncached prompt it has processed (recognized by its shape,
+/// [`darkmux_trajectory::PromptProgressSample`]).
+#[derive(Debug)]
+pub enum StreamItem {
+    Chunk(ChatChunk),
+    PromptProgress(darkmux_trajectory::PromptProgressSample),
+}
+
 pub struct ChunkStream<R: BufRead> {
     reader: R,
     done: bool,
@@ -1107,6 +1118,14 @@ impl<R: BufRead> ChunkStream<R> {
     pub fn translating_messages(mut self) -> Self {
         self.messages = Some(Default::default());
         self
+    }
+
+    /// (#3210) The chunks alone, for a reader that has no use for the
+    /// prefill progress the engine reports between them. Test-only, like
+    /// `chat_streaming`: production reads every item.
+    #[cfg(test)]
+    pub fn chunks(self) -> Chunks<R> {
+        Chunks(self)
     }
 
     /// One `data:` payload as the next item, or `None` to keep reading.
@@ -1136,8 +1155,41 @@ impl<R: BufRead> ChunkStream<R> {
     }
 }
 
-impl<R: BufRead> Iterator for ChunkStream<R> {
+/// (#3210) A [`ChunkStream`]'s chunks alone ([`ChunkStream::chunks`]).
+#[cfg(test)]
+pub struct Chunks<R: BufRead>(ChunkStream<R>);
+
+#[cfg(test)]
+impl<R: BufRead> Iterator for Chunks<R> {
     type Item = Result<ChatChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            return match self.0.next()? {
+                Ok(StreamItem::Chunk(c)) => Some(Ok(c)),
+                Ok(StreamItem::PromptProgress(_)) => continue,
+                Err(e) => Some(Err(e)),
+            };
+        }
+    }
+}
+
+/// A failed read, as the reader's caller sees it.
+///
+/// An idle socket is a DIFFERENT condition from a broken one: the endpoint is
+/// still there and simply is not producing. The caller can end the turn
+/// cleanly and keep everything banked, where a transport failure cannot be
+/// recovered from. Surfaced as a typed marker so the caller asks
+/// `downcast_ref` instead of matching on prose.
+fn read_failure(e: std::io::Error) -> anyhow::Error {
+    if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+        return anyhow!(StreamWentSilent);
+    }
+    anyhow!("SSE read failed: {e}")
+}
+
+impl<R: BufRead> Iterator for ChunkStream<R> {
+    type Item = Result<StreamItem>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -1158,6 +1210,12 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                     // payloads, but it's never run on a partial read.
                     let line = String::from_utf8_lossy(&line_bytes);
                     let trimmed = line.trim_end_matches(['\r', '\n']);
+                    // (#3210) A comment line may be the engine's prefill
+                    // progress (`mlx_lm.server`'s `: keepalive 512/2516`);
+                    // any other comment, like an event separator, is skipped.
+                    if let Some(p) = darkmux_trajectory::PromptProgressSample::of_sse_line(trimmed) {
+                        return Some(Ok(StreamItem::PromptProgress(p)));
+                    }
                     if trimmed.is_empty() || trimmed.starts_with(':') {
                         continue; // event separator or comment / keepalive
                     }
@@ -1168,7 +1226,7 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                         }
                         let data = data.to_string();
                         if let Some(item) = self.payload(&data) {
-                            return Some(item);
+                            return Some(item.map(StreamItem::Chunk));
                         }
                         if self.done {
                             return None;
@@ -1178,19 +1236,7 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                 }
                 Err(e) => {
                     self.done = true;
-                    // An idle socket is a DIFFERENT condition from a broken
-                    // one: the endpoint is still there and simply is not
-                    // producing. The caller can end the turn cleanly and keep
-                    // everything banked, where a transport failure cannot be
-                    // recovered from. Surfaced as a typed marker so the caller
-                    // asks `downcast_ref` instead of matching on prose.
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) {
-                        return Some(Err(anyhow!(StreamWentSilent)));
-                    }
-                    return Some(Err(anyhow!("SSE read failed: {e}")));
+                    return Some(Err(read_failure(e)));
                 }
             }
         }
@@ -1201,6 +1247,9 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
 /// none arrived within one tick.
 pub enum StreamEvent {
     Chunk(ChatChunk),
+    /// (#3210) The engine reported how much of this request's uncached
+    /// prompt it has processed.
+    PromptProgress(darkmux_trajectory::PromptProgressSample),
     Idle,
 }
 
@@ -1236,7 +1285,7 @@ pub enum StreamEvent {
 /// is lost and the next read fails as a decode error), so a healthy stream
 /// could be broken by the very mechanism meant to end a dead one.
 pub struct TickingStream {
-    rx: std::sync::mpsc::Receiver<Result<ChatChunk>>,
+    rx: std::sync::mpsc::Receiver<Result<StreamItem>>,
     tick: Duration,
     done: bool,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -1249,7 +1298,7 @@ pub struct TickingStream {
 impl TickingStream {
     pub fn spawn<I>(inner: I, tick: Duration) -> Self
     where
-        I: Iterator<Item = Result<ChatChunk>> + Send + 'static,
+        I: Iterator<Item = Result<StreamItem>> + Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -1326,7 +1375,8 @@ impl Iterator for TickingStream {
             return None;
         }
         match self.rx.recv_timeout(self.tick) {
-            Ok(Ok(chunk)) => Some(Ok(StreamEvent::Chunk(chunk))),
+            Ok(Ok(StreamItem::Chunk(chunk))) => Some(Ok(StreamEvent::Chunk(chunk))),
+            Ok(Ok(StreamItem::PromptProgress(p))) => Some(Ok(StreamEvent::PromptProgress(p))),
             Ok(Err(e)) => Some(Err(e)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Ok(StreamEvent::Idle)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1627,7 +1677,7 @@ mod tests {
         let mut sse = b"data: ".to_vec();
         sse.extend(std::iter::repeat_n(b'x', 1_500_000));
         // No newline — the iterator's read must error out.
-        let mut iter = ChunkStream::new(&sse[..]);
+        let mut iter = ChunkStream::new(&sse[..]).chunks();
         let first = iter.next();
         assert!(first.is_some(), "iterator must emit at least one Result");
         let err = first.unwrap().unwrap_err();
@@ -1647,7 +1697,7 @@ mod tests {
         let sse = b"data: {\"id\":\"a\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
                     data: {\"id\":\"a\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"}}]}\n\n\
                     data: [DONE]\n\n";
-        let chunks: Vec<_> = ChunkStream::new(&sse[..]).collect();
+        let chunks: Vec<_> = ChunkStream::new(&sse[..]).chunks().collect();
         assert_eq!(chunks.len(), 2);
         let c0 = chunks[0].as_ref().expect("first chunk parses");
         let c1 = chunks[1].as_ref().expect("second chunk parses");
@@ -1659,7 +1709,7 @@ mod tests {
     #[test]
     fn chunk_stream_done_sentinel_terminates() {
         let sse = b"data: [DONE]\n\ndata: {\"id\":\"after\",\"choices\":[]}\n\n";
-        let chunks: Vec<_> = ChunkStream::new(&sse[..]).collect();
+        let chunks: Vec<_> = ChunkStream::new(&sse[..]).chunks().collect();
         // [DONE] terminates the iterator — subsequent chunks aren't read.
         assert!(chunks.is_empty(), "[DONE] must end iteration before later data");
     }
@@ -1671,7 +1721,7 @@ mod tests {
                     event: chunk\n\
                     data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
                     data: [DONE]\n\n";
-        let chunks: Vec<_> = ChunkStream::new(&sse[..]).collect();
+        let chunks: Vec<_> = ChunkStream::new(&sse[..]).chunks().collect();
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
@@ -1679,10 +1729,30 @@ mod tests {
         );
     }
 
+    /// (#3210) The stream carries the engine's prefill progress (the issue's
+    /// `mlx_lm.server` capture) in order, before the first chunk; the
+    /// chunk-only reader yields chunks alone.
+    #[test]
+    fn chunk_stream_items_carry_mlx_prefill_progress_before_the_first_chunk() {
+        let sse = b": keepalive 512/2516\n\n\
+                    : keepalive 2516/2516\n\n\
+                    : OPENROUTER PROCESSING\n\n\
+                    data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                    data: [DONE]\n\n";
+        let items: Vec<String> = ChunkStream::new(&sse[..])
+            .map(|i| match i.unwrap() {
+                StreamItem::Chunk(c) => format!("chunk {}", c.choices[0].delta.content.as_deref().unwrap_or("")),
+                StreamItem::PromptProgress(p) => format!("progress {}/{}", p.processed, p.total),
+            })
+            .collect();
+        assert_eq!(items, vec!["progress 512/2516", "progress 2516/2516", "chunk ok"]);
+        assert_eq!(ChunkStream::new(&sse[..]).chunks().count(), 1, "the chunk reader yields chunks only");
+    }
+
     #[test]
     fn chunk_stream_malformed_json_returns_error_once_then_none() {
         let sse = b"data: not-json-at-all\n\ndata: [DONE]\n\n";
-        let mut stream = ChunkStream::new(&sse[..]);
+        let mut stream = ChunkStream::new(&sse[..]).chunks();
         let first = stream.next();
         let second = stream.next();
         assert!(
@@ -1698,7 +1768,7 @@ mod tests {
     #[test]
     fn chunk_stream_eof_without_done_terminates() {
         let sse = b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        let chunks: Vec<_> = ChunkStream::new(&sse[..]).collect();
+        let chunks: Vec<_> = ChunkStream::new(&sse[..]).chunks().collect();
         assert_eq!(chunks.len(), 1);
     }
 
@@ -2378,7 +2448,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| match e.unwrap() {
                 StreamEvent::Chunk(c) => Some(c),
-                StreamEvent::Idle => None,
+                StreamEvent::Idle | StreamEvent::PromptProgress(_) => None,
             })
             .collect();
         assert_eq!(contents(plain.clone()), vec!["t0", "t1", "t2", "t3", "t4"]);
@@ -2502,7 +2572,7 @@ mod tests {
                 panic!("reader blew up mid-stream");
             }
             yielded = true;
-            Some(Ok(chunk.clone()))
+            Some(Ok(StreamItem::Chunk(chunk.clone())))
         });
         let mut stream = TickingStream::spawn(inner, std::time::Duration::from_millis(20));
         let mut saw_chunk = false;
@@ -2510,7 +2580,7 @@ mod tests {
         for ev in stream.by_ref() {
             match ev {
                 Ok(StreamEvent::Chunk(_)) => saw_chunk = true,
-                Ok(StreamEvent::Idle) => {}
+                Ok(StreamEvent::Idle | StreamEvent::PromptProgress(_)) => {}
                 Err(_) => saw_err = true,
             }
         }

@@ -12444,6 +12444,153 @@
         assert_eq!(deadline, original, "ticks never reset the deadline");
     }
 
+    /// (#3210) The engine's prefill progress (`model.prompt.progress`) is a
+    /// heartbeat carrying the neutral fact, and an advancing report is proof
+    /// of work: the deadline resets, so a long prefill is never read as a
+    /// hang. The opener leaves the first report owed, as it does a chunk.
+    #[test]
+    #[serial]
+    fn tailer_prompt_progress_emits_a_heartbeat_with_the_fact_and_resets_the_deadline() {
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#,
+        ]);
+        assert_eq!(beats.len(), 2, "opener and the first progress report both emit: {beats:?}");
+        assert!(beats[0]["payload"].get("prompt_processed").is_none(), "the opener carries no progress: {beats:?}");
+        let p = &beats[1]["payload"];
+        assert_eq!((p["prompt_processed"].as_u64(), p["prompt_total"].as_u64()), (Some(512), Some(2516)), "{p}");
+        assert_eq!(p["turn_seq"], 3);
+        assert_eq!(p["generated_chars"], 0, "prefill generated nothing: {p}");
+        assert_eq!(p["sampled_at_ms"], 1_758_700_008_000u64);
+        assert!(p.get("prompt_chars").is_none(), "a progress beat is not an opener: {p}");
+        assert!(deadline > original, "an advancing prefill must reset the inactivity deadline");
+    }
+
+    /// (#3210) A report that did not advance proves nothing (a wedged engine
+    /// can repeat itself), so it never resets the deadline.
+    #[test]
+    #[serial]
+    fn tailer_prompt_progress_that_did_not_advance_does_not_reset_the_deadline() {
+        let (_, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":0,"total":2516}"#,
+        ]);
+        assert_eq!(deadline, original, "a zero report must not reset the deadline");
+        let (_, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700009000,"processed":512,"total":2516}"#,
+        ]);
+        assert!(deadline > original, "the first report advanced");
+    }
+
+    /// (#3210, PR #3286 review) A REAL repeat (512, then 512 again): the
+    /// first report resets the deadline; the repeat must not move it, and
+    /// writes no durable heartbeat even with the window open (it carries no
+    /// fact the previous beat did not).
+    #[test]
+    #[serial]
+    fn tailer_a_repeated_progress_report_neither_resets_the_deadline_nor_writes_a_beat() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#);
+        state.poll_and_emit();
+        let after_first = *shared.lock().unwrap();
+        let beats_after_first = heartbeats_in(&isolated.path().join("flows")).len();
+        std::thread::sleep(Duration::from_millis(30));
+        // The 2 s window has passed: only the repeat itself could hold it back.
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700010000,"processed":512,"total":2516}"#);
+        state.poll_and_emit();
+        assert_eq!(*shared.lock().unwrap(), after_first, "a repeated count moved the inactivity deadline");
+        assert_eq!(heartbeats_in(&isolated.path().join("flows")).len(), beats_after_first, "a repeated count wrote a durable heartbeat");
+    }
+
+    /// (#3210) Coalescing keeps the LATEST progress, not the first: reports
+    /// held back by the 2 s window ride on the turn's next heartbeat, and a
+    /// new stream (a new turn, or a continuation of the same one) starts
+    /// with none.
+    #[test]
+    #[serial]
+    fn tailer_coalesced_prompt_progress_keeps_the_latest_report() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        for l in [
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700009000,"processed":1024,"total":2516}"#,
+            r#"{"type":"model.prompt.progress","seq":3,"ts":1758700009500,"processed":2516,"total":2516}"#,
+        ] {
+            writeln!(f, "{l}").unwrap();
+        }
+        state.poll_and_emit();
+        // The 2 s window has passed on the tailer's clock.
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        writeln!(f, r#"{{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":2,"generated_chars":2,"ts":1758700009700}}"#).unwrap();
+        writeln!(f, r#"{{"type":"model.streaming.start","seq":4,"ts":1758700010000,"system_chars":4000,"prompt_chars":9100}}"#).unwrap();
+        writeln!(f, r#"{{"type":"model.partial","seq":4,"partial_index":1,"cumulative_chars":2,"generated_chars":2,"ts":1758700010300}}"#).unwrap();
+        // A continuation of turn 4 (same seq, a new stream) starts clean too.
+        writeln!(f, r#"{{"type":"model.prompt.progress","seq":4,"ts":1758700010400,"processed":100,"total":200}}"#).unwrap();
+        writeln!(f, r#"{{"type":"model.streaming.start","seq":4,"ts":1758700011000,"system_chars":4000,"prompt_chars":9200}}"#).unwrap();
+        writeln!(f, r#"{{"type":"model.partial","seq":4,"partial_index":1,"cumulative_chars":2,"generated_chars":2,"ts":1758700011300}}"#).unwrap();
+        drop(f);
+        state.poll_and_emit();
+        // A later turn's chunk with no opener between (a window open) never
+        // carries an earlier turn's report.
+        writeln!(std::fs::OpenOptions::new().append(true).open(&traj_path).unwrap(), r#"{{"type":"model.prompt.progress","seq":4,"ts":1758700011400,"processed":150,"total":200}}"#).unwrap();
+        state.poll_and_emit();
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        writeln!(std::fs::OpenOptions::new().append(true).open(&traj_path).unwrap(), r#"{{"type":"model.partial","seq":5,"partial_index":1,"cumulative_chars":2,"generated_chars":2,"ts":1758700012300}}"#).unwrap();
+        state.poll_and_emit();
+
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        let progress: Vec<(u64, Option<u64>)> = beats
+            .iter()
+            .map(|b| (b["payload"]["turn_seq"].as_u64().unwrap(), b["payload"]["prompt_processed"].as_u64()))
+            .collect();
+        assert_eq!(
+            progress,
+            vec![(3, None), (3, Some(512)), (3, Some(2516)), (4, None), (4, None), (4, None), (4, None), (5, None)],
+            "the held-back 2516 rides on the next beat of its turn; a new stream or turn starts clean"
+        );
+    }
+
+    /// (#3210) The heartbeat payload of a progress report, mapped purely.
+    #[test]
+    fn heartbeat_payload_of_a_progress_report_carries_the_fact() {
+        let payload = match ev(serde_json::json!({"type": "model.prompt.progress", "seq": 2, "ts": 7u64, "processed": 3, "total": 4})) {
+            darkmux_trajectory::TrajectoryEvent::PromptProgress(p) => heartbeat_payload(&Chunk::of_progress(&p)),
+            other => panic!("{other:?}"),
+        };
+        let v = serde_json::to_value(payload).unwrap();
+        assert_eq!((v["prompt_processed"].as_u64(), v["prompt_total"].as_u64(), v["turn_seq"].as_u64()), (Some(3), Some(4), Some(2)), "{v}");
+        assert!(v.get("partial_index").is_none(), "no chunk was read: {v}");
+    }
+
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
     /// line through `handle_event` and assert the emitted FlowRecord is a
     /// telemetry record (`category:"telemetry"`, `source:"detector"`)

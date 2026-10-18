@@ -19,6 +19,7 @@ import {
   executionRole,
   executionTokenReading,
   promptTokensLabel,
+  promptProgressLabel,
   heartbeatSamples,
   isStalled,
   liveStatePriority,
@@ -1585,6 +1586,139 @@ describe("(#3145) a long prefill reads PROMPT, not STALL", () => {
 
   it("the run page and fleet card read it through the one aggregate", () => {
     expect(aggregateLiveState([issueRun()], opener + 197_000, DEFAULT_POLICY)).toMatchObject({ state: "prompt", promptChars: PROMPT_CHARS });
+  });
+});
+
+// (#3210) The engine's prefill progress on the heartbeat (`prompt_processed`
+// / `prompt_total`, flow 2.3.0). The fixture is the issue's capture:
+// `mlx_lm.server` 0.31.3 on a 13" M2, a 2,516-token prompt at ~60 tok/s,
+// one report per 512-token prefill step. Every time is relative to the
+// opener, and every assertion passes its own clock (no wall clock).
+describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
+  const T = Date.parse("2026-10-11T00:00:57Z");
+  const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: wholeSec(atMs), action, session_id: SID, payload });
+  const opener = (promptChars = 9_000, turn = 1) =>
+    wire(T, "dispatch.turn.heartbeat", { turn_seq: turn, cumulative_chars: 0, sampled_at_ms: T, generated_chars: 0, prompt_chars: promptChars });
+  const report = (atSec: number, processed: number, total = 2_516, turn = 1) =>
+    wire(T + atSec * 1000, "dispatch.turn.heartbeat", {
+      turn_seq: turn,
+      cumulative_chars: 0,
+      sampled_at_ms: T + atSec * 1000,
+      generated_chars: 0,
+      prompt_processed: processed,
+      prompt_total: total,
+    });
+  const start = wire(T - 1_000, "dispatch.start");
+  // The capture's own seconds after the opener (00:00:57).
+  const capture = [report(8, 512), report(16, 1_024), report(24, 1_536), report(33, 2_048), report(41, 2_512), report(42, 2_516)];
+
+  it("one report: the percentage, and no time left until there is a rate", () => {
+    const r = deriveLiveState([start, opener(), capture[0]], T + 9_000);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 512, total: 2_516, percent: 20 } });
+  });
+
+  it("two reports: the time left from their rate, less the time since the last", () => {
+    // 512 tokens in 8 s = 64 tok/s; 1,492 left = 23.3 s, 1 s already gone.
+    const r = deriveLiveState([start, opener(), ...capture.slice(0, 2)], T + 17_000);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 } });
+  });
+
+  it("the whole capture: the latest report, at 100% with nothing left to estimate", () => {
+    const r = deriveLiveState([start, opener(), ...capture], T + 42_100);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 2_516, total: 2_516, percent: 100 } });
+  });
+
+  it("(re-review) a big prompt keeps its size-scaled bound as a floor: one slow step mid-prefill is not STALL", () => {
+    // 244,552 chars (the #3145 bound allows ~579 s). Two quick steps, then
+    // one 7.5x slower: a batched request or a throttled machine.
+    const big = 244_552;
+    const recs = [start, opener(big), report(8, 512, 9_000), report(16, 1_024, 9_000), report(76, 1_536, 9_000)];
+    for (let ms = 0; ms <= 76_000; ms += 500) {
+      const at = T + ms;
+      const seen = recs.filter((r) => r.tMs == null || r.tMs <= at);
+      expect(deriveLiveState(seen, at).state, `at ${ms / 1000}s`).not.toBe("stalled");
+    }
+    // Past the size-scaled bound, three of its own steps of silence is a hang.
+    expect(deriveLiveState(recs.slice(0, 4), T + 600_000).state).toBe("stalled");
+  });
+
+  it("an advancing prefill whose steps are slower than the stall threshold never reads STALL", () => {
+    // A slow machine: 40 s per step, past STALL_AFTER_MS between reports.
+    const slow = [start, opener(), report(40, 512), report(80, 1_024)];
+    expect(deriveLiveState(slow, T + 80_000 + STALL_AFTER_MS + 5_000).state).toBe("prompt");
+    // Three of its own steps of silence is a hang.
+    expect(deriveLiveState(slow, T + 80_000 + 3 * 40_000 + 1).state).toBe("stalled");
+  });
+
+  it("an engine repeating the same count reads STALL: only an advancing report is progress (PR #3286 review)", () => {
+    // 512 at 8 s, 1,024 at 16 s, then 1,024 again every 2 s to 600 s.
+    const repeats = Array.from({ length: (600 - 18) / 2 + 1 }, (_, i) => report(18 + i * 2, 1_024));
+    const records = [start, opener(), report(8, 512), report(16, 1_024), ...repeats];
+    expect(deriveLiveState(records, T + 601_000)).toEqual({ state: "stalled" });
+    // Still PROMPT inside the bound measured from the last advance (16 s).
+    expect(deriveLiveState(records.filter((r) => (r.tMs ?? 0) <= T + 40_000), T + 40_000).state).toBe("prompt");
+  });
+
+  it("the gap before the first report is not a step: a queued request's wait does not stretch the bound (PR #3286 review)", () => {
+    // First report at 600 s (queued behind another request), the next at 608 s, then silence.
+    const queued = [start, opener(), report(600, 512), report(608, 1_024)];
+    expect(deriveLiveState(queued, T + 608_000 + 600_000)).toEqual({ state: "stalled" });
+    // One step of 8 s measured between reports: past STALL_AFTER_MS it is a stall.
+    expect(deriveLiveState(queued, T + 608_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("with fewer than two advancing reports the bound is the size-scaled one, never under STALL_AFTER_MS", () => {
+    const one = [start, opener(244_552), report(8, 512)];
+    const bound = prefillStallAfterMs(244_552);
+    expect(deriveLiveState(one, T + bound).state).toBe("prompt");
+    expect(deriveLiveState(one, T + bound + 1)).toEqual({ state: "stalled" });
+    // A report early in a long silence still needs STALL_AFTER_MS of its own.
+    const late = [start, opener(0), report(85, 512)];
+    expect(deriveLiveState(late, T + 85_000 + STALL_AFTER_MS).state).toBe("prompt");
+    expect(deriveLiveState(late, T + 85_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("the time left is measured over advancing reports only: repeats do not slow the rate", () => {
+    const records = [start, opener(), report(8, 512), report(16, 1_024), report(18, 1_024)];
+    // 64 tok/s between the advances; 1,492 left = 23.3 s, less 3 s since the last advance.
+    expect(deriveLiveState(records, T + 19_000)).toMatchObject({ state: "prompt", promptProgress: { processed: 1_024, secondsLeft: 21 } });
+  });
+
+  it("prefillStallAfterMs is a floor with progress, and the whole bound without it", () => {
+    // A 244,552-char opener allows ~579 s with no progress. With progress,
+    // a silence of three steps is a hang only once that floor has passed
+    // (re-review: a mid-prefill slowdown must not flicker STALL).
+    const bound = prefillStallAfterMs(244_552);
+    const big = [start, opener(244_552), report(8, 512), report(16, 1_024)];
+    expect(bound).toBeGreaterThan(76_000);
+    expect(deriveLiveState(big, T + 16_000 + STALL_AFTER_MS + 1).state).toBe("prompt");
+    expect(deriveLiveState(big, T + bound + 1)).toEqual({ state: "stalled" });
+    expect(deriveLiveState([start, opener(244_552)], T + 16_000 + STALL_AFTER_MS + 1)).toEqual({ state: "prompt", promptChars: 244_552 });
+  });
+
+  it("a previous turn's progress never shows on a new turn's opener", () => {
+    const records = [start, opener(9_000, 1), report(8, 2_516, 2_516, 1), wire(T + 9_000, "dispatch.turn.heartbeat", { turn_seq: 1, sampled_at_ms: T + 9_000, generated_chars: 40, cumulative_chars: 40 }), wire(T + 10_000, "dispatch.turn.heartbeat", { turn_seq: 2, cumulative_chars: 0, sampled_at_ms: T + 10_000, generated_chars: 0, prompt_chars: 9_500 })];
+    expect(deriveLiveState(records, T + 11_000)).toEqual({ state: "prompt", promptChars: 9_500 });
+  });
+
+  it("a report with no usable total is not progress", () => {
+    const bad = wire(T + 8_000, "dispatch.turn.heartbeat", { turn_seq: 1, cumulative_chars: 0, sampled_at_ms: T + 8_000, generated_chars: 0, prompt_processed: 0, prompt_total: 0 });
+    expect(deriveLiveState([start, opener(), bad], T + 9_000)).toEqual({ state: "prompt", promptChars: 9_000 });
+  });
+
+  it("once the model generates, the reading is GEN, not PROMPT's progress", () => {
+    const gen = wire(T + 42_300, "dispatch.turn.heartbeat", { turn_seq: 1, sampled_at_ms: T + 42_300, generated_chars: 12, cumulative_chars: 12, prompt_processed: 2_516, prompt_total: 2_516 });
+    expect(deriveLiveState([start, opener(), ...capture, gen], T + 42_500).state).toBe("generating");
+  });
+
+  it("the fleet card's reading and the shared label carry it", () => {
+    const reading = executionTokenReading([start, opener(), ...capture.slice(0, 2)], T + 17_000);
+    expect(reading.promptProgress).toEqual({ processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 });
+    expect(promptProgressLabel({ processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 })).toBe("40% · ~23s left");
+    expect(promptProgressLabel({ processed: 512, total: 2_516, percent: 20 })).toBe("20%");
+    expect(liveStateLabel({ state: "prompt", promptProgress: { processed: 512, total: 2_516, percent: 20 } })).toBe("processing prompt · 20%");
   });
 });
 
