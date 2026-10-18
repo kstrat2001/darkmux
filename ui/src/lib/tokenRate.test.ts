@@ -1820,6 +1820,30 @@ describe("(#2926) the stream-open chunk is not a rate", () => {
     expect(currentTokenRate([hbT(0, 0), hbT(1_000, 17)])).not.toBeNull();
     expect(currentTokenRate([hbT(0, 0), hbT(1_000, 16)])).toBeNull();
   });
+
+  // A lab run has no live channel and its records never ride the hub, so on a
+  // Redis-backed daemon this machine's card saw them only on the viewer's 20 s
+  // reconcile, until the daemon's flow stream sent what stays off the hub from
+  // the local day file (`local_only_lines`). Seen through a snapshot taken in
+  // turn 1's stream-open window, the card held "— think tok/s" for 20 s.
+  it("a first turn's '— think tok/s' lasts only its stream-open window when each record arrives as written", () => {
+    const all = pepperRecords();
+    const unmeasuredThinkMs = (deliveredAsOf: (t: number) => number, from: number, to: number) => {
+      let ms = 0;
+      for (let t = from; t < to; t += 250) {
+        const r = executionTokenReading(cut(all, deliveredAsOf(t)), t);
+        if (r.state === "generating" && r.thinking && r.tokensPerSec == null) ms += 250;
+      }
+      return ms;
+    };
+    const from = pepperAt("10:51:01");
+    const to = pepperAt("10:51:30");
+    // As written: from turn 1's 3-char chunk (10:51:04) to its next beat (:06).
+    expect(unmeasuredThinkMs((t) => t, from, to)).toBeLessThanOrEqual(2_000);
+    // The inverted case, the defect: a reconcile at 10:51:05, the next at :25.
+    const reconcile = pepperAt("10:51:05");
+    expect(unmeasuredThinkMs((t) => (t < reconcile + 20_000 ? reconcile : t), reconcile, to)).toBe(20_000);
+  });
 });
 
 // (#2915) While the work model's execution is compacting, the PROMPT lamp

@@ -140,6 +140,17 @@ pub(crate) fn hub_stream_of_value(record: &serde_json::Value) -> Option<HubStrea
     hub_stream_for(action.as_ref(), payload.as_ref(), record.get("session_id").and_then(|s| s.as_str()))
 }
 
+/// Whether a record read back from this machine's day file is one the hub
+/// never carries ([`hub_stream_of_value`] is `None`): a lab run's records,
+/// and the heartbeats the rule keeps local (every unmarked generation beat).
+/// The daemon's flow stream on the Redis path sends its own viewers exactly
+/// these from the local file, so a lab run and the 2 s beats still reach
+/// this machine's viewers as they are written, and a beat the hub carries
+/// (prompt-phase, or marked `hub_relay`) reaches them once, from Redis.
+pub fn stays_off_hub(record: &serde_json::Value) -> bool {
+    hub_stream_of_value(record).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +318,37 @@ mod tests {
                 let v = line(payload.clone(), session);
                 let r = crate::reader::parse_record(&v.to_string()).expect("a record");
                 assert_eq!(hub_stream_of_record(&r), hub_stream_of_value(&v), "{v}");
+            }
+        }
+    }
+
+    /// The daemon's local-file fill is exactly the rule's complement: what the
+    /// hub carries never comes from the file too (the viewer would see it
+    /// twice), and what it never carries does (or this machine's viewer would
+    /// not see it at all until a reconcile).
+    #[test]
+    fn stays_off_hub_is_exactly_what_persist_skips() {
+        let mut marked = plain_beat();
+        marked["hub_relay"] = json!(true);
+        let rec = |action: &str, session: String| json!({"ts": "2026-10-18T00:00:00Z", "action": action, "handle": "h", "session_id": session});
+        let cases = [
+            (line(opener(), solo()), false, "a prompt-phase opener comes from Redis"),
+            (line(progress_before_generation(), solo()), false, "a prefill report comes from Redis"),
+            (line(marked.clone(), solo()), false, "a relayed generation beat comes from Redis"),
+            (line(plain_beat(), solo()), true, "an unmarked 2 s generation beat comes from the file"),
+            (line(progress_after_generation(), solo()), true, "a beat after generation started comes from the file"),
+            (line(opener(), lab()), true, "a lab run's opener comes from the file"),
+            (line(marked, lab()), true, "a lab run's marked beat comes from the file"),
+            (rec("dispatch.turn", lab()), true, "a lab run's record comes from the file"),
+            (rec("dispatch.turn", solo()), false, "work comes from Redis"),
+            (rec("machine.telemetry", solo()), false, "a host sample comes from Redis"),
+            (json!({"ts": "2026-10-18T00:00:00Z", "handle": "h"}), false, "a record naming no action rides the hub"),
+        ];
+        for (v, local, why) in cases {
+            assert_eq!(stays_off_hub(&v), local, "{why}: {v}");
+            let r = crate::reader::parse_record(&v.to_string());
+            if let Some(r) = r {
+                assert_eq!(stays_off_hub(&v), hub_stream_of_record(&r).is_none(), "persist routes it the same way: {v}");
             }
         }
     }
