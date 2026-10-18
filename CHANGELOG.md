@@ -14,6 +14,19 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-10-18
+
+darkmux runs on Linux. On Omarchy (Arch on Asahi, an Apple Silicon laptop) with
+`mlx_lm.server`, roles with tools run in Docker as the host user, the machine joins the
+fleet with its own identity, and the machine lens reads its CPU tiers, memory and battery.
+Stage 4 of the engine facade (#316) lands with it: `default_engine` names the machine's
+local engine, `darkmux init` finds the engine that answers, and the machine surfaces name
+it. PROMPT now shows how far the engine has read the prompt (a bar under the brain, and the
+time left), where the engine reports it (`mlx_lm.server` today). A fleet card that is still
+checking draws a radar sweep. Config schemas 2.4 and 2.5 add `default_engine` and
+`runtime.container_user`, and flow schema 2.3.0 adds the prompt-progress fields; an older
+darkmux refuses the new config keys, so upgrade every machine before setting them.
+
 ### Added
 
 - **PROMPT shows how far the engine has read the prompt** (#3210). When the engine reports
@@ -3656,6 +3669,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.3.0
 [5.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.2.0
 [5.1.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.1
 [5.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.0
