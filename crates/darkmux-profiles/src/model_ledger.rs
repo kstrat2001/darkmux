@@ -1699,37 +1699,37 @@ fn memory_rows_from_snapshot(s: &darkmux_platform::MemorySnapshot) -> MemoryRows
 }
 
 /// macOS's memory rows from its kernel counters, as the ledger has always
-/// read them.
+/// read them. The reads only; [`memory_rows_from_kernel`] makes the rows.
 fn macos_memory_rows(messages: &mut Vec<LedgerMessage>) -> MemoryRows {
     // Kernel counters — ONE vm_stat read feeds the pool decomposition
     // (#1821), the compressor row, AND (unchanged) the memorystatus
     // pressure tile below.
     let vm_stat = bounded_stdout("vm_stat", &[], "vm_stat", SYS_PROBE_BOUND, messages);
-    let (used_bytes, available_bytes, free_bytes, compressor_bytes) = match vm_stat.as_deref() {
+    let memsize = bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, messages);
+    let swapusage = bounded_stdout("sysctl", &["-n", "vm.swapusage"], "vm.swapusage", SYS_PROBE_BOUND, messages);
+    let memorystatus =
+        bounded_stdout("sysctl", &["-n", "kern.memorystatus_level"], "memorystatus", SYS_PROBE_BOUND, messages);
+    memory_rows_from_kernel(vm_stat.as_deref(), memsize.as_deref(), swapusage.as_deref(), memorystatus.as_deref())
+}
+
+/// The memory rows from the four kernel reads (`vm_stat`, `hw.memsize`,
+/// `vm.swapusage`, `kern.memorystatus_level`); a read that failed is `None`
+/// and leaves its rows unknown. No pool without a capacity.
+fn memory_rows_from_kernel(
+    vm_stat: Option<&str>,
+    memsize: Option<&str>,
+    swapusage: Option<&str>,
+    memorystatus: Option<&str>,
+) -> MemoryRows {
+    let (used_bytes, available_bytes, free_bytes, compressor_bytes) = match vm_stat {
         Some(out) => parse_pool_from_vm_stat(out),
         None => (None, None, None, None),
     };
-    let capacity_bytes =
-        bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, messages)
-            .and_then(|s| s.trim().parse::<u64>().ok());
+    let capacity_bytes = memsize.and_then(|s| s.trim().parse::<u64>().ok());
     let pool = capacity_bytes
         .map(|capacity_bytes| PoolSnapshot { capacity_bytes, used_bytes, available_bytes, free_bytes });
-    let swap_used_bytes = bounded_stdout(
-        "sysctl",
-        &["-n", "vm.swapusage"],
-        "vm.swapusage",
-        SYS_PROBE_BOUND,
-        messages,
-    )
-    .and_then(|s| parse_swapusage_used_bytes(&s));
-    let margin_percent = bounded_stdout(
-        "sysctl",
-        &["-n", "kern.memorystatus_level"],
-        "memorystatus",
-        SYS_PROBE_BOUND,
-        messages,
-    )
-    .and_then(|s| s.trim().parse::<u64>().ok());
+    let swap_used_bytes = swapusage.and_then(parse_swapusage_used_bytes);
+    let margin_percent = memorystatus.and_then(|s| s.trim().parse::<u64>().ok());
     MemoryRows { pool, swap_used_bytes, compressor_bytes, margin_percent }
 }
 
@@ -2097,6 +2097,56 @@ fn severity_word(severity: Severity) -> &'static str {
     }
 }
 
+/// One model's row of [`render_human`]'s table, with its footnotes.
+fn push_model_row(out: &mut String, m: &ModelRow) {
+    let ident = truncate_ident(&m.identifier, 46);
+    // #1819: an ESTIMATED row's state carries the disclosure right next
+    // to the figure it qualifies — provenance visible everywhere the
+    // verdict appears, not just in the warnings list at the foot. The
+    // POTENTIAL figure itself gets the same `~` prefix the UI's kv line
+    // uses (`modelKvLine`, `machineGauge.ts`) — the CAVEAT travels WITH
+    // the number so it survives a copy-paste out of this table, not
+    // just a separate column a reader could crop away.
+    let is_estimated = m.potential_source == Some(PotentialSource::Estimated);
+    let state_word =
+        if is_estimated { format!("{} (estimated)", m.state.as_str()) } else { m.state.as_str().to_string() };
+    let potential_word =
+        if is_estimated { format!("~{}", fmt_opt(m.potential_bytes)) } else { fmt_opt(m.potential_bytes) };
+    out.push_str(&format!(
+        "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
+        ident,
+        owner_word(m.owner),
+        m.loaded_ctx,
+        fmt_opt(m.weights_bytes),
+        fmt_opt(m.kv_bytes_at_ctx),
+        potential_word,
+        fmt_opt(m.current_bytes),
+        state_word,
+    ));
+    // #1854: footnote the row where the confusing pair actually appears —
+    // this line prints `potential X · current Y` with Y > X, and the
+    // machine-level message six lines down cannot repair that in place.
+    if let (Some(over), Some(cur)) = (m.over_price_bytes, m.current_bytes) {
+        out.push_str(&format!(
+            "  ↳ holds {} more than priced — the fit projection counts the measured {}\n",
+            fmt_bytes(over),
+            fmt_bytes(cur)
+        ));
+    }
+    if let Some(h) = &m.shrink_hint {
+        out.push_str(&format!("  ↳ {h}\n"));
+    }
+}
+
+/// What the machine line's limit is, in words.
+fn limit_desc(source: &LimitSource) -> &'static str {
+    match source {
+        LimitSource::Budget => "the #1243 AI-RAM budget",
+        LimitSource::PhysicalPool => "physical pool — no #1243 budget configured",
+        LimitSource::Unknown => "no budget and no readable pool",
+    }
+}
+
 /// The `darkmux machine resources` table + machine rows + gather-cost line.
 pub fn render_human(ledger: &ModelLedger) -> String {
     let mut out = String::new();
@@ -2109,51 +2159,9 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         out.push_str("  (no models loaded)\n");
     }
     for m in &ledger.models {
-        let ident = truncate_ident(&m.identifier, 46);
-        // #1819: an ESTIMATED row's state carries the disclosure right next
-        // to the figure it qualifies — provenance visible everywhere the
-        // verdict appears, not just in the warnings list at the foot. The
-        // POTENTIAL figure itself gets the same `~` prefix the UI's kv line
-        // uses (`modelKvLine`, `machineGauge.ts`) — the CAVEAT travels WITH
-        // the number so it survives a copy-paste out of this table, not
-        // just a separate column a reader could crop away.
-        let is_estimated = m.potential_source == Some(PotentialSource::Estimated);
-        let state_word =
-            if is_estimated { format!("{} (estimated)", m.state.as_str()) } else { m.state.as_str().to_string() };
-        let potential_word =
-            if is_estimated { format!("~{}", fmt_opt(m.potential_bytes)) } else { fmt_opt(m.potential_bytes) };
-        out.push_str(&format!(
-            "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
-            ident,
-            owner_word(m.owner),
-            m.loaded_ctx,
-            fmt_opt(m.weights_bytes),
-            fmt_opt(m.kv_bytes_at_ctx),
-            potential_word,
-            fmt_opt(m.current_bytes),
-            state_word,
-        ));
-        // #1854: footnote the row where the confusing pair actually appears —
-        // this line prints `potential X · current Y` with Y > X, and the
-        // machine-level message six lines down cannot repair that in place.
-        if let (Some(over), Some(cur)) = (m.over_price_bytes, m.current_bytes) {
-            out.push_str(&format!(
-                "  ↳ holds {} more than priced — the fit projection counts the measured {}\n",
-                fmt_bytes(over),
-                fmt_bytes(cur)
-            ));
-        }
-        if let Some(h) = &m.shrink_hint {
-            out.push_str(&format!("  ↳ {h}\n"));
-        }
+        push_model_row(&mut out, m);
     }
-    let limit_desc = match ledger.limit_source {
-        LimitSource::Budget => "the #1243 AI-RAM budget".to_string(),
-        LimitSource::PhysicalPool => {
-            "physical pool — no #1243 budget configured".to_string()
-        }
-        LimitSource::Unknown => "no budget and no readable pool".to_string(),
-    };
+    let limit_desc = limit_desc(&ledger.limit_source);
     // #1819: the machine-total parenthetical names BOTH gaps when both are
     // present — "unpriced" (uncounted, undercounts the sum) and "estimated"
     // (counted, but via a labeled guess) are different facts and must not
@@ -2616,6 +2624,31 @@ mod tests {
         let machine_line = text.lines().find(|l| l.starts_with("machine: ")).expect("machine line");
         let potential_clause = machine_line.split(" · ").next().expect("potential clause");
         assert!(!potential_clause.contains('('), "no counts parenthetical at all: {machine_line}");
+    }
+
+    /// (#3287) The machine line names where its limit came from, each of the
+    /// three ways; an amber machine prints its shrink hint under the row it
+    /// targets AND under the machine line.
+    #[test]
+    fn render_human_names_the_limit_source_and_prints_the_shrink_hint_twice() {
+        let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
+        inputs.budget_bytes = Some(35_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names the shrink");
+        let text = render_human(&ledger);
+        assert!(text.contains("(the #1243 AI-RAM budget)"), "{text}");
+        assert_eq!(text.matches(&format!("  ↳ {hint}\n")).count(), 2, "row and machine line: {text}");
+        let row = text.lines().position(|l| l.starts_with("devstral")).expect("devstral row");
+        assert_eq!(text.lines().nth(row + 1), Some(format!("  ↳ {hint}").as_str()), "under its row: {text}");
+
+        let text = render_human(&compute_ledger(base_inputs(), 1));
+        assert!(text.contains("(physical pool — no #1243 budget configured)"), "{text}");
+        assert!(!text.contains("  ↳ "), "a green machine prints no hint: {text}");
+
+        let mut inputs = base_inputs();
+        inputs.pool = None;
+        assert!(render_human(&compute_ledger(inputs, 1)).contains("(no budget and no readable pool)"));
     }
 
     /// Contract 5 (schema leniency) for the #1854 additions — a 2.0 payload
@@ -3130,6 +3163,33 @@ mod tests {
         let gig = "total = 4.00G  used = 1.50G  free = 2.50G  (encrypted)";
         assert_eq!(parse_swapusage_used_bytes(gig), Some((1.5f64 * (1u64 << 30) as f64) as u64));
         assert_eq!(parse_swapusage_used_bytes("nonsense"), None);
+    }
+
+    /// (#3287) The kernel reads compose into the rows: the pool needs a
+    /// capacity (`hw.memsize`) and takes vm_stat's decomposition; each failed
+    /// read leaves only its own rows unknown.
+    #[test]
+    fn memory_rows_compose_the_four_kernel_reads_and_degrade_per_read() {
+        let swap = "total = 2048.00M  used = 1.00M  free = 2047.00M  (encrypted)";
+        let rows = memory_rows_from_kernel(Some(VM_STAT_FULL), Some(" 137438953472\n"), Some(swap), Some("43\n"));
+        let pool = rows.pool.expect("a capacity makes a pool");
+        assert_eq!(pool.capacity_bytes, 137_438_953_472);
+        assert_eq!(
+            (pool.used_bytes, pool.available_bytes, pool.free_bytes),
+            (Some(80_281_600), Some(45_875_200), Some(16_384_000))
+        );
+        assert_eq!(rows.compressor_bytes, Some(11_468_800));
+        assert_eq!(rows.swap_used_bytes, Some(1 << 20));
+        assert_eq!(rows.margin_percent, Some(43));
+
+        let rows = memory_rows_from_kernel(None, Some("137438953472"), None, Some("not a number"));
+        let pool = rows.pool.expect("capacity alone still makes a pool");
+        assert_eq!((pool.used_bytes, pool.available_bytes, pool.free_bytes), (None, None, None));
+        assert_eq!((rows.compressor_bytes, rows.swap_used_bytes, rows.margin_percent), (None, None, None));
+
+        let rows = memory_rows_from_kernel(Some(VM_STAT_FULL), Some("garbage"), None, None);
+        assert!(rows.pool.is_none(), "no pool without a readable capacity");
+        assert_eq!(rows.compressor_bytes, Some(11_468_800), "the compressor row does not need the capacity");
     }
 
     /// Rank-pairing must use WEIGHTS, not potential. The live case from

@@ -1388,6 +1388,36 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
     // partition by ownership here so a remote read renders like a local
     // one. No profile-match — that reads this host's registry.
     let value = fleet_cli::fetch_peer_json(id, "/machine/status")?;
+    let (lms_unreachable, models) = peer_resident_list(id, &value)?;
+    let engine = peer_engine(id, &value)?;
+    if let Some(e) = engine.as_ref().filter(|e| e.usable && !e.reports_residency) {
+        return residents_not_reported(e, json, Some(id));
+    }
+    if lms_unreachable {
+        return peer_residents_unknown(id, engine, json);
+    }
+    render_peer_residents(id, &models, engine.as_ref(), json)
+}
+
+/// A reachable peer's residents, rendered like a local read, then (in human
+/// output) the peer's utility model line.
+fn render_peer_residents(
+    id: &str,
+    models: &[types::LoadedModel],
+    engine: Option<&darkmux_serve::wire::MachineEngine>,
+    json: bool,
+) -> Result<i32> {
+    let code = render_residents(models, None, None, json, Some(id), engine)?;
+    if !json {
+        println!();
+        println!("{}", peer_utility_line(id));
+    }
+    Ok(code)
+}
+
+/// A peer's `/machine/status` body read as whether its daemon could reach
+/// LM Studio and the residents it listed.
+fn peer_resident_list(id: &str, value: &serde_json::Value) -> Result<(bool, Vec<types::LoadedModel>)> {
     // (#1426 gate fix) A degraded peer must NOT render as healthy-empty:
     // `lms_unreachable: true` means the peer's daemon could not query
     // LMStudio — its residents are UNKNOWN, not zero. Surface it loudly
@@ -1406,22 +1436,10 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
         Some(Ok(models)) => models,
         _ => anyhow::bail!(
             "machine `{id}` answered with a resident list this darkmux does not read ({})",
-            fleet_cli::peer_reports(&value)
+            fleet_cli::peer_reports(value)
         ),
     };
-    let engine = peer_engine(id, &value)?;
-    if let Some(e) = engine.as_ref().filter(|e| e.usable && !e.reports_residency) {
-        return residents_not_reported(e, json, Some(id));
-    }
-    if lms_unreachable {
-        return peer_residents_unknown(id, engine, json);
-    }
-    let code = render_residents(&models, None, None, json, Some(id), engine.as_ref())?;
-    if !json {
-        println!();
-        println!("{}", peer_utility_line(id));
-    }
-    Ok(code)
+    Ok((lms_unreachable, models))
 }
 
 /// The utility model line for a peer, from the `/machine/specs` it serves (the
@@ -2119,6 +2137,26 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3287) A peer's status body: `lms_unreachable` defaults to false, the
+    /// residents parse, and a body with no list, or one this darkmux does not
+    /// read, is refused naming the peer.
+    #[test]
+    fn a_peer_status_body_reads_as_reachability_and_residents_or_is_refused() {
+        let ok = serde_json::json!({
+            "models": [{ "identifier": "darkmux:m", "model": "m", "status": "idle", "size": "1 GB", "context": 4096 }]
+        });
+        let (unreachable, models) = peer_resident_list("studio", &ok).unwrap();
+        assert!(!unreachable, "absent means reachable");
+        assert_eq!(models.iter().map(|m| m.identifier.as_str()).collect::<Vec<_>>(), ["darkmux:m"]);
+        let degraded = serde_json::json!({ "lms_unreachable": true, "models": [] });
+        let (unreachable, models) = peer_resident_list("studio", &degraded).unwrap();
+        assert!(unreachable && models.is_empty());
+        for body in [serde_json::json!({}), serde_json::json!({ "models": "nope" })] {
+            let err = peer_resident_list("studio", &body).unwrap_err().to_string();
+            assert!(err.contains("machine `studio` answered with a resident list this darkmux does not read"), "{err}");
+        }
+    }
 
     #[test]
     fn a_correction_shows_its_execution_or_says_it_has_none() {

@@ -54,13 +54,8 @@ pub(crate) fn cmd_machine_add(
     // (#2916 re-review C7) Machine names are case-insensitive: an entry that
     // differs only in case is the SAME machine, updated under its existing
     // spelling rather than added twice.
-    let requested = id;
-    let existing_key = fleet::find_machine_key(&fleet::load_roster()?, requested)?;
-    let id_owned = existing_key.clone().unwrap_or_else(|| requested.to_string());
+    let id_owned = existing_spelling(id)?;
     let id = id_owned.as_str();
-    if id != requested {
-        println!("machine: `{requested}` is the existing entry `{id}` (machine names are case-insensitive)");
-    }
     let local_id = flow::resolve_machine_id();
     let is_self_entry = local_id.as_deref().is_some_and(|l| fleet::same_machine(l, id));
     // A peer's hardware cannot be probed from here — `machine add` performs no
@@ -86,31 +81,7 @@ pub(crate) fn cmd_machine_add(
     // check it before sending the fleet token; warn when the address is not
     // a node on the overlay at all.
     if !loopback_intended {
-        let pin = match fleet::configured_provider() {
-            Ok(p) => pin_address(p.as_ref(), address),
-            Err(e) => PinOutcome::Unverified(format!("{e:#}")),
-        };
-        match pin {
-            PinOutcome::Pinned { node_id, shown } => {
-                fleet::mutate_roster(|r| {
-                    if let Some(e) = r.machines.get_mut(id) {
-                        e.node_id = Some(node_id.clone());
-                    }
-                    Ok(())
-                })?;
-                println!("  pinned to the network node `{shown}`; work sent to {id} checks it every time");
-            }
-            PinOutcome::NotANode => eprintln!(
-                "{}",
-                darkmux_types::style::warn(&format!(
-                    "machine: `{address}` is not a node on the tailnet. Fleet work refuses to go there \
-                     (the fleet token would cross a network nobody vouches for); use {id}'s tailnet DNS name."
-                ))
-            ),
-            PinOutcome::Unverified(why) => println!(
-                "  not pinned yet ({why}); the first work sent to {id} pins its node"
-            ),
-        }
+        pin_entry(id, address)?;
     }
     if let Some(d) = description {
         println!("  description: {d}");
@@ -121,6 +92,56 @@ pub(crate) fn cmd_machine_add(
     }
     println!("  roster: {}", fleet::roster_path().display());
     Ok(0)
+}
+
+/// (#2916 re-review C7) The roster entry `requested` names: machine names are
+/// case-insensitive, so an entry that differs only in case is the SAME
+/// machine, updated under its existing spelling (and said so).
+fn existing_spelling(requested: &str) -> Result<String> {
+    let existing_key = fleet::find_machine_key(&fleet::load_roster()?, requested)?;
+    let id = existing_key.unwrap_or_else(|| requested.to_string());
+    if id != requested {
+        println!("machine: `{requested}` is the existing entry `{id}` (machine names are case-insensitive)");
+    }
+    Ok(id)
+}
+
+/// (#2916 review C1) Ask the identity provider which node answers at
+/// `address`, and record the answer on the entry `id`.
+fn pin_entry(id: &str, address: &str) -> Result<()> {
+    let pin = match fleet::configured_provider() {
+        Ok(p) => pin_address(p.as_ref(), address),
+        Err(e) => PinOutcome::Unverified(format!("{e:#}")),
+    };
+    record_pin(id, address, pin)
+}
+
+/// What `machine add` does with a [`PinOutcome`]: a node is pinned on the
+/// entry, an address that is no node is warned about, and an unverified one
+/// waits for the first work sent there.
+fn record_pin(id: &str, address: &str, pin: PinOutcome) -> Result<()> {
+    match pin {
+        PinOutcome::Pinned { node_id, shown } => {
+            fleet::mutate_roster(|r| {
+                if let Some(e) = r.machines.get_mut(id) {
+                    e.node_id = Some(node_id.clone());
+                }
+                Ok(())
+            })?;
+            println!("  pinned to the network node `{shown}`; work sent to {id} checks it every time");
+        }
+        PinOutcome::NotANode => eprintln!(
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "machine: `{address}` is not a node on the tailnet. Fleet work refuses to go there \
+                 (the fleet token would cross a network nobody vouches for); use {id}'s tailnet DNS name."
+            ))
+        ),
+        PinOutcome::Unverified(why) => println!(
+            "  not pinned yet ({why}); the first work sent to {id} pins its node"
+        ),
+    }
+    Ok(())
 }
 
 /// (#2916 review C1) What `machine add` learned about the node at an
@@ -1158,6 +1179,48 @@ mod tests {
             local_name_from_env: false,
             presence: crate::doctor::PresenceState::Read,
         }
+    }
+
+    /// (#3287) What `machine add` does with each pin answer: a node is
+    /// recorded on the entry (only that entry), and an address that is no
+    /// node, or one not verified yet, leaves the roster as it was.
+    #[serial_test::serial]
+    #[test]
+    fn record_pin_writes_a_pinned_node_on_its_entry_and_nothing_otherwise() {
+        let _tmp = isolated_add_env("viewer");
+        cmd_machine_add("peer-a", "127.0.0.1:18765", None, true).unwrap();
+        cmd_machine_add("peer-b", "127.0.0.1:18766", None, true).unwrap();
+        let pinned = PinOutcome::Pinned { node_id: "n-1".into(), shown: "peer-a.tailnet.example".into() };
+        record_pin("peer-a", "peer-a.tailnet.example", pinned).unwrap();
+        let after_pin = fleet::load_roster().unwrap();
+        record_pin("peer-b", "10.0.0.9", PinOutcome::NotANode).unwrap();
+        record_pin("peer-b", "10.0.0.9", PinOutcome::Unverified("no provider".into())).unwrap();
+        let pinned_missing = PinOutcome::Pinned { node_id: "n-2".into(), shown: "ghost".into() };
+        record_pin("ghost", "ghost.tailnet.example", pinned_missing).unwrap();
+        let after_rest = fleet::load_roster().unwrap();
+        clear_add_env();
+        assert_eq!(after_pin.machines["peer-a"].node_id.as_deref(), Some("n-1"));
+        assert_eq!(after_pin.machines["peer-b"].node_id, None, "only the named entry is pinned");
+        assert_eq!(after_rest.machines["peer-b"].node_id, None, "no node, no pin");
+        assert!(!after_rest.machines.contains_key("ghost"), "a pin never adds an entry");
+        assert_eq!(after_rest.machines.len(), 2);
+    }
+
+    /// (#3287) An id differing only in case updates the existing entry under
+    /// its own spelling instead of adding a second one.
+    #[serial_test::serial]
+    #[test]
+    fn an_add_differing_only_in_case_updates_the_existing_entry() {
+        let _tmp = isolated_add_env("viewer");
+        cmd_machine_add("Studio", "127.0.0.1:18765", None, true).unwrap();
+        let spelled = existing_spelling("studio").unwrap();
+        let unknown = existing_spelling("laptop").unwrap();
+        cmd_machine_add("STUDIO", "127.0.0.1:18766", Some("again"), true).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        clear_add_env();
+        assert_eq!((spelled.as_str(), unknown.as_str()), ("Studio", "laptop"));
+        assert_eq!(roster.machines.keys().collect::<Vec<_>>(), vec!["Studio"]);
+        assert_eq!(roster.machines["Studio"].address, "127.0.0.1:18766");
     }
 
     #[serial_test::serial]

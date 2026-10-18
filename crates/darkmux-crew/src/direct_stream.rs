@@ -214,23 +214,7 @@ fn reassemble_messages(text: &str) -> Vec<u8> {
     for data in data_lines(text) {
         let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
         text_out.push_str(delta_text(&event, Shape::Messages).0);
-        let counts = match event["type"].as_str() {
-            Some("message_start") => {
-                for key in ["id", "model"] {
-                    if let Some(v) = event.pointer(&format!("/message/{key}")).filter(|v| !v.is_null()) {
-                        reply[key] = v.clone();
-                    }
-                }
-                event.pointer("/message/usage")
-            }
-            Some("message_delta") => {
-                if let Some(r) = event.pointer("/delta/stop_reason").filter(|r| !r.is_null()) {
-                    reply["stop_reason"] = r.clone();
-                }
-                event.get("usage")
-            }
-            _ => None,
-        };
+        let counts = merge_message_event(&event, &mut reply);
         // A later count replaces an earlier one (`message_delta`'s output
         // tokens are the final total, not an increment).
         for (k, v) in counts.and_then(Value::as_object).into_iter().flatten().filter(|(_, v)| !v.is_null()) {
@@ -242,6 +226,29 @@ fn reassemble_messages(text: &str) -> Vec<u8> {
         reply["usage"] = Value::Object(usage);
     }
     reply.to_string().into_bytes()
+}
+
+/// One Messages event's part of the reply: `message_start`'s id and model,
+/// `message_delta`'s stop reason (a null one is no value). Returns the usage
+/// counts the event carries, if any.
+fn merge_message_event<'e>(event: &'e Value, reply: &mut Value) -> Option<&'e Value> {
+    match event["type"].as_str() {
+        Some("message_start") => {
+            for key in ["id", "model"] {
+                if let Some(v) = event.pointer(&format!("/message/{key}")).filter(|v| !v.is_null()) {
+                    reply[key] = v.clone();
+                }
+            }
+            event.pointer("/message/usage")
+        }
+        Some("message_delta") => {
+            if let Some(r) = event.pointer("/delta/stop_reason").filter(|r| !r.is_null()) {
+                reply["stop_reason"] = r.clone();
+            }
+            event.get("usage")
+        }
+        _ => None,
+    }
 }
 
 /// The events of a finished stream as one reply.

@@ -779,6 +779,30 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
     // nothing about the finalize decision itself, only what gets saved.
     let mut envelope = envelope.clone();
     stamp_operator_stop(&mut envelope);
+    drive_phases(&envelope);
+    close_mission(&envelope, payload);
+
+    // (#2421) Every finalize computes + attaches the mission's own
+    // stream-cost block — never left silently absent on a freshly-finalized
+    // envelope. `mission_created_ts` anchors the day-file scan window
+    // ([`crate::records_emitted::records_emitted_for_mission`]); when the
+    // mission itself can't be loaded (should not happen — it was just
+    // driven through the transitions above — but best-effort throughout
+    // this function is the established discipline), the window can't be
+    // resolved and this degrades to an honest all-zero block plus a named
+    // warning, same shape as the "no records found" miss below.
+    let (records_emitted, records_emitted_warnings) = records_emitted_block(&envelope.mission_id);
+    for reason in records_emitted_warnings {
+        envelope.warnings.push(format!("records-emitted: {reason}"));
+    }
+    envelope.records_emitted = Some(records_emitted);
+
+    let _ = lifecycle::save_envelope(&envelope.mission_id, &envelope);
+}
+
+/// Drive each phase to the lifecycle terminal its outcome names; a refusal
+/// is quiet when the phase is already there, loud when it drifted.
+fn drive_phases(envelope: &MissionEnvelope) {
     for phase in &envelope.phases {
         let result = match phase.outcome {
             // (#2406) `Degraded` drives the phase to the SAME lifecycle
@@ -807,6 +831,11 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
             }
         }
     }
+}
+
+/// Close the mission as Finalized with its reason and payload; a refusal is
+/// quiet when it is already Finalized, loud otherwise.
+fn close_mission(envelope: &MissionEnvelope, payload: Option<serde_json::Value>) {
     let reason = envelope
         .reason
         .clone()
@@ -830,29 +859,23 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
             );
         }
     }
+}
 
-    // (#2421) Every finalize computes + attaches the mission's own
-    // stream-cost block — never left silently absent on a freshly-finalized
-    // envelope. `mission_created_ts` anchors the day-file scan window
-    // ([`crate::records_emitted::records_emitted_for_mission`]); when the
-    // mission itself can't be loaded (should not happen — it was just
-    // driven through the transitions above — but best-effort throughout
-    // this function is the established discipline), the window can't be
-    // resolved and this degrades to an honest all-zero block plus a named
-    // warning, same shape as the "no records found" miss below.
+/// The mission's records-emitted block, with the warnings that qualify it.
+fn records_emitted_block(mission_id: &str) -> (crate::records_emitted::RecordsEmitted, Vec<String>) {
     let finalize_secs = crate::records_emitted::now_secs();
     let mut records_emitted_warnings: Vec<String> = Vec::new();
-    let records_emitted = match lifecycle::load_mission_by_id(&envelope.mission_id) {
+    let records_emitted = match lifecycle::load_mission_by_id(mission_id) {
         Ok(mission) => {
             let (emitted, day_files_searched) = crate::records_emitted::records_emitted_for_mission(
-                &envelope.mission_id,
+                mission_id,
                 mission.created_ts,
                 finalize_secs,
             );
             if emitted.total_records == 0 {
                 records_emitted_warnings.push(format!(
                     "no flow records found for mission `{}` (searched day file(s): {})",
-                    envelope.mission_id,
+                    mission_id,
                     if day_files_searched.is_empty() {
                         "none".to_string()
                     } else {
@@ -860,24 +883,19 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
                     }
                 ));
             } else if let Some(reason) = missing_machine_uid_warning(&emitted) {
-                records_emitted_warnings.push(format!("mission `{}`'s {reason}", envelope.mission_id));
+                records_emitted_warnings.push(format!("mission `{}`'s {reason}", mission_id));
             }
             emitted
         }
         Err(e) => {
             records_emitted_warnings.push(format!(
                 "could not resolve mission `{}`'s created_ts to scan day files for records-emitted: {e:#}",
-                envelope.mission_id
+                mission_id
             ));
             crate::records_emitted::RecordsEmitted::default()
         }
     };
-    for reason in records_emitted_warnings {
-        envelope.warnings.push(format!("records-emitted: {reason}"));
-    }
-    envelope.records_emitted = Some(records_emitted);
-
-    let _ = lifecycle::save_envelope(&envelope.mission_id, &envelope);
+    (records_emitted, records_emitted_warnings)
 }
 
 #[cfg(test)]

@@ -1275,3 +1275,68 @@ fn an_unlisted_utility_is_unbound_on_disk_when_nothing_else_changes() {
     let reg = load(&env);
     assert!(reg.internal.as_ref().and_then(|i| i.utility.as_ref()).is_none(), "the utility binding was kept on disk");
 }
+
+/// (#3287) A config.json that `config set` cannot write is found only after
+/// the registry gained the endpoint: the registry is put back as it was, the
+/// reason says so, and the models are planned on the engine still configured.
+#[test]
+#[serial_test::serial]
+fn a_config_that_refuses_the_engine_puts_the_registry_back() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.lms_missing();
+    fs::create_dir_all(env.config().parent().unwrap()).unwrap();
+    fs::write(env.config(), "{ not json").unwrap();
+    let (_base, server) = serve_models(&["m/one"], 1);
+
+    let r = init(&opts()).unwrap();
+    server.join().unwrap();
+
+    let why = r.engine_unrecorded.clone().unwrap_or_default();
+    assert!(why.ends_with("(profiles.json was put back)"), "{why}");
+    assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON, "the endpoint was taken back out");
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), "{ not json", "the config is not rewritten");
+    assert_eq!(r.models_engine, None, "an engine not recorded is not planned on");
+}
+
+/// (#3287) On a re-run, the engine config.json names is the one the models
+/// are planned from: its registry endpoint is asked what it serves, and a
+/// name that is no endpoint, or an endpoint that does not answer, is the
+/// reason the worker stays unfilled.
+#[test]
+#[serial_test::serial]
+fn the_configured_server_is_the_one_models_are_planned_from() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    fs::write(env.config(), r#"{ "default_engine": "mlx" }"#).unwrap();
+    let report = InitReport::default();
+
+    env.write_registry(EXAMPLE_PROFILES_JSON);
+    let ModelsEngine::Server { name, models } = models_engine(&report, &env.registry(), &env.config()) else {
+        panic!("a server is configured")
+    };
+    let why = models.unwrap_err();
+    assert_eq!(name, "mlx");
+    assert!(why.contains("the default engine `mlx` is not an endpoint in"), "{why}");
+
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_url = format!("http://{}/v1", dead.local_addr().unwrap());
+    drop(dead);
+    env.write_registry(&crate::init_engine::add_endpoint(EXAMPLE_PROFILES_JSON, "mlx", &dead_url).unwrap());
+    let ModelsEngine::Server { models, .. } = models_engine(&report, &env.registry(), &env.config()) else {
+        panic!("a server is configured")
+    };
+    let why = models.unwrap_err();
+    assert!(why.contains(&format!("did not answer `GET /models` at {dead_url}")), "{why}");
+
+    let (base, server) = serve_models(&["m/one"], 1);
+    env.write_registry(&crate::init_engine::add_endpoint(EXAMPLE_PROFILES_JSON, "mlx", &base).unwrap());
+    let ModelsEngine::Server { models, .. } = models_engine(&report, &env.registry(), &env.config()) else {
+        panic!("a server is configured")
+    };
+    server.join().unwrap();
+    assert_eq!(models, Ok(vec!["m/one".to_string()]));
+
+    fs::write(env.config(), r#"{ "default_engine": " LMStudio " }"#).unwrap();
+    assert!(matches!(models_engine(&report, &env.registry(), &env.config()), ModelsEngine::Lmstudio));
+}

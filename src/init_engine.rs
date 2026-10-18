@@ -232,18 +232,32 @@ pub struct TerminalAsk;
 
 impl Ask for TerminalAsk {
     fn choose(&mut self, options: &[Found]) -> Option<usize> {
-        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-            return None;
-        }
-        eprintln!("darkmux init: more than one engine answers on this machine:");
-        for (i, f) in options.iter().enumerate() {
-            eprintln!("  {}) {}", i + 1, f.describe());
-        }
-        eprint!("Which is this machine's engine? [1]: ");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok()?;
-        parse_choice(&line, options.len())
+        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        prompt_choice(interactive, options, &mut std::io::stdin().lock(), &mut std::io::stderr())
     }
+}
+
+/// [`TerminalAsk`]'s question: with someone to ask, list `options` on `out`,
+/// read one answer line from `input` and [`parse_choice`] it. Nobody to ask,
+/// or no line read, is no choice.
+pub fn prompt_choice(
+    interactive: bool,
+    options: &[Found],
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Option<usize> {
+    if !interactive {
+        return None;
+    }
+    let _ = writeln!(out, "darkmux init: more than one engine answers on this machine:");
+    for (i, f) in options.iter().enumerate() {
+        let _ = writeln!(out, "  {}) {}", i + 1, f.describe());
+    }
+    let _ = write!(out, "Which is this machine's engine? [1]: ");
+    let _ = out.flush();
+    let mut line = String::new();
+    input.read_line(&mut line).ok()?;
+    parse_choice(&line, options.len())
 }
 
 /// An answer to [`TerminalAsk`]: empty is the first option, a number in range

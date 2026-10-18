@@ -11839,6 +11839,20 @@ mod tests {
         assert_eq!(c.status, Status::Warn, "{}", c.message);
     }
 
+    /// (#3287) Loaded models pass and are named in order; an empty listing
+    /// warns that nothing is loaded and says a dispatch loads what it needs.
+    #[test]
+    fn models_loaded_names_each_loaded_model_and_warns_when_none_are() {
+        let c = models_loaded_status(Ok(vec![lm("darkmux:qwen", "qwen"), lm("gemma", "gemma")]));
+        assert_eq!(
+            (c.status, c.message.as_str(), c.hint),
+            (Status::Pass, "2 model(s) loaded: darkmux:qwen, gemma", None)
+        );
+        let c = models_loaded_status(Ok(Vec::new()));
+        assert_eq!((c.status, c.message.as_str()), (Status::Warn, "no models loaded in LMStudio"));
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("darkmux dispatch")), "{:?}", c.hint);
+    }
+
     /// (#316) `default_engine`: LM Studio passes with its tier; an endpoint
     /// passes when it answers and fails, naming it, when it does not; a value
     /// naming no usable engine fails with the fix for the tier that set it.
