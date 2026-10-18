@@ -182,6 +182,17 @@ darkmux release.
 
 ### Fixed
 
+- **A peer's card reads a short turn's rate, its tool gen, and a hung prefill's STALL**
+  (matrix review before 5.3.0). The hub writers also relay a stream's first beat past the
+  stream-open chunk and the first beat of each tool call it writes: per stream at most the
+  20 s cadence plus one first output plus one per distinct tool written (on a 10-turn run,
+  19 relayed beats instead of 10, of the 44 kept locally); a turn's opener sampled up to a
+  second before the whole-second `ts` of the marker written ahead of it is now bounded, not
+  PROMPT forever, unless its turn has already closed; a prefill the engine reports nothing about reads STALL at its size bound
+  even while the host's live refreshes keep arriving; the prefill time left is dropped, not
+  held at "~0s left", once progress stops past its own estimate; and the scope's bar rounds
+  down like the percentage under it.
+
 - **`init` on an OpenAI-compatible server no longer keeps a utility model the server
   does not list** (#316). It kept the shipped `internal.utility` binding and only said so,
   and `mlx_lm.server` fetches a model it does not hold from Hugging Face, so the first

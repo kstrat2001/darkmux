@@ -1,5 +1,8 @@
 import { DEFAULT_POLICY } from "./lifecycle";
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
   isCrossTurnPair,
@@ -9,6 +12,7 @@ import {
   PREFILL_FLOOR_MS,
   prefillStallAfterMs,
   STALL_AFTER_MS,
+  HUB_RELAY_INTERVAL_MS,
   aggregateLiveState,
   aggregateTokenRate,
   charsPerSecond,
@@ -32,8 +36,9 @@ import {
   liveExecutions,
   reasonForLine,
 } from "./tokenRate";
-import type { NormRecord } from "./ingest";
+import { ACTION, type NormAction, type NormRecord } from "./ingest";
 import { norm } from "../testing/records";
+import { deepAt, pg1Records, pg2Records } from "../testing/pepperGrinderDeep";
 
 const SID = "darkmux-coder-1790125784225";
 const atSec = (sec: number) => new Date(Date.UTC(2026, 8, 23, 1, 9, 0) + sec * 1000).toISOString();
@@ -1696,6 +1701,19 @@ describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
     expect(deriveLiveState(records, T + 19_000)).toMatchObject({ state: "prompt", promptProgress: { processed: 1_024, secondsLeft: 21 } });
   });
 
+  it("(matrix review) once progress stops past its own estimate, the time left is dropped, not held at '~0s left'", () => {
+    // The d3293c shape: four 512-token steps of a 3,081-token prompt, then
+    // nothing past 2,048. At the last steps' pace (1,536 in 25 s) the 1,033
+    // tokens left take ~16.8 s from the last advance (33 s).
+    const stopped = [start, opener(), report(8, 512, 3_081), report(16, 1_024, 3_081), report(24, 1_536, 3_081), report(33, 2_048, 3_081)];
+    expect(deriveLiveState(stopped, T + 40_000)).toMatchObject({ state: "prompt", promptProgress: { processed: 2_048, total: 3_081, percent: 66, secondsLeft: 10 } });
+    // Inside the estimate it still counts down; past it, the percentage alone.
+    expect(deriveLiveState(stopped, T + 49_000).promptProgress?.secondsLeft).toBe(1);
+    const late = deriveLiveState(stopped, T + 60_000);
+    expect(late).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 2_048, total: 3_081, percent: 66 } });
+    expect(promptProgressLabel(late.promptProgress!)).toBe("66%");
+  });
+
   it("prefillStallAfterMs is a floor with progress, and the whole bound without it", () => {
     // A 244,552-char opener allows ~579 s with no progress. With progress,
     // a silence of three steps is a hang only once that floor has passed
@@ -1982,5 +2000,166 @@ describe("the pairing predicates (#3152)", () => {
   it("a cadence is usable only as a positive finite number", () => {
     expect(isUsableCadenceMs(250)).toBe(true);
     for (const bad of [0, -250, Number.NaN, Number.POSITIVE_INFINITY, "250", null, undefined]) expect(isUsableCadenceMs(bad)).toBe(false);
+  });
+});
+
+// (Matrix review, 5.3.0) Real slices of the laptop's 2026-10-18 runs
+// (`testing/pepperGrinderDeep.ts`).
+describe("(matrix review) an opener sampled just before its marker's whole-second ts", () => {
+  // Turn 8 of PG1: `dispatch.tool` at ts 11:06:35 (written by the tailer
+  // after it read the tool's result), the next stream's opener sampled by
+  // the runtime at 11:06:34.892, then nothing until 11:06:44.007. Cut at
+  // 11:06:43.9, before the first chunk: a prefill that never ends.
+  const opener = deepAt("11:06:34.892");
+  const cut = pg1Records().filter((r) => (r.tMs ?? 0) <= deepAt("11:06:43.900"));
+  const bound = prefillStallAfterMs(70_234);
+
+  it("reads PROMPT with the opener's size inside its bound", () => {
+    expect(deriveLiveState(cut, deepAt("11:06:43.900"))).toEqual({ state: "prompt", promptChars: 70_234 });
+    expect(deriveLiveState(cut, opener + bound)).toEqual({ state: "prompt", promptChars: 70_234 });
+  });
+
+  it("reads STALL past its bound, not PROMPT at +500 s", () => {
+    expect(deriveLiveState(cut, opener + bound + 1)).toEqual({ state: "stalled" });
+    expect(deriveLiveState(cut, opener + 500_000)).toEqual({ state: "stalled" });
+  });
+
+  it("(#3298 review) a CLOSED sub-second turn's opener is never a prefill: PROMPT after a 5-minute rest, not STALL", () => {
+    // The reviewer's sequence: opener at T+0.300, an empty chunk at T+0.500,
+    // the turn closed (no tool calls) and a 300 s rest, both at ts T+1. The
+    // opener sits inside the marker's 1 s window, but its turn has ended.
+    const T = Date.parse("2026-10-18T12:00:00Z");
+    const rec = (atMs: number, action: NormAction, payload: Record<string, unknown>) =>
+      norm({ ts: new Date(Math.floor(atMs / 1000) * 1000).toISOString().replace(".000Z", "Z"), action, session_id: "s-3298", payload });
+    const records = [
+      rec(T - 10_000, ACTION.DispatchStart, {}),
+      rec(T + 300, ACTION.DispatchTurnHeartbeat, { turn_seq: 3, cumulative_chars: 0, sampled_at_ms: T + 300, generated_chars: 0, prompt_chars: 20_000 }),
+      rec(T + 500, ACTION.DispatchTurnHeartbeat, { turn_seq: 3, partial_index: 1, cumulative_chars: 0, sampled_at_ms: T + 500, generated_chars: 0 }),
+      rec(T + 1_000, ACTION.DispatchTurn, { turn_seq: 3, tool_calls_count: 0 }),
+      rec(T + 1_000, ACTION.DispatchRest, { ms: 300_000 }),
+    ];
+    expect(deriveLiveState(records, T + 1_000 + 300_000 + 100)).toEqual({ state: "prompt" });
+  });
+
+  it("the previous turn's opener (a turn and more before the marker) never bounds it", () => {
+    // Turn 7's opener (11:06:22.046) produced output, so it is not a prefill
+    // opener at all; the reading after turn 7's marker but before turn 8's
+    // opener is the plain PROMPT a marker gives.
+    const between = pg1Records().filter((r) => (r.tMs ?? 0) <= deepAt("11:06:35") && !(r.action === ACTION.DispatchTurnHeartbeat && r.tMs === deepAt("11:06:35")));
+    expect(deriveLiveState(between, deepAt("11:06:35.500"))).toEqual({ state: "prompt" });
+  });
+});
+
+// (Matrix review) What a peer's viewer receives of PG2 over the fleet hub:
+// every record but the heartbeats, plus the prompt-phase beats and the
+// generation beats the writer's `HubRelayGate` marks
+// (`crates/darkmux-flow/src/hub_route.rs`). (#3298 review) The routes come
+// from ONE shared corpus, `tests/hub_relay/cases.json`, which the Rust side
+// asserts against the real gate (`the_shared_cases_route_as_written`) and
+// this side against its mirror below, so neither can drift alone.
+type HubCases = { stream_open_max_chars: number; interval_ms: number; cases: { name: string; beats: Beat[]; expect: Route[] }[] };
+type Beat = { sampled_at_ms?: number; generated_chars?: number | null; partial_index?: number; prompt_chars?: number; prompt_processed?: number; prompt_total?: number; phase?: string; tool_name?: string };
+type Route = "prompt" | "relay" | "local";
+const HUB_CASES = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../tests/hub_relay/cases.json"), "utf8")) as HubCases;
+const STREAM_OPEN_MAX_CHARS = 16;
+const promptPhase = (p: Beat) => p.partial_index === undefined && p.generated_chars === 0 && (p.prompt_chars !== undefined || (p.prompt_processed !== undefined && p.prompt_total !== undefined));
+/** The viewer's mirror of the writer's gate: each beat's route, in writer order, a reset at each opener. */
+function hubRoutes(beats: Beat[]): Route[] {
+  let last: number | null = null;
+  let outputRelayed = false;
+  let tools: string[] = [];
+  return beats.map((p) => {
+    if (p.prompt_chars !== undefined) [last, outputRelayed, tools] = [null, false, []];
+    if (promptPhase(p)) return "prompt";
+    const at = p.sampled_at_ms;
+    if (at === undefined) return "local";
+    const pastChunk = typeof p.generated_chars === "number" && p.generated_chars > STREAM_OPEN_MAX_CHARS;
+    const name = p.phase === "writing_tool_call" && p.tool_name ? p.tool_name : null;
+    const newTool = name !== null && !tools.some((t) => t.startsWith(name) || name.startsWith(t)) ? name : null;
+    const due = last === null || at < last || at - last >= HUB_RELAY_INTERVAL_MS || (pastChunk && !outputRelayed) || newTool !== null;
+    if (!due) return "local";
+    [last, outputRelayed] = [at, outputRelayed || pastChunk];
+    if (newTool !== null) tools.push(newTool);
+    return "relay";
+  });
+}
+
+describe("(#3298 review) the viewer's mirror of the hub relay gate routes the shared cases as written", () => {
+  it("names the same bounds as the corpus", () => {
+    expect([HUB_CASES.stream_open_max_chars, HUB_CASES.interval_ms]).toEqual([STREAM_OPEN_MAX_CHARS, HUB_RELAY_INTERVAL_MS]);
+    expect(HUB_CASES.cases.length).toBeGreaterThanOrEqual(8);
+  });
+  for (const c of HUB_CASES.cases) {
+    it(c.name, () => {
+      expect(hubRoutes(c.beats)).toEqual(c.expect);
+    });
+  }
+});
+
+describe("(matrix review) a peer's card reads a short turn's rate and its tool gen from the hub", () => {
+  const PG2_CASE = HUB_CASES.cases[0];
+  /** This machine's file cut to the hub's subset by the corpus's PG2 routes (the real gate's), marked beats carrying `hub_relay`. */
+  function hubSubset(records: NormRecord[]): NormRecord[] {
+    let i = 0;
+    const out: NormRecord[] = [];
+    for (const r of records) {
+      if (r.action !== ACTION.DispatchTurnHeartbeat) {
+        out.push(r);
+        continue;
+      }
+      const p = (r as unknown as { payload: Beat }).payload;
+      expect(p.sampled_at_ms, `beat ${i} is the corpus's`).toBe(PG2_CASE.beats[i].sampled_at_ms);
+      const route = PG2_CASE.expect[i++];
+      if (route === "prompt") out.push(r);
+      else if (route === "relay") out.push(norm({ ...(r as unknown as Record<string, unknown>), payload: { ...p, hub_relay: true } }));
+    }
+    expect(i, "every PG2 beat is in the corpus").toBe(PG2_CASE.beats.length);
+    return out;
+  }
+  const local = pg2Records();
+  const peer = hubSubset(local);
+  const relayedAt = (from: string, to: string) =>
+    peer.filter((r) => r.action === ACTION.DispatchTurnHeartbeat && (r as unknown as { payload: { hub_relay?: true } }).payload.hub_relay && (r.tMs ?? 0) >= deepAt(from) && (r.tMs ?? 0) <= deepAt(to)).map((r) => (r as unknown as { payload: Beat }).payload.sampled_at_ms);
+  const asOf = (recs: NormRecord[], at: number) => recs.filter((r) => (r.tMs ?? 0) <= at);
+  const card = (recs: NormRecord[], hms: string) => executionTokenReading(asOf(recs, deepAt(hms)), deepAt(hms));
+
+  it("the hub carries the writer's marks: turn 10's chunk and first output, turn 8's and the call it enters", () => {
+    expect(relayedAt("12:18:41", "12:18:53")).toEqual([1792325921976, 1792325923953]);
+    expect(relayedAt("12:18:18", "12:18:38")).toEqual([1792325898984, 1792325900856, 1792325903460]);
+    // The volume: 19 generation beats relayed for the run's 10 streams (92 s),
+    // of the 44 the file keeps. The old rule relayed 10 (each stream's first);
+    // the 9 more are 7 first outputs and 2 tool calls entered (turns 6 and 8).
+    const beats = (recs: NormRecord[]) => recs.filter((r) => r.action === ACTION.DispatchTurnHeartbeat && !promptPhase((r as unknown as { payload: Beat }).payload)).length;
+    expect([beats(peer), beats(local)]).toEqual([19, 44]);
+  });
+
+  it("turn 10 (11.8 s of text): the peer reads GEN with a fresh rate 2 s in, close to the local card", () => {
+    for (const hms of ["12:18:44.5", "12:18:47", "12:18:51"]) {
+      const p = card(peer, hms);
+      const l = card(local, hms);
+      expect(p.state, hms).toBe("generating");
+      expect(p.carried, hms).toBe(false);
+      expect(l.tokensPerSec).not.toBeNull();
+      expect(p.tokensPerSec! / l.tokensPerSec!, `${hms}: peer ${p.tokensPerSec} vs local ${l.tokensPerSec}`).toBeGreaterThan(0.75);
+      expect(p.tokensPerSec! / l.tokensPerSec!, hms).toBeLessThan(1.33);
+    }
+  });
+
+  it("turn 8 (an edit written for 15 s): the peer shows tool gen like the local card", () => {
+    for (const hms of ["12:18:24", "12:18:30", "12:18:37"]) {
+      const p = card(peer, hms);
+      expect(p, hms).toMatchObject({ state: "tools", writing: true, toolName: "edit" });
+      expect(card(local, hms), hms).toMatchObject({ state: "tools", writing: true, toolName: "edit" });
+    }
+  });
+
+  it("turn 4 (stream-open chunk in the second of the previous dispatch.tool): GEN with a rate once its first output lands", () => {
+    // Before the first output both cards read PROMPT (the tie goes to the marker).
+    expect(card(peer, "12:17:43.5").state).toBe("prompt");
+    expect(card(local, "12:17:43.5").state).toBe("prompt");
+    const p = card(peer, "12:17:44.5");
+    expect(p.state).toBe("generating");
+    expect(p.tokensPerSec).not.toBeNull();
+    expect(p.carried).toBe(false);
   });
 });

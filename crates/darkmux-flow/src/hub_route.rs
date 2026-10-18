@@ -12,13 +12,14 @@
 //! report written before the reply's first chunk, the only records that say
 //! how far a machine has read its prompt; and, while the reply streams, the
 //! sparse generation beats their writer marked `hub_relay` (one per
-//! execution every [`HUB_GENERATION_BEAT_INTERVAL_MS`], [`HubRelayGate`]), so
+//! execution every [`HUB_GENERATION_BEAT_INTERVAL_MS`], plus a stream's first
+//! real output and the first beat of each tool call it writes, [`HubRelayGate`]), so
 //! a peer's card keeps a rate and never reads a false STALL. Any other beat
 //! that read a chunk stays local. Without these another machine's card can
 //! show neither the prompt bar nor a rate. And a lab run's records never reach the hub, whatever their action (#3074,
 //! contract 3).
 
-use crate::payload::DispatchHeartbeatPayload;
+use crate::payload::{DispatchHeartbeatPayload, StreamPhase};
 use crate::{FlowAction, FlowRecord, HubStream, Payload};
 
 /// (#3210) Whether a heartbeat was written while the turn was still reading
@@ -59,11 +60,23 @@ pub fn is_prompt_phase_heartbeat(p: &DispatchHeartbeatPayload) -> bool {
 /// `the_viewer_mirrors_the_relay_interval`); a peer that falls silent longer
 /// than that reads STALL as a local card would. Two relayed beats pair into
 /// a rate like any other. Clock skew between machines eats into that
-/// margin. About 3 records a minute per generating execution against the 30
-/// a minute the local file keeps.
+/// margin. The cadence alone is about 3 records a minute per generating
+/// execution against the 30 a minute the local file keeps; each stream adds
+/// at most its first output and one record per distinct tool it writes
+/// ([`HubRelayGate`]; PG2 of 2026-10-18: 19 of 44 generation beats over 10
+/// streams in 92 s).
 /// Without these, a peer card went from PROMPT to a false STALL the moment
 /// its prefill ended (live check, PR #3293).
 pub const HUB_GENERATION_BEAT_INTERVAL_MS: u64 = 20_000;
+
+/// (Matrix review) The most chars a stream's first generation beat may hold
+/// and still be only the stream-open chunk (every stream opens with 1-5
+/// chars before any real output). The viewer's `STREAM_OPEN_MAX_CHARS`
+/// (`ui/src/lib/tokenRate.ts`, `openerPairTrusted`), mirrored and pinned by
+/// `the_viewer_mirrors_the_stream_open_chunk`: a pair from the opener to a
+/// beat at or under it is not a rate there, so the gate also relays the
+/// first beat past it.
+pub const STREAM_OPEN_MAX_CHARS: u64 = 16;
 
 /// Whether a heartbeat rides the hub: a prompt-phase one, or a generation
 /// beat its writer marked `hub_relay` ([`HubRelayGate`]).
@@ -77,17 +90,35 @@ pub fn heartbeat_rides_hub(p: &DispatchHeartbeatPayload) -> bool {
 /// (`sampled_at_ms`), so the choice is fixed by the record, not by when the
 /// writer ran. Prompt-phase beats ride the hub anyway and neither consume nor
 /// wait on it.
+///
+/// (Matrix review) Inside the interval, a beat is also marked when it says
+/// something a peer cannot read from the beats already relayed: the
+/// stream's first beat past the stream-open chunk ([`STREAM_OPEN_MAX_CHARS`];
+/// without it a turn under 20 s gave a peer no rate), and (#3298 review) the
+/// first beat writing each tool call, so a peer shows tool gen. Only
+/// ENTERING a call: the peer's tool gen ends with the call's `dispatch.tool`,
+/// which rides the hub anyway, and a stream alternating writing ticks with
+/// owed chunks must not relay every beat. A call counts once by its name: a
+/// name unrelated to every name already marked this stream (neither a
+/// prefix of the other), so a name streamed in pieces is one call. The
+/// cadence continues from the latest mark. Per stream that is at most the
+/// 20 s cadence, plus one first output, plus one per distinct tool written.
 #[derive(Debug, Default)]
 pub struct HubRelayGate {
     last_ms: Option<u64>,
+    /// Whether this stream already relayed a beat past the stream-open chunk.
+    output_relayed: bool,
+    /// The tool names whose writing this stream already relayed.
+    tools_relayed: Vec<String>,
 }
 
 impl HubRelayGate {
     /// A new stream opened (its opener): the first generation beat of every
     /// stream is marked, so a turn shorter than the interval still gives a
-    /// peer a beat to read GEN from. At most one more record per turn.
+    /// peer a beat to read GEN from, and so are its first beat past the
+    /// stream-open chunk and the first beat of each tool call it writes.
     pub fn reset(&mut self) {
-        self.last_ms = None;
+        *self = Self::default();
     }
 
     /// Mark `p` to ride the hub when it is a generation beat and one is due.
@@ -98,11 +129,25 @@ impl HubRelayGate {
             return;
         }
         let Some(at) = p.sampled_at_ms else { return };
-        let due = self.last_ms.is_none_or(|last| at < last || at - last >= HUB_GENERATION_BEAT_INTERVAL_MS);
-        if due {
+        let past_chunk = p.generated_chars.is_some_and(|c| c > STREAM_OPEN_MAX_CHARS);
+        let new_tool = self.new_tool_of(p);
+        let interval_due = self.last_ms.is_none_or(|last| at < last || at - last >= HUB_GENERATION_BEAT_INTERVAL_MS);
+        let first_output = past_chunk && !self.output_relayed;
+        if interval_due || first_output || new_tool.is_some() {
             self.last_ms = Some(at);
+            self.output_relayed |= past_chunk;
+            self.tools_relayed.extend(new_tool);
             p.hub_relay = Some(true);
         }
+    }
+
+    /// The tool `p` is writing, when it is a call this stream has not relayed
+    /// yet: a named writing beat whose name is no prefix of, nor prefixed by,
+    /// a name already relayed.
+    fn new_tool_of(&self, p: &DispatchHeartbeatPayload) -> Option<String> {
+        let name = p.tool_name.as_deref().filter(|n| !n.is_empty() && p.phase == Some(StreamPhase::WritingToolCall))?;
+        let seen = self.tools_relayed.iter().any(|t| t.starts_with(name) || name.starts_with(t.as_str()));
+        (!seen).then(|| name.to_owned())
     }
 }
 
@@ -230,8 +275,9 @@ mod tests {
 
     /// (#3210, live check) The sparse generation beats: on the beat's own
     /// clock, a 2 s stream of generation beats sends one every 20 s,
-    /// starting with the first; prompt-phase beats neither consume nor wait
-    /// on the gate.
+    /// starting with the first (the stream-open chunk) and the first past it
+    /// (matrix review), the cadence counted from that; prompt-phase beats
+    /// neither consume nor wait on the gate.
     #[test]
     fn the_gate_marks_one_generation_beat_per_interval() {
         let mut gate = HubRelayGate::default();
@@ -248,7 +294,7 @@ mod tests {
             }
             assert!(beat.hub_relay != Some(false), "never written false");
         }
-        assert_eq!(relayed, [0, 20_000, 40_000, 60_000]);
+        assert_eq!(relayed, [0, 2_000, 22_000, 42_000, 62_000]);
         let mut late_report = typed(progress_before_generation());
         gate.mark(&mut late_report);
         assert_eq!(late_report.hub_relay, None, "a prompt-phase beat never consumes the gate");
@@ -269,6 +315,129 @@ mod tests {
         let mut again = gen(8_000, 2);
         gate.mark(&mut again);
         assert_eq!(again.hub_relay, None, "inside the interval within one stream");
+    }
+
+    /// A generation beat at `at` with `chars` generated, writing `tool` when named.
+    fn beat_at(at: u64, part: u64, chars: u64, tool: Option<&str>) -> DispatchHeartbeatPayload {
+        let mut v = json!({"turn_seq": 10, "partial_index": part, "cumulative_chars": 0, "sampled_at_ms": at, "generated_chars": chars});
+        if let Some(t) = tool {
+            v["phase"] = json!("writing_tool_call");
+            v["tool_name"] = json!(t);
+        }
+        typed(v)
+    }
+
+    fn marked_of(gate: &mut HubRelayGate, beats: Vec<DispatchHeartbeatPayload>) -> Vec<u64> {
+        let mut out = Vec::new();
+        for mut b in beats {
+            gate.mark(&mut b);
+            if b.hub_relay == Some(true) {
+                out.push(b.sampled_at_ms.unwrap());
+            }
+        }
+        out
+    }
+
+    /// (Matrix review) A short turn relayed only its stream-open chunk (2-4
+    /// chars), which a peer cannot pair into a rate (the viewer's
+    /// `openerPairTrusted`). The first beat past that chunk rides too, so the
+    /// pair stream-open -> first real output is an ordinary pair. Real
+    /// shape: PG2's turn 10 (2026-10-18, 11.8 s of visible text).
+    #[test]
+    fn the_first_beat_past_the_stream_open_chunk_rides_too() {
+        let mut gate = HubRelayGate::default();
+        gate.reset();
+        let turn10 = vec![
+            beat_at(1_792_325_921_976, 1, 3, None),
+            beat_at(1_792_325_923_953, 153, 573, None),
+            beat_at(1_792_325_925_983, 321, 1_263, None),
+            beat_at(1_792_325_928_013, 450, 1_800, None),
+            beat_at(1_792_325_930_072, 561, 2_321, None),
+            beat_at(1_792_325_932_072, 689, 2_831, None),
+        ];
+        assert_eq!(marked_of(&mut gate, turn10), [1_792_325_921_976, 1_792_325_923_953], "the chunk, then the first real output");
+        // A stream whose first beat already is real output marks one, as before.
+        gate.reset();
+        let big_first = vec![beat_at(1_000, 1, 40, None), beat_at(3_000, 2, 400, None)];
+        assert_eq!(marked_of(&mut gate, big_first), [1_000]);
+        // Exactly the chunk bound is still only a chunk; one past it is output.
+        gate.reset();
+        let edge = vec![beat_at(1_000, 1, 3, None), beat_at(2_000, 2, STREAM_OPEN_MAX_CHARS, None), beat_at(3_000, 3, STREAM_OPEN_MAX_CHARS + 1, None), beat_at(5_000, 4, 90, None)];
+        assert_eq!(marked_of(&mut gate, edge), [1_000, 3_000]);
+    }
+
+    /// (Matrix review) Writing a tool call is a state a peer otherwise never
+    /// sees inside 20 s: the gate marks the beat that enters a writing
+    /// stretch, so a peer card shows tool gen; (#3298 review) never the one
+    /// that leaves it (the call's `dispatch.tool` ends tool gen on the hub).
+    /// Real shape: PG2's turn 8 (an `edit` written for 15 s).
+    #[test]
+    fn entering_a_tool_call_rides_and_leaving_it_does_not() {
+        let mut gate = HubRelayGate::default();
+        gate.reset();
+        let mut turn8 = vec![beat_at(1_792_325_898_984, 1, 3, None), beat_at(1_792_325_900_856, 163, 656, None)];
+        for at in [903_460u64, 905_469, 907_476, 909_483, 911_493, 914_501, 916_510] {
+            turn8.push(beat_at(1_792_325_000_000 + at, 293, 1_238, Some("edit")));
+        }
+        turn8.push(beat_at(1_792_325_918_070, 294, 5_236, None));
+        assert_eq!(
+            marked_of(&mut gate, turn8),
+            [1_792_325_898_984, 1_792_325_900_856, 1_792_325_903_460],
+            "the chunk, the first output and the call's first writing beat"
+        );
+        // A second call, named differently, is a new call too.
+        gate.reset();
+        let two = vec![beat_at(1_000, 1, 40, Some("read")), beat_at(3_000, 1, 40, Some("read")), beat_at(5_000, 2, 90, Some("edit"))];
+        assert_eq!(marked_of(&mut gate, two), [1_000, 5_000]);
+    }
+
+    /// (#3298 review) The shared cases (`tests/hub_relay/cases.json`, also
+    /// read by the viewer's mirror in `ui/src/lib/tokenRate.test.ts`): every
+    /// beat routes as written, through the real gate, with a reset at each
+    /// opener as the writers do on a stream's start.
+    #[test]
+    fn the_shared_cases_route_as_written() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!("../../../tests/hub_relay/cases.json")).expect("the cases parse");
+        assert_eq!(doc["stream_open_max_chars"], STREAM_OPEN_MAX_CHARS);
+        assert_eq!(doc["interval_ms"], HUB_GENERATION_BEAT_INTERVAL_MS);
+        let cases = doc["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 8, "the corpus lost cases");
+        let mut wrong = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let mut gate = HubRelayGate::default();
+            let got: Vec<&str> = case["beats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    let mut p = typed(v.clone());
+                    if p.prompt_chars.is_some() {
+                        gate.reset();
+                    }
+                    gate.mark(&mut p);
+                    match (is_prompt_phase_heartbeat(&p), p.hub_relay == Some(true)) {
+                        (true, _) => "prompt",
+                        (false, true) => "relay",
+                        (false, false) => "local",
+                    }
+                })
+                .collect();
+            let want: Vec<&str> = case["expect"].as_array().unwrap().iter().map(|e| e.as_str().unwrap()).collect();
+            if got != want {
+                wrong.push(format!("{name}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The viewer's mirror of [`STREAM_OPEN_MAX_CHARS`] (`openerPairTrusted`'s
+    /// bound) must say the same number.
+    #[test]
+    fn the_viewer_mirrors_the_stream_open_chunk() {
+        let ts = include_str!("../../../ui/src/lib/tokenRate.ts");
+        let want = format!("const STREAM_OPEN_MAX_CHARS = {STREAM_OPEN_MAX_CHARS};");
+        assert!(ts.contains(&want), "ui/src/lib/tokenRate.ts must declare `{want}`");
     }
 
     /// The viewer's mirror of [`HUB_GENERATION_BEAT_INTERVAL_MS`] (its stall

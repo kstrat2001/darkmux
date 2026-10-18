@@ -6,7 +6,8 @@ import { describe, expect, test, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
 import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, MAX_TRANSIENT_FRAMES_PER_SESSION, MAX_TRANSIENT_TRAIN, TRANSIENT_FRAME_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
-import { deriveLiveState, currentTokenRate, heartbeatSamples } from "./tokenRate";
+import { aggregateLiveState, deriveLiveState, currentTokenRate, executionTokenReading, heartbeatSamples, prefillStallAfterMs } from "./tokenRate";
+import { DEFAULT_POLICY } from "./lifecycle";
 import { UTILITY_JOB, utilityReading, utilityStrip } from "./utilityJobs";
 import { ACTION, type NormRecord } from "./ingest";
 import { norm, normAll } from "../testing/records";
@@ -368,6 +369,51 @@ describe("(#2928 re-review, MF-A) a host refresh never enters rate math, only fr
     expect(heartbeatSamples(merged)[0]?.freshMs).toBe(T0 + 40_000);
     const s = deriveLiveState(merged, T0 + 40_100);
     expect(s.state).toBe("prompt");
+  });
+});
+
+describe("(matrix review) a wedged prefill reads STALL at its bound, however the host refreshes it", () => {
+  // LM Studio reports no prefill progress: the opener (20,000 chars, a
+  // 130 s bound) is the only fact, and the host repeats it every 250 ms on
+  // the live wire while the engine reads, or hangs.
+  const PROMPT_CHARS = 20_000;
+  const EXEC = "exec-wedged-0";
+  const wire = (at: number) =>
+    JSON.stringify({ v: 1, kind: "model", session_id: SID, execution_id: EXEC, role: "coder", model: "work-35b", at_ms: at, cadence_ms: 250, fields: { turn_seq: 2, sampled_at_ms: T0, generated_chars: 0, cumulative_chars: 0, prompt_chars: PROMPT_CHARS, ...(at > T0 ? { refreshed_at_ms: at } : {}) } });
+  const durable = (): NormRecord[] => [
+    norm({ ts: new Date(T0 - 60_000).toISOString(), action: "dispatch.start", session_id: SID, execution_id: EXEC, machine_uid: M, handle: "coder" }),
+    norm({ ts: new Date(Math.floor(T0 / 1000) * 1000).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, execution_id: EXEC, machine_uid: M, handle: "coder", payload: { turn_seq: 2, sampled_at_ms: T0, generated_chars: 0, cumulative_chars: 0, prompt_chars: PROMPT_CHARS } }),
+  ];
+  const refreshedTo = (now: number): NormRecord[] => {
+    const store = new LiveStore();
+    for (let at = T0; at <= now; at += 250) store.ingest(wire(at), at);
+    return mergeLive(durable(), store.snapshot().bySession.get(SID));
+  };
+  const bound = prefillStallAfterMs(PROMPT_CHARS);
+
+  test("the bound for this size is 130 s", () => {
+    expect(bound).toBe(130_000);
+  });
+
+  test("PROMPT inside the bound, STALL past it, with the refreshes still arriving", () => {
+    expect(deriveLiveState(refreshedTo(T0 + bound), T0 + bound)).toEqual({ state: "prompt", promptChars: PROMPT_CHARS });
+    expect(deriveLiveState(refreshedTo(T0 + bound + 250), T0 + bound + 250)).toEqual({ state: "stalled" });
+  });
+
+  test("the fleet card and the run page read it through the one aggregate, and the card's execution reading", () => {
+    const at = T0 + bound + 250;
+    expect(aggregateLiveState([refreshedTo(at)], at, DEFAULT_POLICY)).toMatchObject({ state: "stalled" });
+    expect(executionTokenReading(refreshedTo(at), at).state).toBe("stalled");
+  });
+
+  test("a refresh is still liveness for a writing stretch: TOOLS, never STALL, as before", () => {
+    const store = new LiveStore();
+    store.ingest(wireModel(T0 + 1_000, 400, 400, 2), T0 + 1_000);
+    const writing = (at: number) =>
+      JSON.stringify({ v: 1, kind: "model", session_id: SID, at_ms: at, cadence_ms: 250, fields: { turn_seq: 2, sampled_at_ms: T0 + 2_000, generated_chars: 600, cumulative_chars: 400, phase: "writing_tool_call", tool_name: "edit", ...(at > T0 + 2_000 ? { refreshed_at_ms: at } : {}) } });
+    for (let at = T0 + 2_000; at <= T0 + 42_000; at += 250) store.ingest(writing(at), at);
+    const merged = mergeLive([start()], store.snapshot().bySession.get(SID));
+    expect(deriveLiveState(merged, T0 + 42_100)).toMatchObject({ state: "tools", writing: true });
   });
 });
 

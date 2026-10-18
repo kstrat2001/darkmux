@@ -390,3 +390,34 @@ fn the_direct_path_marks_one_generation_beat_per_interval() {
     assert_eq!(marked, [Some(1)], "only the first generation beat inside 20 s");
     assert_eq!(beats.iter().filter(|b| darkmux_flow::heartbeat_rides_hub(b)).count(), 3);
 }
+
+/// (Matrix review) The direct path relays a stream's first beat past the
+/// stream-open chunk as well as the chunk itself: a peer then has a pair to
+/// read a rate from on a turn shorter than 20 s.
+#[test]
+fn the_direct_path_relays_the_first_output_past_the_stream_open_chunk() {
+    use std::cell::RefCell;
+    let emitted = RefCell::new(Vec::new());
+    let mut ev = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::ZERO, |p| emitted.borrow_mut().push(p));
+    let _ = ev.send(
+        serde_json::json!({ "model": "m" }),
+        |_, progress| {
+            let on = progress.expect("a streamed call");
+            on(&SseProgress { chunks: 1, generated_chars: 3, ..SseProgress::default() });
+            for n in 2..=6u64 {
+                on(&SseProgress { chunks: n, generated_chars: n * 40, content_chars: n * 30, ..SseProgress::default() });
+            }
+            Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }))
+        },
+        |_| false,
+    );
+    let marked: Vec<Option<u64>> = emitted
+        .borrow()
+        .iter()
+        .filter_map(|p| match p {
+            darkmux_flow::Payload::DispatchTurnHeartbeat(b) if b.hub_relay == Some(true) => Some(b.partial_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marked, [Some(1), Some(2)], "the 3-char chunk and the first beat past it, nothing more inside 20 s");
+}

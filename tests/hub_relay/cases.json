@@ -1,0 +1,972 @@
+{
+ "_doc": "Which heartbeats ride the fleet hub, beat by beat, in writer order: `prompt` (a prompt-phase beat), `relay` (a generation beat the writer's HubRelayGate marks hub_relay) or `local`. A beat carrying prompt_chars opens a new stream (the writers reset the gate there). Asserted against the real gate by crates/darkmux-flow/src/hub_route.rs (`the_shared_cases_route_as_written`) and against the viewer's mirror by ui/src/lib/tokenRate.test.ts.",
+ "stream_open_max_chars": 16,
+ "interval_ms": 20000,
+ "cases": [
+  {
+   "name": "PG2 (2026-10-18, run 1792325841): every heartbeat of its 10 streams",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325842061,
+     "generated_chars": 0,
+     "prompt_chars": 16555
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325843680,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 127,
+     "cumulative_chars": 3,
+     "sampled_at_ms": 1792325845866,
+     "generated_chars": 680
+    },
+    {
+     "turn_seq": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325847405,
+     "generated_chars": 0,
+     "prompt_chars": 36030
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325849127,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 189,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325851101,
+     "generated_chars": 778
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 380,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325853130,
+     "generated_chars": 1562
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 572,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325855167,
+     "generated_chars": 2334
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 767,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325857191,
+     "generated_chars": 3142
+    },
+    {
+     "turn_seq": 2,
+     "partial_index": 943,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325859204,
+     "generated_chars": 3873
+    },
+    {
+     "turn_seq": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325861068,
+     "generated_chars": 0,
+     "prompt_chars": 36558
+    },
+    {
+     "turn_seq": 3,
+     "partial_index": 1,
+     "cumulative_chars": 2,
+     "sampled_at_ms": 1792325861417,
+     "generated_chars": 2
+    },
+    {
+     "turn_seq": 4,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325862197,
+     "generated_chars": 0,
+     "prompt_chars": 36848
+    },
+    {
+     "turn_seq": 4,
+     "partial_index": 1,
+     "cumulative_chars": 2,
+     "sampled_at_ms": 1792325862464,
+     "generated_chars": 2
+    },
+    {
+     "turn_seq": 4,
+     "partial_index": 168,
+     "cumulative_chars": 696,
+     "sampled_at_ms": 1792325864334,
+     "generated_chars": 696
+    },
+    {
+     "turn_seq": 4,
+     "partial_index": 338,
+     "cumulative_chars": 1407,
+     "sampled_at_ms": 1792325866346,
+     "generated_chars": 1407
+    },
+    {
+     "turn_seq": 4,
+     "partial_index": 371,
+     "cumulative_chars": 1568,
+     "sampled_at_ms": 1792325868768,
+     "generated_chars": 2188
+    },
+    {
+     "turn_seq": 5,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325868781,
+     "generated_chars": 0,
+     "prompt_chars": 41798
+    },
+    {
+     "turn_seq": 5,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325869281,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 5,
+     "partial_index": 24,
+     "cumulative_chars": 2,
+     "sampled_at_ms": 1792325871489,
+     "generated_chars": 690
+    },
+    {
+     "turn_seq": 6,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325871505,
+     "generated_chars": 0,
+     "prompt_chars": 42481
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325871755,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 178,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325873725,
+     "generated_chars": 767
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325875945,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325877951,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325879958,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325881964,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325883971,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325885978,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325887982,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 284,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325889986,
+     "generated_chars": 1199,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 6,
+     "partial_index": 285,
+     "cumulative_chars": 53,
+     "sampled_at_ms": 1792325890917,
+     "generated_chars": 5989
+    },
+    {
+     "turn_seq": 7,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325890935,
+     "generated_chars": 0,
+     "prompt_chars": 48001
+    },
+    {
+     "turn_seq": 7,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325896803,
+     "generated_chars": 2
+    },
+    {
+     "turn_seq": 8,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325897697,
+     "generated_chars": 0,
+     "prompt_chars": 57235
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325898984,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 163,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325900856,
+     "generated_chars": 656
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325903460,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325905469,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325907476,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325909483,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325911493,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325914501,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 293,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325916510,
+     "generated_chars": 1238,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 8,
+     "partial_index": 294,
+     "cumulative_chars": 262,
+     "sampled_at_ms": 1792325918070,
+     "generated_chars": 5236
+    },
+    {
+     "turn_seq": 9,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325918086,
+     "generated_chars": 0,
+     "prompt_chars": 61581
+    },
+    {
+     "turn_seq": 9,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325918936,
+     "generated_chars": 4
+    },
+    {
+     "turn_seq": 10,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325920970,
+     "generated_chars": 0,
+     "prompt_chars": 67438
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325921976,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 153,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1792325923953,
+     "generated_chars": 573
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 321,
+     "cumulative_chars": 652,
+     "sampled_at_ms": 1792325925983,
+     "generated_chars": 1263
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 450,
+     "cumulative_chars": 1189,
+     "sampled_at_ms": 1792325928013,
+     "generated_chars": 1800
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 561,
+     "cumulative_chars": 1710,
+     "sampled_at_ms": 1792325930072,
+     "generated_chars": 2321
+    },
+    {
+     "turn_seq": 10,
+     "partial_index": 689,
+     "cumulative_chars": 2220,
+     "sampled_at_ms": 1792325932072,
+     "generated_chars": 2831
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "local",
+    "local",
+    "prompt",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "prompt",
+    "relay",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "prompt",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "prompt",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "local",
+    "local"
+   ]
+  },
+  {
+   "name": "a clock that steps back marks at once",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 10000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 12000,
+     "generated_chars": 80
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 5000,
+     "generated_chars": 120
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 4,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 7000,
+     "generated_chars": 160
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "local",
+    "relay",
+    "local"
+   ]
+  },
+  {
+   "name": "a beat that does not say how much was generated: never output, never prompt-phase",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 10000,
+     "generated_chars": null
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 12000,
+     "generated_chars": null
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 14000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 4,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 16000,
+     "generated_chars": null
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "local",
+    "relay",
+    "local"
+   ]
+  },
+  {
+   "name": "a phase this build does not name is not a tool call",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 10000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 12000,
+     "generated_chars": 80,
+     "phase": "future_phase",
+     "tool_name": "x"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 14000,
+     "generated_chars": 90
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "local",
+    "local"
+   ]
+  },
+  {
+   "name": "the prompt-phase predicate: the opener and a report before any chunk ride as prompt; a report that read a chunk, or with no total, does not",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 2000,
+     "generated_chars": 0,
+     "prompt_processed": 512,
+     "prompt_total": 2516
+    },
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 3000,
+     "generated_chars": 0,
+     "prompt_processed": 1024
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 4000,
+     "generated_chars": 0,
+     "prompt_processed": 2516,
+     "prompt_total": 2516
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 6000,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 8000,
+     "generated_chars": 40
+    }
+   ],
+   "expect": [
+    "prompt",
+    "prompt",
+    "relay",
+    "local",
+    "local",
+    "relay"
+   ]
+  },
+  {
+   "name": "a stream alternating writing ticks and owed chunks relays its tool call once (#3298 review)",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 2000,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 4000,
+     "generated_chars": 300
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 5000,
+     "generated_chars": 400,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 4,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 6000,
+     "generated_chars": 401
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 5,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 7000,
+     "generated_chars": 402,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 6,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 8000,
+     "generated_chars": 403
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 7,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 9000,
+     "generated_chars": 404,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 8,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 10000,
+     "generated_chars": 405
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 9,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 11000,
+     "generated_chars": 406,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 10,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 12000,
+     "generated_chars": 407
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 11,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 13000,
+     "generated_chars": 408,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 12,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 14000,
+     "generated_chars": 409
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 13,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 15000,
+     "generated_chars": 410,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 14,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 16000,
+     "generated_chars": 411
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 15,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 17000,
+     "generated_chars": 412,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 16,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 18000,
+     "generated_chars": 413
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local",
+    "local"
+   ]
+  },
+  {
+   "name": "a tool name streamed in pieces counts once; a second, different call counts again",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 2000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 3000,
+     "generated_chars": 60,
+     "phase": "writing_tool_call",
+     "tool_name": "ed"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 4000,
+     "generated_chars": 60,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 5000,
+     "generated_chars": 70
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 4,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 7000,
+     "generated_chars": 90,
+     "phase": "writing_tool_call",
+     "tool_name": "read"
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 5,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 9000,
+     "generated_chars": 95,
+     "phase": "writing_tool_call",
+     "tool_name": "edit"
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "relay",
+    "local",
+    "local",
+    "relay",
+    "local"
+   ]
+  },
+  {
+   "name": "a new stream forgets the previous stream's marks",
+   "beats": [
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 1000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 2000,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 3000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 4000,
+     "generated_chars": 50,
+     "phase": "writing_tool_call",
+     "tool_name": "bash"
+    },
+    {
+     "turn_seq": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 5000,
+     "generated_chars": 0,
+     "prompt_chars": 9000
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 1,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 6000,
+     "generated_chars": 3
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 2,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 7000,
+     "generated_chars": 40
+    },
+    {
+     "turn_seq": 1,
+     "partial_index": 3,
+     "cumulative_chars": 0,
+     "sampled_at_ms": 8000,
+     "generated_chars": 50,
+     "phase": "writing_tool_call",
+     "tool_name": "bash"
+    }
+   ],
+   "expect": [
+    "prompt",
+    "relay",
+    "relay",
+    "relay",
+    "prompt",
+    "relay",
+    "relay",
+    "relay"
+   ]
+  }
+ ]
+}
