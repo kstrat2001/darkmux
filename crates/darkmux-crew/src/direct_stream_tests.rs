@@ -335,3 +335,58 @@ fn a_heartbeat_carries_the_prefill_progress_fact() {
 fn a_stream_with_prefill_progress_reassembles_to_the_same_reply() {
     assert_eq!(ok(&format!("{MLX_PREFILL}{SSE}")), ok(SSE));
 }
+
+/// (#3210, PR #3293 review) A tool-call-first reply on mlx: the deltas carry
+/// only tool-call arguments, which `delta_chars` does not count, so every
+/// beat after the prefill says `generated_chars: 0` and carries the turn's
+/// count. None of them is a prompt-phase heartbeat: a beat that read a chunk
+/// never rides the hub. The beat before any chunk, and the opener, still do.
+#[test]
+fn a_tool_call_first_reply_sends_no_prompt_phase_beat_after_the_prefill() {
+    let mut tail = SseTail::new(Shape::Chat);
+    tail.feed(MLX_PREFILL.as_bytes());
+    assert!(darkmux_flow::is_prompt_phase_heartbeat(&chunk_beat(&tail.progress)), "the prefill report travels");
+    assert!(darkmux_flow::is_prompt_phase_heartbeat(&opener(9000)), "the opener travels");
+    let tool_args = "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n";
+    tail.feed(tool_args.as_bytes());
+    let beat = chunk_beat(&tail.progress);
+    assert_eq!((beat.generated_chars, beat.prompt_processed, beat.partial_index), (Some(0), Some(1024), Some(2)), "{beat:?}");
+    assert!(!darkmux_flow::is_prompt_phase_heartbeat(&beat), "a beat that read a chunk stays local: {beat:?}");
+}
+
+/// (#3210, PR #3293 live check) The direct path marks a generation beat for
+/// the hub at most once per 20 s: a burst of chunk beats (the 2 s gate set
+/// to zero, all inside one second) marks only the first. The prefill beat
+/// before it travels as a prompt-phase beat and is not marked.
+#[test]
+fn the_direct_path_marks_one_generation_beat_per_interval() {
+    use std::cell::RefCell;
+    let emitted = RefCell::new(Vec::new());
+    let mut ev = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::ZERO, |p| emitted.borrow_mut().push(p));
+    let prompt = Some(darkmux_trajectory::PromptProgressSample { processed: 2516, total: 2516 });
+    let _ = ev.send(
+        serde_json::json!({ "model": "m" }),
+        |_, progress| {
+            let on = progress.expect("a streamed call");
+            on(&SseProgress { prompt, ..SseProgress::default() });
+            for n in 1..=10u64 {
+                on(&SseProgress { prompt, chunks: n, generated_chars: n * 40, content_chars: n * 30, ..SseProgress::default() });
+            }
+            Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }))
+        },
+        |_| false,
+    );
+    let beats: Vec<darkmux_flow::payload::DispatchHeartbeatPayload> = emitted
+        .borrow()
+        .iter()
+        .filter_map(|p| match p {
+            darkmux_flow::Payload::DispatchTurnHeartbeat(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(beats.len(), 12, "the opener, the prefill beat and ten chunk beats");
+    let marked: Vec<Option<u64>> = beats.iter().filter(|b| b.hub_relay == Some(true)).map(|b| b.partial_index).collect();
+    assert_eq!(marked, [Some(1)], "only the first generation beat inside 20 s");
+    assert_eq!(beats.iter().filter(|b| darkmux_flow::heartbeat_rides_hub(b)).count(), 3);
+}

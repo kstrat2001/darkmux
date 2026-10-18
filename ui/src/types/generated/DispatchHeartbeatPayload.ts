@@ -51,6 +51,15 @@ prompt_processed?: number,
  */
 prompt_total?: number, 
 /**
+ * (#3210, flow 2.3.0) `true` on the sparse generation beats the writer
+ * picked to ride the fleet hub (at most one per execution every
+ * `HUB_GENERATION_BEAT_INTERVAL_MS`), so another machine's card keeps a
+ * rate and never reads STALL while this one generates. Absent otherwise:
+ * a beat without it stays on this machine unless it is a prompt-phase
+ * beat (`darkmux_flow::is_prompt_phase_heartbeat`).
+ */
+hub_relay?: boolean, 
+/**
  * The graph step the record belongs to, when its session is a step's.
  */
 step_id?: string, 

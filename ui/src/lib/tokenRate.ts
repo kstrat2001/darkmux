@@ -67,6 +67,11 @@ export interface HeartbeatSample {
    *  few ms after the previous one, which read as 20,062 tok/s. Absent for a
    *  durable heartbeat, which the host already spaces at least 2 s apart. */
   minSpanMs?: number;
+  /** (#3210) A beat its writer sent over the fleet hub (`hub_relay`): on a
+   *  peer's card the next one can be the relay interval plus the writer's
+   *  own longest silence away, so its stall bound is longer
+   *  (`stallAfterMsOf`). */
+  relayed?: true;
 }
 
 /** (#2889) The `phase` value a heartbeat carries while the model writes a
@@ -106,10 +111,8 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     const visible = num(f.cumulative_chars);
     if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
-    const promptChars = num(f.prompt_chars);
-    if (promptChars !== null) sample.promptChars = promptChars;
-    const prompt = promptProgressOf(f);
-    if (prompt !== null) sample.prompt = prompt;
+    withPromptFacts(sample, f);
+    if (f.hub_relay === true) sample.relayed = true;
     out.push(sample);
   }
   out.sort((a, b) => a.atMs - b.atMs);
@@ -124,6 +127,15 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     }
   }
   return out;
+}
+
+/** The prompt's facts a heartbeat carries, onto its sample: the request's
+ *  size (the opener, #2889) and the engine's prefill progress (#3210). */
+function withPromptFacts(sample: HeartbeatSample, f: LiveHeartbeat): void {
+  const promptChars = num(f.prompt_chars);
+  if (promptChars !== null) sample.promptChars = promptChars;
+  const prompt = promptProgressOf(f);
+  if (prompt !== null) sample.prompt = prompt;
 }
 
 /** (#2928) When a sample's state was last known to hold. */
@@ -485,6 +497,22 @@ function carriedTokenRate(records: NormRecord[], samples: HeartbeatSample[]): To
  * this threshold only governs genuine silence. */
 export const STALL_AFTER_MS = 30_000;
 
+/** (#3210) The writer's interval between the generation beats that ride the
+ *  fleet hub (`hub_relay`): `HUB_GENERATION_BEAT_INTERVAL_MS` in
+ *  `crates/darkmux-flow/src/hub_route.rs`, mirrored here and pinned by a
+ *  drift test on that side. */
+export const HUB_RELAY_INTERVAL_MS = 20_000;
+
+/** (#3210, PR #3293 re-review) The silence a sample allows before STALL. A
+ *  hub-relayed beat (a peer's, as this viewer receives it) allows
+ *  `STALL_AFTER_MS` plus the relay interval: the writer marks the first beat
+ *  at least the interval after its last mark, so a local silence adds to the
+ *  hub's gap (measured: marks 43 s apart after a 25 s local silence). A
+ *  local card's latest beat is normally an unmarked 2 s one. */
+function stallAfterMsOf(s: HeartbeatSample): number {
+  return s.relayed ? STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS : STALL_AFTER_MS;
+}
+
 /** Whether an execution's heartbeat stream has gone quiet — no sample
  * within `STALL_AFTER_MS` of `nowMs`. `false` (not stalled) when there are
  * no heartbeats at all yet: "hasn't started producing" is a different
@@ -492,7 +520,8 @@ export const STALL_AFTER_MS = 30_000;
 export function isStalled(records: NormRecord[], nowMs: number): boolean {
   const samples = heartbeatSamples(records);
   if (samples.length === 0) return false;
-  return nowMs - freshOf(samples[samples.length - 1]) > STALL_AFTER_MS;
+  const last = samples[samples.length - 1];
+  return nowMs - freshOf(last) > stallAfterMsOf(last);
 }
 
 /** (#3145) A prefill's allowance that does not grow with the prompt: the

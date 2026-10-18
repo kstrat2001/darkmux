@@ -330,6 +330,7 @@ pub(crate) fn opener(prompt_chars: u64) -> DispatchHeartbeatPayload {
         tool_name: None,
         prompt_processed: None,
         prompt_total: None,
+        hub_relay: None,
         step_id: None,
         context: None,
     }
@@ -385,6 +386,8 @@ pub(crate) fn turn(reply: &Value, counts: &darkmux_trajectory::UsageCounts, gene
 pub(crate) struct TurnEvidence<F: Fn(darkmux_flow::Payload)> {
     emit: F,
     gate: HeartbeatGate,
+    /// (#3210) Which generation beats also ride the fleet hub.
+    relay: darkmux_flow::HubRelayGate,
     shape: Shape,
     pub streams: bool,
     /// When the attempt that streamed was sent (its model time's start).
@@ -397,6 +400,7 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
         TurnEvidence {
             emit,
             gate: HeartbeatGate::new(interval),
+            relay: darkmux_flow::HubRelayGate::default(),
             shape: Shape::of(dialect),
             streams: true,
             started: None,
@@ -432,11 +436,14 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
     /// Run `call` with the progress callback: heartbeats through the gate,
     /// and the streaming attempt's start noted for the model time.
     fn with_progress<R>(&mut self, call: impl FnOnce(&mut dyn FnMut(&SseProgress)) -> R) -> R {
-        let (gate, emit, started) = (&mut self.gate, &self.emit, &mut self.started);
+        let (gate, relay, emit, started) = (&mut self.gate, &mut self.relay, &self.emit, &mut self.started);
         let mut on = |p: &SseProgress| {
             *started = p.started.or(*started);
             if gate.due(std::time::Instant::now()) {
-                emit(darkmux_flow::Payload::DispatchTurnHeartbeat(chunk_beat(p)));
+                // (#3210) One generation beat per 20 s also rides the hub.
+                let mut beat = chunk_beat(p);
+                relay.mark(&mut beat);
+                emit(darkmux_flow::Payload::DispatchTurnHeartbeat(beat));
             }
         };
         call(&mut on)

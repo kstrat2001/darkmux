@@ -35,6 +35,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.3.0";
 //           Written only when the engine reported progress; absence means
 //           "this engine reported none" (or a darkmux before 2.3.0), never
 //           "nothing was processed".
+//           Also additive (#3210, PR #3293): `payload.hub_relay` on
+//           `dispatch.turn.heartbeat`, `true` on the generation beats the
+//           writer picked to ride the fleet hub (one per execution every
+//           20 s); absent otherwise, never written `false`.
 //   2.2.0 (#3124): `mission.start` gains `payload.config_id`, the config the
 //           run was launched from (`MissionSpec::config_id`): `dispatch` for
 //           a bare `darkmux dispatch`, the config's own id for a `mission
