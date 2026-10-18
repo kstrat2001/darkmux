@@ -540,7 +540,7 @@ fn backfill_skips_heartbeats_and_still_sends_the_rest() {
 /// generated. A report after generation started, a plain beat, and a lab
 /// run's opener stay in the day file.
 #[test]
-fn backfill_resends_prompt_phase_heartbeats_only() {
+fn backfill_resends_prompt_phase_and_relayed_heartbeats_only() {
     use darkmux_types::session_id::{RunId, SessionId};
     let dir = TempDir::new().unwrap();
     let now = current_epoch_secs();

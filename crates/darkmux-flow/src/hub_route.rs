@@ -50,11 +50,17 @@ pub fn is_prompt_phase_heartbeat(p: &DispatchHeartbeatPayload) -> bool {
 }
 
 /// (#3210) The most often a generation heartbeat of one execution rides the
-/// hub: 20 s. Under the viewer's `STALL_AFTER_MS` (30 s, `ui/src/lib/
-/// tokenRate.ts`) with room for the 2 s durable cadence, so a peer's card
-/// that is generating always has a beat inside its stall bound and keeps a
-/// rate (two beats 20 s apart pair like any other). About 3 records a minute
-/// per generating execution against the 30 a minute the local file keeps.
+/// hub: 20 s. The gate marks the first beat at least this long after its
+/// last mark, so the hub's gap is this plus the writer's own longest silence
+/// between durable beats (the PR #3293 re-review measured 43 s after a 25 s
+/// local silence). The viewer therefore allows a relayed beat
+/// `STALL_AFTER_MS` (30 s) plus this interval before STALL (`ui/src/lib/
+/// tokenRate.ts`, `HUB_RELAY_INTERVAL_MS`, mirrored and pinned by
+/// `the_viewer_mirrors_the_relay_interval`); a peer that falls silent longer
+/// than that reads STALL as a local card would. Two relayed beats pair into
+/// a rate like any other. Clock skew between machines eats into that
+/// margin. About 3 records a minute per generating execution against the 30
+/// a minute the local file keeps.
 /// Without these, a peer card went from PROMPT to a false STALL the moment
 /// its prefill ended (live check, PR #3293).
 pub const HUB_GENERATION_BEAT_INTERVAL_MS: u64 = 20_000;
@@ -77,6 +83,13 @@ pub struct HubRelayGate {
 }
 
 impl HubRelayGate {
+    /// A new stream opened (its opener): the first generation beat of every
+    /// stream is marked, so a turn shorter than the interval still gives a
+    /// peer a beat to read GEN from. At most one more record per turn.
+    pub fn reset(&mut self) {
+        self.last_ms = None;
+    }
+
     /// Mark `p` to ride the hub when it is a generation beat and one is due.
     /// A beat with no clock of its own (`sampled_at_ms` absent; every writer
     /// sets it) is not marked. A clock that stepped back marks at once.
@@ -228,6 +241,40 @@ mod tests {
         let mut late_report = typed(progress_before_generation());
         gate.mark(&mut late_report);
         assert_eq!(late_report.hub_relay, None, "a prompt-phase beat never consumes the gate");
+    }
+
+    /// (#3210, PR #3293 re-review) A new stream resets the gate: the first
+    /// generation beat after it is marked even inside the interval.
+    #[test]
+    fn a_new_stream_marks_its_first_generation_beat() {
+        let mut gate = HubRelayGate::default();
+        let gen = |at: u64, part: u64| typed(json!({"turn_seq": 2, "partial_index": part, "cumulative_chars": 1, "sampled_at_ms": at, "generated_chars": 40}));
+        let mut first = gen(1_000, 1);
+        gate.mark(&mut first);
+        gate.reset();
+        let mut next_turn = gen(6_000, 1);
+        gate.mark(&mut next_turn);
+        assert_eq!((first.hub_relay, next_turn.hub_relay), (Some(true), Some(true)), "5 s apart, across a new stream");
+        let mut again = gen(8_000, 2);
+        gate.mark(&mut again);
+        assert_eq!(again.hub_relay, None, "inside the interval within one stream");
+    }
+
+    /// The viewer's mirror of [`HUB_GENERATION_BEAT_INTERVAL_MS`] (its stall
+    /// bound for a relayed beat) must say the same number.
+    #[test]
+    fn the_viewer_mirrors_the_relay_interval() {
+        let ts = include_str!("../../../ui/src/lib/tokenRate.ts");
+        let digits = HUB_GENERATION_BEAT_INTERVAL_MS.to_string();
+        let mut grouped = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                grouped.push('_');
+            }
+            grouped.push(c);
+        }
+        let want = format!("export const HUB_RELAY_INTERVAL_MS = {grouped};");
+        assert!(ts.contains(&want), "ui/src/lib/tokenRate.ts must declare `{want}`");
     }
 
     /// (#3210, live check) A marked generation beat rides the work stream; an

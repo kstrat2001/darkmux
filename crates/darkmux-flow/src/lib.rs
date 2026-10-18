@@ -5604,7 +5604,7 @@ mod tests {
     /// written after generation started, a plain beat, and a lab run's
     /// opener stay local.
     #[test]
-    fn redis_sink_publishes_only_prompt_phase_heartbeats() {
+    fn redis_sink_publishes_prompt_phase_and_relayed_heartbeats_only() {
         use darkmux_types::session_id::{RunId, SessionId};
         let log = std::sync::Arc::new(PeerLog::default());
         let port = spawn_recording_redis_peer(log.clone(), None);
@@ -5640,7 +5640,7 @@ mod tests {
             .filter(|h| xadds.iter().flatten().any(|w| w.contains(&format!("\"handle\":\"{h}\""))))
             .collect();
         assert_eq!(sent, ["opener-solo", "early-solo", "relay-solo"], "{xadds:?}");
-        assert!(xadds.iter().all(|x| x[1] == "darkmux:flow"), "prompt-phase beats ride the work stream: {xadds:?}");
+        assert!(xadds.iter().all(|x| x[1] == "darkmux:flow"), "prompt-phase and relayed beats ride the work stream: {xadds:?}");
     }
 
     /// (#3073) Records ride one cached connection instead of a connection and

@@ -20,6 +20,7 @@ import { liveSampleToRecord, type LiveOverlay } from "../../lib/liveChannel";
 import { ingest } from "../../lib/ingest";
 import { NO_PRESENCE } from "../../lib/lifecycle";
 import { readingLabel } from "./readingLabel";
+import { HUB_RELAY_INTERVAL_MS, STALL_AFTER_MS } from "../../lib/tokenRate";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
   return { tracked: true, receive_key: 0, ...overrides };
@@ -1544,5 +1545,50 @@ describe("(#3210) a peer's sparse generation beats, through the hub", () => {
   it("a 60 s gap after the last beat reads STALL", () => {
     const card = buildFleetCard(ingest(body), new Map(), null, new Set([SID]), false, PEER, LAST + 60_000);
     expect(card.executions[0]?.state).toBe("stalled");
+  });
+});
+
+// (#3210, PR #3293 re-review) The hub's gap between a peer's relayed beats can
+// pass 20 s: the writer marks the first beat at least 20 s after the last
+// mark, so a local silence (here 25 s, from 18 s to 43 s) adds to it. The
+// reviewer's probe: marks at 0 and 43 s. A peer card must not read STALL at
+// +31 s, while the peer is still generating; it reads STALL once the last
+// relayed beat is older than STALL_AFTER_MS + the relay interval.
+describe("(#3210) a peer's relayed beats, a local silence between them", () => {
+  const PEER = "uid-studio";
+  const SID = "s-peer";
+  const G0 = Date.parse("2026-10-18T03:00:30.000Z");
+  const at = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const beat = (ms: number, payload: Record<string, unknown>) => ({
+    ts: at(ms),
+    hub_id: `${ms}-0`,
+    action: "dispatch.turn.heartbeat",
+    handle: "coder",
+    session_id: SID,
+    execution_id: "e-peer",
+    machine_id: "studio",
+    machine_uid: PEER,
+    payload: { turn_seq: 1, sampled_at_ms: ms, ...payload },
+  });
+  const body = {
+    records: [
+      { ts: at(G0 - 30_000), hub_id: `${G0 - 30_000}-0`, action: "dispatch.start", handle: "coder", session_id: SID, execution_id: "e-peer", machine_id: "studio", machine_uid: PEER, payload: { prompt_chars: 9_000 } },
+      beat(G0 - 29_000, { cumulative_chars: 0, generated_chars: 0, prompt_chars: 9_000 }),
+      beat(G0 - 10_000, { cumulative_chars: 0, generated_chars: 0, prompt_processed: 2048, prompt_total: 2048 }),
+      beat(G0, { partial_index: 1, cumulative_chars: 30, generated_chars: 40, hub_relay: true }),
+      beat(G0 + 43_000, { partial_index: 22, cumulative_chars: 700, generated_chars: 900, hub_relay: true }),
+    ],
+  };
+  const read = (now: number) => buildFleetCard(ingest(body), new Map(), null, new Set([SID]), false, PEER, now).executions[0]?.state;
+
+  it("reads GEN through the 43 s gap between relayed beats", () => {
+    expect(read(G0 + 31_000)).toBe("generating");
+    expect(read(G0 + 42_000)).toBe("generating");
+  });
+
+  it("reads STALL once the last relayed beat is older than the extended bound", () => {
+    const last = G0 + 43_000;
+    expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS - 1_000)).toBe("generating");
+    expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS + 1_000)).toBe("stalled");
   });
 });

@@ -11902,6 +11902,8 @@ impl TailerState {
         self.chunk_owed = true;
         self.prompt_progress = None;
         self.reply_started = None;
+        // (#3210) Every stream's first generation beat rides the hub.
+        self.hub_relay.reset();
         self.summary.heartbeats += 1;
         let payload = opening_heartbeat_payload(s);
         // (#2928) The opener is a transition: it goes live at once.

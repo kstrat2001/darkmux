@@ -12605,6 +12605,66 @@
         assert_eq!(prompt_phase, 2, "the opener and the report before the first chunk");
     }
 
+    /// Shared set-up for the tailer's hub-relay tests: a tailer over a fresh
+    /// trajectory, and an appender for its lines.
+    fn relay_rig() -> (darkmux_types::test_isolation::IsolatedState, TempDir, TailerState) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let state = TailerState::new(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::new(Mutex::new(Instant::now())),
+            600,
+        );
+        (isolated, tmp, state)
+    }
+
+    fn relay_feed(tmp: &TempDir, state: &mut TailerState, line: &str) {
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(tmp.path().join("trajectory.jsonl")).unwrap(), "{line}").unwrap();
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        state.poll_and_emit();
+    }
+
+    /// (#3210, PR #3293 re-review) Every stream's first generation beat
+    /// rides the hub, even when the previous stream's mark was under 20 s
+    /// ago: a short turn still gives a peer a beat to read GEN from.
+    #[test]
+    #[serial]
+    fn tailer_marks_the_first_generation_beat_of_every_stream() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":1,"ts":1758700000000,"system_chars":10,"prompt_chars":10}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":1,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700001000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":2,"ts":1758700004000,"system_chars":10,"prompt_chars":20}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":2,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700006000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":2,"partial_index":2,"cumulative_chars":9,"generated_chars":9,"ts":1758700008000}"#);
+        let marked: Vec<(u64, u64)> = heartbeats_in(&isolated.path().join("flows"))
+            .iter()
+            .filter(|b| b["payload"]["hub_relay"] == true)
+            .map(|b| (b["payload"]["turn_seq"].as_u64().unwrap(), b["payload"]["partial_index"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(marked, [(1, 1), (2, 1)], "each stream's first generation beat, 5 s apart");
+    }
+
+    /// (#3210, PR #3293 re-review) A new stream on the same turn (a
+    /// continuation) forgets that the previous stream's reply had started:
+    /// its prefill report is a prompt-phase beat again.
+    #[test]
+    #[serial]
+    fn tailer_a_new_stream_on_the_same_turn_reads_its_prefill_again() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":10,"prompt_chars":10}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700001000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":3,"ts":1758700002000,"system_chars":10,"prompt_chars":20}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.prompt.progress","seq":3,"ts":1758700003000,"processed":512,"total":1024}"#);
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        let last = beats.last().expect("beats");
+        assert_eq!(last["payload"]["prompt_processed"], 512, "the report wrote a beat: {last}");
+        assert!(darkmux_flow::is_prompt_phase_heartbeat(&serde_json::from_value(last["payload"].clone()).unwrap()), "{last}");
+    }
+
     /// (#3210, PR #3293 live check) While a turn generates, the tailer marks
     /// one durable beat every 20 s for the hub, on the beats' own clock (the
     /// fixture's `ts`), so a peer's card keeps a rate and never reads STALL.

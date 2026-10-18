@@ -39,9 +39,11 @@ darkmux release.
   Another machine's card shows the bar and the time left too, live and in playback: a
   turn's prompt-phase heartbeats (its opener, and the engine's reports written before the
   reply's first chunk) ride the fleet hub's work stream. While it generates, one heartbeat
-  per execution every 20 s (`hub_relay`, flow 2.3.0, additive) also rides it, so a peer's
-  card reads GEN with a rate instead of STALL once its prefill ends, and still reads STALL
-  when those beats stop for 30 s. Every other heartbeat stays local, as since #2101; a lab
+  per execution every 20 s, and the first of every stream (`hub_relay`, flow 2.3.0,
+  additive), also rides it, so a peer's card reads GEN with a rate instead of STALL once
+  its prefill ends. A relayed beat allows 50 s of silence before STALL (30 s plus the
+  20 s interval, since a pause on the peer adds to the hub's gap); a peer that stops for
+  longer reads STALL. Every other heartbeat stays local, as since #2101; a lab
   run's stay local (contract 3); an outage's backfill re-sends by the same rule. Per
   execution that is one opener per stream on every engine (LM Studio included: by the PR
   #3293 review's estimate, a tool-heavy mission sends about a third more work records per
