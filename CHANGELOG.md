@@ -17,8 +17,10 @@ darkmux release.
 ### Added
 
 - **PROMPT shows how far the engine has read the prompt** (#3210). When the engine reports
-  prefill progress in its stream, the fleet card reads "processing 40% · ~23s left" (on a
-  phone, "40% · ~23s left") and the run page's readout says the same under the lamps; the
+  prefill progress in its stream, the scope's brain moves up over a thin bar that fills as
+  the prompt is read (bordered, so it shows empty from the first report), the fleet card
+  reads "processing 40% · ~23s left" (on a phone, "40% · ~23s left") and the run page's
+  readout says the same under the lamps; the
   time left is estimated from the reports' own rate once there are two. Today that is
   `mlx_lm.server`, which writes one `: keepalive <processed>/<total>` comment line per
   prefill step with nothing to opt into. Both stream readers (the runtime's and the

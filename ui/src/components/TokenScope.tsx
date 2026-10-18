@@ -71,6 +71,10 @@ export interface TokenScopeProps {
    *  omitted it is derived from the older props below (`stalled`,
    *  `resting`, `tone`), so an existing caller keeps working. */
   state?: ScopeState;
+  /** (#3210) PROMPT's processed fraction (0..1) when the engine reports it:
+   *  the brain moves up and a thin bar under it fills that far. Absent, or
+   *  outside PROMPT, the brain sits alone as before. */
+  promptFraction?: number;
   /** (#2890) While `state` is `"tools"`: the tool being run (the latest
    *  completed call's `tool_name`), drawn as an icon in the center. Unknown
    *  or absent reads as the gear. */
@@ -535,6 +539,7 @@ export function TokenScope({
   centerCarried = false,
   className,
   tone = "generating",
+  promptFraction,
   restEndMs,
   clock = WALL_CLOCK,
 }: TokenScopeProps) {
@@ -747,9 +752,15 @@ export function TokenScope({
     );
   } else if (showBrain) {
     centerKey = "brain";
+    const barPct = promptFraction !== undefined && Number.isFinite(promptFraction) ? Math.round(Math.max(0, Math.min(1, promptFraction)) * 100) : null;
     centerNode = (
-      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state}>
+      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state} data-progress={barPct !== null ? "" : undefined}>
         <BrainGlyph className="token-scope-ico" />
+        {barPct !== null ? (
+          <span className="token-scope-bar">
+            <span className="token-scope-bar__fill" style={{ width: `${barPct}%` }} />
+          </span>
+        ) : null}
       </div>
     );
   } else if (showNumber) {

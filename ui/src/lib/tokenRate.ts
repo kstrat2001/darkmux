@@ -739,7 +739,8 @@ export interface LiveStateReading {
    *  nothing yet, and the engine reports its prefill progress on the
    *  heartbeat (`prompt_processed` / `prompt_total`): how far, and how long
    *  is left. The fleet card's line and the run page's readout show it
-   *  (`promptProgressLabel`); the scope's center keeps the brain. */
+   *  (`promptProgressLabel`); the scope's center keeps the brain and fills a bar under it
+   *  (`TokenScope`'s `promptFraction`). */
   promptProgress?: PromptProgress;
   /** (#2915) Present (always `true`) only when `state === "prompt"` because
    *  this execution is COMPACTING: its `utility.start` (job `compaction`) is

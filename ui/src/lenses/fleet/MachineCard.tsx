@@ -308,6 +308,7 @@ function CardTube({
           toolName={selected.toolName}
           toolWriting={selected.writing === true}
           thinking={selected.state === "generating" && selected.thinking === true}
+          promptFraction={selected.state === "prompt" && selected.promptProgress ? selected.promptProgress.processed / selected.promptProgress.total : undefined}
           {...scopeCenter({
             state: scopeState,
             tokensPerSec: selected.tokensPerSec,

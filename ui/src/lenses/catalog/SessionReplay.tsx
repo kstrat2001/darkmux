@@ -211,7 +211,7 @@ function TrimmedPath({ path }: { path: string }) {
  *  - (#2915) compacting: "compacting · Ns" counting with the page's clock;
  *    the tube center carries no timer;
  *  - (#3210) PROMPT with the engine's prefill progress: how far and how long
- *    is left ("processing 40% · ~23s left"); the tube keeps the brain;
+ *    is left ("processing 40% · ~23s left"); the tube keeps the brain, with the bar under it (`promptFraction`);
  *  - (#2950) a rest whose record says why: the words only ("thermal ·
  *    serious"), trimmed to the line (the lamp status keeps it whole); the
  *    countdown is already the tube's center. Nothing when it names no reason;
@@ -253,6 +253,8 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerCarried: boolean;
   /** (#2915) The tube shows a utility job (compacting), not the work model. */
   utility?: true;
+  /** (#3210) PROMPT's processed fraction, when the engine reports it. */
+  promptFraction?: number;
   /** (#2961) REST only: when the rest ends, on the page clock `clockMs` is
    *  read on. The scope phases its seconds hand and counts its number from
    *  it (`lib/restHand.ts`). */
@@ -289,6 +291,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       toolWriting: state === "tools" ? writing : undefined,
       thinking: generating && live.thinking === true,
       ...(state === "rest" && live.restEndMs !== undefined ? { restEndMs: live.restEndMs, clockMs: live.clockMs } : {}),
+      ...(state === "prompt" && !compacting && live.promptProgress !== undefined ? { promptFraction: live.promptProgress.processed / live.promptProgress.total } : {}),
       // (#2890) The center is the SAME for every scope in the app: see
       // `lib/scopeCenter.ts`.
       ...scopeCenter({
@@ -1003,6 +1006,7 @@ export function SessionReplay({
                       toolWriting={scopeHero.toolWriting}
                       thinking={scopeHero.thinking}
                       utility={scopeHero.utility === true}
+                      promptFraction={scopeHero.promptFraction}
                       size="tile"
                       centerLabel={scopeHero.centerLabel}
                       centerUnit={scopeHero.centerUnit}

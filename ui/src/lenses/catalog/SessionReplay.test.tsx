@@ -1682,7 +1682,11 @@ describe("modelScopeHero (#2890)", () => {
     const promptProgress = { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 };
     const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptProgress }, finishedTokRate: null });
     expect(h).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null, note: "processing 40% · ~23s left" });
+    expect(h?.promptFraction).toBeCloseTo(1_024 / 2_516);
     expect(modelScopeHero({ liveTokScope: { ...live, state: "prompt" }, finishedTokRate: null })?.note).toBeNull();
+    expect(modelScopeHero({ liveTokScope: { ...live, state: "prompt" }, finishedTokRate: null })?.promptFraction).toBeUndefined();
+    // Compacting is the utility's work, not the prompt's: no bar.
+    expect(modelScopeHero({ liveTokScope: { ...live, state: "prompt", compacting: true, promptProgress }, finishedTokRate: null })?.promptFraction).toBeUndefined();
   });
 
   it("(#2890) GEN while thinking: the same number and unit, with the thinking look", () => {

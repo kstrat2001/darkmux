@@ -81,6 +81,28 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-utility")).toBe("false");
   });
 
+  it("(#3210) PROMPT with a reported fraction: the brain over a bar filled that far", () => {
+    const { container } = render(<TokenScope tokensPerSec={0} size="card" state="prompt" promptFraction={0.4} />);
+    const center = container.querySelector(".token-scope-center--brain")!;
+    expect(center.querySelector('[data-scope-icon="brain"]')).not.toBeNull();
+    const bar = center.querySelector(".token-scope-bar");
+    expect(bar).not.toBeNull();
+    expect((bar!.querySelector(".token-scope-bar__fill") as HTMLElement).style.width).toBe("40%");
+  });
+  it("(#3210) the bar starts empty, clamps at full, and is absent without a fraction or outside PROMPT", () => {
+    const fill = (f: number | undefined, state: "prompt" | "generating" = "prompt") => {
+      const { container, unmount } = render(<TokenScope tokensPerSec={0} size="card" state={state} promptFraction={f} />);
+      const el = container.querySelector(".token-scope-bar__fill") as HTMLElement | null;
+      const w = el ? el.style.width : null;
+      unmount();
+      return w;
+    };
+    expect(fill(0)).toBe("0%");
+    expect(fill(1.7)).toBe("100%");
+    expect(fill(undefined)).toBeNull();
+    expect(fill(Number.NaN)).toBeNull();
+    expect(fill(0.5, "generating")).toBeNull();
+  });
   it("no brain outside PROMPT", () => {
     for (const state of ["generating", "tools", "rest", "stalled", "finished", "idle", "nosignal"] as const) {
       const { container } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);

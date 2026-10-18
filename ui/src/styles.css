@@ -9433,6 +9433,35 @@ body {
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-prompt) 80%, transparent));
   animation: token-scope-brain 2.4s ease-in-out infinite;
 }
+/* (#3210) PROMPT with reported progress: the brain moves up and a thin bar
+   under it fills. Its border shows the empty bar from the first report. */
+.token-scope-center--brain[data-progress] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--ico) * 0.1);
+  padding-bottom: calc(var(--ico) * 0.1);
+}
+.token-scope-bar {
+  display: block;
+  width: calc(var(--ico) * 1.3);
+  height: max(4px, calc(var(--ico) * 0.14));
+  border: 1px solid color-mix(in srgb, var(--lamp-prompt) 55%, transparent);
+  border-radius: 999px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.token-scope-bar__fill {
+  display: block;
+  height: 100%;
+  background: var(--lamp-prompt);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--lamp-prompt) 80%, transparent);
+  transition: width 0.6s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-bar__fill { transition: none; }
+}
 @keyframes token-scope-brain {
   0%, 100% { opacity: 0.55; transform: scale(0.94); }
   50% { opacity: 1; transform: scale(1.04); }
