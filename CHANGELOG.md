@@ -195,6 +195,16 @@ darkmux refuses the new config keys, so upgrade every machine before setting the
 
 ### Fixed
 
+- **This machine's own lab run shows live on its card** (#3294). On a daemon with a fleet
+  hub, the viewer's live stream read only the hub, which never carries a lab run's records
+  or the plain 2 s heartbeats, so a lab run (pepper-grinder) reached the card only through
+  the page's 20 s refresh and could hold "— think tok/s" for 20 s. The stream now also
+  sends this machine's records that stay off the hub, once each, and still ends when the
+  hub tail ends so the browser reconnects.
+
+- **The scope centers a number with its unit, and a tool icon with its caption, as a pair**
+  (#3292). "91" over "tok/s" and the wrench over "tool gen" sat low in the tube.
+
 - **A peer's card reads a short turn's rate, its tool gen, and a hung prefill's STALL**
   (matrix review before 5.3.0). The hub writers also relay a stream's first beat past the
   stream-open chunk and the first beat of each tool call it writes: per stream at most the
