@@ -12709,12 +12709,35 @@
             .filter(|b| b["payload"]["hub_relay"] == true)
             .map(|b| b["payload"]["sampled_at_ms"].as_u64().unwrap() - FIRST)
             .collect();
-        assert_eq!(relayed, [0, 20_000, 40_000, 60_000], "one generation beat per 20 s");
+        assert_eq!(relayed, [0, 2_000, 22_000, 42_000], "the stream-open chunk, the first real output, then one per 20 s from it");
         let to_hub = beats
             .iter()
             .filter(|b| darkmux_flow::heartbeat_rides_hub(&serde_json::from_value(b["payload"].clone()).unwrap()))
             .count();
         assert_eq!(to_hub, 6, "the opener, the report and four generation beats");
+    }
+
+    /// (Matrix review) A short turn under 20 s: the tailer relays its
+    /// stream-open chunk, its first real output, and the beat entering the
+    /// tool call it writes, so a peer gets a rate about 2 s into generation
+    /// and sees tool gen. Real shape: PG2's turn 8 (2026-10-18; chunk times
+    /// and counts as written, the writing ticks every 2 s).
+    #[test]
+    #[serial]
+    fn tailer_relays_a_short_turns_first_output_and_its_tool_call() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":8,"ts":1792325897697,"system_chars":10,"prompt_chars":57235}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":8,"partial_index":1,"cumulative_chars":0,"generated_chars":3,"ts":1792325898984}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":8,"partial_index":163,"cumulative_chars":0,"generated_chars":656,"ts":1792325900856}"#);
+        for ts in [1_792_325_903_460u64, 1_792_325_905_469, 1_792_325_907_476] {
+            relay_feed(&tmp, &mut state, &format!(r#"{{"type":"model.tool_call.writing","seq":8,"partial_index":293,"cumulative_chars":262,"generated_chars":1238,"phase":"writing_tool_call","tool_name":"edit","ts":{ts}}}"#));
+        }
+        let marked: Vec<u64> = heartbeats_in(&isolated.path().join("flows"))
+            .iter()
+            .filter(|b| b["payload"]["hub_relay"] == true)
+            .map(|b| b["payload"]["sampled_at_ms"].as_u64().unwrap())
+            .collect();
+        assert_eq!(marked, [1_792_325_898_984, 1_792_325_900_856, 1_792_325_903_460], "chunk, first output, first writing beat");
     }
 
     /// (#3210) Coalescing keeps the LATEST progress, not the first: reports
