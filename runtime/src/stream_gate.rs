@@ -387,7 +387,8 @@ impl StreamGate {
                     }
                 }
             }
-            for text in [d.reasoning_content.as_deref(), d.content.as_deref()]
+            // (#3210) `reasoning_text`: mlx streams it as `reasoning`.
+            for text in [d.reasoning_text(), d.content.as_deref()]
                 .into_iter()
                 .flatten()
             {
@@ -499,6 +500,7 @@ mod tests {
                     role: None,
                     content: content.map(str::to_string),
                     reasoning_content: reasoning.map(str::to_string),
+                    reasoning: None,
                     tool_calls: tool.then(|| {
                         vec![ToolCallDelta {
                             index: Some(0),
@@ -542,6 +544,7 @@ mod tests {
                     role: None,
                     content: None,
                     reasoning_content: None,
+                    reasoning: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index: Some(0),
                         id: None,
@@ -610,6 +613,21 @@ mod tests {
             }
             other => panic!("`off` must never end a call; got {other:?}"),
         }
+    }
+
+    /// (#3210, PR #3293 re-review) mlx streams reasoning in `delta.reasoning`:
+    /// the gate reads it through `Delta::reasoning_text`, so a degenerate
+    /// reasoning loop on mlx is measured (and cut) like one in
+    /// `reasoning_content`.
+    #[test]
+    fn the_gate_sees_mlx_reasoning() {
+        let mut g = gate(1, ALWAYS, "");
+        let mlx: ChatChunk = serde_json::from_str(
+            r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning":"aaaa aaaa aaaa aaaa aaaa aaaa "},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(g.ingest(&mlx), GateAction::Degenerate { .. }), "mlx reasoning must reach the gate");
+        assert_eq!(g.slice_chars(), 30);
     }
 
     #[test]

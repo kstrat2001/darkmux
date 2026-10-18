@@ -67,6 +67,11 @@ export interface HeartbeatSample {
    *  few ms after the previous one, which read as 20,062 tok/s. Absent for a
    *  durable heartbeat, which the host already spaces at least 2 s apart. */
   minSpanMs?: number;
+  /** (#3210) A beat its writer sent over the fleet hub (`hub_relay`): on a
+   *  peer's card the next one can be the relay interval plus the writer's
+   *  own longest silence away, so its stall bound is longer
+   *  (`stallAfterMsOf`). */
+  relayed?: true;
 }
 
 /** (#2889) The `phase` value a heartbeat carries while the model writes a
@@ -106,10 +111,8 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     const visible = num(f.cumulative_chars);
     if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
-    const promptChars = num(f.prompt_chars);
-    if (promptChars !== null) sample.promptChars = promptChars;
-    const prompt = promptProgressOf(f);
-    if (prompt !== null) sample.prompt = prompt;
+    withPromptFacts(sample, f);
+    if (f.hub_relay === true) sample.relayed = true;
     out.push(sample);
   }
   out.sort((a, b) => a.atMs - b.atMs);
@@ -124,6 +127,15 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     }
   }
   return out;
+}
+
+/** The prompt's facts a heartbeat carries, onto its sample: the request's
+ *  size (the opener, #2889) and the engine's prefill progress (#3210). */
+function withPromptFacts(sample: HeartbeatSample, f: LiveHeartbeat): void {
+  const promptChars = num(f.prompt_chars);
+  if (promptChars !== null) sample.promptChars = promptChars;
+  const prompt = promptProgressOf(f);
+  if (prompt !== null) sample.prompt = prompt;
 }
 
 /** (#2928) When a sample's state was last known to hold. */
@@ -401,7 +413,11 @@ const OPENER_TRUST_WINDOW_MS = 2_500;
  *  and at least 235 chars the other 28, nothing in between. 16 sits three
  *  times above the largest chunk seen and far under the smallest real
  *  output, and is about four tokens: too few to measure a rate from over
- *  one heartbeat interval in any case. */
+ *  one heartbeat interval in any case. (Matrix review) The hub's writers
+ *  relay a stream's first beat past it as well as the chunk
+ *  (`STREAM_OPEN_MAX_CHARS` in `crates/darkmux-flow/src/hub_route.rs`,
+ *  mirrored and pinned by `the_viewer_mirrors_the_stream_open_chunk`), so a
+ *  peer's short turn has an ordinary pair to read a rate from. */
 const STREAM_OPEN_MAX_CHARS = 16;
 function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolean {
   if (prev.chars !== 0) return true;
@@ -485,6 +501,22 @@ function carriedTokenRate(records: NormRecord[], samples: HeartbeatSample[]): To
  * this threshold only governs genuine silence. */
 export const STALL_AFTER_MS = 30_000;
 
+/** (#3210) The writer's interval between the generation beats that ride the
+ *  fleet hub (`hub_relay`): `HUB_GENERATION_BEAT_INTERVAL_MS` in
+ *  `crates/darkmux-flow/src/hub_route.rs`, mirrored here and pinned by a
+ *  drift test on that side. */
+export const HUB_RELAY_INTERVAL_MS = 20_000;
+
+/** (#3210, PR #3293 re-review) The silence a sample allows before STALL. A
+ *  hub-relayed beat (a peer's, as this viewer receives it) allows
+ *  `STALL_AFTER_MS` plus the relay interval: the writer marks the first beat
+ *  at least the interval after its last mark, so a local silence adds to the
+ *  hub's gap (measured: marks 43 s apart after a 25 s local silence). A
+ *  local card's latest beat is normally an unmarked 2 s one. */
+function stallAfterMsOf(s: HeartbeatSample): number {
+  return s.relayed ? STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS : STALL_AFTER_MS;
+}
+
 /** Whether an execution's heartbeat stream has gone quiet — no sample
  * within `STALL_AFTER_MS` of `nowMs`. `false` (not stalled) when there are
  * no heartbeats at all yet: "hasn't started producing" is a different
@@ -492,7 +524,8 @@ export const STALL_AFTER_MS = 30_000;
 export function isStalled(records: NormRecord[], nowMs: number): boolean {
   const samples = heartbeatSamples(records);
   if (samples.length === 0) return false;
-  return nowMs - freshOf(samples[samples.length - 1]) > STALL_AFTER_MS;
+  const last = samples[samples.length - 1];
+  return nowMs - freshOf(last) > stallAfterMsOf(last);
 }
 
 /** (#3145) A prefill's allowance that does not grow with the prompt: the
@@ -555,18 +588,38 @@ interface PrefillOpener {
   atMs: number;
   promptChars: number;
   reports: HeartbeatSample[];
+  /** (Matrix review) When the turn's latest real sample was taken: a
+   *  durable beat or a live transition, never a live refresh (which only
+   *  repeats a state, `freshMs`). */
+  lastSampleAtMs: number;
 }
-function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
+function prefillOpener(beats: HeartbeatSample[], closed: ReadonlySet<unknown>): PrefillOpener | null {
   const last = beats[beats.length - 1];
-  if (last === undefined) return null;
+  // (#3298 review) A turn its `dispatch.turn` closed is read, whatever the
+  // timestamps say: a sub-second turn's opener inside the next marker's
+  // second read as a hung prefill after a long rest.
+  if (last === undefined || (last.turn !== undefined && closed.has(last.turn))) return null;
   const reports: HeartbeatSample[] = [];
   for (let i = beats.length - 1; i >= 0; i--) {
     const b = beats[i];
     if (b.turn !== last.turn || producedOutput(b)) return null;
-    if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars, reports: reports.reverse() };
+    if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars, reports: reports.reverse(), lastSampleAtMs: last.atMs };
     if (b.prompt !== undefined) reports.push(b);
   }
   return null;
+}
+
+/** (#3298 review) The turns a `dispatch.turn` record has closed, by
+ *  `turn_seq` (the turn record's own field, the one every heartbeat of the
+ *  turn carries). `records` is one execution's, so the numbers do not
+ *  collide across executions. */
+function closedTurns(records: NormRecord[]): Set<unknown> {
+  const out = new Set<unknown>();
+  for (const r of records) {
+    const turn = payloadOf(r, ACTION.DispatchTurn);
+    if (turn?.turn_seq !== undefined && turn.turn_seq !== null) out.add(turn.turn_seq);
+  }
+  return out;
 }
 
 /** (#3210) How many of its own steps an engine reporting prefill progress
@@ -600,16 +653,20 @@ function progressStallAfterMs(advanced: HeartbeatSample[]): number {
   return Math.max(STALL_AFTER_MS, PROGRESS_STALL_STEPS * longest);
 }
 
-/** (#3145) Whether a prefill has outlasted its bound: silent past
- *  `STALL_AFTER_MS` (the ordinary rule, so a live refresh still counts)
- *  AND past `prefillStallAfterMs` of its opener. (#3210) When the engine
+/** (#3145) Whether a prefill has outlasted its bound: past
+ *  `prefillStallAfterMs` of its opener AND silent past `STALL_AFTER_MS`.
+ *  (Matrix review) The silence counts from the turn's latest real sample,
+ *  never a live refresh: the host repeats the opener every cadence for as
+ *  long as the request is open, wedged or not, so a refresh is no evidence
+ *  the prefill is moving (it read PROMPT until the 600 s watchdog). A
+ *  refresh stays liveness for GEN and a writing stretch (`isStalled`). (#3210) When the engine
  *  reports progress, the silence counts from its last ADVANCING report
  *  (repeats keep the heartbeat fresh but are not progress). The size-scaled
  *  bound from the opener stays a floor; past it, the silence must pass the
  *  engine's own pace with two or more advances (`progressStallAfterMs`), or
  *  `STALL_AFTER_MS` with fewer. */
-function prefillOverdue(opener: PrefillOpener, records: NormRecord[], nowMs: number): boolean {
-  if (opener.reports.length === 0) return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+function prefillOverdue(opener: PrefillOpener, nowMs: number): boolean {
+  if (opener.reports.length === 0) return nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars) && nowMs - opener.lastSampleAtMs > STALL_AFTER_MS;
   const moved = advances(opener.reports);
   const silentMs = nowMs - (moved[moved.length - 1]?.atMs ?? opener.atMs);
   // The size-scaled bound (#3145) stays a floor: a moving prefill whose step
@@ -638,7 +695,11 @@ function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress |
 const ETA_WINDOW_STEPS = 3;
 
 /** (#3210) The time left at the advancing reports' rate, from two or more
- *  of them; `undefined` before there is a rate, and once all is read. */
+ *  of them; `undefined` before there is a rate, and once all is read.
+ *  (Matrix review) Also `undefined` once the estimate is overdue: more time
+ *  has passed since the last advance than the rest was predicted to take,
+ *  so the progress stopped and no time left is known. It used to clamp to
+ *  0 and read "~0s left" for as long as the stop lasted. */
 function secondsLeftOf(advanced: HeartbeatSample[], total: number, nowMs: number): number | undefined {
   // The recent pace, not the whole run's: prefill slows as the context grows
   // (measured on an M2: ~9 s per 512-token step early, ~13 s late), and the
@@ -650,7 +711,8 @@ function secondsLeftOf(advanced: HeartbeatSample[], total: number, nowMs: number
   const spanMs = moved.length >= 2 ? lastMove.atMs - moved[0].atMs : 0;
   if (first === undefined || processed >= total || spanMs <= 0) return undefined;
   const perMs = (processed - first.processed) / spanMs;
-  return Math.max(0, Math.ceil(((total - processed) / perMs - (nowMs - lastMove.atMs)) / 1000));
+  const leftMs = (total - processed) / perMs - (nowMs - lastMove.atMs);
+  return leftMs < 0 ? undefined : Math.ceil(leftMs / 1000);
 }
 
 /** (#3210) The PROMPT reading for a turn still reading its prompt: the
@@ -664,9 +726,9 @@ function promptReading(opener: PrefillOpener, nowMs: number): LiveStateReading {
  *  generated: PROMPT, with the opener's size and progress. (#3210) Fresh is
  *  not enough while the engine repeats a count: the prefill is bounded from
  *  its last advancing report, so a stuck engine still reads STALL. */
-function freshPromptReading(opener: PrefillOpener | null, records: NormRecord[], nowMs: number): LiveStateReading {
+function freshPromptReading(opener: PrefillOpener | null, nowMs: number): LiveStateReading {
   if (opener === null) return { state: "prompt" };
-  return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
+  return prefillOverdue(opener, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
 }
 
 /** (#3210) The status words for a prefill's progress: "40% · ~23s left", or
@@ -683,25 +745,36 @@ export function promptProgressLabel(p: PromptProgress): string {
 function staleReading(
   opener: PrefillOpener | null,
   lastBeatAt: number | null,
-  records: NormRecord[],
   nowMs: number,
 ): LiveStateReading {
-  if (opener !== null && !prefillOverdue(opener, records, nowMs)) return promptReading(opener, nowMs);
+  if (opener !== null && !prefillOverdue(opener, nowMs)) return promptReading(opener, nowMs);
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
 }
 
+/** (Matrix review) How far before a marker's `ts` an opener may be sampled
+ *  and still follow it. A marker's time is its record's `ts`: WHOLE-SECOND,
+ *  and stamped when the host tailer WROTE it, after reading the runtime's
+ *  event. An opener's `sampled_at_ms` is the runtime's own event time. So
+ *  the next stream's opener can carry a time earlier than the `ts` of the
+ *  marker written ahead of it (measured on 2026-10-18: 5 of 37 openers,
+ *  30-213 ms early). The marker's clock cannot order anything inside its
+ *  own second, so its resolution is the honest window. The cost is an
+ *  opener a whole turn older that produced nothing, inside that one
+ *  second: it is bounded (STALL once its prefill bound runs out), never
+ *  PROMPT forever. */
+const MARKER_TS_RESOLUTION_MS = 1_000;
+
 /** (#3145) The PROMPT reading after a marker: bounded by the turn's opener
- *  when the opener is at or after the marker (STALL once its prefill bound
- *  runs out); otherwise the last beat's size while that size is current. */
+ *  when the opener follows the marker (STALL once its prefill bound runs
+ *  out); otherwise the last beat's size while that size is current. */
 function promptAfterMarker(
   opener: PrefillOpener | null,
   lastBeat: HeartbeatSample | null,
   markerAtMs: number,
-  records: NormRecord[],
   nowMs: number,
 ): LiveStateReading {
-  if (opener !== null && opener.atMs >= markerAtMs) {
-    return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
+  if (opener !== null && opener.atMs > markerAtMs - MARKER_TS_RESOLUTION_MS) {
+    return prefillOverdue(opener, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
   }
   return promptSizeIsCurrent(lastBeat, markerAtMs) ? { state: "prompt", promptChars: lastBeat.promptChars } : { state: "prompt" };
 }
@@ -896,7 +969,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
   // (#3145) The current turn's opener while nothing has been generated
   // since it: the prompt's size, and the start its prefill bound counts
   // from, for every PROMPT reading below.
-  const opener = prefillOpener(beats);
+  const opener = prefillOpener(beats, closedTurns(cut));
 
   let marker: StateMarker | null = null;
   // `dispatch.tool` is emitted when a tool COMPLETES. A turn that ends with
@@ -1044,7 +1117,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     // outlasts `prefillStallAfterMs` reads STALL here too, rather than
     // PROMPT for as long as the marker stays the latest evidence.
     const lastBeat = beats.length ? beats[beats.length - 1] : null;
-    const prompt = (): LiveStateReading => promptAfterMarker(opener, lastBeat, found.atMs, cut, nowMs);
+    const prompt = (): LiveStateReading => promptAfterMarker(opener, lastBeat, found.atMs, nowMs);
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) {
@@ -1108,10 +1181,10 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     }
     // (#3145) The size is the turn's opener's, so an empty first chunk
     // after it (which carries none) does not drop it.
-    if (last.chars === 0) return freshPromptReading(opener, cut, nowMs);
+    if (last.chars === 0) return freshPromptReading(opener, nowMs);
     return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
-  return staleReading(opener, lastBeatAt, cut, nowMs);
+  return staleReading(opener, lastBeatAt, nowMs);
 }
 
 /** (#2890) Whether the latest generating sample is reasoning rather than

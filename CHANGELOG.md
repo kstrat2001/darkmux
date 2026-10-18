@@ -49,6 +49,27 @@ darkmux refuses the new config keys, so upgrade every machine before setting the
   steps between reports (30 s before there are two advances), so a step that slows
   mid-way is never STALL sooner than an engine that reports nothing. Engines that report
   nothing read as before. llama.cpp and LM Studio are not recognized yet.
+  Another machine's card shows the bar and the time left too, live and in playback: a
+  turn's prompt-phase heartbeats (its opener, and the engine's reports written before the
+  reply's first chunk) ride the fleet hub's work stream. While it generates, one heartbeat
+  per execution every 20 s, and the first of every stream (`hub_relay`, flow 2.3.0,
+  additive), also rides it, so a peer's card reads GEN with a rate instead of STALL once
+  its prefill ends. A relayed beat allows 50 s of silence before STALL (30 s plus the
+  20 s interval, since a pause on the peer adds to the hub's gap); a peer that stops for
+  longer reads STALL. Every other heartbeat stays local, as since #2101; a lab
+  run's stay local (contract 3); an outage's backfill re-sends by the same rule. Per
+  execution that is one opener per stream on every engine (LM Studio included: by the PR
+  #3293 review's estimate, a tool-heavy mission sends about a third more work records per
+  turn), about one record per 512-token prefill step on an engine that reports progress
+  (never more than one per 2 s), and about 3 a minute while generating, against the 30 a
+  minute the local file keeps. The runtime now also reads the reasoning `mlx_lm.server`
+  streams in `delta.reasoning` (it read only `reasoning_content`), so a thinking model on
+  mlx is treated as reasoning everywhere a `reasoning_content` model already is, as on LM
+  Studio: the GEN and think rate, the `model.reasoning` record, the think bound on
+  `max_tokens`, promoting a terminal reasoning answer or a plain-text tool call written in
+  reasoning, keeping the reasoning in history after a `length` finish, and the stream
+  gate's check-in cadence and degeneracy cut. An unstreamed mlx reply's reasoning is not
+  read yet.
 
 - **A fleet card still checking sweeps like a radar** (#3284). While a card waits for its
   first answers ("checking…"), its scope draws an old radar sweep: a turning beam with a
@@ -173,6 +194,17 @@ darkmux refuses the new config keys, so upgrade every machine before setting the
   an older darkmux refuses the key, so upgrade every machine before writing it.
 
 ### Fixed
+
+- **A peer's card reads a short turn's rate, its tool gen, and a hung prefill's STALL**
+  (matrix review before 5.3.0). The hub writers also relay a stream's first beat past the
+  stream-open chunk and the first beat of each tool call it writes: per stream at most the
+  20 s cadence plus one first output plus one per distinct tool written (on a 10-turn run,
+  19 relayed beats instead of 10, of the 44 kept locally); a turn's opener sampled up to a
+  second before the whole-second `ts` of the marker written ahead of it is now bounded, not
+  PROMPT forever, unless its turn has already closed; a prefill the engine reports nothing about reads STALL at its size bound
+  even while the host's live refreshes keep arriving; the prefill time left is dropped, not
+  held at "~0s left", once progress stops past its own estimate; and the scope's bar rounds
+  down like the percentage under it.
 
 - **`init` on an OpenAI-compatible server no longer keeps a utility model the server
   does not list** (#316). It kept the shipped `internal.utility` binding and only said so,

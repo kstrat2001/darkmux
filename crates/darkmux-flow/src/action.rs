@@ -216,11 +216,20 @@ macro_rules! flow_actions {
             }
 
             /// The hub stream this action rides, `None` when it stays off the hub.
-            /// Heartbeats are local-only liveness detail (a 2 s cadence, most of
-            /// a long mission's records); `machine.telemetry` is the one
-            /// high-rate sampling action, so it gets its own stream. Every other
-            /// action, a thermal or battery transition included, is a rare edge
-            /// and rides the work stream.
+            /// `machine.telemetry` is the one high-rate sampling action, so it
+            /// gets its own stream. Every other action, a thermal or battery
+            /// transition included, is a rare edge and rides the work stream.
+            ///
+            /// `dispatch.turn.heartbeat` answers `None` here: by action alone
+            /// it stays local (#2101: a 2 s cadence, most of a long mission's
+            /// records). Which heartbeats do travel is decided by the payload,
+            /// and only by `hub_route::hub_stream_for` (#3210): a turn's opener
+            /// (`prompt_chars`) and an engine's prefill reports
+            /// (`prompt_processed`/`prompt_total`) written before the reply's
+            /// first chunk ride the work stream, and so does one generation
+            /// beat per execution every 20 s that its writer marked
+            /// `hub_relay`; every other beat stays local. Route a record through that function, never through
+            /// this one alone.
             pub fn hub_stream(&self) -> Option<HubStream> {
                 match self {
                     FlowAction::DispatchTurnHeartbeat => None,

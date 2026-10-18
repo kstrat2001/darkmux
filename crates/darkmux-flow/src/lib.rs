@@ -22,6 +22,8 @@ pub mod test_redis;
 
 mod bookend;
 mod hub_link;
+mod hub_route;
+pub use hub_route::{heartbeat_rides_hub, is_prompt_phase_heartbeat, stays_off_hub, HubRelayGate, HUB_GENERATION_BEAT_INTERVAL_MS};
 mod integrity;
 mod schema;
 mod status;
@@ -1439,8 +1441,9 @@ pub(crate) fn assert_silent_peer_reaches_command_phase(port: u16) {
 }
 
 /// Whether a record's `session_id` names a lab run: such a record stays off
-/// the fleet hub (#3074, contract 3). The one predicate both the live write
-/// ([`RedisSink`]'s `persist`) and the outage backfill use.
+/// the fleet hub (#3074, contract 3). Applied by `hub_route::hub_stream_for`,
+/// the one rule both the live write ([`RedisSink`]'s `persist`) and the
+/// outage backfill use.
 pub(crate) fn is_lab_session(session_id: Option<&str>) -> bool {
     session_id
         .and_then(|wire| darkmux_types::session_id::SessionId::parse(wire).ok())
@@ -1634,18 +1637,16 @@ impl RedisSink {
 impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
-        // (#2101) Heartbeats are local-only liveness detail: the local file
-        // sink keeps every one, but at a 2 s cadence they flushed other
-        // machines' work out of the capped stream. Presence is a separate TTL
-        // key, and any other timed record keeps a peer's run live.
-        let Some(hub_stream) = record.action.hub_stream() else {
+        // (#2101, #3210) Heartbeats stay local except a turn's prompt-phase
+        // ones (its opener and the engine's prefill reports before the
+        // reply's first chunk) and the sparse generation beats their writer
+        // marked `hub_relay`: at a 2 s cadence every beat flushed other machines'
+        // work out of the capped stream, and only the prefill's say how far
+        // a peer has read its prompt. (#3074, contract 3) A lab run's records
+        // stay local. One rule, shared with the outage backfill: `hub_route`.
+        let Some(hub_stream) = crate::hub_route::hub_stream_of_record(record) else {
             return Ok(());
         };
-        // (#3074, contract 3) Lab runs write per-run-local artifacts; the
-        // fleet stream carries engagement work only.
-        if is_lab_session(record.session_id.as_deref()) {
-            return Ok(());
-        }
         // (#388) A sink that is not due to try skips silently: no connection
         // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -2683,8 +2684,9 @@ mod tests {
         assert!(!sink.note_failure(&e, TS));
     }
 
-    /// (#2101) A heartbeat never reaches the fleet stream; any other record
-    /// does. Observed through the sink's own failure accounting against an
+    /// (#2101) A heartbeat that is not a turn's prompt-phase one (#3210:
+    /// here, one with no payload) never reaches the fleet stream; any other
+    /// record does. Observed through the sink's own failure accounting against an
     /// unreachable hub: a record that is attempted fails (and counts toward
     /// the disable threshold), one that is skipped never touches the hub.
     #[test]
@@ -4034,7 +4036,8 @@ mod tests {
         //            `run.start`, the writer's promise to beat its session.
         //   2.3.0 — (#3210) additive: `prompt_processed` / `prompt_total` on
         //            `dispatch.turn.heartbeat`, the engine's prefill progress over
-        //            this request's uncached prompt.
+        //            this request's uncached prompt; and `hub_relay`, `true` on the
+        //            sparse generation beats that ride the fleet hub.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -5593,6 +5596,51 @@ mod tests {
         assert_eq!(xadds.len(), 1, "only the non-lab record is published: {xadds:?}");
         assert!(xadds[0].iter().any(|w| w.contains("solo-one")));
         assert!(!xadds.iter().flatten().any(|w| w.contains("lab-one")));
+    }
+
+    /// (#3210) A turn's prompt-phase heartbeats (its opener, and an engine's
+    /// prefill reports while nothing is generated) reach the hub's work
+    /// stream, so another machine's card can show the prompt bar. A report
+    /// written after generation started, a plain beat, and a lab run's
+    /// opener stay local.
+    #[test]
+    fn redis_sink_publishes_prompt_phase_and_relayed_heartbeats_only() {
+        use darkmux_types::session_id::{RunId, SessionId};
+        let log = std::sync::Arc::new(PeerLog::default());
+        let port = spawn_recording_redis_peer(log.clone(), None);
+        let sink = RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:flow", None).unwrap();
+        let solo = SessionId::adhoc(RunId::standalone("s-3210").unwrap(), "coder", "n").wire();
+        let lab = SessionId::adhoc(RunId::lab("l-3210").unwrap(), "coder", "n").wire();
+        let beat = |handle: &str, session: &str, payload: serde_json::Value| {
+            let mut r = silent_peer_test_record();
+            r.handle = handle.to_string();
+            r.action = crate::FlowAction::DispatchTurnHeartbeat;
+            r.session_id = Some(session.to_string());
+            r.execution_id = Some(darkmux_types::execution_id::ExecutionId::mint());
+            r.payload = Some(Payload::DispatchTurnHeartbeat(serde_json::from_value(payload).unwrap()));
+            r
+        };
+        let opener = serde_json::json!({"turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_chars": 9000});
+        let early = serde_json::json!({"turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_processed": 512, "prompt_total": 2048});
+        let late = serde_json::json!({"turn_seq": 1, "partial_index": 3, "cumulative_chars": 9, "generated_chars": 12, "prompt_processed": 2048, "prompt_total": 2048});
+        let plain = serde_json::json!({"turn_seq": 1, "partial_index": 8, "cumulative_chars": 40, "generated_chars": 60});
+        persist_record(&sink, &beat("opener-solo", &solo, opener.clone()));
+        persist_record(&sink, &beat("early-solo", &solo, early));
+        persist_record(&sink, &beat("late-solo", &solo, late));
+        persist_record(&sink, &beat("plain-solo", &solo, plain));
+        persist_record(&sink, &beat("opener-lab", &lab, opener));
+        // (live check) A generation beat its writer marked for the hub.
+        let relayed = serde_json::json!({"turn_seq": 1, "partial_index": 9, "cumulative_chars": 50, "generated_chars": 80, "hub_relay": true});
+        persist_record(&sink, &beat("relay-solo", &solo, relayed.clone()));
+        persist_record(&sink, &beat("relay-lab", &lab, relayed));
+
+        let xadds = log.xadds();
+        let sent: Vec<&str> = ["opener-solo", "early-solo", "late-solo", "plain-solo", "opener-lab", "relay-solo", "relay-lab"]
+            .into_iter()
+            .filter(|h| xadds.iter().flatten().any(|w| w.contains(&format!("\"handle\":\"{h}\""))))
+            .collect();
+        assert_eq!(sent, ["opener-solo", "early-solo", "relay-solo"], "{xadds:?}");
+        assert!(xadds.iter().all(|x| x[1] == "darkmux:flow"), "prompt-phase and relayed beats ride the work stream: {xadds:?}");
     }
 
     /// (#3073) Records ride one cached connection instead of a connection and

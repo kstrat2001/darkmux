@@ -1451,4 +1451,61 @@ mod tests {
         }])
         .is_none());
     }
+
+    /// (#3210) A peer's prompt-phase heartbeats ride the hub (its opener and
+    /// the engine's prefill reports), and every receiving hop the viewer reads
+    /// keeps them whole: the live tail's date filter, `/flow/:date`'s hub read
+    /// and its union with the local day file, and a replay route's window
+    /// (`/flow-dispatch/:id`, `/flow-mission/:id`), which holds a heartbeat
+    /// without its payload and must serve it from the entry's text.
+    #[test]
+    fn a_peers_prompt_heartbeats_reach_every_route_whole() {
+        let beat = |ts: &str, payload: Value| {
+            json!({ "ts": ts, "level": "info", "category": "work", "tier": "local", "stage": "dispatch",
+                "action": "dispatch.turn.heartbeat", "handle": "coder", "session_id": "s-peer", "mission_id": "m-peer",
+                "machine_id": "studio", "machine_uid": "uid-studio", "payload": payload })
+            .to_string()
+        };
+        let opener = beat("2026-10-18T01:00:00Z", json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_chars": 90_000 }));
+        let report = beat("2026-10-18T01:00:09Z", json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_processed": 1024, "prompt_total": 20_480 }));
+        let progress = |r: &Value| (r["payload"]["prompt_processed"].as_u64(), r["payload"]["prompt_total"].as_u64());
+
+        // The live tail (`/flow/:date/stream`): only the date filters an entry.
+        assert!(crate::record_ts_matches_date(&report, "2026-10-18"));
+
+        // `/flow/:date`: the hub read, then the union with this machine's file.
+        let entry = |id: &str, text: &str| {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(vec![redis::Value::BulkString(b"record".to_vec()), redis::Value::BulkString(text.as_bytes().to_vec())]),
+            ])
+        };
+        let raw = redis::Value::Array(vec![entry("2-0", &report), entry("1-0", &opener)]);
+        let hub = crate::records_from_xrevrange(raw, Some("2026-10-18"), 0).unwrap().records;
+        assert_eq!(hub.len(), 2);
+        assert_eq!(hub[0]["payload"]["prompt_chars"], 90_000);
+        assert_eq!(progress(&hub[1]), (Some(1024), Some(20_480)));
+        // A peer's beat has no twin on this machine: the union keeps it. The
+        // writer's own copy (no hub id) is the same record as the hub's.
+        let own = darkmux_flow::reader::parse_value(&report).unwrap();
+        let union = crate::union_flow_records(hub.clone(), vec![own]);
+        assert_eq!(union.len(), 2, "the local copy of a hub record is one record: {union:?}");
+        assert_eq!(progress(&union[1]), (Some(1024), Some(20_480)));
+
+        // A replay route: the window drops a heartbeat's payload, the route
+        // serves the whole record from the entry's text.
+        let window = FleetRecords(Arc::new(vec![
+            Arc::new(FleetRecord::from_entry("1-0", &opener).unwrap()),
+            Arc::new(FleetRecord::from_entry("2-0", &report).unwrap()),
+        ]));
+        assert!(window.iter().all(|r| r.value().get("payload").is_none()), "the window holds heartbeats compact");
+        let empty_archive = tempfile::TempDir::new().unwrap();
+        for (field, id) in [("session_id", "s-peer"), ("mission_id", "m-peer")] {
+            let (served, _, _) = crate::collect_records_by_field(empty_archive.path(), &window, field, id);
+            assert_eq!(served.len(), 2, "{field}");
+            assert_eq!(served[0]["payload"]["prompt_chars"], 90_000, "{field}");
+            assert_eq!(progress(&served[1]), (Some(1024), Some(20_480)), "{field}");
+            assert_eq!(served[1]["hub_id"], "2-0", "{field}");
+        }
+    }
 }

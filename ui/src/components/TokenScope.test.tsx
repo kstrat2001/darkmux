@@ -103,6 +103,18 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(fill(Number.NaN)).toBeNull();
     expect(fill(0.5, "generating")).toBeNull();
   });
+  it("(matrix review) the bar floors like the percentage it sits over: a full bar never sits over '99%'", () => {
+    const fill = (f: number) => {
+      const { container, unmount } = render(<TokenScope tokensPerSec={0} size="card" state="prompt" promptFraction={f} />);
+      const w = (container.querySelector(".token-scope-bar__fill") as HTMLElement).style.width;
+      unmount();
+      return w;
+    };
+    // 3,069 of 3,081 reads "99%" on the line (`Math.floor`, tokenRate.ts `prefillProgress`).
+    expect(fill(3_069 / 3_081)).toBe("99%");
+    expect(fill(2_048 / 3_081)).toBe("66%");
+    expect(fill(1)).toBe("100%");
+  });
   it("no brain outside PROMPT", () => {
     for (const state of ["generating", "tools", "rest", "stalled", "finished", "idle", "nosignal"] as const) {
       const { container } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);

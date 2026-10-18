@@ -601,6 +601,11 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          literal is a fixture record written to a fake hub",
     ),
     (
+        "crates/darkmux-flow/src/hub_route.rs",
+        "decides which hub stream a record rides (#3210); its `machine.telemetry` \
+         literal is a fixture record in its tests, routed, never written",
+    ),
+    (
         "crates/darkmux-doctor/src/checks_hooks.rs",
         "consumer: the hooks check names `FlowAction::MachineTelemetry` to probe each rule \
          against the telemetry samples darkmux writes (`is_telemetry_sample`), builds nothing",

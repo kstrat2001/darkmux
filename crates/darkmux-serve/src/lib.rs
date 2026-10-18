@@ -3096,7 +3096,10 @@ fn read_ram_free_for_ai_bytes() -> Option<u64> {
 /// When `DARKMUX_REDIS_URL` is set + reachable at request time, the
 /// stream comes from `XREAD BLOCK darkmux:flow $` (and the machine-telemetry
 /// stream beside it) — the **fleet-wide** tail of new records from every
-/// machine writing to the shared streams. When Redis is unset OR unreachable at probe time, falls
+/// machine writing to the shared streams, plus what the hub never carries
+/// (a lab run's records and the 2 s generation heartbeats; a prompt-phase or
+/// `hub_relay` beat comes from Redis) tailed from this machine's own day
+/// file. When Redis is unset OR unreachable at probe time, falls
 /// back to file-tailing `<flows_dir>/<date>.jsonl` (today's
 /// per-machine behavior). #270 PR-B.
 ///
@@ -3171,7 +3174,14 @@ async fn flow_stream_handler(
         // use the URL only for Client::open and never log it (they
         // pre-date the RawRedisUrl wrapper and handle the raw string
         // safely), so the secret stays unlogged. (#661 Slice 5)
-        Box::pin(redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned))
+        let hub = redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned.clone());
+        // What the hub never carries (a lab run's records, the 2 s generation
+        // heartbeats) comes from this machine's own day file, as the file-tail
+        // path sends it: the live channel's durable fallback, and the only
+        // push a lab run has (it opts out of the live channel). The hub's own
+        // records (work, prompt-phase and `hub_relay` beats) come from the hub
+        // alone, so none arrives twice (`stays_off_hub`).
+        hub_then_local(Box::pin(hub), Box::pin(local_only_lines(&state.flows_dir, &date_owned).await))
     } else {
         if redis_url.is_some() {
             eprintln!(
@@ -3211,11 +3221,30 @@ type SseEvents = futures::stream::BoxStream<'static, Result<Event, std::convert:
 /// browser reconnect; the new connection probes Redis again (falling back to
 /// the file tail) and the viewer's reconnect reconcile backfills the gap.
 fn records_then_live(records: SseEvents, live: SseEvents) -> SseEvents {
+    ending_with_first(records, live)
+}
+
+/// The Redis path's lines: the hub tail, with this machine's own lines that
+/// stay off the hub interleaved, ENDING when the hub tail ends. The local
+/// file tail never ends on its own, so it must not hold a response open after
+/// the hub tail gave up (the #3122 trap, on the record side).
+fn hub_then_local(
+    hub: futures::stream::BoxStream<'static, String>,
+    local: futures::stream::BoxStream<'static, String>,
+) -> futures::stream::BoxStream<'static, String> {
+    ending_with_first(hub, local)
+}
+
+/// `first` and `second` interleaved, ending when `first` ends.
+fn ending_with_first<T: Send + 'static>(
+    first: futures::stream::BoxStream<'static, T>,
+    second: futures::stream::BoxStream<'static, T>,
+) -> futures::stream::BoxStream<'static, T> {
     use futures::stream::StreamExt;
-    // Records arrive as `Some`, then one `None` marks their end; the live
-    // samples are always `Some`. The merged stream stops at that `None`.
-    let records = records.map(Some).chain(futures::stream::once(async { None }));
-    Box::pin(futures::stream::select(records, live.map(Some)).take_while(|e| std::future::ready(e.is_some())).filter_map(std::future::ready))
+    // `first` arrives as `Some`, then one `None` marks its end; `second` is
+    // always `Some`. The merged stream stops at that `None`.
+    let first = first.map(Some).chain(futures::stream::once(async { None }));
+    Box::pin(futures::stream::select(first, second.map(Some)).take_while(|e| std::future::ready(e.is_some())).filter_map(std::future::ready))
 }
 
 /// GET /flow/:date — returns flow records for a UTC day.
@@ -4878,6 +4907,17 @@ fn tail_lines(
 }
 
 type TailState = (PathBuf, u64, String, VecDeque<String>);
+
+/// The new lines of this machine's `<date>.jsonl` that the hub never carries
+/// (`darkmux_flow::stays_off_hub`), tailed from now like the file-tail path.
+async fn local_only_lines(flows_dir: &std::path::Path, date: &str) -> impl Stream<Item = String> + use<> {
+    use futures::stream::StreamExt;
+    let path = flows_dir.join(format!("{date}.jsonl"));
+    let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    tail_lines(path, start_offset).filter(|line| {
+        std::future::ready(darkmux_flow::reader::parse_value(line).is_some_and(|v| darkmux_flow::stays_off_hub(&v)))
+    })
+}
 
 /// The SSE events of a flow-line stream, each line redacted first when the
 /// reader is remote (`Some`). The ONE place the file tail and the Redis tail

@@ -9214,6 +9214,33 @@ body {
 }
 .token-scope-center {
   --scope-num: 16px;
+  --scope-unit: 11px;
+  --pair-lift: 0px;
+}
+/* (operator, 2026-10-18: "center the number and tok/s combo vertically")
+   A number with its unit under it is centered as a pair: the number rises
+   by half the unit's line plus the gap, and the unit with it. A center with
+   only a number, or only a unit, is unchanged. */
+.token-scope-center:has(.token-scope-n):has(.token-scope-u) {
+  --pair-lift: calc((var(--scope-unit) * 1.2 + 4px) / 2);
+}
+.token-scope-center .token-scope-n {
+  transform: translateY(calc(-1 * var(--pair-lift)));
+}
+/* The same for TOOLS while the call is generated: the wrench rises with
+   "tool gen" under it, and settles back when the caption fades out. The
+   brain keeps its own layout (its pulse animates `transform`). */
+.token-scope-center--icon:has(.token-scope-u--tools[data-on="true"]) {
+  --pair-lift: calc((var(--scope-unit) * 1.2 + 4px) / 2);
+}
+.token-scope-center--icon:not(.token-scope-center--brain) .token-scope-ico {
+  transform: translateY(calc(-1 * var(--pair-lift)));
+  transition: transform 0.3s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-center--icon:not(.token-scope-center--brain) .token-scope-ico {
+    transition: none;
+  }
 }
 .token-scope-center .token-scope-n {
   font: 400 var(--scope-num)/0.85 var(--font-mono);
@@ -9317,15 +9344,15 @@ body {
 }
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */
-.token-scope-bezel--card .token-scope-center .token-scope-u {
-  font-size: max(9px, calc(var(--tube) * 0.068));
+.token-scope-bezel--card .token-scope-center {
+  --scope-unit: max(9px, calc(var(--tube) * 0.068));
 }
 /* (W1) The desktop card's tube is large enough for a legible center word:
    a tenth of the tube (13px at the usual 134px), so "idle" and "no model
    working" read at 100% zoom. A phone's tube keeps the size above. */
 @media (min-width: 561px) {
-  .token-scope-bezel--card .token-scope-center .token-scope-u {
-    font-size: calc(var(--tube) * 0.1);
+  .token-scope-bezel--card .token-scope-center {
+    --scope-unit: calc(var(--tube) * 0.1);
   }
 }
 @media (max-width: 560px) {
@@ -9350,9 +9377,9 @@ body {
   position: absolute;
   left: 0;
   right: 0;
-  top: calc(50% + var(--scope-num) * 0.5 + 4px);
+  top: calc(50% + var(--scope-num) * 0.5 + 4px - var(--pair-lift));
   text-align: center;
-  font: 11px var(--font-mono);
+  font: var(--scope-unit)/1.2 var(--font-mono);
   letter-spacing: 0.1em;
   color: var(--scope-phosphor);
   opacity: 0.7;
@@ -9389,7 +9416,7 @@ body {
   position: absolute;
   left: 0;
   right: 0;
-  top: calc(50% + var(--ico) / 2 + 4px);
+  top: calc(50% + var(--ico) / 2 + 4px - var(--pair-lift));
   margin-top: 0;
   color: var(--lamp-tools);
   text-shadow: 0 0 8px color-mix(in srgb, var(--lamp-tools) 60%, transparent);

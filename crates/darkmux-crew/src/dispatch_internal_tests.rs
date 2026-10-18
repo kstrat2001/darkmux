@@ -12518,6 +12518,228 @@
         assert_eq!(heartbeats_in(&isolated.path().join("flows")).len(), beats_after_first, "a repeated count wrote a durable heartbeat");
     }
 
+    /// (#3210, PR #3293 review) What the tailer writes after a turn's prefill
+    /// never rides the hub, even while the runtime counts nothing generated
+    /// (a reasoning field it did not read): an opener, the final report, then
+    /// 30 chunks at `generated_chars: 0` carrying the turn's count, each with
+    /// the 2 s window open. Only the opener and the report are prompt-phase.
+    #[test]
+    #[serial]
+    fn tailer_chunks_after_the_prefill_are_never_prompt_phase() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":2516,"total":2516}"#);
+        state.poll_and_emit();
+        for i in 1..=30u64 {
+            state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+            append(&format!(r#"{{"type":"model.partial","seq":3,"partial_index":{i},"cumulative_chars":0,"generated_chars":0,"ts":{}}}"#, 1_758_700_009_000u64 + i * 2000));
+            state.poll_and_emit();
+        }
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 32, "every chunk wrote a durable beat: {}", beats.len());
+        let prompt_phase: Vec<&serde_json::Value> = beats
+            .iter()
+            .filter(|b| darkmux_flow::is_prompt_phase_heartbeat(&serde_json::from_value(b["payload"].clone()).unwrap()))
+            .collect();
+        assert_eq!(prompt_phase.len(), 2, "only the opener and the report travel, not {} of 32", prompt_phase.len());
+        assert!(prompt_phase[0]["payload"].get("prompt_chars").is_some());
+        assert_eq!(prompt_phase[1]["payload"]["prompt_processed"], 2516);
+    }
+
+    /// (#3210, PR #3293 re-review) A prefill report that arrives after the
+    /// reply's first chunk (an engine that reports late, or out of order)
+    /// writes no durable heartbeat of its own: the prefill is over, so
+    /// "prompt-phase beats are written before the first chunk" holds by
+    /// code. Its count still rides the turn's later beats.
+    #[test]
+    #[serial]
+    fn tailer_a_progress_report_after_the_first_chunk_writes_no_beat() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        let open_window = |s: &mut TailerState| s.last_heartbeat_at = s.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#);
+        state.poll_and_emit();
+        open_window(&mut state);
+        append(r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":2,"generated_chars":2,"ts":1758700009000}"#);
+        state.poll_and_emit();
+        open_window(&mut state);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700010000,"processed":2516,"total":2516}"#);
+        state.poll_and_emit();
+        open_window(&mut state);
+        append(r#"{"type":"model.partial","seq":3,"partial_index":2,"cumulative_chars":9,"generated_chars":9,"ts":1758700012000}"#);
+        state.poll_and_emit();
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        let shape: Vec<(Option<u64>, Option<u64>)> =
+            beats.iter().map(|b| (b["payload"]["partial_index"].as_u64(), b["payload"]["prompt_processed"].as_u64())).collect();
+        assert_eq!(shape, [(None, None), (None, Some(512)), (Some(1), Some(512)), (Some(2), Some(2516))], "the late report rides the next chunk's beat only");
+        let prompt_phase = beats
+            .iter()
+            .filter(|b| darkmux_flow::is_prompt_phase_heartbeat(&serde_json::from_value(b["payload"].clone()).unwrap()))
+            .count();
+        assert_eq!(prompt_phase, 2, "the opener and the report before the first chunk");
+    }
+
+    /// Shared set-up for the tailer's hub-relay tests: a tailer over a fresh
+    /// trajectory, and an appender for its lines.
+    fn relay_rig() -> (darkmux_types::test_isolation::IsolatedState, TempDir, TailerState) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let state = TailerState::new(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::new(Mutex::new(Instant::now())),
+            600,
+        );
+        (isolated, tmp, state)
+    }
+
+    fn relay_feed(tmp: &TempDir, state: &mut TailerState, line: &str) {
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(tmp.path().join("trajectory.jsonl")).unwrap(), "{line}").unwrap();
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        state.poll_and_emit();
+    }
+
+    /// (#3210, PR #3293 re-review) Every stream's first generation beat
+    /// rides the hub, even when the previous stream's mark was under 20 s
+    /// ago: a short turn still gives a peer a beat to read GEN from.
+    #[test]
+    #[serial]
+    fn tailer_marks_the_first_generation_beat_of_every_stream() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":1,"ts":1758700000000,"system_chars":10,"prompt_chars":10}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":1,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700001000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":2,"ts":1758700004000,"system_chars":10,"prompt_chars":20}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":2,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700006000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":2,"partial_index":2,"cumulative_chars":9,"generated_chars":9,"ts":1758700008000}"#);
+        let marked: Vec<(u64, u64)> = heartbeats_in(&isolated.path().join("flows"))
+            .iter()
+            .filter(|b| b["payload"]["hub_relay"] == true)
+            .map(|b| (b["payload"]["turn_seq"].as_u64().unwrap(), b["payload"]["partial_index"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(marked, [(1, 1), (2, 1)], "each stream's first generation beat, 5 s apart");
+    }
+
+    /// (#3210, PR #3293 re-review) A new stream on the same turn (a
+    /// continuation) forgets that the previous stream's reply had started:
+    /// its prefill report is a prompt-phase beat again.
+    #[test]
+    #[serial]
+    fn tailer_a_new_stream_on_the_same_turn_reads_its_prefill_again() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":10,"prompt_chars":10}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":5,"generated_chars":5,"ts":1758700001000}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":3,"ts":1758700002000,"system_chars":10,"prompt_chars":20}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.prompt.progress","seq":3,"ts":1758700003000,"processed":512,"total":1024}"#);
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        let last = beats.last().expect("beats");
+        assert_eq!(last["payload"]["prompt_processed"], 512, "the report wrote a beat: {last}");
+        assert!(darkmux_flow::is_prompt_phase_heartbeat(&serde_json::from_value(last["payload"].clone()).unwrap()), "{last}");
+    }
+
+    /// (#3210, PR #3293 live check) While a turn generates, the tailer marks
+    /// one durable beat every 20 s for the hub, on the beats' own clock (the
+    /// fixture's `ts`), so a peer's card keeps a rate and never reads STALL.
+    /// The opener and the report travel as prompt-phase beats; the rest of
+    /// the 2 s beats stay local.
+    #[test]
+    #[serial]
+    fn tailer_marks_one_generation_beat_per_20_s_for_the_hub() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":2516,"total":2516}"#);
+        state.poll_and_emit();
+        const FIRST: u64 = 1_758_700_010_000;
+        for i in 0..=30u64 {
+            state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+            append(&format!(
+                r#"{{"type":"model.partial","seq":3,"partial_index":{},"cumulative_chars":{},"generated_chars":{},"ts":{}}}"#,
+                i + 1,
+                i * 30,
+                i * 40 + 4,
+                FIRST + i * 2000
+            ));
+            state.poll_and_emit();
+        }
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 33, "every chunk wrote a durable beat");
+        let relayed: Vec<u64> = beats
+            .iter()
+            .filter(|b| b["payload"]["hub_relay"] == true)
+            .map(|b| b["payload"]["sampled_at_ms"].as_u64().unwrap() - FIRST)
+            .collect();
+        assert_eq!(relayed, [0, 2_000, 22_000, 42_000], "the stream-open chunk, the first real output, then one per 20 s from it");
+        let to_hub = beats
+            .iter()
+            .filter(|b| darkmux_flow::heartbeat_rides_hub(&serde_json::from_value(b["payload"].clone()).unwrap()))
+            .count();
+        assert_eq!(to_hub, 6, "the opener, the report and four generation beats");
+    }
+
+    /// (Matrix review) A short turn under 20 s: the tailer relays its
+    /// stream-open chunk, its first real output, and the beat entering the
+    /// tool call it writes, so a peer gets a rate about 2 s into generation
+    /// and sees tool gen. Real shape: PG2's turn 8 (2026-10-18; chunk times
+    /// and counts as written, the writing ticks every 2 s).
+    #[test]
+    #[serial]
+    fn tailer_relays_a_short_turns_first_output_and_its_tool_call() {
+        let (isolated, tmp, mut state) = relay_rig();
+        relay_feed(&tmp, &mut state, r#"{"type":"model.streaming.start","seq":8,"ts":1792325897697,"system_chars":10,"prompt_chars":57235}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":8,"partial_index":1,"cumulative_chars":0,"generated_chars":3,"ts":1792325898984}"#);
+        relay_feed(&tmp, &mut state, r#"{"type":"model.partial","seq":8,"partial_index":163,"cumulative_chars":0,"generated_chars":656,"ts":1792325900856}"#);
+        for ts in [1_792_325_903_460u64, 1_792_325_905_469, 1_792_325_907_476] {
+            relay_feed(&tmp, &mut state, &format!(r#"{{"type":"model.tool_call.writing","seq":8,"partial_index":293,"cumulative_chars":262,"generated_chars":1238,"phase":"writing_tool_call","tool_name":"edit","ts":{ts}}}"#));
+        }
+        let marked: Vec<u64> = heartbeats_in(&isolated.path().join("flows"))
+            .iter()
+            .filter(|b| b["payload"]["hub_relay"] == true)
+            .map(|b| b["payload"]["sampled_at_ms"].as_u64().unwrap())
+            .collect();
+        assert_eq!(marked, [1_792_325_898_984, 1_792_325_900_856, 1_792_325_903_460], "chunk, first output, first writing beat");
+    }
+
     /// (#3210) Coalescing keeps the LATEST progress, not the first: reports
     /// held back by the 2 s window ride on the turn's next heartbeat, and a
     /// new stream (a new turn, or a continuation of the same one) starts
