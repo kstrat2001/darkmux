@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.2.0)
+#   brew install darkmux                # stable release (v5.3.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,10 +17,10 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.2.0, the utility model can run on an endpoint darkmux does not manage.
+  # Stable release: v5.3.0, Linux on Omarchy, engine facade stage 4, prompt progress on the scope.
   # See CHANGELOG.md.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.2.0.tar.gz"
-  sha256 "94e2e52d652f0d04aa1ce44a3339cdb0bcbe77e9083dbaca34e6ff62f09bf917"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.3.0.tar.gz"
+  sha256 "3bf45c157dda2c4126de044251a2aa34714bde6613f9761247e582227c4b6f0b"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
