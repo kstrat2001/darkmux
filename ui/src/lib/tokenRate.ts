@@ -571,7 +571,7 @@ function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
 
 /** (#3210) How many of its own steps an engine reporting prefill progress
  *  may stay silent before the silence reads STALL. */
-export const PROGRESS_STALL_STEPS = 3;
+const PROGRESS_STALL_STEPS = 3;
 
 /** (#3210) The reports that moved the count forward, oldest first. A
  *  repeat of a count already reported is not progress: it proves only that
@@ -594,7 +594,7 @@ function advances(reports: HeartbeatSample[]): HeartbeatSample[] {
  *  never less than `STALL_AFTER_MS`. Steps are measured between reports
  *  only: the wait before the first one (a request queued behind another,
  *  a cache lookup) is not the engine's pace. */
-export function progressStallAfterMs(advanced: HeartbeatSample[]): number {
+function progressStallAfterMs(advanced: HeartbeatSample[]): number {
   let longest = 0;
   for (let i = 1; i < advanced.length; i++) longest = Math.max(longest, advanced[i].atMs - advanced[i - 1].atMs);
   return Math.max(STALL_AFTER_MS, PROGRESS_STALL_STEPS * longest);
