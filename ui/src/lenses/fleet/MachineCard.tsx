@@ -264,6 +264,11 @@ function CountLine({
   );
 }
 
+/** (#3210) PROMPT's processed fraction for the scope's bar, when reported. */
+function promptFractionOf(r: { state: string | null; promptProgress?: { processed: number; total: number } }): number | undefined {
+  return r.state === "prompt" && r.promptProgress ? r.promptProgress.processed / r.promptProgress.total : undefined;
+}
+
 /** The tube: a live execution's scope, the idle ring, the powered-off screen of
  * an offline machine, or no-signal static. Every card carries the tube's box,
  * so no card changes size when its data arrives or its machine comes and goes. */
@@ -308,7 +313,7 @@ function CardTube({
           toolName={selected.toolName}
           toolWriting={selected.writing === true}
           thinking={selected.state === "generating" && selected.thinking === true}
-          promptFraction={selected.state === "prompt" && selected.promptProgress ? selected.promptProgress.processed / selected.promptProgress.total : undefined}
+          promptFraction={promptFractionOf(selected)}
           {...scopeCenter({
             state: scopeState,
             tokensPerSec: selected.tokensPerSec,

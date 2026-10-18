@@ -234,6 +234,12 @@ function heroNote(
   return null;
 }
 
+/** (#3210) The scope's prompt bar: PROMPT's processed fraction when the engine
+ *  reports it, never while compacting (the utility's work, not the prompt's). */
+function promptBar(state: ScopeState, compacting: boolean, p: { processed: number; total: number } | undefined): { promptFraction?: number } {
+  return state === "prompt" && !compacting && p !== undefined ? { promptFraction: p.processed / p.total } : {};
+}
+
 /** (#2890) What the MODEL hero's scope shows, from the one view derivation:
  *  the live reading while the run is going, the calm finished state with its
  *  average once it has ended, or nothing when the unit did no model work.
@@ -291,7 +297,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       toolWriting: state === "tools" ? writing : undefined,
       thinking: generating && live.thinking === true,
       ...(state === "rest" && live.restEndMs !== undefined ? { restEndMs: live.restEndMs, clockMs: live.clockMs } : {}),
-      ...(state === "prompt" && !compacting && live.promptProgress !== undefined ? { promptFraction: live.promptProgress.processed / live.promptProgress.total } : {}),
+      ...promptBar(state, compacting, live.promptProgress),
       // (#2890) The center is the SAME for every scope in the app: see
       // `lib/scopeCenter.ts`.
       ...scopeCenter({

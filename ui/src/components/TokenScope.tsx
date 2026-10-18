@@ -524,6 +524,22 @@ function parseWhole(label: string | null | undefined): number | null {
   return label != null && /^\d+$/.test(label) ? Number(label) : null;
 }
 
+/** (#3210) PROMPT's center: the brain, and under it, once the engine reports
+ *  progress, a thin bordered bar filled to the processed fraction. */
+function BrainCenter({ state, promptFraction }: { state: ScopeState; promptFraction: number | undefined }) {
+  const barPct = promptFraction !== undefined && Number.isFinite(promptFraction) ? Math.round(Math.max(0, Math.min(1, promptFraction)) * 100) : null;
+  return (
+    <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state} data-progress={barPct !== null ? "" : undefined}>
+      <BrainGlyph className="token-scope-ico" />
+      {barPct !== null ? (
+        <span className="token-scope-bar">
+          <span className="token-scope-bar__fill" style={{ width: `${barPct}%` }} />
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 export function TokenScope({
   tokensPerSec,
   state: stateProp,
@@ -752,17 +768,7 @@ export function TokenScope({
     );
   } else if (showBrain) {
     centerKey = "brain";
-    const barPct = promptFraction !== undefined && Number.isFinite(promptFraction) ? Math.round(Math.max(0, Math.min(1, promptFraction)) * 100) : null;
-    centerNode = (
-      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state} data-progress={barPct !== null ? "" : undefined}>
-        <BrainGlyph className="token-scope-ico" />
-        {barPct !== null ? (
-          <span className="token-scope-bar">
-            <span className="token-scope-bar__fill" style={{ width: `${barPct}%` }} />
-          </span>
-        ) : null}
-      </div>
-    );
+    centerNode = <BrainCenter state={state} promptFraction={promptFraction} />;
   } else if (showNumber) {
     centerKey = `num:${state}`;
     centerNode = (
