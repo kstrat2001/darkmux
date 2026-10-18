@@ -1189,7 +1189,7 @@ describe("cardFace (#2958)", () => {
   });
 
   it("nothing answered: an idle card says checking…, with no-signal static and no count", () => {
-    expect(cardFace(quiet, false, none)).toMatchObject({ status: CardStatus.Checking, noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false });
+    expect(cardFace(quiet, false, none)).toMatchObject({ status: CardStatus.Checking, noSignal: true, tube: "seeking", countShown: false, utilityQuietKnown: false, active: false });
   });
 
   it("everything answered: idle is a reading", () => {
@@ -1214,7 +1214,7 @@ describe("cardFace (#2958)", () => {
 
   it("offline waits on presence and the flow window, not on /runs; it keeps the tube's box, powered off", () => {
     const gone = { active: false, runsCount: 0, standing: "offline" as const, availability: "known" as const, note: null };
-    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ status: CardStatus.Checking, tube: "nosignal" });
+    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ status: CardStatus.Checking, tube: "seeking" });
     expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ status: CardStatus.Checking });
     expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ status: CardStatus.Offline, tube: "off", noSignal: false, countShown: false });
     expect(cardFace(gone, false, all)).toMatchObject({ status: CardStatus.Offline, tube: "off", countShown: true });
@@ -1268,7 +1268,7 @@ describe("cardFace: an undecided standing is not idle", () => {
   const none = { flow: false, presence: false, sessions: false, runs: false };
   it("says checking… until presence answers, then not streaming; offline only when the standing is offline", () => {
     const base = { active: false, runsCount: 0, availability: "known" as const, note: "not listening" as string | null };
-    expect(cardFace({ ...base, standing: "unknown" }, false, none)).toMatchObject({ status: CardStatus.Checking, tube: "nosignal" });
+    expect(cardFace({ ...base, standing: "unknown" }, false, none)).toMatchObject({ status: CardStatus.Checking, tube: "seeking" });
     expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ status: CardStatus.NotStreaming, tube: "nosignal" });
     expect(cardFace({ ...base, note: null, standing: "online" }, false, all)).toMatchObject({ status: CardStatus.Idle, tube: "idle" });
     expect(cardFace({ ...base, standing: "offline" }, false, all)).toMatchObject({ status: CardStatus.Offline, tube: "off" });

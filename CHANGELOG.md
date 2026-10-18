@@ -37,6 +37,12 @@ darkmux release.
   mid-way is never STALL sooner than an engine that reports nothing. Engines that report
   nothing read as before. llama.cpp and LM Studio are not recognized yet.
 
+- **A fleet card still checking sweeps like a radar** (#3284). While a card waits for its
+  first answers ("checking…"), its scope draws an old radar sweep: a turning beam with a
+  fading phosphor trail over faint range rings. Static now means only a card whose sources
+  answered and still show nothing, so looking and lost no longer look the same. Reduced
+  motion draws one still frame.
+
 - **The machine lens reads a Linux machine** (#3275). CPU load per core and per tier
   (`/proc/stat`; `cpufreq` policies of equal capacity are one tier, as macOS's perf levels
   are, each reading its own CPUs even when they are not one block, as on an M1 Ultra's two

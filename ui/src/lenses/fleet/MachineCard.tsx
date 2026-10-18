@@ -269,6 +269,12 @@ function promptFractionOf(r: { state: string | null; promptProgress?: { processe
   return r.state === "prompt" && r.promptProgress ? r.promptProgress.processed / r.promptProgress.total : undefined;
 }
 
+/** (#3284) The scope state for a tube with no reading to draw: the radar
+ *  sweep while checking, static once the sources answered with nothing. */
+function noReadingTube(tube: CardFace["tube"]): "seeking" | "nosignal" | null {
+  return tube === "seeking" || tube === "nosignal" ? tube : null;
+}
+
 /** The tube: a live execution's scope, the idle ring, the powered-off screen of
  * an offline machine, or no-signal static. Every card carries the tube's box,
  * so no card changes size when its data arrives or its machine comes and goes. */
@@ -332,10 +338,11 @@ function CardTube({
       </div>
     );
   }
-  if (face.tube === "nosignal") {
+  const state = noReadingTube(face.tube);
+  if (state) {
     return (
       <div className="mach-scope" data-testid="fleet-token-scope">
-        <TokenScope tokensPerSec={0} state="nosignal" size="card" {...scopeCenter({ state: "nosignal", tokensPerSec: 0 })} />
+        <TokenScope tokensPerSec={0} state={state} size="card" {...scopeCenter({ state, tokensPerSec: 0 })} />
       </div>
     );
   }

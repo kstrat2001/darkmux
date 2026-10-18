@@ -315,7 +315,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         if (id === "loading") {
           await expect(page.locator(".mach .runs").first(), "loading: no count yet").toHaveText("—");
           for (let i = 0; i < want.length; i++) {
-            await expect(cards.nth(i).locator(".token-scope-bezel"), "loading: the no-signal tube").toHaveAttribute("data-state", "nosignal");
+            await expect(cards.nth(i).locator(".token-scope-bezel"), "loading: the radar sweep (#3284)").toHaveAttribute("data-state", "seeking");
           }
         } else if (offline) {
           await expect(cards.nth(1).locator(".token-scope-bezel"), "offline: the powered-off tube").toHaveAttribute("data-state", "off");
