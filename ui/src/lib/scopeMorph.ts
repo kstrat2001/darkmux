@@ -157,16 +157,7 @@ export function scopeTargets(
       // (#2890, operator) Full radius like TOOLS; the breath pulses around it.
       out.rscale = 1;
       break;
-    case "nosignal":
-      out.ring = 0;
-      out.fuzz = 1;
-      break;
-    case "seeking":
-      // (#3284, operator: "more like a search animation, maybe like old
-      // school radar seek") The sweep draws its own range rings.
-      out.ring = 0;
-      out.radar = 1;
-      break;
+
     case "finished":
       // (#2890 operator review) The ended run's echo: the wave its AVERAGE
       // rate draws, so the shape matches the number in the center, turning
@@ -201,8 +192,19 @@ export function scopeTargets(
         out.ember = 1;
       }
       break;
+    default:
+      noReadingTargets(state, out);
   }
   return out;
+}
+
+/** No reading to draw, so no trace: `nosignal` is static, and (#3284,
+ *  operator: "more like a search animation, maybe like old school radar
+ *  seek") `seeking` is a radar sweep that draws its own range rings. */
+function noReadingTargets(state: "nosignal" | "seeking", out: ScopeParams): void {
+  out.ring = 0;
+  if (state === "seeking") out.radar = 1;
+  else out.fuzz = 1;
 }
 
 /** A scope's morph state, owned by one mounted component. `p` is `null`

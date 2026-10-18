@@ -502,7 +502,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.shadowBlur = 0;
   }
   // SEEKING (#3284): an old radar scope looking for the machine.
-  if (p.radar > 0.02) drawRadar(ctx, cx, cy, R, p, c.radarT);
+  drawRadar(ctx, cx, cy, R, p, c.radarT);
   // NO SIGNAL: static fading in.
   if (p.fuzz > 0.02) {
     const rr = Math.min(w, h) / 2;
@@ -530,6 +530,7 @@ const RADAR_TRAIL_STEPS = 24;
  *  frame's translucent clear adds the afterglow. The wedges are unblurred and
  *  only the beam carries a glow (canvas blur is paid per stroke; see TOOLS). */
 function drawRadar(ctx: CanvasRenderingContext2D, cx: number, cy: number, R: number, p: ScopeParams, head: number) {
+  if (p.radar <= 0.02) return;
   const { r: cr, g: cg, b: cb } = p;
   const k = p.radar;
   const rx = R * p.sx;

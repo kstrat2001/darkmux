@@ -652,6 +652,12 @@ function statusOf(f: { absent: boolean; active: boolean; notStreaming: boolean; 
  *  - A quiet utility strip's "idle": waits on the flow window, the only
  *    source of utility jobs.
  *  Until then the card says "checking…", in the same boxes. */
+/** (#3284) A card with no reading: still checking sweeps for its machine;
+ *  static is for a card whose sources answered and still show nothing. */
+function noReadingTube(status: CardStatus): "seeking" | "nosignal" {
+  return status === CardStatus.Checking ? "seeking" : "nosignal";
+}
+
 export function cardFace(
   card: { active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability; note: string | null },
   hasReading: boolean,
@@ -671,9 +677,7 @@ export function cardFace(
   const status = statusOf({ absent, active: card.active, notStreaming, idleKnown, cardRead: card.note === null });
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
-  // (#3284) A card still checking sweeps for its machine; static is for a
-  // card whose sources answered and still show nothing.
-  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : status === CardStatus.Checking ? "seeking" : "nosignal";
+  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : noReadingTube(status);
   return {
     status,
     active,
