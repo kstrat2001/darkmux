@@ -51,9 +51,9 @@ export interface HeartbeatSample {
   /** (#2889) The request's size in chars, carried only by a turn's opening
    *  heartbeat (flow schema 1.56.0). */
   promptChars?: number;
-  /** (#3210) The engine's prefill progress, in prompt tokens
-   *  (`prompt_processed` of `prompt_total`, flow 2.3.0): the latest report
-   *  this turn when the engine reports any. */
+  /** (#3210) The engine's prefill progress, in tokens of this request's
+   *  uncached prompt (`prompt_processed` of `prompt_total`, flow 2.3.0): the
+   *  latest report this turn when the engine reports any. */
   prompt?: { processed: number; total: number };
   /** (#2928) The latest moment this sample's state was known to still hold:
    *  a live-channel refresh (the host re-sending a silent state, stamped
@@ -524,10 +524,11 @@ function producedOutput(b: HeartbeatSample): boolean {
   return b.chars !== 0 || b.writingTool !== undefined;
 }
 
-/** (#3210) How far the engine has read the prompt, as PROMPT shows it:
- *  `percent` (whole, rounded down, so 100 only once it is all read) and,
- *  from two or more reports' rate, `secondsLeft` (absent until there is a
- *  rate, and once the prompt is all read). */
+/** (#3210) How far the engine has read this request's uncached prompt (what
+ *  its prompt cache did not hold), as PROMPT shows it: `percent` (whole,
+ *  rounded down, so 100 only once it is all read) and, from two or more
+ *  advancing reports' rate, `secondsLeft` (absent until there is a rate,
+ *  and once it is all read). */
 export interface PromptProgress {
   processed: number;
   total: number;
@@ -572,49 +573,73 @@ function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
  *  may stay silent before the silence reads STALL. */
 export const PROGRESS_STALL_STEPS = 3;
 
-/** (#3210) The silence allowed after an engine's last progress report: the
- *  longest step it has taken so far this turn (opener to first report
- *  included) times `PROGRESS_STALL_STEPS`, never less than
- *  `STALL_AFTER_MS`. The engine's own pace, measured, replaces the
- *  size-scaled guess `prefillStallAfterMs` makes when it reports nothing. */
-export function progressStallAfterMs(openerAtMs: number, reports: HeartbeatSample[]): number {
-  let prev = openerAtMs;
-  let longest = 0;
+/** (#3210) The reports that moved the count forward, oldest first. A
+ *  repeat of a count already reported is not progress: it proves only that
+ *  the socket is open, which a wedged engine can do forever. */
+function advances(reports: HeartbeatSample[]): HeartbeatSample[] {
+  const out: HeartbeatSample[] = [];
+  let most = 0;
   for (const r of reports) {
-    longest = Math.max(longest, r.atMs - prev);
-    prev = r.atMs;
+    const n = r.prompt?.processed ?? 0;
+    if (n > most) {
+      out.push(r);
+      most = n;
+    }
   }
+  return out;
+}
+
+/** (#3210) The silence allowed after an engine's last advancing report: the
+ *  longest step between two advancing reports times `PROGRESS_STALL_STEPS`,
+ *  never less than `STALL_AFTER_MS`. Steps are measured between reports
+ *  only: the wait before the first one (a request queued behind another,
+ *  a cache lookup) is not the engine's pace. */
+export function progressStallAfterMs(advanced: HeartbeatSample[]): number {
+  let longest = 0;
+  for (let i = 1; i < advanced.length; i++) longest = Math.max(longest, advanced[i].atMs - advanced[i - 1].atMs);
   return Math.max(STALL_AFTER_MS, PROGRESS_STALL_STEPS * longest);
 }
 
 /** (#3145) Whether a prefill has outlasted its bound: silent past
  *  `STALL_AFTER_MS` (the ordinary rule, so a live refresh still counts)
  *  AND past `prefillStallAfterMs` of its opener. (#3210) When the engine
- *  reports progress, its own pace bounds the silence after its last report
- *  instead (`progressStallAfterMs`); `prefillStallAfterMs` applies only
- *  when it reports none. */
+ *  reports progress, the silence counts from its last ADVANCING report
+ *  (repeats keep the heartbeat fresh but are not progress): with two or
+ *  more advances its own pace bounds it (`progressStallAfterMs`); with
+ *  fewer, the size-scaled bound from the opener still applies, and the
+ *  silence must also pass `STALL_AFTER_MS`. */
 function prefillOverdue(opener: PrefillOpener, records: NormRecord[], nowMs: number): boolean {
-  if (!isStalled(records, nowMs)) return false;
-  const last = opener.reports[opener.reports.length - 1];
-  if (last !== undefined) return nowMs - freshOf(last) > progressStallAfterMs(opener.atMs, opener.reports);
-  return nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+  if (opener.reports.length === 0) return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+  const moved = advances(opener.reports);
+  const silentMs = nowMs - (moved[moved.length - 1]?.atMs ?? opener.atMs);
+  if (moved.length >= 2) return silentMs > progressStallAfterMs(moved);
+  return silentMs > STALL_AFTER_MS && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
 }
 
 /** (#3210) The prefill progress PROMPT shows: the latest report, and the
- *  time left at the rate between the first and the latest report, less the
- *  time since the latest. `undefined` when the engine reported none. */
+ *  time left at the rate between the first and the last ADVANCING report,
+ *  less the time since that last advance (a repeat does not slow the rate).
+ *  `undefined` when the engine reported none. */
 function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress | undefined {
   const last = opener.reports[opener.reports.length - 1];
   if (last?.prompt === undefined) return undefined;
   const { processed, total } = last.prompt;
   const out: PromptProgress = { processed, total, percent: Math.floor((processed / total) * 100) };
-  const first = opener.reports[0].prompt;
-  const spanMs = last.atMs - opener.reports[0].atMs;
-  if (first !== undefined && processed < total && spanMs > 0 && processed > first.processed) {
-    const perMs = (processed - first.processed) / spanMs;
-    out.secondsLeft = Math.max(0, Math.ceil(((total - processed) / perMs - (nowMs - last.atMs)) / 1000));
-  }
+  const secondsLeft = secondsLeftOf(advances(opener.reports), total, nowMs);
+  if (secondsLeft !== undefined) out.secondsLeft = secondsLeft;
   return out;
+}
+
+/** (#3210) The time left at the advancing reports' rate, from two or more
+ *  of them; `undefined` before there is a rate, and once all is read. */
+function secondsLeftOf(moved: HeartbeatSample[], total: number, nowMs: number): number | undefined {
+  const first = moved[0]?.prompt;
+  const lastMove = moved[moved.length - 1];
+  const processed = lastMove?.prompt?.processed ?? 0;
+  const spanMs = moved.length >= 2 ? lastMove.atMs - moved[0].atMs : 0;
+  if (first === undefined || processed >= total || spanMs <= 0) return undefined;
+  const perMs = (processed - first.processed) / spanMs;
+  return Math.max(0, Math.ceil(((total - processed) / perMs - (nowMs - lastMove.atMs)) / 1000));
 }
 
 /** (#3210) The PROMPT reading for a turn still reading its prompt: the
@@ -622,6 +647,15 @@ function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress |
 function promptReading(opener: PrefillOpener, nowMs: number): LiveStateReading {
   const progress = prefillProgress(opener, nowMs);
   return { state: "prompt", promptChars: opener.promptChars, ...(progress !== undefined ? { promptProgress: progress } : {}) };
+}
+
+/** The reading while the latest heartbeat is fresh and nothing has been
+ *  generated: PROMPT, with the opener's size and progress. (#3210) Fresh is
+ *  not enough while the engine repeats a count: the prefill is bounded from
+ *  its last advancing report, so a stuck engine still reads STALL. */
+function freshPromptReading(opener: PrefillOpener | null, records: NormRecord[], nowMs: number): LiveStateReading {
+  if (opener === null) return { state: "prompt" };
+  return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
 }
 
 /** (#3210) The status words for a prefill's progress: "40% · ~23s left", or
@@ -1063,7 +1097,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     }
     // (#3145) The size is the turn's opener's, so an empty first chunk
     // after it (which carries none) does not drop it.
-    if (last.chars === 0) return opener !== null ? promptReading(opener, nowMs) : { state: "prompt" };
+    if (last.chars === 0) return freshPromptReading(opener, cut, nowMs);
     return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
   return staleReading(opener, lastBeatAt, cut, nowMs);

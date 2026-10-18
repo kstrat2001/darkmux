@@ -28,7 +28,7 @@ describe("readingLabel: the status line while an execution runs", () => {
       full: "processing 40% · ~23s left",
       word: "40% · ~23s left",
     });
-    expect(readingTitle(exec({ state: "prompt", promptProgress }), "prompt")).toBe("prompt processed: 1,024 of 2,516 tokens, about 23s left");
+    expect(readingTitle(exec({ state: "prompt", promptProgress }), "prompt")).toBe("uncached prompt processed: 1,024 of 2,516 tokens, about 23s left");
   });
   it("compacting counts its seconds", () => {
     expect(readingLabel(exec({ state: "prompt", compacting: true, compactingSeconds: 12 }), "prompt")).toEqual({ kind: "text", text: "compacting · 12s" });

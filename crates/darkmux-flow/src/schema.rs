@@ -21,8 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const FLOW_SCHEMA_VERSION: &str = "2.3.0";
 // Version history:
 //   2.3.0 (#3210): `dispatch.turn.heartbeat` gains `payload.prompt_processed`
-//           and `payload.prompt_total`, in tokens: how much of the prompt
-//           the engine has processed, the latest it reported this turn. A
+//           and `payload.prompt_total`, in tokens: how much of this
+//           request's UNCACHED prompt the engine has processed (`total` is
+//           what its prompt cache did not hold, not the whole prompt), the
+//           latest it reported this turn. A
 //           neutral fact normalized from the engine's own stream (today
 //           `mlx_lm.server`'s `: keepalive <processed>/<total>` comment
 //           lines, recognized by shape by both stream readers through

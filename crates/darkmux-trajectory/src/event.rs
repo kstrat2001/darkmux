@@ -297,16 +297,17 @@ impl Default for ToolCallWriting {
 }
 
 /// `model.prompt.progress` (#3210, trajectory 1.1): the engine reported how
-/// much of the prompt it has processed, in tokens, before its first output
+/// much of this request's uncached prompt it has processed, in tokens, before its first output
 /// ([`crate::PromptProgressSample`] recognizes the shapes). Not a chunk.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptProgress {
     pub seq: u64,
     pub ts: u64,
-    /// Prompt tokens processed so far.
+    /// Tokens of the uncached prompt processed so far.
     pub processed: u64,
-    /// Prompt tokens the engine is processing in all.
+    /// Tokens the engine has to process: this request's prompt less what
+    /// its prompt cache held, not the whole prompt.
     pub total: u64,
 }
 

@@ -34,6 +34,16 @@ fn events(ws: &std::path::Path) -> Vec<serde_json::Value> {
 /// One streamed turn against `script`, with the proof-of-work clock starting
 /// `aged` in the past. Returns the clock after the turn.
 fn run(script: Vec<(Duration, String)>, ws: &std::path::Path, aged: Duration) -> Instant {
+    run_with_warning(script, ws, aged).0
+}
+
+/// [`run`], also returning the soft-warning flag after the turn (it starts
+/// `true`: a warning already fired in this window).
+fn run_with_warning(
+    script: Vec<(Duration, String)>,
+    ws: &std::path::Path,
+    aged: Duration,
+) -> (Instant, bool) {
     let client = LmStudioClient::with_base_url_and_read_timeout(
         sse_server_scripted(script),
         Duration::from_secs(10),
@@ -64,7 +74,7 @@ fn run(script: Vec<(Duration, String)>, ws: &std::path::Path, aged: Duration) ->
         },
     )
     .expect("the stream completes");
-    proof
+    (proof, warned)
 }
 
 fn mlx_capture() -> Vec<(Duration, String)> {
@@ -189,4 +199,68 @@ fn an_unknown_comment_line_writes_no_progress() {
     assert!(!events(ws.path())
         .iter()
         .any(|e| e["type"] == "model.prompt.progress"));
+}
+
+/// (PR #3286 review) A REAL repeat: 512, then 512 again 300 ms later. The
+/// first report resets the inactivity clock; the repeat must not, so the
+/// clock still reads the first report's moment when the turn ends.
+#[test]
+#[serial_test::serial]
+fn a_repeated_count_does_not_reset_the_inactivity_clock() {
+    let ws = tempfile::Builder::new()
+        .prefix("prompt-progress")
+        .tempdir()
+        .unwrap();
+    let hour = Duration::from_secs(3600);
+    let gap = Duration::from_millis(300);
+    let proof = run(
+        vec![
+            (Duration::ZERO, ": keepalive 512/2516".to_string()),
+            (gap, ": keepalive 512/2516".to_string()),
+        ],
+        ws.path(),
+        hour,
+    );
+    assert!(
+        proof.elapsed() < hour / 2,
+        "the first report advanced and must reset the clock"
+    );
+    assert!(
+        proof.elapsed() >= gap - Duration::from_millis(50),
+        "the repeat 300 ms later reset the clock: {:?}",
+        proof.elapsed()
+    );
+}
+
+/// (PR #3286 review) An advancing report re-arms the soft inactivity warning,
+/// as a chunk does; a report that did not advance leaves it fired.
+#[test]
+#[serial_test::serial]
+fn an_advancing_report_re_arms_the_soft_warning_and_a_repeat_does_not() {
+    let ws = tempfile::Builder::new()
+        .prefix("prompt-progress")
+        .tempdir()
+        .unwrap();
+    let (_, warned) = run_with_warning(
+        vec![(Duration::ZERO, ": keepalive 5/10".to_string())],
+        ws.path(),
+        Duration::ZERO,
+    );
+    assert!(
+        !warned,
+        "an advancing report must clear the fired soft warning"
+    );
+    let ws = tempfile::Builder::new()
+        .prefix("prompt-progress")
+        .tempdir()
+        .unwrap();
+    let (_, warned) = run_with_warning(
+        vec![(Duration::ZERO, ": keepalive 0/10".to_string())],
+        ws.path(),
+        Duration::ZERO,
+    );
+    assert!(
+        warned,
+        "a report that did not advance cleared the soft warning"
+    );
 }

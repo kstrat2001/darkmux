@@ -1093,7 +1093,7 @@ impl std::fmt::Display for StreamWentSilent {
 impl std::error::Error for StreamWentSilent {}
 
 /// (#3210) One item of a reply stream: a chunk, or the engine's report of
-/// how much of the prompt it has processed (recognized by its shape,
+/// how much of this request's uncached prompt it has processed (recognized by its shape,
 /// [`darkmux_trajectory::PromptProgressSample`]).
 #[derive(Debug)]
 pub enum StreamItem {
@@ -1247,7 +1247,8 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
 /// none arrived within one tick.
 pub enum StreamEvent {
     Chunk(ChatChunk),
-    /// (#3210) The engine reported how much of the prompt it has processed.
+    /// (#3210) The engine reported how much of this request's uncached
+    /// prompt it has processed.
     PromptProgress(darkmux_trajectory::PromptProgressSample),
     Idle,
 }

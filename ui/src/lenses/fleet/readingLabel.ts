@@ -57,7 +57,9 @@ export function readingTitle(exec: ExecutionTokenReading, state: LiveState): str
   if (state === "prompt" && exec.promptProgress) {
     const p = exec.promptProgress;
     const left = p.secondsLeft !== undefined ? `, about ${compactDuration(p.secondsLeft)} left` : "";
-    return `prompt processed: ${fmtN(p.processed)} of ${fmtN(p.total)} tokens${left}`;
+    // (#3210) mlx_lm reports the part of this request's prompt its cache did
+    // not hold, not the whole prompt: say so.
+    return `uncached prompt processed: ${fmtN(p.processed)} of ${fmtN(p.total)} tokens${left}`;
   }
   if (state === "prompt" && exec.promptLabel) return `estimated prompt size: ${exec.promptLabel} tokens`;
   if (state === "rest" && exec.restReason) return `resting: ${exec.restReason}`;

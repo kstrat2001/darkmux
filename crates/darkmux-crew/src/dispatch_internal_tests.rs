@@ -12483,6 +12483,41 @@
         assert!(deadline > original, "the first report advanced");
     }
 
+    /// (#3210, PR #3286 review) A REAL repeat (512, then 512 again): the
+    /// first report resets the deadline; the repeat must not move it, and
+    /// writes no durable heartbeat even with the window open (it carries no
+    /// fact the previous beat did not).
+    #[test]
+    #[serial]
+    fn tailer_a_repeated_progress_report_neither_resets_the_deadline_nor_writes_a_beat() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let append = |line: &str| writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&traj_path).unwrap(), "{line}").unwrap();
+        append(r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700008000,"processed":512,"total":2516}"#);
+        state.poll_and_emit();
+        let after_first = *shared.lock().unwrap();
+        let beats_after_first = heartbeats_in(&isolated.path().join("flows")).len();
+        std::thread::sleep(Duration::from_millis(30));
+        // The 2 s window has passed: only the repeat itself could hold it back.
+        state.last_heartbeat_at = state.last_heartbeat_at.map(|t| t - HEARTBEAT_MIN_INTERVAL);
+        append(r#"{"type":"model.prompt.progress","seq":3,"ts":1758700010000,"processed":512,"total":2516}"#);
+        state.poll_and_emit();
+        assert_eq!(*shared.lock().unwrap(), after_first, "a repeated count moved the inactivity deadline");
+        assert_eq!(heartbeats_in(&isolated.path().join("flows")).len(), beats_after_first, "a repeated count wrote a durable heartbeat");
+    }
+
     /// (#3210) Coalescing keeps the LATEST progress, not the first: reports
     /// held back by the 2 s window ride on the turn's next heartbeat, and a
     /// new stream (a new turn, or a continuation of the same one) starts
@@ -12548,7 +12583,7 @@
     #[test]
     fn heartbeat_payload_of_a_progress_report_carries_the_fact() {
         let payload = match ev(serde_json::json!({"type": "model.prompt.progress", "seq": 2, "ts": 7u64, "processed": 3, "total": 4})) {
-            darkmux_trajectory::TrajectoryEvent::PromptProgress(p) => heartbeat_payload(&Chunk::of_progress(&p, true)),
+            darkmux_trajectory::TrajectoryEvent::PromptProgress(p) => heartbeat_payload(&Chunk::of_progress(&p)),
             other => panic!("{other:?}"),
         };
         let v = serde_json::to_value(payload).unwrap();

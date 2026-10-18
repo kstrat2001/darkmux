@@ -12,13 +12,18 @@
 //!
 //! - **`mlx_lm.server`** (verified on 0.31.3 and in 0.32.1's source): before
 //!   the first `data:` event it writes one SSE comment line per prefill
-//!   step, `: keepalive <processed>/<total>`, in prompt tokens. Nothing has
-//!   to be asked for.
+//!   step, `: keepalive <processed>/<total>`, in tokens. `total` is this
+//!   request's UNCACHED prompt: the server prefills only what its prompt
+//!   cache did not hold (`server.py` passes `prompt=rest`, and
+//!   `generate.py` reports `len(prompt)` of that), so with a cache hit it is
+//!   less than the whole prompt. Its first report is `0/<total>`. Nothing
+//!   has to be asked for.
 //!
 //! Every other comment line (OpenRouter's `: OPENROUTER PROCESSING`, a bare
 //! `: keepalive`) is not progress and reads as nothing, as before.
 
-/// One progress report: `processed` of `total` prompt tokens read so far.
+/// One progress report: `processed` of the `total` uncached prompt tokens
+/// read so far.
 /// `processed <= total` and `total > 0`, or the report is not recognized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptProgressSample {

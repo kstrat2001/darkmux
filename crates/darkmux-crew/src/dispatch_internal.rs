@@ -11897,15 +11897,29 @@ impl TailerState {
         self.live_model(s.ts, || live);
     }
 
-    /// (#3210) The engine reported how far it has read the prompt: a
-    /// heartbeat like a chunk's, coalesced the same way. Proof of work only
-    /// when it advanced past the turn's previous report: a wedged engine
-    /// can repeat itself, but cannot read more of the prompt.
+    /// (#3210) The engine reported how far it has read the prompt. A report
+    /// that ADVANCED past the turn's previous one is a heartbeat like a
+    /// chunk's (proof of work, coalesced the same way): a wedged engine can
+    /// repeat itself, but cannot read more of the prompt.
+    ///
+    /// A repeat of the same count reaches the live channel only. It writes no
+    /// durable heartbeat at all, even when the 2 s window is open: it carries
+    /// no fact the turn's previous beat does not, and a durable beat every 2 s
+    /// from an engine stuck on one count would read as activity to every
+    /// consumer that keys on the action (the lifecycle, the runs board). That
+    /// is cleaner than emitting it as a non-proof tick: a tick exists to say
+    /// "the model is writing a tool call", which is a state the viewer
+    /// shows; a repeat says nothing new.
     fn on_prompt_progress(&mut self, p: &darkmux_trajectory::PromptProgress) {
         let before = self.prompt_progress.filter(|(seq, _)| *seq == p.seq).map_or(0, |(_, s)| s.processed);
+        let chunk = Chunk::of_progress(p);
+        if p.processed <= before {
+            self.live_model(p.ts, || serde_json::to_value(heartbeat_payload(&chunk)).unwrap_or_default());
+            return;
+        }
         let sample = darkmux_trajectory::PromptProgressSample { processed: p.processed, total: p.total };
         self.prompt_progress = Some((p.seq, sample));
-        self.on_stream_tick(Chunk::of_progress(p, p.processed > before));
+        self.on_stream_tick(chunk);
     }
 
     /// A streamed chunk (`model.partial`) or a writing tick
@@ -12290,12 +12304,11 @@ struct Chunk<'a> {
 }
 
 impl<'a> Chunk<'a> {
-    /// (#3210) A prefill progress report. `advanced` (it read more of the
-    /// prompt than the turn's previous report) makes it proof of work, as a
-    /// chunk is; a repeat is like a writing tick.
-    fn of_progress(p: &darkmux_trajectory::PromptProgress, advanced: bool) -> Self {
+    /// (#3210) A prefill progress report that advanced: proof of work, as a
+    /// chunk is (a repeat never becomes one; see `on_prompt_progress`).
+    fn of_progress(p: &darkmux_trajectory::PromptProgress) -> Self {
         Self {
-            is_chunk: advanced,
+            is_chunk: true,
             seq: p.seq,
             ts: p.ts,
             partial_index: None,

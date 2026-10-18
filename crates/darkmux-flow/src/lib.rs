@@ -4033,7 +4033,8 @@ mod tests {
         //            Also additive (#3125): `beats` on `dispatch.start` and
         //            `run.start`, the writer's promise to beat its session.
         //   2.3.0 — (#3210) additive: `prompt_processed` / `prompt_total` on
-        //            `dispatch.turn.heartbeat`, the engine's prefill progress.
+        //            `dispatch.turn.heartbeat`, the engine's prefill progress over
+        //            this request's uncached prompt.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

@@ -1638,6 +1638,40 @@ describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
     expect(deriveLiveState(slow, T + 80_000 + 3 * 40_000 + 1).state).toBe("stalled");
   });
 
+  it("an engine repeating the same count reads STALL: only an advancing report is progress (PR #3286 review)", () => {
+    // 512 at 8 s, 1,024 at 16 s, then 1,024 again every 2 s to 600 s.
+    const repeats = Array.from({ length: (600 - 18) / 2 + 1 }, (_, i) => report(18 + i * 2, 1_024));
+    const records = [start, opener(), report(8, 512), report(16, 1_024), ...repeats];
+    expect(deriveLiveState(records, T + 601_000)).toEqual({ state: "stalled" });
+    // Still PROMPT inside the bound measured from the last advance (16 s).
+    expect(deriveLiveState(records.filter((r) => (r.tMs ?? 0) <= T + 40_000), T + 40_000).state).toBe("prompt");
+  });
+
+  it("the gap before the first report is not a step: a queued request's wait does not stretch the bound (PR #3286 review)", () => {
+    // First report at 600 s (queued behind another request), the next at 608 s, then silence.
+    const queued = [start, opener(), report(600, 512), report(608, 1_024)];
+    expect(deriveLiveState(queued, T + 608_000 + 600_000)).toEqual({ state: "stalled" });
+    // One step of 8 s measured between reports: past STALL_AFTER_MS it is a stall.
+    expect(deriveLiveState(queued, T + 608_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("with fewer than two advancing reports the bound is the size-scaled one, never under STALL_AFTER_MS", () => {
+    const one = [start, opener(244_552), report(8, 512)];
+    const bound = prefillStallAfterMs(244_552);
+    expect(deriveLiveState(one, T + bound).state).toBe("prompt");
+    expect(deriveLiveState(one, T + bound + 1)).toEqual({ state: "stalled" });
+    // A report early in a long silence still needs STALL_AFTER_MS of its own.
+    const late = [start, opener(0), report(85, 512)];
+    expect(deriveLiveState(late, T + 85_000 + STALL_AFTER_MS).state).toBe("prompt");
+    expect(deriveLiveState(late, T + 85_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("the time left is measured over advancing reports only: repeats do not slow the rate", () => {
+    const records = [start, opener(), report(8, 512), report(16, 1_024), report(18, 1_024)];
+    // 64 tok/s between the advances; 1,492 left = 23.3 s, less 3 s since the last advance.
+    expect(deriveLiveState(records, T + 19_000)).toMatchObject({ state: "prompt", promptProgress: { processed: 1_024, secondsLeft: 21 } });
+  });
+
   it("prefillStallAfterMs applies only when no progress fact exists", () => {
     // A 244,552-char opener allows 579 s of silence with no progress; once
     // the engine reports progress, its own pace bounds the silence instead.

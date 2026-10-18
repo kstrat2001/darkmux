@@ -71,7 +71,8 @@ export interface TokenScopeProps {
    *  omitted it is derived from the older props below (`stalled`,
    *  `resting`, `tone`), so an existing caller keeps working. */
   state?: ScopeState;
-  /** (#3210) PROMPT's processed fraction (0..1) when the engine reports it:
+  /** (#3210) PROMPT's processed fraction (0..1) of this request's uncached
+   *  prompt, when the engine reports it:
    *  the brain moves up and a thin bar under it fills that far. Absent, or
    *  outside PROMPT, the brain sits alone as before. */
   promptFraction?: number;

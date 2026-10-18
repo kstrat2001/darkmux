@@ -20,19 +20,21 @@ darkmux release.
   prefill progress in its stream, the scope's brain moves up over a thin bar that fills as
   the prompt is read (bordered, so it shows empty from the first report), the fleet card
   reads "processing 40% · ~23s left" (on a phone, "40% · ~23s left") and the run page's
-  readout says the same under the lamps; the
-  time left is estimated from the reports' own rate once there are two. Today that is
-  `mlx_lm.server`, which writes one `: keepalive <processed>/<total>` comment line per
-  prefill step with nothing to opt into. Both stream readers (the runtime's and the
-  host-side direct path) recognize that shape through one shared parser and record it as
-  a neutral fact on `dispatch.turn.heartbeat`: `prompt_processed` and `prompt_total`, in
-  tokens (flow schema 2.3.0, additive; trajectory schema 1.1 adds the
-  `model.prompt.progress` event). A report that advances counts as proof of work, so a
-  long prefill on slow hardware no longer reads as STALL while it is moving; the silence
-  after the last report is bounded by three of the engine's own measured steps (never
-  under 30 s), and the size-based prefill bound applies only to an engine that reports
-  nothing. Engines that report nothing read as before. llama.cpp and LM Studio are not
-  recognized yet.
+  readout says the same under the lamps; the time left is estimated from the rate of the
+  reports that advanced, once there are two. Today that is `mlx_lm.server`, which writes
+  one `: keepalive <processed>/<total>` comment line per prefill step with nothing to opt
+  into. Its `total` is this request's uncached prompt: what its prompt cache did not
+  already hold, so with a cache hit the percentage is of the remainder, not the whole
+  prompt. Both stream readers (the runtime's and the host-side direct path) recognize that
+  shape through one shared parser and record it as a neutral fact on
+  `dispatch.turn.heartbeat`: `prompt_processed` and `prompt_total`, in tokens (flow schema
+  2.3.0, additive; trajectory schema 1.1 adds the `model.prompt.progress` event). A report
+  that advances counts as proof of work, so a long prefill on slow hardware no longer reads
+  as STALL while it is moving; a report repeating the same count does not, and writes no
+  durable heartbeat. The silence after the last advance is bounded by three of the
+  engine's own steps between reports (never under 30 s); before there are two advances,
+  and for an engine that reports nothing, the size-based prefill bound applies. Engines
+  that report nothing read as before. llama.cpp and LM Studio are not recognized yet.
 
 - **The machine lens reads a Linux machine** (#3275). CPU load per core and per tier
   (`/proc/stat`; `cpufreq` policies of equal capacity are one tier, as macOS's perf levels
