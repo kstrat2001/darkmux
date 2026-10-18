@@ -718,6 +718,15 @@ pub struct DispatchHeartbeatPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub prompt_total: Option<u64>,
+    /// (#3210, flow 2.3.0) `true` on the sparse generation beats the writer
+    /// picked to ride the fleet hub (at most one per execution every
+    /// `HUB_GENERATION_BEAT_INTERVAL_MS`), so another machine's card keeps a
+    /// rate and never reads STALL while this one generates. Absent otherwise:
+    /// a beat without it stays on this machine unless it is a prompt-phase
+    /// beat (`darkmux_flow::is_prompt_phase_heartbeat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub hub_relay: Option<bool>,
     /// The graph step the record belongs to, when its session is a step's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

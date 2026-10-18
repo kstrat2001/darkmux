@@ -38,17 +38,23 @@ darkmux release.
   nothing read as before. llama.cpp and LM Studio are not recognized yet.
   Another machine's card shows the bar and the time left too, live and in playback: a
   turn's prompt-phase heartbeats (its opener, and the engine's reports written before the
-  reply's first chunk) now ride the fleet hub's work stream, re-sent after an outage by
-  the same rule. A heartbeat that read a chunk of the reply never travels, whatever it
-  says was generated; every other heartbeat stays local, as since #2101, and a lab run's
-  stay local (contract 3). That is one opener per stream on every engine (LM Studio
-  included: by the PR #3293 review's estimate, a tool-heavy mission sends about a third
-  more work records per turn), plus
-  about one record per 512-token prefill step, never more than one per 2 s, on an engine
-  that reports progress. The runtime now also reads reasoning that `mlx_lm.server` streams
-  in `delta.reasoning` (it read only `reasoning_content`), so on mlx a reasoning phase
-  counts as generated: the GEN and think rate read it instead of 0, and the reasoning is
-  recorded as `model.reasoning` like any other engine's.
+  reply's first chunk) ride the fleet hub's work stream. While it generates, one heartbeat
+  per execution every 20 s (`hub_relay`, flow 2.3.0, additive) also rides it, so a peer's
+  card reads GEN with a rate instead of STALL once its prefill ends, and still reads STALL
+  when those beats stop for 30 s. Every other heartbeat stays local, as since #2101; a lab
+  run's stay local (contract 3); an outage's backfill re-sends by the same rule. Per
+  execution that is one opener per stream on every engine (LM Studio included: by the PR
+  #3293 review's estimate, a tool-heavy mission sends about a third more work records per
+  turn), about one record per 512-token prefill step on an engine that reports progress
+  (never more than one per 2 s), and about 3 a minute while generating, against the 30 a
+  minute the local file keeps. The runtime now also reads the reasoning `mlx_lm.server`
+  streams in `delta.reasoning` (it read only `reasoning_content`), so a thinking model on
+  mlx is treated as reasoning everywhere a `reasoning_content` model already is, as on LM
+  Studio: the GEN and think rate, the `model.reasoning` record, the think bound on
+  `max_tokens`, promoting a terminal reasoning answer or a plain-text tool call written in
+  reasoning, keeping the reasoning in history after a `length` finish, and the stream
+  gate's check-in cadence and degeneracy cut. An unstreamed mlx reply's reasoning is not
+  read yet.
 
 - **A fleet card still checking sweeps like a radar** (#3284). While a card waits for its
   first answers ("checking…"), its scope draws an old radar sweep: a turning beam with a

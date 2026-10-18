@@ -185,8 +185,8 @@ impl Backfill<'_> {
         let uid = v.get("machine_uid").and_then(|u| u.as_str());
         let ours = uid.is_none() || uid == self.own_uid;
         // Work records only, by the live write's own rule (`hub_route`): a
-        // heartbeat stays local unless it is a turn's prompt-phase one
-        // (#2101, #3210), a lab run's records never reach the hub (#3074),
+        // heartbeat stays local unless it is a turn's prompt-phase one or a
+        // generation beat its writer marked `hub_relay` (#2101, #3210), a lab run's records never reach the hub (#3074),
         // and a telemetry sample is live state, so the next one supersedes
         // any the hub missed.
         let publishable = crate::hub_route::hub_stream_of_value(&v) == Some(crate::HubStream::Work);

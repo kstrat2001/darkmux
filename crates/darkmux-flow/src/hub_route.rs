@@ -6,21 +6,24 @@
 //! By action, [`crate::FlowAction::hub_stream`]: `machine.telemetry` rides the
 //! telemetry stream, every other action the work stream, and
 //! `dispatch.turn.heartbeat` stays off the hub (#2101: at a 2 s cadence the
-//! heartbeats flushed other machines' work out of the capped stream). One
-//! kind of heartbeat is the exception, decided by its payload
+//! heartbeats flushed other machines' work out of the capped stream). Two
+//! kinds of heartbeat are the exception, decided by the payload
 //! ([`is_prompt_phase_heartbeat`], #3210): a turn's opener, or a prefill
 //! report written before the reply's first chunk, the only records that say
-//! how far a machine has read its prompt. A beat that read a chunk never
-//! travels.
-//! Without it another machine's card cannot show the prompt bar. And a lab
-//! run's records never reach the hub, whatever their action (#3074,
+//! how far a machine has read its prompt; and, while the reply streams, the
+//! sparse generation beats their writer marked `hub_relay` (one per
+//! execution every [`HUB_GENERATION_BEAT_INTERVAL_MS`], [`HubRelayGate`]), so
+//! a peer's card keeps a rate and never reads a false STALL. Any other beat
+//! that read a chunk stays local. Without these another machine's card can
+//! show neither the prompt bar nor a rate. And a lab run's records never reach the hub, whatever their action (#3074,
 //! contract 3).
 
 use crate::payload::DispatchHeartbeatPayload;
 use crate::{FlowAction, FlowRecord, HubStream, Payload};
 
 /// (#3210) Whether a heartbeat was written while the turn was still reading
-/// its prompt, which is the only kind of heartbeat that rides the hub. The
+/// its prompt (one of the two kinds that ride the hub, with the marked
+/// generation beats, [`heartbeat_rides_hub`]). The
 /// rule is structural: the beat read no chunk of the reply (no
 /// `partial_index`), nothing was generated (`generated_chars` is 0), and it
 /// is either:
@@ -46,6 +49,50 @@ pub fn is_prompt_phase_heartbeat(p: &DispatchHeartbeatPayload) -> bool {
     p.partial_index.is_none() && p.generated_chars == Some(0) && (opener || progress)
 }
 
+/// (#3210) The most often a generation heartbeat of one execution rides the
+/// hub: 20 s. Under the viewer's `STALL_AFTER_MS` (30 s, `ui/src/lib/
+/// tokenRate.ts`) with room for the 2 s durable cadence, so a peer's card
+/// that is generating always has a beat inside its stall bound and keeps a
+/// rate (two beats 20 s apart pair like any other). About 3 records a minute
+/// per generating execution against the 30 a minute the local file keeps.
+/// Without these, a peer card went from PROMPT to a false STALL the moment
+/// its prefill ended (live check, PR #3293).
+pub const HUB_GENERATION_BEAT_INTERVAL_MS: u64 = 20_000;
+
+/// Whether a heartbeat rides the hub: a prompt-phase one, or a generation
+/// beat its writer marked `hub_relay` ([`HubRelayGate`]).
+pub fn heartbeat_rides_hub(p: &DispatchHeartbeatPayload) -> bool {
+    is_prompt_phase_heartbeat(p) || p.hub_relay == Some(true)
+}
+
+/// The writer's side of the sparse generation beats: one per execution,
+/// held by whatever writes its durable heartbeats, marking at most one beat
+/// every [`HUB_GENERATION_BEAT_INTERVAL_MS`] on the beat's own clock
+/// (`sampled_at_ms`), so the choice is fixed by the record, not by when the
+/// writer ran. Prompt-phase beats ride the hub anyway and neither consume nor
+/// wait on it.
+#[derive(Debug, Default)]
+pub struct HubRelayGate {
+    last_ms: Option<u64>,
+}
+
+impl HubRelayGate {
+    /// Mark `p` to ride the hub when it is a generation beat and one is due.
+    /// A beat with no clock of its own (`sampled_at_ms` absent; every writer
+    /// sets it) is not marked. A clock that stepped back marks at once.
+    pub fn mark(&mut self, p: &mut DispatchHeartbeatPayload) {
+        if is_prompt_phase_heartbeat(p) {
+            return;
+        }
+        let Some(at) = p.sampled_at_ms else { return };
+        let due = self.last_ms.is_none_or(|last| at < last || at - last >= HUB_GENERATION_BEAT_INTERVAL_MS);
+        if due {
+            self.last_ms = Some(at);
+            p.hub_relay = Some(true);
+        }
+    }
+}
+
 /// The hub stream a record rides, `None` when it stays local. The one rule;
 /// see the module doc. `action` is `None` for a record that names none (an
 /// archive line from before actions), which rides the work stream as it
@@ -59,7 +106,7 @@ pub(crate) fn hub_stream_for(action: Option<&FlowAction>, payload: Option<&Paylo
     };
     if *action == FlowAction::DispatchTurnHeartbeat {
         return match payload {
-            Some(Payload::DispatchTurnHeartbeat(p)) if is_prompt_phase_heartbeat(p) => Some(HubStream::Work),
+            Some(Payload::DispatchTurnHeartbeat(p)) if heartbeat_rides_hub(p) => Some(HubStream::Work),
             _ => None,
         };
     }
@@ -155,6 +202,43 @@ mod tests {
         assert_eq!(route(progress_before_generation(), lab()), None, "a lab run's report stays local");
         let no_payload = json!({"ts": "2026-10-18T00:00:00Z", "action": "dispatch.turn.heartbeat", "handle": "h"});
         assert_eq!(hub_stream_of_value(&no_payload), None, "a heartbeat with no payload stays local");
+    }
+
+    /// (#3210, live check) The sparse generation beats: on the beat's own
+    /// clock, a 2 s stream of generation beats sends one every 20 s,
+    /// starting with the first; prompt-phase beats neither consume nor wait
+    /// on the gate.
+    #[test]
+    fn the_gate_marks_one_generation_beat_per_interval() {
+        let mut gate = HubRelayGate::default();
+        let mut relayed = Vec::new();
+        let mut opener = typed(opener());
+        gate.mark(&mut opener);
+        assert_eq!(opener.hub_relay, None, "a prompt-phase beat is not marked");
+        for i in 0..=35u64 {
+            let at = 10_000 + i * 2_000;
+            let mut beat = typed(json!({"turn_seq": 2, "partial_index": i + 1, "cumulative_chars": i * 10, "sampled_at_ms": at, "generated_chars": i * 40 + 1}));
+            gate.mark(&mut beat);
+            if beat.hub_relay == Some(true) {
+                relayed.push(at - 10_000);
+            }
+            assert!(beat.hub_relay != Some(false), "never written false");
+        }
+        assert_eq!(relayed, [0, 20_000, 40_000, 60_000]);
+        let mut late_report = typed(progress_before_generation());
+        gate.mark(&mut late_report);
+        assert_eq!(late_report.hub_relay, None, "a prompt-phase beat never consumes the gate");
+    }
+
+    /// (#3210, live check) A marked generation beat rides the work stream; an
+    /// unmarked one stays local, and a lab run's marked beat stays local.
+    #[test]
+    fn a_marked_generation_beat_rides_the_hub() {
+        let mut marked = plain_beat();
+        marked["hub_relay"] = json!(true);
+        assert_eq!(hub_stream_of_value(&line(marked.clone(), solo())), Some(HubStream::Work));
+        assert_eq!(hub_stream_of_value(&line(plain_beat(), solo())), None);
+        assert_eq!(hub_stream_of_value(&line(marked, lab())), None, "contract 3");
     }
 
     /// Every other action routes exactly as [`FlowAction::hub_stream`] says,

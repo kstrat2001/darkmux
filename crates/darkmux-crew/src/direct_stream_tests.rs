@@ -354,3 +354,39 @@ data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"f
     assert_eq!((beat.generated_chars, beat.prompt_processed, beat.partial_index), (Some(0), Some(1024), Some(2)), "{beat:?}");
     assert!(!darkmux_flow::is_prompt_phase_heartbeat(&beat), "a beat that read a chunk stays local: {beat:?}");
 }
+
+/// (#3210, PR #3293 live check) The direct path marks a generation beat for
+/// the hub at most once per 20 s: a burst of chunk beats (the 2 s gate set
+/// to zero, all inside one second) marks only the first. The prefill beat
+/// before it travels as a prompt-phase beat and is not marked.
+#[test]
+fn the_direct_path_marks_one_generation_beat_per_interval() {
+    use std::cell::RefCell;
+    let emitted = RefCell::new(Vec::new());
+    let mut ev = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::ZERO, |p| emitted.borrow_mut().push(p));
+    let prompt = Some(darkmux_trajectory::PromptProgressSample { processed: 2516, total: 2516 });
+    let _ = ev.send(
+        serde_json::json!({ "model": "m" }),
+        |_, progress| {
+            let on = progress.expect("a streamed call");
+            on(&SseProgress { prompt, ..SseProgress::default() });
+            for n in 1..=10u64 {
+                on(&SseProgress { prompt, chunks: n, generated_chars: n * 40, content_chars: n * 30, ..SseProgress::default() });
+            }
+            Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }))
+        },
+        |_| false,
+    );
+    let beats: Vec<darkmux_flow::payload::DispatchHeartbeatPayload> = emitted
+        .borrow()
+        .iter()
+        .filter_map(|p| match p {
+            darkmux_flow::Payload::DispatchTurnHeartbeat(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(beats.len(), 12, "the opener, the prefill beat and ten chunk beats");
+    let marked: Vec<Option<u64>> = beats.iter().filter(|b| b.hub_relay == Some(true)).map(|b| b.partial_index).collect();
+    assert_eq!(marked, [Some(1)], "only the first generation beat inside 20 s");
+    assert_eq!(beats.iter().filter(|b| darkmux_flow::heartbeat_rides_hub(b)).count(), 3);
+}

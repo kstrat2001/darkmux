@@ -23,7 +23,7 @@ pub mod test_redis;
 mod bookend;
 mod hub_link;
 mod hub_route;
-pub use hub_route::is_prompt_phase_heartbeat;
+pub use hub_route::{heartbeat_rides_hub, is_prompt_phase_heartbeat, HubRelayGate, HUB_GENERATION_BEAT_INTERVAL_MS};
 mod integrity;
 mod schema;
 mod status;
@@ -1639,7 +1639,8 @@ impl FlowSink for RedisSink {
         let record = record.get();
         // (#2101, #3210) Heartbeats stay local except a turn's prompt-phase
         // ones (its opener and the engine's prefill reports before the
-        // reply's first chunk): at a 2 s cadence every beat flushed other machines'
+        // reply's first chunk) and the sparse generation beats their writer
+        // marked `hub_relay`: at a 2 s cadence every beat flushed other machines'
         // work out of the capped stream, and only the prefill's say how far
         // a peer has read its prompt. (#3074, contract 3) A lab run's records
         // stay local. One rule, shared with the outage backfill: `hub_route`.
@@ -4035,7 +4036,8 @@ mod tests {
         //            `run.start`, the writer's promise to beat its session.
         //   2.3.0 — (#3210) additive: `prompt_processed` / `prompt_total` on
         //            `dispatch.turn.heartbeat`, the engine's prefill progress over
-        //            this request's uncached prompt.
+        //            this request's uncached prompt; and `hub_relay`, `true` on the
+        //            sparse generation beats that ride the fleet hub.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -5627,13 +5629,17 @@ mod tests {
         persist_record(&sink, &beat("late-solo", &solo, late));
         persist_record(&sink, &beat("plain-solo", &solo, plain));
         persist_record(&sink, &beat("opener-lab", &lab, opener));
+        // (live check) A generation beat its writer marked for the hub.
+        let relayed = serde_json::json!({"turn_seq": 1, "partial_index": 9, "cumulative_chars": 50, "generated_chars": 80, "hub_relay": true});
+        persist_record(&sink, &beat("relay-solo", &solo, relayed.clone()));
+        persist_record(&sink, &beat("relay-lab", &lab, relayed));
 
         let xadds = log.xadds();
-        let sent: Vec<&str> = ["opener-solo", "early-solo", "late-solo", "plain-solo", "opener-lab"]
+        let sent: Vec<&str> = ["opener-solo", "early-solo", "late-solo", "plain-solo", "opener-lab", "relay-solo", "relay-lab"]
             .into_iter()
             .filter(|h| xadds.iter().flatten().any(|w| w.contains(&format!("\"handle\":\"{h}\""))))
             .collect();
-        assert_eq!(sent, ["opener-solo", "early-solo"], "{xadds:?}");
+        assert_eq!(sent, ["opener-solo", "early-solo", "relay-solo"], "{xadds:?}");
         assert!(xadds.iter().all(|x| x[1] == "darkmux:flow"), "prompt-phase beats ride the work stream: {xadds:?}");
     }
 

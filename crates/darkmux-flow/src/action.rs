@@ -226,8 +226,9 @@ macro_rules! flow_actions {
             /// and only by `hub_route::hub_stream_for` (#3210): a turn's opener
             /// (`prompt_chars`) and an engine's prefill reports
             /// (`prompt_processed`/`prompt_total`) written before the reply's
-            /// first chunk ride the work stream; a beat that read a chunk
-            /// (`partial_index`), and every other beat, stays local. Route a record through that function, never through
+            /// first chunk ride the work stream, and so does one generation
+            /// beat per execution every 20 s that its writer marked
+            /// `hub_relay`; every other beat stays local. Route a record through that function, never through
             /// this one alone.
             pub fn hub_stream(&self) -> Option<HubStream> {
                 match self {

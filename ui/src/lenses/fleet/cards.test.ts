@@ -1496,3 +1496,53 @@ describe("(#3210) a peer's prefill progress, through the hub", () => {
     expect(card.executions[0]?.promptProgress).toBeUndefined();
   });
 });
+
+// (#3210, PR #3293 live check) After the prefill, a peer's generation reaches
+// this viewer only as the sparse beats its writer marks for the hub, one every
+// 20 s. The card must read GEN with a rate from them, never STALL while they
+// keep coming, and STALL once they stop for longer than the bound.
+describe("(#3210) a peer's sparse generation beats, through the hub", () => {
+  const PEER = "uid-studio";
+  const SID = "s-peer";
+  const T0 = Date.parse("2026-10-18T02:00:00.000Z");
+  const at = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const beat = (ms: number, payload: Record<string, unknown>) => ({
+    ts: at(ms),
+    hub_id: `${ms}-0`,
+    action: "dispatch.turn.heartbeat",
+    handle: "coder",
+    session_id: SID,
+    execution_id: "e-peer",
+    machine_id: "studio",
+    machine_uid: PEER,
+    payload: { turn_seq: 1, sampled_at_ms: ms, ...payload },
+  });
+  const GEN0 = T0 + 30_000;
+  // 400 chars every 20 s of reasoning (nothing visible yet): 20 chars/s.
+  const gen = [0, 1, 2, 3].map((k) => beat(GEN0 + k * 20_000, { partial_index: 1 + k * 10, cumulative_chars: 0, generated_chars: 40 + k * 400, prompt_processed: 4096, prompt_total: 4096, hub_relay: true }));
+  const body = {
+    records: [
+      { ts: at(T0), hub_id: `${T0}-0`, action: "dispatch.start", handle: "coder", session_id: SID, execution_id: "e-peer", machine_id: "studio", machine_uid: PEER, payload: { prompt_chars: 90_000 } },
+      beat(T0 + 5, { cumulative_chars: 0, generated_chars: 0, prompt_chars: 90_000 }),
+      beat(T0 + 20_000, { cumulative_chars: 0, generated_chars: 0, prompt_processed: 4096, prompt_total: 4096 }),
+      ...gen,
+    ],
+  };
+  const LAST = GEN0 + 60_000;
+
+  it("reads GEN with a rate between beats 20 s apart, thinking carried, never STALL", () => {
+    // Just before the next sparse beat would land: the worst case.
+    for (const now of [LAST + 1_000, LAST + 19_000, LAST + 21_000]) {
+      const card = buildFleetCard(ingest(body), new Map(), null, new Set([SID]), false, PEER, now);
+      const exec = card.executions[0];
+      expect(exec?.state, `at +${now - LAST} ms`).toBe("generating");
+      expect(exec?.thinking).toBe(true);
+      expect(exec?.tokensPerSec).toBeGreaterThan(0);
+    }
+  });
+
+  it("a 60 s gap after the last beat reads STALL", () => {
+    const card = buildFleetCard(ingest(body), new Map(), null, new Set([SID]), false, PEER, LAST + 60_000);
+    expect(card.executions[0]?.state).toBe("stalled");
+  });
+});

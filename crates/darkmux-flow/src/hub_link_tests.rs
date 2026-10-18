@@ -561,6 +561,8 @@ fn backfill_resends_prompt_phase_heartbeats_only() {
         line("late", &solo, late),
         line("plain", &solo, plain),
         line("lab-opener", &lab, opener),
+        line("relay", &solo, serde_json::json!({"turn_seq": 1, "partial_index": 9, "cumulative_chars": 50, "generated_chars": 80, "hub_relay": true})),
+        line("lab-relay", &lab, serde_json::json!({"turn_seq": 1, "partial_index": 9, "cumulative_chars": 50, "generated_chars": 80, "hub_relay": true})),
     ]
     .join("\n");
     std::fs::write(&today, body).unwrap();
@@ -568,7 +570,7 @@ fn backfill_resends_prompt_phase_heartbeats_only() {
     let lines = Backfill { dir: dir.path(), now_secs: now, since: &since, own_uid: None, skip_identity: "", cap: None }.lines();
     let handles: Vec<String> =
         lines.iter().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["handle"].as_str().unwrap().to_string()).collect();
-    assert_eq!(handles, ["opener", "early"]);
+    assert_eq!(handles, ["opener", "early", "relay"]);
 }
 
 /// (#3035) A link state or health value a newer darkmux wrote reads as
