@@ -620,7 +620,7 @@ function prefillOverdue(opener: PrefillOpener, records: NormRecord[], nowMs: num
 }
 
 /** (#3210) The prefill progress PROMPT shows: the latest report, and the
- *  time left at the rate between the first and the last ADVANCING report,
+ *  time left at the pace of the last few ADVANCING steps (`secondsLeftOf`),
  *  less the time since that last advance (a repeat does not slow the rate).
  *  `undefined` when the engine reported none. */
 function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress | undefined {
@@ -633,9 +633,17 @@ function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress |
   return out;
 }
 
+/** (#3210) How many of the latest steps between advancing reports the time
+ *  left is paced on. */
+const ETA_WINDOW_STEPS = 3;
+
 /** (#3210) The time left at the advancing reports' rate, from two or more
  *  of them; `undefined` before there is a rate, and once all is read. */
-function secondsLeftOf(moved: HeartbeatSample[], total: number, nowMs: number): number | undefined {
+function secondsLeftOf(advanced: HeartbeatSample[], total: number, nowMs: number): number | undefined {
+  // The recent pace, not the whole run's: prefill slows as the context grows
+  // (measured on an M2: ~9 s per 512-token step early, ~13 s late), and the
+  // first steps' pace made the time left run short.
+  const moved = advanced.slice(-(ETA_WINDOW_STEPS + 1));
   const first = moved[0]?.prompt;
   const lastMove = moved[moved.length - 1];
   const processed = lastMove?.prompt?.processed ?? 0;

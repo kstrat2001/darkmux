@@ -17,14 +17,15 @@ export type ReadingLabel = { kind: "text"; text: string } | { kind: "byWidth"; f
  *  where the line says `disconnected` instead). */
 export function readingLabel(exec: ExecutionTokenReading, state: LiveState): ReadingLabel {
   if (state === "generating") return { kind: "text", text: generatingText(exec) };
-  // (#3210) How far the engine has read the prompt, when it reports it:
-  // "processing 40% · ~23s left". Ahead of the size estimate, which it makes
-  // redundant (the hover still says how much).
-  // On a phone the short form drops "processing", which ellipsized the time
-  // left away.
+  // (#3210) How far the engine has read the prompt, when it reports it, ahead
+  // of the size estimate it makes redundant (the hover still says how much).
+  // With a time left the line is "40% · ~23s left" alone: "processing" in
+  // front ellipsized the time away on a three-card desktop row, and the
+  // brain over its bar already says it. Before there is a rate, "processing
+  // 20%".
   if (state === "prompt" && exec.promptProgress) {
     const progress = promptProgressLabel(exec.promptProgress);
-    return { kind: "byWidth", full: `processing ${progress}`, word: progress };
+    return { kind: "text", text: exec.promptProgress.secondsLeft !== undefined ? progress : `processing ${progress}` };
   }
   // (#2890) "processing ~36k", not "processing prompt · ~36k": the long form
   // ellipsized the size away on a phone.
