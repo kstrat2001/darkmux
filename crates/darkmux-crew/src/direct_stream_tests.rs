@@ -261,3 +261,52 @@ fn a_messages_turn_streams() {
     assert_eq!(body["stream"], true);
     assert!(ev.streams);
 }
+
+/// (#3210) The issue's capture: `mlx_lm.server` writes one comment line per
+/// prefill step before its first event.
+const MLX_PREFILL: &str = ": keepalive 512/2516\n\n: keepalive 1024/2516\n\n";
+
+/// (#3210) The tail reads the engine's prefill progress (the same shapes the
+/// runtime's reader recognizes, through one parser), keeps the LATEST
+/// report, and says it read something, so the caller's heartbeat fires.
+#[test]
+fn the_tail_reads_mlx_prefill_progress_and_keeps_the_latest_report() {
+    let mut tail = SseTail::new(Shape::Chat);
+    let bytes = MLX_PREFILL.as_bytes();
+    let cut = MLX_PREFILL.find("1024").unwrap();
+    assert!(tail.feed(&bytes[..cut]), "the first report is complete");
+    let sample = |processed| Some(darkmux_trajectory::PromptProgressSample { processed, total: 2516 });
+    assert_eq!(tail.progress.prompt, sample(512));
+    assert!(tail.feed(&bytes[cut..]), "the second report completes across the split");
+    assert_eq!(tail.progress.prompt, sample(1024));
+    assert_eq!(tail.progress.chunks, 0, "a report is not an event");
+    assert!(!tail.feed(b": OPENROUTER PROCESSING\n\n"), "another comment is not progress");
+    assert_eq!(tail.progress.prompt, sample(1024));
+}
+
+/// (#3210) A heartbeat sent while the engine reads the prompt carries the
+/// neutral fact with nothing generated and no chunk index; once chunks
+/// arrive the turn's latest report still rides along.
+#[test]
+fn a_heartbeat_carries_the_prefill_progress_fact() {
+    let mut tail = SseTail::new(Shape::Chat);
+    tail.feed(MLX_PREFILL.as_bytes());
+    let beat = serde_json::to_value(chunk_beat(&tail.progress)).unwrap();
+    assert_eq!((beat["prompt_processed"].as_u64(), beat["prompt_total"].as_u64()), (Some(1024), Some(2516)), "{beat}");
+    assert_eq!(beat["generated_chars"], 0);
+    assert!(beat.get("partial_index").is_none(), "no chunk was read: {beat}");
+    assert!(beat.get("prompt_chars").is_none(), "not the opener: {beat}");
+
+    tail.feed(SSE.as_bytes());
+    let beat = serde_json::to_value(chunk_beat(&tail.progress)).unwrap();
+    assert_eq!(beat["prompt_processed"], 1024);
+    assert_eq!(beat["partial_index"], 5);
+    let plain = serde_json::to_value(chunk_beat(&SseProgress { chunks: 1, ..SseProgress::default() })).unwrap();
+    assert!(plain.get("prompt_processed").is_none(), "absent when the engine reported none: {plain}");
+}
+
+/// (#3210) The progress lines do not change the reply.
+#[test]
+fn a_stream_with_prefill_progress_reassembles_to_the_same_reply() {
+    assert_eq!(ok(&format!("{MLX_PREFILL}{SSE}")), ok(SSE));
+}

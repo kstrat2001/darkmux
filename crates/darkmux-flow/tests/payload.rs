@@ -389,3 +389,20 @@ fn a_malformed_bounds_block_costs_the_bounds_not_the_dispatch_start() {
         other => panic!("a typed dispatch.start, got {other:?}"),
     }
 }
+
+/// (#3210, flow 2.3.0) A heartbeat carries the engine's prefill progress as
+/// two neutral token counts, absent (never null) when the engine reported
+/// none, and a heartbeat written before 2.3.0 reads with neither.
+#[test]
+fn a_heartbeat_carries_prompt_progress_only_when_the_engine_reported_it() {
+    use darkmux_flow::payload::DispatchHeartbeatPayload;
+    let json = r#"{"turn_seq":1,"cumulative_chars":0,"generated_chars":0,"prompt_processed":1024,"prompt_total":2516}"#;
+    let beat: DispatchHeartbeatPayload = serde_json::from_str(json).unwrap();
+    assert_eq!((beat.prompt_processed, beat.prompt_total), (Some(1024), Some(2516)));
+    assert_eq!(serde_json::to_value(&beat).unwrap(), serde_json::from_str::<serde_json::Value>(json).unwrap());
+
+    let older: DispatchHeartbeatPayload = serde_json::from_str(r#"{"turn_seq":1,"cumulative_chars":0,"generated_chars":0}"#).unwrap();
+    assert_eq!((older.prompt_processed, older.prompt_total), (None, None));
+    let written = serde_json::to_value(&older).unwrap();
+    assert!(written.get("prompt_processed").is_none() && written.get("prompt_total").is_none(), "{written}");
+}

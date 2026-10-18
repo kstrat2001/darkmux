@@ -12,7 +12,7 @@ requests:
   #1 model="test-model" max_tokens=32000 stream=true roles=[system,user]
 checkpoint: none
 events:
-  {"schema_version":"1.0","type":"trajectory.header"}
+  {"schema_version":"1.1","type":"trajectory.header"}
   {"prompt_chars":11,"seq":1,"system_chars":11,"type":"model.streaming.start"}
   {"cumulative_chars":7,"delta_chars":7,"generated_chars":7,"partial_index":1,"seq":1,"tool_calls_present":false,"type":"model.partial"}
   {"cumulative_chars":12,"delta_chars":5,"generated_chars":12,"partial_index":2,"seq":1,"tool_calls_present":false,"type":"model.partial"}

@@ -1678,6 +1678,13 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "prompt", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "prompt" } });
   });
 
+  it("(#3210) PROMPT with the engine's progress: the brain stays, the readout says how far and how long is left", () => {
+    const promptProgress = { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 };
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptProgress }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null, note: "processing 40% · ~23s left" });
+    expect(modelScopeHero({ liveTokScope: { ...live, state: "prompt" }, finishedTokRate: null })?.note).toBeNull();
+  });
+
   it("(#2890) GEN while thinking: the same number and unit, with the thinking look", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96, thinking: true }, finishedTokRate: null });
     expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "tok/s", thinking: true, lamps: { state: "generating", thinking: true } });

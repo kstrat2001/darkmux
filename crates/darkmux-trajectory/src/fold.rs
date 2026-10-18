@@ -261,6 +261,7 @@ impl TrajectoryFold {
                 bump(&mut self.detectors.promoted_calls, u32::try_from(p.promoted_call_count).unwrap_or(u32::MAX))
             }
             E::ToolCallWriting(_)
+            | E::PromptProgress(_)
             | E::PromotionSuppressed(_)
             | E::CompactionStart(_)
             | E::CompactionCall(_)

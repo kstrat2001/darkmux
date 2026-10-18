@@ -18,8 +18,21 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.2.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.3.0";
 // Version history:
+//   2.3.0 (#3210): `dispatch.turn.heartbeat` gains `payload.prompt_processed`
+//           and `payload.prompt_total`, in tokens: how much of the prompt
+//           the engine has processed, the latest it reported this turn. A
+//           neutral fact normalized from the engine's own stream (today
+//           `mlx_lm.server`'s `: keepalive <processed>/<total>` comment
+//           lines, recognized by shape by both stream readers through
+//           `darkmux_trajectory::PromptProgressSample`). The viewer reads
+//           PROMPT as a percentage from it and estimates the time left.
+//
+//           ADDITIVE: a reader that does not know the keys ignores them.
+//           Written only when the engine reported progress; absence means
+//           "this engine reported none" (or a darkmux before 2.3.0), never
+//           "nothing was processed".
 //   2.2.0 (#3124): `mission.start` gains `payload.config_id`, the config the
 //           run was launched from (`MissionSpec::config_id`): `dispatch` for
 //           a bare `darkmux dispatch`, the config's own id for a `mission

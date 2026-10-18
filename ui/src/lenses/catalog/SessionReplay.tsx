@@ -26,7 +26,7 @@ import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
-import { liveStateLabel, reasonForLine, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
+import { liveStateLabel, promptProgressLabel, reasonForLine, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
 import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
@@ -200,6 +200,40 @@ function TrimmedPath({ path }: { path: string }) {
   );
 }
 
+/** The readout line under the run page's lamps, for a live scope: the one
+ *  thing the lit lamp and the tube's center do not already say.
+ *
+ *  - disconnected: "disconnected";
+ *  - (#2926) the model generating a tool call: which tool and for how long
+ *    ("tool gen · write · 18s"); LM Studio streams nothing for the
+ *    arguments, so there is no rate, and the seconds tick with the page's
+ *    clock (the playhead in playback);
+ *  - (#2915) compacting: "compacting · Ns" counting with the page's clock;
+ *    the tube center carries no timer;
+ *  - (#3210) PROMPT with the engine's prefill progress: how far and how long
+ *    is left ("processing 40% · ~23s left"); the tube keeps the brain;
+ *  - (#2950) a rest whose record says why: the words only ("thermal ·
+ *    serious"), trimmed to the line (the lamp status keeps it whole); the
+ *    countdown is already the tube's center. Nothing when it names no reason;
+ *  - (#2963) darkmux running a tool: the action and, when known, the running
+ *    call's file, never an earlier call's.
+ */
+function heroNote(
+  state: ScopeState,
+  live: NonNullable<SessionRunView["liveTokScope"]>,
+  writing: boolean,
+  compacting: boolean,
+  toolLine: { action: string; path?: string } | null,
+): string | null {
+  if (state === "nosignal") return "disconnected";
+  if (writing) return liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds });
+  if (compacting) return liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: live.compactingSeconds });
+  if (state === "prompt" && live.promptProgress !== undefined) return `processing ${promptProgressLabel(live.promptProgress)}`;
+  if (state === "rest" && live.restReason !== undefined) return reasonForLine(live.restReason);
+  if (toolLine) return toolLine.path ? `${toolLine.action} · ${toolLine.path}` : toolLine.action;
+  return null;
+}
+
 /** (#2890) What the MODEL hero's scope shows, from the one view derivation:
  *  the live reading while the run is going, the calm finished state with its
  *  average once it has ended, or nothing when the unit did no model work.
@@ -281,35 +315,8 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         thinking: generating && live.thinking === true,
         ...(compacting ? { compacting: true as const, compactingSeconds: live.compactingSeconds } : {}),
       },
-      // (#2926) While the model generates a tool call, the readout line
-      // under the lamps says which tool and for how long ("tool gen · write
-      // · 18s"): LM Studio streams nothing for the arguments, so there is no
-      // rate, and the lit lamp and the tube center carry no live data. The
-      // seconds tick with the page's clock (the playhead in playback).
-      note:
-        state === "nosignal"
-          ? "disconnected"
-          : writing
-            ? liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds })
-            : compacting
-              ? // (#2915) "compacting · Ns" in the same readout slot, counting
-                // with the page's clock; the tube center carries no timer.
-                liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: live.compactingSeconds })
-              : state === "rest" && live.restReason !== undefined
-                ? // (#2950) Why it rests, from the rest's own record, in the
-                  // same slot: "thermal · serious". The words only: the
-                  // countdown is already the tube's center (TOOL GEN's
-                  // seconds are not, which is why its line carries them).
-                  // Nothing when the record names no reason. Trimmed to the
-                  // line (the lamp status keeps it whole).
-                  reasonForLine(live.restReason)
-                : toolLine
-                  ? toolLine.path
-                    ? `${toolLine.action} · ${toolLine.path}`
-                    : // (#2963) The running call's file unknown: the action
-                      // alone, never an earlier call's file.
-                      toolLine.action
-                  : null,
+      // The readout line under the lamps: see `heroNote`.
+      note: heroNote(state, live, writing, compacting, toolLine),
       ...(toolLine ? { noteTool: toolLine } : {}),
     };
   }

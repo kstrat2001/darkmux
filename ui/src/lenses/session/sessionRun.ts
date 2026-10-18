@@ -61,7 +61,7 @@ import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
-import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
+import type { LiveState, LiveStateReading, PromptProgress } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { isSingleShotWorkUsage, sumUsage, usageContribution } from "../../lib/usageRecords";
 
@@ -266,6 +266,9 @@ export interface SessionRunView {
          *  compacting. See `LiveStateReading.compacting`. */
         compacting?: true;
         compactingSeconds?: number;
+        /** (#3210) Present only while PROMPT and the engine reports its
+         *  prefill progress. See `LiveStateReading.promptProgress`. */
+        promptProgress?: PromptProgress;
       }
     | null;
   /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
@@ -1532,11 +1535,16 @@ function stateExtras(r: LiveStateReading | null): Partial<LiveTokScope> {
     case "generating":
       return r.thinking ? { thinking: true } : {};
     case "prompt":
-      return r.compacting ? { compacting: true, compactingSeconds: r.compactingSeconds } : {};
+      return promptExtras(r);
     case "stalled":
     case undefined:
       return {};
   }
+}
+
+function promptExtras(r: LiveStateReading): Partial<LiveTokScope> {
+  if (r.compacting) return { compacting: true, compactingSeconds: r.compactingSeconds };
+  return r.promptProgress !== undefined ? { promptProgress: r.promptProgress } : {};
 }
 
 function restExtras(r: LiveStateReading): Partial<LiveTokScope> {

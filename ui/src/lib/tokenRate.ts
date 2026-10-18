@@ -51,6 +51,10 @@ export interface HeartbeatSample {
   /** (#2889) The request's size in chars, carried only by a turn's opening
    *  heartbeat (flow schema 1.56.0). */
   promptChars?: number;
+  /** (#3210) The engine's prefill progress, in prompt tokens
+   *  (`prompt_processed` of `prompt_total`, flow 2.3.0): the latest report
+   *  this turn when the engine reports any. */
+  prompt?: { processed: number; total: number };
   /** (#2928) The latest moment this sample's state was known to still hold:
    *  a live-channel refresh (the host re-sending a silent state, stamped
    *  `refreshed_at_ms`) moves it forward. Read for freshness (stall) only;
@@ -104,6 +108,8 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
     const promptChars = num(f.prompt_chars);
     if (promptChars !== null) sample.promptChars = promptChars;
+    const prompt = promptProgressOf(f);
+    if (prompt !== null) sample.prompt = prompt;
     out.push(sample);
   }
   out.sort((a, b) => a.atMs - b.atMs);
@@ -518,28 +524,111 @@ function producedOutput(b: HeartbeatSample): boolean {
   return b.chars !== 0 || b.writingTool !== undefined;
 }
 
+/** (#3210) How far the engine has read the prompt, as PROMPT shows it:
+ *  `percent` (whole, rounded down, so 100 only once it is all read) and,
+ *  from two or more reports' rate, `secondsLeft` (absent until there is a
+ *  rate, and once the prompt is all read). */
+export interface PromptProgress {
+  processed: number;
+  total: number;
+  percent: number;
+  secondsLeft?: number;
+}
+
+/** (#3210) A heartbeat's prefill progress fact, when it carries a usable one. */
+function promptProgressOf(f: { prompt_processed?: unknown; prompt_total?: unknown }): { processed: number; total: number } | null {
+  const processed = num(f.prompt_processed);
+  const total = num(f.prompt_total);
+  if (processed === null || total === null || !(total > 0) || processed < 0) return null;
+  return { processed: Math.min(processed, total), total };
+}
+
 /** (#3145) The current turn's opener, when the model has produced nothing
  *  since it: every sample after it in the same turn is a 0-char chunk (an
  *  engine may send an empty first chunk the moment the request lands) and
  *  none is writing a tool call. The silence after it is the prompt being
  *  read. `null` with no opener carrying `prompt_chars` (an older host), or
- *  once anything was generated. */
-function prefillOpener(beats: HeartbeatSample[]): { atMs: number; promptChars: number } | null {
+ *  once anything was generated. (#3210) `reports`: the samples after it that
+ *  carry the engine's prefill progress, oldest first. */
+interface PrefillOpener {
+  atMs: number;
+  promptChars: number;
+  reports: HeartbeatSample[];
+}
+function prefillOpener(beats: HeartbeatSample[]): PrefillOpener | null {
   const last = beats[beats.length - 1];
   if (last === undefined) return null;
+  const reports: HeartbeatSample[] = [];
   for (let i = beats.length - 1; i >= 0; i--) {
     const b = beats[i];
     if (b.turn !== last.turn || producedOutput(b)) return null;
-    if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars };
+    if (b.promptChars !== undefined) return { atMs: b.atMs, promptChars: b.promptChars, reports: reports.reverse() };
+    if (b.prompt !== undefined) reports.push(b);
   }
   return null;
 }
 
+/** (#3210) How many of its own steps an engine reporting prefill progress
+ *  may stay silent before the silence reads STALL. */
+export const PROGRESS_STALL_STEPS = 3;
+
+/** (#3210) The silence allowed after an engine's last progress report: the
+ *  longest step it has taken so far this turn (opener to first report
+ *  included) times `PROGRESS_STALL_STEPS`, never less than
+ *  `STALL_AFTER_MS`. The engine's own pace, measured, replaces the
+ *  size-scaled guess `prefillStallAfterMs` makes when it reports nothing. */
+export function progressStallAfterMs(openerAtMs: number, reports: HeartbeatSample[]): number {
+  let prev = openerAtMs;
+  let longest = 0;
+  for (const r of reports) {
+    longest = Math.max(longest, r.atMs - prev);
+    prev = r.atMs;
+  }
+  return Math.max(STALL_AFTER_MS, PROGRESS_STALL_STEPS * longest);
+}
+
 /** (#3145) Whether a prefill has outlasted its bound: silent past
  *  `STALL_AFTER_MS` (the ordinary rule, so a live refresh still counts)
- *  AND past `prefillStallAfterMs` of its opener. */
-function prefillOverdue(opener: { atMs: number; promptChars: number }, records: NormRecord[], nowMs: number): boolean {
-  return isStalled(records, nowMs) && nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+ *  AND past `prefillStallAfterMs` of its opener. (#3210) When the engine
+ *  reports progress, its own pace bounds the silence after its last report
+ *  instead (`progressStallAfterMs`); `prefillStallAfterMs` applies only
+ *  when it reports none. */
+function prefillOverdue(opener: PrefillOpener, records: NormRecord[], nowMs: number): boolean {
+  if (!isStalled(records, nowMs)) return false;
+  const last = opener.reports[opener.reports.length - 1];
+  if (last !== undefined) return nowMs - freshOf(last) > progressStallAfterMs(opener.atMs, opener.reports);
+  return nowMs - opener.atMs > prefillStallAfterMs(opener.promptChars);
+}
+
+/** (#3210) The prefill progress PROMPT shows: the latest report, and the
+ *  time left at the rate between the first and the latest report, less the
+ *  time since the latest. `undefined` when the engine reported none. */
+function prefillProgress(opener: PrefillOpener, nowMs: number): PromptProgress | undefined {
+  const last = opener.reports[opener.reports.length - 1];
+  if (last?.prompt === undefined) return undefined;
+  const { processed, total } = last.prompt;
+  const out: PromptProgress = { processed, total, percent: Math.floor((processed / total) * 100) };
+  const first = opener.reports[0].prompt;
+  const spanMs = last.atMs - opener.reports[0].atMs;
+  if (first !== undefined && processed < total && spanMs > 0 && processed > first.processed) {
+    const perMs = (processed - first.processed) / spanMs;
+    out.secondsLeft = Math.max(0, Math.ceil(((total - processed) / perMs - (nowMs - last.atMs)) / 1000));
+  }
+  return out;
+}
+
+/** (#3210) The PROMPT reading for a turn still reading its prompt: the
+ *  opener's size and, when the engine reports it, the progress. */
+function promptReading(opener: PrefillOpener, nowMs: number): LiveStateReading {
+  const progress = prefillProgress(opener, nowMs);
+  return { state: "prompt", promptChars: opener.promptChars, ...(progress !== undefined ? { promptProgress: progress } : {}) };
+}
+
+/** (#3210) The status words for a prefill's progress: "40% · ~23s left", or
+ *  the percentage alone before there is a rate. One function, so the fleet
+ *  card's line and the run page's readout say the same thing. */
+export function promptProgressLabel(p: PromptProgress): string {
+  return p.secondsLeft !== undefined ? `${p.percent}% · ~${compactDuration(p.secondsLeft)} left` : `${p.percent}%`;
 }
 
 /** The reading once the evidence is stale. (#3145) A turn that has produced
@@ -547,12 +636,12 @@ function prefillOverdue(opener: { atMs: number; promptChars: number }, records: 
  *  bound runs out; otherwise silence after a heartbeat is STALL, and no
  *  heartbeat at all is PROMPT. */
 function staleReading(
-  opener: { atMs: number; promptChars: number } | null,
+  opener: PrefillOpener | null,
   lastBeatAt: number | null,
   records: NormRecord[],
   nowMs: number,
 ): LiveStateReading {
-  if (opener !== null && !prefillOverdue(opener, records, nowMs)) return { state: "prompt", promptChars: opener.promptChars };
+  if (opener !== null && !prefillOverdue(opener, records, nowMs)) return promptReading(opener, nowMs);
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
 }
 
@@ -560,14 +649,14 @@ function staleReading(
  *  when the opener is at or after the marker (STALL once its prefill bound
  *  runs out); otherwise the last beat's size while that size is current. */
 function promptAfterMarker(
-  opener: { atMs: number; promptChars: number } | null,
+  opener: PrefillOpener | null,
   lastBeat: HeartbeatSample | null,
   markerAtMs: number,
   records: NormRecord[],
   nowMs: number,
 ): LiveStateReading {
   if (opener !== null && opener.atMs >= markerAtMs) {
-    return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : { state: "prompt", promptChars: opener.promptChars };
+    return prefillOverdue(opener, records, nowMs) ? { state: "stalled" } : promptReading(opener, nowMs);
   }
   return promptSizeIsCurrent(lastBeat, markerAtMs) ? { state: "prompt", promptChars: lastBeat.promptChars } : { state: "prompt" };
 }
@@ -646,6 +735,12 @@ export interface LiveStateReading {
    *  status line shows it as an estimate (`promptTokensLabel`); the scope
    *  shows the brain for all of PROMPT (#2890). */
   promptChars?: number;
+  /** (#3210) Present only when `state === "prompt"`, the turn has produced
+   *  nothing yet, and the engine reports its prefill progress on the
+   *  heartbeat (`prompt_processed` / `prompt_total`): how far, and how long
+   *  is left. The fleet card's line and the run page's readout show it
+   *  (`promptProgressLabel`); the scope's center keeps the brain. */
+  promptProgress?: PromptProgress;
   /** (#2915) Present (always `true`) only when `state === "prompt"` because
    *  this execution is COMPACTING: its `utility.start` (job `compaction`) is
    *  the latest evidence and no usage record has ended it. The PROMPT lamp
@@ -967,7 +1062,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     }
     // (#3145) The size is the turn's opener's, so an empty first chunk
     // after it (which carries none) does not drop it.
-    if (last.chars === 0) return opener !== null ? { state: "prompt", promptChars: opener.promptChars } : { state: "prompt" };
+    if (last.chars === 0) return opener !== null ? promptReading(opener, nowMs) : { state: "prompt" };
     return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
   return staleReading(opener, lastBeatAt, cut, nowMs);
@@ -1145,12 +1240,7 @@ export function liveStateLabel(reading: LiveStateReading): string {
       // (#2902 step 5) A day window's wait counts down as "23h 53m".
       return [`rest ${compactDuration(reading.restSecondsLeft ?? 0)}`, ...(reading.restReason ? [reading.restReason] : [])].join(" · ");
     case "prompt":
-      // (#2915) Compacting: the elapsed seconds, counting like REST.
-      if (reading.compacting) return `compacting · ${reading.compactingSeconds ?? 0}s`;
-      // Not the bare word: the run page shows a "prompt · N chars"
-      // disclosure just above the tile.
-      // (#2890, operator) "processing", not "reading": too close to the read tool.
-      return "processing prompt";
+      return promptStateLabel(reading);
     case "tools":
       // (#2889) Elapsed since the call's name arrived, while the model
       // generates its arguments. (#2890, operator) "tool gen", LM Studio's
@@ -1167,6 +1257,17 @@ export function liveStateLabel(reading: LiveStateReading): string {
     case "generating":
       return "";
   }
+}
+
+/** `liveStateLabel`'s PROMPT words. */
+function promptStateLabel(reading: LiveStateReading): string {
+  // (#2915) Compacting: the elapsed seconds, counting like REST.
+  if (reading.compacting) return `compacting · ${reading.compactingSeconds ?? 0}s`;
+  // Not the bare word: the run page shows a "prompt · N chars"
+  // disclosure just above the tile.
+  // (#2890, operator) "processing", not "reading": too close to the read tool.
+  // (#3210) With how far, when the engine reports it.
+  return reading.promptProgress ? `processing prompt · ${promptProgressLabel(reading.promptProgress)}` : "processing prompt";
 }
 
 /** (#2963) The runtime's tools that take a `path` argument
@@ -1384,6 +1485,9 @@ export interface ExecutionTokenReading {
    *  opening heartbeat reported it. For the fleet card's status line only:
    *  the scope's center shows the brain for all of PROMPT. */
   promptLabel?: string;
+  /** (#3210) In PROMPT, the engine's prefill progress, when it reports it.
+   *  See `LiveStateReading.promptProgress`. */
+  promptProgress?: PromptProgress;
 }
 
 export function executionTokenReading(
@@ -1422,13 +1526,20 @@ export function executionTokenReading(
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
     ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
     ...(state === "prompt" && liveState?.compacting ? { compacting: true as const, compactingSeconds: liveState.compactingSeconds } : {}),
-    ...(state === "prompt" && liveState?.promptChars !== undefined
-      ? (() => {
-          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(recordsAsOf(records, nowMs)));
-          return label !== null ? { promptLabel: label } : {};
-        })()
-      : {}),
+    ...(state === "prompt" && liveState ? promptReadingExtras(liveState, records, nowMs) : {}),
   };
+}
+
+/** In PROMPT, what the fleet card's line says beyond the word: the prompt's
+ *  estimated size (#2890) and (#3210) the engine's prefill progress. */
+function promptReadingExtras(reading: LiveStateReading, records: NormRecord[], nowMs: number): Pick<ExecutionTokenReading, "promptLabel" | "promptProgress"> {
+  const out: Pick<ExecutionTokenReading, "promptLabel" | "promptProgress"> = {};
+  if (reading.promptProgress !== undefined) out.promptProgress = reading.promptProgress;
+  if (reading.promptChars !== undefined) {
+    const label = promptTokensLabel(reading.promptChars, measuredCharsPerToken(recordsAsOf(records, nowMs)));
+    if (label !== null) out.promptLabel = label;
+  }
+  return out;
 }
 
 /** (#2889) A request's size in chars as an estimated token count ("~36k"),

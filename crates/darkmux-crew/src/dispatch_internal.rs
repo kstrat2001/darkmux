@@ -10903,6 +10903,11 @@ struct TailerState {
     /// writing tick; the next real `model.partial` then emits (and resets
     /// the inactivity deadline) regardless of the 2 s coalescing window.
     chunk_owed: bool,
+    /// (#3210) The latest prefill progress the engine reported on the open
+    /// stream, with its turn: every heartbeat of that turn carries it, so a
+    /// report the 2 s window held back still reaches the record. Cleared
+    /// when a stream opens.
+    prompt_progress: Option<(u64, darkmux_trajectory::PromptProgressSample)>,
     summary: TrajectorySummary,
     /// (#2947 review M-A) Turn seqs the `warn` policy already warned on.
     /// Under `conclude` the first degenerate finding in a turn acts and the
@@ -11099,6 +11104,7 @@ impl TailerState {
             step_id: None,
             last_heartbeat_at: None,
             chunk_owed: false,
+            prompt_progress: None,
             summary: TrajectorySummary::default(),
             warned_turns: std::collections::HashSet::new(),
             warning_sink: Arc::new(stderr_warning_sink),
@@ -11361,6 +11367,7 @@ impl TailerState {
             step_id: None,
             last_heartbeat_at: None,
             chunk_owed: false,
+            prompt_progress: None,
             summary: TrajectorySummary::default(),
             warned_turns: std::collections::HashSet::new(),
             warning_sink: Arc::new(stderr_warning_sink),
@@ -11507,10 +11514,9 @@ impl TailerState {
             E::Checkpoint(c) => self.on_checkpoint(c),
             E::Reasoning(r) => self.on_reasoning(r),
             E::FeedbackInjected(f) => self.on_feedback_injected(f),
-            E::StreamingStart(s) => self.on_stream_start(s),
-            E::StreamingEnd(_) => self.on_stream_end(),
-            E::Partial(p) => self.on_stream_tick(Chunk::of_partial(p)),
-            E::ToolCallWriting(w) => self.on_stream_tick(Chunk::of_writing(w)),
+            E::StreamingStart(_) | E::StreamingEnd(_) | E::Partial(_) | E::ToolCallWriting(_) | E::PromptProgress(_) => {
+                self.on_stream_event(&event)
+            }
             E::GateObservation(g) => {
                 self.on_detector(&event);
                 if let Some(w) = gate_degeneracy_warning(g) {
@@ -11862,12 +11868,27 @@ impl TailerState {
         self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchFeedbackInjected(payload));
     }
 
+    /// A model stream's own events: its opening and end, each chunk, a
+    /// writing tick, and (#3210) a prefill progress report.
+    fn on_stream_event(&mut self, event: &darkmux_trajectory::TrajectoryEvent) {
+        use darkmux_trajectory::TrajectoryEvent as E;
+        match event {
+            E::StreamingStart(s) => self.on_stream_start(s),
+            E::StreamingEnd(_) => self.on_stream_end(),
+            E::Partial(p) => self.on_stream_tick(Chunk::of_partial(p)),
+            E::ToolCallWriting(w) => self.on_stream_tick(Chunk::of_writing(w)),
+            E::PromptProgress(p) => self.on_prompt_progress(p),
+            _ => {}
+        }
+    }
+
     /// (#2889) A stream opens: the opening heartbeat, with the request's size
     /// and `generated_chars: 0`, before the request is sent. Always emitted,
     /// and never proof of work. It must not consume the chunk rate gate
     /// either (#2889 review, M2): the next real chunk is owed an emission.
     fn on_stream_start(&mut self, s: &darkmux_trajectory::StreamingStart) {
         self.chunk_owed = true;
+        self.prompt_progress = None;
         self.summary.heartbeats += 1;
         let payload = opening_heartbeat_payload(s);
         // (#2928) The opener is a transition: it goes live at once.
@@ -11876,11 +11897,26 @@ impl TailerState {
         self.live_model(s.ts, || live);
     }
 
+    /// (#3210) The engine reported how far it has read the prompt: a
+    /// heartbeat like a chunk's, coalesced the same way. Proof of work only
+    /// when it advanced past the turn's previous report: a wedged engine
+    /// can repeat itself, but cannot read more of the prompt.
+    fn on_prompt_progress(&mut self, p: &darkmux_trajectory::PromptProgress) {
+        let before = self.prompt_progress.filter(|(seq, _)| *seq == p.seq).map_or(0, |(_, s)| s.processed);
+        let sample = darkmux_trajectory::PromptProgressSample { processed: p.processed, total: p.total };
+        self.prompt_progress = Some((p.seq, sample));
+        self.on_stream_tick(Chunk::of_progress(p, p.processed > before));
+    }
+
     /// A streamed chunk (`model.partial`) or a writing tick
     /// (`model.tool_call.writing`, #2889): one coalesced heartbeat per
     /// `HEARTBEAT_MIN_INTERVAL`, so topology edges stay animated without
-    /// flooding the stream.
-    fn on_stream_tick(&mut self, chunk: Chunk<'_>) {
+    /// flooding the stream. (#3210) Also a prefill progress report.
+    fn on_stream_tick(&mut self, mut chunk: Chunk<'_>) {
+        // (#3210) Every heartbeat of the turn carries its latest progress.
+        if chunk.prompt.is_none() {
+            chunk.prompt = self.prompt_progress.filter(|(seq, _)| *seq == chunk.seq).map(|(_, s)| s);
+        }
         // (#2928) The live channel samples every chunk and tick on its own
         // cadence, independent of the durable gate below.
         self.live_model(chunk.ts, || serde_json::to_value(heartbeat_payload(&chunk)).unwrap_or_default());
@@ -12243,24 +12279,45 @@ struct Chunk<'a> {
     is_chunk: bool,
     seq: u64,
     ts: u64,
-    partial_index: u64,
+    /// `None` for a progress report: no chunk was read.
+    partial_index: Option<u64>,
     cumulative_chars: u64,
     generated_chars: Option<u64>,
     phase: Option<darkmux_trajectory::StreamPhase>,
     tool_name: Option<&'a str>,
+    /// (#3210) The turn's latest prefill progress, when the engine reported any.
+    prompt: Option<darkmux_trajectory::PromptProgressSample>,
 }
 
 impl<'a> Chunk<'a> {
+    /// (#3210) A prefill progress report. `advanced` (it read more of the
+    /// prompt than the turn's previous report) makes it proof of work, as a
+    /// chunk is; a repeat is like a writing tick.
+    fn of_progress(p: &darkmux_trajectory::PromptProgress, advanced: bool) -> Self {
+        Self {
+            is_chunk: advanced,
+            seq: p.seq,
+            ts: p.ts,
+            partial_index: None,
+            cumulative_chars: 0,
+            generated_chars: Some(0),
+            phase: None,
+            tool_name: None,
+            prompt: Some(darkmux_trajectory::PromptProgressSample { processed: p.processed, total: p.total }),
+        }
+    }
+
     fn of_partial(p: &'a darkmux_trajectory::Partial) -> Self {
         Self {
             is_chunk: true,
             seq: p.seq,
             ts: p.ts,
-            partial_index: p.partial_index,
+            partial_index: Some(p.partial_index),
             cumulative_chars: p.cumulative_chars,
             generated_chars: p.generated_chars,
             phase: p.phase,
             tool_name: p.tool_name.as_deref(),
+            prompt: None,
         }
     }
 
@@ -12269,11 +12326,12 @@ impl<'a> Chunk<'a> {
             is_chunk: false,
             seq: w.seq,
             ts: w.ts,
-            partial_index: w.partial_index,
+            partial_index: Some(w.partial_index),
             cumulative_chars: w.cumulative_chars,
             generated_chars: w.generated_chars,
             phase: Some(w.phase),
             tool_name: Some(&w.tool_name),
+            prompt: None,
         }
     }
 }
@@ -12294,7 +12352,7 @@ impl<'a> Chunk<'a> {
 fn heartbeat_payload(c: &Chunk<'_>) -> DispatchHeartbeatPayload {
     DispatchHeartbeatPayload {
         turn_seq: c.seq,
-        partial_index: Some(c.partial_index),
+        partial_index: c.partial_index,
         cumulative_chars: c.cumulative_chars,
         sampled_at_ms: Some(c.ts),
         generated_chars: c.generated_chars,
@@ -12305,6 +12363,8 @@ fn heartbeat_payload(c: &Chunk<'_>) -> DispatchHeartbeatPayload {
             darkmux_trajectory::StreamPhase::Unknown => None,
         }),
         tool_name: c.tool_name.map(|name| cap_str(name, MAX_TRAJ_FIELD_BYTES)),
+        prompt_processed: c.prompt.map(|p| p.processed),
+        prompt_total: c.prompt.map(|p| p.total),
         step_id: None,
         context: None,
     }
@@ -12325,6 +12385,8 @@ fn opening_heartbeat_payload(s: &darkmux_trajectory::StreamingStart) -> Dispatch
         prompt_chars: Some(s.system_chars.saturating_add(s.prompt_chars)),
         phase: None,
         tool_name: None,
+        prompt_processed: None,
+        prompt_total: None,
         step_id: None,
         context: None,
     }
@@ -12538,6 +12600,7 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         | E::StreamingStart(_)
         | E::Partial(_)
         | E::ToolCallWriting(_)
+        | E::PromptProgress(_)
         | E::StreamingEnd(_)
         | E::ModelCompleted(_)
         | E::Reasoning(_)

@@ -37,6 +37,18 @@ phase?: StreamPhase,
  */
 tool_name?: string, 
 /**
+ * (#3210, flow 2.3.0) Prompt tokens the engine has processed, the latest
+ * it reported this turn, with `prompt_total`. Absent when the engine
+ * reports no prefill progress (only the shapes
+ * `darkmux_trajectory::PromptProgressSample` recognizes are read).
+ */
+prompt_processed?: number, 
+/**
+ * (#3210, flow 2.3.0) Prompt tokens the engine is processing in all,
+ * with `prompt_processed`.
+ */
+prompt_total?: number, 
+/**
  * The graph step the record belongs to, when its session is a step's.
  */
 step_id?: string, 

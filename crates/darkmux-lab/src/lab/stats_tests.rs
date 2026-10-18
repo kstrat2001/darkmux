@@ -632,11 +632,11 @@ fn stats_refuses_a_trajectory_from_a_newer_darkmux() {
     let flows = tempfile::TempDir::new().unwrap();
     std::fs::write(
         run.path().join(darkmux_trajectory::TRAJECTORY_FILE),
-        "{\"type\":\"trajectory.header\",\"schema_version\":\"1.1\"}\n{\"type\":\"dispatch.start\",\"ts\":1}\n",
+        "{\"type\":\"trajectory.header\",\"schema_version\":\"99.0\"}\n{\"type\":\"dispatch.start\",\"ts\":1}\n",
     )
     .unwrap();
     let err = compute_from_dir(run.path(), flows.path()).unwrap_err().to_string();
-    assert!(err.contains("written by a newer darkmux (trajectory `1.1`") && err.contains("Upgrade darkmux."), "{err}");
+    assert!(err.contains("written by a newer darkmux (trajectory `99.0`") && err.contains("Upgrade darkmux."), "{err}");
 }
 
 /// A missing flow directory is not an error — it means no power arm.

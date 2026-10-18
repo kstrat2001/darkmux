@@ -20,7 +20,7 @@ requests:
   #3 model="test-model" max_tokens=32000 stream=null roles=[system,user,user,user,assistant,assistant,tool,system]
 checkpoint: turns=1 tokens=50 compactions=1 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,user,user,assistant,assistant,tool,system]
 events:
-  {"schema_version":"1.0","type":"trajectory.header"}
+  {"schema_version":"1.1","type":"trajectory.header"}
   {"max":null,"seq":1,"type":"dispatch.context","used":5000}
   {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":50,"prompt_tokens":5000,"reasoning_tokens":null,"total_tokens":5050}}
   {"seq":1,"type":"dispatch.reasoning_bound.not_applied"}

@@ -1824,6 +1824,54 @@ struct Watch<'a> {
 /// unchanged.
 pub(crate) const STREAM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A stream event that is not a chunk, as `run_streaming_turn` records it.
+///
+/// (#2889) A tick (`Idle`): once a tool call is named, the silence IS the
+/// model writing its arguments, so say so, with the counts unchanged. Before
+/// a name arrives a silence is prompt processing or a pause, and this names
+/// nothing. Deliberately NOT proof of work: `last_proof_of_work` and the
+/// soft warning are left alone, and the host does not reset its watchdog on
+/// this event. A tick proves only that the runtime is waiting, which a wedged
+/// endpoint would also produce.
+///
+/// (#3210) The engine's prefill progress (`mlx_lm.server`'s keepalive
+/// lines): recorded for the host to carry on the heartbeat. An ADVANCING
+/// report (past `prompt_processed`, the most this call has reported) is
+/// proof of work, like a chunk: a wedged engine reports no new progress. A
+/// repeat of the same count proves only that the socket is open.
+fn between_chunks(
+    event: &crate::lmstudio::StreamEvent,
+    accumulator: &ChunkAccumulator,
+    trajectory: &mut Trajectory,
+    seq: u32,
+    prompt_processed: &mut u64,
+    last_proof_of_work: &mut std::time::Instant,
+    inactivity_soft_warning_fired_in_window: &mut bool,
+) {
+    match event {
+        crate::lmstudio::StreamEvent::Idle => {
+            if let Some(name) = accumulator.writing_tool_name() {
+                trajectory.append_tool_call_writing(
+                    seq,
+                    accumulator.partial_count(),
+                    accumulator.content_bytes(),
+                    accumulator.generated_bytes(),
+                    name,
+                );
+            }
+        }
+        crate::lmstudio::StreamEvent::PromptProgress(p) => {
+            trajectory.append_prompt_progress(seq, p.processed, p.total);
+            if p.processed > *prompt_processed {
+                *prompt_processed = p.processed;
+                *last_proof_of_work = std::time::Instant::now();
+                *inactivity_soft_warning_fired_in_window = false;
+            }
+        }
+        crate::lmstudio::StreamEvent::Chunk(_) => {}
+    }
+}
+
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
 /// in the events to keep `trajectory.jsonl` bounded), and return the
@@ -1873,6 +1921,9 @@ fn run_streaming_turn(
         policy.acts(),
     );
     let mut cut = CutSource::None;
+    // (#3210) The most prompt tokens the engine has reported processed on
+    // this call: a report only proves work when it moves past this.
+    let mut prompt_processed: u64 = 0;
     // (#2889) Ticking, so the loop wakes during a silence and can say the
     // model is still writing a tool call — see `TickingStream`'s doc.
     let stream = client.chat_streaming_ticking(request, watch.tick)?;
@@ -1890,25 +1941,18 @@ fn run_streaming_turn(
         // typed marker, not a string match.
         let chunk = match chunk_result {
             Ok(crate::lmstudio::StreamEvent::Chunk(c)) => c,
-            // (#2889) No chunk this tick. Once a tool call is named, the
-            // silence IS the model writing its arguments: say so, with the
-            // counts unchanged. Before a name arrives a silence is prompt
-            // processing or a pause, and this names nothing.
-            //
-            // Deliberately NOT proof of work: `last_proof_of_work` and the
-            // soft warning are left alone, and the host does not reset its
-            // watchdog on this event. A tick proves only that the runtime is
-            // waiting, which a wedged endpoint would also produce.
-            Ok(crate::lmstudio::StreamEvent::Idle) => {
-                if let Some(name) = accumulator.writing_tool_name() {
-                    trajectory.append_tool_call_writing(
-                        seq,
-                        accumulator.partial_count(),
-                        accumulator.content_bytes(),
-                        accumulator.generated_bytes(),
-                        name,
-                    );
-                }
+            // (#2889, #3210) No chunk: a tick, or the engine's prefill
+            // progress. See `between_chunks`.
+            Ok(event) => {
+                between_chunks(
+                    &event,
+                    &accumulator,
+                    trajectory,
+                    seq,
+                    &mut prompt_processed,
+                    last_proof_of_work,
+                    inactivity_soft_warning_fired_in_window,
+                );
                 continue;
             }
             Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
@@ -15262,6 +15306,10 @@ mod checkpoint_regression_tests;
 #[cfg(test)]
 #[path = "tool_writing_tests.rs"]
 mod tool_writing_tests;
+
+#[cfg(test)]
+#[path = "prompt_progress_tests.rs"]
+mod prompt_progress_tests;
 
 #[cfg(test)]
 #[path = "loop_characterization_tests.rs"]

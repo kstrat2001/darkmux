@@ -19,6 +19,7 @@ import {
   executionRole,
   executionTokenReading,
   promptTokensLabel,
+  promptProgressLabel,
   heartbeatSamples,
   isStalled,
   liveStatePriority,
@@ -1585,6 +1586,88 @@ describe("(#3145) a long prefill reads PROMPT, not STALL", () => {
 
   it("the run page and fleet card read it through the one aggregate", () => {
     expect(aggregateLiveState([issueRun()], opener + 197_000, DEFAULT_POLICY)).toMatchObject({ state: "prompt", promptChars: PROMPT_CHARS });
+  });
+});
+
+// (#3210) The engine's prefill progress on the heartbeat (`prompt_processed`
+// / `prompt_total`, flow 2.3.0). The fixture is the issue's capture:
+// `mlx_lm.server` 0.31.3 on a 13" M2, a 2,516-token prompt at ~60 tok/s,
+// one report per 512-token prefill step. Every time is relative to the
+// opener, and every assertion passes its own clock (no wall clock).
+describe("(#3210) prefill progress reads PROMPT as a percentage", () => {
+  const T = Date.parse("2026-10-11T00:00:57Z");
+  const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: wholeSec(atMs), action, session_id: SID, payload });
+  const opener = (promptChars = 9_000, turn = 1) =>
+    wire(T, "dispatch.turn.heartbeat", { turn_seq: turn, cumulative_chars: 0, sampled_at_ms: T, generated_chars: 0, prompt_chars: promptChars });
+  const report = (atSec: number, processed: number, total = 2_516, turn = 1) =>
+    wire(T + atSec * 1000, "dispatch.turn.heartbeat", {
+      turn_seq: turn,
+      cumulative_chars: 0,
+      sampled_at_ms: T + atSec * 1000,
+      generated_chars: 0,
+      prompt_processed: processed,
+      prompt_total: total,
+    });
+  const start = wire(T - 1_000, "dispatch.start");
+  // The capture's own seconds after the opener (00:00:57).
+  const capture = [report(8, 512), report(16, 1_024), report(24, 1_536), report(33, 2_048), report(41, 2_512), report(42, 2_516)];
+
+  it("one report: the percentage, and no time left until there is a rate", () => {
+    const r = deriveLiveState([start, opener(), capture[0]], T + 9_000);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 512, total: 2_516, percent: 20 } });
+  });
+
+  it("two reports: the time left from their rate, less the time since the last", () => {
+    // 512 tokens in 8 s = 64 tok/s; 1,492 left = 23.3 s, 1 s already gone.
+    const r = deriveLiveState([start, opener(), ...capture.slice(0, 2)], T + 17_000);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 } });
+  });
+
+  it("the whole capture: the latest report, at 100% with nothing left to estimate", () => {
+    const r = deriveLiveState([start, opener(), ...capture], T + 42_100);
+    expect(r).toEqual({ state: "prompt", promptChars: 9_000, promptProgress: { processed: 2_516, total: 2_516, percent: 100 } });
+  });
+
+  it("an advancing prefill whose steps are slower than the stall threshold never reads STALL", () => {
+    // A slow machine: 40 s per step, past STALL_AFTER_MS between reports.
+    const slow = [start, opener(), report(40, 512), report(80, 1_024)];
+    expect(deriveLiveState(slow, T + 80_000 + STALL_AFTER_MS + 5_000).state).toBe("prompt");
+    // Three of its own steps of silence is a hang.
+    expect(deriveLiveState(slow, T + 80_000 + 3 * 40_000 + 1).state).toBe("stalled");
+  });
+
+  it("prefillStallAfterMs applies only when no progress fact exists", () => {
+    // A 244,552-char opener allows 579 s of silence with no progress; once
+    // the engine reports progress, its own pace bounds the silence instead.
+    const big = [start, opener(244_552), report(8, 512), report(16, 1_024)];
+    expect(prefillStallAfterMs(244_552)).toBeGreaterThan(76_000);
+    expect(deriveLiveState(big, T + 16_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+    expect(deriveLiveState([start, opener(244_552)], T + 16_000 + STALL_AFTER_MS + 1)).toEqual({ state: "prompt", promptChars: 244_552 });
+  });
+
+  it("a previous turn's progress never shows on a new turn's opener", () => {
+    const records = [start, opener(9_000, 1), report(8, 2_516, 2_516, 1), wire(T + 9_000, "dispatch.turn.heartbeat", { turn_seq: 1, sampled_at_ms: T + 9_000, generated_chars: 40, cumulative_chars: 40 }), wire(T + 10_000, "dispatch.turn.heartbeat", { turn_seq: 2, cumulative_chars: 0, sampled_at_ms: T + 10_000, generated_chars: 0, prompt_chars: 9_500 })];
+    expect(deriveLiveState(records, T + 11_000)).toEqual({ state: "prompt", promptChars: 9_500 });
+  });
+
+  it("a report with no usable total is not progress", () => {
+    const bad = wire(T + 8_000, "dispatch.turn.heartbeat", { turn_seq: 1, cumulative_chars: 0, sampled_at_ms: T + 8_000, generated_chars: 0, prompt_processed: 0, prompt_total: 0 });
+    expect(deriveLiveState([start, opener(), bad], T + 9_000)).toEqual({ state: "prompt", promptChars: 9_000 });
+  });
+
+  it("once the model generates, the reading is GEN, not PROMPT's progress", () => {
+    const gen = wire(T + 42_300, "dispatch.turn.heartbeat", { turn_seq: 1, sampled_at_ms: T + 42_300, generated_chars: 12, cumulative_chars: 12, prompt_processed: 2_516, prompt_total: 2_516 });
+    expect(deriveLiveState([start, opener(), ...capture, gen], T + 42_500).state).toBe("generating");
+  });
+
+  it("the fleet card's reading and the shared label carry it", () => {
+    const reading = executionTokenReading([start, opener(), ...capture.slice(0, 2)], T + 17_000);
+    expect(reading.promptProgress).toEqual({ processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 });
+    expect(promptProgressLabel({ processed: 1_024, total: 2_516, percent: 40, secondsLeft: 23 })).toBe("40% · ~23s left");
+    expect(promptProgressLabel({ processed: 512, total: 2_516, percent: 20 })).toBe("20%");
+    expect(liveStateLabel({ state: "prompt", promptProgress: { processed: 512, total: 2_516, percent: 20 } })).toBe("processing prompt · 20%");
   });
 });
 

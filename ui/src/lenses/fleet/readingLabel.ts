@@ -4,23 +4,33 @@
  * execution's own fields, so the five cases are tested without a DOM.
  */
 
-import { fmtN } from "../../lib/format";
-import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
+import { compactDuration, fmtN } from "../../lib/format";
+import { liveStateLabel, promptProgressLabel, reasonForLine } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 
-/** The line's text. `rest` carries both forms of the reason, because the card
- *  shows one by the viewport's width (the line keeps its one-line height). */
-export type ReadingLabel = { kind: "text"; text: string } | { kind: "rest"; full: string; word: string };
+/** The line's text. `byWidth` carries a long and a short form, because the
+ *  card shows one by the viewport's width (the line keeps its one-line
+ *  height): a rest's reason, and (#3210) a prefill's progress. */
+export type ReadingLabel = { kind: "text"; text: string } | { kind: "byWidth"; full: string; word: string };
 
 /** The reading for an execution in `state` (never the disconnection downgrade,
  *  where the line says `disconnected` instead). */
 export function readingLabel(exec: ExecutionTokenReading, state: LiveState): ReadingLabel {
   if (state === "generating") return { kind: "text", text: generatingText(exec) };
+  // (#3210) How far the engine has read the prompt, when it reports it:
+  // "processing 40% · ~23s left". Ahead of the size estimate, which it makes
+  // redundant (the hover still says how much).
+  // On a phone the short form drops "processing", which ellipsized the time
+  // left away.
+  if (state === "prompt" && exec.promptProgress) {
+    const progress = promptProgressLabel(exec.promptProgress);
+    return { kind: "byWidth", full: `processing ${progress}`, word: progress };
+  }
   // (#2890) "processing ~36k", not "processing prompt · ~36k": the long form
   // ellipsized the size away on a phone.
   if (state === "prompt" && exec.promptLabel) return { kind: "text", text: `processing ${exec.promptLabel}` };
   // (#2950) Why it rests, in place of "rest Ns": the tube's center counts the seconds.
-  if (state === "rest" && exec.restReason) return { kind: "rest", full: reasonForLine(exec.restReason), word: exec.restReasonWord ?? exec.restReason };
+  if (state === "rest" && exec.restReason) return { kind: "byWidth", full: reasonForLine(exec.restReason), word: exec.restReasonWord ?? exec.restReason };
   return {
     kind: "text",
     text: liveStateLabel({
@@ -44,6 +54,11 @@ function generatingText(exec: ExecutionTokenReading): string {
 
 /** The tooltip on a reading: the whole reason or size, should a narrow card ellipsize it. */
 export function readingTitle(exec: ExecutionTokenReading, state: LiveState): string | undefined {
+  if (state === "prompt" && exec.promptProgress) {
+    const p = exec.promptProgress;
+    const left = p.secondsLeft !== undefined ? `, about ${compactDuration(p.secondsLeft)} left` : "";
+    return `prompt processed: ${fmtN(p.processed)} of ${fmtN(p.total)} tokens${left}`;
+  }
   if (state === "prompt" && exec.promptLabel) return `estimated prompt size: ${exec.promptLabel} tokens`;
   if (state === "rest" && exec.restReason) return `resting: ${exec.restReason}`;
   return undefined;

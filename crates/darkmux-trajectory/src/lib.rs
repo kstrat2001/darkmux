@@ -12,11 +12,13 @@
 pub mod envelope;
 pub mod event;
 pub mod fold;
+pub mod prompt_progress;
 pub mod usage;
 
 pub use envelope::{FailedExec, ResumedFrom, RuntimeEnvelope};
 pub use event::*;
 pub use fold::*;
+pub use prompt_progress::PromptProgressSample;
 pub use usage::{estimate_tokens, TokenSum, Usage, UsageCounts, CHARS_PER_TOKEN};
 
 /// The runtime's bookkeeping directory, under its out-dir mount. The dot
@@ -29,7 +31,9 @@ pub const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 /// renames or retypes one. The host (which can compare versions through
 /// `darkmux_types::data_version`) refuses to inspect a trajectory whose
 /// header is newer than this; a file with no header predates the marker.
-pub const TRAJECTORY_SCHEMA_VERSION: &str = "1.0";
+///
+/// 1.1 (#3210): the `model.prompt.progress` event.
+pub const TRAJECTORY_SCHEMA_VERSION: &str = "1.1";
 
 /// The trajectory file inside [`TRAJECTORY_SUBDIR`].
 pub const TRAJECTORY_FILE: &str = "trajectory.jsonl";

@@ -15,7 +15,7 @@ requests:
   #2 model="test-model" max_tokens=32000 stream=null roles=[system,user,assistant,tool]
 checkpoint: turns=1 tokens=20 compactions=0 hand_back=false pending=0 seq_base=0 head_started=false roles=[system,user,assistant,tool]
 events:
-  {"schema_version":"1.0","type":"trajectory.header"}
+  {"schema_version":"1.1","type":"trajectory.header"}
   {"ms":2000,"reason":"thermal","seq":0,"state":"serious","type":"runtime.rest"}
   {"max":null,"seq":1,"type":"dispatch.context","used":100}
   {"calls_planned":true,"finish_reason":"tool_calls","reported_model":"ignored-by-test","seq":1,"tool_calls":[{"arguments_chars":48,"id":"call_0","name":"read","path":"/workspace/x.txt"}],"type":"model.completed","usage":{"cached_tokens":null,"completion_tokens":20,"prompt_tokens":100,"reasoning_tokens":null,"total_tokens":120}}

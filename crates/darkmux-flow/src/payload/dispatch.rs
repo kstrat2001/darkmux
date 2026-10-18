@@ -704,6 +704,18 @@ pub struct DispatchHeartbeatPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub tool_name: Option<String>,
+    /// (#3210, flow 2.3.0) Prompt tokens the engine has processed, the latest
+    /// it reported this turn, with `prompt_total`. Absent when the engine
+    /// reports no prefill progress (only the shapes
+    /// `darkmux_trajectory::PromptProgressSample` recognizes are read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub prompt_processed: Option<u64>,
+    /// (#3210, flow 2.3.0) Prompt tokens the engine is processing in all,
+    /// with `prompt_processed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub prompt_total: Option<u64>,
     /// The graph step the record belongs to, when its session is a step's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

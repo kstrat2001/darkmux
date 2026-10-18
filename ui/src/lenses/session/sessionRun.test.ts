@@ -259,6 +259,24 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(runRegions(flowToRenderModel(data), "s1", Date.parse("2026-01-01T00:00:20Z")).liveTokScope?.restReason).toBeUndefined();
   });
 
+  // (#3210) The engine's prefill progress reaches the run page's scope.
+  it("(#3210) a run reading its prompt carries the engine's prefill progress to the scope", () => {
+    const opener = Date.parse("2026-01-01T00:00:01Z");
+    const beat = (sec: number, extra: Record<string, unknown>): RawRecord => ({
+      ts: `2026-01-01T00:00:${String(sec).padStart(2, "0")}Z`,
+      session_id: "s1",
+      action: "dispatch.turn.heartbeat",
+      payload: { turn_seq: 1, sampled_at_ms: Date.parse(`2026-01-01T00:00:${String(sec).padStart(2, "0")}Z`), generated_chars: 0, cumulative_chars: 0, ...extra },
+    });
+    const data: RawRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      beat(1, { prompt_chars: 9_000 }),
+      beat(9, { prompt_processed: 512, prompt_total: 2_516 }),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1", opener + 9_000);
+    expect(view.liveTokScope).toMatchObject({ state: "prompt", promptProgress: { processed: 512, total: 2_516, percent: 20 } });
+  });
+
   it("a run with heartbeats but a long gap since the last one reads as stalled", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");

@@ -14,7 +14,7 @@ requests:
   #2 model="test-model" max_tokens=9000 stream=true roles=[system,user,assistant]
 checkpoint: turns=1 tokens=1001 compactions=0 hand_back=true pending=0 seq_base=0 head_started=false roles=[system,user,assistant]
 events:
-  {"schema_version":"1.0","type":"trajectory.header"}
+  {"schema_version":"1.1","type":"trajectory.header"}
   {"prompt_chars":11,"seq":1,"system_chars":11,"type":"model.streaming.start"}
   {"cumulative_chars":0,"delta_chars":0,"generated_chars":4,"partial_index":1,"seq":1,"tool_calls_present":false,"type":"model.partial"}
   {"cumulative_chars":0,"delta_chars":0,"generated_chars":9,"partial_index":2,"seq":1,"tool_calls_present":false,"type":"model.partial"}
