@@ -52,7 +52,7 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>A local model without LM Studio</h2>
-    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver and installs <code>mlx_lm.server</code>, an OpenAI-compatible chat server. darkmux reaches it as an <em>unmanaged endpoint</em>: darkmux sends requests, and the server owns what is loaded. While it reads a prompt, <code>mlx_lm.server</code> reports how far it has got, so the fleet card's scope shows a bar under the brain and the line says the percentage and the time left. With a prompt cache hit it counts only the part of the prompt the cache didn't hold.</p>
+    <p><a href="https://github.com/joshuaswarren/omarchy-mlx">omarchy-mlx</a> runs Apple's MLX on the Mac's GPU through Mesa's Honeykrisp Vulkan driver and installs <code>mlx_lm.server</code>, an OpenAI-compatible chat server. darkmux uses it as an OpenAI-compatible engine, the machine's default engine once you set it below: darkmux adopts the server you started, sends it requests, and leaves loading to the server, which loads whichever model a request names. While it reads a prompt, <code>mlx_lm.server</code> reports how far it has got, so the scope shows a bar under the brain and the line says the percentage and the time left, on this machine's viewer and on every other viewer in the fleet. With a prompt cache hit it counts only the part of the prompt the cache didn't hold.</p>
     <h3>Install omarchy-mlx</h3>
     <p>The Omarchy menu's entry (Install &gt; AI) refuses chips it hasn't been tested on; the project's own installer warns instead and carries on. Read the script before running it:</p>
     <pre><code>sudo pacman -S --needed lapack blas openblas
@@ -61,7 +61,7 @@ less mlx-install.sh
 bash mlx-install.sh</code></pre>
     <p>It ends with a smoke test on your GPU. If a download fails partway, run it again.</p>
     <h3>Pick a model that fits</h3>
-    <p>The model shares memory with everything else on the machine, and its KV cache grows with the prompt; darkmux's role prompts alone are about 3,500 tokens. The Asahi Vulkan driver also caps each process's GPU heap at half the RAM, and as the context fills it, generation slows sharply, then fails with <code>VK_ERROR_OUT_OF_DEVICE_MEMORY</code>. Pick a model that fits your RAM with room to spare. The examples below use the small <code>mlx-community/Qwen3-1.7B-4bit</code>; with more memory, go bigger.</p>
+    <p>The model shares memory with everything else on the machine, and its KV cache grows with the prompt; darkmux's role prompts alone are about 3,500 tokens. The Asahi Vulkan driver also caps each process's GPU heap at half the RAM, and as the context fills it, generation slows sharply, then fails with <code>VK_ERROR_OUT_OF_DEVICE_MEMORY</code>. Pick a model that fits your RAM with room to spare. The examples below use the small <code>mlx-community/Qwen3-1.7B-4bit</code>; with more memory, go bigger. On an 8 GB machine even that model ran out of GPU memory partway through a 3,000-token prompt at the default heap, and finished 5,800-token prompts with the heap raised to 5 GB (<code>HK_SYSMEM</code>, under "Run it lean" below).</p>
     <h3>Serve it as a user service</h3>
     <pre><code>mkdir -p ~/.config/systemd/user
 cat &gt; ~/.config/systemd/user/mlx-local.service &lt;&lt;'UNIT'
@@ -116,7 +116,7 @@ curl -s http://127.0.0.1:8080/v1/models</code></pre>
 sudo systemctl enable --now docker.service
 sudo ufw allow in on docker0 to any port 8080 proto tcp
 sudo ufw status verbose</code></pre>
-    <p>Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A role with tools compacts against the model's context window, which an unmanaged endpoint has to declare: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
+    <p>Then serve the model on the bridge address (<code>--host 172.17.0.1</code>, Omarchy's Docker bridge) instead of <code>127.0.0.1</code>, so only containers reach it, and point the endpoint at <code>http://host.docker.internal:8080/v1</code>. A role with tools compacts against the model's context window, which an OpenAI-compatible engine doesn't report, so the profile declares it: add <code>"n_ctx": 32768</code> (or the model's real window) to the profile's model.</p>
     <pre><code>darkmux dispatch code-reviewer --profile mlx-small "Use the exec tool to run: echo hello-from-container. Then reply with the output in one sentence."</code></pre>
   </div>
 </section>
@@ -264,9 +264,9 @@ brightnessctl -d apple-panel-bl set 50%</code></pre>
     <ul>
       <li><strong>Machine telemetry is partial.</strong> CPU, the Performance and Efficiency clusters, memory, battery and cluster MHz read on Linux. Power is next; GPU and thermal state read "not reported". The residency planner sees no memory pools (it only manages LM Studio models).</li>
       <li><strong>GPU utilization</strong> has no source: the Asahi GPU driver reports neither a device-wide busy figure nor per-process usage in <code>fdinfo</code>, so the lens shows "—".</li>
-      <li><strong>A model on an unmanaged endpoint</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it manages.</li>
+      <li><strong>A model on an OpenAI-compatible engine</strong> counts as "other" memory on the Machine tab: darkmux attributes only the models it loads itself, on LM Studio.</li>
       <li><strong><code>darkmux doctor</code></strong> fails <code>lms binary</code> while <code>profiles.json</code> has LM Studio profiles, and warns on rows whose probes are macOS-only, such as RAM headroom (<a href="https://github.com/kstrat2001/darkmux/issues/3281">#3281</a>).</li>
-      <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection; darkmux then waits out its full timeout.</li>
+      <li><strong>A model server that runs out of GPU memory</strong> mid-request can stop answering without closing the connection. The fleet card reads STALL, but a role with no tools then waits out the full 600-second request timeout before it ends with an error (<a href="https://github.com/kstrat2001/darkmux/issues/3296">#3296</a>). Restart the server (<code>systemctl --user restart mlx-local</code>) after one.</li>
     </ul>
   </div>
 </section>
