@@ -4601,6 +4601,19 @@ mod tests {
         assert_eq!(got, r#"{"objective":"y"}"#);
     }
 
+    /// (#3295) An unstreamed mlx reply carries its reasoning in
+    /// `message.reasoning`; a thinking utility model returning empty content
+    /// must not fail compaction with "no content or reasoning_content".
+    #[test]
+    fn extract_falls_back_to_mlx_reasoning_field() {
+        let m: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"","reasoning":"{\"objective\":\"y\"}"}"#,
+        )
+        .unwrap();
+        let got = extract_compactor_content(m).unwrap();
+        assert_eq!(got, r#"{"objective":"y"}"#);
+    }
+
     #[test]
     fn extract_errors_when_both_absent() {
         let m = msg_with(None, None);
