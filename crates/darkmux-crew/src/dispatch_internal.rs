@@ -11659,7 +11659,10 @@ impl TailerState {
         // turn boundary: one long reasoning turn once wrote a turn record per
         // API call (66 for a run whose `turns` was 1). Continuations emit
         // `dispatch.checkpoint` instead.
-        if m.ends_turn() {
+        // (#2967) A salvaged turn (#479) also ends: it keeps the raw `length`
+        // but dispatches its well-formed calls, and the next call opens a new
+        // `seq`. A continuation's calls are all marked `runs: false`.
+        if m.ends_turn() || running_tool_calls(m).is_some_and(|calls| !calls.is_empty()) {
             let payload = DispatchTurnPayload {
                 turn_seq: m.seq,
                 finish_reason: cap_str(&m.finish_reason, MAX_TRAJ_FIELD_BYTES),
