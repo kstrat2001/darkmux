@@ -11,7 +11,7 @@ import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
-import { Masthead } from "./components/Masthead";
+import { Masthead, type SubjectState } from "./components/Masthead";
 import { MachineDrawer } from "./components/MachineDrawer";
 import { EventLogColumn } from "./components/EventLogColumn";
 import { PageJudgementProvider } from "./hooks/useJudgement";
@@ -26,6 +26,7 @@ import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
+import { useLiveSessionIds } from "./hooks/useLiveSessionIds";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import type { LiveTailStatus } from "./hooks/useLiveTail";
@@ -44,7 +45,7 @@ import { useDrilledMachine } from "./hooks/useDrilledMachine";
 import { useEventLogRecords } from "./hooks/useEventLogRecords";
 import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
-import { ingest, type NormRecord } from "./lib/ingest";
+import { ACTION, ingest, type NormRecord } from "./lib/ingest";
 import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
 import { sessionRun } from "./lib/runRef";
 import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse";
@@ -136,6 +137,76 @@ const EMPTY_FLOW_RECORDS: NormRecord[] = [];
 function terminalWallMs(records: NormRecord[], sessionId: string): number | null {
   const run = sessionRun(records, sessionId, Infinity);
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
+}
+
+/** (#2284) What the shell knows about a daemon dispatch route's subject.
+ * Whether a dispatch is running comes from presence (`useSessionLiveness`),
+ * not from its records, so it needs both:
+ * - records still loading, or presence not yet answered: `pending`;
+ * - its records have NEVER been read (a 404 id): `failed`. Once one read
+ *   succeeded, a later failed poll changes nothing here: presence decides;
+ * - presence unreadable and the records show no end: `failed`, because
+ *   nothing can say whether it is running. Records that show it ended are a
+ *   replay whatever presence says. */
+interface DispatchSubject {
+  loading: boolean;
+  neverRead: boolean;
+  presenceAnswered: boolean;
+  presenceUnreadable: boolean;
+  ended: boolean;
+}
+function dispatchState(d: DispatchSubject): SubjectState {
+  if (d.loading) return "pending";
+  if (d.neverRead) return "failed";
+  if (!d.presenceAnswered) return "pending";
+  return d.presenceUnreadable && !d.ended ? "failed" : "resolved";
+}
+
+/** (#2284) A mission needs its records query settled; a read that came back
+ * `ok:false` is `failed`, never resolved: it says nothing about whether the
+ * run is live. */
+function missionState(data: { ok: boolean } | undefined): SubjectState {
+  if (data === undefined) return "pending";
+  return data.ok ? "resolved" : "failed";
+}
+
+/** (#2284) Whether `key`'s subject has been read successfully at least once
+ * (React's adjust-state-while-rendering pattern; settles in one pass). */
+function useEverRead(key: string | null, readOk: boolean): boolean {
+  const [readKey, setReadKey] = useState<string | null>(null);
+  if (readOk && readKey !== key) setReadKey(key);
+  return readOk || readKey === key;
+}
+
+/** (#2284) The records carry a role execution's terminal record. */
+function dispatchEnded(records: readonly NormRecord[]): boolean {
+  return records.some((r) => r.action === ACTION.DispatchComplete || r.action === ACTION.DispatchError);
+}
+
+/** (#2284) The route's subject state. Every route but a daemon dispatch or
+ * mission (and a static build) has nothing to wait on. The presence read is
+ * the SAME query `useSessionLiveness` mounts for this dispatch (one cache
+ * slot, one request). */
+function useSubjectState(
+  sourceKind: string,
+  route: Route,
+  records: { loading: boolean; error: unknown; records: readonly NormRecord[] },
+  missionData: { ok: boolean } | undefined,
+): SubjectState {
+  const isDispatch = sourceKind === "daemon" && route.kind === "dispatch";
+  const presence = useLiveSessionIds(isDispatch);
+  const key = route.kind === "dispatch" ? route.dispatchId : null;
+  const everRead = useEverRead(key, isDispatch && !records.loading && records.error === null);
+  if (sourceKind !== "daemon") return "resolved";
+  if (route.kind === "mission") return missionState(missionData);
+  if (!isDispatch) return "resolved";
+  return dispatchState({
+    loading: records.loading,
+    neverRead: records.error !== null && !everRead,
+    presenceAnswered: presence.answered,
+    presenceUnreadable: presence.unreadable,
+    ended: dispatchEnded(records.records),
+  });
 }
 
 export function App() {
@@ -239,6 +310,12 @@ export function App() {
     if (route.kind === "mission") return missionRecords ? missionReplayDate(missionRecords) : null;
     return null;
   }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecords]);
+  // (#2284) What the shell knows about the route's subject. Until it is
+  // resolved, `replayDate` is null (or set) for lack of an answer, and the
+  // masthead must claim neither LIVE nor a replay. The presence read here is
+  // the SAME query `useSessionLiveness` mounts for this dispatch (one cache
+  // slot, one request).
+  const subject = useSubjectState(source.kind, route, routeRecords, missionRecordsQuery.data);
   const day = useDay(replayDate);
   const dayRecords = day.records;
   // (#2346, redesigned after a live-render finding) The transport's own
@@ -636,6 +713,7 @@ export function App() {
         route={displayRoute}
         liveStatus={liveStatus}
         replayDate={route.kind === "playback" ? null : replayDate}
+        subject={subject}
       />
       {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
           not a child of it, so it can never touch that component's own

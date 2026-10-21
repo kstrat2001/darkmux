@@ -112,13 +112,21 @@ export function Masthead({
   route,
   liveStatus,
   replayDate = null,
+  subject = "resolved",
 }: {
   route: Route;
   liveStatus: LiveTailStatus;
   /** The day a daemon dispatch/mission page belongs to, once the shell has
-   * derived it from the records; `null` until then (the pill reads "LIVE"
-   * meanwhile) and on every other route. */
+   * derived it from the records; `null` until then and on every other route.
+   * Read only once `subject` is `resolved`: before that the pill is neutral
+   * whatever this says. */
   replayDate?: string | null;
+  /** (#2284) What the shell knows about this route's subject (a dispatch's
+   * records and presence, or a mission's records). `pending` while that is
+   * in flight and `failed` when the read came back unusable: either way the
+   * pill claims neither LIVE nor a replay. `resolved` on every route with no
+   * subject to resolve. */
+  subject?: SubjectState;
 }) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
@@ -128,8 +136,9 @@ export function Masthead({
   // whose day is known is a recording — the pill (and, for a dispatch, the
   // transport) carries the mode via the replay glyph instead, and a live dot
   // beside it would be false. While the day is still unknown (the subject is
-  // running, the pill reads LIVE) the page is live and says so.
-  const live = isLiveRoute(route) && replayDate == null;
+  // running, the pill reads LIVE) the page is live and says so. (#2284)
+  // "Unknown" covers only a RESOLVED subject: while its read is in flight,
+  // or after it failed, the pill stays neutral (`mastheadPillLabel`).
   // (#2412 round 2, reviewer finding) A DROPPED stream announces
   // "reconnecting" to screen readers only after it has HELD for
   // `RECONNECTING_ANNOUNCE_DELAY_MS` — an SSE hiccup that self-heals inside
@@ -210,7 +219,7 @@ export function Masthead({
           are now mutually exclusive by MEANING rather than by screen width
           (the earlier mobile-only hide was the same instinct, argued from
           the wrong premise). */}
-      {live && liveStatus !== "live" ? (
+      {showsRefetch(route, replayDate, subject, liveStatus) ? (
         <button
           type="button"
           className={`masthead__refresh${spinning ? " spin" : ""}`}
@@ -236,7 +245,7 @@ export function Masthead({
           {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={pillLabel(route, replayDate, liveStatus, announcedLiveStatus)} />
+        <CatalogPanel label={mastheadPillLabel(route, replayDate, subject, liveStatus, announcedLiveStatus)} />
       )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
@@ -317,6 +326,52 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
  * wrong on top of being redundant with the pill's own dot. "LIVE" is never
  * wrong: it names the TRANSPORT state, not a calendar day. */
 const LIVE_CHIP = "LIVE";
+
+/** (#2284) What the shell knows about a route's subject; see `Masthead`'s
+ * `subject` prop. */
+export type SubjectState = "pending" | "failed" | "resolved";
+
+/** (#2284) The pill's words while the subject is not resolved. No dot and no
+ * replay glyph: the page does not know which it is. */
+const NEUTRAL_TEXT: Record<Exclude<SubjectState, "resolved">, string> = {
+  pending: "…",
+  failed: "couldn't read this run",
+};
+
+/** (#2284) The refetch control: on a live route whose stream is down (the
+ * transport is known even while the subject is not), or whose subject read
+ * failed (a retry is the one useful action there). */
+function showsRefetch(route: Route, replayDate: string | null, subject: SubjectState, liveStatus: LiveTailStatus): boolean {
+  if (!isLiveRoute(route)) return false;
+  if (subject === "failed") return true;
+  return liveStatus !== "live" && (subject === "pending" || replayDate == null);
+}
+
+/** (#2284) `pillLabel`, or the neutral label while the subject is not
+ * resolved. The neutral label keeps the stream's own announcement: a dropped
+ * stream is still announced as reconnecting. */
+function mastheadPillLabel(
+  route: Route,
+  replayDate: string | null,
+  subject: SubjectState,
+  liveStatus: LiveTailStatus,
+  announcedLiveStatus: "live" | "reconnecting",
+): ReactNode {
+  if (subject === "resolved") return pillLabel(route, replayDate, liveStatus, announcedLiveStatus);
+  const text = NEUTRAL_TEXT[subject];
+  return (
+    <>
+      <span className="masthead__pilltext" title={text}>
+        {text}
+      </span>
+      {isLiveRoute(route) ? (
+        <span className="mm-sr-only" aria-live="polite">
+          {announcedLiveStatus === "reconnecting" ? "reconnecting" : ""}
+        </span>
+      ) : null}
+    </>
+  );
+}
 
 /** The catalog toggle's own glyph for a route that names a specific
  * recording — the mission id once a mission has closed, or a past date.

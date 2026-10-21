@@ -5,11 +5,11 @@ import { Masthead, RECONNECTING_ANNOUNCE_DELAY_MS } from "./Masthead";
 import type { Route } from "../lib/route";
 import { closeOpenModal, getOpenId } from "../lib/dialogManager";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null) {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null, subject: "pending" | "failed" | "resolved" = "resolved") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} />
+      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} subject={subject} />
     </QueryClientProvider>,
   );
 }
@@ -200,6 +200,45 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
+  it("(#2284) a dispatch or mission page claims nothing while its subject is unresolved: no LIVE, no dot, no replay glyph, no refetch control", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    // Measured on the installed daemon: a FINISHED mission read `● LIVE` for
+    // the first ~1 s, because "day unknown" was read as "running" while the
+    // records were still loading. Unknown is its own state.
+    for (const route of [
+      { kind: "dispatch", dispatchId: "s1", missionId: null },
+      { kind: "mission", missionId: "m1", stepId: null },
+    ]) {
+      for (const status of ["live", "reconnecting"] as const) {
+        const { container, unmount } = renderMasthead(route as never, status, null, "pending");
+        const pill = container.querySelector(".catalog-toggle");
+        expect(pill?.textContent).not.toContain("LIVE");
+        expect(pill?.textContent).not.toMatch(/[●◌▣]/);
+        expect(container.querySelector(".masthead__pilldot")).toBeNull();
+        // (#2284 review) The stream's own state is still known while the
+        // subject is pending: a dropped stream keeps its refetch control and
+        // its "reconnecting" announcement.
+        expect(container.querySelector(".masthead__refresh") !== null).toBe(status === "reconnecting");
+        expect(container.querySelector('.catalog-toggle [aria-live="polite"]')).not.toBeNull();
+        unmount();
+      }
+    }
+    // Resolved and still running: the live dot, as before.
+    const running = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", null, "resolved");
+    expect(running.container.querySelector(".catalog-toggle")?.textContent).toContain("●LIVE");
+    vi.unstubAllGlobals();
+  });
+
+  it("(#2284) a failed subject read says so and offers the refetch even while the stream is up", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const { container } = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", null, "failed");
+    const pill = container.querySelector(".catalog-toggle")?.textContent ?? "";
+    expect(pill).toContain("couldn't read this run");
+    expect(pill).not.toMatch(/LIVE|[●◌▣]/);
+    expect(container.querySelector(".masthead__refresh")).not.toBeNull();
+    vi.unstubAllGlobals();
+  });
+
   it("a daemon playback of today's date still NAMES the day, never LIVE — that word belongs to the live view", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const today = new Date().toISOString().slice(0, 10);
@@ -294,6 +333,22 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     const live = toggle.querySelector('[aria-live="polite"]')!;
     expect(live.textContent).toBe("reconnecting");
     vi.useRealTimers();
+  });
+
+  it("(#2284) a pending subject still announces a dropped stream as reconnecting once the hold elapses", () => {
+    vi.useFakeTimers();
+    try {
+      for (const subject of ["pending", "failed"] as const) {
+        const { container, unmount } = renderMasthead({ kind: "dispatch", dispatchId: "s1", missionId: null } as never, "reconnecting", null, subject);
+        act(() => {
+          vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
+        });
+        expect(container.querySelector('.catalog-toggle [aria-live="polite"]')?.textContent).toBe("reconnecting");
+        unmount();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("(b2) live + reconnecting: aria-live stays \"live\" until the delay has held, and never announces reconnecting for a hiccup that self-heals first", () => {
