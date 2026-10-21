@@ -1882,7 +1882,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let view = fleet_view::cached_view(&state).await.ok();
     let result = tokio::task::spawn_blocking(move || {
         let fleet = fleet_flow_records();
-        let built = runs::build_runs_with_usage(&flows_dir, lab_dir.as_deref(), &fleet.records, None);
+        let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
         let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
         let off_rows = (off(&built.usage.no_run), off(&built.usage.unlisted));
         let mut rows = built.runs;

@@ -1,14 +1,22 @@
-//! (#2891) The flow day files `/runs` folds, parsed once and kept.
+//! (#2891) The flow day files the daemon's `/runs` folds, read once and kept.
 //!
 //! `/runs` folds every record of its window (14 days of day files) on every
-//! request, and the viewer polls it every few seconds. Parsing that history
-//! from scratch was most of the request's cost, and it grows by a day file a
-//! day. A [`FlowRecordStore`] remembers, per day file, how far it has parsed
-//! and the records it kept, so a later read parses only the bytes appended
-//! since. Nothing is served from a timer: every read stats each file in the
-//! window, so a record written a moment ago is in the next build.
+//! request, and the viewer polls it every few seconds. Reading that history
+//! from disk and parsing it from scratch was most of the request's cost, and
+//! it grows by a day file a day. A [`FlowRecordStore`] remembers, per day
+//! file, how far it has read and the lines it kept, so a later read touches
+//! only the bytes appended since. Nothing is served from a timer: every read
+//! stats each file in the window, so a record written a moment ago is in the
+//! next build.
 //!
-//! What a read returns is exactly what a from-scratch walk of the same bytes
+//! What it keeps is the line text, not parsed JSON: a parsed
+//! `serde_json::Value` costs several times its text in memory, and the store
+//! lives as long as the daemon. A kept line is parsed again as it is folded,
+//! one record at a time, so a build never holds the window parsed. Only the
+//! daemon uses a store; a one-shot build (`darkmux run list`) walks the files
+//! once and holds nothing.
+//!
+//! What a read yields is exactly what a from-scratch walk of the same bytes
 //! would visit, in the same order:
 //!
 //! - Day files are `YYYY-MM-DD.jsonl`, dated at or after the window's cutoff,
@@ -23,10 +31,12 @@
 //! - A record the store's `keep` predicate refuses is not kept. The predicate
 //!   must name only records every consumer would ignore.
 //!
-//! A file whose identity changed (device and inode), that is now shorter
-//! than what was parsed, or whose first or last parsed bytes differ (rotated,
-//! truncated or rewritten in place) is parsed again from its start. A file
-//! that is gone, or that left the retained window, is forgotten.
+//! Flow archives are append-only and never rewritten (`docs/agents/CONTRACTS.md`,
+//! schema versioning). A file that breaks that anyway is read again from its
+//! start when the store can tell: its identity changed (device and inode,
+//! a rotation), it is now shorter than what was read (a truncation), or the
+//! last bytes read differ (a rewrite in place). A file that is gone, or that
+//! left the window, is forgotten.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -35,30 +45,38 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-/// How many bytes at each end of a file's parsed prefix are compared to
-/// notice a rewrite that kept the file's identity and length.
+/// How many bytes before the end of what was read are compared to notice a
+/// rewrite that kept the file's identity and did not shorten it.
 const FINGERPRINT_BYTES: u64 = 64;
 
-/// One day file's records as of a read: the kept, newline-terminated ones,
-/// then whatever the unterminated tail parsed to.
-pub(crate) struct DayRecords {
-    committed: Arc<Vec<Value>>,
-    tail: Vec<Value>,
+/// One day file's kept lines as of a read, then the unterminated tail's.
+struct DayLines {
+    committed: Arc<Vec<Box<str>>>,
+    tail: Vec<Box<str>>,
 }
 
-/// Every record of a window's day files, oldest file first.
+/// Every kept line of a window's day files, oldest file first.
 #[derive(Default)]
-pub(crate) struct WindowRecords(Vec<DayRecords>);
+pub(crate) struct WindowRecords(Vec<DayLines>);
 
 impl WindowRecords {
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.0.iter().flat_map(|d| d.committed.iter().chain(d.tail.iter()))
+    /// Visit each kept record in order, parsed one at a time.
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&Value)) {
+        for day in &self.0 {
+            for line in day.committed.iter().chain(day.tail.iter()) {
+                // Every kept line parsed once already; a line that somehow no
+                // longer does is skipped, as the walk skips one.
+                if let Some(v) = darkmux_flow::reader::parse_value(line) {
+                    visit(&v);
+                }
+            }
+        }
     }
 }
 
-/// The parsed day files of one flows directory. One slot, keyed by
-/// directory: a read of another directory starts over. Single-flight: the
-/// lock is held across a read, so concurrent callers parse new bytes once.
+/// The kept day files of one flows directory. One slot, keyed by directory:
+/// a read of another directory starts over. Single-flight: the lock is held
+/// across a read, so concurrent callers read new bytes once.
 pub(crate) struct FlowRecordStore {
     keep: fn(&Value) -> bool,
     slot: Mutex<Option<DirState>>,
@@ -67,8 +85,9 @@ pub(crate) struct FlowRecordStore {
 struct DirState {
     dir: PathBuf,
     files: BTreeMap<String, DayFile>,
-    /// Lines parsed over this state's life: how a test proves a repeat read
-    /// parsed nothing.
+    /// Lines parsed off disk over this state's life: how a test proves a
+    /// repeat read read nothing.
+    #[cfg(test)]
     lines_parsed: u64,
 }
 
@@ -81,17 +100,16 @@ struct FileId {
 #[derive(Default)]
 struct DayFile {
     id: Option<FileId>,
-    /// Bytes parsed and kept: always the end of a newline.
+    /// Bytes read and kept: always the end of a newline.
     committed: u64,
-    head: Vec<u8>,
     last: Vec<u8>,
-    records: Arc<Vec<Value>>,
+    lines: Arc<Vec<Box<str>>>,
     /// A non-UTF-8 line ended this file's walk; nothing after it is read.
     stopped: bool,
 }
 
 enum Line {
-    Record(Value),
+    Keep(Box<str>),
     Skip,
     Stop,
 }
@@ -101,20 +119,24 @@ impl FlowRecordStore {
         Self { keep, slot: Mutex::new(None) }
     }
 
-    /// The window's records: day files in `flows_dir` dated at or after
-    /// `cutoff`. Cached files dated before `retain_from` (or no longer on
-    /// disk) are forgotten; `retain_from` at or before `cutoff` lets a
-    /// narrower read keep a wider caller's files.
-    pub(crate) fn read(&self, flows_dir: &Path, cutoff: &str, retain_from: &str) -> WindowRecords {
+    /// The window's kept lines: day files in `flows_dir` dated at or after
+    /// `cutoff`. Kept files dated before it, or no longer on disk, are
+    /// forgotten.
+    pub(crate) fn read(&self, flows_dir: &Path, cutoff: &str) -> WindowRecords {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         if slot.as_ref().map(|s| s.dir.as_path()) != Some(flows_dir) {
-            *slot = Some(DirState { dir: flows_dir.to_path_buf(), files: BTreeMap::new(), lines_parsed: 0 });
+            *slot = Some(DirState {
+                dir: flows_dir.to_path_buf(),
+                files: BTreeMap::new(),
+                #[cfg(test)]
+                lines_parsed: 0,
+            });
         }
         let state = slot.as_mut().expect("the slot was just filled");
-        state.read(cutoff, retain_from, self.keep)
+        state.read(cutoff, self.keep)
     }
 
-    /// Lines parsed so far for the directory last read (0 before any read).
+    /// Lines parsed off disk so far for the directory last read.
     #[cfg(test)]
     pub(crate) fn lines_parsed(&self) -> u64 {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map_or(0, |s| s.lines_parsed)
@@ -122,7 +144,7 @@ impl FlowRecordStore {
 }
 
 impl DirState {
-    fn read(&mut self, cutoff: &str, retain_from: &str, keep: fn(&Value) -> bool) -> WindowRecords {
+    fn read(&mut self, cutoff: &str, keep: fn(&Value) -> bool) -> WindowRecords {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             self.files.clear();
             return WindowRecords::default();
@@ -136,14 +158,20 @@ impl DirState {
             let Some(date) = name.strip_suffix(".jsonl").filter(|d| d.len() == 10) else {
                 continue;
             };
-            on_disk.insert(date.to_string(), entry.path());
+            if date >= cutoff {
+                on_disk.insert(date.to_string(), entry.path());
+            }
         }
-        self.files.retain(|date, _| on_disk.contains_key(date) && date.as_str() >= retain_from);
+        self.files.retain(|date, _| on_disk.contains_key(date));
         let mut out = Vec::new();
-        for (date, path) in on_disk.range(cutoff.to_string()..) {
+        for (date, path) in &on_disk {
             let file = self.files.entry(date.clone()).or_default();
-            match file.refresh(path, keep, &mut self.lines_parsed) {
-                Some(tail) => out.push(DayRecords { committed: file.records.clone(), tail }),
+            #[cfg(test)]
+            let parsed = &mut self.lines_parsed;
+            #[cfg(not(test))]
+            let parsed = &mut 0u64;
+            match file.refresh(path, keep, parsed) {
+                Some(tail) => out.push(DayLines { committed: file.lines.clone(), tail }),
                 None => {
                     self.files.remove(date);
                 }
@@ -154,17 +182,12 @@ impl DirState {
 }
 
 impl DayFile {
-    /// Bring this file's records up to date with the bytes on disk. Returns
-    /// the unterminated tail's records, or `None` when the file cannot be
-    /// read (a walk skips it).
-    fn refresh(&mut self, path: &Path, keep: fn(&Value) -> bool, parsed: &mut u64) -> Option<Vec<Value>> {
+    /// Bring this file's kept lines up to date with the bytes on disk.
+    /// Returns the unterminated tail's line, or `None` when the file cannot
+    /// be read (a walk skips it).
+    fn refresh(&mut self, path: &Path, keep: fn(&Value) -> bool, parsed: &mut u64) -> Option<Vec<Box<str>>> {
         let mut file = std::fs::File::open(path).ok()?;
-        let meta = file.metadata().ok()?;
-        let len = meta.len();
-        let id = file_id(&meta);
-        if self.id != id || len < self.committed || !self.fingerprints_match(&mut file) {
-            *self = DayFile { id, ..DayFile::default() };
-        }
+        let len = self.check(&mut file)?;
         if self.stopped || len == self.committed {
             return Some(Vec::new());
         }
@@ -172,14 +195,36 @@ impl DayFile {
         let mut buf = Vec::with_capacity((len - start) as usize);
         file.seek(SeekFrom::Start(start)).ok()?;
         (&mut file).take(len - start).read_to_end(&mut buf).ok()?;
+        // Just past the last newline: the bytes before it are whole lines.
         let complete = buf.iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
+        self.keep_lines(&buf[..complete], keep, parsed);
+        self.committed = start + complete as u64;
+        self.last = last_bytes(&mut file, self.committed);
+        Some(self.tail(&buf[complete..], keep, parsed))
+    }
+
+    /// The file's length, after starting this file over when it is not the
+    /// one read last time: another identity (a rotation), shorter than what
+    /// was read (a truncation; checked first so `len - start` cannot
+    /// underflow, though a shorter file also fails the fingerprint), or
+    /// different last bytes (a rewrite in place).
+    fn check(&mut self, file: &mut std::fs::File) -> Option<u64> {
+        let meta = file.metadata().ok()?;
+        let (len, id) = (meta.len(), file_id(&meta));
+        if self.id != id || len < self.committed || last_bytes(file, self.committed) != self.last {
+            *self = DayFile { id, ..DayFile::default() };
+        }
+        Some(len)
+    }
+
+    /// Keep the wanted lines of `whole` (newline-terminated lines), stopping
+    /// the file at a non-UTF-8 one.
+    fn keep_lines(&mut self, whole: &[u8], keep: fn(&Value) -> bool, parsed: &mut u64) {
+        let Some((_, lines)) = whole.split_last() else { return };
         let mut fresh = Vec::new();
-        // `complete` is 0 (no newline yet) or just past the last newline; the
-        // lines are the bytes before it, split on each newline.
-        let lines = if complete == 0 { &buf[..0] } else { &buf[..complete - 1] };
-        for raw in lines.split(|b| *b == b'\n').filter(|_| complete > 0) {
+        for raw in lines.split(|b| *b == b'\n') {
             match parse_line(raw, keep, parsed) {
-                Line::Record(v) => fresh.push(v),
+                Line::Keep(line) => fresh.push(line),
                 Line::Skip => {}
                 Line::Stop => {
                     self.stopped = true;
@@ -188,39 +233,30 @@ impl DayFile {
             }
         }
         if !fresh.is_empty() {
-            Arc::make_mut(&mut self.records).extend(fresh);
+            // Copies the file's lines only while a concurrent build still
+            // holds the previous read's snapshot of them.
+            Arc::make_mut(&mut self.lines).extend(fresh);
         }
-        self.committed = start + complete as u64;
-        self.take_fingerprints(&mut file);
-        let mut tail = Vec::new();
-        if !self.stopped && complete < buf.len() {
-            if let Line::Record(v) = parse_line(&buf[complete..], keep, parsed) {
-                tail.push(v);
-            }
-        }
-        Some(tail)
     }
 
-    fn fingerprints_match(&self, file: &mut std::fs::File) -> bool {
-        let (head, last) = fingerprints(file, self.committed);
-        head == self.head && last == self.last
-    }
-
-    fn take_fingerprints(&mut self, file: &mut std::fs::File) {
-        (self.head, self.last) = fingerprints(file, self.committed);
+    /// The unterminated tail read as one more line, never kept.
+    fn tail(&self, bytes: &[u8], keep: fn(&Value) -> bool, parsed: &mut u64) -> Vec<Box<str>> {
+        if self.stopped || bytes.is_empty() {
+            return Vec::new();
+        }
+        match parse_line(bytes, keep, parsed) {
+            Line::Keep(line) => vec![line],
+            _ => Vec::new(),
+        }
     }
 }
 
-/// The first and last [`FINGERPRINT_BYTES`] of a file's first `upto` bytes
-/// (empty when unreadable, which then fails to match a non-empty print).
-fn fingerprints(file: &mut std::fs::File, upto: u64) -> (Vec<u8>, Vec<u8>) {
+/// The last [`FINGERPRINT_BYTES`] of a file's first `upto` bytes (shorter
+/// when unreadable, which then fails to match a full print).
+fn last_bytes(file: &mut std::fs::File, upto: u64) -> Vec<u8> {
     let n = upto.min(FINGERPRINT_BYTES);
-    (read_at(file, 0, n), read_at(file, upto - n, n))
-}
-
-fn read_at(file: &mut std::fs::File, at: u64, n: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(n as usize);
-    if file.seek(SeekFrom::Start(at)).is_ok() {
+    if file.seek(SeekFrom::Start(upto - n)).is_ok() {
         let _ = file.take(n).read_to_end(&mut buf);
     }
     buf
@@ -252,7 +288,7 @@ fn parse_line(raw: &[u8], keep: fn(&Value) -> bool, parsed: &mut u64) -> Line {
     if v.get("_type").and_then(|t| t.as_str()) == Some("schema") || !keep(&v) {
         return Line::Skip;
     }
-    Line::Record(v)
+    Line::Keep(line.into())
 }
 
 #[cfg(test)]
@@ -305,7 +341,9 @@ mod tests {
     }
 
     fn flat(w: &WindowRecords) -> Vec<Value> {
-        w.iter().cloned().collect()
+        let mut out = Vec::new();
+        w.for_each(|v| out.push(v.clone()));
+        out
     }
 
     fn rec(n: u32) -> String {
@@ -319,8 +357,8 @@ mod tests {
 
     /// Assert the long-lived store, a fresh store and the oracle agree.
     fn agree(store: &FlowRecordStore, dir: &Path, cutoff: &str, step: &str) {
-        let kept = flat(&store.read(dir, cutoff, cutoff));
-        let fresh = flat(&FlowRecordStore::new(store.keep).read(dir, cutoff, cutoff));
+        let kept = flat(&store.read(dir, cutoff));
+        let fresh = flat(&FlowRecordStore::new(store.keep).read(dir, cutoff));
         let want = oracle(dir, cutoff, store.keep);
         assert_eq!(fresh, want, "{step}: a from-scratch read differs from the pre-#2891 walk");
         assert_eq!(kept, want, "{step}: the incremental read differs from a from-scratch walk");
@@ -412,30 +450,27 @@ mod tests {
             append(dir, "2026-01-01", rec(n).as_bytes());
             append(dir, "2026-01-02", rec(n).as_bytes());
         }
-        store.read(dir, "2026-01-01", "2026-01-01");
+        store.read(dir, "2026-01-01");
         assert_eq!(store.lines_parsed(), 20, "the first read parses every line");
-        store.read(dir, "2026-01-01", "2026-01-01");
+        store.read(dir, "2026-01-01");
         assert_eq!(store.lines_parsed(), 20, "a repeat read with nothing appended parses nothing");
         append(dir, "2026-01-02", rec(10).as_bytes());
-        let read = store.read(dir, "2026-01-01", "2026-01-01");
+        let read = store.read(dir, "2026-01-01");
         assert_eq!(store.lines_parsed(), 21, "a read after one append parses one line");
-        assert_eq!(read.iter().count(), 21);
+        assert_eq!(flat(&read).len(), 21);
     }
 
     #[test]
-    fn a_narrower_read_keeps_the_wider_windows_files_it_is_told_to_retain() {
+    fn a_file_that_leaves_the_window_is_forgotten() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let store = FlowRecordStore::new(keep_all);
         append(dir, "2026-01-01", rec(1).as_bytes());
         append(dir, "2026-01-02", rec(2).as_bytes());
-        store.read(dir, "2026-01-01", "2026-01-01");
-        assert_eq!(flat(&store.read(dir, "2026-01-02", "2026-01-01")).len(), 1);
-        store.read(dir, "2026-01-01", "2026-01-01");
-        assert_eq!(store.lines_parsed(), 2, "the older file was retained, not parsed again");
-        store.read(dir, "2026-01-02", "2026-01-02");
-        store.read(dir, "2026-01-01", "2026-01-01");
-        assert_eq!(store.lines_parsed(), 3, "a file outside the retained window is forgotten");
+        store.read(dir, "2026-01-01");
+        assert_eq!(flat(&store.read(dir, "2026-01-02")).len(), 1);
+        store.read(dir, "2026-01-01");
+        assert_eq!(store.lines_parsed(), 3, "the file the narrower read left out was read again");
     }
 
     #[test]
@@ -444,7 +479,7 @@ mod tests {
         append(a.path(), "2026-01-01", rec(1).as_bytes());
         append(b.path(), "2026-01-01", rec(2).as_bytes());
         let store = FlowRecordStore::new(keep_all);
-        store.read(a.path(), "2026-01-01", "2026-01-01");
-        assert_eq!(flat(&store.read(b.path(), "2026-01-01", "2026-01-01")), oracle(b.path(), "2026-01-01", keep_all));
+        store.read(a.path(), "2026-01-01");
+        assert_eq!(flat(&store.read(b.path(), "2026-01-01")), oracle(b.path(), "2026-01-01", keep_all));
     }
 }

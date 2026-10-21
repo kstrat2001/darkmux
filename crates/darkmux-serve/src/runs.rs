@@ -502,7 +502,7 @@ pub struct RunsWithUsage {
 
 /// (#2902 step 2b) [`build_runs`] plus the token breakdown `darkmux run
 /// list --usage` prints, both from ONE scan: the usage fold rides the same
-/// record pass the session index makes (`build_flow_session_index_in`), so
+/// record pass the session index makes (`build_flow_indexes_in`), so
 /// a row's `tokens` and the breakdown are two readings of one record set.
 /// `since_secs` (`--since`, a Unix epoch second) bounds the fold to records
 /// stamped at or after it and widens the day-file walk when it reaches
@@ -518,6 +518,19 @@ pub fn build_runs_with_usage(
         None => ScanWindow::default_window(),
     };
     build_runs_in(flows_dir, lab_dir, fleet, &window)
+}
+
+/// (#2891) [`build_runs_with_usage`] over the default window for the
+/// daemon's `GET /runs`: the day files are read through the daemon's
+/// [`FlowRecordStore`], so a repeat request reads only the bytes appended
+/// since the last one. Same rows, same usage, as the one-shot walk.
+pub(crate) fn build_runs_for_daemon(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: impl Into<FleetRecords>,
+) -> RunsWithUsage {
+    let window = ScanWindow::default_window();
+    build_runs_judged_by(Some(&RUNS_FLOW_RECORDS), flows_dir, lab_dir, fleet, &window, &PeerClocks::cached())
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -558,14 +571,15 @@ fn build_runs_in(
     fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
 ) -> RunsWithUsage {
-    build_runs_judged_by(&RUNS_FLOW_RECORDS, flows_dir, lab_dir, fleet, window, &PeerClocks::cached())
+    build_runs_judged_by(None, flows_dir, lab_dir, fleet, window, &PeerClocks::cached())
 }
 
 /// [`build_runs_in`] judged by an explicit presence reading, so a test can
 /// build the union as any process would, with the beats it would read, and
-/// reading the day files through an explicit [`FlowRecordStore`] (#2891).
+/// reading the day files through `store` (the daemon's, #2891) or, with
+/// `None`, walking them once and holding nothing.
 fn build_runs_judged_by(
-    store: &FlowRecordStore,
+    store: Option<&FlowRecordStore>,
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
     fleet: impl Into<FleetRecords>,
@@ -575,17 +589,16 @@ fn build_runs_judged_by(
     let fleet: FleetRecords = fleet.into();
     // (#2902 step 2b) The usage fold shares the session index's one pass.
     let mut usage_fold = crate::usage_sum::UsageFold::new(window.since_iso.clone());
-    // (#2891) The day files, read once for both indexes below: only the
-    // bytes appended since the store's last read are parsed.
-    let local = local_window_records(store, flows_dir, window);
-    let flow_index = build_flow_session_index_in(&local, &fleet, window, Some(&mut usage_fold), peers);
+    // (#2891) The day files feed both indexes in one pass. Through the
+    // daemon's store only the bytes appended since its last read come off disk.
+    let local = LocalRecords::of(store, flows_dir, window);
+    let (flow_index, flow_missions) = build_flow_indexes_in(&local, &fleet, window, Some(&mut usage_fold), peers);
     let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
     // `Mission` JSON lives on the machine that ran it — so without this it
     // could only ever appear as a scatter of per-session ghosts. One
     // review = one row, wherever it ran.
-    let flow_missions = build_flow_mission_index_in(&local, &fleet, window);
     // (#1523 gate CONSIDER 2) Pre-group flow sessions by `mission_id` ONCE
     // — an O(sessions) pass — rather than filtering the whole `flow_index`
     // per mission (O(missions × sessions), the shape a Studio-scale flow
@@ -972,52 +985,19 @@ fn build_flow_mission_index(
     window_days: i64,
 ) -> HashMap<String, FlowMissionAgg> {
     let window = ScanWindow::within_days(window_days);
-    build_flow_mission_index_in(&fresh_window_records(flows_dir, &window), fleet, &window)
+    let local = LocalRecords::Walk { dir: flows_dir, cutoff: &window.cutoff_date };
+    build_flow_indexes_in(&local, fleet, &window, None, &PeerClocks::default()).1
 }
 
-/// [`build_flow_mission_index`] over an explicit [`ScanWindow`] (#2902
-/// step 2b) — the same window the session index and the usage fold use,
-/// so a `--since` that widens one widens all three.
-fn build_flow_mission_index_in(
-    local: &WindowRecords,
-    fleet: impl Into<FleetRecords>,
-    window: &ScanWindow,
-) -> HashMap<String, FlowMissionAgg> {
-    let mut idx: HashMap<String, FlowMissionAgg> = HashMap::new();
-    // (#1707 gate MUST FIX 2) The fleet half obeys the SAME
-    // `RUNS_FLOW_SCAN_WINDOW_DAYS` bound the local walk does. Without this
-    // the two sources disagree about how far back `/runs` reaches, and the
-    // stream is the WORSE offender: `XADD MAXLEN ~` trims lazily, only on
-    // write, so a fleet that has gone quiet still holds month-old records —
-    // which would resurface dead missions and un-terminated sessions as
-    // Abandoned rows that never age out. This bites the single-machine
-    // redis-enabled operator too, not just a fleet.
-    let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
-    let fleet: FleetRecords = fleet.into();
-
-    let fleet_seen: HashSet<RecordIdentity> =
-        fleet.iter().filter(|r| within_window(r.value())).map(FleetRecord::identity).collect();
-
-    let fold = |idx: &mut HashMap<String, FlowMissionAgg>, v: &serde_json::Value| {
-        let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
-            return;
-        };
-        if mid.is_empty() {
-            return;
-        }
-        idx.entry(mid.to_string()).or_default().fold_record(v);
+/// Fold one record into its mission's [`FlowMissionAgg`], when it names one.
+fn fold_mission_record(idx: &mut HashMap<String, FlowMissionAgg>, v: &serde_json::Value) {
+    let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
+        return;
     };
-
-    for v in fleet.values().filter(|v| within_window(v)) {
-        fold(&mut idx, v);
+    if mid.is_empty() {
+        return;
     }
-    for v in local.iter() {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
-            continue;
-        }
-        fold(&mut idx, v);
-    }
-    idx
+    idx.entry(mid.to_string()).or_default().fold_record(v);
 }
 
 /// One [`Run`] for a mission this daemon observed but does not own (#1705).
@@ -2673,22 +2653,26 @@ fn build_flow_session_index(
     peers: &PeerClocks,
 ) -> HashMap<String, SessionAgg> {
     let window = ScanWindow::within_days(window_days);
-    build_flow_session_index_in(&fresh_window_records(flows_dir, &window), fleet, &window, None, peers)
+    let local = LocalRecords::Walk { dir: flows_dir, cutoff: &window.cutoff_date };
+    build_flow_indexes_in(&local, fleet, &window, None, peers).0
 }
 
-/// [`build_flow_session_index`] over an explicit [`ScanWindow`], optionally
-/// feeding every record the SAME pass visits (fleet first, then the local
-/// day files minus what the fleet already supplied) to a usage fold
-/// (#2902 step 2b) — one walk, not a second one, is what keeps `/runs`'s
-/// cost flat and the two answers over one record set.
-fn build_flow_session_index_in(
-    local: &WindowRecords,
+/// The session index and the mission index over an explicit [`ScanWindow`]
+/// in ONE pass, optionally feeding every record that pass visits (fleet
+/// first, then the local day files minus what the fleet already supplied)
+/// to a usage fold (#2902 step 2b) — one walk, not a second one, is what
+/// keeps `/runs`'s cost flat and the answers over one record set. The two
+/// indexes are independent folds over the same record order (#2891 merged
+/// their two walks).
+fn build_flow_indexes_in(
+    local: &LocalRecords<'_>,
     fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
     mut usage: Option<&mut crate::usage_sum::UsageFold>,
     peers: &PeerClocks,
-) -> HashMap<String, SessionAgg> {
+) -> (HashMap<String, SessionAgg>, HashMap<String, FlowMissionAgg>) {
     let mut idx: HashMap<String, SessionAgg> = HashMap::new();
+    let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
 
     // (#1705) Fleet first, then the local day-files minus anything the
     // fleet already supplied — this machine's records land in BOTH sinks,
@@ -2707,24 +2691,25 @@ fn build_flow_session_index_in(
 
     let fleet_seen: HashSet<RecordIdentity> =
         fleet.iter().filter(|r| within_window(r.value())).map(FleetRecord::identity).collect();
+    let mut fold = |v: &serde_json::Value| {
+        fold_session_record(&mut idx, v);
+        fold_mission_record(&mut missions, v);
+        if let Some(u) = usage.as_deref_mut() {
+            u.add(v);
+        }
+    };
     for v in fleet.values().filter(|v| within_window(v)) {
-        fold_session_record(&mut idx, v);
-        if let Some(u) = usage.as_deref_mut() {
-            u.add(v);
-        }
+        fold(v);
     }
-    for v in local.iter() {
+    local.for_each(|v| {
         if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
-            continue;
+            return;
         }
-        fold_session_record(&mut idx, v);
-        if let Some(u) = usage.as_deref_mut() {
-            u.add(v);
-        }
-    }
+        fold(v);
+    });
     settle_session_index(&mut idx);
     peers.apply(&mut idx);
-    idx
+    (idx, missions)
 }
 
 /// (#3017) Each live peer's own clock as of now, in epoch ms, by hardware
@@ -2820,7 +2805,7 @@ impl PeerClocks {
 }
 
 /// Fold one flow record into its session's [`SessionAgg`]: the one pass
-/// [`build_flow_session_index_in`] makes over the window.
+/// [`build_flow_indexes_in`] makes over the window.
 fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value) {
     let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
         return;
@@ -3080,27 +3065,99 @@ fn feeds_runs_index(v: &serde_json::Value) -> bool {
     named("session_id") || named("mission_id") || crate::usage_sum::is_usage_record(v)
 }
 
-/// (#2891) The day files every `/runs`-shaped build in this process reads:
-/// parsed once, then only their appended bytes (see `flow_window.rs`). Not a
-/// TTL cache: each read stats every file in the window, so a record written
-/// a moment ago is in the next build.
+/// (#2891) The day files the daemon's `GET /runs` reads: kept as line text
+/// and read again only past what was already read (see `flow_window.rs`).
+/// Not a TTL cache: each read stats every file in the window, so a record
+/// written a moment ago is in the next build. A one-shot build walks.
 static RUNS_FLOW_RECORDS: FlowRecordStore = FlowRecordStore::new(feeds_runs_index);
 
-/// The window's local records through `store`: day files dated at or after
-/// the window's cutoff ([`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless
-/// `--since` pushed it earlier, #2902 step 2b). Bounding is specific to this
-/// module; the other flow readers (`/flow-mission/:id`, `/flow-dispatch/:id`,
-/// the full-history catalog endpoints) keep seeing a run's complete history.
-/// The store keeps files back to the default window even for a narrower
-/// read (radio's busy check, #2917), so the board's next read reuses them.
-fn local_window_records(store: &FlowRecordStore, flows_dir: &StdPath, window: &ScanWindow) -> WindowRecords {
-    let retain_from = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS).min(window.cutoff_date.clone());
-    store.read(flows_dir, &window.cutoff_date, &retain_from)
+/// Where a build's local records come from: a walk of the day files dated
+/// at or after `cutoff`, holding nothing past the record being folded, or
+/// the daemon store's kept lines.
+enum LocalRecords<'a> {
+    Walk { dir: &'a StdPath, cutoff: &'a str },
+    Kept(WindowRecords),
 }
 
-/// The window's local records read from scratch, through a store of its own.
-fn fresh_window_records(flows_dir: &StdPath, window: &ScanWindow) -> WindowRecords {
-    local_window_records(&FlowRecordStore::new(feeds_runs_index), flows_dir, window)
+impl<'a> LocalRecords<'a> {
+    /// Through `store` when there is one (the daemon), else a walk.
+    fn of(store: Option<&FlowRecordStore>, dir: &'a StdPath, window: &'a ScanWindow) -> Self {
+        match store {
+            Some(store) => LocalRecords::Kept(store.read(dir, &window.cutoff_date)),
+            None => LocalRecords::Walk { dir, cutoff: &window.cutoff_date },
+        }
+    }
+
+    fn for_each(&self, mut visit: impl FnMut(&serde_json::Value)) {
+        match self {
+            LocalRecords::Walk { dir, cutoff } => for_each_flow_record_from(dir, cutoff, |v| {
+                visit(v);
+                std::ops::ControlFlow::Continue(())
+            }),
+            LocalRecords::Kept(records) => records.for_each(visit),
+        }
+    }
+}
+
+/// Like `crate::for_each_flow_record_across_days`, but bounded to day files
+/// dated at or after `cutoff` (`YYYY-MM-DD`) — a [`ScanWindow`]'s, which is
+/// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless `--since` pushed it
+/// earlier (#2902 step 2b). A SEPARATE,
+/// smaller day-file walk rather than extending the shared primitive —
+/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-dispatch/:id`,
+/// the full-history catalog endpoints) must keep seeing a run's COMPLETE
+/// history; bounding is specific to THIS module's route-resolution/
+/// ghost-synthesis use, not a general flow-reading behavior change that
+/// would ripple into those unrelated endpoints.
+fn for_each_flow_record_from(
+    flows_dir: &StdPath,
+    cutoff: &str,
+    mut visit: impl FnMut(&serde_json::Value) -> std::ops::ControlFlow<()>,
+) {
+    use std::io::BufRead;
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return;
+    };
+    let mut day_files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        let Some(date) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        // A plain length + lexical-compare check — not full calendar
+        // validation (`is_valid_date`'s job elsewhere) — is enough here:
+        // the goal is bounding which files get OPENED, and a malformed
+        // name that happens to compare >= cutoff just gets read (harmless,
+        // same as any other unreadable/malformed file below) while one
+        // that doesn't compare is skipped either way.
+        if date.len() != 10 || date < cutoff {
+            continue;
+        }
+        day_files.push(entry.path());
+    }
+    day_files.sort();
+    for path in day_files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(v) = darkmux_flow::reader::parse_value(line) else {
+                continue;
+            };
+            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+                continue;
+            }
+            if visit(&v).is_break() {
+                return;
+            }
+        }
+    }
 }
 
 /// `YYYY-MM-DD` for `window_days` before today (UTC) — the day-file-name
@@ -5908,18 +5965,18 @@ mod tests {
             }
         };
         let store = FlowRecordStore::new(feeds_runs_index);
-        let body = |store: &FlowRecordStore| {
+        let body = |store: Option<&FlowRecordStore>| {
             let out = build_runs_judged_by(store, dir, None, &[], &ScanWindow::default_window(), &PeerClocks::default());
             let mut runs: Vec<String> = out.runs.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
             runs.sort();
             (runs, serde_json::to_string(&out.usage).unwrap())
         };
         let agree = |step: &str| {
-            // From scratch, keeping every record, as the walk before #2891 did:
-            // so a record `feeds_runs_index` wrongly drops shows here.
-            let fresh = body(&FlowRecordStore::new(|_| true));
+            // The one-shot walk folds every raw record, so a field the kept
+            // form lost, or a record `feeds_runs_index` wrongly drops, shows here.
+            let fresh = body(None);
             assert!(!fresh.0.is_empty(), "{step}: the fixture builds rows");
-            assert_eq!(body(&store), fresh, "{step}: the incremental build differs from a scratch build");
+            assert_eq!(body(Some(&store)), fresh, "{step}: the incremental build differs from a scratch build");
         };
         append(&yesterday, &session(&yesterday, "s-a", None, 0));
         append(&yesterday, &loose(&yesterday, 5));
@@ -5968,7 +6025,7 @@ mod tests {
         );
         let process = || {
             let clocks = PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), peer_now)]), live_sessions: Some(HashSet::new()) };
-            let out = build_runs_judged_by(&FlowRecordStore::new(feeds_runs_index), flows.path(), None, &[], &ScanWindow::default_window(), &clocks);
+            let out = build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &clocks);
             let row = out.runs.iter().find(|r| r.id == "killed-sess").expect("the killed session's row").clone();
             (row.status, row.abandoned_reason)
         };
