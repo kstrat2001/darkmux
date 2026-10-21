@@ -49,6 +49,8 @@ pub mod mission_graph;
 mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.
 pub mod fleet_view;
+/// (#3200) Reaps dispatch containers whose darkmux host died unhandled.
+mod dispatch_reaper;
 mod host_sampler;
 /// The machine card, served by the fleet listener at `GET /fleet/card` and read from each machine's own row of `GET /fleet/view`.
 pub mod machine_card;
@@ -1617,6 +1619,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             host_sampler::ring().clone(),
             Arc::clone(&host_sampler_stop),
         );
+        // (#3200) The dispatch-container reaper: same thread shape, and it
+        // stops on the same flag.
+        let _dispatch_reaper_handle =
+            dispatch_reaper::spawn(dispatch_reaper::REAP_INTERVAL, Arc::clone(&host_sampler_stop));
 
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).

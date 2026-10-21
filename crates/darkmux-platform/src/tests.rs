@@ -598,3 +598,35 @@ fn a_fake_answers_the_reclaimable_memory_the_test_set() {
 fn this_linux_machine_reports_reclaimable_memory() {
     assert!(LinuxPlatform.reclaimable_memory_bytes().is_some_and(|b| b > 0));
 }
+
+/// (#3200) Field 22 of `/proc/<pid>/stat`, past a `comm` that holds spaces
+/// and a `)`.
+#[test]
+fn linux_start_time_is_field_22_after_the_last_paren() {
+    let stat = "4242 (tmux: server) a) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 200";
+    assert_eq!(linux::start_ticks_from_proc_stat(stat), Some(987654));
+    assert_eq!(linux::start_ticks_from_proc_stat("garbage"), None);
+}
+
+/// (#3200) The host's own strategy reads this process's start time, stably,
+/// and a pid with no process reads as `None`.
+#[cfg(unix)]
+#[test]
+fn the_current_strategy_reads_a_live_process_start_time_and_none_for_no_process() {
+    let own = current().process_start_stamp(std::process::id());
+    if current().id() == "other" {
+        assert_eq!(own, None);
+        return;
+    }
+    let own = own.expect("own start time is readable");
+    assert!(own > 0);
+    assert_eq!(current().process_start_stamp(std::process::id()), Some(own), "stable across reads");
+    assert_eq!(current().process_start_stamp(u32::MAX >> 1), None, "no such process");
+}
+
+#[test]
+fn the_fake_answers_only_the_stamps_the_test_set() {
+    let fake = FakePlatform { process_start_stamps: vec![(7, 70)], ..Default::default() };
+    assert_eq!(fake.process_start_stamp(7), Some(70));
+    assert_eq!(fake.process_start_stamp(8), None);
+}

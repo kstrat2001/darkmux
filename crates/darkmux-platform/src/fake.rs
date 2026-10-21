@@ -7,6 +7,9 @@ pub struct FakePlatform {
     pub container_user: ContainerUser,
     pub machine_uid: Option<String>,
     pub reclaimable_memory_bytes: Option<u64>,
+    /// `(pid, stamp)` pairs [`Platform::process_start_stamp`] answers; any
+    /// other pid reads as `None`.
+    pub process_start_stamps: Vec<(u32, u64)>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -19,6 +22,7 @@ impl Default for FakePlatform {
             container_user: ContainerUser::Image,
             machine_uid: None,
             reclaimable_memory_bytes: None,
+            process_start_stamps: Vec::new(),
         }
     }
 }
@@ -71,5 +75,9 @@ impl Platform for FakePlatform {
 
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         self.reclaimable_memory_bytes
+    }
+
+    fn process_start_stamp(&self, pid: u32) -> Option<u64> {
+        self.process_start_stamps.iter().find(|(p, _)| *p == pid).map(|(_, s)| *s)
     }
 }

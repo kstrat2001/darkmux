@@ -136,6 +136,8 @@ pub mod mission_config;
 // (#2706) The pace file `<host_out>/pace.json` — path, wire shape, atomic
 // write. Promoted out of `thermal_governor` when the battery governor
 // became its second writer; see the module doc.
+/// (#3200) Reaping dispatch containers whose darkmux host died unhandled.
+pub mod orphan_reaper;
 pub mod pace_file;
 // (#2706) The battery-charge policy — refuse to START below the operator's
 // floor, and PAUSE a run in flight that crosses it. Consumes #2705's charge

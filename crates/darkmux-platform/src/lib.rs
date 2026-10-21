@@ -77,6 +77,12 @@ pub trait Platform: Send + Sync {
     /// headroom` figure (#3281). `None` when the platform can't read it:
     /// callers report no figure, never a 0 that reads as "full".
     fn reclaimable_memory_bytes(&self) -> Option<u64>;
+    /// (#2917, #3200) An opaque stamp of when process `pid` started, or
+    /// `None` when it cannot be read (no such process, or the platform has
+    /// no reader). Compare it only for EQUALITY against a stamp this same
+    /// method produced for the same pid on this same machine: two equal
+    /// stamps mean the pid was not reused in between.
+    fn process_start_stamp(&self, pid: u32) -> Option<u64>;
 }
 
 /// A battery's charge facts as the OS reports them. The lens derives its

@@ -11,5 +11,10 @@ rust-version = "1.86"
 
 [dependencies]
 
+# (#3200) `sysctl` for a process's start time on macOS (`process_start_stamp`),
+# moved here from darkmux-types' residency lease. Already in the workspace.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.10"

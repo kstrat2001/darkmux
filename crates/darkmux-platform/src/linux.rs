@@ -82,6 +82,12 @@ impl Platform for LinuxPlatform {
     }
 
     /// Each tier's mean `scaling_cur_freq`, aligned with [`Self::cpu_clusters`].
+    /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
+    /// boot. World-readable unless `/proc` is mounted with `hidepid`.
+    fn process_start_stamp(&self, pid: u32) -> Option<u64> {
+        start_ticks_from_proc_stat(&read_to_string(&format!("/proc/{pid}/stat"))?)
+    }
+
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
@@ -103,6 +109,14 @@ pub(crate) fn installed_ram_from_meminfo(meminfo: &str) -> Option<u64> {
         .parse()
         .ok()?;
     Some((kib * 1024).div_ceil(GIB) * GIB)
+}
+
+/// `/proc/<pid>/stat`'s field 22 (start time). `comm` (field 2) is
+/// parenthesized and may contain spaces; fields after the LAST `)` are
+/// space-separated, starting at field 3.
+pub(crate) fn start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 #[cfg(target_os = "linux")]
