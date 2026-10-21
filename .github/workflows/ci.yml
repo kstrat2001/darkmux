@@ -470,10 +470,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The runner is one laptop that takes one job at a time, so a PR that
+      # cannot change what Linux compiles skips the work (and reports green):
+      # the viewer source and its built bundle, docs, and Markdown. Those are
+      # either not Rust input or embedded as text (`include_str!` of the bundle,
+      # two ui/src/lib files, skills' SKILL.md), which compiles the same on
+      # every OS and is tested by the macOS jobs. Fail open like the
+      # build-test-lint filter: any other path runs the check. Pushes to main
+      # always run it.
+      - name: Detect Linux-relevant changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # `every`: a file must match ALL patterns, so each `!` line excludes.
+          predicate-quantifier: 'every'
+          filters: |
+            linux:
+              - '**'
+              - '!ui/**'
+              - '!crates/darkmux-serve/assets/**'
+              - '!docs/**'
+              - '!**/*.md'
+
       - name: Linux check (clippy, OS tests, release build)
+        if: github.event_name != 'pull_request' || steps.filter.outputs.linux == 'true'
         env:
           LINUX_CHECK_SKIP_DOCTOR: '1'
         run: bash scripts/linux-check.sh
+
+      - name: Skipped (nothing Linux compiles changed)
+        if: github.event_name == 'pull_request' && steps.filter.outputs.linux != 'true'
+        run: echo "This PR changes only the viewer, docs or Markdown; the Linux check is skipped (reports green)."
 
   runtime-test-lint:
     name: runtime crate — test + lint (macos-latest)
