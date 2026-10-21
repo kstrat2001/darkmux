@@ -534,7 +534,7 @@ export function missionRowOf(rows: readonly Run[], missionId: string): Run | nul
 }
 
 /** The status the daemon decided on `row`, as a view renders it. */
-export function rowState(row: Run): RunState {
+function rowState(row: Run): RunState {
   return row.abandoned_reason ? { status: row.status, abandonReason: row.abandoned_reason } : { status: row.status };
 }
 
