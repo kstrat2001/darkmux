@@ -3800,10 +3800,13 @@ pub(crate) fn remote_chat_completion(
 /// is collected by the caller. A file that cannot be read reports nothing,
 /// and the reply is still read whole once curl is done.
 ///
-/// (#3296) Once no byte (keepalive comments included) has arrived for
-/// `silence_limit`, curl is killed and the limit is returned: a server that
-/// died with the connection open would otherwise hold the call until curl's
-/// TOTAL timeout. `None` is unbounded.
+/// (#3296) Once the first body byte has arrived, if no byte (keepalive
+/// comments included) then arrives for `silence_limit`, curl is killed and
+/// the limit is returned: a server that died with the connection open would
+/// otherwise hold the call until curl's TOTAL timeout. Before the first byte
+/// the total timeout stays the bound, because LM Studio sends nothing while
+/// it prefills and a long prefill can outlast the limit (#3145, #3301).
+/// `None` is unbounded.
 fn follow_streamed_reply(
     child: &mut std::process::Child,
     body_path: &std::path::Path,
@@ -3816,11 +3819,13 @@ fn follow_streamed_reply(
     let mut tail = crate::direct_stream::SseTail::sent_at(Instant::now(), shape);
     let mut file = std::fs::File::open(body_path).ok();
     let mut buf = vec![0u8; 16 * 1024];
-    let mut last_byte = Instant::now();
+    // When the last body byte arrived; `None` until the first one, so the
+    // cutoff is not armed during a silent prefill.
+    let mut last_byte: Option<Instant> = None;
     loop {
         let exited = !matches!(child.try_wait(), Ok(None));
         while let Some(n) = file.as_mut().and_then(|f| f.read(&mut buf).ok()).filter(|n| *n > 0) {
-            last_byte = Instant::now();
+            last_byte = Some(Instant::now());
             if tail.feed(&buf[..n]) {
                 on(&tail.progress);
             }
@@ -3828,7 +3833,7 @@ fn follow_streamed_reply(
         if exited {
             return None;
         }
-        if silence_limit.is_some_and(|limit| last_byte.elapsed() >= limit) {
+        if silence_limit.is_some_and(|limit| last_byte.is_some_and(|t| t.elapsed() >= limit)) {
             let _ = child.kill();
             return silence_limit;
         }

@@ -3849,6 +3849,43 @@
         assert!(actions.iter().any(|a| a == "dispatch.error"), "terminal dispatch.error: {actions:?}");
     }
 
+    /// (#3296) A loopback server that sends its headers, holds silent for
+    /// `prefill` (LM Studio sends no body byte while it prefills), then
+    /// streams a whole chat reply and closes.
+    fn slow_prefill_http_mock(prefill: Duration) -> String {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(prefill);
+            let _ = stream.write_all(concat!(
+                "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ).as_bytes());
+        });
+        format!("http://127.0.0.1:{port}/v1/chat/completions")
+    }
+
+    /// The cutoff arms at the first body byte: a prefill that sends nothing
+    /// for longer than the cutoff, then streams its reply, is not cut. Before
+    /// the first byte, the call's total timeout is the bound.
+    #[test]
+    #[serial]
+    fn a_silent_prefill_before_the_first_byte_is_not_cut() {
+        let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(1);
+        let url = slow_prefill_http_mock(Duration::from_millis(1800));
+        let req = crate::direct_stream::stream_body(&serde_json::json!({"model": "m", "messages": []}), crate::direct_stream::Shape::Chat);
+        let mut on = |_: &crate::direct_stream::SseProgress| {};
+        let reply = remote_chat_completion(&url, None, &req, 30, Some(&mut on)).expect("a slow prefill keeps its reply");
+        assert_eq!(crate::single_shot::extract_reply(&reply).content, "Hello");
+    }
+
     /// The cutoff counts silence, not the call's length: a stream that keeps
     /// sending keepalive comments past the cutoff is not ended by it.
     #[test]
