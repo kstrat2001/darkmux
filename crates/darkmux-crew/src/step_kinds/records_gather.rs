@@ -584,7 +584,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
             match step.kind.as_str() {
                 SCANNED_DISPATCH_UNIT_KIND => {
                     if step.status != crate::types::NodeStatus::Complete {
-                        scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
+                        scan.errored.push(format!("unit `{}` ({})", step.id, step.status.outcome_word(step.output.as_deref())));
                         continue;
                     }
                     // (#2454) Read the outcome BEFORE the coverage decision
@@ -658,7 +658,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     }
                     let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
                     scan.not_attempted.push(rule);
-                    scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
+                    scan.errored.push(format!("plan `{}` ({})", step.id, step.status.outcome_word(step.output.as_deref())));
                 }
                 other => {
                     // (silent-miss audit, 2026-09-06; narrowed round-2
@@ -678,7 +678,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     // only ever contributes to `errored`, never
                     // `not_attempted`.
                     if matches!(step.status, crate::types::NodeStatus::Error | crate::types::NodeStatus::Abandoned) {
-                        scan.errored.push(format!("{other} `{}` ({:?})", step.id, step.status));
+                        scan.errored.push(format!("{other} `{}` ({})", step.id, step.status.outcome_word(step.output.as_deref())));
                     }
                 }
             }
@@ -1180,6 +1180,8 @@ mod tests {
         );
         assert_eq!(scope.hunks_covered, 1, "four errored units covered nothing: {scope:?}");
         assert_eq!(scope.errored.len(), 4, "and the four are still named: {scope:?}");
+        // (#2594) In the crawl summary's word for the same row, not `Error`.
+        assert!(scope.errored.iter().all(|e| e.ends_with("(error)")), "{scope:?}");
     }
 
     /// The dedup that #2357's own review installed is unchanged by the

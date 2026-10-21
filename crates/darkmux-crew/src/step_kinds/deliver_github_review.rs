@@ -733,7 +733,7 @@ pub fn render_github_review(
         // this arc exists to end, just one layer up from #975's own
         // finding. A run that had a real error is never a clean noop,
         // even with nothing to say about findings: the scope line (with
-        // its own `Errored:` section, `scope_line`'s own doc) IS the
+        // its own `Did not finish:` section, `scope_line`'s own doc) IS the
         // payload.
         let mut body =
             vec![
@@ -1062,9 +1062,11 @@ fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules
     }
     // (#2310 P4c-2b PR #2357 review MUST FIX D) Named so a `"degraded"`
     // run's scope line (its whole payload, when there is nothing else to
-    // say) actually names what broke, not just that something did.
+    // say) actually names what broke, not just that something did. (#2594)
+    // "Did not finish", with each step's own word (`error`, `interrupted`,
+    // `not_run`), the one the crawl summary uses for the same row.
     if !scope.errored.is_empty() {
-        line.push_str(&format!(" Errored: {}.", joined(&scope.errored)));
+        line.push_str(&format!(" Did not finish: {}.", joined(&scope.errored)));
     }
     // (#2425) An input the gather step could not read: the review did not
     // see it, so the comment says so instead of reading as complete.
@@ -2618,11 +2620,11 @@ mod tests {
     /// EVERY mode, not just `review`.
     #[test]
     fn fallback_comment_is_present_on_degraded_and_noop() {
-        let errored_scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
+        let errored_scope = DeliverScope { errored: vec!["unit `x` (error)".to_string()], ..Default::default() };
         let degraded = render(&[], &[], DIFF, &errored_scope, None);
         assert_eq!(degraded.mode, "degraded", "{degraded:?}");
         assert!(!degraded.fallback_comment.is_empty(), "{degraded:?}");
-        assert!(degraded.fallback_comment.contains("Errored:"), "{}", degraded.fallback_comment);
+        assert!(degraded.fallback_comment.contains("Did not finish:"), "{}", degraded.fallback_comment);
 
         let clean = render(&[], &[], DIFF, &DeliverScope::default(), None);
         assert_eq!(clean.mode, "noop", "{clean:?}");
@@ -2788,7 +2790,7 @@ mod tests {
     /// `review: None`).
     #[test]
     fn an_errored_scope_with_nothing_to_say_is_degraded_not_noop() {
-        let scope = DeliverScope { errored: vec!["unit `x` (Error)".to_string()], ..Default::default() };
+        let scope = DeliverScope { errored: vec!["unit `x` (error)".to_string()], ..Default::default() };
         let out = render(&[], &[], DIFF, &scope, None);
         assert_eq!(out.mode, "degraded", "{out:?}");
         let review = out.review.expect("a degraded outcome still carries a review payload (the scope line)");
@@ -2800,7 +2802,7 @@ mod tests {
         // (grep — it is filled only by this module's own tests), so no
         // shipped text loses its code styling, while the containment
         // claim becomes true as written for whoever fills it first.
-        assert!(review.body.contains("Errored: unit \u{02cb}x\u{02cb} (Error)."), "{}", review.body);
+        assert!(review.body.contains("Did not finish: unit \u{02cb}x\u{02cb} (error)."), "{}", review.body);
     }
 
     // ─── (#2425) an unreadable input is visible on the comment itself ───
@@ -3254,7 +3256,7 @@ mod tests {
         let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["mode"], json!("degraded"), "{step_output}");
-        assert!(step_output["summary"].as_str().unwrap().contains("Errored:"), "{step_output}");
+        assert!(step_output["summary"].as_str().unwrap().contains("Did not finish:"), "{step_output}");
         assert_eq!(step_output["entries"], json!([]), "nothing delivered, no rows: {step_output}");
 
         // (PR #2398 review, item 5) A run that DOES deliver carries the

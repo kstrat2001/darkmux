@@ -105,14 +105,10 @@ pub const THERMAL_STOP: &str = "thermal_stop";
 /// scheduler abandoned stopped steps.
 const INTERRUPTED_RESULT: &str = "interrupted";
 
-/// The exact JSON key/value the `partial` `UnitOutcome` in `run` serializes
-/// when `result == INTERRUPTED_RESULT` — [`errored_row`] greps a step's own
-/// persisted error TEXT for this literal substring (never a full JSON
-/// parse: the surrounding text is free-form anyhow prose, not guaranteed to
-/// parse as JSON on its own) to recover the label. Stable because both
-/// sides live in this module and `serde_json::to_string` is deterministic,
-/// compact (no whitespace) output for a fixed field order.
-const INTERRUPTED_MARKER: &str = "\"result\":\"interrupted\"";
+/// (#2594) The marker [`errored_row`] recovers the `interrupted` label by,
+/// shared with the review's scope line through `NodeStatus::outcome_word`.
+/// `run`'s `partial` `UnitOutcome` must serialize to text containing it.
+use darkmux_crew::types::INTERRUPTED_MARKER;
 
 /// A rough multiple of turns per site — read the site, maybe grep around
 /// it, decide, call `create_finding` (or not). Deliberately generous: a
@@ -2127,32 +2123,17 @@ fn errored_row(step: &Step) -> UnitOutcome {
         rule,
         source: String::new(),
         result: match step.status {
-            darkmux_crew::types::NodeStatus::Abandoned => INTERRUPTED_RESULT.to_string(),
-            // (#2593) A step kind's `Err` with no operator's stop lands here
-            // (see `INTERRUPTED_RESULT`'s own doc): an interrupt-coincident
-            // failure (the run's own bound, or a step file written before the
-            // scheduler abandoned stopped steps) is recovered from the step's
-            // own persisted error text, and everything else reads `error`.
-            darkmux_crew::types::NodeStatus::Error => {
-                if step.output.as_deref().is_some_and(|o| o.contains(INTERRUPTED_MARKER)) {
-                    INTERRUPTED_RESULT.to_string()
-                } else {
-                    "error".to_string()
-                }
-            }
             // The step's kind ran to completion and recorded nothing — NOT
             // "never ran" (see this function's own doc). Falls into the
             // `units_errored` leftover in `summarize_mission`, same as
             // pre-#2573.
             darkmux_crew::types::NodeStatus::Complete => "empty".to_string(),
-            // Planned/Running at summary time: the step never settled. An
-            // `Unknown` status (a newer darkmux's, #3035) is not a verdict
-            // either: it reads as a step that did not run.
-            darkmux_crew::types::NodeStatus::Planned
-            | darkmux_crew::types::NodeStatus::Running
-            | darkmux_crew::types::NodeStatus::Unknown => {
-                "not_run".to_string()
-            }
+            // (#2593, #2594) `interrupted` / `error` / `not_run`, decided by
+            // the one shared reading the review's scope line also uses: an
+            // operator's stop, or an `Err` whose persisted text carries the
+            // interrupted marker (see `INTERRUPTED_RESULT`'s own doc), is
+            // `interrupted`; a step that never settled is `not_run`.
+            status => status.outcome_word(step.output.as_deref()).to_string(),
         },
         findings: 0,
         findings_rejected: 0,
