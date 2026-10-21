@@ -5,11 +5,11 @@ import { Masthead, RECONNECTING_ANNOUNCE_DELAY_MS } from "./Masthead";
 import type { Route } from "../lib/route";
 import { closeOpenModal, getOpenId } from "../lib/dialogManager";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null) {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null, subjectResolved = true) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} />
+      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} subjectResolved={subjectResolved} />
     </QueryClientProvider>,
   );
 }
@@ -197,6 +197,31 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     const known = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", "2026-08-07");
     expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("▣m1");
     expect(known.container.querySelector("#modebadge")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("(#2284) a dispatch or mission page claims nothing while its subject is unresolved: no LIVE, no dot, no replay glyph, no refetch control", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    // Measured on the installed daemon: a FINISHED mission read `● LIVE` for
+    // the first ~1 s, because "day unknown" was read as "running" while the
+    // records were still loading. Unknown is its own state.
+    for (const route of [
+      { kind: "dispatch", dispatchId: "s1", missionId: null },
+      { kind: "mission", missionId: "m1", stepId: null },
+    ]) {
+      for (const status of ["live", "reconnecting"] as const) {
+        const { container, unmount } = renderMasthead(route as never, status, null, false);
+        const pill = container.querySelector(".catalog-toggle");
+        expect(pill?.textContent).not.toContain("LIVE");
+        expect(pill?.textContent).not.toMatch(/[●◌▣]/);
+        expect(container.querySelector(".masthead__pilldot")).toBeNull();
+        expect(container.querySelector(".masthead__refresh")).toBeNull();
+        unmount();
+      }
+    }
+    // Resolved and still running: the live dot, as before.
+    const running = renderMasthead({ kind: "mission", missionId: "m1", stepId: null } as never, "live", null, true);
+    expect(running.container.querySelector(".catalog-toggle")?.textContent).toContain("●LIVE");
     vi.unstubAllGlobals();
   });
 

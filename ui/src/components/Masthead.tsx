@@ -112,6 +112,7 @@ export function Masthead({
   route,
   liveStatus,
   replayDate = null,
+  subjectResolved = true,
 }: {
   route: Route;
   liveStatus: LiveTailStatus;
@@ -119,6 +120,12 @@ export function Masthead({
    * derived it from the records; `null` until then (the pill reads "LIVE"
    * meanwhile) and on every other route. */
   replayDate?: string | null;
+  /** (#2284) Whether the shell has heard back about this route's subject (a
+   * dispatch's or mission's records). `false` while that read is in flight:
+   * `replayDate` is then null for lack of an answer, not because the subject
+   * is running, and the pill claims neither LIVE nor a replay. `true` on
+   * every route with no subject to resolve. */
+  subjectResolved?: boolean;
 }) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
@@ -128,8 +135,11 @@ export function Masthead({
   // whose day is known is a recording — the pill (and, for a dispatch, the
   // transport) carries the mode via the replay glyph instead, and a live dot
   // beside it would be false. While the day is still unknown (the subject is
-  // running, the pill reads LIVE) the page is live and says so.
-  const live = isLiveRoute(route) && replayDate == null;
+  // running, the pill reads LIVE) the page is live and says so. (#2284)
+  // "Unknown" covers only a RESOLVED subject: while its records are still
+  // loading, a finished mission would otherwise read LIVE for the first
+  // second, so the pill stays neutral until the shell knows.
+  const live = isLivePill(route, replayDate, subjectResolved);
   // (#2412 round 2, reviewer finding) A DROPPED stream announces
   // "reconnecting" to screen readers only after it has HELD for
   // `RECONNECTING_ANNOUNCE_DELAY_MS` — an SSE hiccup that self-heals inside
@@ -236,7 +246,7 @@ export function Masthead({
           {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={pillLabel(route, replayDate, liveStatus, announcedLiveStatus)} />
+        <CatalogPanel label={mastheadPillLabel(route, replayDate, subjectResolved, liveStatus, announcedLiveStatus)} />
       )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
@@ -317,6 +327,27 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
  * wrong on top of being redundant with the pill's own dot. "LIVE" is never
  * wrong: it names the TRANSPORT state, not a calendar day. */
 const LIVE_CHIP = "LIVE";
+
+/** (#2284) The pill while the route's subject is unresolved: no dot and no
+ * replay glyph, because the page does not yet know which it is. */
+const PENDING_LABEL: ReactNode = <span className="masthead__pilltext">…</span>;
+
+/** (#2284) The live gate: a live route whose subject is known and has no
+ * day. An unresolved subject is neither live nor a replay. */
+function isLivePill(route: Route, replayDate: string | null, subjectResolved: boolean): boolean {
+  return subjectResolved && isLiveRoute(route) && replayDate == null;
+}
+
+/** (#2284) `pillLabel`, or the neutral label while the subject is unresolved. */
+function mastheadPillLabel(
+  route: Route,
+  replayDate: string | null,
+  subjectResolved: boolean,
+  liveStatus: LiveTailStatus,
+  announcedLiveStatus: "live" | "reconnecting",
+): ReactNode {
+  return subjectResolved ? pillLabel(route, replayDate, liveStatus, announcedLiveStatus) : PENDING_LABEL;
+}
 
 /** The catalog toggle's own glyph for a route that names a specific
  * recording — the mission id once a mission has closed, or a past date.

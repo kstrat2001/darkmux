@@ -138,6 +138,16 @@ function terminalWallMs(records: NormRecord[], sessionId: string): number | null
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
 
+/** (#2284) Whether a daemon dispatch/mission route's subject has been heard
+ * back about: the dispatch's records, or the mission's records query
+ * settling. Every other route (and a static build) has nothing to wait on. */
+function isSubjectResolved(sourceKind: string, route: Route, dispatchLoading: boolean, missionSettled: boolean): boolean {
+  if (sourceKind !== "daemon") return true;
+  if (route.kind === "dispatch") return !dispatchLoading;
+  if (route.kind === "mission") return missionSettled;
+  return true;
+}
+
 export function App() {
   const route = useHashRoute();
   const nowMs = Date.now();
@@ -239,6 +249,10 @@ export function App() {
     if (route.kind === "mission") return missionRecords ? missionReplayDate(missionRecords) : null;
     return null;
   }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecords]);
+  // (#2284) Whether the shell has heard back about the route's subject yet.
+  // Until it has, `replayDate` is null for lack of an answer, and the
+  // masthead must not read that as "running".
+  const subjectResolved = isSubjectResolved(source.kind, route, routeRecords.loading, missionRecordsQuery.status !== "pending");
   const day = useDay(replayDate);
   const dayRecords = day.records;
   // (#2346, redesigned after a live-render finding) The transport's own
@@ -636,6 +650,7 @@ export function App() {
         route={displayRoute}
         liveStatus={liveStatus}
         replayDate={route.kind === "playback" ? null : replayDate}
+        subjectResolved={subjectResolved}
       />
       {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
           not a child of it, so it can never touch that component's own
