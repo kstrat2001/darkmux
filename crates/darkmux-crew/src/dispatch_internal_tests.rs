@@ -7252,13 +7252,143 @@
     fn a_dispatch_to_an_engine_that_loads_on_request_says_it_may_switch() {
         use darkmux_profiles::engine::Loading;
         assert_eq!(
-            super::switch_notice_for("mlx", Loading::Unknown, "mlx-community/Qwen3-30B").as_deref(),
+            super::switch_notice_for("mlx", Loading::Unknown, None, "mlx-community/Qwen3-30B").as_deref(),
             Some(
                 "darkmux dispatch: `mlx` loads the model a request names; this dispatch sends \
                  `mlx-community/Qwen3-30B`, which may replace the model it holds. (#316)"
             )
         );
-        assert_eq!(super::switch_notice_for("lms", Loading::Explicit, "m"), None);
+        assert_eq!(super::switch_notice_for("lms", Loading::Explicit, None, "m"), None);
+    }
+
+    /// (#3283) The notice is said only when the engine could be holding a
+    /// model other than the one sent: quiet when the only model it could hold
+    /// is that one (or it holds none), said when another could be held or
+    /// when the engine can't say.
+    #[test]
+    fn the_switch_notice_is_quiet_when_the_engine_can_hold_only_the_model_sent() {
+        use darkmux_profiles::engine::Loading;
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let notice = |held: Option<Vec<String>>| super::switch_notice_for("mlx", Loading::Unknown, held.as_deref(), "m");
+        assert_eq!(notice(Some(ids(&["m"]))), None, "it can hold only the model sent");
+        assert_eq!(notice(Some(ids(&[]))), None, "it holds nothing, so nothing is replaced");
+        assert!(notice(Some(ids(&["m", "other"]))).is_some(), "it could be holding `other`");
+        assert!(notice(Some(ids(&["other"]))).is_some(), "it could be holding `other`");
+        assert!(notice(None).is_some(), "it can't say what it holds");
+    }
+
+    /// An engine that answers only residency and catalog: `resident` and
+    /// `listed` are what it says (`None` fails that probe).
+    struct HoldingEngine {
+        residency: darkmux_profiles::engine::Residency,
+        resident: Option<Vec<String>>,
+        listed: Option<Vec<String>>,
+    }
+
+    impl darkmux_profiles::engine::Engine for HoldingEngine {
+        fn capabilities(&self) -> darkmux_profiles::engine::Capabilities {
+            let mut caps = darkmux_profiles::engine::OpenAiCompatible::new("x", "http://127.0.0.1:9/v1").capabilities();
+            caps.residency = self.residency;
+            caps
+        }
+        fn name(&self) -> String {
+            "holding".into()
+        }
+        fn loaded(&self) -> anyhow::Result<Vec<darkmux_types::LoadedModel>> {
+            unimplemented!()
+        }
+        fn catalog(&self) -> anyhow::Result<Vec<darkmux_profiles::engine::ModelMeta>> {
+            let listed = self.listed.clone().ok_or_else(|| anyhow::anyhow!("unlisted"))?;
+            let template = darkmux_profiles::engine::ModelMeta {
+                publisher: String::new(),
+                display_name: String::new(),
+                model_key: String::new(),
+                size_bytes: 0,
+                params_string: None,
+                architecture: None,
+                max_context_length: None,
+                trained_for_tool_use: false,
+                model_type: "llm".into(),
+            };
+            Ok(listed.into_iter().map(|model_key| darkmux_profiles::engine::ModelMeta { model_key, ..template.clone() }).collect())
+        }
+        fn unload(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn host(&self) -> Option<Box<dyn darkmux_gestalt::ModelHost>> {
+            None
+        }
+        fn resident_ids(&self) -> anyhow::Result<Vec<String>> {
+            self.resident.clone().ok_or_else(|| anyhow::anyhow!("unreported"))
+        }
+        fn version(&self) -> Option<String> {
+            None
+        }
+        fn ledger(&self) -> darkmux_profiles::model_ledger::ModelLedger {
+            unimplemented!()
+        }
+        fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)> {
+            None
+        }
+    }
+
+    /// (#3283) What an engine could be holding: its residents when it reports
+    /// them, else every model it lists, and `None` when the probe fails.
+    #[test]
+    fn what_an_engine_could_hold_is_its_residents_or_else_its_listing() {
+        use darkmux_profiles::engine::Residency::{NotReported, Reported};
+        let ids = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let could_hold = |residency, resident, listed| super::models_it_could_hold(&HoldingEngine { residency, resident, listed });
+        assert_eq!(could_hold(Reported, ids(&["a"]), ids(&["a", "b"])), ids(&["a"]));
+        assert_eq!(could_hold(NotReported, ids(&["a"]), ids(&["a", "b"])), ids(&["a", "b"]));
+        assert_eq!(could_hold(Reported, None, ids(&["a"])), None);
+        assert_eq!(could_hold(NotReported, ids(&["a"]), None), None);
+    }
+
+    /// A loopback `GET /v1/models` that lists `ids`, answering `requests`
+    /// connections; returns the `/v1` base URL.
+    fn models_listing_server(ids: &'static [&'static str], requests: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut chunk = [0u8; 4096];
+                let _ = stream.read(&mut chunk);
+                let data: Vec<_> = ids.iter().map(|id| serde_json::json!({ "id": id })).collect();
+                let body = serde_json::json!({ "object": "list", "data": data }).to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// (#3283) End to end through this machine's default engine: a server
+    /// that lists only the model sent gets no notice; one that lists another
+    /// model too still does.
+    #[test]
+    #[serial]
+    fn the_switch_notice_reads_what_the_default_engine_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let notice_with = |ids: &'static [&'static str]| {
+            let url = models_listing_server(ids, 1);
+            let reg = dir.path().join("profiles.json");
+            std::fs::write(&reg, serde_json::json!({ "profiles": {"p": {"models": [{"id": "m"}]}}, "endpoints": {"azure": {"url": url}} }).to_string()).unwrap();
+            let model = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": url }));
+            unsafe {
+                std::env::set_var("DARKMUX_PROFILES", &reg);
+                std::env::set_var("DARKMUX_DEFAULT_ENGINE", "azure");
+            }
+            let notice = super::engine_switch_notice(&model);
+            unsafe {
+                std::env::remove_var("DARKMUX_DEFAULT_ENGINE");
+                std::env::remove_var("DARKMUX_PROFILES");
+            }
+            notice
+        };
+        assert_eq!(notice_with(&["m"]), None, "the server lists only the model sent");
+        assert!(notice_with(&["m", "other"]).is_some(), "the server could be holding `other`");
     }
 
     /// (#316) Only a model on the default engine is told: another endpoint,
