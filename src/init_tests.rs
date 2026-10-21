@@ -1340,3 +1340,57 @@ fn the_configured_server_is_the_one_models_are_planned_from() {
     fs::write(env.config(), r#"{ "default_engine": " LMStudio " }"#).unwrap();
     assert!(matches!(models_engine(&report, &env.registry(), &env.config()), ModelsEngine::Lmstudio));
 }
+
+// ── #3143 item 5: a run that will fail writes nothing first ──────────────
+
+/// (#3143 item 5) Every input `init` can refuse is checked before its first
+/// write: a malformed CLAUDE.md or AGENTS.md block under `--force`, a
+/// settings.json that is not an object (`--with-hook`), and a bad
+/// `--engine-url`. Each refusal leaves the machine as it was: no registry,
+/// no config, no skills, no hook, and the doc untouched. The error names the
+/// file to fix.
+#[test]
+#[serial_test::serial]
+fn a_refused_input_fails_init_before_anything_is_written() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    let claude_md = env.doc("CLAUDE.md");
+    let agents_md = env.doc("AGENTS.md");
+    fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+    let no_end = |header: &str| format!("# Project\n\n{header}\n\nno end marker here.\n");
+    fs::write(&claude_md, no_end(CLAUDE_MD_HEADER)).unwrap();
+    fs::write(&agents_md, no_end(AGENTS_MD_HEADER)).unwrap();
+
+    let cases: Vec<(&str, InitOptions, String)> = vec![
+        (
+            "malformed CLAUDE.md",
+            InitOptions { with_claude_md: Some(claude_md.clone()), force: true, ..opts() },
+            claude_md.display().to_string(),
+        ),
+        (
+            "malformed AGENTS.md",
+            InitOptions { with_agents_md: Some(agents_md.clone()), force: true, ..opts() },
+            agents_md.display().to_string(),
+        ),
+        ("bad --engine-url", InitOptions { engine_url: Some("not-a-url".into()), ..opts() }, "--engine-url".into()),
+    ];
+    for (label, o, names) in cases {
+        let err = init(&o).expect_err(label);
+        assert!(format!("{err:#}").contains(&names), "{label}: the error names {names}: {err:#}");
+        for p in [env.registry(), env.config(), env.settings(), env.skills_dir()] {
+            assert!(!p.exists(), "{label}: {} was written before the refusal", p.display());
+        }
+    }
+    assert_eq!(fs::read_to_string(&claude_md).unwrap(), no_end(CLAUDE_MD_HEADER));
+    assert_eq!(fs::read_to_string(&agents_md).unwrap(), no_end(AGENTS_MD_HEADER));
+
+    fs::create_dir_all(env.settings().parent().unwrap()).unwrap();
+    fs::write(env.settings(), "[]\n").unwrap();
+    let err = init(&InitOptions { with_hook: true, ..opts() }).expect_err("settings.json is a list");
+    assert!(format!("{err:#}").contains(&env.settings().display().to_string()), "names the settings file: {err:#}");
+    for p in [env.registry(), env.config(), env.skills_dir()] {
+        assert!(!p.exists(), "settings.json: {} was written before the refusal", p.display());
+    }
+    assert_eq!(fs::read_to_string(env.settings()).unwrap(), "[]\n");
+}

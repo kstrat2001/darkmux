@@ -107,6 +107,10 @@ const EXAMPLE_CONFIG: &str = include_str!("../config.example.json");
 pub fn init(opts: &InitOptions) -> Result<InitReport> {
     let mut report = InitReport::default();
 
+    // 0) (#3143 item 5) Refuse a bad input before the first write, so a
+    //    failing run leaves the machine as it found it.
+    preflight(opts)?;
+
     // 1) Bootstrap the profile registry (the "fresh user has no config" case).
     let registry_path = bootstrap_registry(opts.dry_run, &mut report)?;
 
@@ -136,6 +140,26 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     install_integrations(opts, &mut report)?;
 
     Ok(report)
+}
+
+/// Every input `init` can refuse, checked without writing: a bad
+/// `--engine-url`, a settings.json the hook cannot go into, and a malformed
+/// CLAUDE.md or AGENTS.md block under `--force`. The merges run as dry runs,
+/// so the check is the same code that refuses later.
+fn preflight(opts: &InitOptions) -> Result<()> {
+    if let Some(url) = opts.engine_url.as_deref() {
+        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
+    }
+    if opts.with_hook {
+        ensure_session_start_hook(&claude_settings_path()?, true, opts.force)?;
+    }
+    if let Some(target) = opts.with_claude_md.as_ref() {
+        ensure_claude_md_section(target, true, opts.force)?;
+    }
+    if let Some(target) = opts.with_agents_md.as_ref() {
+        ensure_agents_md_section(target, true, opts.force)?;
+    }
+    Ok(())
 }
 
 /// Step 1: bootstrap the profile registry. Never overwrites — even with
@@ -1067,18 +1091,18 @@ fn ensure_session_start_hook(settings_path: &Path, dry_run: bool, force: bool) -
 
     let hooks = value
         .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.json is not a JSON object"))?
+        .ok_or_else(|| anyhow!("{} is not a JSON object", settings_path.display()))?
         .entry("hooks".to_string())
         .or_insert(Value::Object(Default::default()));
     let hooks_obj = hooks
         .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.json hooks is not an object"))?;
+        .ok_or_else(|| anyhow!("{}: `hooks` is not an object", settings_path.display()))?;
     let arr = hooks_obj
         .entry("SessionStart".to_string())
         .or_insert(Value::Array(Vec::new()));
     let arr = arr
         .as_array_mut()
-        .ok_or_else(|| anyhow!("settings.json hooks.SessionStart is not an array"))?;
+        .ok_or_else(|| anyhow!("{}: `hooks.SessionStart` is not an array", settings_path.display()))?;
 
     let already_present = arr.iter().any(|h| {
         h.get("command")
@@ -1133,7 +1157,7 @@ fn ensure_claude_md_section(target: &Path, dry_run: bool, force: bool) -> Result
     let section = darkmux_claude_md_section();
     let new_contents = if has_block {
         // --force refresh: replace the marked block in place.
-        replace_marked_section(&existing, CLAUDE_MD_HEADER, CLAUDE_MD_FOOTER, &section)?
+        replace_marked_section(target, &existing, CLAUDE_MD_HEADER, CLAUDE_MD_FOOTER, &section)?
     } else if existing.is_empty() {
         section
     } else {
@@ -1160,6 +1184,7 @@ fn ensure_claude_md_section(target: &Path, dry_run: bool, force: bool) -> Result
 /// is present, so a missing footer means a genuinely malformed block the
 /// operator should fix by hand, never one we silently overwrite.
 fn replace_marked_section(
+    doc: &Path,
     existing: &str,
     header: &str,
     footer: &str,
@@ -1171,15 +1196,16 @@ fn replace_marked_section(
     let end = existing.find(footer).ok_or_else(|| {
         anyhow!(
             "darkmux start marker `{header}` is present but the end marker `{footer}` is missing \
-             — refusing to rewrite a malformed block. Fix the markers in {} by hand, or remove \
+             in {}, so darkmux will not rewrite the block. Fix the markers by hand, or remove \
              the darkmux block entirely and re-run.",
-            "the target doc"
+            doc.display()
         )
     })?;
     if end < start {
         return Err(anyhow!(
-            "darkmux markers are out of order (`{footer}` appears before `{header}`) — refusing \
-             to rewrite a malformed block. Fix the markers by hand and re-run."
+            "darkmux markers are out of order in {} (`{footer}` appears before `{header}`), \
+             so darkmux will not rewrite the block. Fix the markers by hand and re-run.",
+            doc.display()
         ));
     }
     let end_idx = end + footer.len();
@@ -1227,7 +1253,7 @@ fn ensure_agents_md_section(target: &Path, dry_run: bool, force: bool) -> Result
 
     let section = darkmux_agents_md_section();
     let new_contents = if has_block {
-        replace_marked_section(&existing, AGENTS_MD_HEADER, AGENTS_MD_FOOTER, &section)?
+        replace_marked_section(target, &existing, AGENTS_MD_HEADER, AGENTS_MD_FOOTER, &section)?
     } else if existing.is_empty() {
         section
     } else {
