@@ -42,6 +42,9 @@ export interface LiveSessionsResult {
   /** (#2284) Presence has answered at least once (ok or not). Until it has,
    * an empty `sessions` means "not asked yet", not "nobody is running". */
   answered: boolean;
+  /** (#2284) The latest presence read came back `ok:false`: `sessions` is
+   * empty because it could not be read, not because nobody is running. */
+  unreadable: boolean;
 }
 
 /** `pollLiveSessions()` as a query hook. */
@@ -70,6 +73,6 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
     // Only a SETTLED `ok:false` is a failed read.
     const unreadable = query.data !== undefined && !query.data.ok;
     const meta = query.data?.ok ? (query.data.data.meta ?? null) : null;
-    return { sessions: set, missions, coverage: degradedFleetSource(meta, unreadable), answered: query.data !== undefined };
+    return { sessions: set, missions, coverage: degradedFleetSource(meta, unreadable), answered: query.data !== undefined, unreadable };
   }, [query.data]);
 }

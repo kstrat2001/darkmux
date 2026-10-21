@@ -1411,7 +1411,22 @@ describe("App", () => {
   const delayed = (ms: number, res: () => Response) => new Promise<Response>((r) => setTimeout(() => r(res()), ms));
   const offMeta = { sources: { fleet: { state: "off" } }, complete: true };
   const okMeta = { sources: { fleet: { state: "ok" } }, complete: true };
-  function mockSubject(opts: { missionDelayMs?: number; missionStatus?: number; dispatchStatus?: number; presenceDelayMs?: number; presenceLive?: string[] }) {
+  function mockSubject(opts: {
+    missionDelayMs?: number;
+    missionStatus?: number;
+    dispatchStatus?: number;
+    presenceDelayMs?: number;
+    presenceLive?: string[];
+    /** HTTP status per successive `/flow-dispatch/s-run` call; the last repeats. */
+    runSeq?: number[];
+    /** HTTP status per successive presence call; the last repeats. */
+    presenceSeq?: number[];
+    /** `s-run`'s records end with a `dispatch.complete`. */
+    runEnded?: boolean;
+  }) {
+    let runCalls = 0;
+    let presenceCalls = 0;
+    const nth = (seq: number[] | undefined, i: number) => (seq ? seq[Math.min(i, seq.length - 1)] : 200);
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -1423,14 +1438,21 @@ describe("App", () => {
         ];
         const body = (r: unknown[]) => JSON.stringify({ records: r, count: r.length, truncated: false, generated_at_ms: 1 });
         const live = opts.presenceLive ?? [];
-        if (path === "/flow-dispatch/s1" || path === "/flow-dispatch/s-run") {
+        if (path === "/flow-dispatch/s-run") {
+          const status = nth(opts.runSeq, runCalls++);
+          if (status !== 200) return Promise.resolve(new Response("boom", { status }));
+          const run = recs.slice(0, opts.runEnded ? 2 : 1).map((r) => ({ ...r, session_id: "s-run", mission_id: undefined }));
+          return Promise.resolve(new Response(body(run), { status: 200 }));
+        }
+        if (path === "/flow-dispatch/s1") {
           if (opts.dispatchStatus) return Promise.resolve(new Response("not found", { status: opts.dispatchStatus }));
-          return Promise.resolve(new Response(body(path.endsWith("s-run") ? [{ ...recs[0], session_id: "s-run", mission_id: undefined }] : recs.slice(0, 2)), { status: 200 }));
+          return Promise.resolve(new Response(body(recs.slice(0, 2)), { status: 200 }));
         }
         if (path === "/flow-mission/m-one") {
           const res = () => (opts.missionStatus ? new Response("boom", { status: opts.missionStatus }) : new Response(body(recs), { status: 200 }));
           return delayed(opts.missionDelayMs ?? 0, res);
         }
+        if (path === "/fleet/dispatches/live" && nth(opts.presenceSeq, presenceCalls++) !== 200) return Promise.resolve(new Response("boom", { status: 500 }));
         if (path === "/fleet/dispatches/live")
           return delayed(opts.presenceDelayMs ?? 0, () => new Response(JSON.stringify({ dispatches: live.map((sid) => ({ session_id: sid, machine_uid: "m1", beat_ts_ms: Date.now() })), meta: live.length ? okMeta : offMeta }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: offMeta }), { status: 200 }));
@@ -1458,6 +1480,51 @@ describe("App", () => {
     await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
     expect(seen[0]).toBe("…");
     expect(seen.filter((t) => t.includes("▣"))).toEqual([]);
+  });
+
+  it("(#2284) one failed poll during a running dispatch keeps LIVE: failed is only for a subject never read", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockSubject({ presenceLive: ["s-run"], runSeq: [200, 500] });
+      window.location.hash = "#dispatch=s-run";
+      const seen = recordPill();
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+      const calls = () => (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.filter((c) => String(c[0]) === "/flow-dispatch/s-run").length;
+      const before = calls();
+      await vi.advanceTimersByTimeAsync(6000);
+      await waitFor(() => expect(calls()).toBeGreaterThan(before));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(seen.filter((t) => t.includes("couldn't read"))).toEqual([]);
+      expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(#2284) a failed presence read with a dispatch that has not ended reads failed, never a replay, and recovers when presence answers", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockSubject({ presenceLive: ["s-run"], presenceSeq: [500, 200] });
+      window.location.hash = "#dispatch=s-run";
+      const seen = recordPill();
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("couldn't read this run"), { timeout: 3000 });
+      await vi.advanceTimersByTimeAsync(6000);
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+      expect(seen.filter((t) => t.includes("▣"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(#2284) a failed presence read with a dispatch whose records show it ended is a replay", async () => {
+    mockSubject({ presenceSeq: [500], runEnded: true });
+    window.location.hash = "#dispatch=s-run";
+    const seen = recordPill();
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣2026-08-07"), { timeout: 3000 });
+    expect(seen.filter((t) => t.includes("LIVE") || t.includes("couldn't"))).toEqual([]);
   });
 
   for (const [label, hash, opts] of [

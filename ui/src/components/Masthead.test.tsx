@@ -335,6 +335,22 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     vi.useRealTimers();
   });
 
+  it("(#2284) a pending subject still announces a dropped stream as reconnecting once the hold elapses", () => {
+    vi.useFakeTimers();
+    try {
+      for (const subject of ["pending", "failed"] as const) {
+        const { container, unmount } = renderMasthead({ kind: "dispatch", dispatchId: "s1", missionId: null } as never, "reconnecting", null, subject);
+        act(() => {
+          vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
+        });
+        expect(container.querySelector('.catalog-toggle [aria-live="polite"]')?.textContent).toBe("reconnecting");
+        unmount();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("(b2) live + reconnecting: aria-live stays \"live\" until the delay has held, and never announces reconnecting for a hiccup that self-heals first", () => {
     vi.useFakeTimers();
     const { container, rerender } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");

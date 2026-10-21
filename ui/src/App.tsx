@@ -45,7 +45,7 @@ import { useDrilledMachine } from "./hooks/useDrilledMachine";
 import { useEventLogRecords } from "./hooks/useEventLogRecords";
 import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
-import { ingest, type NormRecord } from "./lib/ingest";
+import { ACTION, ingest, type NormRecord } from "./lib/ingest";
 import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
 import { sessionRun } from "./lib/runRef";
 import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse";
@@ -139,40 +139,74 @@ function terminalWallMs(records: NormRecord[], sessionId: string): number | null
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
 
-/** (#2284) What the shell knows about a daemon dispatch/mission route's
- * subject. A dispatch needs BOTH its records and a presence answer, because
- * whether it is running comes from presence (`useSessionLiveness`), not from
- * the records; until presence answers, its records read as a replay. A
- * mission needs its records query settled. A read that came back `ok:false`
- * is `failed`, never resolved: it says nothing about whether the run is
- * live. Every other route (and a static build) has nothing to wait on. */
-function subjectState(
-  sourceKind: string,
-  route: Route,
-  dispatch: { loading: boolean; failed: boolean; presenceAnswered: boolean },
-  mission: { data: { ok: boolean } | undefined },
-): SubjectState {
-  if (sourceKind !== "daemon") return "resolved";
-  if (route.kind === "dispatch") {
-    if (dispatch.loading) return "pending";
-    if (dispatch.failed) return "failed";
-    return dispatch.presenceAnswered ? "resolved" : "pending";
-  }
-  if (route.kind !== "mission") return "resolved";
-  if (mission.data === undefined) return "pending";
-  return mission.data.ok ? "resolved" : "failed";
+/** (#2284) What the shell knows about a daemon dispatch route's subject.
+ * Whether a dispatch is running comes from presence (`useSessionLiveness`),
+ * not from its records, so it needs both:
+ * - records still loading, or presence not yet answered: `pending`;
+ * - its records have NEVER been read (a 404 id): `failed`. Once one read
+ *   succeeded, a later failed poll changes nothing here: presence decides;
+ * - presence unreadable and the records show no end: `failed`, because
+ *   nothing can say whether it is running. Records that show it ended are a
+ *   replay whatever presence says. */
+interface DispatchSubject {
+  loading: boolean;
+  neverRead: boolean;
+  presenceAnswered: boolean;
+  presenceUnreadable: boolean;
+  ended: boolean;
+}
+function dispatchState(d: DispatchSubject): SubjectState {
+  if (d.loading) return "pending";
+  if (d.neverRead) return "failed";
+  if (!d.presenceAnswered) return "pending";
+  return d.presenceUnreadable && !d.ended ? "failed" : "resolved";
 }
 
-/** (#2284) `subjectState` for this route, with the presence answer it needs
- * for a dispatch. */
+/** (#2284) A mission needs its records query settled; a read that came back
+ * `ok:false` is `failed`, never resolved: it says nothing about whether the
+ * run is live. */
+function missionState(data: { ok: boolean } | undefined): SubjectState {
+  if (data === undefined) return "pending";
+  return data.ok ? "resolved" : "failed";
+}
+
+/** (#2284) Whether `key`'s subject has been read successfully at least once
+ * (React's adjust-state-while-rendering pattern; settles in one pass). */
+function useEverRead(key: string | null, readOk: boolean): boolean {
+  const [readKey, setReadKey] = useState<string | null>(null);
+  if (readOk && readKey !== key) setReadKey(key);
+  return readOk || readKey === key;
+}
+
+/** (#2284) The records carry a role execution's terminal record. */
+function dispatchEnded(records: readonly NormRecord[]): boolean {
+  return records.some((r) => r.action === ACTION.DispatchComplete || r.action === ACTION.DispatchError);
+}
+
+/** (#2284) The route's subject state. Every route but a daemon dispatch or
+ * mission (and a static build) has nothing to wait on. The presence read is
+ * the SAME query `useSessionLiveness` mounts for this dispatch (one cache
+ * slot, one request). */
 function useSubjectState(
   sourceKind: string,
   route: Route,
-  records: { loading: boolean; error: unknown },
+  records: { loading: boolean; error: unknown; records: readonly NormRecord[] },
   missionData: { ok: boolean } | undefined,
 ): SubjectState {
-  const presenceAnswered = useLiveSessionIds(sourceKind === "daemon" && route.kind === "dispatch").answered;
-  return subjectState(sourceKind, route, { loading: records.loading, failed: records.error !== null, presenceAnswered }, { data: missionData });
+  const isDispatch = sourceKind === "daemon" && route.kind === "dispatch";
+  const presence = useLiveSessionIds(isDispatch);
+  const key = route.kind === "dispatch" ? route.dispatchId : null;
+  const everRead = useEverRead(key, isDispatch && !records.loading && records.error === null);
+  if (sourceKind !== "daemon") return "resolved";
+  if (route.kind === "mission") return missionState(missionData);
+  if (!isDispatch) return "resolved";
+  return dispatchState({
+    loading: records.loading,
+    neverRead: records.error !== null && !everRead,
+    presenceAnswered: presence.answered,
+    presenceUnreadable: presence.unreadable,
+    ended: dispatchEnded(records.records),
+  });
 }
 
 export function App() {
