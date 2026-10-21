@@ -630,3 +630,15 @@ fn the_fake_answers_only_the_stamps_the_test_set() {
     assert_eq!(fake.process_start_stamp(7), Some(70));
     assert_eq!(fake.process_start_stamp(8), None);
 }
+
+/// (#3200) The pid-namespace link parses to its inode, and only that shape.
+#[test]
+fn linux_pid_namespace_is_the_ns_links_inode() {
+    assert_eq!(linux::pid_namespace_from_link("pid:[4026531836]").as_deref(), Some("pid:4026531836"));
+    assert_eq!(linux::pid_namespace_from_link("net:[4026531836]"), None);
+    assert_eq!(linux::pid_namespace_from_link("pid:[]"), None);
+    assert_eq!(MacPlatform.pid_namespace().as_deref(), Some("macos"));
+    assert_eq!(OtherPlatform.pid_namespace(), None);
+    let fake = FakePlatform { pid_namespace: Some("ns".into()), ..Default::default() };
+    assert_eq!(fake.pid_namespace().as_deref(), Some("ns"));
+}

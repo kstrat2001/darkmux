@@ -83,6 +83,11 @@ pub trait Platform: Send + Sync {
     /// method produced for the same pid on this same machine: two equal
     /// stamps mean the pid was not reused in between.
     fn process_start_stamp(&self, pid: u32) -> Option<u64>;
+
+    /// (#3200) Which pid namespace this process lives in: two processes
+    /// whose answers differ cannot judge each other's pids. `None` when it
+    /// cannot be read; a caller comparing pids then treats them as foreign.
+    fn pid_namespace(&self) -> Option<String>;
 }
 
 /// A battery's charge facts as the OS reports them. The lens derives its

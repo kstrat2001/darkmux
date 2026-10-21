@@ -79,6 +79,11 @@ impl Platform for MacPlatform {
     fn process_start_stamp(&self, pid: u32) -> Option<u64> {
         kinfo_start_stamp(pid)
     }
+
+    /// macOS has one pid namespace per machine.
+    fn pid_namespace(&self) -> Option<String> {
+        Some("macos".to_string())
+    }
 }
 
 /// (#2917, moved here by #3200) See [`MacPlatform::process_start_stamp`].

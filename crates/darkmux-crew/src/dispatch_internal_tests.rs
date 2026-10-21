@@ -6078,10 +6078,10 @@
     fn build_docker_run_argv_labels_the_container_with_its_host() {
         let mut config = base_argv_config();
         config.host_identity =
-            Some(crate::orphan_reaper::HostIdentity { pid: 42, start: 4200, machine: "MACHINE-A".into() });
+            Some(crate::orphan_reaper::HostIdentity { pid: 42, start: 4200, machine: "MACHINE-A".into(), pid_ns: "pid:9".into() });
         let argv = build_docker_run_argv(&config);
         let fence = argv.iter().position(|a| a == "--").expect("image fence");
-        for label in ["darkmux.dispatch.host-pid=42", "darkmux.dispatch.host-start=4200", "darkmux.dispatch.host-machine=MACHINE-A"] {
+        for label in ["darkmux.dispatch.host-pid=42", "darkmux.dispatch.host-start=4200", "darkmux.dispatch.host-machine=MACHINE-A", "darkmux.dispatch.host-pid-ns=pid:9"] {
             let at = argv.iter().position(|a| a == label).unwrap_or_else(|| panic!("{label} missing: {argv:?}"));
             assert_eq!(argv[at - 1], "--label");
             assert!(at < fence, "{label} must be a docker option, not a runtime arg");

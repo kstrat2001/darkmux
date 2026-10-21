@@ -82,14 +82,20 @@ impl Platform for LinuxPlatform {
     }
 
     /// Each tier's mean `scaling_cur_freq`, aligned with [`Self::cpu_clusters`].
+    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
+        tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
+    }
+
     /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
     /// boot. World-readable unless `/proc` is mounted with `hidepid`.
     fn process_start_stamp(&self, pid: u32) -> Option<u64> {
         start_ticks_from_proc_stat(&read_to_string(&format!("/proc/{pid}/stat"))?)
     }
 
-    fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
-        tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
+    /// The inode of `/proc/self/ns/pid` (its link reads `pid:[4026531836]`).
+    /// Two processes see each other's pids only when this matches.
+    fn pid_namespace(&self) -> Option<String> {
+        pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
     }
 
     /// `/proc/meminfo`'s `MemAvailable`.
@@ -117,6 +123,22 @@ pub(crate) fn installed_ram_from_meminfo(meminfo: &str) -> Option<u64> {
 pub(crate) fn start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// `pid:[4026531836]` -> `pid:4026531836`; anything else is `None`.
+pub(crate) fn pid_namespace_from_link(link: &str) -> Option<String> {
+    let inode = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
+    (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| format!("pid:{inode}"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_link(path: &str) -> Option<String> {
+    std::fs::read_link(path).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_link(_path: &str) -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "linux")]

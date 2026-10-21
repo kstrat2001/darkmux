@@ -11,7 +11,7 @@
 //! side already derives for a host that died mid-run (#3125's lost beat);
 //! the reaper writes no dispatch terminal of its own.
 
-use darkmux_crew::orphan_reaper::{host_liveness, reap_tick, HostLiveness, ReapTick};
+use darkmux_crew::orphan_reaper::{host_liveness, reap_tick, HostLiveness, LocalHost, ReapTick};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,11 +27,11 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// One tick's log lines. `docker_warned` carries "already said docker is
 /// unavailable" between ticks, so a machine without docker logs that once.
 pub(crate) fn tick_lines(
-    this_machine: Option<&str>,
+    local: Option<&LocalHost>,
     liveness: impl Fn(u32) -> HostLiveness,
     docker_warned: &mut bool,
 ) -> Vec<String> {
-    match reap_tick(this_machine, liveness) {
+    match reap_tick(local, liveness) {
         ReapTick::DockerUnavailable if *docker_warned => Vec::new(),
         ReapTick::DockerUnavailable => {
             *docker_warned = true;
@@ -56,14 +56,23 @@ pub(crate) fn tick_lines(
     }
 }
 
+/// One production tick: this host's own machine and pid namespace, and this
+/// machine's real liveness answers. The thread runs exactly this.
+pub(crate) fn this_host_tick_lines(docker_warned: &mut bool) -> Vec<String> {
+    tick_lines(
+        LocalHost::this_host().as_ref(),
+        host_liveness,
+        docker_warned,
+    )
+}
+
 /// Start the reaper thread: a tick at once, then every `interval` until
 /// `stop_flag` is set.
 pub(crate) fn spawn(interval: Duration, stop_flag: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let this_machine = darkmux_hardware::machine_uid();
         let mut docker_warned = false;
         loop {
-            for line in tick_lines(this_machine, host_liveness, &mut docker_warned) {
+            for line in this_host_tick_lines(&mut docker_warned) {
                 eprintln!("{line}");
             }
             let mut slept = Duration::ZERO;
@@ -84,6 +93,64 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    fn local() -> LocalHost {
+        LocalHost {
+            machine: "M".into(),
+            pid_ns: "N".into(),
+        }
+    }
+
+    /// A fake `docker` in `dir` that prints `listing` for `ps` and records
+    /// every call to `<dir>/calls.txt`.
+    fn fake_docker(dir: &std::path::Path, listing: &str) -> std::path::PathBuf {
+        let record = dir.join("calls.txt");
+        let listing_path = dir.join("ps.txt");
+        std::fs::write(&listing_path, listing).unwrap();
+        let docker = dir.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = ps ]; then cat {}; fi\n",
+                record.display(),
+                listing_path.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        record
+    }
+
+    /// (#3200 review) The production wiring, run once against a fake
+    /// docker: a container labeled with THIS test process as its host must
+    /// survive, and one whose host pid has exited must be killed (proving
+    /// the tick listed and judged at all).
+    #[test]
+    #[serial]
+    fn the_production_tick_keeps_a_live_hosts_container_and_kills_a_dead_ones() {
+        let me = darkmux_crew::orphan_reaper::HostIdentity::this_process()
+            .expect("this host reads its own pid, start time, machine uid and pid namespace");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let listing = format!(
+            "darkmux-dispatch-mine\t{}\t{}\t{}\t{}\ndarkmux-dispatch-dead\t{dead_pid}\t1\t{}\t{}\n",
+            me.pid, me.start, me.machine, me.pid_ns, me.machine, me.pid_ns
+        );
+        let dir = TempDir::new().unwrap();
+        let record = fake_docker(dir.path(), &listing);
+        let mut warned = false;
+        let lines = with_path(dir.path(), || this_host_tick_lines(&mut warned));
+        let calls = std::fs::read_to_string(&record).unwrap();
+        let kills: Vec<&str> = calls.lines().filter(|l| l.starts_with("kill ")).collect();
+        assert_eq!(
+            kills,
+            vec!["kill darkmux-dispatch-dead"],
+            "{calls}\n{lines:?}"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
 
     fn with_path<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("PATH").ok();
@@ -116,7 +183,7 @@ mod tests {
         std::fs::write(
             &docker,
             format!(
-                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = ps ]; then printf 'darkmux-dispatch-dead\\t200\\t1\\tM\\ndarkmux-dispatch-live\\t100\\t1\\tM\\n'; fi\n",
+                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = ps ]; then printf 'darkmux-dispatch-dead\\t200\\t1\\tM\\tN\\ndarkmux-dispatch-live\\t100\\t1\\tM\\tN\\n'; fi\n",
                 record.display()
             ),
         )
@@ -131,7 +198,9 @@ mod tests {
             }
         };
         let mut warned = false;
-        let lines = with_path(dir.path(), || tick_lines(Some("M"), liveness, &mut warned));
+        let lines = with_path(dir.path(), || {
+            tick_lines(Some(&local()), liveness, &mut warned)
+        });
         assert_eq!(
             lines,
             vec!["darkmux serve: killed orphaned dispatch container darkmux-dispatch-dead (its darkmux host, pid 200, is gone)"]
@@ -160,8 +229,8 @@ mod tests {
         // SAFETY: `#[serial]`.
         unsafe { std::env::set_var("PATH", empty.path()) };
         let mut warned = false;
-        let first = tick_lines(Some("M"), |_| HostLiveness::Gone, &mut warned);
-        let second = tick_lines(Some("M"), |_| HostLiveness::Gone, &mut warned);
+        let first = tick_lines(Some(&local()), |_| HostLiveness::Gone, &mut warned);
+        let second = tick_lines(Some(&local()), |_| HostLiveness::Gone, &mut warned);
         unsafe {
             match prev {
                 Some(p) => std::env::set_var("PATH", p),

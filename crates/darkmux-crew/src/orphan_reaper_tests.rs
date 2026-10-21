@@ -3,6 +3,14 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 const MACHINE: &str = "MACHINE-A";
+const NS: &str = "pid:4026531836";
+
+fn local() -> LocalHost {
+    LocalHost {
+        machine: MACHINE.to_string(),
+        pid_ns: NS.to_string(),
+    }
+}
 
 fn labeled(name: &str, pid: u32, start: u64, machine: &str) -> ListedContainer {
     ListedContainer {
@@ -10,6 +18,7 @@ fn labeled(name: &str, pid: u32, start: u64, machine: &str) -> ListedContainer {
         host_pid: Some(pid),
         host_start: Some(start),
         host_machine: Some(machine.to_string()),
+        host_pid_ns: Some(NS.to_string()),
     }
 }
 
@@ -32,6 +41,7 @@ fn the_reap_rule_table() {
         host_pid: None,
         host_start: None,
         host_machine: None,
+        host_pid_ns: None,
     };
     let half_labeled = ListedContainer {
         host_start: None,
@@ -71,14 +81,33 @@ fn the_reap_rule_table() {
             false,
         ),
         (
+            "no namespace label -> keep",
+            ListedContainer {
+                host_pid_ns: None,
+                ..labeled("darkmux-dispatch-nons", 200, 1000, MACHINE)
+            },
+            false,
+        ),
+        (
+            "another pid namespace's host -> keep",
+            ListedContainer {
+                host_pid_ns: Some("pid:4026532999".into()),
+                ..labeled("darkmux-dispatch-otherns", 200, 1000, MACHINE)
+            },
+            false,
+        ),
+        (
             "another machine's host -> keep",
             labeled("darkmux-dispatch-peer", 200, 1000, "MACHINE-B"),
             false,
         ),
     ];
     for (why, container, reap) in cases {
-        let got =
-            orphaned_dispatch_containers(std::slice::from_ref(&container), Some(MACHINE), liveness);
+        let got = orphaned_dispatch_containers(
+            std::slice::from_ref(&container),
+            Some(&local()),
+            liveness,
+        );
         assert_eq!(!got.is_empty(), reap, "{why}: {got:?}");
         if reap {
             assert_eq!(
@@ -93,6 +122,7 @@ fn the_reap_rule_table() {
     }
 }
 
+/// The reaper cannot read its own machine or namespace: nothing is reaped.
 #[test]
 fn an_unknown_machine_identity_reaps_nothing() {
     let dead = labeled("darkmux-dispatch-dead", 200, 1000, MACHINE);
@@ -101,7 +131,8 @@ fn an_unknown_machine_identity_reaps_nothing() {
 
 #[test]
 fn parse_reads_labels_and_treats_empty_as_absent() {
-    let out = "darkmux-dispatch-a\t200\t1000\tMACHINE-A\ndarkmux-dispatch-b\t\t\t\n\n";
+    let out =
+        "darkmux-dispatch-a\t200\t1000\tMACHINE-A\tpid:4026531836\ndarkmux-dispatch-b\t\t\t\t\n\n";
     let got = parse_docker_ps(out);
     assert_eq!(
         got,
@@ -111,18 +142,20 @@ fn parse_reads_labels_and_treats_empty_as_absent() {
                 name: "darkmux-dispatch-b".into(),
                 host_pid: None,
                 host_start: None,
-                host_machine: None
+                host_machine: None,
+                host_pid_ns: None,
             },
         ]
     );
 }
 
 #[test]
-fn host_label_args_are_three_labels() {
+fn host_label_args_are_four_labels() {
     let host = HostIdentity {
         pid: 7,
         start: 70,
         machine: "M".into(),
+        pid_ns: "N".into(),
     };
     assert_eq!(
         host_label_args(&host),
@@ -133,6 +166,8 @@ fn host_label_args_are_three_labels() {
             "darkmux.dispatch.host-start=70",
             "--label",
             "darkmux.dispatch.host-machine=M",
+            "--label",
+            "darkmux.dispatch.host-pid-ns=N",
         ]
     );
 }
@@ -201,11 +236,11 @@ fn restore_path(prev: Option<String>) {
 #[serial]
 fn a_tick_lists_once_and_kills_only_the_orphan() {
     let dir = TempDir::new().unwrap();
-    let ps = "darkmux-dispatch-alive\t100\t1000\tMACHINE-A\n\
-              darkmux-dispatch-dead\t200\t1000\tMACHINE-A\n\
+    let ps = "darkmux-dispatch-alive\t100\t1000\tMACHINE-A\tpid:4026531836\n\
+              darkmux-dispatch-dead\t200\t1000\tMACHINE-A\tpid:4026531836\n\
               darkmux-dispatch-old\t\t\t\n";
     let (record, prev) = install_fake_docker(&dir, ps);
-    let tick = reap_tick(Some(MACHINE), liveness);
+    let tick = reap_tick(Some(&local()), liveness);
     restore_path(prev);
     let ReapTick::Listed { reaped } = tick else {
         panic!("docker answered: {tick:?}")
@@ -238,7 +273,19 @@ fn a_tick_without_docker_does_nothing() {
     let prev = std::env::var("PATH").ok();
     // SAFETY: `#[serial]`.
     unsafe { std::env::set_var("PATH", empty.path()) };
-    let tick = reap_tick(Some(MACHINE), liveness);
+    let tick = reap_tick(Some(&local()), liveness);
     restore_path(prev);
     assert!(matches!(tick, ReapTick::DockerUnavailable), "{tick:?}");
+}
+
+/// (#3200 review) `kill(pid, 0)` answers `EPERM` for a live process owned by
+/// another user; that must read as running, never as gone. pid 1 is launchd
+/// or init, owned by root.
+#[test]
+fn another_users_live_process_reads_as_running() {
+    assert!(
+        matches!(host_liveness(1), HostLiveness::Running { .. }),
+        "{:?}",
+        host_liveness(1)
+    );
 }
