@@ -1,0 +1,12 @@
+# cargo audit configuration, read by CI's "cargo audit (RUSTSEC advisories)" job.
+
+[advisories]
+ignore = [
+    # webpki-roots: distrusted root certificates (fixed in 1.0.10). The runtime
+    # lockfile also holds webpki-roots 0.26.11, which ureq 2 depends on; 0.26.11
+    # is a shim with no roots of its own that re-exports webpki-roots 1.x, and
+    # it resolves to the patched 1.0.10 here (runtime/Cargo.lock). The advisory
+    # flags it by version number only. Remove this entry when ureq moves to 3
+    # and 0.26 leaves the lockfile.
+    "RUSTSEC-2026-0381",
+]
