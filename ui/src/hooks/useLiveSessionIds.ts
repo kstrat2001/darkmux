@@ -39,6 +39,9 @@ export interface LiveSessionsResult {
    * nothing — a standalone machine has no fleet substrate by design, and
    * reading as degraded there would be the bug. */
   coverage: DegradedFleetSource | null;
+  /** (#2284) Presence has answered at least once (ok or not). Until it has,
+   * an empty `sessions` means "not asked yet", not "nobody is running". */
+  answered: boolean;
 }
 
 /** `pollLiveSessions()` as a query hook. */
@@ -67,6 +70,6 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
     // Only a SETTLED `ok:false` is a failed read.
     const unreadable = query.data !== undefined && !query.data.ok;
     const meta = query.data?.ok ? (query.data.data.meta ?? null) : null;
-    return { sessions: set, missions, coverage: degradedFleetSource(meta, unreadable) };
+    return { sessions: set, missions, coverage: degradedFleetSource(meta, unreadable), answered: query.data !== undefined };
   }, [query.data]);
 }

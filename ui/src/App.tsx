@@ -11,7 +11,7 @@ import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
-import { Masthead } from "./components/Masthead";
+import { Masthead, type SubjectState } from "./components/Masthead";
 import { MachineDrawer } from "./components/MachineDrawer";
 import { EventLogColumn } from "./components/EventLogColumn";
 import { PageJudgementProvider } from "./hooks/useJudgement";
@@ -26,6 +26,7 @@ import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
+import { useLiveSessionIds } from "./hooks/useLiveSessionIds";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import type { LiveTailStatus } from "./hooks/useLiveTail";
@@ -138,14 +139,40 @@ function terminalWallMs(records: NormRecord[], sessionId: string): number | null
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
 
-/** (#2284) Whether a daemon dispatch/mission route's subject has been heard
- * back about: the dispatch's records, or the mission's records query
- * settling. Every other route (and a static build) has nothing to wait on. */
-function isSubjectResolved(sourceKind: string, route: Route, dispatchLoading: boolean, missionSettled: boolean): boolean {
-  if (sourceKind !== "daemon") return true;
-  if (route.kind === "dispatch") return !dispatchLoading;
-  if (route.kind === "mission") return missionSettled;
-  return true;
+/** (#2284) What the shell knows about a daemon dispatch/mission route's
+ * subject. A dispatch needs BOTH its records and a presence answer, because
+ * whether it is running comes from presence (`useSessionLiveness`), not from
+ * the records; until presence answers, its records read as a replay. A
+ * mission needs its records query settled. A read that came back `ok:false`
+ * is `failed`, never resolved: it says nothing about whether the run is
+ * live. Every other route (and a static build) has nothing to wait on. */
+function subjectState(
+  sourceKind: string,
+  route: Route,
+  dispatch: { loading: boolean; failed: boolean; presenceAnswered: boolean },
+  mission: { data: { ok: boolean } | undefined },
+): SubjectState {
+  if (sourceKind !== "daemon") return "resolved";
+  if (route.kind === "dispatch") {
+    if (dispatch.loading) return "pending";
+    if (dispatch.failed) return "failed";
+    return dispatch.presenceAnswered ? "resolved" : "pending";
+  }
+  if (route.kind !== "mission") return "resolved";
+  if (mission.data === undefined) return "pending";
+  return mission.data.ok ? "resolved" : "failed";
+}
+
+/** (#2284) `subjectState` for this route, with the presence answer it needs
+ * for a dispatch. */
+function useSubjectState(
+  sourceKind: string,
+  route: Route,
+  records: { loading: boolean; error: unknown },
+  missionData: { ok: boolean } | undefined,
+): SubjectState {
+  const presenceAnswered = useLiveSessionIds(sourceKind === "daemon" && route.kind === "dispatch").answered;
+  return subjectState(sourceKind, route, { loading: records.loading, failed: records.error !== null, presenceAnswered }, { data: missionData });
 }
 
 export function App() {
@@ -249,10 +276,12 @@ export function App() {
     if (route.kind === "mission") return missionRecords ? missionReplayDate(missionRecords) : null;
     return null;
   }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecords]);
-  // (#2284) Whether the shell has heard back about the route's subject yet.
-  // Until it has, `replayDate` is null for lack of an answer, and the
-  // masthead must not read that as "running".
-  const subjectResolved = isSubjectResolved(source.kind, route, routeRecords.loading, missionRecordsQuery.status !== "pending");
+  // (#2284) What the shell knows about the route's subject. Until it is
+  // resolved, `replayDate` is null (or set) for lack of an answer, and the
+  // masthead must claim neither LIVE nor a replay. The presence read here is
+  // the SAME query `useSessionLiveness` mounts for this dispatch (one cache
+  // slot, one request).
+  const subject = useSubjectState(source.kind, route, routeRecords, missionRecordsQuery.data);
   const day = useDay(replayDate);
   const dayRecords = day.records;
   // (#2346, redesigned after a live-render finding) The transport's own
@@ -650,7 +679,7 @@ export function App() {
         route={displayRoute}
         liveStatus={liveStatus}
         replayDate={route.kind === "playback" ? null : replayDate}
-        subjectResolved={subjectResolved}
+        subject={subject}
       />
       {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
           not a child of it, so it can never touch that component's own
