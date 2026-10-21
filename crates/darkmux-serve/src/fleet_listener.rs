@@ -1466,12 +1466,37 @@ mod tests {
 
     /// An identity provider a test can change mid-run: a node leaving the
     /// network, the provider going down, another node taking the address.
-    struct Switchable(Mutex<StaticIdentityProvider>, Mutex<Duration>, std::sync::atomic::AtomicUsize);
+    /// The fields: the provider, how long every lookup takes, how many
+    /// lookups have begun, and the first lookup (counted from 0) that is
+    /// held until the test releases it ([`Switchable::hold_from`]).
+    struct Switchable(
+        Mutex<StaticIdentityProvider>,
+        Mutex<Duration>,
+        std::sync::atomic::AtomicUsize,
+        Mutex<Option<usize>>,
+        std::sync::atomic::AtomicBool,
+    );
 
     impl Switchable {
         /// Make every later `identify` take `d` (a slow provider tool).
         fn slow(&self, d: Duration) {
             *self.1.lock().unwrap() = d;
+        }
+
+        /// (#3218) Hold lookup `n` (counted from 0) and every later one until
+        /// [`Switchable::release`], then let it take `slow`'s delay. Set
+        /// before any request, so which lookup is held does not depend on
+        /// when the test thread runs.
+        fn hold_from(&self, n: usize) {
+            *self.3.lock().unwrap() = Some(n);
+        }
+
+        fn release(&self) {
+            self.4.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn lookups(&self) -> usize {
+            self.2.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn set(&self, peers: Vec<darkmux_fleet::NodeIdentity>, down: Option<&str>) {
@@ -1486,7 +1511,12 @@ mod tests {
             "static"
         }
         fn identify(&self, peer: std::net::IpAddr) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
-            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.3.lock().unwrap().is_some_and(|from| n >= from) {
+                while !self.4.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             let delay = *self.1.lock().unwrap();
             std::thread::sleep(delay);
             self.0.lock().unwrap().identify(peer)
@@ -1576,6 +1606,8 @@ mod tests {
                 down: down.then(|| "daemon not running".to_string()),
             }),
             Mutex::new(Duration::ZERO),
+            Default::default(),
+            Mutex::new(None),
             Default::default(),
         ));
         let token_now = Arc::new(Mutex::new(Some(TOKEN.to_string())));
@@ -2316,10 +2348,20 @@ mod tests {
     /// (#2916 stage 2 final review 3) A sender that hangs up WHILE its job is
     /// being checked again (the seat already taken, the provider still
     /// answering) is caught by the check just before the job runs.
+    ///
+    /// (#3218) Deterministic: the recheck's lookup is held from before the
+    /// first request until the sender has hung up, then takes 1.2 s, so the
+    /// hang-up always lands inside the recheck however late this thread
+    /// runs. It used to slow the provider only after reading `queued`; on a
+    /// loaded runner that came after the first job ended, the recheck was
+    /// already done, and the job ran before the hang-up.
     #[test]
     fn a_sender_that_hangs_up_during_the_recheck_never_runs() {
         use std::io::{Read, Write};
         let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        // Lookups 0 and 1 are the gate's, for the first job and the waiter;
+        // lookup 2 is the waiter's recheck once the first job frees the seat.
+        h.network.hold_from(2);
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let body = serde_json::to_vec(&WorkSubmission::new(job("s-gone", None), true)).unwrap();
         let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
@@ -2340,13 +2382,19 @@ mod tests {
             assert!(n > 0, "the listener closed before saying queued");
             got.extend_from_slice(&b[..n]);
         }
-        // The recheck's lookup will take 1.2 s; hang up inside it, after the
-        // waiter has already taken the freed seat.
-        h.network.slow(Duration::from_millis(1_200));
-        wait_ran(&h, 1);
-        std::thread::sleep(Duration::from_millis(300));
+        // The first job ends and the waiter takes the freed seat; its
+        // recheck's lookup begins and is held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.network.lookups() < 3 {
+            assert!(std::time::Instant::now() < deadline, "the recheck never looked the sender up");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "the first job ended before the recheck");
         assert!(!h.seats.running().is_empty(), "the waiter should hold the seat, mid-recheck");
         drop(sock);
+        // The lookup answers 1.2 s after the hang-up.
+        h.network.slow(Duration::from_millis(1_200));
+        h.network.release();
         wait_idle(&h);
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(h.ran.lock().unwrap().len(), 1, "a job whose sender hung up during its recheck ran");
