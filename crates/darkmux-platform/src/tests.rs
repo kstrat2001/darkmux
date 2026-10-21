@@ -42,6 +42,7 @@ fn a_fake_answers_what_the_test_set() {
         container_host_access: ContainerHostAccess::HostGateway,
         container_user: ContainerUser::Image,
         machine_uid: None,
+        ..FakePlatform::default()
     };
     assert_eq!(fake.id(), "fake");
     assert_eq!(
@@ -139,6 +140,7 @@ fn a_fake_answers_the_container_user_the_test_set() {
             gid: Some(6),
         },
         machine_uid: None,
+        ..FakePlatform::default()
     };
     assert_eq!(
         fake.container_user(),
@@ -222,6 +224,7 @@ fn a_fake_answers_the_machine_uid_the_test_set() {
         container_host_access: ContainerHostAccess::Builtin,
         container_user: ContainerUser::Image,
         machine_uid: Some("uid-1".to_string()),
+        ..FakePlatform::default()
     };
     assert_eq!(fake.machine_uid().as_deref(), Some("uid-1"));
 }
@@ -545,4 +548,53 @@ fn this_linux_machine_reports_a_frequency_per_cluster() {
         assert_eq!(LinuxPlatform.cpu_cluster_mhz().len(), LinuxPlatform.cpu_clusters().len());
     }
     assert!(MacPlatform.cpu_cluster_mhz().is_empty() && OtherPlatform.cpu_cluster_mhz().is_empty());
+}
+
+// ── #3281: reclaimable memory, the doctor's RAM headroom figure ──────────
+
+/// macOS: free plus inactive pages from `vm_stat`, times the page size. The
+/// reader doctor ran before, moved.
+#[test]
+fn macos_reclaimable_is_free_plus_inactive_pages() {
+    let vm_stat = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                   Pages free:                              100000.\n\
+                   Pages active:                            500000.\n\
+                   Pages inactive:                           50000.\n";
+    assert_eq!(macos::reclaimable_from_vm_stat(vm_stat, 16_384), Some(150_000 * 16_384));
+    // A field vm_stat printed but that does not parse is no figure at all.
+    assert_eq!(macos::reclaimable_from_vm_stat("Pages free:   .\n", 16_384), None);
+}
+
+#[test]
+fn vm_stat_page_counts_ignore_separators() {
+    assert_eq!(macos::parse_pages_field("                  1234567."), Some(1234567));
+    assert_eq!(macos::parse_pages_field(" 1.234.567."), Some(1234567));
+    assert_eq!(macos::parse_pages_field("        ."), None);
+}
+
+/// Linux: `MemAvailable`, the kernel's own estimate of what can be handed
+/// out without swapping, reclaimable cache included.
+#[test]
+fn linux_reclaimable_is_memavailable() {
+    let meminfo = "MemTotal:       16000000 kB\nMemFree:         1000000 kB\nMemAvailable:    9000000 kB\n";
+    assert_eq!(linux::reclaimable_from_meminfo(meminfo), Some(9_000_000 * 1024));
+    // A kernel too old to report MemAvailable gives no figure, not MemFree.
+    assert_eq!(linux::reclaimable_from_meminfo("MemTotal: 16000000 kB\nMemFree: 1000000 kB\n"), None);
+}
+
+#[test]
+fn an_os_with_no_strategy_reports_no_reclaimable_memory() {
+    assert_eq!(OtherPlatform.reclaimable_memory_bytes(), None);
+}
+
+#[test]
+fn a_fake_answers_the_reclaimable_memory_the_test_set() {
+    let fake = FakePlatform { reclaimable_memory_bytes: Some(42), ..FakePlatform::default() };
+    assert_eq!(fake.reclaimable_memory_bytes(), Some(42));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn this_linux_machine_reports_reclaimable_memory() {
+    assert!(LinuxPlatform.reclaimable_memory_bytes().is_some_and(|b| b > 0));
 }

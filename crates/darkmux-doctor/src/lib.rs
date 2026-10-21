@@ -6889,7 +6889,7 @@ fn check_ram_headroom() -> Check {
             return Check {
                 name: "RAM headroom".into(),
                 status: Status::Warn,
-                message: "could not read vm_stat (non-macOS?)".into(),
+                message: "could not read reclaimable memory on this machine".into(),
                 hint: None,
             };
         }
@@ -6976,10 +6976,11 @@ fn check_load_projection() -> Check {
     if lmstudio_unneeded() {
         return lmstudio_unneeded_check("RAM headroom (load projection)");
     }
-    check_ram_headroom_load_projection()
+    check_ram_headroom_load_projection(darkmux_platform::current())
 }
 
-fn check_ram_headroom_load_projection() -> Check {
+/// The load-projection row, reading free memory from `platform` (#3281).
+fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform) -> Check {
     const NAME: &str = "RAM headroom (load projection)";
     let skip = |reason: &str| Check {
         name: NAME.into(),
@@ -7044,9 +7045,9 @@ fn check_ram_headroom_load_projection() -> Check {
         }
     }
 
-    let reclaimable_gb = match read_reclaimable_gb() {
+    let reclaimable_gb = match reclaimable_gb_from(platform) {
         Some(g) => g as f64,
-        None => return skip("could not read vm_stat (non-macOS?)"),
+        None => return skip("could not read reclaimable memory on this machine"),
     };
 
     classify_load_projection(reclaimable_gb, total_unloaded_gb, &pending, profile_name)
@@ -7403,7 +7404,7 @@ pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 
 /// The AI-available RAM in bytes: the same `reclaimable + resident −
 /// safety_margin` figure the `RAM headroom` row reports, floored at 0.
-/// `None` when `vm_stat` cannot be read (non-macOS). One computation for
+/// `None` when the platform can't read reclaimable memory. One computation for
 /// every caller: `serve`'s /machine/specs and `init`'s utility window (#3020).
 pub fn ai_headroom_bytes() -> Option<u64> {
     let resident_gb = engine::local().loaded()
@@ -7423,38 +7424,15 @@ fn headroom_bytes_from(reclaimable_gb: Option<u64>, resident_gb: f64, safety_gb:
     Some((real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
 }
 
+/// The host's reclaimable memory in whole GiB, rounded down: the platform's
+/// answer (macOS `vm_stat`, Linux `/proc/meminfo`), never an OS check here.
 fn read_reclaimable_gb() -> Option<u64> {
-    let out = Command::new("vm_stat").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut free_pages: u64 = 0;
-    let mut inactive_pages: u64 = 0;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("Pages free:") {
-            free_pages = parse_pages_field(rest)?;
-        } else if let Some(rest) = line.strip_prefix("Pages inactive:") {
-            inactive_pages = parse_pages_field(rest)?;
-        }
-    }
-    // macOS: page size is 16K on Apple Silicon, 4K on Intel. Read it.
-    let page_size = read_page_size().unwrap_or(16_384);
-    let bytes = (free_pages + inactive_pages).saturating_mul(page_size);
-    Some(bytes / (1024 * 1024 * 1024))
+    reclaimable_gb_from(darkmux_platform::current())
 }
 
-fn parse_pages_field(s: &str) -> Option<u64> {
-    let cleaned: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-    cleaned.parse().ok()
-}
-
-fn read_page_size() -> Option<u64> {
-    let out = Command::new("pagesize").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+/// [`read_reclaimable_gb`] against a given platform, so a test can fake it.
+fn reclaimable_gb_from(platform: &dyn darkmux_platform::Platform) -> Option<u64> {
+    platform.reclaimable_memory_bytes().map(|bytes| bytes / (1024 * 1024 * 1024))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7856,7 +7834,7 @@ mod tests {
     #[test]
     fn ai_headroom_is_reclaimable_plus_resident_minus_safety_in_bytes() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        // vm_stat unreadable: no figure at all, never a 0 that reads as "full".
+        // Reclaimable unreadable: no figure at all, never a 0 that reads as "full".
         assert_eq!(headroom_bytes_from(None, 4.0, 2), None);
         // Below the safety margin clamps at 0, never wraps.
         assert_eq!(headroom_bytes_from(Some(1), 0.0, 2), Some(0));
@@ -7866,6 +7844,25 @@ mod tests {
         assert_eq!(headroom_bytes_from(Some(60), 17.25, 2), Some(75 * GIB + GIB / 4));
         // Rounds to the nearest byte rather than truncating.
         assert_eq!(headroom_bytes_from(Some(2), 1.0 / (GIB as f64) * 0.6, 2), Some(1));
+    }
+
+    // ── #3281: the reclaimable figure is the platform's answer ───────────
+
+    #[test]
+    fn reclaimable_gb_is_the_platforms_answer_in_whole_gib() {
+        use darkmux_platform::FakePlatform;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let platform = |bytes| FakePlatform { reclaimable_memory_bytes: bytes, ..FakePlatform::default() };
+        // Whole GiB, rounded down, the way the vm_stat reader reported it.
+        assert_eq!(reclaimable_gb_from(&platform(Some(40 * GIB + GIB / 2))), Some(40));
+        // A platform that can't read it (any OS without a strategy) gives no
+        // figure, so headroom stays None rather than reading as "full".
+        assert_eq!(reclaimable_gb_from(&platform(None)), None);
+        // The same figure feeds the headroom arithmetic.
+        assert_eq!(
+            headroom_bytes_from(reclaimable_gb_from(&platform(Some(40 * GIB))), 4.0, 2),
+            Some(42 * GIB)
+        );
     }
     /// Visible text only — the marker and hint carry ANSI escapes whose bytes
     /// must not count toward a width assertion.
@@ -11727,17 +11724,6 @@ mod tests {
         assert_eq!(r.pass_count(), 2);
         assert_eq!(r.warn_count(), 1);
         assert_eq!(r.fail_count(), 1);
-    }
-
-    #[test]
-    fn parse_pages_field_handles_commas_and_dot() {
-        // vm_stat lines look like "Pages free:                  1234567."
-        assert_eq!(
-            parse_pages_field("                  1234567."),
-            Some(1234567)
-        );
-        assert_eq!(parse_pages_field(" 1.234.567."), Some(1234567));
-        assert_eq!(parse_pages_field("        ."), None);
     }
 
     #[test]

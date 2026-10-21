@@ -49,4 +49,8 @@ impl Platform for OtherPlatform {
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
         Vec::new()
     }
+
+    fn reclaimable_memory_bytes(&self) -> Option<u64> {
+        None
+    }
 }

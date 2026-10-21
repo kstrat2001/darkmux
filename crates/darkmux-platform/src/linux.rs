@@ -85,6 +85,11 @@ impl Platform for LinuxPlatform {
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
+
+    /// `/proc/meminfo`'s `MemAvailable`.
+    fn reclaimable_memory_bytes(&self) -> Option<u64> {
+        reclaimable_from_meminfo(&read_to_string("/proc/meminfo")?)
+    }
 }
 
 /// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.
@@ -441,3 +446,10 @@ fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
     Vec::new()
 }
 
+
+/// `MemAvailable` from `/proc/meminfo`: the kernel's estimate of what can be
+/// handed out without swapping, reclaimable cache included. `None` when the
+/// kernel doesn't report it; `MemFree` would understate it, so no stand-in.
+pub(crate) fn reclaimable_from_meminfo(meminfo: &str) -> Option<u64> {
+    memory_from_meminfo(meminfo)?.available_bytes
+}

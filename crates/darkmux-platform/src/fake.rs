@@ -6,6 +6,7 @@ pub struct FakePlatform {
     pub container_host_access: ContainerHostAccess,
     pub container_user: ContainerUser,
     pub machine_uid: Option<String>,
+    pub reclaimable_memory_bytes: Option<u64>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -17,6 +18,7 @@ impl Default for FakePlatform {
             container_host_access: ContainerHostAccess::Builtin,
             container_user: ContainerUser::Image,
             machine_uid: None,
+            reclaimable_memory_bytes: None,
         }
     }
 }
@@ -65,5 +67,9 @@ impl Platform for FakePlatform {
 
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>> {
         Vec::new()
+    }
+
+    fn reclaimable_memory_bytes(&self) -> Option<u64> {
+        self.reclaimable_memory_bytes
     }
 }

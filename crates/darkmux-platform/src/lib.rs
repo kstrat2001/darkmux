@@ -71,6 +71,12 @@ pub trait Platform: Send + Sync {
     /// Each cluster's current frequency in MHz, aligned with
     /// [`Platform::cpu_clusters`]. Empty when the platform reports none here.
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>>;
+
+    /// Bytes a model could be loaded into right now without swapping: what
+    /// is free plus what the OS hands back on demand. The doctor's `RAM
+    /// headroom` figure (#3281). `None` when the platform can't read it:
+    /// callers report no figure, never a 0 that reads as "full".
+    fn reclaimable_memory_bytes(&self) -> Option<u64>;
 }
 
 /// A battery's charge facts as the OS reports them. The lens derives its
