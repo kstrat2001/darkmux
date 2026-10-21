@@ -62,6 +62,7 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// responses, set `role = "tool"` and `tool_call_id` to the id from the
 /// assistant's tool_call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "MessageWire")]
 pub struct Message {
     pub role: String,
 
@@ -93,8 +94,45 @@ pub struct Message {
     /// (always None on the request side); deserialize-populated on
     /// the response side. Consumers (compaction.rs's call_and_parse)
     /// should fall back to this field when `content` is empty.
+    ///
+    /// (#3295) Deserialized as the first non-empty of `reasoning_content`
+    /// and mlx_lm.server's `reasoning` (see [`MessageWire`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+}
+
+/// (#3295) The response-side shape of a [`Message`]: the same fields plus
+/// `reasoning`, the name mlx_lm.server gives an unstreamed reply's reasoning.
+/// Folded into `reasoning_content` on the way in, the same first-non-empty
+/// read as [`Delta::reasoning_text`], so no consumer reads two fields and a
+/// server sending both never has its one text summed. Never serialized.
+#[derive(Deserialize)]
+struct MessageWire {
+    role: String,
+    content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+    tool_call_id: Option<String>,
+    name: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+}
+
+impl From<MessageWire> for Message {
+    fn from(w: MessageWire) -> Self {
+        let reasoning_content = match (w.reasoning_content, w.reasoning) {
+            (Some(rc), _) if !rc.is_empty() => Some(rc),
+            (_, Some(r)) if !r.is_empty() => Some(r),
+            (rc, _) => rc,
+        };
+        Self {
+            role: w.role,
+            content: w.content,
+            tool_calls: w.tool_calls,
+            tool_call_id: w.tool_call_id,
+            name: w.name,
+            reasoning_content,
+        }
+    }
 }
 
 impl Message {
@@ -1927,6 +1965,44 @@ mod tests {
     /// sends one text twice; the first non-empty one is read, never the sum
     /// (the host's direct path reads them the same way, `direct_stream.rs`
     /// `delta_text`).
+    /// (#3295) The unstreamed twin of `accumulator_counts_mlx_reasoning_field`:
+    /// mlx_lm.server puts an unstreamed reply's reasoning in
+    /// `message.reasoning`. A `Message` reads it the way a `Delta` does, the
+    /// first non-empty of `reasoning_content` and `reasoning`, never the sum,
+    /// so every consumer of `reasoning_content` (compaction's fallback, the
+    /// plain-text tool-call promotion, the reasoning trace) sees it.
+    #[test]
+    fn message_reads_mlx_reasoning_field() {
+        let msg = |fields: &str| -> Message {
+            serde_json::from_str(&format!(r#"{{"role":"assistant",{fields}}}"#)).unwrap()
+        };
+        let m = msg(r#""content":"","reasoning":"abc""#);
+        assert_eq!(
+            m.reasoning_content.as_deref(),
+            Some("abc"),
+            "mlx's `reasoning` is read"
+        );
+        let m = msg(r#""reasoning_content":"de","reasoning":"de""#);
+        assert_eq!(
+            m.reasoning_content.as_deref(),
+            Some("de"),
+            "both fields: one text, never summed"
+        );
+        let m = msg(r#""reasoning_content":"","reasoning":"f""#);
+        assert_eq!(
+            m.reasoning_content.as_deref(),
+            Some("f"),
+            "an empty placeholder never hides the other field"
+        );
+        let m = msg(r#""reasoning_content":"g""#);
+        assert_eq!(m.reasoning_content.as_deref(), Some("g"));
+        let m = msg(r#""content":"x""#);
+        assert_eq!(m.reasoning_content, None);
+        // The request side is unchanged: `reasoning` is read, never written.
+        let wire = serde_json::to_string(&msg(r#""content":"x","reasoning":"r""#)).unwrap();
+        assert!(!wire.contains(r#""reasoning":"#), "{wire}");
+    }
+
     #[test]
     fn accumulator_counts_mlx_reasoning_field() {
         let chunk = |delta: &str| -> ChatChunk {
