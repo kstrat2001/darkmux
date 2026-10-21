@@ -1160,7 +1160,12 @@ pub(crate) struct ConnLimits {
     /// (#3190) After the answer, how long the listener reads what the sender
     /// still sends before closing: time for it to read the answer and hang
     /// up, so the close never resets a connection whose answer is unread.
+    /// The connection keeps its slots (`max_conns`, `per_ip`) meanwhile.
     pub linger: std::time::Duration,
+    /// (#3190) The most the listener reads while it lingers; past it the
+    /// connection is dropped (and reset), so a sender that keeps writing
+    /// cannot keep the listener reading for the whole `linger`.
+    pub linger_bytes: usize,
 }
 
 impl ConnLimits {
@@ -1170,6 +1175,7 @@ impl ConnLimits {
         header_read_timeout: std::time::Duration::from_secs(3),
         conn_deadline: std::time::Duration::from_secs(60 * 60 + 300),
         linger: std::time::Duration::from_secs(2),
+        linger_bytes: 1024 * 1024,
     };
 }
 
@@ -1269,8 +1275,10 @@ impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
 /// Serve `app` on `listener` with [`ConnLimits`]: a connection past the cap
 /// is closed at once (so the listener never holds more than `max_conns`
 /// descriptors), headers must arrive within `header_read_timeout`, one
-/// request per connection, and no connection outlives `conn_deadline`. The
-/// peer address is attached as `ConnectInfo` for the gate.
+/// request per connection, and no connection outlives `conn_deadline` plus
+/// `linger` (the answer, then the drain after it; the connection keeps its
+/// slots through both). The peer address is attached as `ConnectInfo` for
+/// the gate.
 pub(crate) async fn serve_bounded(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -1312,7 +1320,7 @@ pub(crate) async fn serve_bounded(
                 .serve_connection(TokioIo::new(stream), svc)
                 .without_shutdown();
             if let Ok(Ok(parts)) = tokio::time::timeout(limits.conn_deadline, conn).await {
-                close_after_answer(parts.io.into_inner(), limits.linger).await;
+                close_after_answer(parts.io.into_inner(), limits.linger, limits.linger_bytes).await;
             }
         });
     }
@@ -1323,14 +1331,22 @@ pub(crate) async fn serve_bounded(
 /// leave body bytes unread, or still on their way; closing then resets the
 /// connection, and a reset sender loses the answer it has not read yet
 /// (macOS fails its next `setsockopt` with EINVAL). So: send FIN, then read
-/// and discard until the sender hangs up, for at most `linger`.
-async fn close_after_answer(mut stream: tokio::net::TcpStream, linger: std::time::Duration) {
+/// and discard until the sender hangs up, for at most `linger` and at most
+/// `max_bytes`; past either, the connection is dropped. The caller holds the
+/// connection's slots until this returns.
+async fn close_after_answer(mut stream: tokio::net::TcpStream, linger: std::time::Duration, max_bytes: usize) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if stream.shutdown().await.is_err() {
         return;
     }
     let mut sink = [0u8; 4096];
-    let drain = async { while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {} };
+    let mut left = max_bytes;
+    let drain = async {
+        while let Ok(n @ 1..) = stream.read(&mut sink).await {
+            let Some(rest) = left.checked_sub(n) else { return };
+            left = rest;
+        }
+    };
     let _ = tokio::time::timeout(linger, drain).await;
 }
 
@@ -2889,9 +2905,70 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         sock.set_read_timeout(Some(Duration::from_secs(5))).expect("the connection was reset");
         let mut got = String::new();
+        let reading = std::time::Instant::now();
         sock.read_to_string(&mut got).expect("the answer broke off");
+        // The listener sends FIN with the answer: the sender's read ends at
+        // once, not when the listener stops lingering.
+        let took = reading.elapsed();
+        assert!(took < ConnLimits::PRODUCTION.linger / 4, "the answer ended only after {took:?}: no FIN");
         assert!(got.starts_with("HTTP/1.1 401"), "{got}");
         assert!(got.contains("\"refusal\":\"token\""), "{got}");
+    }
+
+    /// (#3190) The drain after an answer is capped in bytes as well as in
+    /// time: a sender that keeps writing is dropped once it passes
+    /// `linger_bytes`, and its connection slot frees then, not when `linger`
+    /// ends. One connection per address, a 30 s linger: a second request
+    /// from the address is served only once the first connection's slot
+    /// is gone.
+    #[test]
+    fn a_sender_that_keeps_writing_after_its_answer_is_dropped_at_the_cap() {
+        use std::io::{Read, Write};
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let limits = ConnLimits {
+            max_conns: 8,
+            per_ip: 1,
+            header_read_timeout: Duration::from_secs(5),
+            conn_deadline: Duration::from_secs(60),
+            linger: Duration::from_secs(30),
+            linger_bytes: 1024 * 1024,
+        };
+        // Answers at once, without reading the body.
+        let app = Router::new().route("/early", axum::routing::post(|| async { "no" }));
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                let (_tx, rx) = tokio::sync::watch::channel(false);
+                serve_bounded(l, app, limits, rx).await;
+            });
+        });
+        let request = |len: usize| format!("POST /early HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n");
+        // Declares 64 MiB and sends 8 MiB of it, then keeps the socket open.
+        let mut flood = std::net::TcpStream::connect(addr).unwrap();
+        flood.write_all(request(64 << 20).as_bytes()).unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..128 {
+            if flood.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            let _ = s.write_all(request(0).as_bytes());
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut got = String::new();
+            let _ = s.read_to_string(&mut got);
+            if got.starts_with("HTTP/1.1 200") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the flooding connection still holds its slot");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(flood);
     }
 
     /// (#2916 review M1) Bounded connections: a half-sent request is closed
@@ -2909,6 +2986,7 @@ mod tests {
             header_read_timeout: Duration::from_millis(800),
             conn_deadline: Duration::from_secs(30),
             linger: Duration::from_secs(2),
+            linger_bytes: 1024 * 1024,
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
@@ -2968,6 +3046,7 @@ mod tests {
             header_read_timeout: Duration::from_secs(5),
             conn_deadline: Duration::from_secs(30),
             linger: Duration::from_secs(2),
+            linger_bytes: 1024 * 1024,
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
