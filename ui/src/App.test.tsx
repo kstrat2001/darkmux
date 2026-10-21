@@ -1393,6 +1393,156 @@ describe("App", () => {
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 
+  // (#2284) The masthead must not claim LIVE, or a replay, before the shell
+  // knows which the subject is. Each case records EVERY text the pill shows
+  // from first paint, so a one-frame flash fails the test, not just the end
+  // state.
+  function recordPill(): string[] {
+    const seen: string[] = [];
+    const note = () => {
+      const t = document.querySelector(".catalog-toggle")?.textContent ?? null;
+      if (t !== null && seen[seen.length - 1] !== t) seen.push(t);
+    };
+    const obs = new MutationObserver(note);
+    obs.observe(document.body, { subtree: true, childList: true, characterData: true });
+    note();
+    return seen;
+  }
+  const delayed = (ms: number, res: () => Response) => new Promise<Response>((r) => setTimeout(() => r(res()), ms));
+  const offMeta = { sources: { fleet: { state: "off" } }, complete: true };
+  const okMeta = { sources: { fleet: { state: "ok" } }, complete: true };
+  function mockSubject(opts: {
+    missionDelayMs?: number;
+    missionStatus?: number;
+    dispatchStatus?: number;
+    presenceDelayMs?: number;
+    presenceLive?: string[];
+    /** HTTP status per successive `/flow-dispatch/s-run` call; the last repeats. */
+    runSeq?: number[];
+    /** HTTP status per successive presence call; the last repeats. */
+    presenceSeq?: number[];
+    /** `s-run`'s records end with a `dispatch.complete`. */
+    runEnded?: boolean;
+  }) {
+    let runCalls = 0;
+    let presenceCalls = 0;
+    const nth = (seq: number[] | undefined, i: number) => (seq ? seq[Math.min(i, seq.length - 1)] : 200);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        const recs = [
+          { ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
+          { ts: "2026-08-07T09:30:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
+          { ts: "2026-08-07T09:31:00.000Z", category: "mission", action: "mission.close", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "mission-m-one", mission_id: "m-one" },
+        ];
+        const body = (r: unknown[]) => JSON.stringify({ records: r, count: r.length, truncated: false, generated_at_ms: 1 });
+        const live = opts.presenceLive ?? [];
+        if (path === "/flow-dispatch/s-run") {
+          const status = nth(opts.runSeq, runCalls++);
+          if (status !== 200) return Promise.resolve(new Response("boom", { status }));
+          const run = recs.slice(0, opts.runEnded ? 2 : 1).map((r) => ({ ...r, session_id: "s-run", mission_id: undefined }));
+          return Promise.resolve(new Response(body(run), { status: 200 }));
+        }
+        if (path === "/flow-dispatch/s1") {
+          if (opts.dispatchStatus) return Promise.resolve(new Response("not found", { status: opts.dispatchStatus }));
+          return Promise.resolve(new Response(body(recs.slice(0, 2)), { status: 200 }));
+        }
+        if (path === "/flow-mission/m-one") {
+          const res = () => (opts.missionStatus ? new Response("boom", { status: opts.missionStatus }) : new Response(body(recs), { status: 200 }));
+          return delayed(opts.missionDelayMs ?? 0, res);
+        }
+        if (path === "/fleet/dispatches/live" && nth(opts.presenceSeq, presenceCalls++) !== 200) return Promise.resolve(new Response("boom", { status: 500 }));
+        if (path === "/fleet/dispatches/live")
+          return delayed(opts.presenceDelayMs ?? 0, () => new Response(JSON.stringify({ dispatches: live.map((sid) => ({ session_id: sid, machine_uid: "m1", beat_ts_ms: Date.now() })), meta: live.length ? okMeta : offMeta }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: offMeta }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay(path === "/flow/2026-08-07" ? recs : []), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("(#2284) a closed mission whose records are slow reads neutral, then names itself: never LIVE", async () => {
+    mockSubject({ missionDelayMs: 300 });
+    window.location.hash = "#mission=m-one";
+    const seen = recordPill();
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣m-one"), { timeout: 3000 });
+    expect(seen[0]).toBe("…");
+    expect(seen.filter((t) => t.includes("LIVE"))).toEqual([]);
+  });
+
+  it("(#2284) a running dispatch whose presence answers late reads neutral, then LIVE: never a replay", async () => {
+    mockSubject({ presenceDelayMs: 400, presenceLive: ["s-run"] });
+    window.location.hash = "#dispatch=s-run";
+    const seen = recordPill();
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+    expect(seen[0]).toBe("…");
+    expect(seen.filter((t) => t.includes("▣"))).toEqual([]);
+  });
+
+  it("(#2284) one failed poll during a running dispatch keeps LIVE: failed is only for a subject never read", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockSubject({ presenceLive: ["s-run"], runSeq: [200, 500] });
+      window.location.hash = "#dispatch=s-run";
+      const seen = recordPill();
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+      const calls = () => (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.filter((c) => String(c[0]) === "/flow-dispatch/s-run").length;
+      const before = calls();
+      await vi.advanceTimersByTimeAsync(6000);
+      await waitFor(() => expect(calls()).toBeGreaterThan(before));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(seen.filter((t) => t.includes("couldn't read"))).toEqual([]);
+      expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(#2284) a failed presence read with a dispatch that has not ended reads failed, never a replay, and recovers when presence answers", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockSubject({ presenceLive: ["s-run"], presenceSeq: [500, 200] });
+      window.location.hash = "#dispatch=s-run";
+      const seen = recordPill();
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("couldn't read this run"), { timeout: 3000 });
+      await vi.advanceTimersByTimeAsync(6000);
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+      expect(seen.filter((t) => t.includes("▣"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(#2284) a failed presence read with a dispatch whose records show it ended is a replay", async () => {
+    mockSubject({ presenceSeq: [500], runEnded: true });
+    window.location.hash = "#dispatch=s-run";
+    const seen = recordPill();
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("▣2026-08-07"), { timeout: 3000 });
+    expect(seen.filter((t) => t.includes("LIVE") || t.includes("couldn't"))).toEqual([]);
+  });
+
+  for (const [label, hash, opts] of [
+    ["a mission whose records read 500s", "#mission=m-one", { missionStatus: 500 }],
+    ["a dispatch id the daemon 404s", "#dispatch=s1", { dispatchStatus: 404 }],
+  ] as const) {
+    it(`(#2284) ${label} says it could not read the run, offers a refetch, and never claims LIVE or a replay`, async () => {
+      mockSubject(opts);
+      window.location.hash = hash;
+      const seen = recordPill();
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("couldn't read this run"), { timeout: 3000 });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(seen.filter((t) => t.includes("LIVE") || t.includes("▣"))).toEqual([]);
+      expect(document.querySelector(".masthead__refresh")).not.toBeNull();
+    });
+  }
+
   it("a daemon mission page names ITSELF in the pill once the mission has CLOSED (#2412: the mission id, not the date), with no transport", async () => {
     // (operator, 2026-09-01) A mission is an overview, not a scrubbable
     // recording — playback lives in the drill-in detail view. So a playback
