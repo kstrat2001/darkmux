@@ -14232,19 +14232,39 @@ pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource)
 /// engine when that engine loads whatever a request names (`mlx_lm.server`
 /// holds one model and switches to the one asked for): the operator is told
 /// once per dispatch that this dispatch may replace the model the engine
-/// holds. Decided from the engine's declared capabilities, never its name.
+/// holds. Decided from the engine's declared capabilities, never its name,
+/// and said only when the engine could be holding another model (#3283).
 fn engine_switch_notice(model: &darkmux_types::ProfileModel) -> Option<String> {
     let endpoint_id = model.endpoint.as_ref()?.named_id()?;
     let default_engine = darkmux_types::config_access::default_engine();
     if default_engine.trim() != endpoint_id {
         return None;
     }
-    switch_notice_for(endpoint_id, engine::local().capabilities().loading, &model.id)
+    let local = engine::local();
+    let loading = local.capabilities().loading;
+    if loading != engine::Loading::Unknown {
+        return None;
+    }
+    switch_notice_for(endpoint_id, loading, models_it_could_hold(local.as_ref()).as_deref(), &model.id)
 }
 
-/// The decision and wording of [`engine_switch_notice`], pure.
-fn switch_notice_for(engine_id: &str, loading: engine::Loading, model_id: &str) -> Option<String> {
-    (loading == engine::Loading::Unknown).then(|| {
+/// Every model `engine` could be holding, or `None` when it can't say. An
+/// engine that reports residency names what it holds. One that only lists
+/// models (`mlx_lm.server`: its Hugging Face cache plus the model it was
+/// started with, never which one it holds) can hold only a model it lists.
+fn models_it_could_hold(engine: &dyn engine::Engine) -> Option<Vec<String>> {
+    match engine.capabilities().residency {
+        engine::Residency::Reported => engine.resident_ids().ok(),
+        engine::Residency::NotReported => engine.catalog().ok().map(|c| c.into_iter().map(|m| m.model_key).collect()),
+    }
+}
+
+/// The decision and wording of [`engine_switch_notice`], pure. Said when the
+/// engine loads on request and could be holding a model other than
+/// `model_id`, or can't say what it holds (`could_hold` is `None`).
+fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Option<&[String]>, model_id: &str) -> Option<String> {
+    let holds_only_this = could_hold.is_some_and(|ids| ids.iter().all(|id| id == model_id));
+    (loading == engine::Loading::Unknown && !holds_only_this).then(|| {
         format!(
             "darkmux dispatch: `{engine_id}` loads the model a request names; this dispatch sends `{model_id}`, \
              which may replace the model it holds. (#316)"
