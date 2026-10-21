@@ -86,7 +86,7 @@ const RUNNING_GRAPH: MissionGraph = { ...GRAPH, mission_status: "active" };
 const MISSION_REC = { ts: new Date().toISOString(), action: "step.start", mission_id: "m1", step_id: "a-step", session_id: "s-a", machine_uid: "UID-A", machine_id: "box-a" };
 
 function mockFetch(
-  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean; runs?: unknown[] } = {},
+  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean; runs?: unknown[]; runsPending?: boolean } = {},
 ) {
   const graph = opts.graph ?? GRAPH;
   const graphStatus = opts.graphStatus ?? 200;
@@ -113,6 +113,7 @@ function mockFetch(
       if (url.startsWith(`/flow/${todayUTC()}`)) {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
       }
+      if (opts.runsPending && url === "/runs") return new Promise<Response>(() => {});
       if (opts.runs && url === "/runs") {
         return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs }), { status: 200 }));
       }
@@ -152,6 +153,22 @@ describe("(#2868) the mission header shows the runs board's status, never the li
     renderLens(id);
     await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("abandoned"));
     expect(document.querySelector(".missionlens .msub")?.textContent ?? "").not.toContain("elapsed");
+  });
+
+  it("while /runs has not answered, the header claims no status: neutral, never the lifecycle word", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runsPending: true });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    await new Promise((r) => setTimeout(r, 50));
+    const chip = document.querySelector(".mstatus");
+    expect(chip?.textContent).not.toBe("finalized");
+    expect(chip?.getAttribute("data-status-kind")).toBe("unknown");
+  });
+
+  it("a /runs that fails falls back to the lifecycle word", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("finalized"));
   });
 
   it("a lab row naming the same id is not the mission's row", async () => {

@@ -281,16 +281,32 @@ function useMissionHeaderState(
   missionId: string,
   graph: Pick<MissionGraph, "mission_status"> | null | undefined,
   daemonBacked: boolean,
-): { status: WorkStatusWord | undefined; abandonReason?: AbandonReason } {
+): MissionHeaderState {
+  const reachable = runsReachable();
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>(runsSrc()),
-    enabled: runsReachable(),
+    enabled: reachable,
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
+  // (#2868) Until `/runs` answers, the header claims nothing: the lifecycle
+  // word would flash green `finalized` before the row turns it red (#2284's
+  // class). A page with no `/runs` to ask, or one that failed, falls back.
+  if (reachable && runsQuery.status === "pending") return { status: undefined, pending: true };
   const rows = runsQuery.data?.ok ? (runsQuery.data.data.runs ?? []) : [];
   const row = missionRowOf(rows, missionId);
-  return row ? rowState(row) : { status: graph?.mission_status };
+  return { ...(row ? rowState(row) : { status: graph?.mission_status }), pending: false };
+}
+
+/** The neutral chip's word and hover text while `/runs` has not answered. */
+const pendingLabel = (h: MissionHeaderState): string | undefined => (h.pending ? "\u2026" : undefined);
+const pendingTitle = (h: MissionHeaderState): string | undefined => (h.pending ? "reading the run's status" : undefined);
+
+interface MissionHeaderState {
+  status: WorkStatusWord | undefined;
+  abandonReason?: AbandonReason;
+  /** `/runs` has not answered yet: the chip is neutral and says so. */
+  pending: boolean;
 }
 
 /** Mission-wide span from the per-step metrics the fold already keeps:
@@ -786,7 +802,7 @@ export function MissionGraphLens({
           <button type="button" className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={onNameTap}>
             {showFullId ? graph.mission_id : idParts.name}
           </button>
-          <WorkStatus status={status} abandonReason={headerState.abandonReason} className="mstatus" />
+          <WorkStatus status={status} abandonReason={headerState.abandonReason} label={pendingLabel(headerState)} title={pendingTitle(headerState)} className="mstatus" />
         </div>
         <div className="msub">
           {startMs ? <span>{"started " + clkhm(startMs)}</span> : null}
