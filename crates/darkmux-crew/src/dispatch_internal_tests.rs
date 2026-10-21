@@ -5477,7 +5477,7 @@
     #[test]
     fn host_gateway_mapping_follows_the_platforms_answer() {
         use darkmux_platform::{ContainerHostAccess, ContainerUser, FakePlatform, Platform};
-        let fake = |access| FakePlatform { container_host_access: access, container_user: ContainerUser::Image, machine_uid: None };
+        let fake = |access| FakePlatform { container_host_access: access, container_user: ContainerUser::Image, ..FakePlatform::default() };
         let flag = "--add-host=host.docker.internal:host-gateway".to_string();
         let mut cfg = argv_config_with_base_url(None);
 
@@ -5521,7 +5521,7 @@
         let linux_like = FakePlatform {
             container_host_access: ContainerHostAccess::HostGateway,
             container_user: ContainerUser::Host { uid: 1001, gid: Some(1001) },
-            machine_uid: None,
+            ..FakePlatform::default()
         };
         assert_eq!(resolve_container_user(None, &linux_like).unwrap(), ContainerUser::Host { uid: 1001, gid: Some(1001) });
         assert_eq!(resolve_container_user(Some("image"), &linux_like).unwrap(), ContainerUser::Image);
