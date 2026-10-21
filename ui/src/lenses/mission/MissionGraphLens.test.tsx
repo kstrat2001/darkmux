@@ -86,7 +86,7 @@ const RUNNING_GRAPH: MissionGraph = { ...GRAPH, mission_status: "active" };
 const MISSION_REC = { ts: new Date().toISOString(), action: "step.start", mission_id: "m1", step_id: "a-step", session_id: "s-a", machine_uid: "UID-A", machine_id: "box-a" };
 
 function mockFetch(
-  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean } = {},
+  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean; runs?: unknown[] } = {},
 ) {
   const graph = opts.graph ?? GRAPH;
   const graphStatus = opts.graphStatus ?? 200;
@@ -113,10 +113,55 @@ function mockFetch(
       if (url.startsWith(`/flow/${todayUTC()}`)) {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
       }
+      if (opts.runs && url === "/runs") {
+        return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs }), { status: 200 }));
+      }
       return Promise.resolve(new Response("not found", { status: 404 }));
     }),
   );
 }
+
+/** (#2868) A finalized mission whose every phase was abandoned: closed out
+ *  (lifecycle `finalized`) but it did not succeed. */
+const ABANDONED_GRAPH: MissionGraph = {
+  ...GRAPH,
+  nodes: GRAPH.nodes.map((n) => ({
+    ...n,
+    status: "abandoned",
+    steps: n.steps?.map((s) => ({ ...s, status: "error" })),
+  })) as MissionGraph["nodes"],
+};
+
+describe("(#2868) the mission header shows the runs board's status, never the lifecycle word", () => {
+  it("a finalized mission whose phases were all abandoned reads the row's error, not a green finalized", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: [{ id: "m1", kind: "mission", status: "error" }] });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("error"));
+    expect(document.querySelector(".mstatus")?.getAttribute("data-status-kind")).toBe("error");
+  });
+
+  it("an operator's stop reads aborted, from the row's abandoned_reason", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: [{ id: "m1", kind: "mission", status: "abandoned", abandoned_reason: "aborted" }] });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.getAttribute("data-status-kind")).toBe("aborted"));
+  });
+
+  it("an active mission the row calls abandoned (it went quiet) stops its elapsed clock", async () => {
+    const id = "crawl-x-1788484173-b562e3";
+    mockFetch({ graph: { ...ABANDONED_GRAPH, mission_id: id, mission_status: "active" }, runs: [{ id, kind: "mission", status: "abandoned", abandoned_reason: "noterminal" }] });
+    renderLens(id);
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("abandoned"));
+    expect(document.querySelector(".missionlens .msub")?.textContent ?? "").not.toContain("elapsed");
+  });
+
+  it("a lab row naming the same id is not the mission's row", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: [{ id: "m1", kind: "lab", status: "complete" }] });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector(".mstatus")?.textContent).toBe("finalized");
+  });
+});
 
 describe("MissionGraphLens", () => {
   it("renders a loading state before the graph fetch resolves", () => {

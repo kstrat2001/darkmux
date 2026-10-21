@@ -60,10 +60,12 @@ import { clkhm, fmtElapsed } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
+import { missionRowOf, rowState } from "../../lib/lifecycle";
+import type { RunsResponse } from "../../types/generated/RunsResponse";
+import { queryKeys, PRESENCE_POLL_MS, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { useDay } from "../../hooks/useDay";
-import { getSource } from "../../lib/source";
-import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
+import { getSource, runsReachable, runsSrc } from "../../lib/source";
+import { WorkStatus, workStatusKind, type WorkStatusWord } from "../../components/WorkStatus";
 import { bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -268,6 +270,29 @@ function splitMissionId(id: string): { name: string; epoch: number | null; hash:
   if (!m) return { name: id, epoch: null, hash: null };
   return { name: m[1], epoch: Number(m[2]) * 1000, hash: m[3] };
 }
+/** (#2868) The mission header's status. A mission's status is decided ONCE,
+ *  on its `/runs` row (the runs board's decision, `darkmux run list`'s too),
+ *  and the header renders that decision. Only a mission the daemon does not
+ *  list (outside its window, a static build with no runs fixture) shows its
+ *  lifecycle word (`finalized`, `active`), which says the mission was closed
+ *  out or is open, not how it ended. The query is the runs board's own (same
+ *  key, one shared cache entry). */
+function useMissionHeaderState(
+  missionId: string,
+  graph: Pick<MissionGraph, "mission_status"> | null | undefined,
+  daemonBacked: boolean,
+): { status: WorkStatusWord | undefined; abandonReason?: AbandonReason } {
+  const runsQuery = useQuery({
+    queryKey: queryKeys.runs(),
+    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
+    enabled: runsReachable(),
+    refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
+  });
+  const rows = runsQuery.data?.ok ? (runsQuery.data.data.runs ?? []) : [];
+  const row = missionRowOf(rows, missionId);
+  return row ? rowState(row) : { status: graph?.mission_status };
+}
+
 /** Mission-wide span from the per-step metrics the fold already keeps:
  * earliest step start, latest step end (0 when unknown). */
 function missionSpan(metrics: MetricsMap): { start: number; end: number } {
@@ -610,11 +635,12 @@ export function MissionGraphLens({
     graph &&
     graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
   );
+  const headerState = useMissionHeaderState(missionId, graph, daemonBacked);
   // (#2332 review) `active` is a mission's status from mint to finalize —
   // including every sign-off gate, where no step is running. The header's
   // elapsed clock must tick for the MISSION, so the clock follows the mission
   // status as well as the steps.
-  const missionRunning = !!graph && workStatusKind(graph.mission_status) === "running";
+  const missionRunning = !!graph && workStatusKind(headerState.status) === "running";
   const now = useNow(anyRunning || missionRunning);
   const policy = useLifecyclePolicy();
   // Each step's run phase as of `now`, from the records attributed to it:
@@ -726,7 +752,7 @@ export function MissionGraphLens({
 
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
-  const status = graph.mission_status;
+  const status = headerState.status;
   const running = missionRunning;
   const idParts = splitMissionId(graph.mission_id);
   const span = missionSpan(metrics);
@@ -760,7 +786,7 @@ export function MissionGraphLens({
           <button type="button" className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={onNameTap}>
             {showFullId ? graph.mission_id : idParts.name}
           </button>
-          <WorkStatus status={status} className="mstatus" />
+          <WorkStatus status={status} abandonReason={headerState.abandonReason} className="mstatus" />
         </div>
         <div className="msub">
           {startMs ? <span>{"started " + clkhm(startMs)}</span> : null}
