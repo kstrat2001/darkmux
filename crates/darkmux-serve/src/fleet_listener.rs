@@ -1157,6 +1157,10 @@ pub(crate) struct ConnLimits {
     /// Longest a connection may live: a waiting submission holds its
     /// connection for the whole job, so this is the job cap plus slack.
     pub conn_deadline: std::time::Duration,
+    /// (#3190) After the answer, how long the listener reads what the sender
+    /// still sends before closing: time for it to read the answer and hang
+    /// up, so the close never resets a connection whose answer is unread.
+    pub linger: std::time::Duration,
 }
 
 impl ConnLimits {
@@ -1165,6 +1169,7 @@ impl ConnLimits {
         per_ip: PER_IP_CONNECTIONS,
         header_read_timeout: std::time::Duration::from_secs(3),
         conn_deadline: std::time::Duration::from_secs(60 * 60 + 300),
+        linger: std::time::Duration::from_secs(2),
     };
 }
 
@@ -1304,10 +1309,29 @@ pub(crate) async fn serve_bounded(
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read_timeout)
                 .keep_alive(false)
-                .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(limits.conn_deadline, conn).await;
+                .serve_connection(TokioIo::new(stream), svc)
+                .without_shutdown();
+            if let Ok(Ok(parts)) = tokio::time::timeout(limits.conn_deadline, conn).await {
+                close_after_answer(parts.io.into_inner(), limits.linger).await;
+            }
         });
     }
+}
+
+/// (#3190) Close a connection whose answer is written without resetting it.
+/// A request answered before its body was read (a refusal at the gate) can
+/// leave body bytes unread, or still on their way; closing then resets the
+/// connection, and a reset sender loses the answer it has not read yet
+/// (macOS fails its next `setsockopt` with EINVAL). So: send FIN, then read
+/// and discard until the sender hangs up, for at most `linger`.
+async fn close_after_answer(mut stream: tokio::net::TcpStream, linger: std::time::Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let mut sink = [0u8; 4096];
+    let drain = async { while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {} };
+    let _ = tokio::time::timeout(linger, drain).await;
 }
 
 /// Start the listener if `fleet.listener.enabled`. Never fails the daemon:
@@ -2834,6 +2858,42 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// (#3190) A request refused before its body is read still gets its
+    /// answer whole. Closing a socket that holds unread bytes resets the
+    /// connection, and a reset sender cannot read the answer that arrived
+    /// before it: macOS refuses the next `setsockopt` (ureq sets its read
+    /// timeout before every read) with EINVAL, Linux the next read with
+    /// ECONNRESET. The listener answers, stops writing, and reads what the
+    /// sender still sends until it hangs up. The sender here sends its body
+    /// only after the answer, and reads only after that: without the drain
+    /// the body meets a closed socket and this fails every time.
+    #[test]
+    fn a_refusal_before_the_body_is_read_reaches_the_sender_whole() {
+        use std::io::{Read, Write};
+        let h = start(Some(laptop()), false, 0);
+        let body = serde_json::to_vec(&WorkSubmission::new(job("s-early", None), true)).unwrap();
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer wrong-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+            body.len()
+        )
+        .unwrap();
+        // The body arrives after the gate has answered: as from a sender
+        // that writes its headers and its body separately (ureq does), on a
+        // listener that answers in between.
+        std::thread::sleep(Duration::from_millis(300));
+        sock.write_all(&body).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        sock.set_read_timeout(Some(Duration::from_secs(5))).expect("the connection was reset");
+        let mut got = String::new();
+        sock.read_to_string(&mut got).expect("the answer broke off");
+        assert!(got.starts_with("HTTP/1.1 401"), "{got}");
+        assert!(got.contains("\"refusal\":\"token\""), "{got}");
+    }
+
     /// (#2916 review M1) Bounded connections: a half-sent request is closed
     /// once the header deadline passes, connections past the cap are closed
     /// on accept, and once the slots free a real request is served.
@@ -2848,6 +2908,7 @@ mod tests {
             per_ip: 8,
             header_read_timeout: Duration::from_millis(800),
             conn_deadline: Duration::from_secs(30),
+            linger: Duration::from_secs(2),
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
@@ -2906,6 +2967,7 @@ mod tests {
             per_ip: 2,
             header_read_timeout: Duration::from_secs(5),
             conn_deadline: Duration::from_secs(30),
+            linger: Duration::from_secs(2),
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
