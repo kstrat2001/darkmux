@@ -7,6 +7,9 @@ import { queryKeys } from "../../lib/queryKeys";
 import type { MissionGraph } from "./graph";
 import type { NormRecord } from "../../lib/ingest";
 import { normAll, type RawRecord } from "../../testing/records";
+import { runBadgeStatus, runStatusLabel } from "../runs/format";
+import { workStatusKind } from "../../components/WorkStatus";
+import type { Run } from "../../types/generated/Run";
 
 /** Returns the `QueryClient` too (unused by most callers) so a test can
  *  seed a cache slot this component doesn't fetch into itself — the live
@@ -86,12 +89,13 @@ const RUNNING_GRAPH: MissionGraph = { ...GRAPH, mission_status: "active" };
 const MISSION_REC = { ts: new Date().toISOString(), action: "step.start", mission_id: "m1", step_id: "a-step", session_id: "s-a", machine_uid: "UID-A", machine_id: "box-a" };
 
 function mockFetch(
-  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean; runs?: unknown[]; runsPending?: boolean } = {},
+  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean; runs?: unknown[] | ((call: number) => unknown[] | null); runsPending?: boolean } = {},
 ) {
   const graph = opts.graph ?? GRAPH;
   const graphStatus = opts.graphStatus ?? 200;
   const flowMissionRecords = opts.flowMissionRecords ?? [];
   const flowMissionTruncated = opts.flowMissionTruncated ?? false;
+  let runsCalls = 0;
   vi.stubGlobal(
     "fetch",
     vi.fn((url: string) => {
@@ -115,7 +119,8 @@ function mockFetch(
       }
       if (opts.runsPending && url === "/runs") return new Promise<Response>(() => {});
       if (opts.runs && url === "/runs") {
-        return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs }), { status: 200 }));
+        const rows = typeof opts.runs === "function" ? opts.runs(runsCalls++) : opts.runs;
+        return Promise.resolve(rows === null ? new Response("down", { status: 500 }) : new Response(JSON.stringify({ runs: rows }), { status: 200 }));
       }
       return Promise.resolve(new Response("not found", { status: 404 }));
     }),
@@ -151,7 +156,8 @@ describe("(#2868) the mission header shows the runs board's status, never the li
     const id = "crawl-x-1788484173-b562e3";
     mockFetch({ graph: { ...ABANDONED_GRAPH, mission_id: id, mission_status: "active" }, runs: [{ id, kind: "mission", status: "abandoned", abandoned_reason: "noterminal" }] });
     renderLens(id);
-    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("abandoned"));
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe(runStatusLabel({ id, kind: "mission", status: "abandoned", abandoned_reason: "noterminal" } as Run)));
+    expect(document.querySelector(".mstatus")?.textContent).toBe("no ending");
     expect(document.querySelector(".missionlens .msub")?.textContent ?? "").not.toContain("elapsed");
   });
 
@@ -169,6 +175,36 @@ describe("(#2868) the mission header shows the runs board's status, never the li
     mockFetch({ graph: ABANDONED_GRAPH });
     renderLens();
     await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("finalized"));
+  });
+
+  it("a crew-of-one mission's row (kind dispatch) is the mission's row", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: [{ id: "m1", kind: "dispatch", status: "error" }] });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("error"));
+  });
+
+  it("a running row whose machine is not reporting reads as the board reads it, with no pulse and no ticking clock", async () => {
+    const id = "crawl-x-1788484173-b562e3";
+    const row = { id, kind: "mission", status: "running", not_reporting: true } as Run;
+    mockFetch({ graph: { ...ABANDONED_GRAPH, mission_id: id, mission_status: "active" }, runs: [row] });
+    renderLens(id);
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe(runStatusLabel(row)));
+    const chip = document.querySelector(".mstatus");
+    expect(chip?.getAttribute("data-status-kind")).toBe("idle");
+    expect(chip?.getAttribute("data-live")).toBeNull();
+    expect(chip?.getAttribute("title") ?? "").toContain("not reporting");
+    expect(document.querySelector(".missionlens .msub")?.textContent ?? "").not.toContain("elapsed");
+  });
+
+  it("a failed /runs refetch after a good read keeps the last known row, never the lifecycle word", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: (call) => (call === 0 ? [{ id: "m1", kind: "mission", status: "error" }] : null) });
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("error"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.runs() });
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector(".mstatus")?.textContent).toBe("error");
   });
 
   it("a lab row naming the same id is not the mission's row", async () => {
@@ -780,4 +816,31 @@ describe("mission header sub-line and meter (#2332)", () => {
     fireEvent.click(document.querySelector(".midname")!);
     expect(document.querySelector(".midname")?.textContent).toBe(MINTED);
   });
+});
+
+// (#2868) Parity: for every row shape, the mission header's chip reads the
+// word and kind the runs board's badge reads for the same row
+// (`RunsBoard.tsx`'s `runStatusLabel` + `runBadgeStatus`).
+describe("(#2868) header chip parity with the runs board", () => {
+  const SHAPES: Partial<Run>[] = [
+    { status: "running" },
+    { status: "running", not_reporting: true },
+    { status: "complete" },
+    { status: "error" },
+    { status: "degraded" },
+    { status: "abandoned", abandoned_reason: "aborted" },
+    { status: "abandoned", abandoned_reason: "noterminal" },
+    { status: "abandoned" },
+    { status: "error", kind: "dispatch" },
+  ];
+  for (const shape of SHAPES) {
+    it(JSON.stringify(shape), async () => {
+      const row = { id: "m1", kind: "mission", ...shape } as Run;
+      mockFetch({ graph: ABANDONED_GRAPH, runs: [row] });
+      renderLens();
+      const word = runStatusLabel(row);
+      await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe(row.status === "running" && !row.not_reporting ? "running" : word));
+      expect(document.querySelector(".mstatus")?.getAttribute("data-status-kind")).toBe(workStatusKind(runBadgeStatus(row), row.abandoned_reason));
+    });
+  }
 });

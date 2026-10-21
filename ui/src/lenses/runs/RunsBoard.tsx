@@ -12,7 +12,6 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { emptyFilterSel, filterSelPairs, isFilterSelEmpty, type FilterDim, type FilterSel } from "../../lib/runsFilterQuery";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
 import { decodeMachineKey } from "../../lib/machineKey";
 import { useMachineKeyContext } from "../../hooks/useMachineKey";
 import { FilterBar } from "./RunsFilterBar";
@@ -30,8 +29,7 @@ import {
   runsAgo,
   runSubtitleParts,
   type SubtitlePart,
-  runBadgeStatus,
-  runStatusLabel,
+  runChip,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
 } from "./format";
@@ -808,7 +806,6 @@ function RunSubtitle({ parts }: { parts: SubtitlePart[] }) {
 }
 
 function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
-  const notReporting = runBadgeStatus(run) === NOT_REPORTING_STATUS;
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
   const subtitle = runSubtitleParts(run, machine);
@@ -832,13 +829,7 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
         : {})}
     >
       <div className="labrunmain">
-        <WorkStatus
-          status={runBadgeStatus(run)}
-          abandonReason={run.abandoned_reason}
-          label={runStatusLabel(run)}
-          className="labbadge"
-          title={notReporting ? NOT_REPORTING_TITLE : undefined}
-        />
+        <WorkStatus {...runChip(run)} className="labbadge" />
         <RunKindIcon kind={run.kind} />
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}
