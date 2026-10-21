@@ -207,6 +207,54 @@ describe("(#2868) the mission header shows the runs board's status, never the li
     expect(document.querySelector(".mstatus")?.textContent).toBe("error");
   });
 
+  it("a kept running row (every /runs read since failed) reads last-known: no pulse, no ticking clock", async () => {
+    const id = "crawl-x-1788484173-b562e3";
+    mockFetch({ graph: { ...ABANDONED_GRAPH, mission_id: id, mission_status: "active" }, runs: (call) => (call === 0 ? [{ id, kind: "mission", status: "running" }] : null) });
+    const { queryClient } = renderLens(id);
+    await waitFor(() => expect(document.querySelector(".mstatus")?.getAttribute("data-live")).toBe("beating"));
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.runs() });
+      });
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    const chip = document.querySelector(".mstatus");
+    expect(chip?.textContent).toBe("running");
+    expect(chip?.getAttribute("data-live")).not.toBe("beating");
+    expect(chip?.getAttribute("title") ?? "").toContain("last known status");
+    expect(document.querySelector(".missionlens .msub")?.textContent ?? "").not.toContain("elapsed");
+    expect(document.querySelector(".mproc")).toBeNull();
+  });
+
+  it("a kept ended row keeps its word and color, marked last-known", async () => {
+    mockFetch({ graph: ABANDONED_GRAPH, runs: (call) => (call === 0 ? [{ id: "m1", kind: "mission", status: "error" }] : null) });
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("error"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.runs() });
+    });
+    await waitFor(() => expect(document.querySelector(".mstatus")?.getAttribute("title") ?? "").toContain("last known status"));
+    expect(document.querySelector(".mstatus")?.getAttribute("data-status-kind")).toBe("error");
+  });
+
+  it("navigating to another mission during an outage shows that mission's own last-known row", async () => {
+    mockFetch({
+      graph: ABANDONED_GRAPH,
+      runs: (call) => (call === 0 ? [{ id: "m1", kind: "mission", status: "error" }, { id: "m2", kind: "mission", status: "complete" }] : null),
+    });
+    const { queryClient, rerender } = renderLens("m1");
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe("error"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.runs() });
+    });
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <MissionGraphLens missionId="m2" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mstatus")?.textContent).toBe(runStatusLabel({ id: "m2", kind: "mission", status: "complete" } as Run)));
+  });
+
   it("a lab row naming the same id is not the mission's row", async () => {
     mockFetch({ graph: ABANDONED_GRAPH, runs: [{ id: "m1", kind: "lab", status: "complete" }] });
     renderLens();
@@ -832,6 +880,9 @@ describe("(#2868) header chip parity with the runs board", () => {
     { status: "abandoned", abandoned_reason: "noterminal" },
     { status: "abandoned" },
     { status: "error", kind: "dispatch" },
+    { status: "planned" },
+    { status: "escalated" },
+    { status: "unparseable" },
   ];
   for (const shape of SHAPES) {
     it(JSON.stringify(shape), async () => {
