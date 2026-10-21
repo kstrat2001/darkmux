@@ -4140,7 +4140,13 @@ pub(crate) fn parse_hosted_response(
         // (#3270) A Messages error names its class in `error.type`, with no
         // `code`; it reaches this body reading inside a stream (HTTP 200), so
         // it is read as the HTTP status its unstreamed twin carries.
-        let code = err.get("code").and_then(|c| c.as_u64()).or_else(|| messages_error_status(err));
+        // (#3271) A string `code` (OpenRouter's mid-stream `server_error`)
+        // is read the same way, as the status its HTTP twin carries.
+        let code = err
+            .get("code")
+            .and_then(|c| c.as_u64())
+            .or_else(|| string_code_status(err))
+            .or_else(|| messages_error_status(err));
         let status = err.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let msg = err
             .get("message")
@@ -4176,6 +4182,18 @@ pub(crate) fn parse_hosted_response(
         )));
     }
     Ok(resp)
+}
+
+/// (#3271) The HTTP status a known string `error.code` stands for. OpenRouter
+/// sends `server_error` on a mid-stream failure (its streaming guide); OpenAI
+/// and OpenRouter name a rate limit `rate_limit_exceeded`; Azure's 500 carries
+/// `InternalServerError`. An unknown string reads as no code, as before.
+fn string_code_status(err: &serde_json::Value) -> Option<u64> {
+    match err.get("code")?.as_str()? {
+        "server_error" | "InternalServerError" => Some(500),
+        "rate_limit_exceeded" => Some(429),
+        _ => None,
+    }
 }
 
 /// The HTTP status a Messages `error.type` is sent with when it is not inside

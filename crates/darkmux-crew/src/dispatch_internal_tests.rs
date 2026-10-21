@@ -20428,6 +20428,41 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
     }
 
+    /// (#3271) A chat-completions error event with a STRING code inside a
+    /// stream (HTTP 200), the shape OpenRouter documents for a mid-stream
+    /// failure, is classified as its unstreamed HTTP twin: `server_error` as a
+    /// server error that may have spent (500), not a rejection. A numeric code
+    /// keeps its own reading.
+    #[test]
+    fn a_chat_error_event_with_a_string_code_is_classified_as_its_http_twin() {
+        let start = "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"}}]}\n\n";
+        let ev = |code: &str| {
+            format!("{start}data: {{\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"error\":{{\"code\":{code},\"message\":\"Provider disconnected unexpectedly\"}},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"error\"}}]}}\n\n").into_bytes()
+        };
+        let kind = |r: &std::result::Result<serde_json::Value, HostedCallError>| match r {
+            Ok(_) => "ok".to_string(),
+            Err(HostedCallError::RateLimited(_)) => "rate_limited".into(),
+            Err(HostedCallError::ServerShed(_)) => "shed".into(),
+            Err(HostedCallError::Other(e)) => format!(
+                "other:{:?}:spent={}",
+                e.chain().find_map(|c| c.downcast_ref::<HostedFailureError>()).map(|f| f.kind),
+                call_may_have_spent(e)
+            ),
+        };
+        let twin = |status: u16| {
+            finish_reply(false, false, Some(status), br#"{"error":{"code":null,"message":"Provider disconnected unexpectedly"}}"#.to_vec())
+        };
+        for (status, code) in [
+            (500, r#""server_error""#),
+            (500, r#""InternalServerError""#),
+            (429, r#""rate_limit_exceeded""#),
+            (502, "502"),
+            (400, "400"),
+        ] {
+            assert_eq!(kind(&finish_reply(true, false, Some(200), ev(code))), kind(&twin(status)), "{code}");
+        }
+    }
+
     /// (#3270 review F2) A server error inside a stream that happens to say
     /// "stream" is not the endpoint refusing to stream: no unstreamed resend.
     #[test]
