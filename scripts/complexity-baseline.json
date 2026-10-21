@@ -25,7 +25,6 @@
   "crates/darkmux-crew/src/dispatch_internal.rs::ensure_runtime_binary_cached_at": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::kill_container_persistently": 19,
   "crates/darkmux-crew/src/dispatch_internal.rs::parse_hosted_response": 11,
-  "crates/darkmux-crew/src/dispatch_internal.rs::remote_chat_attempt": 12,
   "crates/darkmux-crew/src/dispatch_internal.rs::resolve_dispatch_model_with_hosts": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::resolve_endpoint_secret": 14,
   "crates/darkmux-crew/src/envelope.rs::MissionOutcomeStatus::decide": 11,

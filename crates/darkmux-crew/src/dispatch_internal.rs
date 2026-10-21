@@ -3799,31 +3799,70 @@ pub(crate) fn remote_chat_completion(
 /// each time a read completes an event, until curl exits; the exit itself
 /// is collected by the caller. A file that cannot be read reports nothing,
 /// and the reply is still read whole once curl is done.
+///
+/// (#3296) Once the first body byte has arrived, if no byte (keepalive
+/// comments included) then arrives for `silence_limit`, curl is killed and
+/// the limit is returned: a server that died with the connection open would
+/// otherwise hold the call until curl's TOTAL timeout. Before the first byte
+/// the total timeout stays the bound, because LM Studio sends nothing while
+/// it prefills and a long prefill can outlast the limit (#3145, #3301).
+/// `None` is unbounded.
 fn follow_streamed_reply(
     child: &mut std::process::Child,
     body_path: &std::path::Path,
     shape: crate::direct_stream::Shape,
     on: Option<&mut (dyn FnMut(&crate::direct_stream::SseProgress) + '_)>,
-) {
+    silence_limit: Option<Duration>,
+) -> Option<Duration> {
     use std::io::Read;
-    let Some(on) = on else {
-        return;
-    };
+    let on = on?;
     let mut tail = crate::direct_stream::SseTail::sent_at(Instant::now(), shape);
     let mut file = std::fs::File::open(body_path).ok();
     let mut buf = vec![0u8; 16 * 1024];
+    // When the last body byte arrived; `None` until the first one, so the
+    // cutoff is not armed during a silent prefill.
+    let mut last_byte: Option<Instant> = None;
     loop {
         let exited = !matches!(child.try_wait(), Ok(None));
         while let Some(n) = file.as_mut().and_then(|f| f.read(&mut buf).ok()).filter(|n| *n > 0) {
+            last_byte = Some(Instant::now());
             if tail.feed(&buf[..n]) {
                 on(&tail.progress);
             }
         }
         if exited {
-            return;
+            return None;
+        }
+        if silence_limit.is_some_and(|limit| last_byte.is_some_and(|t| t.elapsed() >= limit)) {
+            let _ = child.kill();
+            return silence_limit;
         }
         std::thread::sleep(STREAM_POLL);
     }
+}
+
+/// (#3296) The no-data cutoff for a streamed reply: the runtime's own
+/// inactivity limit (`runtime.inactivity_timeout_seconds`), `0` unbounded.
+fn stream_silence_limit() -> Option<Duration> {
+    match darkmux_types::config_access::inactivity_timeout_seconds() {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// (#3296) The error for a streamed call ended by [`follow_streamed_reply`]
+/// after `limit` with no data: the request was sent, so it may have been
+/// processed (charged as `Unanswered`).
+fn silent_stream_error(url: &str, limit: Duration) -> HostedCallError {
+    let source = darkmux_types::config_access::inactivity_timeout_seconds_with_source().1.as_str();
+    HostedCallError::Other(failure(
+        HostedFailure::Unanswered,
+        format!(
+            "no data from {url} for {}s (runtime.inactivity_timeout_seconds, from {source}): \
+             the model server stopped streaming with the connection open, so the call was ended",
+            limit.as_secs()
+        ),
+    ))
 }
 
 /// The hosted call's curl arguments; (#3211) a streamed reply is written to
@@ -3927,6 +3966,7 @@ fn remote_chat_attempt(
     // even if the create/write/curl fails partway (a partial secret file must
     // never linger).
     let streams = progress.is_some();
+    let mut silenced: Option<Duration> = None;
     let mut run = || -> Result<std::process::Output> {
         #[cfg(unix)]
         let mut f = {
@@ -3980,7 +4020,13 @@ fn remote_chat_attempt(
         // delivery to the launcher in a real invocation shape).
         let child_pid = child.id();
         darkmux_types::child_registry::register(child_pid);
-        follow_streamed_reply(&mut child, &body_path, crate::direct_stream::Shape::messages_if(messages), progress.as_deref_mut());
+        silenced = follow_streamed_reply(
+            &mut child,
+            &body_path,
+            crate::direct_stream::Shape::messages_if(messages),
+            progress.as_deref_mut(),
+            stream_silence_limit(),
+        );
         let wait_result = child.wait_with_output().map_err(|e| {
             failure(HostedFailure::Unanswered, format!("running curl for hosted dispatch: {e}"))
         });
@@ -3992,6 +4038,18 @@ fn remote_chat_attempt(
     let response = std::fs::read(&body_path).unwrap_or_default();
     let _ = std::fs::remove_file(&body_path);
     let out = result.map_err(HostedCallError::Other)?;
+    if let Some(e) = failed_curl_exit(url, &out, silenced) {
+        return Err(e);
+    }
+    let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
+    // (#3211) A streamed reply, put back together as the unstreamed one.
+    finish_reply(streams, messages, status, response)
+}
+
+/// The error for a curl call that did not exit cleanly, `None` for one that
+/// did: interrupted by the operator, (#3296) ended for a silent stream, or
+/// curl's own failure.
+fn failed_curl_exit(url: &str, out: &std::process::Output, silenced: Option<Duration>) -> Option<HostedCallError> {
     // (#2462) Gated on `!success()`, never overriding a clean exit — and
     // written as the SAME conjunction the docker container path's NEW-4
     // check uses (`is_set() && !status.success()`, a few thousand lines
@@ -4010,22 +4068,25 @@ fn remote_chat_attempt(
     // didn't; darkmux killed its own child because the operator asked it
     // to stop.
     if darkmux_types::interrupt::is_set() && !out.status.success() {
-        return Err(HostedCallError::Other(anyhow!(
+        return Some(HostedCallError::Other(anyhow!(
             "hosted dispatch {} (SIGINT/SIGTERM/SIGHUP): \
              the request to {url} was killed mid-flight",
             darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         )));
     }
-    if !out.status.success() {
-        let exit = out.status.code().unwrap_or(-1);
-        return Err(HostedCallError::Other(failure(
-            curl_failure_kind(exit),
-            describe_curl_failure(url, exit, &String::from_utf8_lossy(&out.stderr)),
-        )));
+    if out.status.success() {
+        return None;
     }
-    let status = String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok();
-    // (#3211) A streamed reply, put back together as the unstreamed one.
-    finish_reply(streams, messages, status, response)
+    // (#3296) darkmux ended a silent stream itself: say so, never curl's
+    // bare kill exit. A curl that finished cleanly first keeps its reply.
+    if let Some(limit) = silenced {
+        return Some(silent_stream_error(url, limit));
+    }
+    let exit = out.status.code().unwrap_or(-1);
+    Some(HostedCallError::Other(failure(
+        curl_failure_kind(exit),
+        describe_curl_failure(url, exit, &String::from_utf8_lossy(&out.stderr)),
+    )))
 }
 
 /// A finished call's reply, classified: (#3211) a streamed one put back

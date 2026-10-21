@@ -3732,6 +3732,16 @@
     /// reported, what an unreported call would be charged, and the
     /// `token_source` of every usage record it wrote.
     fn run_capped_hosted_dispatch(base_url: &str) -> (Result<DispatchResult>, Option<u64>, u64, Vec<String>) {
+        let (result, charged, unreported, sources, _) = run_capped_hosted_dispatch_within(base_url, 1);
+        (result, charged, unreported, sources)
+    }
+
+    /// [`run_capped_hosted_dispatch`] with the dispatch's total timeout
+    /// given, also returning the action of every flow record it wrote.
+    fn run_capped_hosted_dispatch_within(
+        base_url: &str,
+        timeout_seconds: u32,
+    ) -> (Result<DispatchResult>, Option<u64>, u64, Vec<String>, Vec<String>) {
         let flows_dir = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
@@ -3745,7 +3755,7 @@
         opts.role_id = "pr-reviewer".to_string();
         opts.session = session.clone();
         opts.json = false;
-        opts.timeout_seconds = 1;
+        opts.timeout_seconds = timeout_seconds;
         let pm = darkmux_types::ProfileModel::hosted_for_test(
             "gpt-remote",
             Some(100000),
@@ -3778,17 +3788,133 @@
                 crate::direct_stream::Shape::Chat,
             ),
         );
-        let mut sources = Vec::new();
+        let (mut sources, mut actions) = (Vec::new(), Vec::new());
         for entry in std::fs::read_dir(flows_dir.path()).unwrap().flatten() {
             let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
             for line in text.lines() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                actions.push(v["action"].as_str().unwrap_or("?").to_string());
                 if v["action"] == "telemetry.tokens" {
                     sources.push(v["payload"]["token_source"].as_str().unwrap_or("?").to_string());
                 }
             }
         }
-        (result, charged, unreported, sources)
+        (result, charged, unreported, sources, actions)
+    }
+
+    /// (#3296) A loopback server that answers a streamed call with its
+    /// headers and one event, then goes silent with the connection open: a
+    /// model server whose generate thread died mid-reply. It first sends
+    /// `beats` more keepalive comments, `every` apart. Dropping the sender
+    /// frees it.
+    fn stalled_stream_http_mock(beats: u32, every: Duration) -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: keepalive\n\n",
+            );
+            let _ = stream.flush();
+            for _ in 0..beats {
+                std::thread::sleep(every);
+                let _ = stream.write_all(b": keepalive\n\n");
+                let _ = stream.flush();
+            }
+            let _ = held.recv_timeout(Duration::from_secs(30));
+        });
+        (format!("http://127.0.0.1:{port}/v1/chat/completions"), release)
+    }
+
+    /// (#3296) A streamed call whose server goes silent mid-reply ends once
+    /// no byte has arrived for `runtime.inactivity_timeout_seconds`, with an
+    /// error naming the cutoff, long before curl's total timeout; the
+    /// dispatch still ends with its terminal `dispatch.error`.
+    #[test]
+    #[serial]
+    fn a_stream_that_goes_silent_ends_at_the_inactivity_cutoff() {
+        let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(1);
+        let (url, _held) = stalled_stream_http_mock(0, Duration::ZERO);
+        let t0 = Instant::now();
+        let (result, charged, unreported, _, actions) = run_capped_hosted_dispatch_within(&url, 30);
+        let took = t0.elapsed();
+        let err = format!("{:#}", result.expect_err("the silent call fails"));
+        assert!(took < Duration::from_secs(15), "ended at the cutoff, not the 30 s total timeout: {took:?}");
+        assert!(err.contains("no data") && err.contains("runtime.inactivity_timeout_seconds"), "{err}");
+        assert_eq!(charged, Some(unreported), "charged as a call the server may have processed");
+        assert!(actions.iter().any(|a| a == "dispatch.error"), "terminal dispatch.error: {actions:?}");
+    }
+
+    /// (#3296) A loopback server that sends its headers, holds silent for
+    /// `prefill` (LM Studio sends no body byte while it prefills), then
+    /// streams a whole chat reply and closes.
+    fn slow_prefill_http_mock(prefill: Duration) -> String {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(prefill);
+            let _ = stream.write_all(concat!(
+                "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ).as_bytes());
+        });
+        format!("http://127.0.0.1:{port}/v1/chat/completions")
+    }
+
+    /// The cutoff arms at the first body byte: a prefill that sends nothing
+    /// for longer than the cutoff, then streams its reply, is not cut. Before
+    /// the first byte, the call's total timeout is the bound.
+    #[test]
+    #[serial]
+    fn a_silent_prefill_before_the_first_byte_is_not_cut() {
+        let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(1);
+        let url = slow_prefill_http_mock(Duration::from_millis(1800));
+        let req = crate::direct_stream::stream_body(&serde_json::json!({"model": "m", "messages": []}), crate::direct_stream::Shape::Chat);
+        let mut on = |_: &crate::direct_stream::SseProgress| {};
+        let reply = remote_chat_completion(&url, None, &req, 30, Some(&mut on)).expect("a slow prefill keeps its reply");
+        assert_eq!(crate::single_shot::extract_reply(&reply).content, "Hello");
+    }
+
+    /// The cutoff counts silence, not the call's length: a stream that keeps
+    /// sending keepalive comments past the cutoff is not ended by it.
+    #[test]
+    #[serial]
+    fn a_stream_sending_keepalives_outlives_the_inactivity_cutoff() {
+        let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(1);
+        let (url, held) = stalled_stream_http_mock(6, Duration::from_millis(400));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2600));
+            drop(held);
+        });
+        let (result, _, _, _, _) = run_capped_hosted_dispatch_within(&url, 30);
+        let err = format!("{:#}", result.expect_err("a stream the server cut off fails"));
+        assert!(!err.contains("runtime.inactivity_timeout_seconds"), "kept alive past 1 s: {err}");
+    }
+
+    /// `0` means unbounded, as every darkmux zero-knob does.
+    #[test]
+    #[serial]
+    fn a_zero_inactivity_budget_never_cuts_a_silent_stream() {
+        let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(0);
+        let (url, held) = stalled_stream_http_mock(0, Duration::ZERO);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(held);
+        });
+        let (result, _, _, _, _) = run_capped_hosted_dispatch_within(&url, 30);
+        let err = format!("{:#}", result.expect_err("a stream the server cut off fails"));
+        assert!(!err.contains("runtime.inactivity_timeout_seconds"), "no cutoff at 0: {err}");
     }
 
     /// (#2925) A hosted call that was sent and timed out is charged ONCE, the
