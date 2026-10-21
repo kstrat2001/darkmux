@@ -1152,7 +1152,8 @@ impl<R: BufRead> ChunkStream<R> {
         let Some(t) = self.messages.as_mut() else {
             return Some(serde_json::from_str::<ChatChunk>(data).map_err(|e| {
                 self.done = true;
-                anyhow!("SSE chunk parse failed: {e} — payload: {data}")
+                error_event(data)
+                    .unwrap_or_else(|| anyhow!("SSE chunk parse failed: {e} — payload: {data}"))
             }));
         };
         let translated = serde_json::from_str::<serde_json::Value>(data)
@@ -1171,6 +1172,24 @@ impl<R: BufRead> ChunkStream<R> {
             }
         }
     }
+}
+
+/// (#3299) A `data:` payload that is the engine's error rather than a chunk
+/// (`{"error":{"message":...}}`, LM Studio's refusal of a prompt over the
+/// context window), as the error it reports: worded like its Messages twin,
+/// an `error` event (`messages_dialect.rs`), and leading with the engine's own
+/// message. `None` when the payload carries no `error`. Read only after a
+/// payload failed to parse as a chunk, so no chunk pays for it.
+fn error_event(data: &str) -> Option<anyhow::Error> {
+    let event = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let err = event.get("error")?;
+    let message = err.get("message").unwrap_or(err);
+    let message = message
+        .as_str()
+        .map_or_else(|| message.to_string(), str::to_string);
+    Some(anyhow!(
+        "endpoint sent an error event mid-stream: {message}"
+    ))
 }
 
 /// (#3210) A [`ChunkStream`]'s chunks alone ([`ChunkStream::chunks`]).
@@ -1706,6 +1725,70 @@ mod tests {
         );
         // After the error, iterator is exhausted.
         assert!(iter.next().is_none(), "iterator must terminate after cap error");
+    }
+
+    /// (#3299) An engine that refuses a streamed request after the 200 sends
+    /// its error as a `data:` payload. LM Studio does this for a prompt over
+    /// the context window; the runtime read it as a chunk and failed with
+    /// "SSE chunk parse failed: missing field `id`", the real cause buried in
+    /// the echoed payload. The error reads like its Messages twin (an `error`
+    /// event, `messages_dialect.rs`) and leads with the engine's own message.
+    #[test]
+    fn an_error_event_in_a_chat_stream_fails_with_the_engines_message() {
+        use crate::test_support::sse_server_scripted;
+        let refusal = "The number of tokens to keep from the initial prompt is greater than the context length";
+        let script = vec![(
+            Duration::ZERO,
+            serde_json::json!({ "error": { "message": refusal } }).to_string(),
+        )];
+        let client = LmStudioClient::with_base_url_and_read_timeout(
+            sse_server_scripted(script),
+            Duration::from_secs(10),
+        );
+        let request = ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: 0.0,
+            max_tokens: None,
+            response_format: None,
+        };
+        let mut stream = client.chat_streaming(&request).expect("the 200 arrives");
+        let err = stream
+            .next()
+            .expect("one item")
+            .expect_err("an error event is an error");
+        assert_eq!(
+            err.to_string(),
+            format!("endpoint sent an error event mid-stream: {refusal}")
+        );
+        assert!(stream.next().is_none(), "the stream ends at the error");
+    }
+
+    /// (#3299) An `error` that is a bare string, or an object with no
+    /// `message`, still fails as an error event, carrying what was sent.
+    #[test]
+    fn an_error_event_without_a_message_carries_the_error_as_sent() {
+        let first_err = |payload: &str| {
+            let sse = format!("data: {payload}\n\n");
+            let mut stream = ChunkStream::new(sse.as_bytes()).chunks();
+            stream
+                .next()
+                .expect("one item")
+                .expect_err("an error")
+                .to_string()
+        };
+        assert_eq!(
+            first_err(r#"{"error":"model not loaded"}"#),
+            "endpoint sent an error event mid-stream: model not loaded"
+        );
+        assert_eq!(
+            first_err(r#"{"error":{"code":503}}"#),
+            r#"endpoint sent an error event mid-stream: {"code":503}"#
+        );
+        // A payload that is neither a chunk nor an error is still a parse failure.
+        assert!(first_err(r#"{"nope":1}"#).starts_with("SSE chunk parse failed"));
     }
 
     // ─── ChunkStream (SSE framing) ─────────────────────────────
