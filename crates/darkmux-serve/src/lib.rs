@@ -60,6 +60,7 @@ mod redaction_stream;
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
 mod fleet_window;
+mod flow_window;
 pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
 pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
 mod routes;
