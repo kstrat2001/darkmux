@@ -19545,6 +19545,57 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
     }
 
+    /// (#2967) A salvaged turn (#479: a `length` cut whose well-formed calls
+    /// the runtime dispatches anyway) ends there: the next call opens a new
+    /// `seq`. Its `model.completed` keeps the raw `length`, so the turn
+    /// record must key on the calls that RUN, or the viewer never learns the
+    /// running call's name and reads PROMPT while it runs. A `length` cut
+    /// whose calls are all discarded is still a continuation: no record.
+    #[test]
+    #[serial]
+    fn a_salvaged_turn_gets_its_turn_record_naming_the_running_calls() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-salvage"),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // Turn 1: a continuation whose cut-off call is discarded, then the
+        // salvaged call that dispatches `read` and drops a truncated `edit`.
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"length","calls_planned":true,"tool_calls":[{"name":"read","arguments_chars":9,"path":"a.rs","runs":false}],"usage":{"completion_tokens":32000}}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"length","calls_planned":true,"tool_calls":[{"name":"read","arguments_chars":20,"path":"src/lib.rs"},{"name":"edit","arguments_chars":7,"runs":false}],"usage":{"completion_tokens":8000}}"#);
+        // Turn 2 ends normally.
+        state.handle_event(r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"completion_tokens":64}}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-salvage"));
+        let turns: Vec<&serde_json::Value> =
+            records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
+        assert_eq!(turns.len(), 2, "one record per logical turn, the salvaged one included; got {turns:?}");
+        let salvaged = &turns[0]["payload"];
+        assert_eq!(salvaged["turn_seq"], 1);
+        assert_eq!(salvaged["finish_reason"], "length", "the raw reason is kept");
+        assert_eq!(salvaged["tool_names"], serde_json::json!(["read"]), "only the call that runs");
+        assert_eq!(salvaged["tool_paths"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(turns[1]["payload"]["turn_seq"], 2);
+    }
+
     /// (#2863) A turn record carries the turn's GENERATION time, summed over
     /// every stream it took. The viewer's turn header shows it; the flow's
     /// own timestamps are whole seconds, which is guesswork for a 1.3 s turn.
