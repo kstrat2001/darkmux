@@ -77,6 +77,10 @@ pub enum DetectorKind {
     /// The degeneracy gate judged the stream repeating.
     #[serde(rename = "repetition")]
     Repetition,
+    /// (#2799) A triggered compaction its own guards refused: nothing was
+    /// installed and the thread is unchanged.
+    #[serde(rename = "compaction_skipped")]
+    CompactionSkipped,
     /// A value this build does not name, read from an archive written by another version.
     /// Never written.
     #[schemars(skip)]
@@ -373,6 +377,7 @@ impl DetectorKind {
             DetectorKind::MalformedToolNames => "malformed_tool_names",
             DetectorKind::Escalation => "escalation",
             DetectorKind::Repetition => "repetition",
+            DetectorKind::CompactionSkipped => "compaction_skipped",
             DetectorKind::Unknown => "unknown",
         }
     }

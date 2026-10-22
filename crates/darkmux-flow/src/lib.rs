@@ -4049,7 +4049,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.3.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.4.0");
     }
 
     #[test]

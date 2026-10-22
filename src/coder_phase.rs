@@ -2187,6 +2187,10 @@ fn allocate_injected_context(
     )
 }
 
+/// Detector kinds about darkmux's own machinery, never a caution about the
+/// code: kept out of a dispatch's brief (see `mission_cautions`).
+const DARKMUX_INTERNAL_DETECTOR_KINDS: &[&str] = &["repetition", "compaction_skipped"];
+
 /// (#994 retrieve+inject) The loop pathologies darkmux's detectors flagged
 /// across this mission's earlier dispatches, for injection into the next coder
 /// brief — the doom-loop fix's AUTO-DERIVED half (sibling to the operator-
@@ -2269,7 +2273,10 @@ fn mission_cautions(
             // before the #2887 F4 turn-grouping this brief-inject path does
             // not do) to every future dispatch's brief on a mission that
             // merely ran under a gate that fired — noise, not a caution.
-            if kind == "repetition" {
+            // (#2799) `compaction_skipped` is the same class: the runtime's
+            // own housekeeping (a compaction its guards refused), nothing
+            // about the code.
+            if DARKMUX_INTERNAL_DETECTOR_KINDS.contains(&kind) {
                 continue;
             }
             let severity = finding.severity.as_str();
