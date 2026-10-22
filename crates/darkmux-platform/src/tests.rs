@@ -740,12 +740,12 @@ fn linux_reads_its_release_and_ram_from_the_files_it_has() {
 #[test]
 fn only_the_mac_has_a_keychain_to_keep_a_secret_in() {
     for p in [&LinuxPlatform as &dyn Platform, &OtherPlatform, &FakePlatform::default()] {
-        assert!(p.keychain_store("darkmux-test-item", "nobody", "s").is_err(), "{}", p.id());
-        p.keychain_forget("darkmux-test-item", "nobody");
+        assert!(p.store_secret("darkmux-test-item", "nobody", "s").is_err(), "{}", p.id());
+        p.forget_secret("darkmux-test-item", "nobody");
     }
     if std::env::consts::OS != "macos" {
-        assert!(MacPlatform.keychain_store("darkmux-test-item", "nobody", "s").is_err());
-        MacPlatform.keychain_forget("darkmux-test-item", "nobody");
+        assert!(MacPlatform.store_secret("darkmux-test-item", "nobody", "s").is_err());
+        MacPlatform.forget_secret("darkmux-test-item", "nobody");
     }
 }
 

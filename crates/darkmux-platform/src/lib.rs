@@ -117,13 +117,13 @@ pub trait Platform: Send + Sync {
     /// `account`, replacing one there. An error says why it was not stored;
     /// a platform with no keychain (its [`Platform::secret_store`] is a file)
     /// always errs. A caller reads the item back to know it was kept.
-    fn keychain_store(&self, _item: &str, _account: &str, _secret: &str) -> Result<(), String> {
+    fn store_secret(&self, _item: &str, _account: &str, _secret: &str) -> Result<(), String> {
         Err("this machine keeps secrets in a file, not a keychain".to_string())
     }
 
     /// Deletes the login keychain's generic password `item` for `account`,
     /// if there is one. Nothing to do where there is no keychain.
-    fn keychain_forget(&self, _item: &str, _account: &str) {}
+    fn forget_secret(&self, _item: &str, _account: &str) {}
 
     /// The memory size as the machine was sold, in GB, for naming a machine
     /// class: what [`Platform::ram_installed_bytes`] says, where that is exact.

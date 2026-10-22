@@ -85,7 +85,7 @@ fn store_token_in(platform: &dyn Platform, file: &Path, token: &str) -> Result<S
 }
 
 fn store_in_keychain(platform: &dyn Platform, file: &Path, token: &str) -> Result<()> {
-    let kept = platform.keychain_store(TOKEN_ITEM, &user(), token);
+    let kept = platform.store_secret(TOKEN_ITEM, &user(), token);
     // `security -i` can exit 0 when its command failed: the read back is the check.
     if read_token_from(platform, file).as_deref() != Some(token) {
         bail!("the login keychain did not keep the token: {}", kept.err().unwrap_or_default());
@@ -103,7 +103,7 @@ fn store_in_file(path: &Path, token: &str) -> Result<String> {
 
 fn forget_token_in(platform: &dyn Platform, file: &Path) {
     match platform.secret_store() {
-        SecretStore::Keychain => platform.keychain_forget(TOKEN_ITEM, &user()),
+        SecretStore::Keychain => platform.forget_secret(TOKEN_ITEM, &user()),
         SecretStore::PrivateFile => {
             let _ = std::fs::remove_file(file);
         }

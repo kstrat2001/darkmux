@@ -115,11 +115,11 @@ impl Platform for MacPlatform {
 
     /// `security -i` reads the command from stdin, so the secret is never on
     /// an argv. It can exit 0 when the command failed: the caller reads back.
-    fn keychain_store(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {
+    fn store_secret(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {
         security_interactive(&format!("add-generic-password -U -a \"{account}\" -s {item} -w \"{secret}\"\n"))
     }
 
-    fn keychain_forget(&self, item: &str, account: &str) {
+    fn forget_secret(&self, item: &str, account: &str) {
         let _ = command_stdout("security", &["delete-generic-password", "-a", account, "-s", item]);
     }
 }
