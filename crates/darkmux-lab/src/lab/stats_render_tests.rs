@@ -130,8 +130,26 @@ fn power_and_energy_print_when_measured() {
     assert!(t.contains("energy       190 J per 1k tokens   10.6 kJ while busy"), "{t}");
     assert!(!t.contains("over the run"), "the run's total draw is a different, larger figure");
     assert!(t.contains("thermal      fair 4   cpu speed limit min 100%"), "{t}");
-    s.gpu_w_busy = None;
+    s.pkg_w_busy = None;
     assert!(!run_text(&s).contains("power "), "no telemetry, no power line");
+}
+
+/// (#3331) Omarchy reads one package total, no GPU utilization and board
+/// temperatures: the line prints the package alone, says the busy share came
+/// from the model streams, and the board temperature prints on its own line.
+#[test]
+fn a_package_only_host_prints_its_package_and_board_temperature() {
+    let mut s = run("r");
+    s.gpu_w_busy = None;
+    s.cpu_w_busy = None;
+    s.gpu_duty_pct = None;
+    s.busy_ms = Some(s.wall_ms / 4);
+    s.board_temp_c_max_busy = Some(54.4);
+    s.fan_rpm_max_busy = Some(2214);
+    let t = run_text(&s);
+    assert!(t.contains("power        package 38 W   busy 25.0% of the run (model streams) (100 samples)"), "{t}");
+    assert!(!t.contains("gpu "), "no rail was read: {t}");
+    assert!(t.contains("board        hottest sensor 54.4 °C   fan max 2214 rpm"), "{t}");
 }
 
 /// The caveats print beneath the figures, and only when a check failed.

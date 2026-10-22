@@ -174,7 +174,7 @@ fn energy_per_token_uses_billed_seconds_not_all_generation() {
         completed(2, Some(2_000), 0),
     );
     let flows = FlowFacts {
-        samples: vec![Sample { gpu_pct: 95, w_gpu: 30.0, w_cpu: 5.0, w_total: 40.0, ..Default::default() }],
+        samples: vec![Sample { gpu_pct: Some(95), w_gpu: Some(30.0), w_cpu: Some(5.0), w_total: 40.0, ..Default::default() }],
         ..Default::default()
     };
     let s = derive_stats("t".into(), &run_fold(&traj, 120_000), flows, None, None);
@@ -484,6 +484,71 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
     assert_eq!(s.throttled_samples, 0);
     assert_eq!(s.mem_pct_busy_max, Some(62));
     assert!(s.checks.have_telemetry_samples);
+}
+
+/// (#3331) An Omarchy sample: a package total with no rails, no GPU
+/// utilization, no thermal state, and board sensors.
+fn omarchy_telem(ts: u64, pkg_mw: u64, nand_c: f64) -> String {
+    line(serde_json::json!({
+        "action": "machine.telemetry",
+        "payload": {
+            "sampled_at_ms": ts, "sampler_cost_ms": 1, "interval_ms": 25_000, "gpu_pct": null, "mem_pct": 70,
+            "thermal": null,
+            "power_mw": null, "package_power_mw": pkg_mw,
+            "sensors": {"temps_c": {"NAND Flash Temperature": nand_c, "Battery Hotspot": 36.8}, "fan_rpm": 1558}
+        }
+    }))
+}
+
+/// (#3331) With no GPU utilization, a sample is busy when it was taken
+/// inside a model stream. The package watts and energy follow from that;
+/// the GPU duty, the rails and the thermal state are absent with a reason,
+/// never zero, and "never capped" is not claimed for a host that reads no
+/// speed limit.
+#[test]
+fn a_host_with_no_gpu_figure_is_busy_inside_its_model_streams() {
+    let from = 1_000_000;
+    let raw = format!(
+        "{}{}{}{}",
+        omarchy_telem(from + 25_000, 18_000, 51.0),
+        omarchy_telem(from + 50_000, 20_000, 54.4),
+        omarchy_telem(from + 75_000, 2_600, 50.0),
+        omarchy_telem(from + 100_000, 2_600, 49.0),
+    );
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 100_000, None, &mut flows);
+    // One stream across the first half of the run.
+    let traj = format!("{}{}", stream(1, from + 1_000, Some(from + 55_000)), completed(1, Some(1_000), 0));
+    let s = derive_stats("t".into(), &run_fold(&traj, 100_000), flows, None, None);
+
+    assert_eq!(s.busy_basis, Some(BusyBasis::ModelStreams));
+    assert_eq!((s.samples_busy, s.samples_idle), (2, 2));
+    assert_eq!(s.pkg_w_busy, Some(19.0));
+    assert_eq!(s.busy_ms, Some(50_000));
+    assert_eq!(s.pkg_j_busy, Some(950.0), "19 W across 50 busy seconds");
+    assert_eq!(s.gpu_duty_pct, None, "a stream duty is not a GPU figure");
+    assert_eq!((s.gpu_w_busy, s.cpu_w_busy), (None, None));
+    assert_eq!(s.cpu_speed_limit_min, None);
+    assert!(s.thermal_states_busy.is_empty());
+    assert_eq!(s.board_temp_c_max_busy, Some(54.4));
+    assert_eq!(s.fan_rpm_max_busy, Some(1558));
+    for field in ["gpu_duty_pct", "gpu_w_busy", "cpu_w_busy", "thermal_states_busy", "cpu_speed_limit_min"] {
+        assert!(s.host_unmeasured.get(field).is_some_and(|r| r.starts_with("no telemetry sample")), "{field}: {:?}", s.host_unmeasured);
+    }
+    assert!(!s.host_unmeasured.contains_key("board_temp_c_max_busy"));
+    assert!(s.checks.have_telemetry_samples && s.checks.telemetry_covers_run);
+}
+
+/// macOS samples carry every figure, so nothing is listed as unmeasured.
+#[test]
+fn a_host_that_reads_everything_lists_nothing_unmeasured_but_board_sensors() {
+    let from = 1_000_000;
+    let raw = format!("{}{}", telem(from + 50_000, 96, 40.0), telem(from + 100_000, 0, 0.0));
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 100_000, None, &mut flows);
+    let s = derive_stats("t".into(), &run_fold("", 100_000), flows, None, None);
+    assert_eq!(s.busy_basis, Some(BusyBasis::GpuUtilization));
+    assert_eq!(s.host_unmeasured.keys().collect::<Vec<_>>(), vec!["board_temp_c_max_busy"]);
 }
 
 /// The sampler runs continuously; only samples inside the run's own window

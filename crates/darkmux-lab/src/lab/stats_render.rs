@@ -108,10 +108,23 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         g.checkpoint.policy.as_deref().map(|p| format!("   policy={}", sanitize_for_terminal(p))).unwrap_or_default()
     );
 
-    if let (Some(gpu), Some(cpu), Some(pkg)) = (s.gpu_w_busy, s.cpu_w_busy, s.pkg_w_busy) {
+    if let Some(pkg) = s.pkg_w_busy {
+        // (#3331) A host with no per-rail split (Omarchy) prints the package
+        // alone, and its busy share comes from the model streams, so the
+        // line says which.
+        let rails = match (s.gpu_w_busy, s.cpu_w_busy) {
+            (Some(gpu), Some(cpu)) => format!("gpu {gpu} W   cpu {cpu} W   "),
+            _ => String::new(),
+        };
+        let busy = match (s.gpu_duty_pct, s.busy_ms) {
+            (Some(d), _) => format!("busy {d}% of the run"),
+            (None, Some(b)) if s.wall_ms > 0 => {
+                format!("busy {:.1}% of the run (model streams)", 100.0 * b as f64 / s.wall_ms as f64)
+            }
+            _ => "busy share unknown".to_string(),
+        };
         p!(out, 
-            "power        gpu {gpu} W   cpu {cpu} W   package {pkg} W   busy {}% of the run ({} samples)",
-            s.gpu_duty_pct.unwrap_or(0.0),
+            "power        {rails}package {pkg} W   {busy} ({} samples)",
             s.samples_busy + s.samples_idle
         );
         if let Some(j) = s.pkg_j_per_1k_tokens {
@@ -127,6 +140,12 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
                 "thermal      {}   cpu speed limit min {}%",
                 states.join(", "),
                 s.cpu_speed_limit_min.unwrap_or(100)
+            );
+        }
+        if let Some(t) = s.board_temp_c_max_busy {
+            p!(out, 
+                "board        hottest sensor {t} °C{}",
+                s.fan_rpm_max_busy.map(|f| format!("   fan max {f} rpm")).unwrap_or_default()
             );
         }
     }

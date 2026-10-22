@@ -86,6 +86,18 @@ impl Platform for LinuxPlatform {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
 
+    /// The SMC's `Heatpipe Power` sensor (hwmon, Asahi's `macsmc_hwmon`):
+    /// it follows SoC load, ~2.6 W idle to ~20 W with every CPU busy on an
+    /// M2 (#3331), and there is no CPU, GPU or ANE split beside it.
+    fn package_power_mw(&self) -> Option<f64> {
+        package_mw_from_hwmon(&read_hwmon())
+    }
+
+    /// Every labeled hwmon temperature, and the fastest fan.
+    fn board_sensors(&self) -> Option<crate::BoardSensors> {
+        board_sensors_from_hwmon(&read_hwmon())
+    }
+
     /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
     /// boot. World-readable unless `/proc` is mounted with `hidepid`.
     fn process_start_stamp(&self, pid: u32) -> Option<u64> {
@@ -488,4 +500,79 @@ fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
 /// kernel doesn't report it; `MemFree` would understate it, so no stand-in.
 pub(crate) fn reclaimable_from_meminfo(meminfo: &str) -> Option<u64> {
     memory_from_meminfo(meminfo)?.available_bytes
+}
+
+/// One hwmon input: the chip's `name`, the input's stem (`power4`), its
+/// `_label` when it has one, and the raw `_input` value in hwmon's units
+/// (microwatts, millidegrees Celsius, rpm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HwmonInput {
+    pub chip: String,
+    pub sensor: String,
+    pub label: Option<String>,
+    pub value: i64,
+}
+
+/// The label Apple's SMC gives the sensor that follows SoC power. Matched by
+/// label, never by index: the index is the device tree's ordering.
+const PACKAGE_POWER_LABEL: &str = "Heatpipe Power";
+
+/// [`PACKAGE_POWER_LABEL`]'s reading in milliwatts. A negative reading is
+/// not a draw, so it is no reading.
+pub(crate) fn package_mw_from_hwmon(inputs: &[HwmonInput]) -> Option<f64> {
+    inputs
+        .iter()
+        .find(|i| i.sensor.starts_with("power") && i.label.as_deref() == Some(PACKAGE_POWER_LABEL))
+        .filter(|i| i.value >= 0)
+        .map(|i| i.value as f64 / 1000.0)
+}
+
+/// Labeled temperatures (to 0.1 °C) and the fastest fan. A label that only
+/// names the kind (`temp`) says nothing about where the sensor sits, so it
+/// is skipped; so is an unlabeled one. A label two chips share is keyed
+/// `chip label`. `None` when there is neither a temperature nor a fan.
+pub(crate) fn board_sensors_from_hwmon(inputs: &[HwmonInput]) -> Option<crate::BoardSensors> {
+    let temps: Vec<(&HwmonInput, &str)> = inputs
+        .iter()
+        .filter(|i| i.sensor.starts_with("temp"))
+        .filter_map(|i| Some((i, i.label.as_deref().map(str::trim).filter(|l| !l.is_empty() && *l != "temp")?)))
+        .collect();
+    let mut temps_c = std::collections::BTreeMap::new();
+    for (i, label) in &temps {
+        let shared = temps.iter().filter(|(_, l)| l == label).count() > 1;
+        let key = if shared { format!("{} {label}", i.chip) } else { label.to_string() };
+        temps_c.insert(key, (i.value as f64 / 100.0).round() / 10.0);
+    }
+    let fan_rpm = inputs
+        .iter()
+        .filter(|i| i.sensor.starts_with("fan") && i.value >= 0)
+        .filter_map(|i| u32::try_from(i.value).ok())
+        .max();
+    (!temps_c.is_empty() || fan_rpm.is_some()).then_some(crate::BoardSensors { temps_c, fan_rpm })
+}
+
+/// Every `*_input` under `/sys/class/hwmon`. An input that can't be read or
+/// parsed is left out; that is what an absent sensor reads as.
+#[cfg(target_os = "linux")]
+fn read_hwmon() -> Vec<HwmonInput> {
+    let Ok(chips) = std::fs::read_dir("/sys/class/hwmon") else { return Vec::new() };
+    let mut out = Vec::new();
+    for chip in chips.flatten() {
+        let dir = chip.path();
+        let Some(name) = std::fs::read_to_string(dir.join("name")).ok().map(|n| n.trim().to_string()) else { continue };
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        for f in files.flatten() {
+            let file = f.file_name().to_string_lossy().into_owned();
+            let Some(sensor) = file.strip_suffix("_input") else { continue };
+            let Some(value) = std::fs::read_to_string(f.path()).ok().and_then(|v| v.trim().parse().ok()) else { continue };
+            let label = std::fs::read_to_string(dir.join(format!("{sensor}_label"))).ok().map(|l| l.trim().to_string());
+            out.push(HwmonInput { chip: name.clone(), sensor: sensor.to_string(), label, value });
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_hwmon() -> Vec<HwmonInput> {
+    Vec::new()
 }
