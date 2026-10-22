@@ -188,22 +188,22 @@ pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option
 /// (`localhost`, `127.0.0.1`, a `*.localhost` preview): judged on the host
 /// itself, not on how the address starts.
 pub fn site_is_safe(site: &str) -> bool {
-    if site.starts_with("https://") {
-        return !site.contains(char::is_whitespace);
+    use darkmux_types::endpoint::{url_host, url_names_this_machine};
+    if site.contains(char::is_whitespace) {
+        return false;
     }
-    let Some(rest) = site.strip_prefix("http://") else {
+    if site.starts_with("https://") {
+        return true;
+    }
+    // The address must be `http://` and then the very host curl dials: no userinfo to hide another behind.
+    let Some(hostport) = url_host(site) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    if !site.starts_with(&format!("http://{hostport}")) {
         return false;
     }
-    let host = match authority.rsplit_once(':') {
-        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => authority,
-    }
-    .to_ascii_lowercase();
-    host == "localhost" || host == "127.0.0.1" || (host.ends_with(".localhost") && host.len() > ".localhost".len())
+    let host = hostport.rsplit_once(':').map_or(hostport.as_str(), |(h, _)| h).to_ascii_lowercase();
+    url_names_this_machine(site) || (host.ends_with(".localhost") && host.len() > ".localhost".len())
 }
 
 /// curl's output with `-w "\n%{http_code}"`: the body, then the status line.
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn plain_http_only_to_this_machine() {
-        for ok in ["https://evals.darkmux.com", "http://localhost:3419", "http://de.localhost:3419", "http://127.0.0.1"] {
+        for ok in ["https://evals.darkmux.com", "http://localhost:3419", "http://de.localhost:3419", "http://127.0.0.1", "http://[::1]:3419"] {
             assert!(site_is_safe(ok), "{ok}");
         }
         for bad in [
@@ -248,6 +248,9 @@ mod tests {
             "http://evil.com/.localhost:",
             "http://evil.com",
             "http://localhost@evil.com",
+            "http://me@localhost:3419",
+            "http://.localhost",
+            "https://evals.darkmux.com x",
             "ftp://x",
         ] {
             assert!(!site_is_safe(bad), "{bad}");
