@@ -2080,13 +2080,19 @@ fn audit_dir_allowed_here(dir: &std::path::Path) -> bool {
     allowed
 }
 
+/// Whether the default sink carries the audit layer: audit is on, and this
+/// build may write at its dir ([`audit_dir_allowed_here`]).
+fn audit_layer_enabled() -> bool {
+    darkmux_types::config_access::audit_enabled() && audit_dir_allowed_here(&audit_dir())
+}
+
 fn build_default_sink() -> Arc<dyn FlowSink> {
     let mut sinks: Vec<Arc<dyn FlowSink>> = Vec::new();
 
     // (#875) `env(DARKMUX_AUDIT_DIR) presence > config.audit.enabled` via
     // config_access — so a config-only operator with `audit.enabled: true` gets
     // the AuditFileSink instead of it silently staying off.
-    let audit_enabled = darkmux_types::config_access::audit_enabled() && audit_dir_allowed_here(&audit_dir());
+    let audit_enabled = audit_layer_enabled();
     if audit_enabled {
         #[cfg(unix)]
         {
