@@ -21454,6 +21454,21 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         assert!(bounded > now + Duration::from_secs(599) && bounded < now + Duration::from_secs(700));
     }
 
+    /// (#2639) A budget too large for `now + secs` to represent (an
+    /// operator typing a ~19-digit number) never panics: a deadline past what
+    /// an `Instant` can hold is the same as no deadline, so it reads as
+    /// unbounded. The configured value itself is never clamped or rewritten.
+    #[test]
+    fn an_unrepresentable_inactivity_budget_reads_as_unbounded_instead_of_panicking() {
+        let now = Instant::now();
+        for secs in [u64::MAX, u64::MAX / 2, 9_300_000_000_000_000_000] {
+            let deadline = inactivity_deadline_after(secs, Duration::from_secs(5));
+            assert!(deadline > now + Duration::from_secs(365 * 24 * 3600), "{secs} must be unbounded");
+        }
+        let bounded = inactivity_deadline_after(600, Duration::from_secs(5));
+        assert!(bounded > now + Duration::from_secs(604) && bounded < now + Duration::from_secs(700));
+    }
+
     /// The watchdog's wake loop, handed the deadline a `0` budget produces,
     /// does not report an expiry: a done flag is the only thing that wakes it.
     #[test]
