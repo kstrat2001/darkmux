@@ -539,6 +539,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
             concat!(
                 r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"rep.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
                 r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"rep.phase.s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters: the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
+                // (#2799) A refused compaction is the same class: never a caution.
+                r#"{"ts":"2026-06-22T10:02:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"rep.phase.s1","handle":"coder","payload":{"kind":"compaction_skipped","severity":"info","detail":"compaction triggered at turn 7 (generation 3, 42 messages) and refused: summary too long; the thread is unchanged (#2797)"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -562,6 +564,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(
             !cautions.iter().any(|c| c.contains("[repetition]") || c.contains("degeneracy gate")),
             "repetition must never reach the model-facing brief: {cautions:?}"
+        );
+        assert!(
+            !cautions.iter().any(|c| c.contains("[compaction_skipped]")),
+            "a refused compaction must never reach the model-facing brief: {cautions:?}"
         );
     }
 

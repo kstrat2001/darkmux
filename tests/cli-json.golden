@@ -238,7 +238,7 @@ DetectorCounts
   per_turn_cap: uint32
   feedback_injected: uint32
   promoted_calls: uint32
-DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition"
+DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition" | "compaction_skipped"
 DetectorSeverity = "warn" | "info"
 Dialect = "chat-completions" | "chat-completions-max-tokens" | "messages"
 DirectDispatchEnvelope

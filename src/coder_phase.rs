@@ -2269,7 +2269,10 @@ fn mission_cautions(
             // before the #2887 F4 turn-grouping this brief-inject path does
             // not do) to every future dispatch's brief on a mission that
             // merely ran under a gate that fired — noise, not a caution.
-            if kind == "repetition" {
+            // (#2799) `compaction_skipped` is the same class: the runtime's
+            // own housekeeping (a compaction its guards refused), nothing
+            // about the code.
+            if darkmux_flow::payload::DARKMUX_INTERNAL_DETECTOR_KINDS.contains(&kind) {
                 continue;
             }
             let severity = finding.severity.as_str();

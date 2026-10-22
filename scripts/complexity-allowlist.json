@@ -1,4 +1,9 @@
 {
- "rust": {},
+ "rust": {
+  "crates/darkmux-flow/src/payload/telemetry.rs::DetectorKind::as_str": {
+   "max": 13,
+   "reason": "a flat enum-to-wire-word match: one arm per DetectorKind variant (11 kinds + unknown), no logic; it grows by one with each new kind (#2799 added compaction_skipped)"
+  }
+ },
  "ts": {}
 }

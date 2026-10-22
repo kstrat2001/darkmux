@@ -11865,6 +11865,53 @@
         assert!(detail.contains("recorded, not concluded"), "got {detail:?}");
     }
 
+    /// (#2799) A refused compaction (`compaction.skipped`, #2797) reaches the
+    /// flow stream as a `telemetry.detector` record while the run is live,
+    /// naming the turn, the generation it would have been and the guard's
+    /// reason. Before this it stopped at `trajectory.jsonl`, so an operator
+    /// watching occupancy stay high had no live reason why.
+    #[test]
+    #[serial]
+    fn a_refused_compaction_reaches_the_flow_stream_as_a_detector_record() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-compaction-skipped"),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"compaction.skipped","turn":7,"attempted_generation":3,"ts":1,"messages":42,"reason":"summary longer than the turns it replaces"}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-compaction-skipped"));
+        let detectors: Vec<&serde_json::Value> =
+            records.iter().filter(|v| v["action"] == "telemetry.detector").collect();
+        assert_eq!(detectors.len(), 1, "one record for the refusal; got {records:?}");
+        let payload = &detectors[0]["payload"];
+        assert_eq!(payload["kind"], "compaction_skipped");
+        assert_eq!(payload["severity"], "warn", "a refusal recovered nothing: never the check-marked `info`");
+        let detail = payload["detail"].as_str().unwrap();
+        for part in ["turn 7", "generation 3", "42 messages", "summary longer than the turns it replaces"] {
+            assert!(detail.contains(part), "detail must name {part:?}; got {detail:?}");
+        }
+    }
+
     /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
     /// verbatim from the runtime-stamped event, same passthrough discipline
     /// as the observe-mode test above, exercising the enforce/acted:true

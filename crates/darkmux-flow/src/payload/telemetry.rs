@@ -77,6 +77,10 @@ pub enum DetectorKind {
     /// The degeneracy gate judged the stream repeating.
     #[serde(rename = "repetition")]
     Repetition,
+    /// (#2799) A triggered compaction its own guards refused: nothing was
+    /// installed and the thread is unchanged.
+    #[serde(rename = "compaction_skipped")]
+    CompactionSkipped,
     /// A value this build does not name, read from an archive written by another version.
     /// Never written.
     #[schemars(skip)]
@@ -359,6 +363,11 @@ impl Attribution for TelemetryDetectorPayload {
     }
 }
 
+/// (#2887 F5, #2799) Detector kinds about darkmux's own machinery, never a
+/// finding about the code: a dispatch's brief (`mission_cautions`) and the
+/// crew index's `cautions` table both leave them out, through this one list.
+pub const DARKMUX_INTERNAL_DETECTOR_KINDS: &[&str] = &["repetition", "compaction_skipped"];
+
 impl DetectorKind {
     /// The wire word.
     pub fn as_str(self) -> &'static str {
@@ -373,6 +382,7 @@ impl DetectorKind {
             DetectorKind::MalformedToolNames => "malformed_tool_names",
             DetectorKind::Escalation => "escalation",
             DetectorKind::Repetition => "repetition",
+            DetectorKind::CompactionSkipped => "compaction_skipped",
             DetectorKind::Unknown => "unknown",
         }
     }

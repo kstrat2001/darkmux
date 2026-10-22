@@ -18,8 +18,18 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.3.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.4.0";
 // Version history:
+//   2.4.0 (#2799): `telemetry.detector` gains `payload.kind:
+//           "compaction_skipped"`: a compaction the runtime triggered and its
+//           own guards refused (#2797's `compaction.skipped` trajectory
+//           event), severity `warn` (`info` reads as recovered), the detail naming the turn, the
+//           generation it would have been, the message count and the reason.
+//           It used to stop at `trajectory.jsonl`, so a live view never saw
+//           why no compaction landed.
+//
+//           ADDITIVE: a reader that does not know the kind reads it as
+//           `DetectorKind::Unknown` (`#[serde(other)]`), never an error.
 //   2.3.0 (#3210): `dispatch.turn.heartbeat` gains `payload.prompt_processed`
 //           and `payload.prompt_total`, in tokens: how much of this
 //           request's UNCACHED prompt the engine has processed (`total` is

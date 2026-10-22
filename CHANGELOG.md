@@ -14,6 +14,17 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed
+
+- **FLOW 2.4.0 (additive).** A compaction the runtime triggered and then refused
+  (its own guards kept the thread unchanged) now reaches the live flow stream as a
+  `telemetry.detector` record, `kind: "compaction_skipped"`, severity `warn`, naming
+  the turn, the generation it would have been, the message count and the reason.
+  It used to stop at the dispatch's `trajectory.jsonl`, so a live view showing
+  context occupancy staying high had no reason beside it. Like `repetition`, it is
+  about darkmux's own machinery, so it is never injected into a dispatch's brief
+  as a caution. An older reader reads the new kind as unknown (#2799).
+
 ## [5.3.0] - 2026-10-18
 
 darkmux runs on Linux. On Omarchy (Arch on Asahi, an Apple Silicon laptop) with

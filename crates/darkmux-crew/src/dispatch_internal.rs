@@ -11614,6 +11614,7 @@ impl TailerState {
             | E::MalformedToolNames(_)
             | E::ToolCallDiscarded(_)
             | E::EscalationTriggered(_)
+            | E::CompactionSkipped(_)
             | E::GateAbort(_) => self.on_detector(&event),
             E::Context(c) => {
                 // (#557 slice 3) Per-turn context-window occupancy: the exact
@@ -11636,7 +11637,6 @@ impl TailerState {
             | E::DispatchComplete(_)
             | E::ToolCallPromoted(_)
             | E::PromotionSuppressed(_)
-            | E::CompactionSkipped(_)
             | E::CompactionUnproductive(_)
             | E::StaleContextTokens(_)
             | E::PreSendBound(_)
@@ -12616,9 +12616,21 @@ fn recorded_policy(policy: Option<&str>) -> Option<darkmux_types::config::Detect
 /// clean stream-gate observation (the same filter that keeps
 /// `dispatch.context` from flooding the stream).
 fn detector_telemetry_payload(event: &darkmux_trajectory::TrajectoryEvent) -> Option<TelemetryDetectorPayload> {
-    let mut finding = detector_finding(event)?;
+    let mut finding = detector_finding(event).or_else(|| compaction_skipped_finding(event))?;
     finding.detail = cap_str(&finding.detail, MAX_TRAJ_FIELD_BYTES);
     Some(finding)
+}
+
+/// (#2799) A refused compaction (#2797), live, so an operator watching
+/// occupancy stay high sees why no compaction landed. `Warn`, not `Info`:
+/// `Info` reads as "recovered" (the viewer draws it with a check mark), and
+/// a refusal recovered nothing: the thread is as full as before.
+fn compaction_skipped_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<TelemetryDetectorPayload> {
+    let darkmux_trajectory::TrajectoryEvent::CompactionSkipped(e) = event else { return None };
+    Some(TelemetryDetectorPayload::new(DetectorKind::CompactionSkipped, DetectorSeverity::Warn, format!(
+        "compaction triggered at turn {} (generation {}, {} messages) and refused: {}; the thread is unchanged (#2797)",
+        e.turn, e.attempted_generation, e.messages, e.reason
+    )))
 }
 
 /// Each detector-class event's finding. See [`detector_telemetry_payload`].
