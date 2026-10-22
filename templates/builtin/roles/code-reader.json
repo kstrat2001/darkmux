@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "id": "code-reader",
+  "description": "Tool-less code reader for the `reply-patch` lab provider: the code is in the message, and the reply names corrected lines as `FIX <line>: <corrected line>`, which the harness applies and tests. No tools on purpose: it measures reading and repair on models too small to drive a tool loop.",
+  "skills": [],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "role_family": "specialist"
+}

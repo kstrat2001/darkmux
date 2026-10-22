@@ -42,86 +42,7 @@ impl WorkloadProvider for CodingTaskProvider {
             fs::create_dir_all(sandbox_dir)?;
         }
 
-        // 1. Apply external sandbox seed (sibling directory referenced
-        //    via `sandboxSeed`). Embedded workloads can't use this
-        //    because include_str! only handles individual files.
-        if let Some(seed_rel) = manifest_seed_path(loaded) {
-            // (#897) The seed path comes from the (operator-installed,
-            // untrusted) manifest. Reject absolute / `..` / root components
-            // the same way setupContent keys are, then — after joining —
-            // canonicalize and assert the resolved path stays under base_dir,
-            // so a seed dir that is itself a symlink pointing outside can't
-            // pull host content into the agent-visible sandbox.
-            reject_escaping_relpath(&seed_rel, "sandboxSeed")?;
-            let seed_path = loaded.base_dir.join(&seed_rel);
-            if seed_path.exists() {
-                let base_canon = loaded.base_dir.canonicalize().with_context(|| {
-                    format!("resolving workload dir {}", loaded.base_dir.display())
-                })?;
-                let seed_canon = seed_path.canonicalize().with_context(|| {
-                    format!("resolving sandboxSeed path {}", seed_path.display())
-                })?;
-                if !seed_canon.starts_with(&base_canon) {
-                    bail!(
-                        "sandboxSeed `{seed_rel}` resolves outside the workload dir → {}",
-                        seed_canon.display()
-                    );
-                }
-                copy_dir_recursive(&seed_canon, sandbox_dir)
-                    .with_context(|| format!("seeding sandbox from {}", seed_canon.display()))?;
-            }
-        }
-
-        // 2. Apply inline setupContent (works with embedded workloads).
-        //    Writes each (relative-path → content) pair into the
-        //    sandbox dir, creating parent directories as needed.
-        //
-        //    Precedence: setupContent OVERLAYS on top of sandboxSeed.
-        //    If both target the same file, setupContent wins. This lets
-        //    an embedded workload patch a specific file over a copied
-        //    seed directory.
-        //
-        //    Re-applies on every dispatch (no skip-if-exists). The
-        //    sandbox is operator-mutated by each run (agent edits land
-        //    on disk); re-applying setupContent gives every dispatch a
-        //    deterministic starting point so re-runs don't measure
-        //    cached agent edits as "instant fixes."
-        if !loaded.manifest.workload.setup_content.is_empty() {
-            for (rel_path, content) in &loaded.manifest.workload.setup_content {
-                // Path-traversal hardening: reject absolute paths, `..`
-                // components, and any key that would resolve outside
-                // sandbox_dir. Embedded workloads are trusted (compiled
-                // in), but `~/.darkmux/workloads/<id>.json` is operator-
-                // installed and may come from a gist / friend / future
-                // install verb. Validate at the receiver, not at install.
-                validate_setup_content_key(rel_path).with_context(|| {
-                    format!("setupContent key `{rel_path}` is unsafe")
-                })?;
-                let target = sandbox_dir.join(rel_path);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!(
-                            "creating parent dir {} for setupContent file {}",
-                            parent.display(),
-                            rel_path
-                        )
-                    })?;
-                }
-                fs::write(&target, content).with_context(|| {
-                    format!("writing setupContent file {}", target.display())
-                })?;
-            }
-            // Operator-visible signal that the sandbox was reset before
-            // the agent ran. Without this, an operator looking at a
-            // mutated `~/.darkmux/sandboxes/<workload>/` couldn't tell
-            // whether the dispatch ran against fresh state or stale
-            // post-prior-edit state.
-            eprintln!(
-                "[lab] setupContent re-applied to {} ({} file(s))",
-                sandbox_dir.display(),
-                loaded.manifest.workload.setup_content.len()
-            );
-        }
+        seed_sandbox(loaded, sandbox_dir)?;
 
         // 3. Validate workload+role pairing. Coding-task workloads are
         //    editing-shaped; pairing with a role whose tool_palette
@@ -416,6 +337,7 @@ impl WorkloadProvider for CodingTaskProvider {
                 final_hash,
                 refused_artifacts: &refused_artifacts,
                 verify: verify_outcome,
+                provider: self.id(),
             },
             &dispatched,
         )
@@ -513,6 +435,92 @@ impl WorkloadProvider for CodingTaskProvider {
 /// reads the prompt's host path, can't find files at that path inside
 /// the container, and produces an empty trajectory. Verify commands
 /// run on the host and continue to use the host path.
+/// Steps 1 and 2 of setup: copy the workload's `sandboxSeed`, then overlay its
+/// `setupContent`. Shared with `reply-patch`, which seeds a sandbox the same way.
+pub(crate) fn seed_sandbox(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<()> {
+    // 1. Apply external sandbox seed (sibling directory referenced
+    //    via `sandboxSeed`). Embedded workloads can't use this
+    //    because include_str! only handles individual files.
+    if let Some(seed_rel) = manifest_seed_path(loaded) {
+        // (#897) The seed path comes from the (operator-installed,
+        // untrusted) manifest. Reject absolute / `..` / root components
+        // the same way setupContent keys are, then — after joining —
+        // canonicalize and assert the resolved path stays under base_dir,
+        // so a seed dir that is itself a symlink pointing outside can't
+        // pull host content into the agent-visible sandbox.
+        reject_escaping_relpath(&seed_rel, "sandboxSeed")?;
+        let seed_path = loaded.base_dir.join(&seed_rel);
+        if seed_path.exists() {
+            let base_canon = loaded.base_dir.canonicalize().with_context(|| {
+                format!("resolving workload dir {}", loaded.base_dir.display())
+            })?;
+            let seed_canon = seed_path.canonicalize().with_context(|| {
+                format!("resolving sandboxSeed path {}", seed_path.display())
+            })?;
+            if !seed_canon.starts_with(&base_canon) {
+                bail!(
+                    "sandboxSeed `{seed_rel}` resolves outside the workload dir → {}",
+                    seed_canon.display()
+                );
+            }
+            copy_dir_recursive(&seed_canon, sandbox_dir)
+                .with_context(|| format!("seeding sandbox from {}", seed_canon.display()))?;
+        }
+    }
+
+    // 2. Apply inline setupContent (works with embedded workloads).
+    //    Writes each (relative-path → content) pair into the
+    //    sandbox dir, creating parent directories as needed.
+    //
+    //    Precedence: setupContent OVERLAYS on top of sandboxSeed.
+    //    If both target the same file, setupContent wins. This lets
+    //    an embedded workload patch a specific file over a copied
+    //    seed directory.
+    //
+    //    Re-applies on every dispatch (no skip-if-exists). The
+    //    sandbox is operator-mutated by each run (agent edits land
+    //    on disk); re-applying setupContent gives every dispatch a
+    //    deterministic starting point so re-runs don't measure
+    //    cached agent edits as "instant fixes."
+    if !loaded.manifest.workload.setup_content.is_empty() {
+        for (rel_path, content) in &loaded.manifest.workload.setup_content {
+            // Path-traversal hardening: reject absolute paths, `..`
+            // components, and any key that would resolve outside
+            // sandbox_dir. Embedded workloads are trusted (compiled
+            // in), but `~/.darkmux/workloads/<id>.json` is operator-
+            // installed and may come from a gist / friend / future
+            // install verb. Validate at the receiver, not at install.
+            validate_setup_content_key(rel_path).with_context(|| {
+                format!("setupContent key `{rel_path}` is unsafe")
+            })?;
+            let target = sandbox_dir.join(rel_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "creating parent dir {} for setupContent file {}",
+                        parent.display(),
+                        rel_path
+                    )
+                })?;
+            }
+            fs::write(&target, content).with_context(|| {
+                format!("writing setupContent file {}", target.display())
+            })?;
+        }
+        // Operator-visible signal that the sandbox was reset before
+        // the agent ran. Without this, an operator looking at a
+        // mutated `~/.darkmux/sandboxes/<workload>/` couldn't tell
+        // whether the dispatch ran against fresh state or stale
+        // post-prior-edit state.
+        eprintln!(
+            "[lab] setupContent re-applied to {} ({} file(s))",
+            sandbox_dir.display(),
+            loaded.manifest.workload.setup_content.len()
+        );
+    }
+    Ok(())
+}
+
 fn expand_placeholders(input: &str, sandbox_dir: &Path) -> String {
     expand_placeholders_with(input, &sandbox_dir.display().to_string())
 }
@@ -604,7 +612,7 @@ fn validate_setup_content_key(key: &str) -> Result<()> {
 /// `validate_setup_content_key` and the `sandboxSeed` check (#897) so the
 /// same trust boundary is enforced identically in both places — one place
 /// to audit the escape rule.
-fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
+pub(crate) fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
     if raw.is_empty() {
         bail!("{label} is empty");
     }
@@ -761,7 +769,7 @@ fn dispatch_via_internal(
 /// its own (`darkmux-out-<role>-<unix micros>`), so `darkmux doctor`'s
 /// temp-residue check treats it the same. Only the NAME is chosen here; the
 /// dispatch creates the directory and refuses one that already exists.
-fn named_out_dir(role_id: &str) -> PathBuf {
+pub(crate) fn named_out_dir(role_id: &str) -> PathBuf {
     let micros = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
     std::env::temp_dir().join(format!("darkmux-out-{role_id}-{micros}"))
 }
@@ -775,18 +783,18 @@ fn named_out_dir(role_id: &str) -> PathBuf {
 /// A trajectory that never got a terminal record (the container was
 /// SIGKILLed) is closed with `interrupted`, so `darkmux run stats` reports
 /// what completed and says so, rather than reading an open-ended run.
-struct TrajectoryPreserver {
+pub(crate) struct TrajectoryPreserver {
     out_dir: PathBuf,
     run_dir: PathBuf,
     armed: bool,
 }
 
 impl TrajectoryPreserver {
-    fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
+    pub(crate) fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
         Self { out_dir, run_dir, armed: true }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -1073,7 +1081,7 @@ fn augment_qa_reply_with_workspace_delta(
 /// hostile `verify.command`. `darkmux lab register` warns at register time
 /// when a fixture declares one (the trust-establishment point); running
 /// verify inside the declared `--image` is a deferred hardening step.
-fn run_verify_command(
+pub(crate) fn run_verify_command(
     loaded: &LoadedWorkload,
     run_dir: &Path,
     sandbox_dir: &Path,
@@ -1153,6 +1161,7 @@ pub(crate) struct FinishInputs<'a> {
     pub final_hash: Option<String>,
     pub refused_artifacts: &'a [RefusedArtifact],
     pub verify: Option<crate::workloads::types::VerifyOutcome>,
+    pub provider: &'a str,
 }
 
 /// The tail of a run: write the manifest and build the result. How the
@@ -1176,6 +1185,7 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
             final_hash: f.final_hash.as_deref(),
             refused_artifacts: f.refused_artifacts,
             end: &end,
+            provider: f.provider,
         },
     )?;
     Ok(RunResult {
@@ -1202,6 +1212,9 @@ pub struct ManifestInputs<'a> {
     /// How the dispatch ended; stamped onto the manifest so an escalation
     /// reads as one on every surface that reads `manifest.json`.
     pub end: &'a DispatchEnd,
+    /// The provider that ran: `coding-task`, or `reply-patch`, which records
+    /// its runs in the same shape.
+    pub provider: &'a str,
 }
 
 /// Build and write this run's `manifest.json`: the one place the coding-task
@@ -1237,7 +1250,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         manifest_schema_version: Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string()),
         run_id: Some(run_id),
         workload: Some(m.workload_id.to_string()),
-        provider: Some(CodingTaskProvider.id().to_string()),
+        provider: Some(m.provider.to_string()),
         profile: Some(m.profile_name.to_string()),
         profile_description: Some(m.profile_description.to_string()),
         duration_ms: Some(u64::try_from(m.duration_ms).unwrap_or(u64::MAX)),
@@ -1397,6 +1410,7 @@ mod tests {
             trials: None,
             task_timeout_seconds: None,
             max_turns: None,
+            patch_target: None,
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),
@@ -1455,7 +1469,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], verify: None }, &d).unwrap();
+            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], verify: None, provider: "coding-task" }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -1494,6 +1508,7 @@ mod tests {
                     final_hash: None,
                     refused_artifacts: &[],
                     end: &end,
+                    provider: "coding-task",
                 },
             )
             .unwrap();

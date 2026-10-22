@@ -452,6 +452,7 @@ mod tests {
             trials: None,
             task_timeout_seconds: None,
             max_turns: None,
+            patch_target: None,
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),

@@ -56,6 +56,13 @@ pub(crate) const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "pepper-grinder",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/pepper-grinder.json")),
     ),
+    // The public small-machine workload: binds the published salt-shaker
+    // fixture (`node-salt-shaker-js@1.0`) on the tool-less reply-patch
+    // provider, sized for an 8 GB machine.
+    (
+        "salt-shaker",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/salt-shaker.json")),
+    ),
     (
         "quick-coding",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-coding.json")),

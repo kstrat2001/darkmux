@@ -1,5 +1,6 @@
 pub mod coding_task;
 pub mod prompt;
+pub mod reply_patch;
 pub mod tool_bench;
 pub mod workspace_delta;
 
@@ -9,6 +10,7 @@ use anyhow::Result;
 pub fn register_builtins() -> Result<()> {
     registry::register(Box::new(prompt::PromptProvider))?;
     registry::register(Box::new(coding_task::CodingTaskProvider))?;
+    registry::register(Box::new(reply_patch::ReplyPatchProvider))?;
     registry::register(Box::new(tool_bench::ToolBenchProvider::production()))?;
     Ok(())
 }

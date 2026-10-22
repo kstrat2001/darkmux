@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "_comment": "The public small-machine workload. Binds the published salt-shaker fixture by contract (node-salt-shaker-js@1.0): clone github.com/kstrat2001/salt-shaker, `darkmux lab fixture register <path>`, then `darkmux lab run salt-shaker -p <profile>`. No tools: the numbered source is in the prompt, the reply's FIX lines are applied by the reply-patch provider, and `npm test` judges the result. Sized for an 8 GB machine: about 2,000 prompt tokens, a two-line reply.",
+  "workload": {
+    "id": "salt-shaker",
+    "provider": "reply-patch",
+    "role": "code-reader",
+    "description": "Two named bugs in a 44-line duration parser on the public salt-shaker fixture (github.com/kstrat2001/salt-shaker, MIT). The model reads the numbered file with no tools and replies with the two corrected lines; the harness applies them and runs the suite (baseline 6 passing, 3 failing). Measured on 2026-10-22: Qwen3-4B-Instruct-2507 fixes both on an 8 GB M2; Qwen3-0.6B and 1.7B fix neither.",
+    "prompt": "Below is src/duration.js, shown with line numbers. Its function `parseDuration(text)` turns strings like \"1h30m\" into milliseconds. It has exactly two bugs:\n\n- Line 15 has the wrong multiplier for minutes.\n- Line 40 rejects exactly seven days, which should be allowed.\n\n```js\n${PATCH_FILE}\n```\n\nReply with exactly two lines and nothing else:\n\nFIX 15: <the corrected line 15>\nFIX 40: <the corrected line 40>\n",
+    "requires_fixture": "node-salt-shaker-js@1.0",
+    "patchTarget": "src/duration.js",
+    "verify": {
+      "command": "npm test",
+      "must_contain": [],
+      "must_not_contain": []
+    }
+  }
+}

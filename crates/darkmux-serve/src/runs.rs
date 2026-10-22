@@ -4655,6 +4655,7 @@ mod tests {
                             final_hash: None,
                             refused_artifacts: &[],
                             end,
+                            provider: "coding-task",
                         },
                     )
                 }

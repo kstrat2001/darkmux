@@ -39,6 +39,9 @@ pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     // model fabricate instead of calling tools; fabrication under the
     // freeform ANSWER:/BLOCKED: contract is what the bench measures).
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.json"))),
+    // Tool-less reader for the `reply-patch` lab provider: the code is in the
+    // message and the reply's FIX lines are applied and tested by the harness.
+    ("code-reader", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reader.json"))),
     // (#1222 Phase B packet 4 - #2418) Review seats (probe: k-draw,
     // per-bundle defect-finding; judge: double-confirm ruling on each
     // surviving flag) were removed here — they were the review funnel's
@@ -79,6 +82,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/reviewer.md"))),
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.md"))),
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"))),
+    ("code-reader", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reader.md"))),
     // (#1222 Phase B packet 4 - #2418) The review-probe/review-probe-{high,
     // mid,low}/review-judge/review-verify seat prompts were removed here
     // along with their role manifests above — the review funnel that

@@ -175,6 +175,11 @@ pub(crate) struct WorkloadSpec {
     /// (`tool-bench`) The per-task dispatch timeout override, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "taskTimeoutSeconds")]
     pub task_timeout_seconds: Option<serde_json::Value>,
+    /// (`reply-patch`) The file the reply's `FIX <line>: <text>` lines apply
+    /// to, relative to the sandbox. Shown to the model numbered, in place of
+    /// `${PATCH_FILE}` in the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "patchTarget")]
+    pub patch_target: Option<String>,
     /// (`coding-task`) The turn cap a run's dispatch falls back to when the
     /// operator has set none (`DispatchOpts::max_turns_override`: an operator's
     /// `max_turns` in env or config still wins). Lets a small-machine fixture
