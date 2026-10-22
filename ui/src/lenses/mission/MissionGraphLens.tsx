@@ -747,9 +747,14 @@ export function MissionGraphLens({
           <div className="msg none" role="alert">
             {msg}
           </div>
-          <button type="button" className="evbtn" title="retry — refetch graph" onClick={refresh}>
-            ↻
-          </button>
+          {/* A 404 is an answer, not a failure: the backstop poll keeps
+              asking, so a manual retry could only repeat it. Only a real
+              failure offers one. */}
+          {!notFound && (
+            <button type="button" className="evbtn retrybtn" title="retry — refetch graph" onClick={refresh}>
+              ↻ retry
+            </button>
+          )}
         </div>
       );
     }

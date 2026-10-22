@@ -290,6 +290,9 @@ describe("MissionGraphLens", () => {
     renderLens();
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert").textContent).toMatch(/ephemeral or cleared run/i);
+    // A 404 is an answer, not a failure: the backstop poll already refetches,
+    // so a manual retry would only repeat the same 404.
+    expect(document.querySelector('.missionlens[data-state="error"] button')).toBeNull();
   });
 
   it("renders the raw diagnostic on a non-404 error, distinct from the 404 branch", async () => {
@@ -297,6 +300,8 @@ describe("MissionGraphLens", () => {
     renderLens();
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert").textContent).toMatch(/darkmux mission graph:/i);
+    // A real failure keeps a retry, and it says what it does.
+    expect(screen.getByRole("button", { name: /retry/i }).textContent).toMatch(/retry/i);
   });
 
   // (operator, 2026-10-07) A step an operator's signal ended reads ABORTED,

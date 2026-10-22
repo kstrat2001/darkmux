@@ -6913,6 +6913,11 @@ body {
   color: var(--fg);
   border-color: var(--accent-dim);
 }
+/* The lens is a flex column, which would stretch the error state's retry
+   across the whole panel. */
+.missionlens .retrybtn {
+  align-self: flex-start;
+}
 .missionlens .evbtn.on {
   color: var(--accent);
   border-color: var(--accent);
