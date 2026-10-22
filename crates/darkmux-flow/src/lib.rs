@@ -4038,6 +4038,9 @@ mod tests {
         //            `dispatch.turn.heartbeat`, the engine's prefill progress over
         //            this request's uncached prompt; and `hub_relay`, `true` on the
         //            sparse generation beats that ride the fleet hub.
+        //   2.5.0 — (#3331) additive: `machine.telemetry`'s `now.package_power_mw`
+        //            (a total with no rails) and `now.sensors` (board
+        //            temperatures and fan), both on Omarchy.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -4049,7 +4052,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.4.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.5.0");
     }
 
     #[test]

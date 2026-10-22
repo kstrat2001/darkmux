@@ -69,17 +69,31 @@ pub struct CpuCluster {
     pub mhz: Option<u32>,
 }
 
-/// The three power rails, in milliwatts, over the sample's interval.
+/// Package power in milliwatts: the total, and each rail the host could
+/// read. On macOS, IOReport's three rails over the sample's interval, with
+/// the total their sum; on Omarchy (#3331), the SMC's one SoC total, read at
+/// the sample, with no rails. A rail not read is `None`, never `0.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PowerSample {
-    pub cpu_mw: f64,
-    pub gpu_mw: f64,
-    pub ane_mw: f64,
+    pub cpu_mw: Option<f64>,
+    pub gpu_mw: Option<f64>,
+    pub ane_mw: Option<f64>,
+    total_mw: f64,
 }
 
 impl PowerSample {
+    /// All three rails; the total is their sum.
+    pub const fn rails(cpu_mw: f64, gpu_mw: f64, ane_mw: f64) -> Self {
+        Self { cpu_mw: Some(cpu_mw), gpu_mw: Some(gpu_mw), ane_mw: Some(ane_mw), total_mw: cpu_mw + gpu_mw + ane_mw }
+    }
+
+    /// A total the host could not split into rails.
+    pub const fn total_only(total_mw: f64) -> Self {
+        Self { cpu_mw: None, gpu_mw: None, ane_mw: None, total_mw }
+    }
+
     pub fn total_mw(&self) -> f64 {
-        self.cpu_mw + self.gpu_mw + self.ane_mw
+        self.total_mw
     }
 }
 
@@ -111,8 +125,14 @@ pub struct HostSampleFull {
     /// never per sample.
     pub battery: Option<BatterySample>,
     /// `None` on the first sample (an energy delta needs two reads) and
-    /// whenever IOReport is unavailable.
+    /// whenever IOReport is unavailable. (#3331) On a host with an
+    /// instantaneous package sensor instead (Omarchy's SMC), read at every
+    /// sample, the first included, as a total with no rails.
     pub power: Option<PowerSample>,
+    /// (#3331) The board's labeled temperatures and fan, where the platform
+    /// reads them (Omarchy). Never mapped onto [`Self::thermal`]: a
+    /// temperature is not a pressure state.
+    pub sensors: Option<darkmux_platform::BoardSensors>,
 }
 
 /// Which sources actually resolved on this host — what `darkmux doctor`
@@ -417,8 +437,8 @@ pub fn reduce_host_extras(raw: &[HostExtraAt], configured_interval_ms: Option<u6
         cap_ms.map_or(gap, |cap| gap.min(cap))
     };
 
-    let cpu: Vec<f64> = raw.iter().filter_map(|s| s.power.map(|p| p.cpu_mw)).collect();
-    let gpu: Vec<f64> = raw.iter().filter_map(|s| s.power.map(|p| p.gpu_mw)).collect();
+    let cpu: Vec<f64> = raw.iter().filter_map(|s| s.power.and_then(|p| p.cpu_mw)).collect();
+    let gpu: Vec<f64> = raw.iter().filter_map(|s| s.power.and_then(|p| p.gpu_mw)).collect();
     let total: Vec<f64> = raw
         .iter()
         .filter_map(|s| s.power.map(|p| p.total_mw()))
@@ -675,7 +695,7 @@ impl HostProbe {
         // EVERY target, not dead code the non-aarch64 lib build would flag
         // under `-D warnings`, matching the module doc's "tested (and, here,
         // exercised) everywhere" promise.
-        let power = power_from_rails(None, None, None);
+        let power = power_from_rails(None, None, None).or_else(platform::package_power);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let (clusters, gpu_mhz, power) = {
             let mut clusters = clusters;
@@ -729,6 +749,7 @@ impl HostProbe {
             // slow half (health) is NOT read here; see the field's doc.
             battery: host_reading.battery,
             power,
+            sensors: darkmux_platform::current().board_sensors(),
         }
     }
 }
@@ -749,7 +770,7 @@ impl HostProbe {
 /// target the way the module doc promises the arithmetic is.
 fn power_from_rails(cpu_mw: Option<f64>, gpu_mw: Option<f64>, ane_mw: Option<f64>) -> Option<PowerSample> {
     match (cpu_mw, gpu_mw, ane_mw) {
-        (Some(cpu_mw), Some(gpu_mw), Some(ane_mw)) => Some(PowerSample { cpu_mw, gpu_mw, ane_mw }),
+        (Some(cpu_mw), Some(gpu_mw), Some(ane_mw)) => Some(PowerSample::rails(cpu_mw, gpu_mw, ane_mw)),
         _ => None,
     }
 }
@@ -845,6 +866,11 @@ mod platform {
     pub fn with_cluster_mhz(clusters: Vec<super::CpuCluster>) -> Vec<super::CpuCluster> {
         clusters
     }
+
+    /// IOReport's rails are the power reading here (the branch above).
+    pub fn package_power() -> Option<super::PowerSample> {
+        None
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -861,6 +887,12 @@ mod platform {
             c.mhz = c.mhz.or(mhz);
         }
         clusters
+    }
+
+    /// (#3331) The platform's one package total (Omarchy: the SMC's
+    /// `Heatpipe Power`), with no rails beside it.
+    pub fn package_power() -> Option<super::PowerSample> {
+        darkmux_platform::current().package_power_mw().map(super::PowerSample::total_only)
     }
 }
 
@@ -889,11 +921,7 @@ mod tests {
     }
 
     fn p(cpu: f64, gpu: f64, ane: f64) -> Option<PowerSample> {
-        Some(PowerSample {
-            cpu_mw: cpu,
-            gpu_mw: gpu,
-            ane_mw: ane,
-        })
+        Some(PowerSample::rails(cpu, gpu, ane))
     }
 
     fn t(state: &str, limit: u64) -> Option<ThermalSample> {
@@ -1266,8 +1294,32 @@ mod tests {
 
     #[test]
     fn total_mw_sums_the_three_rails() {
-        let p = PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 5.0 };
+        let p = PowerSample::rails(1200.0, 30.0, 5.0);
         assert_eq!(p.total_mw(), 1235.0);
+    }
+
+    /// (#3331) Omarchy's one SoC total: no rail is invented beside it, the
+    /// wire carries it as `package_power_mw` with `power_mw` null, and the window still reduces its total
+    /// and energy while the rail windows read "not measured".
+    #[test]
+    fn a_total_only_reading_has_no_rails_on_the_wire_or_in_the_window() {
+        let p = PowerSample::total_only(5001.0);
+        assert_eq!((p.cpu_mw, p.gpu_mw, p.ane_mw, p.total_mw()), (None, None, None, 5001.0));
+        assert_eq!(wire::rails_now(&p), None, "no rail is written as 0");
+        let now = wire::host_sample_now(&HostSampleFull { power: Some(p), ..Default::default() }, 1);
+        assert_eq!((now.power_mw, now.package_power_mw), (None, Some(5001)));
+        let mac = wire::host_sample_now(&HostSampleFull { power: Some(PowerSample::rails(1200.0, 30.0, 5.0)), ..Default::default() }, 1);
+        assert_eq!((mac.power_mw.map(|p| p.total), mac.package_power_mw), (Some(1235), None));
+        let raw = [
+            HostExtraAt { at_ms: 0, power: Some(PowerSample::total_only(18_000.0)), thermal: None },
+            HostExtraAt { at_ms: 3_600_000, power: Some(PowerSample::total_only(2_000.0)), thermal: None },
+        ];
+        let x = reduce_host_extras(&raw, None);
+        let w = x.power.unwrap();
+        assert_eq!(w.total.mean_mw, Some(10_000.0));
+        assert_eq!((w.cpu, w.gpu), (MwStats::default(), MwStats::default()));
+        assert_eq!(x.energy_mwh, Some(18_000.0), "18 W held for an hour");
+        assert!(x.thermal.is_none(), "no pressure state was read, so none is reported");
     }
 
     // (#2108 review finding) `power_from_rails`: an unrecognized unit on
@@ -1279,7 +1331,7 @@ mod tests {
     fn power_from_rails_requires_all_three_or_none() {
         assert_eq!(
             power_from_rails(Some(1200.0), Some(30.0), Some(5.0)),
-            Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 5.0 }),
+            Some(PowerSample::rails(1200.0, 30.0, 5.0)),
             "all three present ⇒ a real reading"
         );
         assert_eq!(power_from_rails(None, None, None), None, "none present ⇒ no reading at all");
@@ -1289,7 +1341,7 @@ mod tests {
     fn power_from_rails_an_unknown_unit_rail_is_not_zeroed() {
         // ANE's unit failed to parse (e.g. an unrecognized energy unit);
         // CPU and GPU read fine. The pre-fix code reported
-        // `Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 0.0 })`
+        // `Some(PowerSample::rails(1200.0, 30.0, 0.0))`
         // — a fabricated "ANE draws 0 mW" that looks exactly like a real
         // measurement. The fix reports no power at all for this sample
         // rather than mixing two real numbers with one invented zero.
@@ -1615,7 +1667,8 @@ mod tests {
         if let Some(p) = &s.power {
             // A Mac drawing more than 1 kW, or negative power, means the unit
             // scaling is wrong — the exact failure the closed unit set guards.
-            for (name, mw) in [("cpu", p.cpu_mw), ("gpu", p.gpu_mw), ("ane", p.ane_mw)] {
+            let rails = [("cpu", p.cpu_mw), ("gpu", p.gpu_mw), ("ane", p.ane_mw)];
+            for (name, mw) in rails.into_iter().filter_map(|(n, mw)| Some((n, mw?))).chain([("total", p.total_mw())]) {
                 assert!(
                     (0.0..=1_000_000.0).contains(&mw),
                     "{name} power implausible ({mw} mW) — check the energy unit scaling"

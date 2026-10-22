@@ -16550,12 +16550,12 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &[
             HostExtraAt {
                 at_ms: 0,
-                power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                power: Some(PowerSample::rails(1000.0, 100.0, 0.0)),
                 thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
             },
             HostExtraAt {
                 at_ms: 3_600_000,
-                power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                power: Some(PowerSample::rails(3000.0, 100.0, 0.0)),
                 thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
             },
         ],
@@ -18207,7 +18207,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             gpu_mhz: Some(500),
             gpu_mem_bytes: Some(1_000_000),
             thermal: Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 90 }),
-            power: Some(PowerSample { cpu_mw: 800.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+            power: Some(PowerSample::rails(800.0, 100.0, 0.0)),
+            sensors: None,
             // (#2705) The charge half of the machine-scoped telemetry
             // payload — asserted below alongside every other field, so the
             // record's full shape stays pinned in one place.
@@ -18676,12 +18677,12 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &[
                 HostExtraAt {
                     at_ms: 0,
-                    power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(1000.0, 100.0, 0.0)),
                     thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
                 },
                 HostExtraAt {
                     at_ms: 8000,
-                    power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(3000.0, 100.0, 0.0)),
                     thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
                 },
             ],
@@ -18824,12 +18825,12 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &[
                 HostExtraAt {
                     at_ms: 0,
-                    power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(1000.0, 100.0, 0.0)),
                     thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
                 },
                 HostExtraAt {
                     at_ms: 8000,
-                    power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(3000.0, 100.0, 0.0)),
                     thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
                 },
             ],
@@ -19044,12 +19045,12 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &[
                 HostExtraAt {
                     at_ms: 0,
-                    power: Some(PowerSample { cpu_mw: 500.0, gpu_mw: 50.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(500.0, 50.0, 0.0)),
                     thermal: Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 90 }),
                 },
                 HostExtraAt {
                     at_ms: 2000,
-                    power: Some(PowerSample { cpu_mw: 600.0, gpu_mw: 60.0, ane_mw: 0.0 }),
+                    power: Some(PowerSample::rails(600.0, 60.0, 0.0)),
                     thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 40 }),
                 },
             ],
@@ -21950,7 +21951,7 @@ fn a_reading_joins_the_utilization_series_when_any_of_its_three_was_read() {
 fn a_reading_joins_the_extras_series_when_it_read_power_or_thermal() {
     let none = crate::host_probe::HostSampleFull::default();
     assert!(super::host_extra_at(7, &none).is_none());
-    let power = crate::host_probe::PowerSample { cpu_mw: 1.0, gpu_mw: 2.0, ane_mw: 3.0 };
+    let power = crate::host_probe::PowerSample::rails(1.0, 2.0, 3.0);
     let with_power = crate::host_probe::HostSampleFull { power: Some(power), ..Default::default() };
     let at = super::host_extra_at(7, &with_power).expect("power alone");
     assert_eq!((at.at_ms, at.power, at.thermal), (7, Some(power), None));

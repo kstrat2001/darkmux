@@ -3,6 +3,7 @@ import type { BatteryCharge } from "./BatteryCharge";
 import type { CpuClusterNow } from "./CpuClusterNow";
 import type { DeclaredFleetMode } from "./DeclaredFleetMode";
 import type { PowerNow } from "./PowerNow";
+import type { SensorsNow } from "./SensorsNow";
 import type { ThermalNow } from "./ThermalNow";
 
 /**
@@ -48,4 +49,17 @@ sampler_cost_ms: number, cpu_pct: number | null,
 /**
  * One entry per `hw.perflevelN`; `null` when the host reports none.
  */
-cpu_clusters: Array<CpuClusterNow> | null, mem_pct: number | null, gpu_pct: number | null, gpu_mhz: number | null, gpu_mem_bytes: number | null, thermal: ThermalNow | null, battery: BatteryCharge | null, power_mw: PowerNow | null, };
+cpu_clusters: Array<CpuClusterNow> | null, mem_pct: number | null, gpu_pct: number | null, gpu_mhz: number | null, gpu_mem_bytes: number | null, thermal: ThermalNow | null, battery: BatteryCharge | null, power_mw: PowerNow | null, 
+/**
+ * (#3331, flow 2.5.0) The package total in milliwatts, where the host
+ * reads one with no per-rail split (Omarchy: the SMC's `Heatpipe
+ * Power`); `power_mw` is then `null`, since a rail it did not read is
+ * never written as `0`. Absent where `power_mw` carries the total
+ * (macOS), and on every record written before 2.5.0.
+ */
+package_power_mw?: number, 
+/**
+ * (#3331, flow 2.5.0) Absent where the host reads no board sensors
+ * (macOS today), and on every record written before 2.5.0.
+ */
+sensors?: SensorsNow, };

@@ -18,8 +18,20 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.4.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.5.0";
 // Version history:
+//   2.5.0 (#3331): `machine.telemetry` gains `now.package_power_mw`, the
+//           package total in milliwatts where the host reads one with no
+//           per-rail split (Omarchy on Asahi: the SMC's `Heatpipe Power`).
+//           `now.power_mw` stays `null` there, because its CPU/GPU/ANE
+//           rails were not read and are never written as `0`. Also
+//           `now.sensors`: `{temps_c: {<label>: °C}, fan_rpm}` from the
+//           board's labeled sensors (Omarchy's SMC hwmon). Temperatures are
+//           not a thermal pressure level and never fill `now.thermal`, which
+//           stays `null` on Omarchy.
+//
+//           ADDITIVE: both keys are written only when read, so a macOS record
+//           is unchanged and a reader that does not know them ignores them.
 //   2.4.0 (#2799): `telemetry.detector` gains `payload.kind:
 //           "compaction_skipped"`: a compaction the runtime triggered and its
 //           own guards refused (#2797's `compaction.skipped` trajectory

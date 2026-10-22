@@ -57,6 +57,20 @@ pub struct PowerNow {
     pub total: i64,
 }
 
+/// (#3331) The board's labeled temperature sensors and its fan, where the host
+/// reports them (Omarchy: the SMC's hwmon). Temperatures, not a thermal
+/// pressure level, so they never fill [`ThermalNow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct SensorsNow {
+    /// Degrees Celsius, keyed by the sensor's own label.
+    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, number>"))]
+    pub temps_c: BTreeMap<String, f64>,
+    /// The fastest fan; `null` on a fanless machine.
+    pub fan_rpm: Option<u32>,
+}
+
 /// What a battery is doing right now, from observed facts only.
 ///
 /// `Held` is on AC, not charging, not full, with current about zero: macOS is holding the level
@@ -116,6 +130,19 @@ pub struct HostSampleNow {
     pub thermal: Option<ThermalNow>,
     pub battery: Option<BatteryCharge>,
     pub power_mw: Option<PowerNow>,
+    /// (#3331, flow 2.5.0) The package total in milliwatts, where the host
+    /// reads one with no per-rail split (Omarchy: the SMC's `Heatpipe
+    /// Power`); `power_mw` is then `null`, since a rail it did not read is
+    /// never written as `0`. Absent where `power_mw` carries the total
+    /// (macOS), and on every record written before 2.5.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "number"))]
+    pub package_power_mw: Option<i64>,
+    /// (#3331, flow 2.5.0) Absent where the host reads no board sensors
+    /// (macOS today), and on every record written before 2.5.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub sensors: Option<SensorsNow>,
 }
 
 /// One battery HEALTH reading: a slow-moving machine fact, refreshed on an
@@ -388,5 +415,22 @@ mod charge_state_tests {
     fn an_unrecognized_state_reads_as_unknown_not_an_error() {
         let s: ChargeState = serde_json::from_str("\"trickle\"").unwrap();
         assert_eq!(s, ChargeState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::HostSampleNow;
+
+    /// (#3331, 2.5.0) The new keys are absent unless read, so a macOS record
+    /// serializes exactly as before, and a record from before 2.5.0 reads.
+    #[test]
+    fn package_power_and_sensors_are_absent_unless_read() {
+        let old = r#"{"sampled_at_ms":1,"sampler_cost_ms":1,"cpu_pct":null,"cpu_clusters":null,"mem_pct":null,"gpu_pct":null,"gpu_mhz":null,"gpu_mem_bytes":null,"thermal":null,"battery":null,"power_mw":null}"#;
+        let now: HostSampleNow = serde_json::from_str(old).unwrap();
+        assert_eq!((now.package_power_mw, now.sensors.is_some()), (None, false));
+        assert_eq!(serde_json::to_string(&now).unwrap(), old);
+        let omarchy: HostSampleNow = serde_json::from_str(&old.replace("}", r#","package_power_mw":5001}"#)).unwrap();
+        assert_eq!(omarchy.package_power_mw, Some(5001));
     }
 }

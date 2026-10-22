@@ -102,6 +102,7 @@ BoundRef
   value: uint64 | null
   source: string | null
 BudgetPolicy = "off" | "warn" | "wait"
+BusyBasis = "gpu_utilization" | "model_streams" | "mixed"
 CapabilityProfile = { [key: string]: number }
 CardAccepts
   peer_name: string
@@ -480,6 +481,8 @@ HostSampleNow
   thermal: ThermalNow | null
   battery: BatteryCharge | null
   power_mw: PowerNow | null
+  package_power_mw?: int64 | null
+  sensors?: SensorsNow | null
 HostWindow
   thermal_worst_state: string | null
   above_nominal_ms: uint64 | null
@@ -1023,6 +1026,10 @@ RunStats
   cpu_w_busy: double | null
   pkg_w_busy: double | null
   gpu_duty_pct: double | null
+  busy_basis: BusyBasis | null
+  host_unmeasured: { [key: string]: string }
+  board_temp_c_max_busy: double | null
+  fan_rpm_max_busy: uint32 | null
   samples_busy: uint
   samples_idle: uint
   busy_ms: uint64 | null
@@ -1063,6 +1070,9 @@ SchemaSkew
   observed_versions?: string[]
   skew_detected: boolean
   skew_reason?: string | null
+SensorsNow
+  temps_c: { [key: string]: double }
+  fan_rpm: uint32 | null
 SetError
   run: string
   error: string

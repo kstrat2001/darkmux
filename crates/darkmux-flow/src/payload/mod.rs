@@ -56,7 +56,7 @@ pub use lifecycle::{
 pub use machine::{
     BatteryCharge, BatteryHealthNow, ChargeState, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
     MachineBatteryPayload, MachineLoad, MachineTelemetryPayload, MachineThermalPayload, MetricWindow,
-    PowerNow, PowerWindowWire, ThermalNow, ThermalWindowWire,
+    PowerNow, PowerWindowWire, SensorsNow, ThermalNow, ThermalWindowWire,
 };
 pub use telemetry::{
     DARKMUX_INTERNAL_DETECTOR_KINDS, DetectorArea, DetectorKind, DetectorSeverity, LmsEvent, LmsRole, TelemetryCompactionPayload, TelemetryContextPayload,
