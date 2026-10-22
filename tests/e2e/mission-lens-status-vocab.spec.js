@@ -217,6 +217,14 @@ test('every phase container has a visible border, not one that matches the backg
   // `.phasegroup` base rule was never derived from either number and needs
   // its own measurement to be trusted at all.
   const { errors } = await open(page, [graph('active', 'planned')]);
+  // (#1734) Wait for the lens to lay the phase container out (a renderer
+  // mounted and a non-zero box) before asserting on it: a bare visibility
+  // wait raced React Flow's first layout on the CI runner ~1 run in 3, the
+  // same gate mission-lens-layout-geometry.spec.js uses.
+  await page.waitForFunction(() => {
+    const el = document.querySelector('.missionlens .phasegroup');
+    return !!el && el.getBoundingClientRect().height > 0;
+  });
   const box = page.locator('.missionlens .phasegroup').first();
   await expect(box).toBeVisible();
 
