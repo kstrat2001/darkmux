@@ -1114,7 +1114,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
                 continue;
             }
             for line in std::fs::read_to_string(&p).unwrap().lines() {
-                let r: serde_json::Value = serde_json::from_str(line).unwrap();
+                // (#1847) A flow file may hold a line that is not one record
+                // (a partial write, a blank); skip it rather than panic.
+                let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 if r.get("stage").and_then(|v| v.as_str()) == Some("debrief")
                     && r.get("action").and_then(|v| v.as_str()) == Some("mission.debrief.prompt")
                     && r.get("mission_id").and_then(|v| v.as_str()) == Some("m-x")

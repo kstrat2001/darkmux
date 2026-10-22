@@ -13615,7 +13615,9 @@
             }
         }
 
-        let records = drain_flow_records(tmp.path());
+        // (#1664) Scoped to this execution's session: an unscoped drain
+        // counted a sibling test's records into the exact counts below.
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("mission-run-m1-build-abc"));
 
         // Every record of the tailed execution (its turns, tool calls and
         // usage) names it, with no exception.

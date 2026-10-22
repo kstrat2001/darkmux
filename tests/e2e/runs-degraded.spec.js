@@ -173,11 +173,13 @@ test('degraded rows are still rendered inertly, not as markup', async ({ page })
 });
 
 test('an empty runs payload reads as empty, never as an error', async ({ page }) => {
-  const errors = await openRuns(page, { generated_at_ms: 1893456600000, runs: [] }).catch(() => []);
-  // `openRuns` waits for a row, which will not appear — so re-drive it here
-  // without that wait rather than asserting on a timeout.
+  // (#1664) Not `openRuns`: it waits for a row that will not appear, and
+  // swallowing that timeout also threw away its error list, so this test's
+  // `errors` was always empty. The listener is registered here instead.
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
   await page.route('**/runs*', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ runs: [] }) })
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ generated_at_ms: 1893456600000, runs: [] }) })
   );
   await page.goto('/index-lab.html#lens=runs');
   await expect(page.locator('.labrunrow')).toHaveCount(0);

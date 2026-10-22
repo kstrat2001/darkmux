@@ -926,6 +926,24 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(screen.getByRole("button", { name: "--kind mission ▾" })).toHaveFocus();
   });
 
+  it("a click outside the token closes the menu without changing the selection (#1921)", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    expect(screen.getByRole("listbox", { name: "--kind" })).toBeInTheDocument();
+    // A click inside the menu's anchor (an option's row) is not "outside".
+    fireEvent.click(screen.getByRole("listbox", { name: "--kind" }));
+    expect(screen.getByRole("listbox", { name: "--kind" })).toBeInTheDocument();
+
+    fireEvent.click(document.body);
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "--kind all ▾" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("opt.kind="))).toBe(false);
+  });
+
   it("keyboard: Escape closes the menu without changing the selection and returns focus to the token", async () => {
     const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
