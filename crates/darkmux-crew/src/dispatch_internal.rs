@@ -7320,6 +7320,75 @@ fn container_dispatch_start_payload(
     ))
 }
 
+/// (#2640) The `docker run` CLI child, reaped on every exit path. Rust's
+/// `Child` never waits on drop, so a panic or an early `?` between the spawn
+/// and `wait_with_output` left a zombie under a process that survives it (the
+/// fleet runner catches panics). Dropped un-waited, the child goes to a
+/// detached thread that reaps it within [`CLI_REAP_GRACE`] and kills it
+/// after: never a blocking wait inside an unwind. Declared after the kill
+/// guard wherever both live, so the container is killed first and the CLI
+/// then exits on its own.
+struct ReapedChild(Option<std::process::Child>);
+
+/// How long a dropped docker CLI gets to exit on its own (the kill guard
+/// has just killed its container) before it is killed and reaped.
+const CLI_REAP_GRACE: Duration = Duration::from_secs(10);
+const CLI_REAP_POLL: Duration = Duration::from_millis(100);
+
+impl ReapedChild {
+    fn id(&self) -> u32 {
+        self.0.as_ref().map_or(0, std::process::Child::id)
+    }
+
+    fn get_mut(&mut self) -> Option<&mut std::process::Child> {
+        self.0.as_mut()
+    }
+
+    /// Waits for the child and collects its output: the normal reap.
+    fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+        match self.0.take() {
+            Some(child) => child.wait_with_output(),
+            None => Err(std::io::Error::other("the container's docker CLI was already reaped")),
+        }
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = std::thread::Builder::new()
+                .name("darkmux-cli-reaper".into())
+                .spawn(move || reap_bounded(&mut child, CLI_REAP_GRACE, CLI_REAP_POLL));
+        }
+    }
+}
+
+/// How [`reap_bounded`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    Exited,
+    Killed,
+    Unwaitable,
+}
+
+/// Reaps `child`: polls for it to exit for up to `grace`, then kills it and
+/// waits (a killed process exits at once). Never waits unbounded on a child
+/// that will not exit by itself.
+fn reap_bounded(child: &mut std::process::Child, grace: Duration, poll: Duration) -> ReapOutcome {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return ReapOutcome::Exited,
+            Err(_) => return ReapOutcome::Unwaitable,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                return if child.wait().is_ok() { ReapOutcome::Killed } else { ReapOutcome::Unwaitable };
+            }
+            Ok(None) => std::thread::sleep(poll),
+        }
+    }
+}
+
 /// The spawned container, and what the run resolved on the way to it.
 struct LaunchedContainer {
     // Field order is drop order: the kill guard, then the pid registration,
@@ -7328,7 +7397,7 @@ struct LaunchedContainer {
     container_kill_guard: ContainerKillGuard,
     /// (#2131 review round 2) The child's pid, registered for `kill_all`.
     container_child_registration: PidRegistration,
-    child: std::process::Child,
+    child: ReapedChild,
     container_name: String,
     compaction: crate::dispatch::CompactionDispatchArgs,
     utility_model: Option<String>,
@@ -7403,7 +7472,9 @@ fn launch_container(
         (remote_auth.is_some(), compactor_auth.is_some()),
         (inactivity_timeout_seconds, inactivity_timeout_seconds_source),
     )?;
-    let mut child = spawn_container(&argv_config, opts.max_turns_override)?;
+    // (#2640) Wrapped at once: every path below that drops it un-waited
+    // (an early `?`, a panic) still reaps the docker CLI.
+    let mut child = ReapedChild(Some(spawn_container(&argv_config, opts.max_turns_override)?));
 
     // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
     // the child exists — mirrors the hosted-curl path's own
@@ -7448,7 +7519,9 @@ fn launch_container(
     // every exposure vector: the secret still lives in the runtime
     // process's memory for the dispatch's duration (see the residual-risk
     // note on `auth_header_stdin` in `runtime/src/main.rs`).
-    pipe_auth_headers(&mut child, remote_auth.take(), compactor_auth.take())?;
+    if let Some(c) = child.get_mut() {
+        pipe_auth_headers(c, remote_auth.take(), compactor_auth.take())?;
+    }
     Ok(LaunchedContainer {
         container_kill_guard,
         container_child_registration,
