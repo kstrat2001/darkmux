@@ -59,11 +59,16 @@ import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { clkhm, fmtElapsed } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
-import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
+import { fetchJson, type FetchResult } from "../../lib/fetcher";
+import { missionRowOf } from "../../lib/lifecycle";
+import { runChip } from "../runs/format";
+import type { Run } from "../../types/generated/Run";
+import type { RunsResponse } from "../../types/generated/RunsResponse";
+import { queryKeys, PRESENCE_POLL_MS, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { useDay } from "../../hooks/useDay";
-import { getSource } from "../../lib/source";
-import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
+import { getSource, runsReachable, runsSrc } from "../../lib/source";
+import { WorkStatus, workStatusKind, type WorkStatusWord } from "../../components/WorkStatus";
+import type { LivenessState } from "../../components/LivenessPulse";
 import { bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -268,6 +273,77 @@ function splitMissionId(id: string): { name: string; epoch: number | null; hash:
   if (!m) return { name: id, epoch: null, hash: null };
   return { name: m[1], epoch: Number(m[2]) * 1000, hash: m[3] };
 }
+/** (#2868) The mission header's status chip. A mission's status is decided
+ *  ONCE, on its `/runs` row (the runs board's decision, `darkmux run list`'s
+ *  too), and the header shows that row exactly as the board's badge does
+ *  (`runChip`: word, color, pulse, hover). The query is the runs board's own
+ *  (same key, one shared cache entry).
+ *
+ *  - Until `/runs` first answers, the chip is neutral and claims nothing: the
+ *    lifecycle word would flash green `finalized` before the row turns it red
+ *    (#2284's class).
+ *  - A refetch that fails keeps the last good read and shows the mission's
+ *    row from it as last known (`lastKnownChip`): its word and color, never
+ *    the live treatment.
+ *  - Only with no row to show does the chip read the lifecycle word
+ *    (`finalized`, `active`: closed out or open, not how it ended): `/runs`
+ *    answered without this mission (a peer's mission outside the window), it
+ *    failed before any good read, or this page has no `/runs` to ask (a static
+ *    build with no runs fixture). */
+function useMissionHeaderState(
+  missionId: string,
+  graph: Pick<MissionGraph, "mission_status"> | null | undefined,
+  daemonBacked: boolean,
+): MissionHeaderChip {
+  const reachable = runsReachable();
+  const runsQuery = useQuery({
+    queryKey: queryKeys.runs(),
+    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
+    enabled: reachable,
+    refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
+  });
+  const kept = useKeptMissionRow(runsQuery.data, missionId);
+  if (reachable && runsQuery.status === "pending") return PENDING_CHIP;
+  if (!kept.row) return { status: graph?.mission_status };
+  return kept.stale ? lastKnownChip(runChip(kept.row)) : runChip(kept.row);
+}
+
+/** The mission's row from the latest GOOD `/runs` read, and whether that read
+ *  is stale (the latest read failed). A failed refetch never erases what was
+ *  known, for this mission or any other the page navigates to; `missionRowOf`
+ *  picks the mission's own row out of the kept read. (React's "store
+ *  information from previous renders" pattern.) */
+function useKeptMissionRow(data: FetchResult<RunsResponse> | undefined, missionId: string): { row: Run | null; stale: boolean } {
+  const [kept, setKept] = useState<RunsResponse["runs"] | null>(null);
+  const rows = data?.ok ? data.data.runs : undefined;
+  if (rows && rows !== kept) setKept(rows);
+  const row = missionRowOf(rows ?? kept ?? [], missionId);
+  return { row, stale: !rows && row !== null };
+}
+
+/** A kept row's chip while `/runs` is failing: its word and color stand, but
+ *  a running row loses the live treatment (no pulse, no clock, no process
+ *  readout), since nothing says it is still running. */
+function lastKnownChip(chip: MissionHeaderChip): MissionHeaderChip {
+  return { ...chip, live: "stale", title: LAST_KNOWN_TITLE };
+}
+
+/** Whether the header's chip is a run in flight right now: running, and not a
+ *  kept row read while `/runs` is failing. It gates the clock and the host
+ *  readout. */
+function chipIsLive(chip: MissionHeaderChip): boolean {
+  return workStatusKind(chip.status, chip.abandonReason) === "running" && chip.live !== "stale";
+}
+
+const LAST_KNOWN_TITLE = "last known status; the daemon's run list isn't answering";
+
+/** The chip the header renders: a row's (`runChip`), a kept row's
+ *  (`lastKnownChip`), the lifecycle word, or the neutral one while `/runs`
+ *  has not answered. */
+type MissionHeaderChip = { status: WorkStatusWord | undefined; abandonReason?: AbandonReason; label?: string; title?: string; live?: LivenessState };
+
+const PENDING_CHIP: MissionHeaderChip = { status: undefined, label: "\u2026", title: "reading the run's status" };
+
 /** Mission-wide span from the per-step metrics the fold already keeps:
  * earliest step start, latest step end (0 when unknown). */
 function missionSpan(metrics: MetricsMap): { start: number; end: number } {
@@ -610,11 +686,12 @@ export function MissionGraphLens({
     graph &&
     graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
   );
+  const headerState = useMissionHeaderState(missionId, graph, daemonBacked);
   // (#2332 review) `active` is a mission's status from mint to finalize —
   // including every sign-off gate, where no step is running. The header's
   // elapsed clock must tick for the MISSION, so the clock follows the mission
   // status as well as the steps.
-  const missionRunning = !!graph && workStatusKind(graph.mission_status) === "running";
+  const missionRunning = !!graph && chipIsLive(headerState);
   const now = useNow(anyRunning || missionRunning);
   const policy = useLifecyclePolicy();
   // Each step's run phase as of `now`, from the records attributed to it:
@@ -726,7 +803,6 @@ export function MissionGraphLens({
 
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
-  const status = graph.mission_status;
   const running = missionRunning;
   const idParts = splitMissionId(graph.mission_id);
   const span = missionSpan(metrics);
@@ -760,7 +836,7 @@ export function MissionGraphLens({
           <button type="button" className="midname" title={graph.mission_id} data-mission-id={graph.mission_id} onClick={onNameTap}>
             {showFullId ? graph.mission_id : idParts.name}
           </button>
-          <WorkStatus status={status} className="mstatus" />
+          <WorkStatus {...headerState} className="mstatus" />
         </div>
         <div className="msub">
           {startMs ? <span>{"started " + clkhm(startMs)}</span> : null}

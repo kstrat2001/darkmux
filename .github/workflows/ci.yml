@@ -1139,6 +1139,16 @@ jobs:
             exit 1
           fi
           echo "demo in sync with the served viewer"
+          # (#2648) The Machine info trigger renders only when the page carries
+          # a `darkmux-version` meta. The daemon injects it at serve time; the
+          # demo went without it, so the trigger was unreachable on
+          # darkmux.com/demo. The version must be the crate's own.
+          want=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if ! grep -qF "<meta name=\"darkmux-version\" content=\"$want\">" docs/demo/index.html; then
+            echo "::error::docs/demo/index.html has no darkmux-version meta for $want; scripts/build-demo.sh must inject it."
+            exit 1
+          fi
+          echo "demo carries darkmux-version $want"
 
   # ────────────────────────────────────────────────────────────────────────
   # The React viewer (`ui/`) + the parity harness that grades it.

@@ -5273,6 +5273,7 @@
         // with compaction, allowed tools, and json mode. Asserts the
         // COMPLETE argv vector including all hardening flags (#839).
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-test-123".to_string(),
             workspace: PathBuf::from("/host/workspace"),
@@ -5543,6 +5544,7 @@
     /// A minimal argv config whose only variable is the container base URL.
     fn argv_config_with_base_url(base_url: Option<String>) -> DockerRunConfig {
         DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-2904".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -5822,6 +5824,7 @@
         // compaction, no allowed tools, no json — asserts that optional
         // flags are omitted when not set.
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-min".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -5966,6 +5969,7 @@
             "required": ["verdict"]
         });
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: Some(schema.clone()),
             container_name: "darkmux-dispatch-schema".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -6028,6 +6032,7 @@
     /// exactly one field so the assertion isolates that branch.
     fn base_argv_config() -> DockerRunConfig {
         DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-edge".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -6064,6 +6069,24 @@
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
         }
+    }
+
+    /// (#3200) A known host labels its container with pid, start time and
+    /// machine, before the `--` image fence; an unknown host labels nothing,
+    /// so `darkmux serve`'s reaper leaves the container alone.
+    #[test]
+    fn build_docker_run_argv_labels_the_container_with_its_host() {
+        let mut config = base_argv_config();
+        config.host_identity =
+            Some(crate::orphan_reaper::HostIdentity { pid: 42, start: 4200, machine: "MACHINE-A".into(), pid_ns: "pid:9".into() });
+        let argv = build_docker_run_argv(&config);
+        let fence = argv.iter().position(|a| a == "--").expect("image fence");
+        for label in ["darkmux.dispatch.host-pid=42", "darkmux.dispatch.host-start=4200", "darkmux.dispatch.host-machine=MACHINE-A", "darkmux.dispatch.host-pid-ns=pid:9"] {
+            let at = argv.iter().position(|a| a == label).unwrap_or_else(|| panic!("{label} missing: {argv:?}"));
+            assert_eq!(argv[at - 1], "--label");
+            assert!(at < fence, "{label} must be a docker option, not a runtime arg");
+        }
+        assert!(!build_docker_run_argv(&base_argv_config()).iter().any(|a| a == "--label"), "no host, no labels");
     }
 
     /// (#2480 review, finding 5) `--timeout` reaches the container as a
@@ -7863,6 +7886,7 @@
         // inspects the REAL Command the dispatch executes, not just
         // build_docker_run_argv's output vector (which the other tests cover).
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-reg".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -14985,6 +15009,7 @@
         assert!(warning.is_none());
 
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-compactor-wire".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -19520,6 +19545,57 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
     }
 
+    /// (#2967) A salvaged turn (#479: a `length` cut whose well-formed calls
+    /// the runtime dispatches anyway) ends there: the next call opens a new
+    /// `seq`. Its `model.completed` keeps the raw `length`, so the turn
+    /// record must key on the calls that RUN, or the viewer never learns the
+    /// running call's name and reads PROMPT while it runs. A `length` cut
+    /// whose calls are all discarded is still a continuation: no record.
+    #[test]
+    #[serial]
+    fn a_salvaged_turn_gets_its_turn_record_naming_the_running_calls() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-salvage"),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // Turn 1: a continuation whose cut-off call is discarded, then the
+        // salvaged call that dispatches `read` and drops a truncated `edit`.
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"length","calls_planned":true,"tool_calls":[{"name":"read","arguments_chars":9,"path":"a.rs","runs":false}],"usage":{"completion_tokens":32000}}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"length","calls_planned":true,"tool_calls":[{"name":"read","arguments_chars":20,"path":"src/lib.rs"},{"name":"edit","arguments_chars":7,"runs":false}],"usage":{"completion_tokens":8000}}"#);
+        // Turn 2 ends normally.
+        state.handle_event(r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"completion_tokens":64}}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-salvage"));
+        let turns: Vec<&serde_json::Value> =
+            records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
+        assert_eq!(turns.len(), 2, "one record per logical turn, the salvaged one included; got {turns:?}");
+        let salvaged = &turns[0]["payload"];
+        assert_eq!(salvaged["turn_seq"], 1);
+        assert_eq!(salvaged["finish_reason"], "length", "the raw reason is kept");
+        assert_eq!(salvaged["tool_names"], serde_json::json!(["read"]), "only the call that runs");
+        assert_eq!(salvaged["tool_paths"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(turns[1]["payload"]["turn_seq"], 2);
+    }
+
     /// (#2863) A turn record carries the turn's GENERATION time, summed over
     /// every stream it took. The viewer's turn header shows it; the flow's
     /// own timestamps are whole seconds, which is guesswork for a 1.3 s turn.
@@ -21376,6 +21452,21 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         assert!(unbounded > now + Duration::from_secs(365 * 24 * 3600), "0 must be unbounded");
         let bounded = inactivity_deadline_after(600, Duration::ZERO);
         assert!(bounded > now + Duration::from_secs(599) && bounded < now + Duration::from_secs(700));
+    }
+
+    /// (#2639) A budget too large for `now + secs` to represent (an
+    /// operator typing a ~19-digit number) never panics: a deadline past what
+    /// an `Instant` can hold is the same as no deadline, so it reads as
+    /// unbounded. The configured value itself is never clamped or rewritten.
+    #[test]
+    fn an_unrepresentable_inactivity_budget_reads_as_unbounded_instead_of_panicking() {
+        let now = Instant::now();
+        for secs in [u64::MAX, u64::MAX / 2, 9_300_000_000_000_000_000] {
+            let deadline = inactivity_deadline_after(secs, Duration::from_secs(5));
+            assert!(deadline > now + Duration::from_secs(365 * 24 * 3600), "{secs} must be unbounded");
+        }
+        let bounded = inactivity_deadline_after(600, Duration::from_secs(5));
+        assert!(bounded > now + Duration::from_secs(604) && bounded < now + Duration::from_secs(700));
     }
 
     /// The watchdog's wake loop, handed the deadline a `0` budget produces,

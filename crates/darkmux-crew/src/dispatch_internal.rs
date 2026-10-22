@@ -2090,35 +2090,13 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
 /// its own `"cli"`-labeled block, the same way it hand-rolls `"launcher"`
 /// and `"forced-agentic-remote"`. The two spell the same tier the same way.
 ///
-/// (#2234 follow-up review) A `#2234` pass briefly added a
-/// `.min(MAX_INACTIVITY_TIMEOUT_SECS)` clamp here, reverted in this same
-/// follow-up: it was invisible (no warning, no doctor row, no docs —
-/// `darkmux config get runtime.inactivity_timeout_seconds` still reported
-/// the operator's raw, unclamped value), it silently overrode
-/// `src/cli.rs`'s `--timeout` parser, which bounds the flag with
-/// `range(1..)` and an explicit prior-review comment that it is
-/// "deliberately unbounded above ... the operator's own call" — the
-/// parser refused to bound the operator and the resolver did it behind
-/// their back 5,000 lines away — and it desynchronized
-/// `resolved_runtime_bounds` (which resolves the config tier
-/// directly, bypassing this function) from the container/watchdog value
-/// this function actually produced, the opposite of this function's own
-/// stated purpose ("so no two of them can disagree about the budget").
-/// Its justification was also off by roughly 29 billion×: measured by
-/// binary search, `Instant::now() + Duration::from_secs(n)` does not
-/// panic until `n` reaches approximately `9.22e18` — not the 315_360_000
-/// (~10 years) the clamp used. That figure is NOT a fixed constant: it is
-/// `Instant::now()`-relative, so it walks down as the process's own uptime
-/// advances — independently re-running the same binary search (#2641
-/// follow-up review, CONSIDER 4) reproduced the ~9.22e18 order of
-/// magnitude but landed on a different exact value than an earlier
-/// measurement of the same search, off by roughly two thousand. See the
-/// tracking issue filed alongside this revert
-/// (#2639) for the conditions a real clamp needs before it returns: routed
-/// through THIS function so the bounds record can't desync, self-
-/// disclosing (a resolution-time warning + a `darkmux doctor` row), and
-/// sized from a measured, uptime-dependent ~9.22e18 ceiling — not a single
-/// number a future implementer can hardcode.
+/// (#2234, #2639) No clamp here, on purpose. A `.min(...)` clamp was tried
+/// and reverted: it hid the change from `config get`, overrode `--timeout`'s
+/// deliberately unbounded parser, and desynced the bounds record from the
+/// watchdog. The only real hazard of a huge value, `Instant + secs`
+/// overflowing near 9.22e18 (uptime-dependent), is handled where the deadline
+/// is built ([`inactivity_deadline_after`]): an unrepresentable deadline reads
+/// as unbounded, which is what such a value means anyway.
 fn effective_inactivity_timeout_seconds(
     timeout_override_seconds: Option<u32>,
 ) -> (u64, InactivityBudgetSource) {
@@ -2140,10 +2118,16 @@ const UNBOUNDED_INACTIVITY: Duration = Duration::from_secs(100 * 365 * 24 * 3600
 /// The inactivity deadline `extra` past `now + secs`. A budget of `0` means
 /// UNBOUNDED, the reading every darkmux zero-knob has (#3074): it used to put
 /// the deadline at `now`, so the watchdog killed the container on its first
-/// poll.
+/// poll. (#2639) A budget too large for an `Instant` to hold reads as
+/// unbounded too, instead of panicking: a deadline past the representable
+/// range never fires either way. The configured value is never clamped, so
+/// the bounds record and `config get` keep reporting it as typed.
 fn inactivity_deadline_after(secs: u64, extra: Duration) -> Instant {
+    let now = Instant::now();
     let budget = if secs == 0 { UNBOUNDED_INACTIVITY } else { Duration::from_secs(secs) };
-    Instant::now() + budget + extra
+    now.checked_add(budget)
+        .and_then(|t| t.checked_add(extra))
+        .unwrap_or_else(|| now + UNBOUNDED_INACTIVITY + extra)
 }
 
 /// (#2480 review, finding 5) Where THIS dispatch's inactivity budget came
@@ -2264,6 +2248,12 @@ fn apply_runtime_limit_flags(cmd: &mut Command, max_turns_override: Option<u32>)
 pub struct DockerRunConfig {
     /// Unique container name for `docker ps` debugging.
     pub container_name: String,
+    /// (#3200) The darkmux process starting this container, written as
+    /// labels (`orphan_reaper::host_label_args`) so `darkmux serve`'s reaper
+    /// can tell a container whose host died unhandled. `None` (the host
+    /// cannot read its own start time or machine uid) labels nothing, and
+    /// the reaper leaves an unlabeled container alone.
+    pub host_identity: Option<crate::orphan_reaper::HostIdentity>,
     /// Host path of the agent's workspace tree (mounted at /workspace).
     pub workspace: PathBuf,
     /// Host path for out-of-band bookkeeping (mounted at /darkmux-out).
@@ -2561,6 +2551,9 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // `runtime/src/main.rs` about `/proc/1/mem`; see that comment's own note
     // for the now-off-by-one PID under `--init`.
     args.push("--init".to_string());
+
+    // (#3200) Who started this container, for `darkmux serve`'s reaper.
+    args.extend(config.host_identity.iter().flat_map(crate::orphan_reaper::host_label_args));
 
     // (#1187) Keep stdin open ONLY when the container needs its remote auth
     // secret piped in — every other dispatch (local, or a remote endpoint
@@ -7645,6 +7638,7 @@ fn container_run_config(
     let agentic_brain = agentic_brain_flags(agentic_pm);
     Ok(DockerRunConfig {
         container_name: container_name.to_string(),
+        host_identity: crate::orphan_reaper::HostIdentity::this_process(),
         workspace: run.workspace.clone(),
         host_out: run.host_out.clone(),
         // (#2295) The attachment directories the briefed mods want readable
@@ -11659,7 +11653,10 @@ impl TailerState {
         // turn boundary: one long reasoning turn once wrote a turn record per
         // API call (66 for a run whose `turns` was 1). Continuations emit
         // `dispatch.checkpoint` instead.
-        if m.ends_turn() {
+        // (#2967) A salvaged turn (#479) also ends: it keeps the raw `length`
+        // but dispatches its well-formed calls, and the next call opens a new
+        // `seq`. A continuation's calls are all marked `runs: false`.
+        if m.ends_turn() || running_tool_calls(m).is_some_and(|calls| !calls.is_empty()) {
             let payload = DispatchTurnPayload {
                 turn_seq: m.seq,
                 finish_reason: cap_str(&m.finish_reason, MAX_TRAJ_FIELD_BYTES),

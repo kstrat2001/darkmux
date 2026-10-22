@@ -16,7 +16,8 @@
 
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../../lib/format";
-import { NOT_REPORTING_STATUS } from "../../lib/machineAvailability";
+import { NOT_REPORTING_STATUS, NOT_REPORTING_TITLE } from "../../lib/machineAvailability";
+import type { AbandonReason } from "../../types/generated/AbandonReason";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
 import { dispatchHash } from "../../lib/route";
 import { relayedFromText } from "../../lib/relayWords";
@@ -51,6 +52,21 @@ export function runsAgo(r: Run, now: number = Date.now()): string {
  * (#1907 split `abandoned` on `Run.abandoned_reason`, which it reads). */
 export function runStatusLabel(r: Run): string {
   return runStatusWord(runBadgeStatus(r), r.abandoned_reason);
+}
+
+/** (#2868) A row's status chip as every surface shows it: the board's badge
+ *  and the mission header both spread this into `WorkStatus`, so the word,
+ *  the color, the pulse and the hover text cannot differ between them. */
+export interface RunChip {
+  status: RunBadgeStatus;
+  abandonReason?: AbandonReason;
+  label: string;
+  title?: string;
+}
+
+export function runChip(r: Run): RunChip {
+  const status = runBadgeStatus(r);
+  return { status, abandonReason: r.abandoned_reason, label: runStatusLabel(r), title: status === NOT_REPORTING_STATUS ? NOT_REPORTING_TITLE : undefined };
 }
 
 /** (5.0 R3) The status a row's badge keys its color and pulse on. It is the
