@@ -854,8 +854,9 @@ fn derive_cautions(tx: &Connection) -> Result<()> {
             // lines up. `repetition` (the degeneracy gate + reasoning
             // checkpoint) is not a finding about a file or a pattern the
             // next dispatch should be cautioned about; it is an
-            // operator-facing signal about THIS run's own output.
-            if kind == "repetition" {
+            // operator-facing signal about THIS run's own output. (#2799)
+            // One list for both copies, so they cannot drift again.
+            if darkmux_flow::payload::DARKMUX_INTERNAL_DETECTOR_KINDS.contains(&kind.as_str()) {
                 continue;
             }
             insert.execute(params![
@@ -1323,6 +1324,11 @@ mod tests {
                          the degeneracy gate judged this repeating (#2836)",
                         None,
                     ),
+                ),
+                // (#2799) A refused compaction is the same class.
+                detector_line(
+                    darkmux_flow::FlowSource::Detector,
+                    finding(DetectorKind::CompactionSkipped, "compaction triggered at turn 7 and refused", None),
                 ),
             ],
         );

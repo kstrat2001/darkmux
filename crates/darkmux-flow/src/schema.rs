@@ -23,7 +23,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.4.0";
 //   2.4.0 (#2799): `telemetry.detector` gains `payload.kind:
 //           "compaction_skipped"`: a compaction the runtime triggered and its
 //           own guards refused (#2797's `compaction.skipped` trajectory
-//           event), severity `info`, the detail naming the turn, the
+//           event), severity `warn` (`info` reads as recovered), the detail naming the turn, the
 //           generation it would have been, the message count and the reason.
 //           It used to stop at `trajectory.jsonl`, so a live view never saw
 //           why no compaction landed.

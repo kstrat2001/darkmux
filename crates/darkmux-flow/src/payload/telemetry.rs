@@ -363,6 +363,11 @@ impl Attribution for TelemetryDetectorPayload {
     }
 }
 
+/// (#2887 F5, #2799) Detector kinds about darkmux's own machinery, never a
+/// finding about the code: a dispatch's brief (`mission_cautions`) and the
+/// crew index's `cautions` table both leave them out, through this one list.
+pub const DARKMUX_INTERNAL_DETECTOR_KINDS: &[&str] = &["repetition", "compaction_skipped"];
+
 impl DetectorKind {
     /// The wire word.
     pub fn as_str(self) -> &'static str {

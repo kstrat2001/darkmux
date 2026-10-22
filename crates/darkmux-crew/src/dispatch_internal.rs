@@ -12622,11 +12622,12 @@ fn detector_telemetry_payload(event: &darkmux_trajectory::TrajectoryEvent) -> Op
 }
 
 /// (#2799) A refused compaction (#2797), live, so an operator watching
-/// occupancy stay high sees why no compaction landed. `Info`: nothing was
-/// installed and the run continues unchanged.
+/// occupancy stay high sees why no compaction landed. `Warn`, not `Info`:
+/// `Info` reads as "recovered" (the viewer draws it with a check mark), and
+/// a refusal recovered nothing: the thread is as full as before.
 fn compaction_skipped_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<TelemetryDetectorPayload> {
     let darkmux_trajectory::TrajectoryEvent::CompactionSkipped(e) = event else { return None };
-    Some(TelemetryDetectorPayload::new(DetectorKind::CompactionSkipped, DetectorSeverity::Info, format!(
+    Some(TelemetryDetectorPayload::new(DetectorKind::CompactionSkipped, DetectorSeverity::Warn, format!(
         "compaction triggered at turn {} (generation {}, {} messages) and refused: {}; the thread is unchanged (#2797)",
         e.turn, e.attempted_generation, e.messages, e.reason
     )))

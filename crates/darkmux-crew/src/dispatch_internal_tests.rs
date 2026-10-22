@@ -11905,7 +11905,7 @@
         assert_eq!(detectors.len(), 1, "one record for the refusal; got {records:?}");
         let payload = &detectors[0]["payload"];
         assert_eq!(payload["kind"], "compaction_skipped");
-        assert_eq!(payload["severity"], "info", "the run continues unchanged: recorded, not alarming");
+        assert_eq!(payload["severity"], "warn", "a refusal recovered nothing: never the check-marked `info`");
         let detail = payload["detail"].as_str().unwrap();
         for part in ["turn 7", "generation 3", "42 messages", "summary longer than the turns it replaces"] {
             assert!(detail.contains(part), "detail must name {part:?}; got {detail:?}");

@@ -59,7 +59,7 @@ pub use machine::{
     PowerNow, PowerWindowWire, ThermalNow, ThermalWindowWire,
 };
 pub use telemetry::{
-    DetectorArea, DetectorKind, DetectorSeverity, LmsEvent, LmsRole, TelemetryCompactionPayload, TelemetryContextPayload,
+    DARKMUX_INTERNAL_DETECTOR_KINDS, DetectorArea, DetectorKind, DetectorSeverity, LmsEvent, LmsRole, TelemetryCompactionPayload, TelemetryContextPayload,
     TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
 };
 pub use thermal::{
