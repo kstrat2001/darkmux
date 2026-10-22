@@ -107,6 +107,25 @@ if [ ! -f "$SRC" ]; then
   exit 1
 fi
 
+# (#2648) The two build metas the daemon's `inject_mode_meta` always writes:
+# `darkmux-version` (`build_version()`) and `darkmux-flow-schema`
+# (`FLOW_SCHEMA_VERSION`). The masthead renders its Machine info trigger only
+# when `darkmux-version` is present, so without it the About panel was
+# unreachable on darkmux.com/demo. Read from the same sources the binary
+# compiles in, minus the build tag: the tag is a git sha, and the demo is
+# regenerated on every viewer commit, so a sha would churn this file on each
+# one. Each must match exactly once, the same discipline as the steps above.
+DEMO_VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"$/\1/p' "$ROOT/Cargo.toml")
+FLOW_SCHEMA=$(sed -n 's/^pub const FLOW_SCHEMA_VERSION: &str = "\([^"]*\)";$/\1/p' "$ROOT/crates/darkmux-flow/src/schema.rs")
+for pair in "DEMO_VERSION:Cargo.toml [package] version" "FLOW_SCHEMA:crates/darkmux-flow/src/schema.rs FLOW_SCHEMA_VERSION"; do
+  var=${pair%%:*}
+  val=${!var}
+  if [ -z "$val" ] || [ "$(printf '%s\n' "$val" | grep -c .)" -ne 1 ]; then
+    echo "build-demo: expected exactly one ${pair#*:}, found: '${val}'" >&2
+    exit 1
+  fi
+done
+
 # `--print-source` exists so the pre-commit hook can ask WHICH file the demo is
 # built from instead of hardcoding an answer that goes stale (which is exactly
 # what happened to this script itself). One owner of the derivation, two
@@ -156,6 +175,8 @@ fi
 <meta name="darkmux-graphs-src" content="./demo-graphs.json">
 <meta name="darkmux-fleet-src" content="./demo-fleet.json">
 <meta name="darkmux-flow-date" content="$FLOW_DATE">
+<meta name="darkmux-version" content="$DEMO_VERSION">
+<meta name="darkmux-flow-schema" content="$FLOW_SCHEMA">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"
