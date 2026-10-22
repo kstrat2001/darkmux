@@ -2062,22 +2062,31 @@ fn redis_sink_from_config(url: &str) -> Result<RedisSink> {
 }
 
 /// (#2730) Whether this build's default sink may write the audit trail at
-/// `dir`. Always, in a real build. In a test build only under the system temp
-/// dir: the singleton is built before any test's isolation guard runs, so an
+/// `dir`. Always, in a real build. In a test build only under an OS temp
+/// root: the singleton is built before any test's isolation guard runs, so an
 /// operator's exported `DARKMUX_AUDIT_DIR` would bind the whole test binary
 /// to their real hash chain, which cannot shed a fabricated record. A test's
-/// own `TempDir` is always under the temp dir, and a real chain never is.
+/// own `TempDir` is always under one, and a real chain never is. The roots
+/// are fixed, not just this process's temp dir: the CLI test harness gives a
+/// spawned binary its own `TMPDIR`, below which the parent's `TempDir` is not.
 fn audit_dir_allowed_here(dir: &std::path::Path) -> bool {
     if !cfg!(any(test, feature = "test-support")) {
         return true;
     }
-    let tmp = std::env::temp_dir();
-    let tmp_real = std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
-    let allowed = dir.starts_with(&tmp) || dir.starts_with(&tmp_real);
+    let allowed = under_a_temp_root(dir);
     if !allowed {
-        eprintln!("flow: test build: audit sink off, {} is outside the temp dir (#2730)", dir.display());
+        eprintln!("flow: test build: audit sink off, {} is outside every temp root (#2730)", dir.display());
     }
     allowed
+}
+
+/// Whether `dir` is under this process's temp dir or an OS temp root
+/// (`/tmp`, macOS's per-user `/var/folders`), raw or through `/private`.
+fn under_a_temp_root(dir: &std::path::Path) -> bool {
+    let tmp = std::env::temp_dir();
+    let mut roots = vec![std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone()), tmp];
+    roots.extend(["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"].map(std::path::PathBuf::from));
+    roots.iter().any(|root| dir.starts_with(root))
 }
 
 /// Whether the default sink carries the audit layer: audit is on, and this
@@ -4235,12 +4244,26 @@ mod tests {
     /// whole test binary's sink bound to it (the singleton is built before
     /// any test's guard runs), taking fabricated records the chain cannot
     /// shed. A test's own temp audit dir is still honored.
+    /// (#2730) A spawned test binary gets its own `TMPDIR` from the CLI
+    /// harness, so the parent's `TempDir` must still count: the roots are
+    /// the OS's, not only this process's temp dir.
+    #[test]
+    fn os_temp_roots_count_whatever_this_process_tmpdir_is() {
+        for dir in ["/tmp/.tmpesZ2Ke", "/private/tmp/x", "/var/folders/ab/T/.tmpX", "/private/var/folders/ab/T/x"] {
+            assert!(under_a_temp_root(std::path::Path::new(dir)), "{dir}");
+        }
+        for dir in ["/Users/someone/.darkmux/audit", "/home/someone/.darkmux/audit", "/tmpfoo/audit", "relative/audit"] {
+            assert!(!under_a_temp_root(std::path::Path::new(dir)), "{dir}");
+        }
+    }
+
     #[serial_test::serial]
     #[test]
     fn a_test_build_default_sink_never_audits_outside_the_temp_dir() {
         isolate_test_env_once();
         let prev = std::env::var("DARKMUX_AUDIT_DIR").ok();
-        let real = std::env::temp_dir().parent().unwrap().join("darkmux-real-audit-2730");
+        // Outside every temp root, as a real chain under a home dir is.
+        let real = std::path::PathBuf::from("/darkmux-real-audit-2730-never-created");
         unsafe { std::env::set_var("DARKMUX_AUDIT_DIR", &real) };
         let (outside, _) = summarize_sink(&build_default_sink().info());
         let tmp = tempfile::TempDir::new().unwrap();
