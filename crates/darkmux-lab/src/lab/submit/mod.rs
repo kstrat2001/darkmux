@@ -560,8 +560,19 @@ impl Refusals {
         self.text(&s["weightsHash"], &st("weightsHash"), 200, Some(&forms.hex64), true);
         self.text(&s["quant"], &st("quant"), 40, None, true);
         self.text(&s["modelId"], &st("modelId"), 40, Some(&forms.model_id), true);
-        for (j, c) in s["cpuCores"].as_array().into_iter().flatten().enumerate() {
-            self.text(&c["cluster"], &st(&format!("cpuCores[{j}].cluster")), 20, Some(&forms.cluster), false);
+        if let Some(clusters) = s["cpuCores"].as_array() {
+            if !(1..=4).contains(&clusters.len()) {
+                self.errs.push(format!("{}: expected 1 to 4 CPU clusters, or null", st("cpuCores")));
+            }
+            for (j, c) in clusters.iter().enumerate() {
+                self.text(&c["cluster"], &st(&format!("cpuCores[{j}].cluster")), 20, Some(&forms.cluster), false);
+                if c["cores"].as_u64().is_none_or(|n| n > 1000) {
+                    self.numbers.push(format!("{}: outside 0 to 1000", st(&format!("cpuCores[{j}].cores"))));
+                }
+            }
+        }
+        if s["gpuCores"].as_u64().is_some_and(|n| n > 1000) {
+            self.numbers.push(format!("{}: outside 0 to 1000", st("gpuCores")));
         }
         for (k, max) in [("activeSeconds", MAX_SECONDS), ("tokensPerSecond", 100_000.0)] {
             if r[k].as_f64().is_some_and(|n| !(0.0..=max).contains(&n)) {

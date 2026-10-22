@@ -789,8 +789,10 @@ fn macos_machine_config_reads_perf_levels_gpu_cores_and_model() {
     assert_eq!(crate::macos::sysctl_value(head, "hw.memsize"), None);
     let levels = "hw.perflevel0.name: Super\nhw.perflevel0.physicalcpu: 6\nhw.perflevel1.name: Performance\nhw.perflevel1.physicalcpu: 12\n";
     assert_eq!(crate::macos::perf_levels_from_sysctl(levels, 2), vec![("Super".to_string(), 6), ("Performance".to_string(), 12)]);
-    // A level with no core count is left out, not reported as zero.
+    // A level with no core count is not reported as zero, and with one level
+    // unread the rest is not reported as the whole machine.
     assert_eq!(crate::macos::perf_levels_from_sysctl("hw.perflevel0.name: Super\n", 1), vec![]);
+    assert_eq!(crate::macos::perf_levels_from_sysctl("hw.perflevel0.name: Super\nhw.perflevel0.physicalcpu: 6\n", 2), vec![]);
     let ioreg = "+-o AGXAcceleratorG17X  <class AGXAcceleratorG17X, id 0x1000003a5>\n    {\n      \"gpu-core-count\" = 40\n      \"IOClass\" = \"AGXAcceleratorG17X\"\n    }\n";
     assert_eq!(crate::macos::gpu_cores_from_ioreg(ioreg), Some(40));
     assert_eq!(crate::macos::gpu_cores_from_ioreg("\"gpu-core-count\" = 0\n"), None);

@@ -246,11 +246,23 @@ fn what_the_site_would_refuse_is_refused_here() {
     let mut vm = stack();
     vm.chip = "Apple M2 (Virtual)".into();
     vm.quant = Some("q".repeat(41));
+    vm.cpu_cores = (0..5).map(|i| (if i == 0 { "super core".to_string() } else { "Performance".to_string() }, 4)).collect();
+    vm.gpu_cores = Some(5000);
+    vm.model_id = Some("kains-macbook".into());
     let bad_ran = RanBy { version: Some("5.4.0 beta".into()), ..Default::default() };
     let bad = bundle_run("r2", &manifest(), &stats(), &bad_ran, &vm);
     let both = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![bad, good.clone(), good]).unwrap();
     let refused = site_refusals(&both);
-    for want in ["runs[0].stack.chip", "runs[0].stack.quant", "runs[0].darkmuxVersion", "runs[2]: the same run twice"] {
+    for want in [
+        "runs[0].stack.chip",
+        "runs[0].stack.quant",
+        "runs[0].stack.cpuCores: expected 1 to 4",
+        "runs[0].stack.cpuCores[0].cluster",
+        "runs[0].stack.gpuCores: outside",
+        "runs[0].stack.modelId",
+        "runs[0].darkmuxVersion",
+        "runs[2]: the same run twice",
+    ] {
         assert!(refused.iter().any(|r| r.starts_with(want)), "{want} in {refused:?}");
     }
 }

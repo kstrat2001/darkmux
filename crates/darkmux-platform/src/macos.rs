@@ -113,7 +113,9 @@ impl Platform for MacPlatform {
     /// `hw.model`, and the GPU's `gpu-core-count` from the AGX accelerator
     /// in the IORegistry. None of them needs root.
     fn machine_config(&self) -> crate::MachineConfig {
-        let head = command_stdout("sysctl", &["hw.model", "hw.nperflevels"]).unwrap_or_default();
+        // Separate calls: sysctl exits non-zero when any one key is unknown.
+        let model = command_stdout("sysctl", &["hw.model"]).unwrap_or_default();
+        let head = command_stdout("sysctl", &["hw.nperflevels"]).unwrap_or_default();
         let levels = sysctl_value(&head, "hw.nperflevels").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(8);
         let keys: Vec<String> =
             (0..levels).flat_map(|i| [format!("hw.perflevel{i}.name"), format!("hw.perflevel{i}.physicalcpu")]).collect();
@@ -125,7 +127,7 @@ impl Platform for MacPlatform {
         crate::MachineConfig {
             cpu_clusters: perf_levels_from_sysctl(&per_level, levels),
             gpu_cores: command_stdout("ioreg", &["-rc", "AGXAccelerator", "-d1"]).as_deref().and_then(gpu_cores_from_ioreg),
-            model_id: sysctl_value(&head, "hw.model").map(str::to_string),
+            model_id: sysctl_value(&model, "hw.model").map(str::to_string),
         }
     }
 
@@ -277,16 +279,17 @@ pub(crate) fn sysctl_value<'a>(output: &'a str, key: &str) -> Option<&'a str> {
     output.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')).map(str::trim).filter(|v| !v.is_empty())
 }
 
-/// `(name, physical cores)` per perf level, level 0 first; a level that
-/// reads no name or no cores is left out.
+/// `(name, physical cores)` per perf level, level 0 first. When any level
+/// reads no name or no cores, nothing: part of a machine is not its config.
 pub(crate) fn perf_levels_from_sysctl(output: &str, levels: usize) -> Vec<(String, u32)> {
     (0..levels)
-        .filter_map(|i| {
+        .map(|i| {
             let name = sysctl_value(output, &format!("hw.perflevel{i}.name"))?;
             let cores = sysctl_value(output, &format!("hw.perflevel{i}.physicalcpu"))?.parse::<u32>().ok()?;
             (cores > 0).then(|| (name.to_string(), cores))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// `"gpu-core-count" = 40` in `ioreg -rc AGXAccelerator -d1` output.
