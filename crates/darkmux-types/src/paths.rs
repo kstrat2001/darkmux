@@ -334,6 +334,30 @@ fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
 /// available (which is unusual; would mean a misconfigured environment).
 /// `pub(crate)` so `config_access` can expand `~` in `config.dirs.*` values
 /// (#661 Slice 3).
+/// (#2664) Why a set `DARKMUX_HOME` cannot be used, or `None` when it can
+/// (unset, blank, absolute, or `~`-rooted). A relative value names a
+/// different root in every working directory, the cwd-dependent root 4.0
+/// removed: a fixture registered from one directory vanished when listed
+/// from another. The message names the value and gives the absolute form it
+/// meant here, so the fix is one copy.
+pub fn relative_home_problem() -> Option<String> {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read("DARKMUX_HOME");
+    relative_home_problem_for(env::var("DARKMUX_HOME").ok().as_deref(), env::current_dir().ok().as_deref())
+}
+
+fn relative_home_problem_for(raw: Option<&str>, cwd: Option<&Path>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if expand_tilde(raw).is_absolute() {
+        return None;
+    }
+    let meant = cwd.map(|c| c.join(raw).display().to_string()).unwrap_or_else(|| format!("/path/to/{raw}"));
+    Some(format!(
+        "DARKMUX_HOME is a relative path ({raw}), which names a different darkmux root in every directory; \
+         set it to an absolute path, e.g. export DARKMUX_HOME={meant}"
+    ))
+}
+
 pub(crate) fn expand_tilde(s: &str) -> PathBuf {
     if let Some(stripped) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -535,6 +559,17 @@ mod tests {
                 Some(v) => env::set_var("DARKMUX_HOME", v),
                 None => env::remove_var("DARKMUX_HOME"),
             }
+        }
+    }
+
+    #[test]
+    fn a_relative_darkmux_home_is_refused_naming_the_absolute_form() {
+        let cwd = Path::new("/work/a");
+        let msg = relative_home_problem_for(Some(".dmrel"), Some(cwd)).expect("a relative home is refused");
+        assert!(msg.contains("(.dmrel)") && msg.contains("DARKMUX_HOME=/work/a/.dmrel"), "{msg}");
+        assert!(relative_home_problem_for(Some("sub/dir"), Some(cwd)).is_some());
+        for ok in [None, Some(""), Some("  "), Some("/abs/root"), Some("~"), Some("~/root"), Some(" /abs/root ")] {
+            assert_eq!(relative_home_problem_for(ok, Some(cwd)), None, "{ok:?} is usable");
         }
     }
 

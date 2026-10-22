@@ -156,6 +156,14 @@ fn main() -> Result<()> {
 /// one that nothing reads (and about a leftover `config.json` key at its old
 /// default); `--help` / `--version` never reach `run`.
 fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
+    // (#2664) A relative `DARKMUX_HOME` would put every read and write,
+    // `config set` included, under a root that depends on the directory the
+    // command runs in. Only `doctor`, which reports it, starts.
+    if !matches!(cmd, Cmd::Doctor { .. }) {
+        if let Some(problem) = darkmux_types::paths::relative_home_problem() {
+            anyhow::bail!(problem);
+        }
+    }
     if matches!(cmd, Cmd::Doctor { .. } | Cmd::Config { .. }) {
         return Ok(());
     }

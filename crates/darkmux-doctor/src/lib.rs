@@ -211,6 +211,7 @@ pub fn run() -> DoctorReport {
         check_fleet_routes(),
         check_role_tool_vocab_typos(),
         check_ignored_project_darkmux(),
+        check_relative_home(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
@@ -330,6 +331,20 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
 /// so only what else is in it is stranded. Warn, naming each stranded entry.
 fn check_ignored_project_darkmux() -> Check {
     ignored_project_status(darkmux_types::paths::ignored_project_state())
+}
+
+/// (#2664) A relative `DARKMUX_HOME` names a different root in every
+/// directory, so every other command refuses to start; doctor reports it.
+fn check_relative_home() -> Check {
+    relative_home_status(darkmux_types::paths::relative_home_problem())
+}
+
+fn relative_home_status(problem: Option<String>) -> Check {
+    let name = "DARKMUX_HOME".to_string();
+    match problem {
+        Some(message) => Check { name, status: Status::Fail, message, hint: None },
+        None => Check { name, status: Status::Pass, message: "unset or absolute".into(), hint: None },
+    }
 }
 
 /// Pure decision for [`check_ignored_project_darkmux`]. The `DARKMUX_HOME`
@@ -12198,8 +12213,10 @@ mod tests {
         //
         // (#3275) 68: `checks_container::check_container_user` joined beside the
         // power-posture row.
+        //
+        // (#2664) 69: `check_relative_home` joined beside the project-local row.
         let expected =
-            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14270,6 +14287,16 @@ mod tests {
     /// Runs `check_ignored_project_darkmux` from a fresh cwd holding `files`
     /// (paths relative to it; a trailing `/` makes a directory), with
     /// `DARKMUX_HOME` set to `home_rel` under it when given.
+    /// (#2664) doctor reports a relative `DARKMUX_HOME` as a failure (every
+    /// other command refuses to start on it), and passes otherwise.
+    #[test]
+    fn a_relative_home_fails_the_darkmux_home_check() {
+        let fail = relative_home_status(Some("DARKMUX_HOME is a relative path (.dmrel) ...".into()));
+        assert_eq!(fail.status, Status::Fail);
+        assert!(fail.message.contains(".dmrel"), "{}", fail.message);
+        assert_eq!(relative_home_status(None).status, Status::Pass);
+    }
+
     fn ignored_project_check(files: &[&str], home_rel: Option<&str>) -> Check {
         let tmp = tempfile::TempDir::new().unwrap();
         for f in files {
