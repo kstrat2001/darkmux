@@ -551,6 +551,18 @@ fn a_host_that_reads_everything_lists_nothing_unmeasured_but_board_sensors() {
     assert_eq!(s.host_unmeasured.keys().collect::<Vec<_>>(), vec!["board_temp_c_max_busy"]);
 }
 
+/// Samples that were all idle leave the package figures absent, and say why.
+#[test]
+fn package_figures_with_no_busy_sample_say_so() {
+    let from = 1_000_000;
+    let raw = format!("{}{}", telem(from + 50_000, 0, 0.0), telem(from + 100_000, 1, 0.0));
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 100_000, None, &mut flows);
+    let s = derive_stats("t".into(), &run_fold("", 100_000), flows, None, None);
+    assert_eq!(s.pkg_w_busy, None);
+    assert_eq!(s.host_unmeasured.get("pkg_w_busy").map(String::as_str), Some("no telemetry sample in the run window was busy"));
+}
+
 /// The sampler runs continuously; only samples inside the run's own window
 /// describe the run.
 #[test]

@@ -1108,6 +1108,15 @@ fn host_unmeasured(samples: &[Sample], host: &HostFigures) -> BTreeMap<String, S
     for (field, _, what) in unread.into_iter().filter(|(_, unread, _)| *unread) {
         out.insert(field.to_string(), none_read(what));
     }
+    // Every sample carries package power (a reading without it is not a
+    // sample), so the package figures are absent only when none was busy.
+    // Busy time and the energy built on it are also withheld when the
+    // samples don't cover the run; `unreconciled` says that one.
+    if host.samples_busy == 0 {
+        for field in ["pkg_w_busy", "pkg_j_busy", "pkg_j_per_1k_tokens"] {
+            out.insert(field.to_string(), "no telemetry sample in the run window was busy".to_string());
+        }
+    }
     out
 }
 

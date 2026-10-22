@@ -150,6 +150,8 @@ fn a_package_only_host_prints_its_package_and_board_temperature() {
     assert!(t.contains("power        package 38 W   busy 25.0% of the run (model streams) (100 samples)"), "{t}");
     assert!(!t.contains("gpu "), "no rail was read: {t}");
     assert!(t.contains("board        hottest sensor 54.4 °C   fan max 2214 rpm"), "{t}");
+    s.pkg_w_busy = None;
+    assert!(run_text(&s).contains("board        hottest sensor 54.4 °C"), "board sensors print without power");
 }
 
 /// The caveats print beneath the figures, and only when a check failed.

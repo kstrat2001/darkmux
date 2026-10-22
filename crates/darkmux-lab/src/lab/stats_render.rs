@@ -142,12 +142,13 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
                 s.cpu_speed_limit_min.unwrap_or(100)
             );
         }
-        if let Some(t) = s.board_temp_c_max_busy {
-            p!(out, 
-                "board        hottest sensor {t} °C{}",
-                s.fan_rpm_max_busy.map(|f| format!("   fan max {f} rpm")).unwrap_or_default()
-            );
-        }
+    }
+    // Board sensors are read independently of power, so they print on their own.
+    if let Some(t) = s.board_temp_c_max_busy {
+        p!(out, 
+            "board        hottest sensor {t} °C{}",
+            s.fan_rpm_max_busy.map(|f| format!("   fan max {f} rpm")).unwrap_or_default()
+        );
     }
 
     let caveats = s.unreconciled();
