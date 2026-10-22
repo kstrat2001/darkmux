@@ -291,6 +291,7 @@ impl WorkloadProvider for CodingTaskProvider {
             loaded.manifest.workload.image.as_deref(),
             config_path,
             out_dir,
+            max_turns_from_workload(&loaded.manifest.workload)?,
         )?;
         let duration_ms = started.elapsed().as_millis();
         let (stdout, stderr) = (&dispatched.stdout, &dispatched.stderr);
@@ -662,6 +663,19 @@ fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
 /// agent a contradiction (prompt: "fix the bug"; doctrine: "you must
 /// not modify code"). Override via the workload's `role:` field or
 /// `DARKMUX_DEFAULT_ROLE` env var.
+/// The workload's `maxTurns`, as the dispatch's turn-cap fallback. Refused by
+/// name when it is not a positive count that fits a `u32`: `0` would end the
+/// run before its first turn, and a clamp would run a bound nobody typed.
+fn max_turns_from_workload(wl: &crate::workloads::types::WorkloadSpec) -> Result<Option<u32>> {
+    let Some(n) = crate::providers::tool_bench::knob_u64_strict(wl.max_turns.as_ref(), "maxTurns", "a positive integer")? else {
+        return Ok(None);
+    };
+    match u32::try_from(n) {
+        Ok(n) if n >= 1 => Ok(Some(n)),
+        _ => bail!("workload `maxTurns` must be a positive integer that fits in 32 bits, got {n}"),
+    }
+}
+
 fn pick_role(loaded: &LoadedWorkload) -> String {
     if let Some(r) = loaded.manifest.workload.role.as_deref() {
         return r.to_string();
@@ -686,6 +700,7 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
+    max_turns: Option<u32>,
 ) -> Result<(Dispatched, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
@@ -701,7 +716,9 @@ fn dispatch_via_internal(
         record_context: None,
         resume_from: None,
         host_out: Some(host_out),
-        max_turns_override: None,
+        // The workload's `maxTurns`: a fallback, so an operator's own
+        // `max_turns` in env or config still wins.
+        max_turns_override: max_turns,
         timeout_override_seconds: None, // (#2480)
         role_id: role_id.to_string(),
         message: prompt.to_string(),
@@ -1379,9 +1396,41 @@ mod tests {
             image: None,
             trials: None,
             task_timeout_seconds: None,
+            max_turns: None,
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),
+        }
+    }
+
+    /// A workload's `maxTurns` reaches the dispatch as the turn-cap fallback
+    /// (`DispatchOpts::max_turns_override`), so a small-machine fixture can
+    /// bound a model that loops. Absent stays uncapped by the workload.
+    #[test]
+    fn max_turns_reads_the_workload_key() {
+        let mut spec = basic_spec();
+        assert_eq!(max_turns_from_workload(&spec).unwrap(), None);
+        spec.max_turns = Some(serde_json::json!(12));
+        assert_eq!(max_turns_from_workload(&spec).unwrap(), Some(12));
+        spec.max_turns = Some(serde_json::json!("12"));
+        assert_eq!(max_turns_from_workload(&spec).unwrap(), Some(12));
+    }
+
+    /// Zero, a negative, a fraction and a value past `u32` are refused by
+    /// name rather than read as "uncapped" or clamped.
+    #[test]
+    fn max_turns_refuses_a_value_that_is_not_a_positive_count() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-3),
+            serde_json::json!(2.5),
+            serde_json::json!(5_000_000_000u64),
+            serde_json::json!("lots"),
+        ] {
+            let mut spec = basic_spec();
+            spec.max_turns = Some(bad.clone());
+            let err = max_turns_from_workload(&spec).expect_err(&format!("{bad} must be refused"));
+            assert!(err.to_string().contains("maxTurns"), "names the key: {err}");
         }
     }
 

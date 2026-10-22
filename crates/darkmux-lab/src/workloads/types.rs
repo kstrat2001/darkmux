@@ -175,6 +175,12 @@ pub(crate) struct WorkloadSpec {
     /// (`tool-bench`) The per-task dispatch timeout override, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "taskTimeoutSeconds")]
     pub task_timeout_seconds: Option<serde_json::Value>,
+    /// (`coding-task`) The turn cap a run's dispatch falls back to when the
+    /// operator has set none (`DispatchOpts::max_turns_override`: an operator's
+    /// `max_turns` in env or config still wins). Lets a small-machine fixture
+    /// bound a model that loops. Absent means the workload sets no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "maxTurns")]
+    pub max_turns: Option<serde_json::Value>,
     /// (`tool-bench`) The chaining ladder's depths.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "chainDepths")]
     pub chain_depths: Option<serde_json::Value>,

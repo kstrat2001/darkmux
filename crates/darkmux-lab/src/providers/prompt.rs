@@ -451,6 +451,7 @@ mod tests {
             image: None,
             trials: None,
             task_timeout_seconds: None,
+            max_turns: None,
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),

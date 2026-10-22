@@ -774,7 +774,7 @@ fn quoted_number_to_u64(s: &str) -> Option<u64> {
 /// count, "an integer" for a key like `seed` that legitimately accepts
 /// zero — since the keys this parses don't all mean the same thing and one
 /// shared phrase would misdescribe at least one of them.
-fn knob_u64_strict(value: Option<&serde_json::Value>, key: &str, expect: &str) -> Result<Option<u64>> {
+pub(crate) fn knob_u64_strict(value: Option<&serde_json::Value>, key: &str, expect: &str) -> Result<Option<u64>> {
     match value {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => v
