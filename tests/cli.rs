@@ -1105,6 +1105,24 @@ fn profile_list_errors_when_config_missing() {
         );
 }
 
+// (#2664) A relative DARKMUX_HOME names a different root in every directory,
+// so a command refuses to start, naming the absolute form it meant here;
+// `config` is refused too (it would write config.json under that root).
+#[test]
+fn a_relative_darkmux_home_refuses_to_start() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    for args in [&["run", "list"][..], &["config", "get", "runtime.inactivity_timeout_seconds"][..]] {
+        let mut cmd = darkmux_cmd();
+        cmd.current_dir(tmp.path())
+            .env("DARKMUX_HOME", ".dmrel")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("DARKMUX_HOME is a relative path (.dmrel)"));
+    }
+    assert!(!tmp.path().join(".dmrel").exists(), "nothing was written under the relative root");
+}
+
 // (#1426) The retired top-level spellings now fail with an unknown-subcommand
 // error (no compat alias — pre-2.0 clean removal).
 #[test]
