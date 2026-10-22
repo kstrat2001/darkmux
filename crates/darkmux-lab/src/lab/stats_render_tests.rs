@@ -125,6 +125,8 @@ fn rests_print_their_distinct_delays_and_the_ratchet() {
 fn power_and_energy_print_when_measured() {
     let mut s = run("r");
     s.thermal_states_busy.insert("fair".into(), 4);
+    assert!(run_text(&s).contains("cpu speed limit min not read"), "an unread limit is not 100%");
+    s.cpu_speed_limit_min = Some(100);
     let t = run_text(&s);
     assert!(t.contains("gpu 30 W   cpu 8 W   package 38 W   busy 70% of the run (100 samples)"), "{t}");
     assert!(t.contains("energy       190 J per 1k tokens   10.6 kJ while busy"), "{t}");

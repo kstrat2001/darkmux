@@ -108,48 +108,7 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         g.checkpoint.policy.as_deref().map(|p| format!("   policy={}", sanitize_for_terminal(p))).unwrap_or_default()
     );
 
-    if let Some(pkg) = s.pkg_w_busy {
-        // (#3331) A host with no per-rail split (Omarchy) prints the package
-        // alone, and its busy share comes from the model streams, so the
-        // line says which.
-        let rails = match (s.gpu_w_busy, s.cpu_w_busy) {
-            (Some(gpu), Some(cpu)) => format!("gpu {gpu} W   cpu {cpu} W   "),
-            _ => String::new(),
-        };
-        let busy = match (s.gpu_duty_pct, s.busy_ms) {
-            (Some(d), _) => format!("busy {d}% of the run"),
-            (None, Some(b)) if s.wall_ms > 0 => {
-                format!("busy {:.1}% of the run (model streams)", 100.0 * b as f64 / s.wall_ms as f64)
-            }
-            _ => "busy share unknown".to_string(),
-        };
-        p!(out, 
-            "power        {rails}package {pkg} W   {busy} ({} samples)",
-            s.samples_busy + s.samples_idle
-        );
-        if let Some(j) = s.pkg_j_per_1k_tokens {
-            p!(out, 
-                "energy       {j} J per 1k tokens{}",
-                s.pkg_j_busy.map(|t| format!("   {:.1} kJ while busy", t / 1000.0)).unwrap_or_default()
-            );
-        }
-        if !s.thermal_states_busy.is_empty() {
-            let states: Vec<String> =
-                s.thermal_states_busy.iter().map(|(k, v)| format!("{k} {v}")).collect();
-            p!(out, 
-                "thermal      {}   cpu speed limit min {}%",
-                states.join(", "),
-                s.cpu_speed_limit_min.unwrap_or(100)
-            );
-        }
-    }
-    // Board sensors are read independently of power, so they print on their own.
-    if let Some(t) = s.board_temp_c_max_busy {
-        p!(out, 
-            "board        hottest sensor {t} °C{}",
-            s.fan_rpm_max_busy.map(|f| format!("   fan max {f} rpm")).unwrap_or_default()
-        );
-    }
+    host_text(s, &mut out);
 
     let caveats = s.unreconciled();
     if !caveats.is_empty() {
@@ -160,6 +119,58 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         }
     }
     out
+}
+
+
+/// The host telemetry lines: power, energy and thermal state where package
+/// power was read, and the board sensors wherever they were.
+fn host_text(s: &crate::lab::stats::RunStats, out: &mut String) {
+    if let Some(pkg) = s.pkg_w_busy {
+        power_text(s, pkg, out);
+    }
+    // Board sensors are read independently of power, so they print on their own.
+    if let Some(t) = s.board_temp_c_max_busy {
+        p!(out, 
+            "board        hottest sensor {t} °C{}",
+            s.fan_rpm_max_busy.map(|f| format!("   fan max {f} rpm")).unwrap_or_default()
+        );
+    }
+}
+
+fn power_text(s: &crate::lab::stats::RunStats, pkg: f64, out: &mut String) {
+    // (#3331) A host with no per-rail split (Omarchy) prints the package
+    // alone, and its busy share comes from the model streams, so the
+    // line says which.
+    let rails = match (s.gpu_w_busy, s.cpu_w_busy) {
+        (Some(gpu), Some(cpu)) => format!("gpu {gpu} W   cpu {cpu} W   "),
+        _ => String::new(),
+    };
+    let busy = match (s.gpu_duty_pct, s.busy_ms) {
+        (Some(d), _) => format!("busy {d}% of the run"),
+        (None, Some(b)) if s.wall_ms > 0 => {
+            format!("busy {:.1}% of the run (model streams)", 100.0 * b as f64 / s.wall_ms as f64)
+        }
+        _ => "busy share unknown".to_string(),
+    };
+    p!(out, 
+        "power        {rails}package {pkg} W   {busy} ({} samples)",
+        s.samples_busy + s.samples_idle
+    );
+    if let Some(j) = s.pkg_j_per_1k_tokens {
+        p!(out, 
+            "energy       {j} J per 1k tokens{}",
+            s.pkg_j_busy.map(|t| format!("   {:.1} kJ while busy", t / 1000.0)).unwrap_or_default()
+        );
+    }
+    if !s.thermal_states_busy.is_empty() {
+        let states: Vec<String> =
+            s.thermal_states_busy.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        p!(out, 
+            "thermal      {}   cpu speed limit min {}",
+            states.join(", "),
+            s.cpu_speed_limit_min.map_or("not read".to_string(), |p| format!("{p}%"))
+        );
+    }
 }
 
 /// A run a set view was asked for and could not read.
