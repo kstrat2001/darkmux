@@ -21490,6 +21490,53 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
     ));
 }
 
+    // ─── (#2640) the docker CLI child is reaped on every exit path ────────
+
+    /// `ps`'s state letter for `pid`, `None` once the process is gone.
+    fn ps_state(pid: u32) -> Option<String> {
+        let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// A child that exits by itself is reaped without a kill.
+    #[test]
+    fn reap_bounded_reaps_a_child_that_exits() {
+        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        assert_eq!(reap_bounded(&mut child, Duration::from_secs(5), Duration::from_millis(10)), ReapOutcome::Exited);
+    }
+
+    /// A child that will not exit is killed at the grace, never waited on
+    /// unbounded.
+    #[test]
+    fn reap_bounded_kills_a_child_that_outlives_the_grace() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        assert_eq!(reap_bounded(&mut child, Duration::from_millis(200), Duration::from_millis(10)), ReapOutcome::Killed);
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded: {:?}", started.elapsed());
+    }
+
+    /// Dropped un-waited (a panic or an early `?` after the spawn), the
+    /// docker CLI does not stay a zombie under this process.
+    #[test]
+    fn a_dropped_unwaited_cli_child_is_reaped_not_left_a_zombie() {
+        let child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        let wrapped = ReapedChild(Some(child));
+        // The probe can fail: exited and not yet waited on, it IS a zombie.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ps_state(pid).is_some_and(|s| s.starts_with('Z')) {
+            assert!(Instant::now() < deadline, "the child never became a zombie: {:?}", ps_state(pid));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(wrapped);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ps_state(pid).is_some_and(|s| s.starts_with('Z')) {
+            assert!(Instant::now() < deadline, "still a zombie after the drop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     // ─── (#3074) an inactivity budget of 0 means unbounded ───────────────
 
     /// `0` must not read as "expire immediately": the deadline lands far
