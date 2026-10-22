@@ -14262,7 +14262,10 @@ fn liveness_markers_stay_out_of_a_terminal_but_not_out_of_logs() {
 #[cfg(unix)]
 #[test]
 fn sink_banners_stay_out_of_a_terminal_but_not_out_of_logs() {
-    let audit = TempDir::new().unwrap();
+    // Under a fixed temp root, not `$TMPDIR`: a test build writes the audit
+    // trail only under one (#2730), and the mutation lanes point `$TMPDIR`
+    // at a runner scratch directory that is not.
+    let audit = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     let args = ["flow", "note", "--text", "quiet-banner-probe", "--source", "orchestrator"];
     let build = |extra: &[&str]| {
         let mut c = darkmux_std_cmd();
