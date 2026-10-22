@@ -33,6 +33,7 @@
 import { useMemo, useState } from "react";
 import { escapeBidiControls } from "../lib/recordDetail";
 import { wireOf, type NormRecord } from "../lib/ingest";
+import { usePageNowMs } from "../hooks/useJudgement";
 
 /** Envelope fields measured as effectively constant within a session. Not a
  *  guess — see this module's header for the distinct-value counts. */
@@ -59,11 +60,12 @@ function midTruncate(s: string, max = 28): string {
   return `${s.slice(0, keep)}…${s.slice(-keep)}`;
 }
 
-/** How long ago `t` was, or null for a time that does not parse or lies in
- *  the future. */
-function relTime(t: number): string | null {
+/** How long before `nowMs` (the page's clock: the playhead on a replay,
+ *  #2880) `t` was, or null for a time that does not parse or lies in the
+ *  future. */
+function relTime(t: number, nowMs: number): string | null {
   if (Number.isNaN(t)) return null;
-  const s = Math.floor((Date.now() - t) / 1000);
+  const s = Math.floor((nowMs - t) / 1000);
   if (s < 0) return null;
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
@@ -153,6 +155,7 @@ function arrayItemLabel(item: unknown, i: number): string {
 
 /** Format by NAME PATTERN then TYPE — the rule set that replaces 26 schemas. */
 function Value({ name, value }: { name: string; value: unknown }) {
+  const nowMs = usePageNowMs();
   if (value === null || value === undefined) return <span className="rv__nil">—</span>;
   if (typeof value === "boolean") return <span className={`rv__bool${value ? " on" : ""}`}>{String(value)}</span>;
 
@@ -207,7 +210,7 @@ function Value({ name, value }: { name: string; value: unknown }) {
     // A payload's own `*_ts` field (`started_ts`, `finalized_ts`), not the
     // record's `ts`: this panel shows arbitrary payload values, so it parses
     // them itself. The record's own time comes in parsed, as `tMs`.
-    const rel = relTime(Date.parse(s));
+    const rel = relTime(Date.parse(s), nowMs);
     return <span className="rv__time">{clockOf(s)}{rel ? <span className="rv__dim"> · {rel}</span> : null}</span>;
   }
   if (/(_id|_uid)$/.test(name)) return <span className="rv__id" title={s}>{midTruncate(s)}</span>;
@@ -267,6 +270,7 @@ function maskUids(v: unknown): unknown {
 /** Shows a record's wire fields (`wireOf`), headed by its own time as
  *  ingest parsed it (`tMs`). */
 export function RecordView({ record: norm }: { record: NormRecord }) {
+  const nowMs = usePageNowMs();
   const atMs = norm.tMs;
   const [showConstants, setShowConstants] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
@@ -296,7 +300,7 @@ export function RecordView({ record: norm }: { record: NormRecord }) {
       {ts ? (
         <div className="rv__when">
           {atMs === null ? ts : clockOf(ts)}
-          {atMs !== null && relTime(atMs) ? <span className="rv__dim"> · {relTime(atMs)}</span> : null}
+          {atMs !== null && relTime(atMs, nowMs) ? <span className="rv__dim"> · {relTime(atMs, nowMs)}</span> : null}
         </div>
       ) : null}
 
